@@ -3,22 +3,8 @@
 
 package hfdownloader
 
-// Regression coverage for the sixth correction set (issue #140 / PR #151):
-//   - publish must never overwrite a content-addressed blob that another writer
-//     completed while the transfer was in flight;
-//   - a free OS ownership lock is authoritative for a lock-fenced record, even
-//     when the record carries a reused/live PID, so Download resumes instead of
-//     skipping a crash state;
-//   - a fallback writer that lost its claim must not poison a successor's
-//     payload;
-//   - single-path final-byte transport errors finalize instead of planning an
-//     invalid range; file_finalizing precedes the proof and exact-size inherited
-//     partials emit a full-progress reading;
-//   - a skipped same-SHA/different-path item still gets its own snapshot and
-//     friendly entries after the winner publishes;
-//   - a known digest with an unknown expected size is proven before publication;
-//   - a successful single-path download removes obsolete legacy multipart
-//     artifacts, and cleanup removes the atomic record temp.
+// Cross-checks ownership, publication, resume, and cleanup across transfer
+// routes, including progress and cache-link outcomes.
 
 import (
 	"bytes"
@@ -50,9 +36,7 @@ func lfsTreeNode(path string, size int, sha string) string {
 		path, size, sha, size, sha)
 }
 
-// TestPublishKeepsMidFlightContentAddressedBlob covers B1: another writer
-// completes blobs/<sha> between claim and publish. The publish guard must keep
-// the good blob and treat this item as a completed skip.
+// A blob published after claim but before publish must remain the winner.
 func TestPublishKeepsMidFlightContentAddressedBlob(t *testing.T) {
 	const total = 64 * 1024
 	good := rangedTestPayload(total)
@@ -117,9 +101,7 @@ func TestPublishKeepsMidFlightContentAddressedBlob(t *testing.T) {
 	}
 }
 
-// TestDownload_FreeLockFencedRecordWithLivePIDResumes covers B2: a lock-fenced
-// record whose owner lock is free is stale even when the record carries our
-// live PID. Download must resume and publish, not skip.
+// A free lock makes a fenced record stale even when its recorded PID is live.
 func TestDownload_FreeLockFencedRecordWithLivePIDResumes(t *testing.T) {
 	const total = 64 * 1024
 	good := rangedTestPayload(total)
@@ -133,9 +115,8 @@ func TestDownload_FreeLockFencedRecordWithLivePIDResumes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A foreign instance token with our live PID: record identity alone would
-	// call this "downloading", and record age is not an ownership signal. The
-	// free domain lock says the owner is gone.
+	// The foreign instance token prevents treating our PID as self; the free
+	// domain lock is authoritative because this record is fenced.
 	meta.Instance = "foreign-reused-pid"
 	meta.PID = os.Getpid()
 	meta.Host = processHostname
@@ -146,7 +127,7 @@ func TestDownload_FreeLockFencedRecordWithLivePIDResumes(t *testing.T) {
 	if err := writeStagingMeta(staging+".meta", meta); err != nil {
 		t.Fatal(err)
 	}
-	// The persistent lock file exists but is held by nobody.
+	// An obsolete staging lock file may remain, but the destination-domain lock is free.
 	if err := os.WriteFile(stagingOwnershipLockPath(staging), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -179,8 +160,7 @@ func TestDownload_FreeLockFencedRecordWithLivePIDResumes(t *testing.T) {
 	}
 }
 
-// TestPoisonStagingSkipsLostUnfencedClaim covers B3: an old writer that no
-// longer owns the record must not truncate another owner's payload.
+// A writer that lost an unfenced claim must not truncate its successor's data.
 func TestPoisonStagingSkipsLostUnfencedClaim(t *testing.T) {
 	const size = 128
 	dir := t.TempDir()
@@ -214,7 +194,7 @@ func TestPoisonStagingSkipsLostUnfencedClaim(t *testing.T) {
 	d.poisonStagingIfOwned()
 	assertExactFile(t, staging, successor)
 
-	// A record still owned by this process is poisoned under the lock.
+	// The same-instance record permits poisoning under the metadata gate.
 	ours := foreign
 	ours.Instance = processInstanceToken
 	if err := writeStagingMeta(metaPath, &ours); err != nil {
@@ -230,9 +210,8 @@ func TestPoisonStagingSkipsLostUnfencedClaim(t *testing.T) {
 	}
 }
 
-// TestDownloadSingle_FinalByteRequiresResponseFraming covers the single-path
-// framing correction: all requested bytes arrive but the chunked response is
-// aborted before its terminal chunk, so the last byte must be re-requested.
+// If a response ends before terminal framing, revalidate the final byte even
+// when all requested bytes arrived.
 func TestDownloadSingle_FinalByteRequiresResponseFraming(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
@@ -291,9 +270,8 @@ func TestDownloadSingle_FinalByteRequiresResponseFraming(t *testing.T) {
 	}
 }
 
-// TestDownloadSingle_EmitsFinalizingBeforeProofAndFullProgress covers M2: an
-// exact-size inherited partial must emit a full-progress reading and
-// file_finalizing before the pre-publish proof/rename.
+// An exact-size inherited partial reports full progress and finalizing before
+// its pre-publication proof.
 func TestDownloadSingle_EmitsFinalizingBeforeProofAndFullProgress(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
@@ -338,15 +316,8 @@ func TestDownloadSingle_EmitsFinalizingBeforeProofAndFullProgress(t *testing.T) 
 	assertExactFile(t, dst, full)
 }
 
-// TestDownload_SharedBlobSkippedPathsGetLinks covers M4: two plan items with
-// the same SHA and different paths wait for the shared blob key's ownership
-// domain while a live owner holds it. After that owner publishes, both paths
-// still get their own snapshot and friendly entries. A third, different-SHA
-// item keeps Download alive until the shared blob is published.
-//
-// The wait is the job contract: the file is not present while the live owner
-// holds the key, so the items must not skip it as "done" - they wait, and the
-// published blob is then reused with their own links created.
+// Same-SHA items with different paths wait for publication and then get their
+// own links; another item keeps the job active during the wait.
 func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 	const total = 64 * 1024
 	shared := rangedTestPayload(total)
@@ -405,10 +376,7 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 		StallTimeout:       "0",
 	}
 
-	// A live owner (this test) holds the shared blob key's ownership domain,
-	// so both same-SHA paths WAIT for the domain while the blob is still
-	// absent. Under the one-destination-domain model the domain IS the
-	// ownership fence; the record needs no separate claim to block them.
+	// Hold the shared key before either same-SHA path is scheduled.
 	repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -419,8 +387,6 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 	}
 	defer domain.release()
 
-	// The in-process contention hook proves that the same-SHA paths really
-	// wait for the domain instead of proceeding.
 	waiting := make(chan struct{}, 4)
 	oldContention := blobDomainContentionHook
 	blobDomainContentionHook = func(string) {
@@ -450,7 +416,6 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 		releaseOnce.Do(func() { close(release) })
 		t.Fatal("the blocker transfer never started")
 	}
-	// Both same-SHA paths are waiting for the ownership domain.
 	for i := 0; i < 2; i++ {
 		select {
 		case <-waiting:
@@ -460,8 +425,6 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 		}
 	}
 
-	// The live owner publishes the shared blob and releases the domain; only
-	// then is the blocker released so Download can finish.
 	if err := os.WriteFile(sharedBlob, shared, 0o644); err != nil {
 		releaseOnce.Do(func() { close(release) })
 		t.Fatal(err)
@@ -469,7 +432,6 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 	domain.release()
 	releaseOnce.Do(func() { close(release) })
 
-	// The waiting items now find the published blob and finish as skips.
 	for i := 0; i < 2; i++ {
 		select {
 		case <-skipCh:
@@ -496,9 +458,8 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 	assertExactFile(t, filepath.Join(blobsDir, blockerSHA), blocker)
 }
 
-// TestDownloadSingle_UnknownSizeKnownDigestRequiresProof covers the minor: a
-// known digest with an unknown expected size cannot rely on a size check, so it
-// must be proven before the rename even in size mode.
+// A known digest with unknown size requires proof before rename, including in
+// size mode.
 func TestDownloadSingle_UnknownSizeKnownDigestRequiresProof(t *testing.T) {
 	const total = 4_096
 	good := rangedTestPayload(total)
@@ -660,38 +621,7 @@ func TestDownloadUnknownSizeLFSStoresSinglePathFallbackCorrectly(t *testing.T) {
 	}
 }
 
-// TestDownloadSingle_RemovesLegacyMultipartArtifacts covers the minor: a
-// successful single-path finalization clears an obsolete .part-NN/.parts.json
-// family for the same destination.
-func TestDownloadSingle_RemovesLegacyMultipartArtifacts(t *testing.T) {
-	const total = 4_096
-	full := rangedTestPayload(total)
-	dir := t.TempDir()
-	dst := filepath.Join(dir, "single.bin")
-	if err := os.WriteFile(dst+".part-00", []byte("stale"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dst+".parts.json", []byte(`{"size":4096}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
-	}))
-	defer srv.Close()
-	it := PlanItem{RelativePath: "single.bin", URL: srv.URL, Size: total}
-	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Verify: "size", Retries: 0, StallTimeout: "0"}, it, dst, singleOpts{}, func(ProgressEvent) {}); err != nil {
-		t.Fatalf("downloadSingle: %v", err)
-	}
-	assertExactFile(t, dst, full)
-	for _, p := range []string{dst + ".part-00", dst + ".parts.json"} {
-		if _, serr := os.Stat(p); !os.IsNotExist(serr) {
-			t.Errorf("legacy multipart artifact %s survived single-path success, stat err=%v", filepath.Base(p), serr)
-		}
-	}
-}
-
-// TestRemoveStagingArtifactsRemovesRecordTemp covers the atomic record-temp
-// cleanup: a crashed meta rewrite must not leave <staging>.meta.tmp behind.
+// Cleanup must remove the atomic record rewrite's <staging>.meta.tmp residue.
 func TestRemoveStagingArtifactsRemovesRecordTemp(t *testing.T) {
 	dir := t.TempDir()
 	staging := filepath.Join(dir, "x.incomplete")

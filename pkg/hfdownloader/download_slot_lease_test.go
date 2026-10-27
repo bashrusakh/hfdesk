@@ -3,24 +3,8 @@
 
 package hfdownloader
 
-// Regression coverage for the MaxActiveDownloads slot lease (issue #140 /
-// PR #151).
-//
-// An item that waits for another writer's ownership domain is not
-// transferring, so it must NOT hold one of the job's MaxActiveDownloads
-// slots: with a low limit one waiting item used to keep every other file of
-// the job from starting, so the job looked stalled while its concurrency
-// budget was spent on a wait. The slot is still required for a TRANSFER: a
-// contended item takes its slot back before the acquisition returns a domain
-// it will transfer under.
-//
-// The cases drive the real Download path, so they cover the item-level
-// destination-domain acquisition of both modes (cache and flat) and the two
-// waits it can perform (the in-process slot and the cross-process lifetime OS
-// lock). The flat unknown-size hand-off keeps the domain the item already
-// holds, so it is covered as the same one acquisition, not a second one. The synchronization is deterministic: the test holds the
-// destination's domain itself, and the payload/`file_done` signals of the
-// OTHER file prove that the job proceeded. No sleep decides the outcome.
+// Ownership waiters release their transfer slot and reacquire it before
+// transfer, in cache and flat mode and for both in-process and OS-lock waits.
 
 import (
 	"bytes"
@@ -38,20 +22,13 @@ import (
 	"time"
 )
 
-// slotLeaseFile is one file of the slot-lease test hub.
 type slotLeaseFile struct {
 	rel  string
 	body []byte
-	// omitSize makes the tree and the HEAD response report no size, which
-	// routes a multipart item through the unknown-size hand-off to the
-	// single-request path.
+	// omitSize exercises multipart-to-single handoff after unknown-size HEAD.
 	omitSize bool
 }
 
-// slotLeaseHub serves a small repository and records the per-file payload
-// requests. It can hold the FIRST payload response open, which is what the
-// concurrency case needs: while that response is held, a second transfer may
-// only start if the MaxActiveDownloads limiter let it.
 type slotLeaseHub struct {
 	srv *httptest.Server
 
@@ -72,7 +49,6 @@ type slotLeaseHub struct {
 	maxActive atomic.Int64
 }
 
-// newSlotLeaseHub starts the two-file hub in tree order (the order of files).
 func newSlotLeaseHub(t *testing.T, files []slotLeaseFile, gateFirst bool) *slotLeaseHub {
 	t.Helper()
 	h := &slotLeaseHub{
@@ -92,7 +68,6 @@ func newSlotLeaseHub(t *testing.T, files []slotLeaseFile, gateFirst bool) *slotL
 		h.omitSize[f.rel] = f.omitSize
 		sha := singleTestSHA(f.body)
 		if f.omitSize {
-			// No Size and no LFS.Size: the plan's item has an unknown size.
 			nodes = append(nodes, fmt.Sprintf(
 				`{"type":"file","path":%q,"lfs":{"oid":%q,"sha256":%q}}`,
 				f.rel, sha, sha))
@@ -123,9 +98,7 @@ func newSlotLeaseHub(t *testing.T, files []slotLeaseFile, gateFirst bool) *slotL
 			}
 			if r.Method == http.MethodHead {
 				if h.omitSize[rel] {
-					// Range support is advertised but the size stays
-					// unknown, so the multipart route hands the item over
-					// to the single-request path.
+					// Keep range support while leaving size unresolved.
 					w.Header().Set("Accept-Ranges", "bytes")
 					return
 				}
@@ -137,9 +110,6 @@ func newSlotLeaseHub(t *testing.T, files []slotLeaseFile, gateFirst bool) *slotL
 				return
 			}
 			h.payloads[rel].Add(1)
-			// active counts payload requests that are inside the handler.
-			// The first one may be held below, so a second transfer would
-			// be visible as a concurrent handler entry.
 			cur := h.active.Add(1)
 			defer h.active.Add(-1)
 			for {
@@ -168,17 +138,14 @@ func newSlotLeaseHub(t *testing.T, files []slotLeaseFile, gateFirst bool) *slotL
 	return h
 }
 
-// release opens the first-payload gate. It is safe to call more than once.
 func (h *slotLeaseHub) release() {
 	h.releaseOnce.Do(func() { close(h.releaseFirst) })
 }
 
-// payloadCount returns how many payload GETs the file received.
 func (h *slotLeaseHub) payloadCount(rel string) int64 {
 	return h.payloads[rel].Load()
 }
 
-// slotLeaseFlatDst returns the flat/output-mode destination of one file.
 func slotLeaseFlatDst(t *testing.T, out, rel string) string {
 	t.Helper()
 	base, err := DestinationBase(out, "owner/model")
@@ -191,9 +158,6 @@ func slotLeaseFlatDst(t *testing.T, out, rel string) string {
 	return filepath.Join(base, filepath.FromSlash(rel))
 }
 
-// slotLeaseFlatSettings returns the flat-mode settings of the slot cases:
-// one transfer slot, one connection, and the single-request route for the
-// small payloads below.
 func slotLeaseFlatSettings(out, endpoint string) Settings {
 	return Settings{
 		OutputDir:          out,
@@ -207,8 +171,6 @@ func slotLeaseFlatSettings(out, endpoint string) Settings {
 	}
 }
 
-// runSlotLeaseDownload runs one Download and reports every completed path on
-// the done channel.
 func runSlotLeaseDownload(ctx context.Context, cfg Settings, done chan string) <-chan error {
 	result := make(chan error, 1)
 	go func() {
@@ -225,7 +187,6 @@ func runSlotLeaseDownload(ctx context.Context, cfg Settings, done chan string) <
 	return result
 }
 
-// awaitSlotFileDone waits for the file_done event of one path.
 func awaitSlotFileDone(t *testing.T, done <-chan string, rel string) {
 	t.Helper()
 	deadline := time.After(30 * time.Second)
@@ -241,9 +202,6 @@ func awaitSlotFileDone(t *testing.T, done <-chan string, rel string) {
 	}
 }
 
-// TestDownloadSlotLeaseFlatMode covers the flat/output-mode destination
-// domain: while the first item waits for the domain the test holds, the
-// second file of the SAME limit-1 job must transfer and complete.
 func TestDownloadSlotLeaseFlatMode(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -258,9 +216,7 @@ func TestDownloadSlotLeaseFlatMode(t *testing.T) {
 	dstA := slotLeaseFlatDst(t, out, "a.bin")
 	dstB := slotLeaseFlatDst(t, out, "b.bin")
 
-	// The live owner of a.bin's flat destination domain: the in-process slot
-	// AND the lifetime OS lock, exactly what a second writer of that
-	// destination would meet.
+	// Hold both domain layers for a.bin.
 	flat := newFlatDestinationDomain(dstA)
 	owner, err := blobDomainAcquire(context.Background(), flat.key, flat.lockSrc)
 	if err != nil {
@@ -279,12 +235,9 @@ func TestDownloadSlotLeaseFlatMode(t *testing.T) {
 	done := make(chan string, 8)
 	result := runSlotLeaseDownload(context.Background(), slotLeaseFlatSettings(out, hub.srv.URL), done)
 
-	// b.bin must transfer and complete while a.bin waits.
 	awaitSlotFileDone(t, done, "b.bin")
 	assertExactFile(t, dstB, payloadB)
 
-	// a.bin must not have transferred or appeared while the test holds its
-	// domain.
 	if _, serr := os.Stat(dstA); !os.IsNotExist(serr) {
 		t.Fatalf("a.bin exists while its destination domain is held by another writer, stat err=%v", serr)
 	}
@@ -292,8 +245,6 @@ func TestDownloadSlotLeaseFlatMode(t *testing.T) {
 		t.Fatalf("a.bin issued %d payload requests while its destination domain was held, want 0", got)
 	}
 
-	// The owner releases the domain: the waiting item transfers exactly once
-	// and the job completes.
 	releaseOwner()
 	select {
 	case err := <-result:
@@ -310,10 +261,6 @@ func TestDownloadSlotLeaseFlatMode(t *testing.T) {
 	}
 }
 
-// TestDownloadSlotLeaseCrossProcessWait covers the second wait of the domain
-// acquisition: the in-process slot is free, so the item passes it and waits
-// for the lifetime OS lock held by the test. The item must release its
-// MaxActiveDownloads slot for that wait too.
 func TestDownloadSlotLeaseCrossProcessWait(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -328,8 +275,7 @@ func TestDownloadSlotLeaseCrossProcessWait(t *testing.T) {
 	dstA := slotLeaseFlatDst(t, out, "a.bin")
 	dstB := slotLeaseFlatDst(t, out, "b.bin")
 
-	// Only the OS lock is held (no in-process domain entry): this is the
-	// cross-process branch of acquireBlobDomainWithin.
+	// Hold only the OS lock to exercise the foreign-process wait path.
 	owner, err := acquireStagingOwnershipLock(flatDomainLockSrc(dstA))
 	if err != nil {
 		t.Fatal(err)
@@ -367,10 +313,6 @@ func TestDownloadSlotLeaseCrossProcessWait(t *testing.T) {
 	}
 }
 
-// TestDownloadSlotLeaseCacheMode covers the cache destination's domain: while
-// the first item waits for the blob key's domain, the second item of the
-// SAME limit-1 job must transfer, publish its blob and create its cache
-// links.
 func TestDownloadSlotLeaseCacheMode(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -435,8 +377,6 @@ func TestDownloadSlotLeaseCacheMode(t *testing.T) {
 	}
 }
 
-// assertOwnershipContractLinksMissing checks that an item's own cache entries
-// do not exist.
 func assertOwnershipContractLinksMissing(t *testing.T, cacheDir, rel string) {
 	t.Helper()
 	repoDir := filepath.Join(cacheDir, "hub", "models--owner--model")
@@ -446,11 +386,8 @@ func assertOwnershipContractLinksMissing(t *testing.T, cacheDir, rel string) {
 	}
 }
 
-// TestDownloadSlotLeaseFlatModeUnknownSizeHandoff covers the flat-mode
-// unknown-size hand-off: the item waits for its destination domain before the
-// HEAD, and the hand-off to the single-request path keeps that same domain.
-// The wait must yield the slot there too, so the other file of the limit-1 job
-// still transfers.
+// An unknown-size item yields its slot during the domain wait, then keeps
+// the acquired domain through the multipart-to-single handoff.
 func TestDownloadSlotLeaseFlatModeUnknownSizeHandoff(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -481,8 +418,6 @@ func TestDownloadSlotLeaseFlatModeUnknownSizeHandoff(t *testing.T) {
 	defer releaseOwner()
 
 	cfg := slotLeaseFlatSettings(out, hub.srv.URL)
-	// A threshold of 0 selects the multipart route, which is where the
-	// unknown-size hand-off lives.
 	cfg.MultipartThreshold = "0"
 	done := make(chan string, 8)
 	result := runSlotLeaseDownload(context.Background(), cfg, done)
@@ -508,10 +443,6 @@ func TestDownloadSlotLeaseFlatModeUnknownSizeHandoff(t *testing.T) {
 	}
 }
 
-// TestDownloadSlotLeaseCancellation covers cancellation of a waiting item:
-// Download returns promptly, the waiting item transfers nothing, and the
-// destination can be downloaded normally afterwards (the lease did not leave
-// the item stuck or the slot poisoned).
 func TestDownloadSlotLeaseCancellation(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -559,9 +490,7 @@ func TestDownloadSlotLeaseCancellation(t *testing.T) {
 			}
 			defer release()
 
-			// Install the contention probe BEFORE the item starts: it proves
-			// the item really was waiting for the domain when the test
-			// cancels.
+			// Install the package hook before launching the item.
 			contended := installBlobDomainContentionProbe(t)
 			if tc.name == "cross-process OS lock" {
 				contended = installDomainContentionProbe(t)
@@ -589,9 +518,6 @@ func TestDownloadSlotLeaseCancellation(t *testing.T) {
 				t.Fatalf("the cancelled item created the destination, stat err=%v", serr)
 			}
 
-			// The destination is free afterwards: an ordinary download with
-			// the same settings still completes, so the waiting item did not
-			// leave the slot/lease state broken.
 			release()
 			done2 := make(chan string, 4)
 			result2 := runSlotLeaseDownload(context.Background(), slotLeaseFlatSettings(out, hub.srv.URL), done2)
@@ -609,10 +535,6 @@ func TestDownloadSlotLeaseCancellation(t *testing.T) {
 	}
 }
 
-// TestDownloadSlotLeaseBoundsConcurrentTransfers is the regression guard: the
-// lease must still bound concurrent TRANSFERS. With MaxActiveDownloads=1 the
-// first payload response is held open, so a second transfer could only start
-// if the limiter let it.
 func TestDownloadSlotLeaseBoundsConcurrentTransfers(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -646,8 +568,6 @@ func TestDownloadSlotLeaseBoundsConcurrentTransfers(t *testing.T) {
 			done := make(chan string, 8)
 			result := runSlotLeaseDownload(context.Background(), slotLeaseFlatSettings(out, hub.srv.URL), done)
 
-			// The first transfer is inside the handler. With one slot no
-			// second payload request may start while it is held.
 			select {
 			case <-hub.firstEntered:
 			case <-time.After(30 * time.Second):
@@ -681,15 +601,11 @@ func TestDownloadSlotLeaseBoundsConcurrentTransfers(t *testing.T) {
 	}
 }
 
-// slotNoticeRecorder records the lease signals of a destination-domain
-// acquisition.
 type slotNoticeRecorder struct {
 	mu     sync.Mutex
 	begins int
 	ends   int
-	// began is closed on the FIRST beginWait when the test installed it. It is
-	// the deterministic "the acquisition is now waiting" signal; tests
-	// that only count signals leave it nil.
+	// began closes on the first beginWait; nil disables this synchronization signal.
 	began chan struct{}
 }
 
@@ -709,19 +625,14 @@ func (r *slotNoticeRecorder) endWait() bool {
 	return true
 }
 
-// counts reports the recorded begin/end signal counts.
 func (r *slotNoticeRecorder) counts() (begins, ends int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.begins, r.ends
 }
 
-// TestDownloadSlotLeaseFailedDomainAcquisitionDoesNotRetakeTheSlot pins the
-// failure path of the lease: when the acquisition gives up (the ownership
-// budget expired while a proven live owner still holds the lock), no domain
-// reaches the caller and the item is about to report the actionable error, so
-// the slot must stay returned. Re-taking it would make the failure wait for
-// some other transfer to free a slot before the error could be reported.
+// Failed acquisition keeps the slot returned so error reporting cannot wait
+// for an unrelated transfer.
 func TestDownloadSlotLeaseFailedDomainAcquisitionDoesNotRetakeTheSlot(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -753,18 +664,11 @@ func TestDownloadSlotLeaseFailedDomainAcquisitionDoesNotRetakeTheSlot(t *testing
 	}
 }
 
-// TestDownloadSlotLeaseFreePathDoesNotReleaseOrRetake pins the free
-// (uncontended) path of the lease: when the destination's ownership domain is
-// available, the acquisition never signals a wait, so it must neither return
-// the item's slot nor take it back. The test holds no lock and no in-process
-// domain entry, so the acquisition can only run through the fast path.
 func TestDownloadSlotLeaseFreePathDoesNotReleaseOrRetake(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	dst := filepath.Join(t.TempDir(), "tmp-blob")
-	// The temp directory makes the destination, and therefore this key,
-	// unique to this test.
 	key := flatDomainKey(dst)
 	notice := &slotNoticeRecorder{}
 	ctx := withDownloadSlotWaitNotice(context.Background(), notice)

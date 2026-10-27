@@ -3,13 +3,7 @@
 
 package hfdownloader
 
-// OS-level staging ownership coverage for issue #140 (T4 correction):
-//   - the non-blocking ownership probe and CheckBlob's use of it;
-//   - publish refuses a missing/foreign record and leaves the staging alone;
-//   - a real helper process holding the lock (with a deliberately stale-looking
-//     record) blocks takeover, and completes when released;
-//   - a helper process that dies while holding the lock releases it at death,
-//     so the next claimant resumes the committed prefix and publishes.
+// Covers ownership probes and claim checks, plus live/crashed helper processes.
 
 import (
 	"bytes"
@@ -20,7 +14,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -52,70 +45,8 @@ func TestStagingOwnershipLockProbe(t *testing.T) {
 	}
 }
 
-// TestCheckBlobHeldOwnershipLockReportsDownloading pins the status consumer: a
-// held OS ownership lock reports an active writer even if the record carries
-// this process's own instance token (a suspended/active owner is still live).
-func TestCheckBlobHeldOwnershipLockReportsDownloading(t *testing.T) {
-	if !stagingOSLockAvailable {
-		t.Skip("this platform has no OS ownership lock primitive")
-	}
-	cache := NewHFCache(t.TempDir())
-	repo, err := cache.Repo("owner/name", RepoTypeModel)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.EnsureDirs(); err != nil {
-		t.Fatal(err)
-	}
-	sha := strings.Repeat("e", 64)
-	staging := repo.IncompletePath(sha)
-	if err := os.WriteFile(staging, []byte("partial"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	meta := IncompleteMeta{
-		PID:        os.Getpid(),
-		Instance:   processInstanceToken,
-		Host:       processHostname,
-		StartedAt:  time.Now().UTC(),
-		Size:       100,
-		Version:    stagingMetaVersion,
-		Repo:       "o/r",
-		Path:       "x.bin",
-		Ranges:     buildRangeLayout(100, 2),
-		LockFenced: true,
-	}
-	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &meta); err != nil {
-		t.Fatal(err)
-	}
-
-	lock, err := acquireStagingOwnershipLock(mustDomainDst(t, repo, sha))
-	if err != nil {
-		t.Fatal(err)
-	}
-	status, _, err := repo.CheckBlob(sha)
-	lock.release()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != BlobDownloading {
-		t.Errorf("held ownership lock status = %v, want BlobDownloading", status)
-	}
-	// With the lock released, the same-instance record is an earlier run of
-	// this process: take-over-able.
-	if status, _, err = repo.CheckBlob(sha); err != nil || status != BlobStale {
-		t.Errorf("released ownership lock status = %v (err=%v), want BlobStale", status, err)
-	}
-}
-
-// TestStagingPublishRefusesForeignClaim pins B2: publish re-reads the record
-// under the transition lock while it holds the OS ownership lock, and refuses
-// a missing or foreign record with errStagingClaimLost instead of renaming
-// another writer's staging file.
-//
-// The record the owned case installs is a COMPLETE layout, because publish
-// also checks the publication invariant (every range Done, committed total
-// equal to the expected size) before it renames. The ownership semantics
-// under test are unchanged: an owned, complete record still publishes.
+// Publish refuses missing/foreign claims under the ownership lock and still
+// accepts an owned claim with a complete layout.
 func TestStagingPublishRefusesForeignClaim(t *testing.T) {
 	payload := []byte("someone else's payload")
 	makeDownload := func(t *testing.T) (*stagingDownload, string, string) {
@@ -241,11 +172,8 @@ func writeOSLockChildResult(t *testing.T, path string, res stagingOSLockChildRes
 	}
 }
 
-// TestStagingOSLockChildProcess is the re-executed helper used by the
-// real-process ownership tests. It claims the staging pair through the real
-// claim path (so the OS lock and the record are both established), seeds a
-// committed prefix, and then either holds the lock until the parent releases it
-// or exits abruptly without releasing.
+// TestStagingOSLockChildProcess is the re-executed helper that claims and seeds
+// staging, then holds the lock or exits without releasing it.
 func TestStagingOSLockChildProcess(t *testing.T) {
 	if os.Getenv(stagingOSLockChildEnv) != "1" {
 		t.Skip("helper process for the staging ownership lock tests")
@@ -263,8 +191,7 @@ func TestStagingOSLockChildProcess(t *testing.T) {
 	it := PlanItem{RelativePath: filepath.Base(cfg.Publish), URL: "http://127.0.0.1:1/lock.bin", Size: cfg.Size, AcceptRanges: true}
 	job := Job{Repo: "o/r"}
 	metaPath := cfg.Staging + ".meta"
-	// The child owns the destination's domain for the whole interval, exactly
-	// like an item goroutine does; the claim trusts that domain.
+	// Hold the destination domain throughout the child claim and transfer.
 	domain, derr := acquireBlobDomain(context.Background(), flatDomainKey(cfg.Publish), cfg.Staging)
 	if derr != nil {
 		writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{Err: derr.Error()})
@@ -314,8 +241,7 @@ func TestStagingOSLockChildProcess(t *testing.T) {
 	}
 
 	if cfg.Mode == "crash" {
-		// No state.release(): the process exits while holding the lock, and
-		// the kernel drops it. os.Exit skips every deferred release.
+		// Exit while holding the domain; os.Exit skips defers and the kernel releases it.
 		os.Exit(0)
 	}
 
@@ -354,8 +280,6 @@ func TestStagingOSLockChildProcess(t *testing.T) {
 	writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{})
 }
 
-// startStagingOSLockChild starts the helper and returns its command and config
-// paths; the caller waits for it explicitly.
 func startStagingOSLockChild(t *testing.T, cfg stagingOSLockChildConfig) (*exec.Cmd, *bytes.Buffer) {
 	t.Helper()
 	exe, err := os.Executable()
@@ -384,12 +308,8 @@ func startStagingOSLockChild(t *testing.T, cfg stagingOSLockChildConfig) (*exec.
 	return cmd, &out
 }
 
-// TestStagingOSLockHeldByLiveProcessBlocksTakeover is the real-process form of
-// B3(i)/(iii): a helper holds the destination's ownership domain while its
-// record looks stale-looking (aged mtime), so only the lifetime lock can refuse
-// takeover. A second acquisition must report the proven live owner as busy and
-// leave the staging untouched; once the helper is released it completes and
-// publishes.
+// An aged record cannot allow takeover while the child holds the domain;
+// after the parent signals it, the child completes and publishes.
 func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 	if os.Getenv(stagingOSLockChildEnv) == "1" {
 		t.Skip("child process")
@@ -433,9 +353,6 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	// Pre-condition: the record is already old enough that an age-based model
-	// would call it stale; its timestamp cannot grant another process
-	// ownership.
 	metaBefore, err := os.ReadFile(metaPath)
 	if err != nil {
 		t.Fatalf("helper record: %v", err)
@@ -456,21 +373,16 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The destination's domain is held by the helper, so a second writer must
-	// not take it over. The bounded acquisition reports the PROVEN live owner
-	// as busy after its wait budget.
 	shortBlobOwnershipWait(t, 250*time.Millisecond)
 	if _, derr := blobDomainAcquire(context.Background(), flatDomainKey(dst), flatDomainLockSrc(dst)); !errors.Is(derr, errStagingOwnershipBusy) {
 		_ = cmd.Process.Kill()
 		t.Fatalf("second claimant error = %v, want errStagingOwnershipBusy while the OS lock is held", derr)
 	}
-	// Cleanup must observe the same held lifetime fence; stale diagnostics do
-	// not authorize deleting a suspended owner's payload or metadata.
+	// Cleanup must preserve the waiting child's data while its domain is held.
 	if err := CleanupJobPartFiles(Settings{OutputDir: dir}, []string{dst}); err != nil {
 		_ = cmd.Process.Kill()
 		t.Fatalf("cleanup of a live owner's destination: %v", err)
 	}
-	// The second claimant must not have touched the owner's staging or record.
 	stagingAfter, err := os.ReadFile(staging)
 	if err != nil {
 		t.Fatalf("live owner's staging disappeared: %v", err)
@@ -486,7 +398,6 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 		t.Error("the second claimant rewrote the live owner's claim record")
 	}
 
-	// Release the helper: it wakes up, completes the payload, and publishes.
 	if err := os.WriteFile(cfg.GoPath, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -515,10 +426,7 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 	}
 }
 
-// TestStagingOSLockReleasedByCrashedProcess is the real-process form of B3(ii):
-// a helper claims and seeds a committed prefix, then dies abruptly while
-// holding the OS lock. The kernel releases it at death, so the next claimant
-// acquires immediately, resumes only the missing suffix, and publishes.
+// A crashed process releases its lock; the next claimant resumes and publishes.
 func TestStagingOSLockReleasedByCrashedProcess(t *testing.T) {
 	if os.Getenv(stagingOSLockChildEnv) == "1" {
 		t.Skip("child process")

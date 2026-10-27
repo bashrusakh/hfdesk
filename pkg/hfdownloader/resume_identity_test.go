@@ -5,9 +5,8 @@ package hfdownloader
 
 import "testing"
 
-// TestResumeIdentityMatches is the direct table of the ONE identity rule both
-// staged record formats share. The rows are derived from the rule, not from a
-// route: a route test would only prove that one adapter is wired up.
+// Exercise the shared pinned identity comparison independently of either
+// persisted-record adapter.
 func TestResumeIdentityMatches(t *testing.T) {
 	base := resumeIdentity{
 		Repo:   "owner/model",
@@ -47,9 +46,8 @@ func TestResumeIdentityMatches(t *testing.T) {
 	}
 }
 
-// TestResumeIdentityAdapters pins the mapping from each persisted record to the
-// shared identity value: the records keep their own fields, but both must
-// expose the same five identity dimensions.
+// Both persisted formats must expose the same five identity fields while
+// retaining their separate lifecycle state.
 func TestResumeIdentityAdapters(t *testing.T) {
 	want := resumeIdentity{
 		Repo:   "owner/model",

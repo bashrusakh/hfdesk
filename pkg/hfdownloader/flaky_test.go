@@ -161,10 +161,8 @@ func TestDownloadMultipart_ResumesAfterFlakyConnection(t *testing.T) {
 	}
 }
 
-// slowRangeServer serves Range requests at a bounded byte rate so the test
-// can cancel context mid-stream deterministically. It streams bytes in small
-// chunks with a short sleep between chunks, and reports the number of body
-// bytes it actually delivered to the client.
+// slowRangeServer streams small chunks slowly enough to cancel mid-transfer
+// and counts bytes accepted by successful server writes.
 func slowRangeServer(t *testing.T, full []byte) (*httptest.Server, *int64) {
 	t.Helper()
 	var (
@@ -215,20 +213,9 @@ func slowRangeServer(t *testing.T, full []byte) (*httptest.Server, *int64) {
 	return srv, &delivered
 }
 
-// TestDownloadMultipart_CancelMidStreamDoesNotClaim100 is a regression test
-// for the UI bug: when a user paused mid-download, downloadMultipart used to
-// emit a "file_progress downloaded==total" event via its tail path even
-// though the parts were incomplete, then ran assembly over the partial set
-// and destroyed the part files. On a subsequent resume the UI had already
-// snapped to 100%, assembly had corrupted/removed the partial bytes, and
-// the real resume appeared to start over from zero.
-//
-// This test cancels the context mid-download and asserts:
-//   - downloadMultipart returns a context error (not nil success)
-//   - no file_progress event ever reports downloaded == total
-//   - the preallocated staging file survives with its committed bytes and
-//     resume metadata, and the durable checkpoint never claims bytes the
-//     server did not actually deliver
+// Cancellation must return an error without a terminal 100% event or publication.
+// Staging and metadata survive, with a nonzero partial checkpoint no larger
+// than the server's successful writes; preallocated length is not progress.
 func TestDownloadMultipart_CancelMidStreamDoesNotClaim100(t *testing.T) {
 	tmpDir := t.TempDir()
 	const totalSize = 200_000
@@ -325,16 +312,13 @@ func TestDownloadMultipart_CancelMidStreamDoesNotClaim100(t *testing.T) {
 			lastSeen, totalSize)
 	}
 
-	// The staging file must survive with the bytes that were actually
-	// written — no assembly pass ever ran, and its committed checkpoint
-	// must never exceed the data on disk.
+	// Preserve staging and its partial committed-range metadata after cancellation.
 	staging := dst + ".incomplete"
 	fi, err := os.Stat(staging)
 	if err != nil {
 		t.Fatalf("staging file did not survive cancel: %v", err)
 	}
-	// The staging file is PREALLOCATED to the logical size; its length is
-	// never evidence of progress (issue #140 invariant).
+	// Preallocated length is not evidence of transferred or committed bytes.
 	if fi.Size() != totalSize {
 		t.Errorf("staging file not preallocated: size=%d want %d", fi.Size(), totalSize)
 	}
@@ -349,13 +333,11 @@ func TestDownloadMultipart_CancelMidStreamDoesNotClaim100(t *testing.T) {
 	if committed >= totalSize {
 		t.Errorf("committed=%d equals the total; the checkpoint must never claim uncommitted bytes", committed)
 	}
-	// The durable checkpoint must never claim bytes the server did not
-	// actually deliver (issue #140: metadata never leads the payload).
+	// The committed checkpoint cannot exceed the server's successful writes.
 	if committed > *delivered {
 		t.Errorf("committed checkpoint %d exceeds the %d bytes the server delivered; metadata claims bytes not written", committed, *delivered)
 	}
 
-	// The published destination must NOT exist.
 	if _, err := os.Stat(dst); err == nil {
 		t.Error("final dst file exists after cancellation; should have been left alone")
 	}

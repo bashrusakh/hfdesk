@@ -324,8 +324,7 @@ func TestRepoDir_CheckBlob(t *testing.T) {
 		if meta != nil {
 			t.Errorf("meta = %+v, want nil for an unreadable record", meta)
 		}
-		// CheckBlob only reports; it never removes. The claim refuses this
-		// record as unproven, so both artifacts must survive the status query.
+		// A status query must preserve both the malformed record and its payload.
 		if _, err := os.Stat(incompletePath); err != nil {
 			t.Errorf("the unreadable record's payload was not preserved: %v", err)
 		}

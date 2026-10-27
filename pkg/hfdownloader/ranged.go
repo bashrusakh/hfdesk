@@ -3,79 +3,11 @@
 
 package hfdownloader
 
-// Ranged multipart downloads (issue #140).
-//
-// The downloader writes every ranged worker directly into ONE staging file
-// at its assigned offset (WriteAt on a preallocated file) instead of
-// downloading per-connection .part-NN payload files and stitching them
-// with a full-file assembly copy. The staging file is:
-//
-//   - HF cache mode, LFS blob with a known SHA-256:
-//     blobs/<sha256>.incomplete (RepoDir.IncompletePath) — the future blob
-//     itself, so finalization is a rename into blobs/<sha256> plus
-//     snapshot/friendly link work, never another payload-sized copy.
-//   - every other destination: <dst>.incomplete, adjacent to the final
-//     file (same directory, so the final rename is atomic and cheap).
-//
-// Resume state lives in a versioned metadata file next to the staging file
-// (staging+".meta", i.e. blobs/<sha>.incomplete.meta in cache mode — exactly
-// RepoDir.IncompleteMetaPath). It extends IncompleteMeta with the range
-// layout and per-range committed prefixes. The persisted range contract is
-// authoritative for an existing incomplete download and is independent of the
-// worker count, so changing Settings.Concurrency between runs re-fetches
-// only the missing bytes.
-//
-// A record is trusted only when its repo/path/size/resolved-commit identity
-// matches, its identity is PINNED on both sides (the record's own flag and the
-// current plan's: an unpinned commit is the planner's fallback to the
-// requested revision, which pins nothing), its blob SHA is present on both
-// sides or neither, its ranges tile
-// [0,size) with normalized completion (Done means all bytes arrived under a
-// response whose framing ended cleanly), and the staging payload exists at the expected logical size
-// before any create/truncate. A record whose payload vanished is discarded and
-// re-downloaded; it is never allowed to publish a preallocated zero file.
-//
-// Ownership rests on the per-process instance token for identity and one
-// exclusion fence: the DESTINATION's ownership domain. Its OS-level exclusive
-// lock is the persistent domain lock — blobs/tmp-<name>.lock for a cache
-// destination, <destination>.incomplete.lock for a flat/output-mode one — and
-// the domain is acquired ONCE at item level, after the pre-download skip
-// decision and before the HEAD/claim. It is held for the whole ownership
-// interval: claim read, create/resume, transfer, hash, publish/cleanup. A busy
-// lock means a live owner, including a suspended process that could still
-// resume writing through an open handle; a crashed process releases the lock
-// at death, so takeover/resume is immediate. The claim takes no second OS lock:
-// it receives the held domain and fails closed unless that domain covers its
-// staging path. Every record transition — claim, take-over, checkpoint,
-// removal — uses the per-path in-process metadata gate, which serializes
-// intra-item transitions only: while the domain is held no other
-// current-version writer of this destination exists. There is no lease-only
-// mutation fallback: a domain that cannot be acquired returns an operation
-// error before claim/payload mutation. A legacy record without LockFenced
-// remains protected unless same-host owner death is proven. Publish re-checks
-// the record under the metadata gate and verifies that the domain is still held
-// before the rename; a missing or foreign record returns errStagingClaimLost.
-//
-// Completion is content-addressed: only a publish target whose name IS the
-// known blob digest proves the transfer is complete. An arbitrary destination
-// (a legacy/output dst, or a tmp-<sha> staging name for an item without a
-// digest) that already exists is not trusted by the claim: the pre-download
-// skip check is authoritative for those paths, and a declined file is
-// re-downloaded and renamed over the old bytes.
-//
-// Crash-safety contract: payload data is written BEFORE its checkpoint is
-// advanced; the metadata may lag the payload; metadata never claims bytes
-// that were not successfully written. The staging file is preallocated to
-// the expected logical size, and its on-disk length is NEVER treated as
-// evidence of completion — a sparse/preallocated file reports its final
-// size from the first truncate, so only the committed ranges count.
-//
-// Partial downloads from old or unsupported formats are DISCARDED, never
-// migrated: only a version-4 record is resumable, and a pre-#140
-// .part-NN/.parts.json family is obsolete residue. The affected file is
-// re-downloaded from zero; already-published content is untouched. The
-// single-request path likewise never migrates a leftover .part into ranged
-// staging: a sidecarless or unsupported .part is discarded by that route.
+// Ranged downloads write workers directly into one staging payload. Resume
+// records track committed ranges and are trusted only for a matching pinned
+// identity and valid framing. The destination ownership domain fences claim,
+// transfer, proof, publication, and cleanup; only version-4 state resumes.
+// See doc.go for the complete ownership, resume, and publication contract.
 
 import (
 	"context"
@@ -96,88 +28,37 @@ import (
 	"time"
 )
 
-// stagingMetaVersion is the IncompleteMeta.Version value written by this
-// downloader. Version 4 is the only resumable version: a FENCED record of any
-// other version (or one whose owner is provably dead or is this process) is
-// discarded under the claim/domain and the transfer starts from zero (old
-// branch records, including a version-3 record whose legacy_migrated flag
-// described migrated bytes, are never trusted). An UNFENCED record whose owner
-// cannot be proven dead is refused as ErrStagingOwnershipUnproven before the
-// version-discard branch and preserved.
+// stagingMetaVersion is the only resumable record version.
 const stagingMetaVersion = 4
 
-// linkStagingClaimRecord atomically publishes a complete fresh record without
-// replacing an existing path. Tests replace it to exercise the crash/error
-// boundary between temp completion and final claim installation, and to
-// simulate a filesystem that cannot create hard links at all.
+// linkStagingClaimRecord atomically installs a fresh record without replacement.
 var linkStagingClaimRecord = os.Link
 
-// renameStagingClaimRecord installs a staged record over an existing one. It
-// is the replacement primitive and the install used on filesystems that cannot
-// create hard links. Tests replace it to exercise the failure boundary between
-// staging a complete record and installing it.
+// renameStagingClaimRecord installs a staged record over an existing one.
 var renameStagingClaimRecord = os.Rename
 
-// stagingRecordTempSuffix is the suffix of the staged-record path beside the
-// authoritative staging record. The staged file holds a complete record that
-// is installed by an atomic link or rename; it is never authoritative itself.
 const stagingRecordTempSuffix = ".tmp"
 
 var (
-	// errBlobIncompleteOwned reports that the staging file for this
-	// destination is currently owned by another live writer (another
-	// process, or a concurrently running download in this process), or that
-	// a legacy record's owner cannot be proven dead. The file is NOT present
-	// in that state, so the caller must fail the item with an actionable
-	// error rather than touch the staging or report a successful skip.
-	//
-	// It classifies BOTH kinds of refusal - a PROVEN live owner and an
-	// UNPROVEN record - because in both cases the staging file is not
-	// available to this writer. The two are told apart by
-	// ErrStagingOwnershipUnproven, which only the unproven case carries, and
-	// by their operator-visible messages.
+	// errBlobIncompleteOwned means the staging destination is unavailable due
+	// to a proven live owner or an unproven record. The latter also wraps
+	// ErrStagingOwnershipUnproven.
 	errBlobIncompleteOwned = errors.New("incomplete download is owned by another live writer")
 
-	// errBlobAlreadyComplete reports that a content-addressed publish target
-	// (blobs/<known-sha>) already exists, so the transfer is unnecessary this
-	// run. Arbitrary destinations are deliberately not completion proof: their
-	// pre-download skip check is authoritative and a declined file must be
-	// re-downloaded (a concurrent writer finishing is not a skip decision).
+	// errBlobAlreadyComplete means the known content-addressed target exists.
 	errBlobAlreadyComplete = errors.New("destination already complete")
 
-	// errStagingLayoutIncomplete reports that the range layout of a staging
-	// download does not cover the whole expected payload: not every range is
-	// Done, or the committed total is below the expected size. The
-	// publication refuses to rename such a payload onto the publish target -
-	// an incomplete payload published as the finished file is exactly the
-	// silent corruption this downloader must never produce. The staged bytes
-	// stay on disk for a resume. Distinguishable via errors.Is.
+	// errStagingLayoutIncomplete means committed ranges do not cover the payload.
 	errStagingLayoutIncomplete = errors.New("staging range layout is incomplete")
 
-	// errStagingPayloadSize reports that the staging payload's physical
-	// logical size does not equal the expected size, even though the range
-	// layout claims a complete transfer. The publication refuses to rename
-	// such a payload: the record and the file behind it disagree, and the
-	// staged bytes stay on disk for a resume. Distinguishable via errors.Is.
+	// errStagingPayloadSize means a complete-looking layout has the wrong file size.
 	errStagingPayloadSize = errors.New("staging payload size does not match the expected size")
 )
 
-// removeStagingArtifactsIfUnowned removes a staging payload/record pair only
-// while its record proves that no live writer remains. The caller must hold
-// the DESTINATION's ownership domain for the whole operation: that domain is
-// the fence every current-version writer of the destination holds, so once the
-// caller has it no other writer can be using the pair.
-//
-// The record check remains necessary for state written outside that domain: a
-// record that was never fenced is preserved unless same-host process evidence
-// proves its owner dead, and an unreadable record is preserved too. A fenced
-// record is removable because its writer could only be alive while holding the
-// very domain the caller holds.
-//
-// Best-effort: a skipped or failed removal is logged and never turns into a
-// hard cleanup error.
+// removeStagingArtifactsIfUnowned requires the caller's destination domain. It
+// takes the metadata gate and preserves live or unproven records; cleanup is
+// best-effort and skipped removals are logged.
 func removeStagingArtifactsIfUnowned(staging, metaPath string) {
-	// Fast path: nothing to remove, and no gate has to be taken.
 	if stagingArtifactsAbsent(staging, metaPath) {
 		return
 	}
@@ -199,7 +80,6 @@ func removeStagingArtifactsIfUnowned(staging, metaPath string) {
 			return
 		}
 	case errors.Is(err, os.ErrNotExist):
-		// No record: remove an orphaned payload if one exists.
 	default:
 		// An unreadable record cannot establish that its writer is dead.
 		log.Printf("warning: skip cleanup of staging file %s: ownership record is unreadable", staging)
@@ -208,134 +88,58 @@ func removeStagingArtifactsIfUnowned(staging, metaPath string) {
 	removeStagingArtifactsLocked(staging, metaPath)
 }
 
-// Observability counters for tests and the opt-in local-I/O benchmark.
-// Package variables (not public API) in the established pattern of
-// maxAttemptsPerRetry; package tests run sequentially and reset them.
+// Observability counters used by tests and the opt-in local-I/O benchmark.
 var (
-	// stagingWriteBytes counts all payload bytes written into staging files
-	// by the ranged downloader: the network transfer landing on disk. It is
-	// not "extra" local I/O; compare it with the file size to derive the
-	// transfer factor.
 	stagingWriteBytes atomic.Int64
-	// hashPassCount counts full-file SHA-256 passes over downloaded
-	// payloads and hashPassBytes the bytes they read. Strict Verify=sha256
-	// must perform at most one such pass per file on the normal path;
-	// Verify=size performs none there (the unpinned-identity and durable
-	// ProofPending gates are the documented exceptions).
+	// hashPassCount and hashPassBytes count full-file verification passes.
 	hashPassCount atomic.Int64
 	hashPassBytes atomic.Int64
-	// finalizationNanos is the wall time of the most recent successful
-	// multipart finalization phase: from the last transferred byte (the
-	// file_finalizing signal) through the optional strict hash and the publish
-	// rename, stopping at that rename. It excludes caller-level work after
-	// downloadMultipart returns (cache snapshot/friendly link creation, the
-	// manifest, and other job finalization). The opt-in local-I/O benchmark
-	// reports it as the network-complete -> file-published metric. It describes
-	// the last successful file, so it is meaningful for sequential package
-	// tests and the benchmark, not as a per-file multi-download aggregate.
+	// finalizationNanos measures the last successful transfer's finalization
+	// through publication, excluding caller-side cache and job work.
 	finalizationNanos atomic.Int64
 )
 
-// multipartOpts parameterizes downloadMultipart's staging/publish layout.
-// The zero value stages at dst+".incomplete" and publishes with a rename
-// to dst, which is what plain (non-cache) destinations and the package
-// tests use. Download passes the blob-keyed paths for LFS files in HF
-// cache mode so the staging file IS the future blob.
 type multipartOpts struct {
-	// Staging is the staging payload path. Empty means dst+".incomplete".
+	// Staging is the payload path; empty defaults to dst+".incomplete".
 	Staging string
-	// Publish is the success rename target. Empty means dst.
+	// Publish is the final path; empty defaults to dst.
 	Publish string
-	// Commit is the resolved commit SHA of the plan that produced this item.
-	// It is part of the resume identity; the requested branch name (Job.Revision)
-	// is not enough because the branch may move between runs.
+	// Commit is the resolved commit, or the requested revision when unresolved.
 	Commit string
-	// CommitPinned reports whether Commit is an immutable, RESOLVED commit or
-	// the planner's fallback to the requested revision, which pins nothing.
-	// The single-request fallback of this path inherits the same rule: bytes
-	// are inherited only under a pinned identity.
+	// CommitPinned is false when Commit is only the requested-revision fallback.
 	CommitPinned bool
-	// ContentAddressed marks Publish as a content-addressed blob path whose
-	// existence alone proves the transfer complete (blobs/<known-sha>). When
-	// false (legacy/output dst, tmp-<sha> staging for an unknown digest), an
-	// existing publish target is stale bytes the claim must not skip: the
-	// caller's pre-download skip decision is authoritative for that path.
+	// ContentAddressed makes an existing Publish target completion proof.
 	ContentAddressed bool
-	// DirectBlobPublished reports whether this call actually published to
-	// Publish. When size remains unknown after HEAD, downloadMultipart falls
-	// back to the single-path temp destination instead; the caller must then
-	// pass that temp through the normal cache-store owner.
+	// DirectBlobPublished reports whether this call published directly to Publish.
 	DirectBlobPublished *bool
-	// Domain is the ownership domain of the destination this item transfers
-	// to. It is REQUIRED: the caller (the item goroutine) holds it for the
-	// whole operation - the skip decision, the HEAD, the claim, the transfer,
-	// the publication, the store and the cancel cleanup - and it is the only
-	// ownership fence of the destination. The multipart claim verifies that
-	// this domain covers its staging path and mutates the record under it; it
-	// takes no second lock. A nil or non-covering domain fails the claim
-	// closed, so no transfer can run unowned.
+	// Domain is required and held by the caller for this item's full operation;
+	// the claim verifies it covers staging and takes no second lock.
 	Domain *blobDomain
 }
 
-// stagingClaimState is what a successful claim produced.
 type stagingClaimState struct {
-	// ranges is the authoritative committed range layout resumed from the
-	// previous owner's record; nil for a fresh claim.
+	// ranges is the resumed layout, or nil for a fresh claim.
 	ranges []RangeProgress
-	// fresh reports that no versioned range state existed, so the staging payload
-	// holds no validated bytes.
+	// fresh means no resumable range state existed.
 	fresh bool
-	// proofPending reports that the record still carries the durable
-	// known-digest proof gate; the run must prove before publication regardless
-	// of the current mode (except Verify="none").
+	// proofPending means known-digest proof is required before publication.
 	proofPending bool
 }
 
-// claimStaging establishes exclusive ownership of the staging record.
-//
-// The EXCLUSION is not this function's job: the caller already holds the
-// destination's ownership domain (blobDomain), which is the single lifetime
-// fence every writer of the destination takes - in this process and in every
-// other one. The claim verifies that the held domain covers staging and fails
-// closed otherwise; it never takes an OS lock and never registers a second
-// in-process owner.
-//
-// What the claim adds on top of that fence:
-//
-//   - record transitions: the per-path in-process metadata gate serializes
-//     local read-modify-write operations. While the destination domain is
-//     held no competing writer exists, so the gate is intra-item
-//     serialization, not exclusion;
-//   - the record's identity and durability: the atomic complete-record
-//     install, the take-over rules for fenced and unfenced records, and the
-//     version-4-only resume rule.
-//
-// A take-over preserves the record's committed ranges only when the record is
-// a fully normalized, identity-matching versioned record AND its staging payload
-// exists at the expected logical size. contentAddressed marks the publish
-// target as a known blob digest, the only destination whose existence proves
-// completion. commitPinned is the CURRENT plan's pinned identity: the record's
-// own flag must agree with it before any staged byte may be inherited.
+// claimStaging validates or creates resume state while the caller holds the
+// destination domain. It fails closed if that domain does not cover staging;
+// only normalized state for the matching pinned identity can be resumed.
 func claimStaging(ctx context.Context, staging, publish, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, cfg Settings, contentAddressed bool, domain *blobDomain) (state *stagingClaimState, err error) {
-	// The claim is only as good as the fence it was given: a missing,
-	// released or non-covering domain means this writer does not own the
-	// destination, so mutating its record or payload would be an unowned
-	// operation. Fail closed before touching anything.
 	if !domain.coversStaging(staging) {
 		return nil, fmt.Errorf("refuse to claim staging %s: the held destination ownership domain does not cover it", staging)
 	}
-	// Durable proof gate: a fresh claim for a known-digest mode starts with
-	// ProofPending set, and a take-over preserves the record's flag (or adds it
-	// when the current mode/item still needs the proof). The claim write is
-	// therefore durable before any transfer or proof starts.
+	// Persist the required proof gate before transfer; a resumed claim preserves
+	// any pending proof even if the current mode would not otherwise require it.
 	proofMode := it.SHA256 != "" && (cfg.Verify == "sha256" || cfg.Verify == "etag")
 
 	for round := 0; round < 8; round++ {
-		// A content-addressed blob may have been published while we were
-		// getting here. Re-checked every round because a waited-for owner
-		// often publishes just before waking us. An arbitrary destination is
-		// never completion proof here: the caller's authoritative skip check
-		// already declined it.
+		// Re-check content-addressed completion after domain acquisition. An arbitrary
+		// target is not proof: the caller's skip decision already declined it.
 		if contentAddressed {
 			if _, err := os.Stat(publish); err == nil {
 				return nil, errBlobAlreadyComplete
@@ -350,8 +154,6 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 				return nil, cerr
 			}
 			if errors.Is(lerr, errStagingLockBusy) {
-				// Another mutation of this record did not finish; no claim
-				// can be established for this run.
 				return nil, errBlobIncompleteOwned
 			}
 			return nil, lerr
@@ -371,76 +173,36 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 	return nil, fmt.Errorf("could not claim staging file %s: claim did not converge", staging)
 }
 
-// claimStagingLocked performs one evaluate/transition pass while the caller
-// holds the staging metadata gate and the destination's ownership domain.
-// retry=true asks the caller to re-evaluate after discarding unusable state or
-// after losing an exclusive create to an older writer that does not
-// participate in the domain.
+// claimStagingLocked evaluates or transitions state under both ownership gates.
+// retry requests a fresh evaluation after unusable state or a create race.
 func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, proofMode bool) (*stagingClaimState, bool, error) {
 	raw, rerr := os.ReadFile(metaPath)
 	if errors.Is(rerr, os.ErrNotExist) {
 		meta := newClaimMeta(it, job, commit, commitPinned)
-		// A fresh known-digest mode claim persists the durable proof gate in
-		// its very first record write, before any transfer can start. The
-		// record is fenced by the destination ownership domain the caller
-		// holds, so CheckBlob can use a free domain lock as the authoritative
-		// no-writer signal on supported platforms.
 		meta.ProofPending = proofMode
 		meta.LockFenced = true
 		return createStagingClaim(metaPath, meta)
 	}
 	if rerr != nil {
-		// The record exists but cannot be read. That is an UNPROVEN owner for
-		// exactly the same reason a malformed record is: the read failure
-		// establishes neither a live writer nor a dead one, so the record and
-		// its payload are preserved and never taken over. Preserve the cause
-		// as well as the classification: the operator-visible message names
-		// the staging pair, while errors.Is still finds both the unproven
-		// sentinel and the underlying filesystem error.
+		// Preserve unreadable state and its cause: neither owner liveness nor
+		// safe takeover can be established.
 		return nil, false, fmt.Errorf("%w: read staging record %s: %w",
 			newStagingUnprovenOwnerError(it, staging, metaPath), metaPath, rerr)
 	}
 	var meta IncompleteMeta
 	if json.Unmarshal(raw, &meta) != nil {
-		// Unreadable record. With the destination ownership domain held, no
-		// live current-version writer can be mid-claim: every current writer
-		// creates this record while holding that domain. An unreadable legacy
-		// record cannot establish that its owner is dead, regardless of age.
-		//
-		// The refusal is reported as an UNPROVEN owner, not as a live one: no
-		// live writer is proven, so the operator must not be told that another
-		// process is downloading this file. The record and its payload are
-		// preserved (never taken over), and the message names the staging
-		// pair the operator has to remove to retry.
+		// Preserve malformed metadata: holding the domain does not establish who wrote it.
 		return nil, false, newStagingUnprovenOwnerError(it, staging, metaPath)
 	}
 
-	// A LockFenced record belongs to the current lifetime-lock protocol. An
-	// unfenced record is not proven dead by a free new lock.
-	//
-	// Such a record is UNPROVEN, not proven-live: the recorded identity is
-	// not a fence, so neither "a live writer owns it" nor "its owner is
-	// gone" can be established. The record is preserved and never taken
-	// over, and the operator-visible error says so and names the documented
-	// recovery instead of claiming another process is downloading the file.
+	// A free domain proves death only for records created under that fence.
+	// Preserve unfenced records unless same-host death is independently proven.
 	if !meta.LockFenced && !stagingOwnerProvablyDead(&meta) && !stagingOwnerIsSelf(&meta) {
 		return nil, false, newStagingUnprovenOwnerError(it, staging, metaPath)
 	}
 
-	// Dead, stale, or same-instance owner: take over. A fully validated versioned
-	// record for this exact resolved object with a payload present at the
-	// expected logical size preserves its committed ranges (resume). Anything
-	// else is unvalidated data and is discarded per the downloader correctness
-	// rules (never guess at unknown resume state). The metadata gate is
-	// held, so the record is still the one evaluated above: a racer cannot
-	// have replaced it, and removing it cannot displace a live claim.
-	//
-	// Only the CURRENT record version is resumable. A record from any other
-	// format - including a branch-only version-3 record whose legacy_migrated
-	// flag described bytes imported from a pre-#140 partial - is obsolete
-	// state: it is discarded here, under the destination ownership domain and
-	// the metadata gate, and the transfer starts from zero. The version is
-	// never silently ignored.
+	// After ownership is established, resume only current-version pinned matching
+	// state with valid ranges and payload size; otherwise discard and retry.
 	if meta.Version != stagingMetaVersion {
 		downloadLog.Warn("discarding a staging record from an unsupported format; re-downloading from zero",
 			"staging", staging,
@@ -459,11 +221,8 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	take := newClaimMeta(it, job, commit, commitPinned)
 	take.StartedAt = meta.StartedAt
 	take.Ranges = ranges
-	// Preserve the durable gate or add it for the current known-digest mode.
 	take.ProofPending = meta.ProofPending || proofMode
-	// Record the ownership mode of THIS claim, not the predecessor's: the
-	// caller holds the destination's ownership domain, which fences the whole
-	// interval.
+	// This claim is fenced by the held domain, regardless of its predecessor.
 	take.LockFenced = true
 	if err := writeStagingMetaFile(metaPath, &take); err != nil {
 		return nil, false, err
@@ -474,29 +233,10 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	return stagingClaimStateFromMeta(take), false, nil
 }
 
-// createStagingClaim atomically installs a complete record for a fresh claim
-// without replacing a record that appeared after the caller's absent check.
-//
-// The complete JSON is staged in the sibling temp file <meta>.tmp and then
-// installed by one atomic operation:
-//
-//   - a hard link of the staged inode to metaPath. Link creation is atomic and
-//     no-replace, so a record that appeared after the caller's absent check is
-//     never replaced.
-//   - when the filesystem cannot create hard links at all, an atomic rename of
-//     the staged file to metaPath. A rename does replace an existing target, so
-//     it is used only after confirming that no record is present, and it is
-//     safe because the destination ownership domain and the local metadata
-//     gate exclude every foreign mutator for the whole transition.
-//
-// The staged file is created with O_EXCL, so it is always a fresh inode. A
-// staged path left behind by an interrupted operation is therefore never
-// written through: it may still be a hard link to the authoritative record
-// (an install that crashed before removing its staged name), and truncating it
-// would empty the authoritative record before it was replaced.
-//
-// A crash during staging leaves no authoritative claim; retry=true means
-// another writer installed the record first and the caller must re-evaluate it.
+// createStagingClaim atomically installs a complete record without replacing a
+// concurrent claim. It stages to a fresh sibling inode, then links or renames
+// under the ownership gates. Never truncate leftover temp state: it may alias
+// the authoritative record after an interrupted hard-link install.
 func createStagingClaim(metaPath string, meta IncompleteMeta) (*stagingClaimState, bool, error) {
 	data, err := json.Marshal(meta)
 	if err != nil {
@@ -508,18 +248,14 @@ func createStagingClaim(metaPath string, meta IncompleteMeta) (*stagingClaimStat
 	}
 	installed, retry, err := installStagedClaimRecord(metaPath, tmp)
 	if !installed {
-		// The staged copy was not installed: remove it so the residue cannot
-		// be mistaken for an authoritative record. A removal failure is not
-		// fatal: the staged path is never authoritative.
+		// A failed install leaves only non-authoritative temp state; remove it best-effort.
 		if rmErr := os.Remove(tmp); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 			log.Printf("warning: remove staged claim record %s: %v", tmp, rmErr)
 		}
 		return nil, retry, err
 	}
-	// The staged name is dropped after the install. A hard-link install leaves
-	// both names on one inode, so the staged name must not survive as an alias
-	// of the authoritative record: a later run would clear and rewrite it.
-	// A rename install already moved the staged file away.
+	// Drop the temporary alias after a hard-link install. A rename install has
+	// already removed that name; future staging must always use a fresh inode.
 	if rmErr := os.Remove(tmp); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 		log.Printf("warning: remove staged claim record %s: %v", tmp, rmErr)
 	}
@@ -531,20 +267,9 @@ func createStagingClaim(metaPath string, meta IncompleteMeta) (*stagingClaimStat
 	return stagingClaimStateFromMeta(meta), false, nil
 }
 
-// stageStagingClaimRecord writes the complete record bytes to the sibling temp
-// file <meta>.tmp and returns its path.
-//
-// The staged path is cleared first and then created with O_EXCL, so the staged
-// file is always a fresh inode. A staged path that survived an interrupted
-// operation may be a hard link to the authoritative record (an install that
-// crashed between linking and removing its staged name); writing through it
-// would truncate the authoritative record before it was replaced. Clearing the
-// staged PATH never touches the authoritative record: unlinking an alias drops
-// only the extra name, and the record keeps its own name and its bytes.
-//
-// A staged path that is not a regular file (a directory, say) is an error
-// rather than something to clear: it cannot hold a staged record, and the
-// operation must fail without touching the authoritative record.
+// stageStagingClaimRecord writes a complete record to a fresh sibling temp.
+// An existing temp may alias the authoritative record; unlink the name rather
+// than truncating it. Non-regular residue is an error.
 func stageStagingClaimRecord(metaPath string, data []byte) (string, error) {
 	tmp := metaPath + stagingRecordTempSuffix
 	if err := clearStagingRecordTemp(tmp); err != nil {
@@ -568,9 +293,8 @@ func stageStagingClaimRecord(metaPath string, data []byte) (string, error) {
 	return tmp, nil
 }
 
-// clearStagingRecordTemp removes a staged-record residue so the path can be
-// recreated as a fresh file. It reports an error when the path holds
-// something that cannot be a staged record.
+// clearStagingRecordTemp removes residue before fresh creation and rejects
+// non-file entries other than symlinks.
 func clearStagingRecordTemp(tmp string) error {
 	info, err := os.Lstat(tmp)
 	if errors.Is(err, os.ErrNotExist) {
@@ -589,18 +313,9 @@ func clearStagingRecordTemp(tmp string) error {
 	return nil
 }
 
-// installStagedClaimRecord installs the staged record at metaPath.
-//
-// The hard-link path is atomic and no-replace: a record that appeared after
-// the caller's absent check is reported as "not installed" (retry) and is
-// never replaced. When the filesystem cannot create hard links, the install
-// falls back to an atomic rename, which does replace the target; it is used
-// only when no record is present, and it is safe because the lifetime
-// ownership lock and the local metadata gate exclude every foreign mutator
-// for the whole transition.
-//
-// A hard-link failure that is NOT a lack of hard-link support is a real
-// failure: it is reported, never silently downgraded to a replacing rename.
+// installStagedClaimRecord installs without replacing a predecessor. Rename
+// fallback is allowed only when hard links are unsupported and both ownership
+// gates exclude other mutators.
 func installStagedClaimRecord(metaPath, tmp string) (installed bool, retry bool, err error) {
 	linkErr := linkStagingClaimRecord(tmp, metaPath)
 	if linkErr == nil {
@@ -613,9 +328,7 @@ func installStagedClaimRecord(metaPath, tmp string) (installed bool, retry bool,
 	if !stagingHardLinkUnsupported(linkErr) {
 		return false, false, fmt.Errorf("install initial claim record %s: %w", metaPath, linkErr)
 	}
-	// This filesystem cannot create hard links. Install by rename instead,
-	// but only while no record is present: a record that appeared is
-	// authoritative and must not be replaced.
+	// Rename fallback is safe only while no authoritative record exists.
 	if _, statErr := os.Lstat(metaPath); statErr == nil {
 		return false, true, nil
 	} else if !errors.Is(statErr, os.ErrNotExist) {
@@ -627,13 +340,8 @@ func installStagedClaimRecord(metaPath, tmp string) (installed bool, retry bool,
 	return true, false, nil
 }
 
-// stagingHardLinkUnsupported reports whether err means the filesystem cannot
-// create hard links at all, as opposed to a transient or specific failure
-// (a full disk, an I/O error). Only the former justifies the rename-based
-// install; every other failure must surface.
-//
-// The errnos are matched through the portable error interface, so the check
-// behaves the same on Unix and on Windows without a platform-specific file.
+// stagingHardLinkUnsupported identifies unsupported-link errors; other
+// failures must not trigger the replacing-rename fallback.
 func stagingHardLinkUnsupported(err error) bool {
 	if err == nil {
 		return false
@@ -647,7 +355,6 @@ func stagingHardLinkUnsupported(err error) bool {
 	if errors.Is(err, syscall.EPERM) {
 		return true
 	}
-	// EMLINK: the link count of the staged inode is already at its maximum.
 	if errors.Is(err, syscall.EMLINK) {
 		return true
 	}
@@ -662,9 +369,7 @@ func stagingClaimStateFromMeta(meta IncompleteMeta) *stagingClaimState {
 	}
 }
 
-// claimRecordOurs re-reads the claim record and reports whether it still
-// carries our process instance token (i.e. a racing take-over has not
-// replaced it).
+// claimRecordOurs checks the record's process-instance token.
 func claimRecordOurs(metaPath string) bool {
 	raw, err := os.ReadFile(metaPath)
 	if err != nil {
@@ -677,15 +382,8 @@ func claimRecordOurs(metaPath string) bool {
 	return m.Instance != "" && m.Instance == processInstanceToken
 }
 
-// newClaimMeta builds the claim record for it/job: our PID and instance
-// token, the expected logical size, and the resolved remote identity. Ranges
-// are filled in by the caller once determined (fresh layout) and persisted
-// with writeStagingMeta.
-//
-// The identity records whether the commit was actually RESOLVED
-// (commitPinned): a record written under an unpinned identity names a
-// revision whose content may have moved, and such a record never authorizes
-// inheriting its bytes.
+// newClaimMeta builds this run's identity and diagnostics; callers add layout
+// and lifecycle flags before installation. Unpinned identity cannot authorize resume.
 func newClaimMeta(it PlanItem, job Job, commit string, commitPinned bool) IncompleteMeta {
 	return IncompleteMeta{
 		PID:          os.Getpid(),
@@ -702,10 +400,6 @@ func newClaimMeta(it PlanItem, job Job, commit string, commitPinned bool) Incomp
 	}
 }
 
-// stagingArtifactsAbsent reports whether neither the staging payload nor its
-// record exists. It is a cleanup fast path: there is nothing to remove, so no
-// ownership lock file needs to be created for a destination that never used the
-// ranged path.
 func stagingArtifactsAbsent(staging, metaPath string) bool {
 	if _, err := os.Stat(staging); !errors.Is(err, os.ErrNotExist) {
 		return false
@@ -719,30 +413,16 @@ func stagingArtifactsAbsent(staging, metaPath string) bool {
 	return true
 }
 
-// stagingPayloadSizeOK reports whether the staging payload exists and has
-// exactly the expected logical size. Preallocation makes the length useless as
-// completion evidence, but a missing or differently sized payload invalidates
-// every committed range in the record: the bytes those ranges claim are not
-// there. This check must run before any create/truncate of the staging path.
+// stagingPayloadSizeOK checks that the staging payload exists at the expected
+// size. Preallocation size is not completion evidence, but mismatch invalidates
+// committed ranges; check before any create or truncate.
 func stagingPayloadSizeOK(staging string, size int64) bool {
 	fi, err := os.Stat(staging)
 	return err == nil && fi.Size() == size
 }
 
-// checkStagingPayloadSize verifies that the staging payload's physical
-// logical size equals the expected size and returns an actionable error when
-// it does not.
-//
-// The range layout is the completion contract for the BYTES; this check is the
-// completion contract for the PAYLOAD. A record can claim a complete layout
-// while the file behind it is short (a torn write, a truncated staging file
-// restored from a backup, a record that survived a payload that did not), and
-// publishing such a payload would put a file that does not match its own
-// metadata on the destination. The check therefore runs on the closed payload
-// handle, so every write has been flushed, and BEFORE the rename.
-//
-// The staged bytes are left on disk: a short payload is a state a later run
-// can re-transfer, so nothing is destroyed by the refusal.
+// checkStagingPayloadSize verifies the closed payload length before publication.
+// On mismatch it returns an error and preserves the partial for retry.
 func checkStagingPayloadSize(staging string, size int64) error {
 	fi, err := os.Stat(staging)
 	if err != nil {
@@ -755,22 +435,8 @@ func checkStagingPayloadSize(staging string, size int64) error {
 	return nil
 }
 
-// stagingMetaResumable validates a staging record against the exact remote
-// object and returns its normalized range layout. It first compares the shared
-// resume identity (the same rule the single-request path applies), then adds
-// the checks that are specific to this record format: its version, the
-// all-or-nothing blob SHA claim and the range layout.
-//
-// The record is resumable only when its identity matches the current item -
-// repo, path, size and resolved commit - and is PINNED on both sides (the
-// record's own flag and the current plan's). A record written under an
-// unpinned identity names a revision whose content may have moved, so its
-// bytes are never inherited, however well the repository, commit string, path
-// and size match. A record written without the pinned flag is unpinned and
-// therefore not inheritable.
-//
-// A record from any other version is not understood and is never resumed: old
-// or unsupported formats are discarded and the file is re-downloaded.
+// stagingMetaResumable checks version, shared pinned identity, digest
+// consistency, and normalized ranges before authorizing resume.
 func stagingMetaResumable(meta IncompleteMeta, it PlanItem, job Job, commit string, commitPinned bool) ([]RangeProgress, bool) {
 	if meta.Version != stagingMetaVersion || meta.Size <= 0 {
 		return nil, false
@@ -784,9 +450,7 @@ func stagingMetaResumable(meta IncompleteMeta, it PlanItem, job Job, commit stri
 	}) {
 		return nil, false
 	}
-	// A blob SHA is an all-or-nothing identity claim. If either side has one,
-	// both must be present and equal; a one-sided SHA cannot prove content
-	// identity and must not authorize resuming old bytes.
+	// Digest identity must be present on both sides or neither, and equal when present.
 	if (meta.SHA256 == "") != (it.SHA256 == "") {
 		return nil, false
 	}
@@ -800,13 +464,8 @@ func stagingMetaResumable(meta IncompleteMeta, it PlanItem, job Job, commit stri
 	return ranges, true
 }
 
-// normalizedRangeLayout returns a normalized copy of ranges when they exactly
-// tile [0, size), with in-range committed prefixes and no byte claimed past a
-// range end. Done=true means the full range is committed after clean response
-// framing. A full Committed prefix without Done is not framing proof and is
-// reduced to length-1 so retry always requests a nonempty suffix.
-//
-// A record that cannot be normalized is not trustworthy resume data.
+// normalizedRangeLayout validates an exact tiling and committed prefixes.
+// A full prefix without Done lacks framing proof, so it reserves the final byte.
 func normalizedRangeLayout(ranges []RangeProgress, size int64) ([]RangeProgress, bool) {
 	out := append([]RangeProgress(nil), ranges...)
 	if !normalizeRangesInPlace(out, size) {
@@ -815,17 +474,8 @@ func normalizedRangeLayout(ranges []RangeProgress, size int64) ([]RangeProgress,
 	return out, true
 }
 
-// stagingLayoutComplete reports whether a range layout covers the whole
-// expected payload: the layout tiles [0, size) exactly, every range is Done
-// (the range's bytes arrived under a response whose framing ended cleanly),
-// and the committed total equals size.
-//
-// The layout is validated with the package's OWN range validation
-// (normalizeRangesInPlace, through normalizedRangeLayout), never with a
-// re-implemented check, so the publication guard and the resume path can
-// never disagree about what a complete layout is. The copy
-// normalizedRangeLayout returns is used for the decision, so the caller's
-// layout is never mutated.
+// stagingLayoutComplete checks that all normalized ranges are Done and total
+// the payload size. It shares resume validation and does not mutate the input.
 func stagingLayoutComplete(ranges []RangeProgress, size int64) bool {
 	layout, ok := normalizedRangeLayout(ranges, size)
 	if !ok {
@@ -867,27 +517,18 @@ func normalizeRangesInPlace(ranges []RangeProgress, size int64) bool {
 	return off == size
 }
 
-// removeStagingArtifactsLocked removes the staging meta record and then the
-// staging payload (best-effort; missing files are not an error). The caller
-// holds the staging metadata gate, so no concurrent transition can recreate
-// or replace the record between the two removals. Metadata is removed first so
-// a crash between the two removals cannot leave a record claiming bytes whose
-// payload no longer exists. The publish path is the deliberate exception: it
-// renames the payload into place first, then removes the now-obsolete record.
+// removeStagingArtifactsLocked requires the destination domain and metadata
+// gate. Remove metadata before payload so a crash cannot leave trusted ranges
+// over missing bytes. Publication deliberately places the payload first.
 func removeStagingArtifactsLocked(staging, metaPath string) {
-	// The atomic record rewrite stages its JSON in metaPath+".tmp"; a crash
-	// between create and rename leaves that transient artifact behind. It is
-	// never a blob and must not survive cleanup.
+	// Remove any interrupted atomic-record temp as well.
 	// lgtm[go/path-injection]
 	if err := os.Remove(metaPath + stagingRecordTempSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Printf("warning: cleanup staging meta temp %s: %v", metaPath+stagingRecordTempSuffix, err)
 	}
 	// lgtm[go/path-injection]
 	if err := os.Remove(metaPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		// Keep the payload if the record could not be removed: deleting the
-		// payload first would leave a record claiming bytes that no longer
-		// exist. The next claim's payload check discards such a record, but
-		// preserving the ordering here avoids creating it.
+		// Preserve the payload if its record could not be removed.
 		log.Printf("warning: cleanup staging meta %s (payload preserved): %v", metaPath, err)
 		return
 	}
@@ -897,8 +538,6 @@ func removeStagingArtifactsLocked(staging, metaPath string) {
 	}
 }
 
-// readStagingMeta loads the staging record. It returns an error for a
-// missing or unparseable record.
 func readStagingMeta(metaPath string) (*IncompleteMeta, error) {
 	data, err := os.ReadFile(metaPath)
 	if err != nil {
@@ -911,15 +550,8 @@ func readStagingMeta(metaPath string) (*IncompleteMeta, error) {
 	return &meta, nil
 }
 
-// writeStagingMetaFile atomically rewrites the staging record (stage in the
-// same directory, then rename) so a crash never leaves a partial record. The
-// caller must hold the staging metadata gate (see staging_lock.go).
-//
-// The staged copy is written to a fresh inode at the sibling temp path, so a
-// staged path left behind by an interrupted operation is never written
-// through: it may still be a hard link to the authoritative record, and
-// truncating it would empty the authoritative record before the rename
-// replaced it.
+// writeStagingMetaFile requires the metadata gate and atomically replaces the
+// record from a fresh sibling inode, never truncating a leftover hard-link alias.
 func writeStagingMetaFile(metaPath string, meta *IncompleteMeta) error {
 	data, err := json.Marshal(meta)
 	if err != nil {
@@ -961,15 +593,9 @@ func buildRangeLayout(size int64, n int) []RangeProgress {
 	return ranges
 }
 
-// hasResumableStagingState reports whether a versioned staging pair carries a valid,
-// identity-matching range layout and a payload at the expected logical size.
-// Ownership/liveness is deliberately not part of this check: the multipart
-// claim applies it and either resumes or backs off as owned. The detection only
-// decides whether existing state should keep the multipart route.
-//
-// The identity check is the same one the claim applies, including the PINNED
-// rule: a record staged under an unpinned identity cannot be inherited, so it
-// does not keep the item on the multipart route either.
+// hasResumableStagingState checks pinned identity, version, ranges, and payload
+// size to retain multipart routing. It does not establish ownership; the claim
+// performs that check under the destination domain.
 func hasResumableStagingState(staging, metaPath string, it PlanItem, job Job, commit string, commitPinned bool) bool {
 	meta, err := readStagingMeta(metaPath)
 	if err != nil || meta == nil {
@@ -981,11 +607,8 @@ func hasResumableStagingState(staging, metaPath string, it PlanItem, job Job, co
 	return stagingPayloadSizeOK(staging, it.Size)
 }
 
-// parseContentRange parses a Content-Range header value strictly. Accepted
-// forms: "bytes <start>-<end>/<total>" and "bytes <start>-<end>/*" (the
-// unsatisfied-total form, which cannot confirm the expected size — the
-// caller decides whether that is acceptable). Anything else is an error; no
-// generic 206 is ever accepted without an exact match.
+// parseContentRange accepts "bytes <start>-<end>/<total>" and the unknown-total
+// form "bytes <start>-<end>/*"; callers validate them against the requested range.
 func parseContentRange(v string) (start, end, total int64, hasTotal bool, err error) {
 	rest, ok := strings.CutPrefix(strings.TrimSpace(v), "bytes ")
 	if !ok {
@@ -1017,22 +640,10 @@ func parseContentRange(v string) (start, end, total int64, hasTotal bool, err er
 	return start, end, total, hasTotal, nil
 }
 
-// validateRangeResponse enforces the strict ranged-response contract before
-// any byte of the body may be written:
-//
-//   - the response must carry a Content-Range of the exact requested
-//     [start, end] (both the "<total>" and "/*" forms match on the range;
-//     only "/*" leaves the total unconfirmed),
-//   - an advertised total must equal the expected logical size when both
-//     are known,
-//   - a parseable Content-Length must equal the requested byte count.
-//
-// The exact body byte count is enforced by the bounded writer at copy time: a
-// short body is rejected after the copy, and an oversized body is refused as
-// errRangedBodyOverflow. The latter is a protocol violation, not a completion:
-// runRange never normalizes it to Done even when the requested prefix was
-// already written, and a worker can never write before or after its assigned
-// range.
+// validateRangeResponse checks exact inclusive bounds, any advertised total
+// against the known size, and any parseable Content-Length against the request.
+// The bounded writer and copy result separately enforce body length; overflow
+// is a protocol error, never framing-complete coverage.
 func validateRangeResponse(rs *http.Response, wantStart, wantEnd, expectedSize int64) error {
 	cr := rs.Header.Get("Content-Range")
 	if cr == "" {
@@ -1056,22 +667,12 @@ func validateRangeResponse(rs *http.Response, wantStart, wantEnd, expectedSize i
 	return nil
 }
 
-// errRangedBodyOverflow marks a bounded-writer protocol violation: the
-// response tried to write past the worker's assigned range. It is not a
-// transport failure, so it must never be normalized into a completed range —
-// even when every requested byte had already been accepted before the excess
-// arrived. The attempt is retried only within the normal retry budget; a
-// persistent violation fails the range and preserves the resumable staging
-// state instead of publishing.
+// errRangedBodyOverflow is a protocol violation, even after the requested prefix
+// was written. It must never mark a range Done.
 var errRangedBodyOverflow = errors.New("ranged body exceeds assigned range")
 
-// boundedAtWriter writes into a file at a fixed base offset and refuses to
-// write more than limit bytes, so a worker can never write before or after
-// its assigned range no matter what the server sends. Each successful
-// Write advances the position; written reports the bytes accepted. A would-be
-// overflow returns errRangedBodyOverflow (wrapped with the counts) instead of
-// silently truncating, so the caller can distinguish a protocol violation
-// from an ordinary transport failure.
+// boundedAtWriter confines writes to its assigned range and returns
+// errRangedBodyOverflow rather than silently truncating excess data.
 type boundedAtWriter struct {
 	f       *os.File
 	base    int64
@@ -1104,7 +705,6 @@ func (w *boundedAtWriter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-// stagingDownload is the shared state of one ranged multipart download.
 type stagingDownload struct {
 	ctx    context.Context
 	httpc  *http.Client
@@ -1114,39 +714,27 @@ type stagingDownload struct {
 	it     PlanItem
 	dst    string
 	stg    string // staging payload path
-	pub    string // publish (rename) target
-	meta   string // staging meta path
+	pub    string // publication target
+	meta   string // staging metadata path
 	emit   func(ProgressEvent)
 	out    *os.File
 	ranges []RangeProgress
 
-	// commit is the resolved plan commit forming part of the resume identity.
 	commit string
 
-	// commitPinned reports whether that commit is an immutable, RESOLVED
-	// commit. It is part of the resume identity: a record written under an
-	// unpinned identity (the planner's fallback to the requested revision)
-	// never authorizes inheriting its bytes, so the flag travels with the
-	// commit into every record this download writes.
+	// commitPinned is false for requested-revision fallback identities; their
+	// staged bytes are never inherited.
 	commitPinned bool
 
-	// startedAt is this run's claim start (now). A resumed record's original
-	// StartedAt is diagnostic only; it is deliberately not inherited so the
-	// record always describes the current claim.
+	// startedAt describes this run's claim, not the predecessor's diagnostic clock.
 	startedAt time.Time
 
-	// contentAddressed marks pub as blobs/<known-sha>, whose existence alone
-	// proves completion. Publish must not overwrite it if another writer
-	// (single path, legacy tmp-<sha>+store, another staging family) published
-	// the blob while this transfer was in flight.
+	// contentAddressed makes pub a known-digest blob whose existence proves
+	// completion; publication uses the blob no-replace policy.
 	contentAddressed bool
 
-	// domain is the ownership domain of the destination this download stages
-	// for. The item holds it for the whole download - through the claim, the
-	// transfer, the publication and the cancel cleanup - so the publication's
-	// existence decision and the placement that follows it cannot be overtaken
-	// by another writer, and the claim can trust the fence instead of taking a
-	// second lock.
+	// domain fences this item's claim, transfer, publication, and cancel cleanup.
+	// It excludes other domain participants; the claim takes no second domain.
 	domain *blobDomain
 
 	// partCtx is the part-scoped cancellable context, stored so every
@@ -1154,39 +742,24 @@ type stagingDownload struct {
 	// cancel-cleanup semantics.
 	partCtx context.Context
 
-	// proofPending is the durable known-digest publication gate. It is set
-	// before any pre-publication proof starts and cleared only after the proof
-	// succeeds (both transitions flushed to the staging record). A resumed
-	// record carrying it forces the proof in every mode except Verify="none".
+	// proofPending is persisted before proof and cleared durably after success;
+	// a resumed known-digest record forces re-proof unless Verify is "none".
 	proofPending bool
 
-	// metaMu guards the range layout and every meta rewrite. The layout's
-	// mutable fields (RangeProgress.Committed/Done) are owner-shared state:
-	// every checkpoint flush normalizes them in place, and every range worker
-	// advances its own range's committed prefix. They are therefore only
-	// read or written while this gate is held.
+	// metaMu guards metadata rewrites and range Committed/Done fields, including
+	// in-place normalization during checkpoints.
 	metaMu sync.Mutex
 
-	// progress counts bytes written this run; emitted progress is
-	// baseCommitted + progress, and never decreases within a run.
+	// progress counts unique bytes written this run; emitted progress is
+	// baseCommitted + progress and never decreases within a run.
 	progress atomic.Int64
 	// baseCommitted is the committed total at claim time (excluded from
 	// this-run speed accounting, consistent with the resumed/skipped-bytes
 	// rule the single path already follows).
 	baseCommitted int64
 
-	// seqHash, when non-nil, is fed every staging write in order: strict
-	// hash-on-write for the single fresh sequential transfer.
-	//
-	// It is owner-shared state: every range worker inspects it on each write
-	// and may invalidate it when a response's framing cannot be trusted. It
-	// is therefore only read or written while seqMu is held, and the hash
-	// itself is only fed while seqMu is held, so the hash's internal state
-	// and the nil/non-nil decision can never be observed inconsistently.
-	//
-	// It is only ever non-nil for a strictly sequential transfer (one task
-	// covering the whole payload from offset 0), which also means only one
-	// worker exists while it is live.
+	// seqHash hashes writes only for a fresh whole-file sequential task. Untrusted
+	// framing invalidates it, requiring a final full-file pass. Access requires seqMu.
 	seqHash hashWriter
 	// seqMu guards seqHash: its nil/non-nil state, the hash's own bytes,
 	// and the invalidation that switches the transfer over to the single
@@ -1194,34 +767,25 @@ type stagingDownload struct {
 	seqMu sync.Mutex
 }
 
-// hashWriter is the subset of hash.Hash used for hash-on-write.
 type hashWriter interface {
 	io.Writer
 	Sum([]byte) []byte
 }
 
-// fenced reports whether this download still holds the destination's
-// ownership domain (and therefore its lifetime OS lock). Every record this
-// run writes is fenced by that domain; a released domain means the interval
-// this run believed it owned was handed back, so nothing may be published.
+// fenced reports whether the destination domain and its OS lock remain held;
+// publication requires that fence.
 func (d *stagingDownload) fenced() bool {
 	return d.domain.lockHeld()
 }
 
-// flushMeta persists the current range state atomically.
 func (d *stagingDownload) flushMeta() error {
 	d.metaMu.Lock()
 	defer d.metaMu.Unlock()
 	return d.flushMetaLocked()
 }
 
-// flushMetaLocked persists the current range state; caller holds metaMu. The
-// local per-path metadata gate is acquired inside, and the record is re-read
-// and must still name this process instance before it is replaced: a flush
-// can never race a take-over, overwrite the new owner's claim, or
-// resurrect ownership this process has lost. A nil range layout (the window
-// between claim creation and the initial layout flush) writes an
-// ownership-only record that claims no bytes.
+// flushMetaLocked requires metaMu, then takes the metadata gate and rechecks
+// the process-instance token before replacement. A nil layout claims no bytes.
 func (d *stagingDownload) flushMetaLocked() error {
 	meta := newClaimMeta(d.it, d.job, d.commit, d.commitPinned)
 	meta.StartedAt = d.startedAt
@@ -1234,10 +798,8 @@ func (d *stagingDownload) flushMetaLocked() error {
 		meta.Ranges = d.ranges
 	}
 	lock := &stagingStateLock{path: stagingLockPath(d.meta)}
-	// A checkpoint must still persist the durable high-water mark when the
-	// user cancels; that is what makes the next run resumable. The lock
-	// acquisition therefore does not derive from d.ctx — critical sections are
-	// tiny, and the bounded wait prevents an unbounded stall.
+	// Persist the checkpoint even after cancellation; use a bounded metadata-gate
+	// wait independent of d.ctx so the next run can resume committed bytes.
 	if err := lock.acquire(context.Background(), stagingLockWait); err != nil {
 		return err
 	}
@@ -1245,15 +807,8 @@ func (d *stagingDownload) flushMetaLocked() error {
 	return writeStagingMetaOwnedLocked(d.meta, &meta)
 }
 
-// seqHashDigest returns the hex digest of the hash-on-write state and
-// whether that state was usable. The decision and the digest are taken
-// together under seqMu, so the digest can never be read from a hash that a
-// worker invalidated concurrently, and the hash's internal state is never
-// summed while another worker is feeding it.
-//
-// A false result means the caller must fall back to the single final
-// full-file pass: the hash-on-write state is absent, or it was invalidated
-// because a response's framing could not be trusted.
+// seqHashDigest reads digest and usability together under seqMu. False requires
+// the final full-file pass, including after framing invalidated hash-on-write.
 func (d *stagingDownload) seqHashDigest() (string, bool) {
 	d.seqMu.Lock()
 	defer d.seqMu.Unlock()
@@ -1263,12 +818,8 @@ func (d *stagingDownload) seqHashDigest() (string, bool) {
 	return hex.EncodeToString(d.seqHash.Sum(nil)), true
 }
 
-// closeOut closes the staging handle exactly once so Windows can unlink the
-// file before cancel cleanup or the publish rename.
-// closeOut closes the staging handle exactly once so Windows can unlink the
-// file before cancel cleanup or the publish rename. The returned error is a
-// real finalization signal on the success path (a buffered write or close
-// failure can lose bytes); best-effort cleanup paths discard it.
+// closeOut closes the handle once so Windows can rename or remove staging.
+// Publication propagates close errors; best-effort cleanup ignores them.
 func (d *stagingDownload) closeOut() error {
 	if d.out != nil {
 		err := d.out.Close()
@@ -1278,45 +829,23 @@ func (d *stagingDownload) closeOut() error {
 	return nil
 }
 
-// requiresPrePublicationProof reports whether the current item, Verify mode
-// and record state require the known-digest proof before publication:
-//
-//   - Verify=sha256 or Verify=etag with a known digest (fresh or resumed);
-//   - any non-"none" mode whose record still carries ProofPending, so a crash
-//     mid-proof, a failed mismatch cleanup, or a later mode change cannot
-//     launder unproven all-Done ranges into a published blob;
-//   - any non-"none" mode with an UNPINNED identity and a known digest. An
-//     unpinned identity names a revision the endpoint did not resolve to a
-//     commit, so nothing in the transfer is bound to an immutable object: the
-//     bytes behind the name may have changed between the plan's tree walk and
-//     this transfer, and only the content proof can detect that. The size
-//     contract cannot.
-//
-// Verify="none" never requires it (the explicit no-hash opt-out). The
-// single-request path is not a staging record: its .part is only renamed after
-// the proof, so every restart sees inherited bytes and re-proves them in any
-// non-"none" mode.
+// requiresPrePublicationProof checks a known digest for sha256/etag, pending
+// proof, or unpinned identity; Verify="none" explicitly opts out.
 func (d *stagingDownload) requiresPrePublicationProof() bool {
 	if d.it.SHA256 == "" || d.cfg.Verify == "none" {
 		return false
 	}
 	if !d.commitPinned {
-		// The identity is not pinned to an immutable commit, so the transfer
-		// is not bound to the object the plan described. One full-file
-		// content proof closes that hole; the normal size-mode "no reread"
-		// rule still applies to a PINNED identity.
+		// An unresolved revision is not immutable; prove its known digest even in size
+		// mode. Pinned size-mode transfers retain the no-reread normal path.
 		return true
 	}
 	return d.cfg.Verify == "sha256" || d.cfg.Verify == "etag" || d.proofPending
 }
 
-// poisonStagingLocked truncates the staging payload to zero so a later claim
-// cannot trust the record's all-Done ranges even if the durable ProofPending
-// flag is missing. The caller must hold the metadata gate AND have re-read
-// the record as owned by this process; this prevents an
-// stale writer from truncating another owner's payload.
-// It is best-effort: failures are logged and the durable flag remains the
-// primary guard.
+// poisonStagingLocked requires the domain, metadata gate, and an owned-record
+// recheck. Zeroing invalidates all-Done coverage if the pending flag is lost;
+// failure is best-effort because ProofPending remains the primary guard.
 func (d *stagingDownload) poisonStagingLocked() {
 	_ = d.closeOut()
 	if err := os.Truncate(d.stg, 0); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1324,11 +853,9 @@ func (d *stagingDownload) poisonStagingLocked() {
 	}
 }
 
-// poisonStagingIfOwned poisons the payload only while the claim is still owned
-// under the metadata gate. The caller already holds the destination ownership
-// domain, so no current-version successor can exist. If the metadata gate is unavailable,
-// the poison is skipped: the durable ProofPending flag already prevents the
-// unproven bytes from being published.
+// poisonStagingIfOwned requires the held domain and rechecks ownership under
+// the metadata gate. If that gate is unavailable, ProofPending still blocks
+// unchecked publication (except for Verify="none").
 func (d *stagingDownload) poisonStagingIfOwned() {
 	lock := &stagingStateLock{path: stagingLockPath(d.meta)}
 	if err := lock.acquire(context.Background(), stagingLockCleanupWait); err != nil {
@@ -1363,13 +890,9 @@ func (d *stagingDownload) clearProofPending() error {
 	return nil
 }
 
-// applyCancelCleanup applies the caller's explicit-cancel cleanup policy after
-// a post-claim phase observed a done part context. Internal aborts (a
-// fail-fast sibling or a claim failure) preserve the resumable
-// staging bytes. The ownership check and every removal happen inside one
-// locked transition, so a take-over cannot interleave between the check and
-// the deletions, and a writer that lost its claim never removes the new
-// owner's data.
+// applyCancelCleanup preserves internal-abort state. Explicit cancel follows
+// the caller's policy, checking ownership and removing artifacts in one
+// metadata-gated transition while the destination domain remains held.
 func (d *stagingDownload) applyCancelCleanup() {
 	if d.partCtx == nil || d.partCtx.Err() == nil {
 		return
@@ -1399,16 +922,9 @@ func (d *stagingDownload) applyCancelCleanup() {
 	removeStagingArtifactsLocked(d.stg, d.meta)
 }
 
-// resetClaim discards a claim whose validated payload no longer matched at
-// open time and installs a fresh, layout-less claim for the same object under
-// the metadata gate. It exists because the claim's payload check and the
-// open are separate filesystem operations: if the payload vanished or changed
-// size in between, every committed range in the record is untrustworthy and
-// must not be truncated in place under the old record.
-//
-// open may be nil (the payload vanished); the helper creates it. When open is
-// non-nil the payload is truncated in place while the lock is held, so no
-// contender can claim the path between the discard and the recreate.
+// resetClaim replaces metadata before resetting a payload that changed between
+// claim validation and open. The caller holds the domain; this helper takes the
+// metadata gate. nil creates a handle, otherwise the supplied handle is truncated.
 func (d *stagingDownload) resetClaim(open *os.File) (*os.File, error) {
 	lock := &stagingStateLock{path: stagingLockPath(d.meta)}
 	if err := lock.acquire(d.ctx, stagingLockWait); err != nil {
@@ -1445,50 +961,25 @@ func (d *stagingDownload) resetClaim(open *os.File) (*os.File, error) {
 	return open, nil
 }
 
-// retryWaitSleep waits out a retry/backoff pause. The record needs no rewrite
-// during the wait: the held destination ownership domain is the ownership
-// signal, and committed checkpoints are already durable. sleepCtx keeps
-// pause/cancel/shutdown prompt.
-//
-// ok reports whether the full wait elapsed; false means ctx was done and the
-// caller must treat the attempt as cancelled (as with sleepCtx).
+// retryWaitSleep waits cancellably without rewriting durable checkpoints:
+// the held domain, not record age, proves ownership. False means ctx ended.
 func (d *stagingDownload) retryWaitSleep(ctx context.Context, wait time.Duration) (ok bool, err error) {
 	return sleepCtx(ctx, wait), nil
 }
 
-// rangeTask is one unit of missing work: the uncommitted suffix of a range.
 type rangeTask struct {
 	idx  int
 	from int64 // absolute resume offset (range Start + committed prefix)
 }
 
-// downloadMultipart downloads a file using multiple parallel range
-// requests, writing every worker directly into one staging file at its
-// assigned offset.
-//
-// opts selects the staging layout: blob-keyed staging for LFS files in HF
-// cache mode (the staging file is the future blob, so finalization is
-// rename-only), dst-adjacent staging otherwise. The returned bool reports
-// whether a content proof against it.SHA256 already completed inside this
-// call before the publish rename (hash-on-write or the single pre-publish
-// pass), so the caller must not repeat it. A known digest is proven
-// pre-publication in both Verify=sha256 and Verify=etag modes.
-//
-// Reliability invariants preserved from the previous implementation:
-// stall watchdog + resume from the durable current offset, bounded retry
-// budget with progress refunds and the absolute attempt ceiling,
-// Retry-After/RateLimit-aware waits, fail-fast 401/403/404 with
-// partCancel(abortError(...)) cause propagation, job/part cancellation
-// propagation, pause preserving resumable data, and the user-cancel
-// cleanup callback distinction (internal aborts never delete resumable
-// bytes).
+// downloadMultipart writes ranges directly into one staging payload, blob-keyed
+// in LFS cache mode and dst-adjacent otherwise. The bool reports known-digest
+// proof completed here before publication, so the caller must not repeat it.
+// Retry, cancellation, and fail-fast contracts are in doc.go.
 func downloadMultipart(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, opts multipartOpts, emit func(ProgressEvent)) (bool, error) {
-	// HEAD to resolve size, reissued only when the server throttles (429/503)
-	// and bounded by the same attempt/backoff conventions as the transfer
-	// loops: wait the larger of the server-requested Retry-After and the
-	// local backoff (capped at DefaultMaxRetryAfter) with a context-aware
-	// sleep so pause/cancel/shutdown stays prompt, then reissue the HEAD
-	// within the configured retry budget.
+	// Resolve size with HEAD; retry only 429/503 within the configured budget,
+	// sleeping cancellably for the larger server-requested or local backoff
+	// (capped at DefaultMaxRetryAfter).
 	retry := newRetry(cfg)
 	remaining := cfg.Retries
 	if remaining < 0 {
@@ -1502,38 +993,19 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		if err != nil {
 			return false, err
 		}
-		// A HEAD response carries headers only, so its body is closed
-		// immediately instead of being held open (via defer) for the whole
-		// parallel transfer. Status and headers stay readable after Close
-		// for the classification and size resolution below.
+		// Close the header-only response before the potentially long transfer.
 		resp.Body.Close()
 
 		apiErr := classifyFileResponse(resp, it.URL)
 
-		// A permanent gated/private/missing response on HEAD fails the whole
-		// job immediately with the actionable message, before any part
-		// requests are issued.
-		//
-		// NOTHING IS REMOVED HERE. This route stages at <staging>.incomplete
-		// and creates no `.part` of its own, so a `<dst>.part` and its
-		// `.part.meta` sidecar next to this destination belong to the
-		// SINGLE-REQUEST route - possibly to a LIVE writer of it - or to an
-		// earlier run. The item DOES hold the destination ownership domain
-		// here: it is acquired once at item level for every route, before the
-		// HEAD. That domain excludes other writers of the destination, not
-		// the single-request route's own artifacts: route ownership is why
-		// this route removes nothing. Unlinking those files would delete the
-		// single-request writer's resume state (and unlink its open partial,
-		// whose later publication would fail with ENOENT). The single-request
-		// HEAD failure keeps its own cleanup, because that route creates the
-		// partial and knows it is the one its attempt created.
+		// A permanent HEAD failure creates no multipart payload. The held destination
+		// domain does not make the single route's .part/sidecar ours to remove: preserve
+		// that route's resume state, including bytes left by an earlier run.
 		if apiErr != nil && apiErr.IsFailFast() {
 			return false, apiErr
 		}
 
-		// A throttling 429/503 must not be accepted as the resolved HEAD.
-		// Every other status keeps the previous behavior (proceed and let
-		// the range loop classify it).
+		// Non-throttling HEAD statuses defer final classification to the range request.
 		if resp.StatusCode != http.StatusTooManyRequests &&
 			resp.StatusCode != http.StatusServiceUnavailable {
 			if it.Size == 0 {
@@ -1546,11 +1018,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			break
 		}
 
-		// Throttled: wait out the server-requested Retry-After (or the local
-		// backoff, whichever is larger) and reissue the HEAD. When the retry
-		// budget is exhausted, surface the transient error like an exhausted
-		// transfer retry instead of silently proceeding with a throttled
-		// response.
 		if remaining == 0 {
 			return false, apiErr
 		}
@@ -1570,15 +1037,8 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		if opts.DirectBlobPublished != nil {
 			*opts.DirectBlobPublished = false
 		}
-		// The size is unknown, so the single-request path is the only one
-		// that can transfer this item. The item already holds the
-		// destination's ownership domain - the same domain this route would
-		// need - so the hand-off simply keeps holding it; it must not take a
-		// second lock (that would conflict with itself).
-		//
-		// The single path applies the same identity rule as every other
-		// single-request transfer: bytes are inherited only when the identity
-		// sidecar proves they belong to this exact object.
+		// Unknown size requires the single path. Pass the already-held domain rather
+		// than locking again; its sidecar still governs any inherited bytes.
 		return downloadSingle(ctx, httpc, token, job, cfg, it, dst,
 			singleOpts{Commit: opts.Commit, CommitPinned: opts.CommitPinned, Domain: opts.Domain}, emit)
 	}
@@ -1593,12 +1053,8 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	}
 	metaPath := stg + ".meta"
 
-	// Claim the staging record under the destination domain the item already
-	// holds: the claim verifies that the domain covers the staging path, then
-	// performs its record transitions under the local metadata gate. A live
-	// owner - including a suspended one - cannot
-	// exist while this item holds the domain; only a content-addressed publish
-	// target is treated as already complete.
+	// Claim under the item's held domain and local metadata gate; only a known
+	// content-addressed publication target is completion proof.
 	state, err := claimStaging(ctx, stg, pub, metaPath, it, job, opts.Commit, opts.CommitPinned, cfg, opts.ContentAddressed, opts.Domain)
 	if err != nil {
 		return false, err
@@ -1624,25 +1080,15 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		domain:           opts.Domain,
 	}
 
-	// Part-scoped cancellable context: a permanent (fail-fast) error on any
-	// one range cancels the whole file so sibling workers stop promptly
-	// instead of downloading/retrying/waiting until wg.Wait() returns. The
-	// cancel cause is an abortCause wrapping the original error (see
-	// abortError), which lets a sibling worker that exits via its ctx path
-	// distinguish an internal abort from a user cancel/pause. Every post-claim
-	// phase (transfer, strict hash, publish) uses this same context.
+	// A permanent range error cancels siblings with an abortCause, preserving the
+	// original error and distinguishing internal abort from user cancel/pause.
+	// Transfer, proof, and publication share this post-claim context.
 	partCtx, partCancel := context.WithCancelCause(ctx)
 	defer partCancel(nil)
 	d.partCtx = partCtx
 
-	// Open the staging payload. A resumed claim opens the payload the claim
-	// already validated; a fresh claim creates/truncates it. S1: the payload
-	// existence/size check happened in claimStaging BEFORE this create, so old
-	// ranges are never trusted after a create+truncate. Re-check here against
-	// a cleanup race: if the payload vanished or changed size, the record's
-	// ranges are no longer trustworthy, so discard the record first (meta
-	// before payload semantics; the payload is then truncated, not trusted) and
-	// re-establish a fresh claim under the metadata gate.
+	// Resume only the payload validated before any create/truncate. Recheck after
+	// open; if it vanished or resized, reset metadata before trusting any ranges.
 	openFlags := os.O_RDWR
 	if state.fresh {
 		openFlags |= os.O_CREATE
@@ -1689,18 +1135,12 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		// a nil layout that would discard them on the next claim.
 		d.metaMu.Lock()
 		d.ranges = append([]RangeProgress(nil), state.ranges...)
-		d.startedAt = time.Now().UTC() // resumed run keeps its own clock
+		d.startedAt = time.Now().UTC()
 		d.metaMu.Unlock()
 	}
 
-	// Determine the authoritative range layout. A fresh claim starts from
-	// zero: partial downloads from old or unsupported formats are discarded,
-	// never migrated, and only a current-format record can resume. An obsolete
-	// pre-#140 .part-NN/.parts.json family next to this destination is
-	// discarded here, while the claim owns the staging and its domain; the
-	// transfer itself ignores it. The single-route <dst>.part and its sidecar
-	// are NOT touched: they belong to the single-request route (this route
-	// creates no .part), so only that route discards them.
+	// Fresh claims start from zero. Discard obsolete .part-NN/.parts.json while
+	// holding the domain; never import them or touch the single route's .part/sidecar.
 	if state.fresh {
 		d.metaMu.Lock()
 		d.ranges = buildRangeLayout(it.Size, cfg.Concurrency)
@@ -1731,8 +1171,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		d.proofPending = true
 	}
 	proofPendingForFlush := d.proofPending
-	// The committed baseline is read from the shared layout, so it is
-	// derived under the same gate that guards every layout mutation.
 	d.baseCommitted = committedTotal(d.ranges)
 	d.metaMu.Unlock()
 
@@ -1749,19 +1187,9 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		return false, err
 	}
 
-	// Missing work: the uncommitted suffix of every incomplete range. The
-	// persisted layout stays authoritative regardless of the configured
-	// worker count, so a changed Concurrency re-fetches only missing
-	// bytes and never invalidates committed ones. Completion is normalized
-	// defensively here too: a complete-prefix range is never turned into a
-	// bytes=End+1-End request.
-	//
-	// The layout is owner-shared state: every checkpoint flush normalizes the
-	// same Committed/Done fields in place, and the derivation below mutates
-	// them too. The derivation therefore runs under the metadata gate, so
-	// the flush normalization and this read-modify-write of the same fields
-	// are serialized. The gate is released before any network work: the
-	// derived task list is a private snapshot of the layout.
+	// Derive missing suffixes under metaMu: checkpoint normalization mutates the
+	// same layout. Persisted partitions survive Concurrency changes; full prefixes
+	// without framing proof reserve the last byte. Release the gate before network I/O.
 	d.metaMu.Lock()
 	tasks := make([]rangeTask, 0, len(d.ranges))
 	for i := range d.ranges {
@@ -1774,19 +1202,13 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		}
 		tasks = append(tasks, rangeTask{idx: i, from: r.Start + r.Committed})
 	}
-	// The strict hash-on-write precondition reads the layout's bounds for
-	// the single derived task; it is read under the same gate.
 	seqHashEligible := cfg.Verify == "sha256" && it.LFS && it.SHA256 != "" &&
 		len(tasks) == 1 && d.baseCommitted == 0 &&
 		d.ranges[tasks[0].idx].Start == 0 && d.ranges[tasks[0].idx].End == it.Size-1
 	d.metaMu.Unlock()
 
-	// Strict hash-on-write is only possible when this run writes the whole
-	// payload sequentially from offset 0: one task covering [0, size) with
-	// no pre-committed bytes. Resumed or out-of-order transfers fall back
-	// to the single pre-publish full-file pass below. Only Verify=sha256
-	// feeds the hash on write; Verify=etag uses the same single final pass
-	// (at most one full-file read either way).
+	// Hash-on-write is limited to sha256 LFS with one whole-file task and no
+	// committed baseline. Resumed/out-of-order transfers and etag use the final pass.
 	if seqHashEligible {
 		d.seqMu.Lock()
 		d.seqHash = sha256.New()
@@ -1812,9 +1234,8 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	taskCh := make(chan rangeTask)
 	workers := cfg.Concurrency
 	if workers < 1 {
-		// Download() normalizes the setting, but a direct caller must never
-		// reach finalization with tasks queued and zero consumers: that would
-		// publish a preallocated, incomplete staging file.
+		// Direct callers also need at least one worker; queued work must not reach
+		// publication merely because no consumer ran.
 		workers = 1
 	}
 	if workers > len(tasks) {
@@ -1845,10 +1266,8 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		}()
 	}
 
-	// Emit periodic progress from the in-memory counter: workers update it
-	// atomically after successful writes, and the ticker only reads it —
-	// no stat-scanning of any file. The ticker is stopped before the
-	// finalization phase so it can never observe mid-publish state.
+	// Report the atomic in-memory count; join the ticker before finalization so
+	// it cannot observe publication in progress.
 	tickerDone := make(chan struct{})
 	var tickerWG sync.WaitGroup
 	tickerWG.Add(1)
@@ -1869,8 +1288,6 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		}
 	}()
 
-	// Feed the workers; the channel closes after every task is enqueued,
-	// or early when partCtx is done (the workers then drain and exit).
 	go func() {
 		for _, t := range tasks {
 			select {
@@ -1887,10 +1304,8 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	close(tickerDone)
 	tickerWG.Wait()
 
-	// A permanent (fail-fast) range error cancels partCtx and is the error
-	// the caller must see, in preference to a sibling's "context canceled".
-	// An internal abort must NOT run cancel-cleanup (T3): the staging file
-	// preserves the committed ranges for a later retry.
+	// Return the original permanent error, not a sibling's cancellation. Internal
+	// abort preserves committed staging ranges rather than running user cleanup.
 	partErrMu.Lock()
 	permanentErr := partErr
 	partErrMu.Unlock()
@@ -1898,19 +1313,12 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		return false, permanentErr
 	}
 
-	// If the context was cancelled while workers were running (pause /
-	// abort / timeout), return the cancellation error immediately. Workers
-	// that exit via their ctx-aware retry/sleep path do NOT push to errCh,
-	// so the ctx check must happen explicitly — and it is what prevents a
-	// bogus "downloaded == total" progress emit and stops an incomplete
-	// staging file from being published. Every attempt boundary already
-	// flushed the committed high-water marks, so a pause preserves exactly
-	// the durable resume state.
+	// Workers can return nil on cancellation without sending errCh. Check context
+	// before terminal progress or publication; attempt-boundary checkpoints preserve
+	// resume state for pause/internal abort.
 	if ctx.Err() != nil || partCtx.Err() != nil {
-		// User cancel: close the staging handle (Windows
-		// cannot unlink an open file) and run the caller's cancel-cleanup
-		// policy, all only while this process still owns the claim. An internal
-		// abort preserves the resumable bytes.
+		// Close before user-cancel cleanup (Windows cannot unlink the open payload);
+		// internal abort preserves resumable bytes.
 		d.applyCancelCleanup()
 		if ctx.Err() != nil {
 			return false, ctx.Err()
@@ -1918,86 +1326,54 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		return false, partCtx.Err()
 	}
 
-	// Surface the first transfer failure (retry budget exhausted, terminal
-	// protocol violation, ...). The staging file and its committed ranges
-	// stay on disk for resume.
+	// Transfer failures preserve staging and committed ranges for resume.
 	select {
 	case e := <-errCh:
 		return false, e
 	default:
 	}
 
-	// Everything past this point is metadata-only finalization work: the
-	// optional strict hash pass and the atomic rename. Emit one explicit
-	// full-progress reading first so the caller's last observed
-	// file_progress value is the full byte count, then signal the
-	// finalizing phase so the UI doesn't sit silently at 100%.
+	// Report full transfer progress, then finalizing before optional content proof
+	// and publication so the UI does not sit silently at 100%.
 	emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size})
 	emit(ProgressEvent{Event: "file_finalizing", Path: it.RelativePath, Message: "finalizing"})
 
-	// Finalization timing: network-complete (the last transferred byte) ->
-	// file-done (the publish rename). Reset per call so a failure never reports
-	// a stale reading; the opt-in benchmark reports this as its phase metric.
+	// Measure this call's proof/publication interval after the finalizing callback;
+	// clear the previous reading so a failure cannot report stale timing.
 	finalizationNanos.Store(0)
 	finalizeStart := time.Now()
 
-	// Abort before finalizing if the job/part context was cancelled between
-	// the guard above and here. An internal fail-fast abort preserves the
-	// staging bytes; a user cancel runs the same cancel-cleanup as every other
-	// post-claim phase.
+	// Recheck cancellation after file_finalizing; user cleanup applies, while an
+	// internal abort preserves staging.
 	if cerr := partCtx.Err(); cerr != nil {
 		d.applyCancelCleanup()
 		return false, cerr
 	}
 
-	// Content proof before publication.
-	//
-	// The durable ProofPending flag was already set and flushed before the
-	// transfer; it forces the proof here regardless of the current mode,
-	// including size, whenever the item has a known digest and Verify is not
-	// "none". This is why a crash mid-proof, a mismatch whose cleanup failed,
-	// or a later mode change cannot publish an all-Done but unproven record.
-	//
-	//   - Verify=sha256 or Verify=etag with a known digest: at most one full
-	//     read, always before the rename/publish. With parallel direct writes
-	//     the hash cannot be composed from range hashes, so a fresh sequential
-	//     sha256 transfer may have fed the hash on write (eliminating the pass);
-	//     every other case performs exactly one sequential pass here. This is
-	//     why a known-digest mismatch can never reach the final destination or
-	//     the content-addressed blob key: publication follows this gate.
-	//
-	// No known digest means only the size/coverage contract applies here; a
-	// non-LFS ETag fallback HEAD is a separate, historical post-publication
-	// check performed by the caller.
-	//
-	// A mismatch keeps ProofPending set, poisons the payload, attempts the
-	// owned discard, and never publishes corrupt bytes.
+	// Prove a known digest before publication when required, including a resumed
+	// ProofPending record in size mode (Verify="none" opts out). Reuse eligible
+	// sequential sha256 hash-on-write, otherwise make one full-file pass.
+	// No known digest means size/coverage here; the caller's historical sha256
+	// HEAD-ETag fallback remains post-publication. Mismatch preserves the pending
+	// gate, attempts poison and owned discard, and never publishes these bytes.
 	needContentProof := d.requiresPrePublicationProof()
 	contentVerified := false
 	if needContentProof {
 		sum := ""
 		usedSeqHash := false
 		if cfg.Verify == "sha256" && it.LFS {
-			// The single sequential task fed the hash with every staging
-			// write, in order, from offset 0. The digest and the decision to
-			// use it are taken together, so a hash that a worker invalidated
-			// (untrusted framing) is never summed.
+			// Read hash usability and digest together; untrusted framing invalidates it.
 			if digest, ok := d.seqHashDigest(); ok {
 				sum = digest
 				usedSeqHash = true
 			}
 		}
 		if !usedSeqHash {
-			// One sequential full-file pass over the completed staging file,
-			// bounded by the part context so a user cancel or a sibling abort
-			// stops the pass promptly; computeSHA256Ctx records it in the
-			// hash-pass counters.
+			// The single full-file pass honors partCtx and records hash-pass counters.
 			computed, herr := computeSHA256Ctx(partCtx, stg)
 			if herr != nil {
-				// User cancel during the strict hash: the same close-handle /
-				// cleanup sequence as every other post-claim phase. An internal
-				// abort keeps the resumable bytes; the durable ProofPending flag
-				// keeps them untrusted.
+				// User cancel closes and cleans up per policy; internal abort preserves bytes
+				// with ProofPending still guarding them.
 				d.applyCancelCleanup()
 				if cerr := ctx.Err(); cerr != nil {
 					return false, cerr
@@ -2010,14 +1386,9 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			sum = computed
 		}
 		if !strings.EqualFold(sum, it.SHA256) {
-			// Corruption detected: never publish. ProofPending stays set; the
-			// payload is poisoned to zero so a later run cannot trust the
-			// all-Done ranges even if the record flag is lost, and the owned
-			// discard is attempted. The durable flag plus the zero-length
-			// payload make a failed discard safe: the next claim either
-			// discards (size mismatch) or re-proves (flag) and refuses again.
-			// The explicit redownload policy remains this actionable error plus
-			// a fresh transfer on retry.
+			// Never publish a mismatch. Keep ProofPending set and attempt owner-checked
+			// poison/discard; if either fails, the durable gate or zero-length payload
+			// forces re-proof/discard on the next run.
 			d.poisonStagingIfOwned()
 			if !removeStagingArtifactsOwned(stg, metaPath) {
 				log.Printf("warning: staging data for %s survived a known-digest mismatch; "+
@@ -2045,36 +1416,14 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	return contentVerified, err
 }
 
-// publish atomically renames the staging file onto the destination and
-// removes the resume metadata, then removes any obsolete pre-#140 multipart
-// artifacts for dst. The staging file and its publish target share a
-// directory, so the normal path is rename-only — no payload copy. The rename
-// replaces any pre-existing file at the target atomically: for a
-// non-content-addressed destination the claim does not treat that file as
-// complete (the caller's skip decision is authoritative), so the new bytes
-// overwrite stale/incomplete ones in one step.
-//
-// Publication is claim-checked. The rename happens only while this process
-// still owns the staging pair: the record is re-read under the metadata gate
-// (the take-over serialization point) and the destination ownership domain
-// must still be held for the same interval. A missing or foreign record returns
-// errStagingClaimLost and leaves the staging payload untouched for its actual
-// owner; nothing is renamed. This closes the window where a writer whose claim
-// was taken over (or whose record was removed) could still publish a foreign
-// staging file.
-//
-// Publication is ALSO layout-checked, explicitly: before the rename the live
-// and the persisted range layout must both cover the whole expected payload
-// (every range Done, committed total equal to the expected size). An
-// incomplete layout returns errStagingLayoutIncomplete and nothing is
-// renamed, so the guarantee "an incomplete payload is never published" is a
-// checked invariant here and not only an implication of the control flow that
-// reached publish.
+// publish requires the held domain and owned record, complete live and persisted
+// layouts, exact payload size, cleared required proof, and a final cancellation
+// check. Blob placement follows the no-replace tiers in doc.go; arbitrary targets
+// replace bytes the caller declined to skip. Success removes owned staging and
+// obsolete multipart artifacts, never the single route's .part/sidecar.
 func (d *stagingDownload) publish() error {
-	// Publication is gated on the durable known-digest proof. The finalization
-	// path clears ProofPending only after a successful proof; reaching publish
-	// with it still set means the proof was skipped or its clear was not made
-	// durable. Refusing here leaves the record + payload for a later re-proof.
+	// A pending known-digest proof blocks publication unless Verify="none";
+	// preserve the pair for re-proof on a later run.
 	if d.proofPending && d.it.SHA256 != "" && d.cfg.Verify != "none" {
 		return fmt.Errorf("refusing to publish %s: durable known-digest proof is still pending", d.it.RelativePath)
 	}
@@ -2082,23 +1431,14 @@ func (d *stagingDownload) publish() error {
 	if err := d.closeOut(); err != nil {
 		return fmt.Errorf("close staging file %s before publish: %w", d.stg, err)
 	}
-	// The PAYLOAD must physically hold the expected number of bytes before
-	// anything is renamed onto the publish target. The layout check below
-	// proves what the BYTES claim; this check proves the FILE behind them
-	// exists at the expected size. A record can describe a complete layout
-	// while the payload behind it is short, and publishing that payload would
-	// put a file that disagrees with its own metadata on the destination.
-	// The handle is closed, so every write has been flushed and the size is
-	// the payload's real logical size.
+	// Check physical payload length independently of range metadata: complete-looking
+	// layouts can refer to a short file. The handle is closed before placement.
 	if err := checkStagingPayloadSize(d.stg, d.it.Size); err != nil {
 		return err
 	}
 
-	// Snapshot the live layout under the layout gate. The snapshot is taken
-	// BEFORE the metadata gate below is acquired, so the gate order stays
-	// metaMu -> metadata gate everywhere (the flush path takes them in that
-	// order) and no inversion is possible. The snapshot cannot be stale: the
-	// range workers have joined, so nothing mutates the layout any more.
+	// Snapshot under metaMu before taking the metadata gate, matching checkpoint
+	// lock order. Workers have joined, so this layout will no longer change.
 	d.metaMu.Lock()
 	live := append([]RangeProgress(nil), d.ranges...)
 	d.metaMu.Unlock()
@@ -2109,9 +1449,7 @@ func (d *stagingDownload) publish() error {
 	}
 	defer lock.release()
 
-	// Ownership re-read under the metadata gate. The destination's ownership
-	// domain must still be held: losing it would mean the interval this
-	// process believed it owned was already handed to a successor.
+	// Recheck both the held destination domain and record ownership under the gate.
 	if !d.fenced() {
 		return errStagingClaimLost
 	}
@@ -2121,24 +1459,8 @@ func (d *stagingDownload) publish() error {
 	if err := d.ctx.Err(); err != nil {
 		return err
 	}
-	// The publication invariant is asserted HERE, explicitly, instead of
-	// being left to the control flow above: the range layout of this
-	// download must cover the whole expected payload before anything is
-	// renamed onto the publish target. Every range must be Done and the
-	// committed total must equal the expected size.
-	//
-	// Without this check the guarantee "an incomplete payload is never
-	// published" rested only on the fact that every runRange nil-return path
-	// is caught by the cancellation guard or by the errCh drain - correct, but
-	// implicit, and exactly the kind of invariant a later refactor can break
-	// silently. A layout that fails this check is never renamed: a partial
-	// payload published as the finished file is the silent corruption this
-	// downloader must never produce, and the staged bytes stay on disk for a
-	// resume.
-	//
-	// The live layout is the truth about the bytes this run wrote; the
-	// persisted record is the truth about the published payload's provenance.
-	// Both must describe the same complete layout.
+	// Both live and persisted layouts must tile the expected payload with all ranges
+	// Done and exactly size committed bytes. Refusal preserves staging for resume.
 	if !stagingLayoutComplete(live, d.it.Size) {
 		return fmt.Errorf("refusing to publish %s: the staging range layout is incomplete (%d of %d bytes committed); the staged bytes are preserved for a resume: %w",
 			d.it.RelativePath, committedTotal(live), d.it.Size, errStagingLayoutIncomplete)
@@ -2159,23 +1481,13 @@ func (d *stagingDownload) publish() error {
 		return err
 	}
 	if d.contentAddressed {
-		// The target is a content-addressed blob: its existence is completion
-		// proof and it is NEVER replaced. The placement is one no-replace
-		// step, so a concurrent publisher of the same blob key cannot be
-		// overtaken between the decision and the placement (a Stat-then-
-		// rename would let the other writer's rename replace this blob,
-		// leaving bytes that do not hash to the key they are stored under -
-		// corruption CheckBlob would then report as complete). On a
-		// filesystem with hard links the placement is atomic no-replace; on
-		// one without, it is exclusive to the blob key's ownership domain
-		// this download holds, so no domain participant can create the
-		// target in between.
+		// Preserve existing content-addressed completion: hard-link placement is atomic
+		// no-replace; without hard links, check/rename excludes only domain participants.
+		// External writers are not fenced by that fallback (see doc.go).
 		if err := blobPublishPlace(d.stg, d.pub, d.domain); err != nil {
 			if errors.Is(err, errBlobTargetExists) {
-				// Another writer published this blob first. Its bytes are the
-				// completion proof; discard this process's staging pair and
-				// report the item as complete so the caller treats it as a
-				// skip and creates its own links.
+				// Reuse the existing blob: discard our staging pair and let the caller create
+				// this item's links as a blob-exists skip.
 				removeStagingArtifactsLocked(d.stg, d.meta)
 				return errBlobAlreadyComplete
 			}
@@ -2189,23 +1501,16 @@ func (d *stagingDownload) publish() error {
 			return err
 		}
 	}
-	// The payload is now authoritative. Removing the obsolete record under the
-	// same lock cannot race a successor: it would have had to observe this
-	// claim first.
+	// Placement succeeded; remove our now-obsolete staging record under the same gate.
 	removeStagingArtifactsLocked(d.stg, d.meta)
-	// Obsolete artifacts from a pre-#140 version, if any linger next to
-	// dst, must not survive a successful finalization; they are ignored
-	// resume state, so a cleanup failure is logged and does not turn the
-	// published file into an error. The single-route <dst>.part and its
-	// sidecar are deliberately NOT removed: this route creates no .part, so
-	// only the single-request route discards its own partial.
+	// Legacy multipart cleanup is nonfatal after successful publication. Leave the
+	// single route's .part and identity sidecar to that route.
 	if err := removeMultipartResumeFiles(d.dst); err != nil {
 		log.Printf("warning: cleanup obsolete multipart artifacts for %s after publish: %v", d.dst, err)
 	}
 	return nil
 }
 
-// committedTotal sums the committed bytes of a range layout.
 func committedTotal(ranges []RangeProgress) int64 {
 	var n int64
 	for i := range ranges {
@@ -2218,17 +1523,10 @@ func committedTotal(ranges []RangeProgress) int64 {
 	return n
 }
 
-// runRange downloads the uncommitted suffix of one range with the full
-// per-attempt retry discipline: stall watchdog, high-water-mark refunds,
-// the absolute attempt ceiling, Retry-After-aware waits, and fail-fast
-// propagation. It writes only into [from, r.End] of the staging file via a
-// bounded writer, strictly validates every ranged response, and advances
-// the durable committed checkpoint only after bytes were successfully
-// written — the checkpoint can never pass the bytes actually on disk.
-//
-// It returns nil when the range completed or the part context was
-// cancelled (the aggregate ctx checks turn that into the cancellation the
-// caller must see), and an error when the range terminally failed.
+// runRange transfers only the missing suffix within its assigned bounds,
+// checkpointing bytes actually written. It applies stall/backoff/refund and
+// lifetime retry limits. nil means complete OR partCtx canceled; the caller
+// must check cancellation before publishing. Other terminal failures return errors.
 func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setPartErr func(error)) error {
 	r := &d.ranges[task.idx]
 	commit0 := task.from - r.Start // durable prefix of this range at task start
@@ -2243,20 +1541,13 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 	attempt := 0
 	ceiling := absoluteAttemptCeiling(attempts)
 	var lastErr error
-	// pos is the bytes this run has added to the range's committed prefix;
-	// hwm bounds refunds exactly as the legacy part loop did (see
-	// downloadSingle for the two-term rationale).
+	// pos is this run's added prefix; hwm prevents duplicate progress refunds.
 	pos := int64(0)
 	hwm := int64(0)
-	// countedUpTo is the absolute end of the bytes this run has already
-	// reported as progress for this range. It is initialized to the task's
-	// durable start (bytes before it belong to baseCommitted) and advances
-	// only when a write lands beyond it, so an overflowing attempt's accepted
-	// prefix is not counted a second time when the retry rewrites it.
+	// countedUpTo excludes the inherited baseline and counts each newly written byte
+	// once, even when overflow forces the same suffix to be rewritten.
 	countedUpTo := task.from
 	if commit0 > 0 {
-		// The bytes already on disk are reused: the request asks for the
-		// remaining suffix of this range only.
 		downloadLog.Info("resuming download",
 			"repo", d.job.Repo,
 			"path", d.it.RelativePath,
@@ -2293,15 +1584,8 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 		case err != nil:
 			taskErr = err
 		case rs.StatusCode == http.StatusPartialContent:
-			// Strict protocol validation BEFORE any body byte may be
-			// written: exact Content-Range, expected total, and a
-			// Content-Length matching the requested byte count. The
-			// bounded writer enforces the exact body count during the
-			// copy: a short body is rejected after the copy, and an
-			// oversized body is refused as errRangedBodyOverflow. An
-			// oversized response is a protocol violation, never a
-			// completed range, even if it delivered every requested byte
-			// before the excess (see the error branch below).
+			// Validate range headers before writing; the bounded copy rejects short or
+			// oversized bodies, and overflow never completes a range.
 			if verr := validateRangeResponse(rs, wantStart, wantEnd, d.it.Size); verr != nil {
 				taskErr = verr
 				rs.Body.Close()
@@ -2313,23 +1597,12 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 				paced := d.cfg.SpeedLimiter.Reader(attemptCtx, body)
 				w := newBoundedAtWriter(d.out, wantStart, wantLen)
 				w.onWrite = func(p []byte) {
-					// Progress counts durable, unique bytes: only the part of
-					// this write beyond the highest absolute offset already
-					// counted for the range. An overflowing attempt does not
-					// advance pos, so its accepted prefix must remain counted
-					// here; the retry rewrites the same range and adds nothing
-					// until it passes countedUpTo.
 					end := wantStart + w.written
 					if end > countedUpTo {
 						d.progress.Add(end - countedUpTo)
 						countedUpTo = end
 					}
-					// The hash-on-write state is owner-shared: another worker
-					// may invalidate it concurrently. The decision and the
-					// hash's own bytes are taken together under seqMu, so a
-					// byte is never fed into a hash that is being dropped,
-					// and the hash's internal state is never mutated
-					// concurrently with a read of its digest.
+					// Serialize hash writes with invalidation and digest reads under seqMu.
 					d.seqMu.Lock()
 					if d.seqHash != nil {
 						_, _ = d.seqHash.Write(p)
@@ -2364,20 +1637,13 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 				// stall; a done partCtx keeps the genuine-cancel error.
 				taskErr = classifyStall(partCtx, body, cerr)
 				if !overflow {
-					// pos advances by the bytes actually written, so the next
-					// retry's Range request resumes from the durable offset and
-					// the committed checkpoint never passes the written bytes.
-					// Written bytes do not prove response framing: if the final
-					// requested byte arrived but EOF/framing failed, keep that byte
-					// uncommitted so retry requests a non-empty suffix.
+					// Resume from accepted writes, but reserve the last byte if framing failed
+					// after all requested bytes arrived; retry must request a nonempty suffix.
 					accepted := w.written
 					if accepted == wantLen {
 						accepted--
-						// The hash consumed this byte, and the retry will feed it
-						// again. Drop hash-on-write for one final full-file pass.
-						// The invalidation is a shared-state write, so it
-						// happens under seqMu like every other access to the
-						// hash-on-write state.
+						// Retrying the reserved byte would hash it twice; invalidate under seqMu and
+						// use the final full-file proof instead.
 						d.seqMu.Lock()
 						d.seqHash = nil
 						d.seqMu.Unlock()
@@ -2393,22 +1659,9 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 						return ferr
 					}
 				}
-				// An oversized response is never completion, even when every
-				// requested byte had already been accepted before the excess:
-				// pos deliberately does not advance (a retry must re-request
-				// the same suffix rather than plan bytes=End+1-End), the
-				// checkpoint is never persisted as Done, and the normal retry
-				// budget decides whether this attempt is retried. A persistent
-				// violation fails the range with the staging state preserved.
-				//
-				// It also poisons the sequential hash-on-write: the retry
-				// re-requests this same range and would feed its bytes into the
-				// same hash a second time, so no valid retry could ever verify.
-				// Drop it and fall back to exactly one final full-file pass.
-				//
-				// The invalidation is a shared-state write: parallel workers
-				// can reach this branch concurrently, so it happens under
-				// seqMu like every other access to the hash-on-write state.
+				// Overflow commits no new prefix or Done state, even after all requested bytes
+				// were accepted. Retry the same suffix within budget and invalidate hash-on-write
+				// under seqMu to avoid hashing rewritten bytes twice.
 				if overflow {
 					d.seqMu.Lock()
 					d.seqHash = nil
@@ -2416,18 +1669,14 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 				}
 			}
 		default:
-			// Any non-206 is a failure. A permanent 401/403/404 fails the
-			// whole job immediately; a throttling 429/503 shapes the next
-			// wait; any other status (including a 200 that ignored Range)
-			// is a multipart protocol violation and is retried.
+			// Non-206 fails the attempt. 401/403/404 fail the job; other terminal 4xx fail
+			// the file. Retryable statuses use server-aware backoff; an ignored-Range 200
+			// remains a retried multipart protocol violation.
 			rs.Body.Close()
 			if apiErr := classifyFileResponse(rs, d.it.URL); apiErr != nil {
 				taskErr = apiErr
 				if apiErr.IsFailFast() || !apiErr.IsRetryable() {
-					// Terminal for the whole file: cancel sibling workers
-					// with the original error as the cause and record it for
-					// the caller. No cleanup runs — the committed ranges are
-					// resumable data.
+					// Cancel siblings with the original terminal error; preserve committed staging.
 					setPartErr(apiErr)
 					attemptCancel()
 					return apiErr
@@ -2440,11 +1689,8 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 		attemptCancel()
 		lastErr = taskErr
 
-		// Refund the retry budget only when this attempt moved STRICTLY
-		// above the high-water mark captured BEFORE the attempt. preHwm is
-		// read first because hwm is updated unconditionally below, so an
-		// attempt's higher offset is recorded and can never later earn a
-		// free refund from a bodyless failure.
+		// Compare with the pre-attempt high-water mark before recording the new one;
+		// a later bodyless failure must not earn a second refund for old progress.
 		advanced := pos > preHwm
 		if pos > hwm {
 			hwm = pos

@@ -136,9 +136,8 @@ func TestTakeoverReplacementFailurePreservesAndResumesValidatedRecord(t *testing
 	if err := os.Remove(temp); err != nil {
 		t.Fatal(err)
 	}
-	// Replace the injected failure with an interrupted replacement temp from a
-	// crash-before-rename. Recovery must overwrite only the temp; the validated
-	// predecessor remains authoritative until the complete successor is renamed.
+	// A crash-before-rename temp must not replace the validated predecessor
+	// until a complete successor is installed.
 	if err := os.WriteFile(temp, []byte(`{"instance":"interrupted-successor`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -156,10 +155,8 @@ func TestTakeoverReplacementFailurePreservesAndResumesValidatedRecord(t *testing
 	}
 }
 
-// TestRangedDownloadSucceedsWithoutHardLinkSupport covers a filesystem that
-// cannot create hard links at all. The claim record must still install
-// atomically, so the whole ranged path keeps working there: a hard link is
-// not an authorized prerequisite of the download.
+// A ranged download must complete when atomic claim-record hard links are
+// unsupported, using the guarded record-install fallback.
 func TestRangedDownloadSucceedsWithoutHardLinkSupport(t *testing.T) {
 	oldLink := linkStagingClaimRecord
 	defer func() { linkStagingClaimRecord = oldLink }()
@@ -183,16 +180,13 @@ func TestRangedDownloadSucceedsWithoutHardLinkSupport(t *testing.T) {
 	}
 	assertExactFile(t, dst, full)
 
-	// No staged residue may survive a successful install.
 	metaPath := dst + ".incomplete.meta"
 	if _, err := os.Stat(metaPath + ".tmp"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("staged claim record survived the install: %v", err)
 	}
 }
 
-// TestFreshClaimInstallSucceedsWithoutHardLinkSupport covers the claim
-// transition itself on a filesystem without hard-link support: the record must
-// still be installed completely and be authoritative afterwards.
+// Fresh claim installation must remain complete when record linking is unsupported.
 func TestFreshClaimInstallSucceedsWithoutHardLinkSupport(t *testing.T) {
 	oldLink := linkStagingClaimRecord
 	defer func() { linkStagingClaimRecord = oldLink }()
@@ -220,9 +214,7 @@ func TestFreshClaimInstallSucceedsWithoutHardLinkSupport(t *testing.T) {
 	if meta.Instance != processInstanceToken || meta.Version != stagingMetaVersion {
 		t.Fatalf("installed claim record is not complete/current: %+v", meta)
 	}
-	// The staged name must not survive the install: a hard-link install
-	// leaves both names on one inode, so a surviving staged name would be an
-	// alias of the authoritative record.
+	// Successful fallback installation must not leave the staged record name.
 	if _, err := os.Stat(metaPath + ".tmp"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("staged claim record survived the install: %v", err)
 	}
@@ -241,8 +233,7 @@ func TestStagedRecordResidueCannotEmptyPredecessor(t *testing.T) {
 	if err := os.WriteFile(metaPath, predecessor, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Crash residue: the staged path is a hard link to the authoritative
-	// record, i.e. both names share one inode.
+	// Crash residue aliases the authoritative record's inode.
 	staged := metaPath + ".tmp"
 	if err := os.Link(metaPath, staged); err != nil {
 		t.Fatal(err)
@@ -270,10 +261,8 @@ func TestStagedRecordResidueCannotEmptyPredecessor(t *testing.T) {
 	}
 }
 
-// TestInterruptedInstallResidueDoesNotReplacePredecessor covers the same
-// alias hazard combined with a filesystem that cannot create hard links: the
-// install must not replace the record that is already there, and must not
-// empty it through the staged alias.
+// Existing hard-link temp residue plus unsupported record linking must
+// neither empty nor replace the authoritative predecessor.
 func TestInterruptedInstallResidueDoesNotReplacePredecessor(t *testing.T) {
 	dir := t.TempDir()
 	metaPath := filepath.Join(dir, "install.incomplete.meta")

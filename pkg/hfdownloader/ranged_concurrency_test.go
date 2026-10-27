@@ -3,27 +3,8 @@
 
 package hfdownloader
 
-// Concurrency coverage for the shared state of a ranged download
-// (issue #140).
-//
-// Two owner-level shared objects are covered here:
-//
-//  1. The staging record's range layout. Every checkpoint flush normalizes the
-//     layout in place while it holds the download's metadata gate; the
-//     download itself derives its task list and its committed baseline from
-//     the same layout. Every access to the layout's mutable fields
-//     (RangeProgress.Committed/Done) must be serialized by that gate,
-//     otherwise a checkpoint's normalization and the task derivation race on
-//     the same bytes. The range layout's Start/End bounds are immutable once
-//     the layout is installed, so only Committed/Done need the gate.
-//
-//  2. The strict hash-on-write state. Every range worker inspects it on each
-//     write and invalidates it when a response's framing cannot be trusted,
-//     so parallel workers can reach the invalidation concurrently. The
-//     invalidation, the hash's own bytes and the final digest must be taken
-//     together under one lock, so no worker can invalidate a hash another
-//     worker is still feeding and no digest can be summed from a hash that
-//     was invalidated underneath it.
+// Exercises concurrent checkpoint normalization of the mutable range layout
+// and invalidation of strict hash-on-write state across workers.
 
 import (
 	"bytes"
@@ -42,12 +23,8 @@ import (
 	"time"
 )
 
-// blockingRangeServer serves a fixed payload with correct HEAD/Range
-// handling, but holds every ranged GET until release() is called. That keeps
-// several range workers inside their post-claim transfers at the same time,
-// so concurrent checkpoint normalization can be exercised deterministically.
-//
-// The recorded Range headers are appended under mu and returned by requests().
+// blockingRangeServer holds ranged GETs until release, then serves valid responses.
+// Recorded Range headers are protected by mu and returned by requests.
 func blockingRangeServer(t *testing.T, full []byte) (srv *httptest.Server, requests func() []string, release func()) {
 	t.Helper()
 	var (
@@ -76,16 +53,8 @@ func blockingRangeServer(t *testing.T, full []byte) (srv *httptest.Server, reque
 	}, func() { releaseOnce.Do(func() { close(released) }) }
 }
 
-// TestRangedMultipart_ResumedTaskDerivationIsRaceFree drives a resumed
-// download whose layout already carries Done ranges, so the derivation of the
-// missing work reads the shared layout under the metadata gate and produces a
-// private task snapshot.
-//
-// The download must (a) issue exactly the missing suffix requests and
-// (b) produce byte-exact output. The layout variants place the Done ranges at
-// different positions and use different missing-work shapes, so the derived
-// task index and the requested byte ranges differ per variant: a fix that only
-// handled one position, or one missing-work shape, would fail the others.
+// Done ranges in different positions must produce private missing-work tasks
+// that request exactly the uncommitted suffixes and produce byte-exact output.
 func TestRangedMultipart_ResumedTaskDerivationIsRaceFree(t *testing.T) {
 	const total = 8000
 	full := rangedTestPayload(total)
@@ -97,8 +66,6 @@ func TestRangedMultipart_ResumedTaskDerivationIsRaceFree(t *testing.T) {
 		wantRanges []string
 	}{
 		{
-			// The Done range is first: the derived task is the second range
-			// and the request starts at that range's own committed prefix.
 			name: "done range first",
 			ranges: []RangeProgress{
 				{Start: 0, End: 3999, Committed: 4000, Done: true},
@@ -107,9 +74,6 @@ func TestRangedMultipart_ResumedTaskDerivationIsRaceFree(t *testing.T) {
 			wantRanges: []string{"bytes=4000-7999"},
 		},
 		{
-			// The Done range is last: the derived task is the first range,
-			// so the request starts at offset 0 and the derived task index
-			// differs from the first variant.
 			name: "done range last",
 			ranges: []RangeProgress{
 				{Start: 0, End: 3999},
@@ -118,8 +82,6 @@ func TestRangedMultipart_ResumedTaskDerivationIsRaceFree(t *testing.T) {
 			wantRanges: []string{"bytes=0-3999"},
 		},
 		{
-			// Done ranges on both ends with the missing work in the middle:
-			// the derivation walks Done, incomplete, Done.
 			name: "done ranges on both ends",
 			ranges: []RangeProgress{
 				{Start: 0, End: 1999, Committed: 2000, Done: true},
@@ -129,9 +91,6 @@ func TestRangedMultipart_ResumedTaskDerivationIsRaceFree(t *testing.T) {
 			wantRanges: []string{"bytes=2000-5999"},
 		},
 		{
-			// A partially committed (not Done) range next to a Done range:
-			// the request must resume at the committed prefix, and the Done
-			// range must not be re-requested.
 			name: "partial prefix next to done range",
 			ranges: []RangeProgress{
 				{Start: 0, End: 3999, Committed: 1000},
@@ -164,9 +123,6 @@ func TestRangedMultipart_ResumedTaskDerivationIsRaceFree(t *testing.T) {
 					t.Fatalf("iteration %d: downloadMultipart: %v", i, err)
 				}
 
-				// Exact missing-range request oracle: only the uncommitted
-				// suffix of the incomplete range is requested, and the
-				// already-Done range is never re-requested.
 				if got := *requests; !slices.Equal(got, v.wantRanges) {
 					t.Errorf("iteration %d: ranged requests = %v, want %v", i, got, v.wantRanges)
 				}
@@ -179,18 +135,9 @@ func TestRangedMultipart_ResumedTaskDerivationIsRaceFree(t *testing.T) {
 	}
 }
 
-// TestRangedMultipart_ConcurrentCheckpointNormalizationIsRaceFree drives one
-// download whose complete range layout starts empty with a worker per range.
-// Every worker finishes concurrently and advances its range's Committed/Done
-// fields, and every completion flushes the record, whose writer normalizes the
-// whole shared layout in place. All those layout accesses must be serialized
-// by the metadata gate: otherwise the concurrent checkpoint normalizations and
-// record writes race on the same bytes. Under -race that property is enforced
-// by the race detector.
-//
-// The finalization event is held so the record can be inspected before the
-// publication removes it: every range must be persisted as Done and the
-// committed total must cover the payload.
+// Concurrent worker completions normalize and persist the shared layout under
+// the metadata gate. Run with -race; hold finalization to inspect all-Done
+// persisted ranges and the committed total before publication removes the record.
 func TestRangedMultipart_ConcurrentCheckpointNormalizationIsRaceFree(t *testing.T) {
 	const total = 64 * 1024
 	const workers = 8
@@ -228,8 +175,7 @@ func TestRangedMultipart_ConcurrentCheckpointNormalizationIsRaceFree(t *testing.
 		done <- err
 	}()
 
-	// Wait until every worker has entered its ranged GET, so the transfer
-	// completions and their checkpoint flushes really overlap.
+	// Wait for every ranged GET before releasing responses to competing workers.
 	deadline := time.Now().Add(10 * time.Second)
 	for len(requests()) < workers {
 		select {
@@ -282,16 +228,8 @@ func TestRangedMultipart_ConcurrentCheckpointNormalizationIsRaceFree(t *testing.
 	}
 }
 
-// overflowingChunkedServer serves a payload whose ranged responses are
-// chunked (no Content-Length) and one byte longer than the requested range.
-// The bounded writer refuses the excess, so every ranged response is a
-// protocol violation: the range is never completed and the bytes are never
-// published.
-//
-// The first response for each distinct range is held until every worker has
-// arrived, so the parallel workers are inside the transfer simultaneously
-// and really overlap their invalidations. Later attempts (retries) are
-// served immediately so the test cannot deadlock on the barrier.
+// overflowingChunkedServer sends chunked ranges one byte too long. First
+// requests wait at a worker barrier; retries bypass it so they cannot deadlock.
 func overflowingChunkedServer(t *testing.T, full []byte, workers int) (*httptest.Server, func() int) {
 	t.Helper()
 	var (
@@ -334,7 +272,7 @@ func overflowingChunkedServer(t *testing.T, full []byte, workers int) (*httptest
 			}
 		}
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(full)))
-		// No Content-Length: chunked framing, so the client reads every byte.
+		// Omit Content-Length so the excess reaches the body's framing check.
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write(bytes.Repeat([]byte{0x7}, int(end-start+2)))
 	}))
@@ -346,19 +284,8 @@ func overflowingChunkedServer(t *testing.T, full []byte, workers int) (*httptest
 	}
 }
 
-// TestRangedMultipart_ParallelOverflowInvalidationIsRaceFree drives two
-// parallel range workers whose responses both overflow their assigned range.
-//
-// Each worker reaches the invalidation of the shared hash-on-write state
-// ("d.seqHash = nil") because the response framing cannot be trusted. Those
-// invalidations are concurrent writes to one shared field, so they must be
-// synchronized: the download must (a) run without a data race, (b) reject
-// both oversized bodies as protocol violations, (c) publish nothing, and
-// (d) leave the staging record with a valid, non-Done layout so the next run
-// resumes instead of trusting the partial bytes.
-//
-// The parallel case is what makes the invalidation shared: with one worker
-// there is no second writer.
+// Parallel oversized ranges exercise shared hash-state invalidation under -race.
+// They must fail without publication and retain a valid, non-Done staging layout.
 func TestRangedMultipart_ParallelOverflowInvalidationIsRaceFree(t *testing.T) {
 	const total = 20_000
 	full := rangedTestPayload(total)
@@ -385,11 +312,9 @@ func TestRangedMultipart_ParallelOverflowInvalidationIsRaceFree(t *testing.T) {
 		t.Errorf("ranged GET hits = %d, want at least %d (both workers must have reached the overflow path)", n, workers)
 	}
 
-	// Nothing may be published after a protocol violation.
 	if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
 		t.Errorf("destination was published after an oversized body (stat err = %v)", serr)
 	}
-	// The staging payload and its record are preserved for a later resume.
 	if _, serr := os.Stat(staging); serr != nil {
 		t.Errorf("staging payload was not preserved for resume: %v", serr)
 	}
@@ -404,21 +329,14 @@ func TestRangedMultipart_ParallelOverflowInvalidationIsRaceFree(t *testing.T) {
 			t.Errorf("range %d was persisted as Done after an oversized body: %+v", i, r)
 		}
 	}
-	// The record must still be a valid layout that the next run can resume
-	// from: it tiles the file and claims no byte past a range end.
+	// The preserved layout must remain structurally valid: tile the file and claim no bytes past a range end.
 	if _, ok := normalizedRangeLayout(meta.Ranges, meta.Size); !ok {
 		t.Errorf("persisted layout is not a valid resumable layout: %+v", meta.Ranges)
 	}
 }
 
-// TestRangedMultipart_SequentialOverflowKeepsSingleFinalHash is the
-// neighbouring single-worker control for the parallel invalidation case.
-//
-// One worker, one oversized chunked body, then a valid retry: the
-// hash-on-write state must be invalidated exactly once, the retry must
-// verify against the known digest, and the transfer must fall back to
-// exactly one final full-file pass (never more, never none). This is the
-// sequential meaning the parallel case must not weaken.
+// Sequential control: after an oversized response, a valid retry must drop
+// hash-on-write state and verify with exactly one final full-file pass.
 func TestRangedMultipart_SequentialOverflowKeepsSingleFinalHash(t *testing.T) {
 	const total = 8000
 	full := rangedTestPayload(total)
@@ -449,7 +367,6 @@ func TestRangedMultipart_SequentialOverflowKeepsSingleFinalHash(t *testing.T) {
 			_, _ = w.Write(bytes.Repeat([]byte{0xEE}, int(end-start+2)))
 			return
 		}
-		// Valid retry of the same range.
 		w.Header().Set("Content-Length", strconv.Itoa(int(end-start+1)))
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write(full[start : end+1])
@@ -467,9 +384,7 @@ func TestRangedMultipart_SequentialOverflowKeepsSingleFinalHash(t *testing.T) {
 	if !verified {
 		t.Error("the final full-file verification pass was not reported as completed")
 	}
-	// The invalidated hash-on-write state must fall back to exactly one
-	// final full-file pass: not zero (the poisoned hash would be used) and
-	// not more than one.
+	// Overflow invalidates hash-on-write, requiring exactly one final full-file pass.
 	if got := hashPassCount.Load(); got != 1 {
 		t.Errorf("strict mode after an overflow retry performed %d full-file passes; want exactly 1", got)
 	}

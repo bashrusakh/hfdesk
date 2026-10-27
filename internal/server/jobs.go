@@ -1893,22 +1893,10 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 	}
 }
 
-// cleanupPausedJobPartFiles removes partial download files for a job whose
-// runJob goroutine has already exited (paused jobs whose downloader
-// goroutine returned without doing cleanup). The downloader's in-flight
-// cleanup callback cannot reach these files because the goroutine is
-// gone, so the server performs the cleanup itself using the same path
-// resolution the downloader would have used.
-//
-// Used by CancelJob (pause → cancel) and DismissJobResult (pause →
-// dismiss). All errors are best-effort: missing directories and per-file
-// removal failures are logged and skipped inside CleanupJobPartFiles.
-//
-// dsts comes from the per-job in-flight tracker populated by
-// Settings.OnPartialFile during the most recent runJob. If the
-// tracker is empty (e.g. the run was short and the downloader
-// never got to register any dsts, or every dst was finalized
-// successfully), cleanup is a no-op.
+// cleanupPausedJobPartFiles cleans tracked partials after the job's runJob has exited.
+// CancelJob and DismissJobResult use it for paused jobs; destinations come from
+// Settings.OnPartialFile in the last run. An empty tracker is a no-op.
+// CleanupJobPartFiles logs and skips missing paths and removal failures.
 func (m *JobManager) cleanupPausedJobPartFiles(job *Job) {
 	dsts := m.snapshotPartialFiles(job)
 	// Clear the tracker before deleting the files so a stale callback

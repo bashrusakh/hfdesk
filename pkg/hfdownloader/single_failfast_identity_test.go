@@ -3,19 +3,8 @@
 
 package hfdownloader
 
-// The fail-fast branch of the single-request path must not destroy the
-// resume identity (issue #140 follow-up).
-//
-// A permanent 401/403/404 fails the item immediately. The branch removes the
-// zero-byte partial the attempt created - and the identity sidecar that
-// describes the partial. Removing the sidecar while a NON-EMPTY partial
-// survives destroys the only proof that the bytes on disk belong to this
-// object: the next run cannot inherit them and discards them, so a permanent
-// (but eventually fixable) error loses the resumable progress.
-//
-// The regression below pins the rule: the sidecar goes only with the partial
-// it describes, and a later run with the same identity resumes from the
-// stored offset.
+// A permanent 401/403/404 may remove its zero-byte partial and sidecar, but
+// must preserve both when the partial contains resumable bytes.
 
 import (
 	"bytes"
@@ -32,13 +21,6 @@ import (
 	"time"
 )
 
-// TestSinglePathFailFastKeepsInheritedPartialAndIdentity pins the fail-fast
-// rule of the single-request path.
-//
-// An inherited partial (staged by an earlier run, with the identity sidecar
-// that proves it belongs to this object) survives a permanent 403 byte for
-// byte, and so does its sidecar. A later run with the same identity resumes
-// from the stored offset instead of re-downloading the whole object.
 func TestSinglePathFailFastKeepsInheritedPartialAndIdentity(t *testing.T) {
 	body := []byte("the complete object content of the item")
 	const prefixLen = 7
@@ -50,7 +32,6 @@ func TestSinglePathFailFastKeepsInheritedPartialAndIdentity(t *testing.T) {
 	it := PlanItem{RelativePath: "model.bin", Size: int64(len(body))}
 	opts := singleTestIdentity
 
-	// The partial and its sidecar are staged by an earlier run.
 	seedSinglePartial(t, dst, prefix, job, it, opts)
 	sidecarBefore, err := os.ReadFile(singlePartIdentityPath(dst))
 	if err != nil {
@@ -77,7 +58,6 @@ func TestSinglePathFailFastKeepsInheritedPartialAndIdentity(t *testing.T) {
 
 	cfg := Settings{Retries: 0, StallTimeout: "0"}
 
-	// The permanent error fails the item with the actionable message.
 	forbidden.Store(true)
 	_, err = downloadSingle(context.Background(), srv.Client(), "", job, cfg, it, dst, opts, func(ProgressEvent) {})
 	if err == nil {
@@ -87,7 +67,6 @@ func TestSinglePathFailFastKeepsInheritedPartialAndIdentity(t *testing.T) {
 		t.Errorf("item error = %v, want the actionable permanent-status message", err)
 	}
 
-	// The partial survives byte for byte.
 	got, rerr := os.ReadFile(dst + ".part")
 	if rerr != nil {
 		t.Fatalf("the fail-fast error removed the staged partial: %v", rerr)
@@ -127,10 +106,7 @@ func TestSinglePathFailFastKeepsInheritedPartialAndIdentity(t *testing.T) {
 	assertExactFile(t, dst, body)
 }
 
-// TestSinglePathFailFastRemovesTheEmptyPartialAndItsSidecar is the other
-// side of the same rule: a partial that is EMPTY carries no resumable
-// progress, so it and its sidecar are removed together and no identity record
-// outlives the partial it describes.
+// Empty partials carry no progress; fail-fast removes them together with their sidecars.
 func TestSinglePathFailFastRemovesTheEmptyPartialAndItsSidecar(t *testing.T) {
 	body := []byte("the complete object content of the item")
 
@@ -140,7 +116,6 @@ func TestSinglePathFailFastRemovesTheEmptyPartialAndItsSidecar(t *testing.T) {
 	it := PlanItem{RelativePath: "model.bin", Size: int64(len(body))}
 	opts := singleTestIdentity
 
-	// An empty partial with the sidecar that describes it.
 	seedSinglePartial(t, dst, nil, job, it, opts)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

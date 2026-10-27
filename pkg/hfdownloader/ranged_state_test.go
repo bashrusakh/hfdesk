@@ -3,20 +3,6 @@
 
 package hfdownloader
 
-// Regression coverage for the shared staging-file ownership/resume state
-// machine (issue #140 correction set). Each blocker test is written to fail
-// against the pre-correction implementation:
-//
-//   - a body error after the final requested byte must leave a nonempty
-//     revalidation suffix, never publish an unframed response or request an
-//     impossible bytes=End+1-End range;
-//   - a completed-looking record with a missing/wrong-sized payload must be
-//     discarded and re-downloaded, never published as zeros;
-//   - a foreign instance token with our own PID is not self-ownership;
-//   - a resolved-commit mismatch invalidates the record;
-//   - the destination ownership domain is the only exclusion fence, and an
-//     unproven record is refused rather than taken over.
-
 import (
 	"bytes"
 	"context"
@@ -34,15 +20,8 @@ import (
 	"time"
 )
 
-// TestDownload_OwnedClaimIsNotCountedAsSkipped verifies that a live owner's
-// claim is NOT counted as a skip.
-//
-// The file is not present while another writer holds the item's staging, so
-// the item must fail with the actionable live-owner error instead of being
-// counted in the "skipped N" summary: a job that reports success must mean
-// the requested files are present. The live owner is simulated by holding the
-// OS ownership lock, which is what a real writer holds for its whole
-// interval.
+// A held destination lock with no published blob must time out as a live-owner
+// error, not contribute a successful skip.
 func TestDownload_OwnedClaimIsNotCountedAsSkipped(t *testing.T) {
 	tmpDir := t.TempDir()
 	const size = 64 * 1024
@@ -54,8 +33,7 @@ func TestDownload_OwnedClaimIsNotCountedAsSkipped(t *testing.T) {
 	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// A live writer's staging file: payload preallocated and an unreadable
-	// (mid-claim) record, with the DESTINATION DOMAIN held for the interval.
+	// Preallocate payload and seed an unreadable record while holding its domain.
 	staging := filepath.Join(blobsDir, sha+".incomplete")
 	if err := os.WriteFile(staging, make([]byte, size), 0o644); err != nil {
 		t.Fatal(err)
@@ -106,9 +84,7 @@ func TestDownload_OwnedClaimIsNotCountedAsSkipped(t *testing.T) {
 	}
 }
 
-// TestRangedMultipart_ZeroConcurrencyStillCompletes is a safety guard: a
-// direct caller that leaves Concurrency at zero must still get workers, never
-// a "finalization" of queued-but-undownloaded ranges.
+// Zero Concurrency must still transfer queued ranges before publication.
 func TestRangedMultipart_ZeroConcurrencyStillCompletes(t *testing.T) {
 	tmpDir := t.TempDir()
 	const total = 4000
@@ -352,10 +328,8 @@ func TestRangedMultipart_FinalChunkFailureRetriesLastByteUntilFramed(t *testing.
 	}
 }
 
-// TestRangedMultipart_MissingOrWrongPayloadInvalidatesRecord reproduces
-// blocker 2: a record can claim every range Done while its payload was deleted
-// or replaced. The record must be discarded and the bytes re-fetched; a
-// preallocated zero file must never be published in Verify=size mode.
+// TestRangedMultipart_MissingOrWrongPayloadInvalidatesRecord ensures a complete
+// record cannot authorize resume when its payload is missing or wrong-sized.
 func TestRangedMultipart_MissingOrWrongPayloadInvalidatesRecord(t *testing.T) {
 	const total = 8000
 	full := rangedTestPayload(total)
@@ -366,7 +340,6 @@ func TestRangedMultipart_MissingOrWrongPayloadInvalidatesRecord(t *testing.T) {
 		payload func(t *testing.T, staging string)
 	}{
 		{"payload deleted", func(t *testing.T, staging string) {
-			// Intentionally absent.
 		}},
 		{"payload wrong logical size", func(t *testing.T, staging string) {
 			if err := os.WriteFile(staging, bytes.Repeat([]byte{0xA5}, total/2), 0o644); err != nil {
@@ -384,11 +357,8 @@ func TestRangedMultipart_MissingOrWrongPayloadInvalidatesRecord(t *testing.T) {
 			}
 			tc.payload(t, staging)
 
-			// A valid-looking completed record from a provably dead foreign
-			// owner. Raw JSON keeps this fixture readable by the pre-fix code
-			// (which ignores instance/host) for falsification. The record
-			// states a RESOLVED, PINNED commit, so the only reason it may be
-			// discarded is the payload check this test exercises.
+			// Seed a complete, pinned record from a dead owner so payload
+			// validity is the only condition under test.
 			raw := fmt.Sprintf(
 				`{"pid":99999999,"instance":"foreign-dead","host":%q,"size":%d,"version":4,"repo":"o/r","path":"ghost.bin","commit":%q,"commit_pinned":true,"ranges":[{"start":0,"end":%d,"committed":%d,"done":true}]}`,
 				host, total, rangedSeedCommit, total-1, total)
@@ -419,11 +389,8 @@ func TestRangedMultipart_MissingOrWrongPayloadInvalidatesRecord(t *testing.T) {
 	}
 }
 
-// TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf reproduces blocker
-// 3b's namespace/PID-reuse half: our PID with a different instance token is a
-// foreign live owner while it holds the OS ownership lock (the fence a real
-// writer keeps for its whole interval), and only becomes take-over-able when
-// that lock is gone and the same-host owner is provably dead.
+// A foreign instance token with our PID is not self: an unfenced record whose
+// owner is not provably dead must be refused even under a free domain.
 func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 	const total = 8000
 	full := rangedTestPayload(total)
@@ -444,9 +411,7 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 	if err := os.WriteFile(staging+".meta", []byte(raw), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// The record is UNFENCED and its owner cannot be proven dead, so the claim
-	// refuses it without any additional lock: the record's own identity rule
-	// is what protects it.
+	// The held domain does not prove an unfenced owner dead; preserve this record.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			w.Header().Set("Content-Length", strconv.Itoa(total))
@@ -464,17 +429,13 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 		t.Fatalf("error = %v, want the unproven-ownership refusal: a different instance token with our PID must not be taken over", err)
 	}
 
-	// Provably dead same-host owner and no ownership lock: take-over resumes
-	// its validated prefix. The record states a RESOLVED, PINNED identity in
-	// the CURRENT format, so the fixture exercises the take-over and not the
-	// pinned-identity or version gate.
+	// A dead same-host owner with matching pinned v4 identity may resume its prefix.
 	staleMeta := fmt.Sprintf(
 		`{"pid":99999999,"instance":"different-process-instance","host":%q,"size":%d,"version":4,"repo":"o/r","path":"pid-reuse.bin","commit":%q,"commit_pinned":true,"ranges":[{"start":0,"end":799,"committed":800,"done":true},{"start":800,"end":%d,"committed":0,"done":false}]}`,
 		host, total, rangedSeedCommit, total-1)
 	if err := os.WriteFile(staging+".meta", []byte(staleMeta), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Put the committed prefix bytes in place.
 	out, err := os.OpenFile(staging, os.O_WRONLY, 0o644)
 	if err != nil {
 		t.Fatal(err)
@@ -491,9 +452,7 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 		t.Fatalf("take-over of a dead same-host owner failed: %v", err)
 	}
 	assertExactFile(t, dst, full)
-	// The CURRENT format treats a Done range as clean-framed completion, so
-	// the 800 committed bytes are reused and only the missing suffix is
-	// fetched. The take-over itself is what this test pins.
+	// The Done prefix is clean-framed; request only bytes 800-7999.
 	wantRanges := map[string]bool{"bytes=800-7999": false}
 	for _, rh := range *gotRanges {
 		if _, ok := wantRanges[rh]; !ok {
@@ -512,9 +471,7 @@ func TestRangedMultipart_ForeignInstanceWithOurPIDIsNotSelf(t *testing.T) {
 	}
 }
 
-// TestRangedMultipart_ResolvedCommitMismatchDiscardsStaging verifies S5: a
-// moved branch / different resolved commit invalidates the record even when
-// no blob SHA is available to distinguish the bytes.
+// A different resolved commit invalidates the record even without a blob SHA.
 func TestRangedMultipart_ResolvedCommitMismatchDiscardsStaging(t *testing.T) {
 	tmpDir := t.TempDir()
 	const total = 8000
@@ -681,10 +638,8 @@ func (c *cancelAfterEarlyGuardContext) Err() error {
 	return c.Context.Err()
 }
 
-// TestStagingPublishCancellationAfterEarlyGuardStopsBeforePlacement pins the
-// final cancellation check immediately before placement: a cancellation that
-// lands after the earlier guard must still prevent the rename, and the staged
-// payload and record must stay on disk for a resume.
+// Cancellation after the early guard must prevent placement and preserve
+// both payload and record for resume.
 func TestStagingPublishCancellationAfterEarlyGuardStopsBeforePlacement(t *testing.T) {
 	dir := t.TempDir()
 	staging := filepath.Join(dir, "late-cancel.incomplete")
@@ -720,11 +675,8 @@ func TestStagingPublishCancellationAfterEarlyGuardStopsBeforePlacement(t *testin
 	}
 }
 
-// TestRangedMultipart_V3LegacyMigratedRecordIsDiscardedUnderV4 pins the S0
-// format break: a version-3 record carrying legacy_migrated:true is not resume
-// state. Its record and payload are discarded under the claim, the file is
-// downloaded from zero (one whole-file request), no legacy content proof runs,
-// and the published content is exact.
+// A version-3 record with legacy_migrated is discarded under the claim; the
+// file restarts from zero and publishes the exact current content.
 func TestRangedMultipart_V3LegacyMigratedRecordIsDiscardedUnderV4(t *testing.T) {
 	const total = 8000
 	full := rangedTestPayload(total)
@@ -762,9 +714,7 @@ func TestRangedMultipart_V3LegacyMigratedRecordIsDiscardedUnderV4(t *testing.T) 
 	}
 }
 
-// TestStagingMetaResumableAcceptsOnlyTheCurrentVersion pins the version gate
-// directly: every other record version is refused, including version 3 (the
-// branch format that could carry legacy_migrated) and a future version.
+// Only the current record version is eligible for resume.
 func TestStagingMetaResumableAcceptsOnlyTheCurrentVersion(t *testing.T) {
 	const size = 100
 	it := PlanItem{RelativePath: "x.bin", Size: size}
@@ -789,9 +739,7 @@ func TestStagingMetaResumableAcceptsOnlyTheCurrentVersion(t *testing.T) {
 	}
 }
 
-// TestRangedMultipart_CurrentFormatV4RecordResumesCommittedPrefix is the
-// positive control for the version gate: the current format still resumes, so
-// the discard rule cannot degrade into re-downloading every file.
+// The current format still resumes its committed prefix.
 func TestRangedMultipart_CurrentFormatV4RecordResumesCommittedPrefix(t *testing.T) {
 	const total = 8000
 	full := rangedTestPayload(total)

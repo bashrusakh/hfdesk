@@ -410,14 +410,8 @@ func TestDeleteSelectedGGUFRefusesCreateTempPublicationTarget(t *testing.T) {
 	}
 }
 
-// TestStoreDownloadedFileRefusesReservedCollisionName pins the store
-// boundary: a blob key whose NAME belongs to the downloader's staging
-// namespace is refused.
-//
-// The shared classifier excludes a staging-shaped name from EVERY content
-// surface - the cache statistics, the listing, the selection, the mirror and
-// the deletion path - so a blob published under such a name would be stored
-// and invisible. The boundary that accepts the name therefore refuses it.
+// Refuse staging-shaped blob keys before placement: content under a reserved
+// shape would be invisible to cache and mirror surfaces.
 func TestStoreDownloadedFileRefusesReservedCollisionName(t *testing.T) {
 	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
 	if err != nil {
@@ -441,26 +435,19 @@ func TestStoreDownloadedFileRefusesReservedCollisionName(t *testing.T) {
 	if !strings.Contains(err.Error(), "staging") {
 		t.Errorf("store error %q does not explain that the name belongs to the staging namespace", err)
 	}
-	// Nothing was published: the refusal happens before the payload is placed.
 	if _, serr := os.Stat(repo.BlobPath(key)); !os.IsNotExist(serr) {
 		t.Errorf("the refused store published the blob, stat err=%v", serr)
 	}
 	if _, serr := os.Stat(filepath.Join(repo.SnapshotsDir(), "version-a", "model-Q4_K_M.gguf")); !os.IsNotExist(serr) {
 		t.Errorf("the refused store created the snapshot entry, stat err=%v", serr)
 	}
-	// The payload is untouched: the caller still owns it.
 	if _, serr := os.Stat(temp); serr != nil {
 		t.Errorf("the refused store consumed the payload: %v", serr)
 	}
 }
 
-// TestDeleteSelectedGGUFRefusesStagingShapedBlobTarget keeps the deletion
-// path's coverage of the reserved namespace: a snapshot entry that links to a
-// staging-shaped blob is refused before anything is unlinked.
-//
-// The state is built directly on disk because the public store no longer
-// creates it (see TestStoreDownloadedFileRefusesReservedCollisionName); the
-// deletion path must still refuse such a target if it finds one.
+// Build the reserved-shaped blob/snapshot directly: public storage refuses it,
+// but deletion must also reject existing collisions before unlinking anything.
 func TestDeleteSelectedGGUFRefusesStagingShapedBlobTarget(t *testing.T) {
 	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
 	if err != nil {
@@ -493,9 +480,6 @@ func TestDeleteSelectedGGUFRefusesStagingShapedBlobTarget(t *testing.T) {
 	}
 }
 
-// TestFinalizeBlobRefusesReservedCollisionName pins the same boundary on the
-// exported writer of blobs/<key>: a staging-shaped blob key is refused before
-// anything is created or moved.
 func TestFinalizeBlobRefusesReservedCollisionName(t *testing.T) {
 	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
 	if err != nil {
@@ -505,7 +489,6 @@ func TestFinalizeBlobRefusesReservedCollisionName(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := "tmp-" + strings.Repeat("f", 64)
-	// The payload the caller would have published.
 	if err := os.WriteFile(repo.IncompletePath(key), []byte("payload"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -516,16 +499,12 @@ func TestFinalizeBlobRefusesReservedCollisionName(t *testing.T) {
 	if !errors.Is(err, errReservedBlobName) {
 		t.Fatalf("FinalizeBlob error = %v, want the reserved-name refusal", err)
 	}
-	// Nothing was published.
 	if _, serr := os.Stat(repo.BlobPath(key)); !os.IsNotExist(serr) {
 		t.Errorf("the refused finalize published the blob, stat err=%v", serr)
 	}
 }
 
-// TestStoreDownloadedFileAcceptsUnusualNonReservedName pins the other side
-// of the boundary: a non-canonical but NON-reserved name is still accepted.
-// The public storage API's tolerance for unusual published names is
-// unchanged; only the downloader's own staging namespace is refused.
+// Non-canonical, non-reserved blob names remain valid published content.
 func TestStoreDownloadedFileAcceptsUnusualNonReservedName(t *testing.T) {
 	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
 	if err != nil {
@@ -607,12 +586,8 @@ func TestStagingBlobPathClassifierMatchesProducerNamespace(t *testing.T) {
 			t.Errorf("staging lock path %q was not classified", name)
 		}
 	}
-	// The exhaustive producer-shape list also covers the shapes that are
-	// produced OUTSIDE the blobs/ namespace and therefore never occur there:
-	// the single-request partial of a flat-mode destination ("<name>.part"),
-	// the legacy layout metadata ("<name>.parts.json") and the persistent
-	// ownership lock ("<name>.lock"). A blob named after one of them is
-	// refused exactly like the other producer shapes.
+	// Reserve all producer name shapes inside blobs/, including forms normally
+	// created for flat destinations; a blob using one is still a staging collision.
 	for _, name := range []string{"model.part", "model.parts.json", "abc.lock", "opaque-key.lock"} {
 		if got := repo.isIncompleteBlobPath(repo.BlobPath(name)); !got {
 			t.Errorf("producer staging path %q was not classified", name)

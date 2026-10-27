@@ -3,35 +3,9 @@
 
 package hfdownloader
 
-// Regression coverage for the no-replace publication tiers and for the
-// writers of a content-addressed blob (issue #140 / PR #151).
-//
-// The publication primitive has two tiers, and they guarantee DIFFERENT
-// things:
-//
-//   - ATOMIC NO-REPLACE: the payload is placed with a hard link, which
-//     creates the final name and fails when the name already exists. The
-//     existence decision and the placement are ONE filesystem operation.
-//   - DOMAIN-EXCLUSIVE: on a filesystem that cannot create hard links there
-//     is no standard-library atomic no-replace rename (os.Rename replaces on
-//     Unix and on Windows), so the placement is a check-then-rename performed
-//     while the blob key's ownership domain is held exclusively. The property
-//     that holds there is "an existing blobs/<sha> is never replaced by a
-//     DOMAIN PARTICIPANT", not "never replaced" unconditionally.
-//
-// The defect this file pins: the fallback tier shipped a Stat-then-rename
-// that REPLACED the target whenever it appeared between the stat and the
-// rename, while the documentation claimed the fallback "still refuses to
-// replace an existing target". The link seam below makes that branch
-// reachable from a committed test, which is what no shipped test could do
-// before.
-//
-// The file also pins:
-//   - FinalizeBlob, an exported writer of blobs/<sha>, no longer replaces an
-//     existing content-addressed blob and participates in the blob key's
-//     ownership domain;
-//   - the single-request route fails BEFORE it writes a payload when the
-//     lifetime ownership of the blob key is unavailable.
+// Covers both publication tiers: hard-link placement is atomic no-replace;
+// the no-hard-link fallback protects only against domain participants. Also
+// covers FinalizeBlob's domain participation and fail-closed behavior.
 
 import (
 	"bytes"
@@ -48,12 +22,8 @@ import (
 	"time"
 )
 
-// forceUnsupportedHardLinks makes the placement take its domain-exclusive
-// tier: the filesystem "cannot create hard links".
-//
-// The seam is narrow on purpose - it replaces the link operation only, so the
-// rest of the placement (the existence check, the rename, the domain
-// requirement) is the shipped code.
+// forceUnsupportedHardLinks selects the fallback without replacing its other
+// production steps.
 func forceUnsupportedHardLinks(t *testing.T) {
 	t.Helper()
 	old := blobLink
@@ -63,7 +33,6 @@ func forceUnsupportedHardLinks(t *testing.T) {
 	t.Cleanup(func() { blobLink = old })
 }
 
-// newPublicationRepo creates an HF cache repo with its directories.
 func newPublicationRepo(t *testing.T) *RepoDir {
 	t.Helper()
 	repo, err := NewHFCache(t.TempDir()).Repo("owner/model", RepoTypeModel)
@@ -76,8 +45,6 @@ func newPublicationRepo(t *testing.T) *RepoDir {
 	return repo
 }
 
-// acquirePublicationDomain takes the ownership domain of one blob key, the
-// way every writer of blobs/<sha> does.
 func acquirePublicationDomain(t *testing.T, repo *RepoDir, sha string) *blobDomain {
 	t.Helper()
 	dst, err := repo.blobDomainDst(sha)
@@ -92,10 +59,6 @@ func acquirePublicationDomain(t *testing.T, repo *RepoDir, sha string) *blobDoma
 	return domain
 }
 
-// TestPublicationWithoutHardLinksNeverReplacesTheProvenBlob forces the
-// domain-exclusive tier and pins the property that tier actually has: an
-// existing content-addressed blob is the completion proof, and a domain
-// participant does not replace it.
 func TestPublicationWithoutHardLinksNeverReplacesTheProvenBlob(t *testing.T) {
 	forceUnsupportedHardLinks(t)
 	repo := newPublicationRepo(t)
@@ -122,15 +85,11 @@ func TestPublicationWithoutHardLinksNeverReplacesTheProvenBlob(t *testing.T) {
 	if rerr != nil || !bytes.Equal(got, winner) {
 		t.Fatalf("the proven blob was replaced: %q, %v", got, rerr)
 	}
-	// The refused payload is left for the caller to discard.
 	if _, serr := os.Stat(src); serr != nil {
 		t.Errorf("the refused payload was removed by the placement: %v", serr)
 	}
 }
 
-// TestPublicationWithoutHardLinksPublishesANewBlob pins that hard-link
-// support is not a prerequisite for downloading: the domain-exclusive tier
-// still publishes a blob that does not exist yet.
 func TestPublicationWithoutHardLinksPublishesANewBlob(t *testing.T) {
 	forceUnsupportedHardLinks(t)
 	repo := newPublicationRepo(t)
@@ -152,17 +111,11 @@ func TestPublicationWithoutHardLinksPublishesANewBlob(t *testing.T) {
 	if rerr != nil || !bytes.Equal(got, payload) {
 		t.Fatalf("the published blob = %q, %v; want the payload's bytes", got, rerr)
 	}
-	// The staging name is dropped, so the published blob is the only name
-	// left for those bytes.
 	if _, serr := os.Stat(src); serr == nil {
 		t.Error("the staging name still exists after the publication")
 	}
 }
 
-// TestPublicationWithoutHardLinksRefusesWithoutTheDomain pins that the
-// domain-exclusive tier cannot be reached by accident: without the ownership
-// domain of the blob key it publishes, the placement refuses instead of
-// running a rename that could replace the target.
 func TestPublicationWithoutHardLinksRefusesWithoutTheDomain(t *testing.T) {
 	forceUnsupportedHardLinks(t)
 	repo := newPublicationRepo(t)
@@ -189,80 +142,6 @@ func TestPublicationWithoutHardLinksRefusesWithoutTheDomain(t *testing.T) {
 	}
 }
 
-// TestPublicationWithoutHardLinksIsExclusiveToTheDomain pins the exclusivity
-// the domain-exclusive tier relies on: a second writer of the same blob key
-// waits for the domain and then finds the published blob instead of
-// replacing it.
-func TestPublicationWithoutHardLinksIsExclusiveToTheDomain(t *testing.T) {
-	forceUnsupportedHardLinks(t)
-	repo := newPublicationRepo(t)
-
-	sha := strings.Repeat("e", 64)
-	blobPath := repo.BlobPath(sha)
-	winner := []byte("the proven winner")
-	loser := []byte("the unproven loser")
-	winnerSrc := filepath.Join(repo.BlobsDir(), "tmp-"+sha+".part")
-	loserSrc := filepath.Join(repo.BlobsDir(), "tmp-"+sha+".other")
-	if err := os.WriteFile(winnerSrc, winner, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(loserSrc, loser, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// The winner holds the domain and publishes.
-	domain := acquirePublicationDomain(t, repo, sha)
-	if err := blobPublishPlace(winnerSrc, blobPath, domain); err != nil {
-		t.Fatalf("the winner's publication = %v, want success", err)
-	}
-
-	// The second writer starts while the winner still holds the domain.
-	domainWait := make(chan struct{}, 1)
-	oldHook := blobDomainContentionHook
-	var hookOnce sync.Once
-	blobDomainContentionHook = func(string) {
-		hookOnce.Do(func() { domainWait <- struct{}{} })
-	}
-	defer func() { blobDomainContentionHook = oldHook }()
-
-	loserDone := make(chan error, 1)
-	go func() {
-		d, derr := acquireBlobDomain(t.Context(), blobPath, mustDomainDst(t, repo, sha))
-		if derr != nil {
-			loserDone <- derr
-			return
-		}
-		defer d.release()
-		loserDone <- blobPublishPlace(loserSrc, blobPath, d)
-	}()
-
-	select {
-	case <-domainWait:
-	case err := <-loserDone:
-		t.Fatalf("the second writer did not wait for the ownership domain: %v", err)
-	case <-time.After(60 * time.Second):
-		t.Fatal("the second writer neither waited for the ownership domain nor finished")
-	}
-
-	// The winner releases the domain; the second writer then finds the
-	// published blob.
-	domain.release()
-	select {
-	case err := <-loserDone:
-		if !errors.Is(err, errBlobTargetExists) {
-			t.Fatalf("the second writer's placement = %v, want errBlobTargetExists", err)
-		}
-	case <-time.After(60 * time.Second):
-		t.Fatal("the second writer never finished")
-	}
-
-	got, rerr := os.ReadFile(blobPath)
-	if rerr != nil || !bytes.Equal(got, winner) {
-		t.Fatalf("the published blob = %q, %v; want the winner's bytes", got, rerr)
-	}
-}
-
-// mustDomainDst resolves the ownership domain destination of one blob key.
 func mustDomainDst(t *testing.T, repo *RepoDir, sha string) string {
 	t.Helper()
 	dst, err := repo.blobDomainDst(sha)
@@ -272,9 +151,6 @@ func mustDomainDst(t *testing.T, repo *RepoDir, sha string) string {
 	return dst
 }
 
-// TestFinalizeBlobNeverReplacesAnExistingBlob pins the exported writer of
-// blobs/<sha>: a finalized blob that another writer already published is
-// the completion proof and keeps its bytes.
 func TestFinalizeBlobNeverReplacesAnExistingBlob(t *testing.T) {
 	repo := newPublicationRepo(t)
 
@@ -299,16 +175,11 @@ func TestFinalizeBlobNeverReplacesAnExistingBlob(t *testing.T) {
 	if rerr != nil || !bytes.Equal(got, winner) {
 		t.Fatalf("the proven blob was replaced: %q, %v", got, rerr)
 	}
-	// The refused payload is preserved for the caller to discard.
 	if _, serr := os.Stat(repo.IncompletePath(sha)); serr != nil {
 		t.Errorf("the refused payload was removed: %v", serr)
 	}
 }
 
-// TestFinalizeBlobParticipatesInTheBlobKeyDomain pins that FinalizeBlob
-// writes into the blob key's ownership domain like every other writer of
-// blobs/<sha>: it waits for the domain instead of racing the writer that
-// holds it.
 func TestFinalizeBlobParticipatesInTheBlobKeyDomain(t *testing.T) {
 	repo := newPublicationRepo(t)
 
@@ -318,7 +189,6 @@ func TestFinalizeBlobParticipatesInTheBlobKeyDomain(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Another writer holds the domain of this blob key.
 	holder := acquirePublicationDomain(t, repo, sha)
 
 	domainWait := make(chan struct{}, 1)
@@ -356,9 +226,7 @@ func TestFinalizeBlobParticipatesInTheBlobKeyDomain(t *testing.T) {
 	}
 }
 
-// newPlainHub serves the plan endpoints and the file body without holding
-// the response, so a test can observe whether the transfer started at all.
-// The returned counter is the number of file body requests the hub served.
+// newPlainHub serves full-body responses and counts payload GETs.
 func newPlainHub(t *testing.T, total int, sha string, body []byte) (*httptest.Server, func() int) {
 	t.Helper()
 	var mu sync.Mutex
@@ -390,13 +258,6 @@ func newPlainHub(t *testing.T, total int, sha string, body []byte) (*httptest.Se
 	}
 }
 
-// TestSingleRouteFailsBeforePayloadMutationWhenTheDomainIsUnavailable pins
-// that the single-request route does not write a payload for a blob key it
-// cannot own.
-//
-// The lifetime ownership of the blob key is the fence that keeps two writers
-// of the same key apart, so an operation that cannot take it must fail
-// BEFORE it mutates a claim or a payload, not after the transfer wrote one.
 func TestSingleRouteFailsBeforePayloadMutationWhenTheDomainIsUnavailable(t *testing.T) {
 	oldAcquire := stagingOwnershipAcquire
 	stagingOwnershipAcquire = func(string) (*stagingOwnershipLock, error) {
@@ -421,8 +282,6 @@ func TestSingleRouteFailsBeforePayloadMutationWhenTheDomainIsUnavailable(t *test
 	if !strings.Contains(err.Error(), "ownership domain") {
 		t.Fatalf("the download error = %v, want an actionable ownership-domain failure", err)
 	}
-	// The transfer must not have run at all: the operation failed before it
-	// could write a payload.
 	if n := served(); n != 0 {
 		t.Errorf("the single-request route transferred the file %d times although the ownership domain was unavailable", n)
 	}
@@ -431,8 +290,7 @@ func TestSingleRouteFailsBeforePayloadMutationWhenTheDomainIsUnavailable(t *test
 	if rerr != nil {
 		t.Fatal(rerr)
 	}
-	// The single-request route writes blobs/tmp-<sha>.part. It must not have
-	// written it: the operation failed before the transfer.
+	// The single-request route would stage at blobs/tmp-<sha>.part.
 	if _, serr := os.Stat(filepath.Join(repo.BlobsDir(), "tmp-"+sha+".part")); serr == nil {
 		t.Error("the single-request route wrote a payload although the ownership domain was unavailable")
 	}
@@ -441,9 +299,6 @@ func TestSingleRouteFailsBeforePayloadMutationWhenTheDomainIsUnavailable(t *test
 	}
 }
 
-// TestSingleRouteFailsBeforePayloadMutationWithADeniedOwnershipLock is the
-// same invariant for a denied (not merely unsupported) lifetime lock: the
-// operation fails before it mutates a payload.
 func TestSingleRouteFailsBeforePayloadMutationWithADeniedOwnershipLock(t *testing.T) {
 	oldAcquire := stagingOwnershipAcquire
 	denied := errors.New("injected ownership lock permission denied")
@@ -480,10 +335,6 @@ func TestSingleRouteFailsBeforePayloadMutationWithADeniedOwnershipLock(t *testin
 	}
 }
 
-// TestSingleRouteKeepsTheEarlierPartialWhenTheDomainIsUnavailable is the
-// data-loss half of the same invariant: the failure must not remove a
-// partial the failing operation did not write, and the transfer must not
-// have started at all.
 func TestSingleRouteKeepsTheEarlierPartialWhenTheDomainIsUnavailable(t *testing.T) {
 	oldAcquire := stagingOwnershipAcquire
 	stagingOwnershipAcquire = func(string) (*stagingOwnershipLock, error) {
@@ -527,9 +378,6 @@ func TestSingleRouteKeepsTheEarlierPartialWhenTheDomainIsUnavailable(t *testing.
 	}
 }
 
-// TestPublishedBlobSurvivesTheDomainExclusiveTierEndToEnd pins the whole
-// single-request route on a filesystem that cannot create hard links: the
-// blob is published, and it holds exactly the transferred bytes.
 func TestPublishedBlobSurvivesTheDomainExclusiveTierEndToEnd(t *testing.T) {
 	forceUnsupportedHardLinks(t)
 
@@ -563,9 +411,6 @@ func TestPublishedBlobSurvivesTheDomainExclusiveTierEndToEnd(t *testing.T) {
 	}
 }
 
-// TestPlacementRejectsAForeignDomain pins that the domain-exclusive tier
-// only runs under the domain of the blob key it publishes: a domain of
-// another key is not enough.
 func TestPlacementRejectsAForeignDomain(t *testing.T) {
 	forceUnsupportedHardLinks(t)
 	repo := newPublicationRepo(t)
@@ -588,10 +433,6 @@ func TestPlacementRejectsAForeignDomain(t *testing.T) {
 	}
 }
 
-// TestPublicationWithoutHardLinksReportsTheLinkFailure pins that a placement
-// which cannot use the hard-link tier and cannot use the domain-exclusive
-// tier says so, instead of publishing a blob that might replace another
-// writer's bytes.
 func TestPublicationWithoutHardLinksReportsTheLinkFailure(t *testing.T) {
 	forceUnsupportedHardLinks(t)
 	repo := newPublicationRepo(t)

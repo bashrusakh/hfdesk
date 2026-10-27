@@ -92,43 +92,8 @@ jobs:
       - name: Test selected-cache path locality
         run: go test ./internal/server -run '^TestCacheSelectionRejectsNonLocalRepoBeforeJoining$' -count=1 -v
 
-      # The downloader's runtime behavior is the part of HFDesk that is
-      # platform-specific in the most dangerous way: the lifetime ownership
-      # lock is an OS primitive (flock on Unix, an exclusive-share CreateFile
-      # handle on Windows), and the resume, publication and cleanup rules
-      # depend on it. Without this step the green Windows badge covers only
-      # the build, the vet and two server tests, so a regression in the
-      # downloader's Windows runtime would ship unnoticed.
-      #
-      # The selection is deliberately narrow: the full package suite has
-      # pre-existing Windows-compatibility gaps (symlink creation needs
-      # privileges the runner does not grant), and those gaps are not what
-      # this step is for. Every test below needs no symlink, no privilege and
-      # no platform-specific path shape, and each one covers a distinct part
-      # of the contract:
-      #
-      #   - the ownership lock itself: a live owner in ANOTHER process blocks
-      #     the takeover (the CreateFile sharing violation on Windows), a
-      #     crashed owner releases the lock at death, and the non-owning
-      #     observation tells a writer apart from a reader;
-      #   - the cross-process claim exclusion: independent processes claiming
-      #     one staging file never mistake each other for owners;
-      #   - the ranged protocol and the resume: out-of-order ranges produce
-      #     exact bytes, and a pinned matching identity resumes only the
-      #     missing suffix;
-      #   - the publication: an existing content-addressed blob is never
-      #     replaced, through the no-replace placement and through
-      #     FinalizeBlob;
-      #   - the single-request identity: the staged bytes of one revision are
-      #     inherited only under the matching identity;
-      #   - the flat/output-mode destination domain: both routes and the
-      #     cleanup resolve ONE ownership identity for a flat destination,
-      #     and the hand-off to the single-request path holds it too;
-      #   - explicit-cancel cleanup while the single-path content proof is
-      #     running: the proof can reach the cleanup with the partial's
-      #     writable handle still open, so the cleanup must close that handle
-      #     before removing the cancelled `.part` and its `.part.meta`
-      #     sidecar (Windows cannot unlink an open file).
+      # Keep this Windows subset symlink- and privilege-free. It covers ownership,
+      # resume, publication, and closing the partial before cancel cleanup.
       - name: Test downloader ownership, resume and publication
         run: go test ./pkg/hfdownloader -count=1 -run '^(TestStagingOSLockHeldByLiveProcessBlocksTakeover|TestStagingOSLockReleasedByCrashedProcess|TestStagingOwnershipHolderObservation|TestStagingOwnership_CrossProcessClaimantsDoNotSeeEachOtherAsOwners|TestRangedMultipart_OutOfOrderRangesProduceExactBytes|TestRangedResumeKeepsAPinnedMatchingIdentity|TestPublishBlobNoReplaceRefusesToOverwrite|TestFinalizeBlobNeverReplacesAnExistingBlob|TestSinglePathIdentityKeepsResumeForTheSameRevision|TestDownloadFlatModeRoutesExcludeEachOther|TestDownloadFlatModeSingleRouteWritersAreExcluded|TestDownloadFlatModeSingleRouteTakesTheDestinationDomain|TestDownloadFlatModeUnknownSizeHandoffUsesOneDomain|TestCleanupJobPartFilesFlatModeRespectsTheDestinationDomain|TestDownloadSingle_CancelDuringProofRemovesPartial)$' -v
 
@@ -241,4 +206,3 @@ jobs:
       # platform would otherwise stay unnoticed until a macOS installation.
       - name: Test command layer
         run: go test ./cmd/hfdesk -v
-

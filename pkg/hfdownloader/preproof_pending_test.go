@@ -3,14 +3,8 @@
 
 package hfdownloader
 
-// Regression coverage for the durable pre-publication proof gate (issue #140,
-// PR #151 follow-up). A known-digest proof must be recorded as pending before it
-// starts and cleared only after it succeeds, so a crash mid-proof, a mismatch
-// whose cleanup cannot take the metadata gate, or a later Verify-mode change
-// (including "size") can never publish unproven all-Done ranges.
-//
-// The flag is read/written as raw JSON so the same test binary can also run
-// against the pre-fix archive, where IncompleteMeta has no such field.
+// A pending known-digest proof must survive a crash, failed cleanup, or a
+// Verify-mode change.
 
 import (
 	"bytes"
@@ -65,9 +59,8 @@ func setProofPendingRaw(t *testing.T, metaPath string, pending bool) {
 	}
 }
 
-// proofRecoveryHub declares one LFS file with the digest of content and serves
-// content for payload requests, counting payload GETs so a test can prove a
-// size run re-downloaded instead of laundering a surviving staging record.
+// proofRecoveryHub serves one LFS file and counts ranged GETs to distinguish
+// re-download from publication of surviving staging bytes.
 func proofRecoveryHub(t *testing.T, content []byte) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
 	sha := singleTestSHA(content)
@@ -93,11 +86,8 @@ func proofRecoveryHub(t *testing.T, content []byte) (*httptest.Server, *atomic.I
 	return srv, &gets
 }
 
-// TestStagingProofPendingSurvivesCleanupFailure reproduces the fail-safe gap:
-// a known-digest mismatch whose owned discard cannot take the metadata gate
-// must not leave an all-Done record that a later Verify=size run can publish
-// with zero ranged GETs. The durable flag and the poisoned (zero-length)
-// payload must force a discard/re-download (or a re-proof failure).
+// If mismatch cleanup cannot acquire the metadata gate, a later size-mode run
+// must re-prove or discard the surviving all-Done state, never publish it unchecked.
 func TestStagingProofPendingSurvivesCleanupFailure(t *testing.T) {
 	const total = 64 * 1024
 	good := rangedTestPayload(total)
@@ -181,10 +171,8 @@ func TestStagingProofPendingSurvivesCleanupFailure(t *testing.T) {
 	}
 }
 
-// TestStagingProofPendingForcesReproofInSizeMode simulates a crash in the
-// middle of the proof: a fully committed record carries ProofPending. A later
-// Verify=size run must still hash before publishing — a mismatch must not
-// publish, and matching content must publish with exactly one pass.
+// An all-Done ProofPending record must receive one proof in size mode:
+// corrupt bytes fail without publication; matching bytes publish.
 func TestStagingProofPendingForcesReproofInSizeMode(t *testing.T) {
 	const total = 64 * 1024
 	good := rangedTestPayload(total)
@@ -256,10 +244,8 @@ func TestStagingProofPendingForcesReproofInSizeMode(t *testing.T) {
 	}
 }
 
-// TestStagingProofSuccessClearsPendingDurably proves the flag is cleared and
-// flushed after a successful proof before publication. The publish rename is
-// forced to fail, leaving the record inspectable; a subsequent Verify=size run
-// must trust the proven bytes (zero hash passes) and publish them.
+// Fail publication after proof so the cleared durable flag remains inspectable;
+// a later size-mode resume must publish without another hash pass.
 func TestStagingProofSuccessClearsPendingDurably(t *testing.T) {
 	const total = 64 * 1024
 	good := rangedTestPayload(total)
@@ -309,7 +295,7 @@ func TestStagingProofSuccessClearsPendingDurably(t *testing.T) {
 		t.Error("ProofPending was not cleared durably after a successful proof")
 	}
 
-	// A subsequent size run must trust the proven record: no re-hash, no GETs.
+	// A subsequent size run trusts the proven record without another hash pass.
 	if err := os.RemoveAll(pub); err != nil {
 		t.Fatal(err)
 	}

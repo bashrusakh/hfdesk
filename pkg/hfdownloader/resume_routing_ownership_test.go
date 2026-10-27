@@ -3,16 +3,8 @@
 
 package hfdownloader
 
-// Correction #7 regressions (issue #140 / PR #151):
-//   - a fallback (LockFenced=false) record with a live foreign owner must not
-//     be displaced by a lock-capable process in claim or cleanup;
-//   - a lock-fenced record with a free lock remains take-over-able;
-//   - usable legacy or versioned staging state keeps the multipart route when
-//     the item is ranged-capable even below the configured threshold;
-//   - without range support the single path warns, then removes the obsolete
-//     versioned staging pair only after the final file is durable and
-//     claim-checked;
-//   - an ignored-Range 200 restart clears the inherited-bytes proof flag.
+// Covers ownership fencing, resumable-route selection, and cleanup timing when
+// range support is unavailable or an ignored-Range response restarts transfer.
 
 import (
 	"bytes"
@@ -30,8 +22,8 @@ import (
 	"time"
 )
 
-// recordingHub declares one file (LFS or plain) with the SHA-256 of full and
-// serves full for payload requests. It records every ranged GET.
+// recordingHub declares one LFS/plain file with full's digest and serves full.
+// It records each payload GET's Range header, including empty full-body headers.
 func recordingHub(t *testing.T, full []byte, rel string, lfs bool) (*httptest.Server, func() []string) {
 	t.Helper()
 	sha := singleTestSHA(full)
@@ -224,11 +216,8 @@ func TestCleanupJobPartFiles_FallbackLiveOwnerSurvives(t *testing.T) {
 	}
 }
 
-// TestDownload_LowThresholdOldMultipartFamilyIsReDownloaded pins the S0
-// routing rule: a pre-#140 .part-NN/.parts.json family is not resume state, so
-// it does not force the multipart route. With a threshold above the item size
-// the item takes the single-request path, downloads the whole file from zero,
-// publishes exact content, and the obsolete family is cleaned up.
+// Pre-#140 part families are not resume state: an above-size threshold must
+// keep the single route, fetch from zero and clean up the obsolete family.
 func TestDownload_LowThresholdOldMultipartFamilyIsReDownloaded(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
@@ -252,7 +241,7 @@ func TestDownload_LowThresholdOldMultipartFamilyIsReDownloaded(t *testing.T) {
 		Endpoint:           srv.URL,
 		Concurrency:        2,
 		MaxActiveDownloads: 1,
-		MultipartThreshold: "1MB", // routes the 4 KiB item to the single path
+		MultipartThreshold: "1MB",
 		Verify:             "size",
 		Retries:            0,
 		StallTimeout:       "0",
@@ -262,7 +251,6 @@ func TestDownload_LowThresholdOldMultipartFamilyIsReDownloaded(t *testing.T) {
 		t.Fatalf("Download: %v", err)
 	}
 	assertExactFile(t, dst, full)
-	// The single-request path re-downloads from zero: one full GET, no range.
 	if got := getRanges(); len(got) != 1 || got[0] != "" {
 		t.Errorf("payload GETs = %v, want exactly one full-body request (no old-format resume)", got)
 	}
@@ -394,7 +382,6 @@ func TestDownloadSingle_IgnoredRangeRestartClearsInheritedProof(t *testing.T) {
 		mu.Lock()
 		ranges = append(ranges, r.Header.Get("Range"))
 		mu.Unlock()
-		// Ignore the requested range and return the whole body with 200.
 		w.Header().Set("Content-Length", strconv.Itoa(total))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(full)

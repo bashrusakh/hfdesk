@@ -3,30 +3,9 @@
 
 package hfdownloader
 
-// Regression coverage for the flat/output-mode DESTINATION domain.
-//
-// A flat/output-mode destination owns ONE ownership domain, and both routes
-// and the cleanup resolve that ONE identity:
-//
-//   - the domain's lifetime lock is the persistent sibling of the MULTIPART
-//     staging name, <destination>.incomplete.lock - the item-level
-//     destination-domain lock every route acquires exactly once; the multipart
-//     claim takes no lock of its own;
-//   - the single-request route holds that domain while it transfers.
-//
-// One lock file therefore excludes every pair of writers of the same flat
-// destination: single-vs-single, single-vs-multipart and
-// multipart-vs-multipart. Before the flat destination owned a domain, the
-// single-request route took no lock at all, so two writers of the same flat
-// destination interleaved over the same payload, and a cleanup could delete
-// another writer's LIVE partial.
-//
-// The cases below drive the real Download path, so they exercise the product
-// routing and not just the raw lock primitive. The synchronization is
-// deterministic and never a sleep: the live owner is held INSIDE the
-// transfer by a gated local server (the first payload request signals the
-// test), and the production contention hooks prove that the second writer
-// really met the contended lock.
+// Exercises same-destination exclusion across single/multipart writers and
+// cleanup through Download. A gated local server and contention hook establish
+// overlap deterministically.
 
 import (
 	"bytes"
@@ -44,20 +23,9 @@ import (
 	"time"
 )
 
-// flatModeGatedHub serves one file and holds every PAYLOAD response until
-// the test opens the gate.
-//
-// The first payload request closes entered, so the test knows that a writer
-// is inside the transfer - and therefore holds the destination's ownership
-// domain - without sleeping. The HEAD requests are NOT gated: the multipart
-// route resolves the size with a HEAD before it claims the staging, and a
-// gated HEAD would stall the very writer the test is waiting for.
-//
-// resolveRevision says whether the endpoint resolves the requested revision
-// to an immutable commit. When it does not, the planner falls back to the
-// requested revision, which pins nothing: the staging record of such a run
-// is NOT resumable, so a second writer does not switch to the multipart
-// route to consume it.
+// flatModeGatedHub holds payload GETs and signals transfer start. HEAD is left
+// ungated because multipart routing needs it to resolve size. resolveRev
+// selects whether fixtures use a pinned commit.
 type flatModeGatedHub struct {
 	srv        *httptest.Server
 	entered    chan struct{}
@@ -68,14 +36,11 @@ type flatModeGatedHub struct {
 	resolveRev bool
 }
 
-// newFlatModeGatedHub starts the gated local server for one file.
 func newFlatModeGatedHub(t *testing.T, full []byte, rel string, lfs bool) *flatModeGatedHub {
 	t.Helper()
 	return newFlatModeGatedHubWithRevision(t, full, rel, lfs, true)
 }
 
-// newFlatModeGatedHubWithRevision starts the gated local server and decides
-// whether the endpoint resolves the requested revision.
 func newFlatModeGatedHubWithRevision(t *testing.T, full []byte, rel string, lfs, resolveRev bool) *flatModeGatedHub {
 	t.Helper()
 	h := &flatModeGatedHub{
@@ -93,8 +58,6 @@ func newFlatModeGatedHubWithRevision(t *testing.T, full []byte, rel string, lfs,
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/revision/main"):
 			if !h.resolveRev {
-				// The endpoint does not resolve the revision: the planner
-				// falls back to the requested revision, which pins nothing.
 				http.NotFound(w, r)
 				return
 			}
@@ -117,20 +80,17 @@ func newFlatModeGatedHubWithRevision(t *testing.T, full []byte, rel string, lfs,
 		}
 	}))
 	t.Cleanup(func() {
-		// The gate is opened before the server is closed, so a still-blocked
-		// handler cannot keep the server from shutting down.
+		// Unblock handlers before closing the test server.
 		h.open()
 		h.srv.Close()
 	})
 	return h
 }
 
-// open releases the gate. It is safe to call more than once.
 func (h *flatModeGatedHub) open() {
 	h.gateOnce.Do(func() { close(h.gate) })
 }
 
-// awaitPayloadEntered blocks until a writer is inside the transfer.
 func (h *flatModeGatedHub) awaitPayloadEntered(t *testing.T) {
 	t.Helper()
 	select {
@@ -140,24 +100,8 @@ func (h *flatModeGatedHub) awaitPayloadEntered(t *testing.T) {
 	}
 }
 
-// TestDownloadFlatModeRoutesExcludeEachOther pins the exclusion between the
-// two routes of ONE flat destination.
-//
-// Before the flat destination owned a domain, the single-request route took
-// no lock at all, so a single-route writer and a multipart-route writer of
-// the same destination interleaved over the same payload and could publish
-// corrupt bytes.
-//
-// Both directions are covered, because they fail differently: the
-// single-request writer WAITS for the domain and then fails with the
-// actionable live-owner error, while the multipart writer's claim finds the
-// contended lock at once.
-//
-// The multipart-owner direction uses an endpoint that does NOT resolve the
-// requested revision. A pinned, resumable staging record would make the
-// second writer switch to the multipart route to consume that state (the
-// pre-existing resume rule), and the case under test is the writer that
-// stays on the single-request route and meets the destination's domain.
+// Tests both single/multipart contention directions. The multipart-owner case
+// uses an unpinned revision so resume routing does not change the route under test.
 func TestDownloadFlatModeRoutesExcludeEachOther(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -170,10 +114,6 @@ func TestDownloadFlatModeRoutesExcludeEachOther(t *testing.T) {
 	})
 }
 
-// testFlatModeRoutesExcludeEachOther is the body of the cross-route
-// exclusion case: the owner runs on ownerThreshold and holds the
-// destination's domain inside the transfer, the writer runs on
-// writerThreshold and must be excluded.
 func testFlatModeRoutesExcludeEachOther(t *testing.T, ownerThreshold, writerThreshold string, resolveRev bool) {
 	t.Helper()
 	const total = 4_096
@@ -182,8 +122,6 @@ func testFlatModeRoutesExcludeEachOther(t *testing.T, ownerThreshold, writerThre
 	out := t.TempDir()
 	dst := legacyOutputDst(t, out)
 
-	// Record every ownership-domain acquisition of the run. Both routes take
-	// the ONE destination domain at item level, so both writers appear here.
 	var (
 		mu       sync.Mutex
 		acquired []string
@@ -202,12 +140,8 @@ func testFlatModeRoutesExcludeEachOther(t *testing.T, ownerThreshold, writerThre
 		ownerResult <- runFlatModeDownload(context.Background(), flatModeSettings(out, hub.srv.URL, ownerThreshold))
 	}()
 
-	// The owner is inside the transfer, so it holds the destination's domain.
 	hub.awaitPayloadEntered(t)
 
-	// The second writer is started before the owner releases the domain. It
-	// must WAIT for the domain (never take it over) instead of transferring or
-	// running its HEAD.
 	contended := installBlobDomainContentionProbe(t)
 	writerResult := make(chan flatModeOutcome, 1)
 	go func() {
@@ -226,10 +160,7 @@ func testFlatModeRoutesExcludeEachOther(t *testing.T, ownerThreshold, writerThre
 		t.Errorf("the destination exists while the owner still holds the domain, stat err=%v", serr)
 	}
 
-	// The owner publishes the exact bytes; only then may the waiting writer
-	// obtain the destination. A flat destination has no published
-	// content-addressed target to re-check, so the waiting writer downloads
-	// the file itself (never concurrently with the owner).
+	// Flat mode has no blob target to re-check after releasing the owner.
 	hub.open()
 	var owner flatModeOutcome
 	select {
@@ -253,8 +184,6 @@ func testFlatModeRoutesExcludeEachOther(t *testing.T, ownerThreshold, writerThre
 	}
 	assertExactFile(t, dst, full)
 
-	// Both writers used the ONE flat destination domain: the model has no
-	// route-private ownership fence any more.
 	mu.Lock()
 	got := append([]string(nil), acquired...)
 	mu.Unlock()
@@ -268,13 +197,8 @@ func testFlatModeRoutesExcludeEachOther(t *testing.T, ownerThreshold, writerThre
 	}
 }
 
-// TestDownloadFlatModeSingleRouteWritersAreExcluded pins that two
-// single-request writers of ONE flat destination are mutually excluded.
-//
-// The second writer waits for the destination's domain instead of writing
-// over the first writer's live partial. A flat destination has no published
-// content-addressed target to re-check, so the waiting writer obtains the
-// file itself afterwards - but never WHILE the owner holds the destination.
+// Single-request writers of one flat destination serialize; the waiter
+// transfers only after the first owner releases.
 func TestDownloadFlatModeSingleRouteWritersAreExcluded(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -291,8 +215,7 @@ func TestDownloadFlatModeSingleRouteWritersAreExcluded(t *testing.T) {
 	}()
 	hub.awaitPayloadEntered(t)
 
-	// The in-process domain contention hook proves the second writer waited
-	// for the destination's domain instead of proceeding.
+	// Observe actual domain contention before checking the waiting writer.
 	contended := installBlobDomainContentionProbe(t)
 	writerResult := make(chan flatModeOutcome, 1)
 	go func() {
@@ -300,8 +223,6 @@ func TestDownloadFlatModeSingleRouteWritersAreExcluded(t *testing.T) {
 	}()
 	awaitContention(t, contended, "the flat destination's ownership domain")
 
-	// While the owner holds the domain, the second writer transferred
-	// nothing and the destination does not exist.
 	if got := hub.payloads.Load(); got != 1 {
 		t.Errorf("payload requests while the owner holds the domain = %d, want only the owner's one", got)
 	}
@@ -309,8 +230,6 @@ func TestDownloadFlatModeSingleRouteWritersAreExcluded(t *testing.T) {
 		t.Errorf("the destination exists while the owner still holds the domain, stat err=%v", serr)
 	}
 
-	// The owner publishes the exact bytes and releases the domain; the
-	// waiting writer then obtains the domain and the file itself.
 	hub.open()
 	var owner flatModeOutcome
 	select {
@@ -333,14 +252,8 @@ func TestDownloadFlatModeSingleRouteWritersAreExcluded(t *testing.T) {
 	assertExactFile(t, dst, full)
 }
 
-// TestDownloadFlatModeUnknownSizeHandoffUsesOneDomain pins that the
-// multipart route's hand-off to the single-request path keeps the ONE
-// destination domain the item already holds, instead of taking a second lock.
-//
-// The hand-off happens when the size stays unknown after the HEAD. Under the
-// one-domain model the item acquired the domain before the HEAD, so the
-// hand-off must neither re-acquire it (a second exclusive open of the same
-// file would contend with itself) nor run without it.
+// Unknown-size handoff retains the domain acquired before HEAD; reacquiring it
+// would self-contend, while dropping it would transfer unowned.
 func TestDownloadFlatModeUnknownSizeHandoffUsesOneDomain(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -354,14 +267,9 @@ func TestDownloadFlatModeUnknownSizeHandoffUsesOneDomain(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/revision/main"):
 			_, _ = w.Write([]byte(`{"sha":"commit-unknown-size"}`))
 		case strings.Contains(r.URL.Path, "/tree/"):
-			// Both tree Size and LFS.Size are omitted: the plan's item has
-			// an unknown size.
 			node := fmt.Sprintf(`{"type":"file","path":"model.bin","lfs":{"oid":%q,"sha256":%q}}`, sha, sha)
 			_, _ = w.Write([]byte("[" + node + "]"))
 		case strings.Contains(r.URL.Path, "/resolve/") && r.Method == http.MethodHead:
-			// The HEAD advertises range support but omits Content-Length, so
-			// the size stays unknown and the multipart route hands the item
-			// over to the single-request path.
 			w.Header().Set("Accept-Ranges", "bytes")
 		case strings.Contains(r.URL.Path, "/resolve/") && r.Method == http.MethodGet:
 			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
@@ -388,8 +296,6 @@ func TestDownloadFlatModeUnknownSizeHandoffUsesOneDomain(t *testing.T) {
 	}
 	defer func() { blobDomainAcquire = oldAcquire }()
 
-	// The threshold selects the multipart route; the item-level acquisition is
-	// the only place the domain is taken.
 	res := runFlatModeDownload(context.Background(), flatModeSettings(out, srv.URL, "0"))
 	if res.err != nil {
 		t.Fatalf("Download: %v", res.err)
@@ -403,18 +309,8 @@ func TestDownloadFlatModeUnknownSizeHandoffUsesOneDomain(t *testing.T) {
 	assertExactFile(t, dst, full)
 }
 
-// TestCleanupJobPartFilesFlatModeRespectsTheDestinationDomain pins that a
-// cleanup of a flat destination removes its artifacts only while that
-// destination's domain is held.
-//
-// A cleanup that removed them without the domain could delete the LIVE
-// partial of another writer (a cancelled job whose destination meanwhile
-// became owned by another job), and that writer would keep writing to an
-// unlinked inode and fail its later publication with ENOENT.
-//
-// The second half pins the other side of the same contract: the job that
-// owns the destination can still clean up its OWN artifacts, because its
-// writer released the domain when it returned.
+// Cleanup preserves a live flat-destination owner's partial and removes it
+// once that domain is free.
 func TestCleanupJobPartFilesFlatModeRespectsTheDestinationDomain(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -434,8 +330,6 @@ func TestCleanupJobPartFilesFlatModeRespectsTheDestinationDomain(t *testing.T) {
 		}
 	}
 
-	// A live writer holds the destination's domain: the persistent sibling
-	// lock of the multipart staging name.
 	owner, err := acquireStagingOwnershipLock(flatDomainLockSrc(dst))
 	if err != nil {
 		t.Fatal(err)
@@ -454,8 +348,6 @@ func TestCleanupJobPartFilesFlatModeRespectsTheDestinationDomain(t *testing.T) {
 		}
 	}
 
-	// The owner released the destination: the job's own artifacts are
-	// removed.
 	owner.release()
 	if err := CleanupJobPartFiles(Settings{OutputDir: out}, []string{dst}); err != nil {
 		t.Fatalf("CleanupJobPartFiles: %v", err)

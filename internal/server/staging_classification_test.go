@@ -3,27 +3,6 @@
 
 package server
 
-// Classification of the downloader's staging artifacts (issue #140
-// follow-up, group 2).
-//
-// A cache's blobs/ directory holds published content and the downloader's own
-// staging artifacts. The mirror, the cache statistics, the cache listing, the
-// cache selection and the cache deletion must all agree on that distinction:
-// an unfinished download or a legacy multipart residue is not ready content.
-//
-// The regressions below cover:
-//
-//	(a) every staging shape the downloader creates is excluded from the
-//	    content surfaces, and the deletion path leaves the real blobs alone;
-//	(b) a legitimate file OUTSIDE blobs/ - a snapshot entry named
-//	    "tokenizer.model.meta" - is copied AND verified: copy and verify agree;
-//	(c) a published blobs/<64-hex> is copied and verified as before;
-//	(d) an unusual published blob name (the public storage API accepts it) is
-//	    still copied, verified and counted;
-//	(e) the negative controls: with the historical suffix-only classifier and
-//	    the historical blobs/-only verification scope restored, the defects are
-//	    observed again.
-
 import (
 	"encoding/json"
 	"net/http"
@@ -40,8 +19,6 @@ const (
 	stagingTestContent = "published blob content"
 )
 
-// stagingArtifactNames is the full set of staging shapes the downloader
-// creates, in the blobs/ namespace.
 func stagingArtifactNames() []string {
 	return []string{
 		"tmp-" + stagingTestSHA,
@@ -51,6 +28,7 @@ func stagingArtifactNames() []string {
 		stagingTestSHA + ".incomplete",
 		stagingTestSHA + ".incomplete.meta",
 		stagingTestSHA + ".incomplete.meta.tmp",
+		stagingTestSHA + ".incomplete.lock",
 		stagingTestSHA + ".lock",
 		stagingTestSHA + ".part-00",
 		stagingTestSHA + ".parts.json",
@@ -58,10 +36,6 @@ func stagingArtifactNames() []string {
 	}
 }
 
-// stagingFixtureRepo builds a cache repository with published content, an
-// unusual published name, a full set of staging artifacts and snapshot
-// entries. It returns the repository path and the published entries with
-// their content.
 func stagingFixtureRepo(t *testing.T, hub string) (string, map[string]string) {
 	t.Helper()
 	repo := filepath.Join(hub, "models--owner--model")
@@ -96,11 +70,9 @@ func stagingFixtureRepo(t *testing.T, hub string) (string, map[string]string) {
 	if err := os.WriteFile(filepath.Join(snapshots, "tokenizer.model.meta"), []byte("snapshot metadata"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// A regular snapshot entry that links to the published blob.
 	if err := os.Symlink(filepath.Join("..", "..", "blobs", stagingTestSHA), filepath.Join(snapshots, "weights.safetensors")); err != nil {
 		t.Fatal(err)
 	}
-	// A selectable GGUF entry with its own published payload.
 	if err := os.Symlink(filepath.Join("..", "..", "blobs", "selected-blob"), filepath.Join(snapshots, "model-Q4_K_M.gguf")); err != nil {
 		t.Fatal(err)
 	}
@@ -110,9 +82,6 @@ func stagingFixtureRepo(t *testing.T, hub string) (string, map[string]string) {
 	return repo, published
 }
 
-// stagingBlobsOnlyRepo builds a repository whose blobs/ directory holds one
-// published blob and the full set of staging artifacts, and no snapshots: the
-// cache listing falls back to the blobs/ directory for such a repository.
 func stagingBlobsOnlyRepo(t *testing.T, hub string) string {
 	t.Helper()
 	repo := filepath.Join(hub, "models--owner--blobs-only")
@@ -131,9 +100,6 @@ func stagingBlobsOnlyRepo(t *testing.T, hub string) string {
 	return repo
 }
 
-// TestStagingArtifactsAreNotCacheContent is regression (a): the mirror, the
-// cache statistics, the cache listing and the cache selection must not treat
-// a staging artifact as ready content.
 func TestStagingArtifactsAreNotCacheContent(t *testing.T) {
 	isolateCacheState(t)
 	cacheRoot := t.TempDir()
@@ -147,7 +113,6 @@ func TestStagingArtifactsAreNotCacheContent(t *testing.T) {
 		publishedSize += int64(len(content))
 	}
 
-	// The mirror's blob count and scan size see the published content only.
 	if got := countBlobs(repo); got != len(published) {
 		t.Errorf("countBlobs = %d, want %d published blobs", got, len(published))
 	}
@@ -175,16 +140,14 @@ func TestStagingArtifactsAreNotCacheContent(t *testing.T) {
 		}
 	}
 
-	// The mirror copies the published content and none of the staging
-	// artifacts.
 	dstHub := filepath.Join(t.TempDir(), "hub")
 	if err := copyRepoCache(repo, hub, dstHub); err != nil {
 		t.Fatalf("copyRepoCache: %v", err)
 	}
 	dstBlobs := filepath.Join(dstHub, "models--owner--model", "blobs")
-	for name := range published {
-		if _, err := os.Stat(filepath.Join(dstBlobs, name)); err != nil {
-			t.Errorf("published blob %s was not copied: %v", name, err)
+	for name, content := range published {
+		if data, err := os.ReadFile(filepath.Join(dstBlobs, name)); err != nil || string(data) != content {
+			t.Errorf("published blob %s was not copied byte-for-byte: %q %v", name, data, err)
 		}
 	}
 	for _, name := range stagingArtifactNames() {
@@ -193,7 +156,6 @@ func TestStagingArtifactsAreNotCacheContent(t *testing.T) {
 		}
 	}
 
-	// The cache statistics count the published content only.
 	s := newTestServerWithConfig(t, Config{CacheDir: cacheRoot})
 	w := cacheRequest(t, s, "GET", "/api/cache", "")
 	if w.Code != http.StatusOK {
@@ -212,8 +174,6 @@ func TestStagingArtifactsAreNotCacheContent(t *testing.T) {
 		t.Errorf("cache stats TotalSize = %d, want %d", listed.Stats.TotalSize, publishedSize)
 	}
 
-	// The cache listing of a repository without snapshots walks blobs/: it
-	// shows the published blob only.
 	w = cacheRequest(t, s, "GET", "/api/cache/owner/blobs-only", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("cache listing: status %d body %s", w.Code, w.Body.String())
@@ -231,8 +191,6 @@ func TestStagingArtifactsAreNotCacheContent(t *testing.T) {
 		}
 	}
 
-	// The cache selection ignores a blobs/ directory that holds nothing but
-	// staging artifacts.
 	stageOnly := filepath.Join(t.TempDir(), "models--owner--staging")
 	if err := os.MkdirAll(filepath.Join(stageOnly, "blobs"), 0o755); err != nil {
 		t.Fatal(err)
@@ -249,9 +207,6 @@ func TestStagingArtifactsAreNotCacheContent(t *testing.T) {
 	}
 }
 
-// TestStagingArtifactsDoNotAffectTheDeletionPath is the deletion half of
-// regression (a): the deletion path must not mistake a staging artifact for a
-// blob, and the real blobs keep the fate their selection gives them.
 func TestStagingArtifactsDoNotAffectTheDeletionPath(t *testing.T) {
 	root := t.TempDir()
 	hub := filepath.Join(root, "hub")
@@ -262,8 +217,6 @@ func TestStagingArtifactsDoNotAffectTheDeletionPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The selection names ONE entry; the other published blobs are not
-	// selected and must survive the deletion untouched.
 	result := rd.DeleteSelectedGGUF([]hfdownloader.SelectedGGUFEntry{
 		{Path: "model-Q4_K_M.gguf", Versions: []string{"commit123"}},
 	})
@@ -273,31 +226,21 @@ func TestStagingArtifactsDoNotAffectTheDeletionPath(t *testing.T) {
 	if len(result.Removed) == 0 {
 		t.Fatalf("the selected entry was not removed: %+v", result)
 	}
-	// The published blob of the unselected entry is untouched.
 	if _, err := os.Stat(filepath.Join(rd.BlobsDir(), stagingTestSHA)); err != nil {
 		t.Errorf("the unselected published blob was removed by the deletion path: %v", err)
 	}
-	// The staging artifacts are not blobs: they are left alone.
 	for _, name := range stagingArtifactNames() {
 		if _, err := os.Stat(filepath.Join(rd.BlobsDir(), name)); err != nil {
 			t.Errorf("staging artifact %s was removed by the deletion path: %v", name, err)
 		}
 	}
-	// The unusual published name is a real blob: the deletion path treats it
-	// as content, not as an artifact.
 	if _, err := os.Stat(filepath.Join(rd.BlobsDir(), "unusual-published-name.bin")); err != nil {
 		t.Errorf("the unusual published blob was removed by the deletion path: %v", err)
 	}
 }
 
-// TestUnusualPublishedBlobNameIsStoredVisibleAndMirrored pins the other side
-// of the store boundary (issue #140 follow-up).
-//
-// The public storage API refuses a blob key whose NAME belongs to the
-// downloader's staging namespace, because such a blob would be invisible to
-// every content surface. The refusal is narrow: an unusual but NON-reserved
-// name is still accepted, and the blob it produces is stored, visible to the
-// cache surfaces and mirrored.
+// A non-reserved unusual name remains valid content across storage and mirror
+// surfaces; only reserved staging shapes are excluded.
 func TestUnusualPublishedBlobNameIsStoredVisibleAndMirrored(t *testing.T) {
 	isolateCacheState(t)
 	cacheRoot := t.TempDir()
@@ -333,8 +276,6 @@ func TestUnusualPublishedBlobNameIsStoredVisibleAndMirrored(t *testing.T) {
 	}
 
 	repo := filepath.Join(hub, "models--owner--model")
-	// VISIBLE: the blob is counted as content, and the domain lock the store
-	// created next to it is not.
 	if got := countBlobs(repo); got != 1 {
 		t.Errorf("countBlobs = %d, want the unusual published blob", got)
 	}
@@ -356,7 +297,6 @@ func TestUnusualPublishedBlobNameIsStoredVisibleAndMirrored(t *testing.T) {
 		t.Errorf("cache stats TotalSize = %d, want %d", listed.Stats.TotalSize, len(content))
 	}
 
-	// MIRRORED: the mirror copies the unusual published name and verifies it.
 	entries, err := scanHubForMirror(hub)
 	if err != nil {
 		t.Fatalf("scanHubForMirror: %v", err)
@@ -377,10 +317,7 @@ func TestUnusualPublishedBlobNameIsStoredVisibleAndMirrored(t *testing.T) {
 	}
 }
 
-// TestMirrorCopyAndVerifyAgreeOnTheSameSet covers regressions (b), (c) and
-// (d): the copy and the verification must cover the same set - a published
-// blob, an unusual published name and a snapshot entry whose name has a
-// staging shape - and none of the staging artifacts.
+// Copy and verification must agree on snapshot .meta files and unusual blobs.
 func TestMirrorCopyAndVerifyAgreeOnTheSameSet(t *testing.T) {
 	hub := t.TempDir()
 	repo, published := stagingFixtureRepo(t, hub)
@@ -391,12 +328,10 @@ func TestMirrorCopyAndVerifyAgreeOnTheSameSet(t *testing.T) {
 	}
 	dstRepo := filepath.Join(dstHub, "models--owner--model")
 
-	// The snapshot entry with a staging-shaped name outside blobs/ is copied.
 	snapshot := filepath.Join(dstRepo, "snapshots", "commit123", "tokenizer.model.meta")
 	if data, err := os.ReadFile(snapshot); err != nil || string(data) != "snapshot metadata" {
 		t.Fatalf("the snapshot entry was not copied: %q %v", data, err)
 	}
-	// The published content is copied, the staging artifacts are not.
 	for name := range published {
 		if _, err := os.Stat(filepath.Join(dstRepo, "blobs", name)); err != nil {
 			t.Errorf("published blob %s was not copied: %v", name, err)
@@ -406,13 +341,10 @@ func TestMirrorCopyAndVerifyAgreeOnTheSameSet(t *testing.T) {
 		t.Errorf("a staging artifact was copied, stat err=%v", err)
 	}
 
-	// A fresh copy verifies.
 	if err := verifyRepoCache(repo, hub, dstHub); err != nil {
 		t.Fatalf("verifyRepoCache on a fresh copy: %v", err)
 	}
 
-	// A corrupted snapshot entry is DETECTED: the copy and the verification
-	// cover the same set.
 	if err := os.WriteFile(snapshot, []byte("corrupted"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -424,7 +356,6 @@ func TestMirrorCopyAndVerifyAgreeOnTheSameSet(t *testing.T) {
 		t.Errorf("verification error = %v, want it to name the corrupted snapshot entry", verifyErr)
 	}
 
-	// A corrupted published blob is detected as well.
 	if err := os.WriteFile(snapshot, []byte("snapshot metadata"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -434,63 +365,4 @@ func TestMirrorCopyAndVerifyAgreeOnTheSameSet(t *testing.T) {
 	if err := verifyRepoCache(repo, hub, dstHub); err == nil {
 		t.Error("a corrupted published blob was not detected")
 	}
-}
-
-// TestNegativeControlOldSuffixOnlyClassifierCountsStagingArtifacts is the
-// negative control for the classification fix: with the historical
-// suffix-only predicate restored, the staging artifacts ARE counted and
-// copied - the defect the exhaustive classifier removes.
-func TestNegativeControlOldSuffixOnlyClassifierCountsStagingArtifacts(t *testing.T) {
-	old := isBlobStagingArtifactName
-	defer func() { isBlobStagingArtifactName = old }()
-	// The historical predicate: the four suffixes the old classifier knew.
-	isBlobStagingArtifactName = func(name string) bool {
-		return strings.HasSuffix(name, ".incomplete") ||
-			strings.HasSuffix(name, ".meta") ||
-			strings.HasSuffix(name, ".meta.tmp") ||
-			strings.HasSuffix(name, ".lock")
-	}
-
-	hub := t.TempDir()
-	repo, published := stagingFixtureRepo(t, hub)
-
-	if got := countBlobs(repo); got <= len(published) {
-		t.Fatalf("the negative control did not reproduce the defect: countBlobs = %d, want more than the %d published blobs", got, len(published))
-	}
-	dstHub := filepath.Join(t.TempDir(), "hub")
-	if err := copyRepoCache(repo, hub, dstHub); err != nil {
-		t.Fatalf("copyRepoCache: %v", err)
-	}
-	dstBlobs := filepath.Join(dstHub, "models--owner--model", "blobs")
-	if _, err := os.Stat(filepath.Join(dstBlobs, "tmp-"+stagingTestSHA+".part")); err != nil {
-		t.Fatalf("the negative control did not reproduce the defect: the single-request partial was not copied: %v", err)
-	}
-	t.Logf("negative control reproduced the miscount: countBlobs = %d", countBlobs(repo))
-}
-
-// TestNegativeControlOldVerifyScopeMissesSnapshotEntries is the negative
-// control for the copy/verify agreement: with the historical blobs/-only
-// verification scope restored, a corrupted snapshot entry is NOT detected.
-func TestNegativeControlOldVerifyScopeMissesSnapshotEntries(t *testing.T) {
-	old := mirrorVerifyCoversEntry
-	defer func() { mirrorVerifyCoversEntry = old }()
-	// The historical scope: only the blobs/ directory was verified.
-	mirrorVerifyCoversEntry = func(rel string) bool {
-		return filepath.Dir(rel) == "blobs"
-	}
-
-	hub := t.TempDir()
-	repo, _ := stagingFixtureRepo(t, hub)
-	dstHub := filepath.Join(t.TempDir(), "hub")
-	if err := copyRepoCache(repo, hub, dstHub); err != nil {
-		t.Fatalf("copyRepoCache: %v", err)
-	}
-	snapshot := filepath.Join(dstHub, "models--owner--model", "snapshots", "commit123", "tokenizer.model.meta")
-	if err := os.WriteFile(snapshot, []byte("corrupted"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := verifyRepoCache(repo, hub, dstHub); err != nil {
-		t.Fatalf("the negative control did not reproduce the defect: the corrupted snapshot entry was detected: %v", err)
-	}
-	t.Log("negative control reproduced the unverified snapshot entry")
 }

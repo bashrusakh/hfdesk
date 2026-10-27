@@ -5,12 +5,9 @@
 
 package hfdownloader
 
-// Windows ownership lock: an exclusive-share CreateFile handle
-// (dwShareMode=0). While the handle is open, every other open of the same path
-// fails with ERROR_SHARING_VIOLATION, which is the ownership-busy signal. The
-// handle is closed to release the lock; the kernel does so at process exit, so
-// a crashed owner is recoverable. syscall (stdlib) is sufficient — no
-// dependency is added.
+// Windows ownership uses a deny-all CreateFile handle (dwShareMode=0).
+// Sharing violation signals a conflicting open. Close/process exit releases it;
+// non-owning shared probes distinguish a writer from probe contention.
 
 import (
 	"errors"
@@ -19,8 +16,7 @@ import (
 )
 
 const (
-	// stagingOSLockAvailable reports that this platform implements the OS
-	// ownership lock.
+	// stagingOSLockAvailable means this build implements the OS ownership primitive.
 	stagingOSLockAvailable = true
 
 	// errorSharingViolation is Windows ERROR_SHARING_VIOLATION. syscall does
@@ -33,7 +29,6 @@ const (
 	errorInvalidFunction = syscall.Errno(1)
 )
 
-// stagingOSLockHandle is one held exclusive-share file handle.
 type stagingOSLockHandle struct {
 	h syscall.Handle
 }
@@ -69,7 +64,6 @@ func openStagingOSLock(path string) (stagingOSLockHandle, error) {
 	return stagingOSLockHandle{h: h}, nil
 }
 
-// release closes the handle and drops the exclusive share.
 func (h stagingOSLockHandle) release() {
 	if h.h != 0 {
 		_ = syscall.CloseHandle(h.h)
@@ -108,20 +102,7 @@ func probeStagingOSLock(path string) (bool, error) {
 	return false, nil
 }
 
-// observeStagingOSLockHolder is implemented once, in staging_oslock.go, on
-// top of the shared non-owning status probe.
-//
-// On Windows the status probe is exactly the right primitive. A Windows open
-// succeeds only when it is compatible with EVERY existing handle in both
-// directions. The owner holds a deny-all handle (dwShareMode=0), so a
-// shared-access open (FILE_SHARE_READ|FILE_SHARE_WRITE, GENERIC_READ) is:
-//
-//   - REFUSED by the deny-all owner, because the owner's share mode does not
-//     permit the new access => an exclusive holder exists; and
-//   - GRANTED when only a reader holds the file, because the reader's share
-//     mode permits the new access.
-//
-// The observation must never open the file with dwShareMode=0. A deny-all
-// observer is itself an exclusive holder, so every peer — a concurrent
-// claimant or a concurrent status probe — would see a live writer that does
-// not exist and would skip files nobody is downloading.
+// CreateFile checks access/share compatibility in both directions. Our shared
+// read/write probes coexist, but a writer's deny-all handle refuses them.
+// Never observe with dwShareMode=0: that would impersonate a writer and make
+// peers wait or fail on ownership that does not exist.

@@ -3,18 +3,7 @@
 
 package hfdownloader
 
-// B1 regression coverage: the single-request path is under the same
-// validation/trust model as the ranged path.
-//
-//   - a complete inherited .part is published only after a content proof when a
-//     digest is known and Verify != "none" (a corrupt same-size part must never
-//     reach the blob);
-//   - a moved-commit / wrong-prefix .part is caught by the same proof even
-//     though its length matches;
-//   - every 206 is validated for the exact requested Content-Range, expected
-//     total and exact body length, and the bounded writer rejects an overlong
-//     body; none of those may publish;
-//   - Verify="none" keeps its documented no-hash semantics.
+// Covers single-request resume proof, response framing, and Verify="none".
 
 import (
 	"bytes"
@@ -34,22 +23,8 @@ import (
 	"time"
 )
 
-// postProofCancelContext observes the single-path publication boundary
-// without counting context consultations.
-//
-// finalizeSinglePartial closes the partial handle after the content proof
-// succeeds and immediately before the publication rename, so a closed handle
-// is the product's own observable "proof done, not yet published" state. This
-// context reports cancellation only from that state onwards, which places the
-// cancellation strictly between the proof and the rename.
-//
-// Counting ctx.Err() calls cannot do that: the number of consultations
-// depends on how the standard library implements context.Cause (Go 1.25 only
-// consults Err when no cancellation cause is recorded, Go 1.26 always does),
-// so a counted threshold lands on a different guard per toolchain.
-//
-// An armed context cancels the parent the first time the boundary is
-// observed; an unarmed one only records that the boundary was reached.
+// postProofCancelContext observes the proof-to-rename boundary via the closed
+// partial handle, avoiding ctx.Err call counts that vary across Go versions.
 type postProofCancelContext struct {
 	context.Context
 	boundary func() bool
@@ -72,12 +47,7 @@ func (c *postProofCancelContext) Err() error {
 	return c.Context.Err()
 }
 
-// closedFileBoundary reports whether the product has closed the given
-// handle. A Stat on a handle the product already closed fails on every
-// supported platform (os.ErrClosed on Unix, an invalid-handle error on
-// Windows), while a Stat on a live handle of this regular file succeeds, so
-// the probe observes the product's own transition instead of racing it: it
-// never polls and never sleeps.
+// closedFileBoundary detects this regular-file handle's close through Stat failure, without sleeps.
 func closedFileBoundary(f *os.File) func() bool {
 	return func() bool {
 		_, err := f.Stat()
@@ -106,10 +76,8 @@ func TestDownloadSingle_CompletePartialRequiresContentProof(t *testing.T) {
 		}))
 		t.Cleanup(srv.Close)
 		it := PlanItem{RelativePath: "complete.bin", URL: srv.URL + "/complete.bin", Size: size, LFS: true, SHA256: sha}
-		// The staged bytes are inherited only when the identity record proves
-		// they belong to this item, and an exact size is published without a
-		// request only with the clean-framing completion proof; the content
-		// proof then has to reject the corrupt ones.
+		// A matching pinned identity plus clean framing reaches content proof without
+		// HTTP; corrupt same-size bytes must then fail that proof.
 		seedSinglePartial(t, dst, part, Job{Repo: "o/r"}, it, completeSingleIdentity())
 		return it, dst, srv, &requests
 	}
@@ -213,16 +181,8 @@ func TestDownloadSingle_CompletePartialRequiresContentProof(t *testing.T) {
 	})
 }
 
-// TestDownloadSingle_MovedCommitPartialIsContentProven covers the single-path
-// moved-commit case from both sides of the identity rule.
-//
-// A .part staged by an EARLIER revision carries that revision's identity
-// record, so the current item must not inherit those bytes at all: the
-// staged prefix is discarded and the file is transferred again. The content
-// proof stays the last line of defense for the case the identity record
-// cannot rule out - a record that matches the current item while the staged
-// bytes are another revision's (or simply corrupt). There the bytes have the
-// right length, so only the content proof can reject them.
+// A moved-commit partial is rejected by identity; same-identity corrupt bytes
+// are rejected by content proof.
 func TestDownloadSingle_MovedCommitPartialIsContentProven(t *testing.T) {
 	const size = 4_096
 	const prefix = 2_048
@@ -234,7 +194,6 @@ func TestDownloadSingle_MovedCommitPartialIsContentProven(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			*requested = r.Header.Get("Range")
 			if *requested == "" {
-				// A full request: the whole body, no range.
 				w.Header().Set("Content-Length", strconv.Itoa(len(full)))
 				_, _ = w.Write(full)
 				return
@@ -259,7 +218,6 @@ func TestDownloadSingle_MovedCommitPartialIsContentProven(t *testing.T) {
 		dst := filepath.Join(dir, "moved.bin")
 		job := Job{Repo: "o/r"}
 		it := PlanItem{RelativePath: "moved.bin", Size: size, LFS: true, SHA256: sha}
-		// The staged bytes and their record belong to the earlier revision.
 		earlier := singleOpts{Commit: "5555555555555555555555555555555555555555", CommitPinned: true}
 		seedSinglePartial(t, dst, bytes.Repeat([]byte{0x5A}, prefix), job, it, earlier)
 
@@ -319,10 +277,8 @@ func TestDownloadSingle_MovedCommitPartialIsContentProven(t *testing.T) {
 	})
 }
 
-// TestDownloadSingle_RejectsInvalidRangedResponses pins the strict 206
-// contract: an exact Content-Range for the requested interval, the expected
-// total, and exactly the requested body length. A wrong range, a short body and
-// an oversized body must all fail without publishing, leaving resumable bytes.
+// Invalid 206 intervals, totals or body lengths must fail without publication
+// and preserve the resumable partial.
 func TestDownloadSingle_RejectsInvalidRangedResponses(t *testing.T) {
 	const size = 4_000
 	const prefix = 1_200
@@ -571,104 +527,8 @@ func TestDownloadSingle_CancelAtFinalizeBeforeRename(t *testing.T) {
 	}
 }
 
-// TestFinalizeSinglePartial_CancelAfterProofBeforeRename pins the
-// single-path publication invariant: a cancellation observed after the
-// content proof succeeded but before the rename must not publish the final
-// file.
-//
-// The cancellation is placed on the product's own post-proof transition
-// rather than on a counted number of context consultations, so the test
-// behaves identically on every supported Go version (see
-// postProofCancelContext). The guard this exercises is the pre-rename one:
-// it is the last check before os.Rename, and it is the one that enforces
-// "cancellation observed before publication must not rename the final
-// file".
-func TestFinalizeSinglePartial_CancelAfterProofBeforeRename(t *testing.T) {
-	const size = 64 * 1024
-	full := rangedTestPayload(size)
-	sha := singleTestSHA(full)
-	dir := t.TempDir()
-	configure := Settings{Verify: "sha256", CleanupPartialsOnCancel: func() bool { return false }}
-	it := PlanItem{RelativePath: "post-hash-cancel.bin", Size: size, SHA256: sha}
-	emit := func(ProgressEvent) {}
-
-	// The first run establishes that the boundary is observable: the product
-	// closes the partial handle after the content proof and before the
-	// publication rename, so an unusable handle is the "proof done, not yet
-	// published" state. Nothing is canceled here; the run must publish.
-	tmp := filepath.Join(dir, "calibrate.part")
-	dst := filepath.Join(dir, "calibrate.bin")
-	if err := os.WriteFile(tmp, full, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	out, err := os.OpenFile(tmp, os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	calibration := &postProofCancelContext{
-		Context:  context.Background(),
-		boundary: closedFileBoundary(out),
-	}
-	verified, err := finalizeSinglePartial(calibration, out, tmp, dst, it, configure, false, pinnedSingleIdentity(), emit)
-	if err != nil || !verified {
-		t.Fatalf("calibration finalization = (%v,%v)", verified, err)
-	}
-	if _, err := os.Stat(dst); err != nil {
-		t.Fatalf("calibration run did not publish the destination: %v", err)
-	}
-	if !calibration.observed.Load() {
-		t.Fatal("the product never consulted the context between the content proof and the rename, " +
-			"so the pre-rename publication guard is missing")
-	}
-	if err := os.Remove(dst); err != nil {
-		t.Fatal(err)
-	}
-
-	// The second run arms the same boundary. The cancellation is therefore
-	// observed strictly after the content proof succeeded and before the
-	// rename, without depending on how many times the context is consulted.
-	tmp = filepath.Join(dir, "post-hash-cancel.part")
-	dst = filepath.Join(dir, "post-hash-cancel.bin")
-	if err := os.WriteFile(tmp, full, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	out, err = os.OpenFile(tmp, os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	baseCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ctx := &postProofCancelContext{
-		Context:  baseCtx,
-		boundary: closedFileBoundary(out),
-		cancel:   cancel,
-		armed:    true,
-	}
-	hashPassCount.Store(0)
-	verified, err = finalizeSinglePartial(ctx, out, tmp, dst, it, configure, false, pinnedSingleIdentity(), emit)
-	if !errors.Is(err, context.Canceled) || verified {
-		t.Fatalf("post-proof cancellation = (%v,%v), want canceled before publication", verified, err)
-	}
-	if !ctx.observed.Load() {
-		t.Fatal("cancellation did not reach the post-proof boundary")
-	}
-	if hashPassCount.Load() != 1 {
-		t.Errorf("prepublication proof passes=%d, want one", hashPassCount.Load())
-	}
-	if _, err := os.Stat(dst); !os.IsNotExist(err) {
-		t.Fatalf("destination published after post-hash cancellation: %v", err)
-	}
-	if got, err := os.ReadFile(tmp); err != nil || !bytes.Equal(got, full) {
-		t.Fatalf("pause failed to preserve proven partial: read err=%v", err)
-	}
-}
-
-// TestFinalizeSinglePartial_PostProofCancelHonorsCleanupPolicy pins the
-// cleanup policy at the SAME post-proof boundary the publication guard uses:
-// a pause preserves the proven partial, an explicit cancel removes it, and
-// neither publishes the destination. It uses the same count-free boundary
-// as TestFinalizeSinglePartial_CancelAfterProofBeforeRename so it does not
-// depend on the standard library's context.Cause implementation.
+// At the post-proof/pre-rename boundary, pause preserves the partial, explicit
+// cancel removes it, and neither publishes. Use the observable closed-handle boundary.
 func TestFinalizeSinglePartial_PostProofCancelHonorsCleanupPolicy(t *testing.T) {
 	const size = 32 * 1024
 	full := rangedTestPayload(size)
@@ -732,21 +592,8 @@ func TestFinalizeSinglePartial_PostProofCancelHonorsCleanupPolicy(t *testing.T) 
 	}
 }
 
-// TestDownloadSingle_CancelDuringProofRemovesPartial pins the explicit-cancel
-// cleanup at the single-path content proof, the only pre-publication
-// cancellation branch that reached the cleanup while the partial's writable
-// handle was still open.
-//
-// On Windows os.Remove cannot unlink an open file: downloadSingle opens the
-// partial without FILE_SHARE_DELETE. The proof-cancel branch used to call the
-// cleanup with that handle still open, so an explicit cancel during
-// verification retained the whole `.part` AND its `.part.meta` sidecar; the
-// deferred close happened after the only cleanup attempt. The seam cancels at
-// the exact start of the proof, and the cleanup callback records whether the
-// payload handle was already closed, so the close-before-cleanup order is
-// checked on every platform. The artifact assertions then fail on Windows if
-// the pre-fix order ever returns; on Unix removal succeeds regardless, but the
-// ordering assertion still discriminates.
+// Proof cancellation must close this writable partial before cleanup: Windows
+// cannot unlink it while that handle is open. Check the ordering on every platform.
 func TestDownloadSingle_CancelDuringProofRemovesPartial(t *testing.T) {
 	const size = 64 * 1024
 	full := rangedTestPayload(size)

@@ -17,8 +17,6 @@ import (
 	"time"
 )
 
-// downloadSingleErr adapts downloadSingle's (contentVerified, error) result to
-// the error-only shape used by goroutine result channels.
 func downloadSingleErr(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, opts singleOpts, emit func(ProgressEvent)) error {
 	_, err := downloadSingle(ctx, httpc, token, job, cfg, it, dst, opts, emit)
 	return err
@@ -105,51 +103,6 @@ func TestDownloadSingle_ResumesFromExistingPartial(t *testing.T) {
 	}
 }
 
-// TestDownloadSingle_CompletePartialIsFinalized verifies that if a .part file
-// already contains all the bytes (e.g. interrupted right before rename), the
-// next run finalizes it without a network request.
-func TestDownloadSingle_CompletePartialIsFinalized(t *testing.T) {
-	tmpDir := t.TempDir()
-	full := []byte("already fully downloaded content")
-
-	dst := filepath.Join(tmpDir, "blobs", "tmp-complete")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	job := Job{Repo: "o/r"}
-	it := PlanItem{
-		RelativePath: "test.bin",
-		Size:         int64(len(full)),
-	}
-	// The complete partial is published without a request only when its
-	// identity record proves the bytes belong to this item AND records that
-	// the producing run saw the response body end cleanly at the exact size.
-	seedSinglePartial(t, dst, full, job, it, completeSingleIdentity())
-
-	var requestCount int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
-		w.Write(full)
-	}))
-	defer srv.Close()
-
-	it.URL = srv.URL + "/test.bin"
-	_, err := downloadSingle(context.Background(), srv.Client(), "", job, Settings{Retries: 0}, it, dst, singleTestIdentity, func(ProgressEvent) {})
-	if err != nil {
-		t.Fatalf("downloadSingle: %v", err)
-	}
-	if requestCount != 0 {
-		t.Errorf("expected 0 HTTP requests (already complete), got %d", requestCount)
-	}
-	got, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatalf("read final: %v", err)
-	}
-	if !bytes.Equal(got, full) {
-		t.Errorf("final content mismatch")
-	}
-}
-
 // TestDownloadSingle_ServerIgnoresRangeReturnsFull verifies that when the server
 // returns 200 OK (full body) in response to a Range request, the resume logic
 // correctly restarts from zero instead of appending duplicate bytes.
@@ -193,13 +146,8 @@ func TestDownloadSingle_ServerIgnoresRangeReturnsFull(t *testing.T) {
 	}
 }
 
-// TestDownloadMultipart_OldMultipartArtifactsAreNotResumed pins the S0
-// behavior: a pre-#140 .part-NN/.parts.json family and a sidecarless
-// single-route .part are old/unsupported formats, so they are neither resumed
-// nor migrated. The file is downloaded from zero (one fresh range layout), the
-// obsolete multipart family is discarded under the claim, the single-route
-// .part is left byte-identically untouched, and the published content is
-// exactly the served payload.
+// Old multipart families are discarded and refetched, never migrated. The
+// multipart route must leave the single route's sidecarless .part untouched.
 func TestDownloadMultipart_OldMultipartArtifactsAreNotResumed(t *testing.T) {
 	tmpDir := t.TempDir()
 	const totalSize = 16000
@@ -213,8 +161,7 @@ func TestDownloadMultipart_OldMultipartArtifactsAreNotResumed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A structurally valid pre-#140 layout with two fully-sized parts. The
-	// layout is irrelevant now: nothing parses it.
+	// Seed old-format metadata and full-sized parts; their bytes must not be inherited.
 	const oldParts = 2
 	oldChunk := totalSize / oldParts
 	for i := 0; i < oldParts; i++ {

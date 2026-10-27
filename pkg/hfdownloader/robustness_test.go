@@ -309,14 +309,8 @@ func TestDownloadMultipart_StalledPartRecoversAndAssembles(t *testing.T) {
 	}
 }
 
-// alwaysStallServer responds to every body request by declaring the full
-// length and then delivering no bytes at all, holding the connection open
-// until the client aborts the attempt. Every attempt therefore ends in a
-// stall, which lets tests exhaust the retry budget on stalls alone. The
-// ranged responses carry protocol-valid Content-Range/Content-Length
-// headers (issue #140's strict validation rejects anything else before
-// the body is read, which would test the validator instead of the stall
-// watchdog).
+// alwaysStallServer sends valid HEAD/range headers but no body bytes until
+// cancellation, so retries exhaust on body stalls rather than header rejection.
 func alwaysStallServer(t *testing.T, total int) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1486,10 +1480,7 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Seed CURRENT-FORMAT resumable bytes: a version-4 record whose second
-	// range holds a 499-byte committed prefix. The internal fail-fast abort
-	// must preserve that staging state. (Old-format .part-NN artifacts are
-	// not resume state and are covered separately.)
+	// Seed a pinned v4 record with 499 committed bytes in range 1; the internal abort must preserve them.
 	full := bytes.Repeat([]byte("p"), 100_000)
 	seedRangedState(t, dst+".incomplete", "o/r", "pa.bin", 100_000,
 		[]RangeProgress{
@@ -1519,9 +1510,7 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 		t.Fatal("downloadMultipart did not terminate after a permanent part error; sibling part was not aborted")
 	}
 
-	// T3: the pre-existing resumable bytes must not have been deleted: the
-	// second range's 499 committed bytes survive the internal abort, and so do
-	// the staging file and its committed-range metadata.
+	// Internal fail-fast abort preserves the existing committed prefix and its staging metadata.
 	staging := dst + ".incomplete"
 	if fi, err := os.Stat(staging); err != nil || fi.Size() != 100_000 {
 		t.Errorf("staging file was removed/modified by the internal abort (stat err=%v)", err)
@@ -2054,14 +2043,8 @@ func TestDownloadSingle_AppendCeilingBounded(t *testing.T) {
 	}
 }
 
-// TestDownloadMultipart_GrowingPrefixBounded verifies the absolute ceiling on
-// the multipart range loop: a range server that answers every request with a
-// VALID 206 (exact Content-Range and Content-Length for the requested range)
-// but streams only a strictly growing prefix of that range before aborting
-// advances the range high-water mark every attempt, so without the ceiling it
-// would refund forever. Strict ranged-response validation (issue #140)
-// cannot reject these responses — the protocol fields are correct — which
-// is exactly what keeps this test a genuine pin of the ceiling.
+// Valid range headers plus an advancing truncated body refund the progress
+// budget repeatedly; the independent lifetime attempt ceiling must still terminate the loop.
 func TestDownloadMultipart_GrowingPrefixBounded(t *testing.T) {
 	tmpDir := t.TempDir()
 	dst := filepath.Join(tmpDir, "blobs", "tmp-mpgrow")
@@ -2071,10 +2054,7 @@ func TestDownloadMultipart_GrowingPrefixBounded(t *testing.T) {
 
 	const total = 100_000
 	const partCount = 2
-	// Each attempt appends a strictly growing prefix of the requested range
-	// and then aborts, so the range's on-disk offset advances on every
-	// attempt (the counterexample for the refund rule alone) while the
-	// range never completes.
+	// Each aborted response advances the on-disk offset, exercising progress refunds.
 	const growthPerRequest = 100
 	var (
 		mu           sync.Mutex
@@ -2102,7 +2082,6 @@ func TestDownloadMultipart_GrowingPrefixBounded(t *testing.T) {
 		if fl, ok := w.(http.Flusher); ok {
 			fl.Flush()
 		}
-		// Stream a strictly growing prefix of the range, then abort.
 		w.Write(make([]byte, int64(n)*growthPerRequest))
 		if fl, ok := w.(http.Flusher); ok {
 			fl.Flush()
@@ -2139,8 +2118,7 @@ func TestDownloadMultipart_GrowingPrefixBounded(t *testing.T) {
 	mu.Lock()
 	n := partRequests
 	mu.Unlock()
-	// Two ranges; each runs until its `attempt` index reaches the ceiling, so
-	// a range makes at most ceiling+1 requests.
+	// The lifetime ceiling permits at most ceiling+1 requests per range.
 	bound := partCount * (absoluteAttemptCeiling(cfg.Retries) + 1)
 	if n > bound {
 		t.Errorf("made %d part requests; want <= %d", n, bound)
@@ -2153,23 +2131,8 @@ func TestDownloadMultipart_GrowingPrefixBounded(t *testing.T) {
 	}
 }
 
-// --- Second-round T2/T3 regression tests ---
-
-// TestDownloadSingle_RestartAboveHwmNoFreeRefund pins the T2 fix for the
-// "restart above previous max earns a later free refund" counterexample.
-//
-// Sequence (Retries=2), mirroring the reviewer's steps:
-//  1. an ordinary 206 attempt reaches 1000 -> hwm=1000 (legitimate refund);
-//  2. an ignored-Range 200 truncates to 0 and reaches 2000, then aborts
-//     (truncatedRestart -> no refund, but 2000 is now the real high-water);
-//  3. a bodyless 503 writes nothing (pos stays 2000).
-//
-// Under the pre-fix rule hwm was only updated on the refunding attempt, so it
-// stayed 1000 and the bodyless attempt 3 saw pos>hwm -> a free refund for zero
-// new bytes; the loop then needed 4 requests instead of 3 to exhaust the
-// budget. With the fix hwm is updated unconditionally after every attempt, so
-// attempt 3 is not progress and the budget is exhausted after exactly
-// Retries+1 requests.
+// The ignored-Range 200 restart advances the high-water mark without refunding
+// retries. A following bodyless 503 is not progress and must exhaust the budget.
 func TestDownloadSingle_RestartAboveHwmNoFreeRefund(t *testing.T) {
 	tmpDir := t.TempDir()
 	dst := filepath.Join(tmpDir, "blobs", "tmp-freefeat")
@@ -2245,23 +2208,9 @@ func TestDownloadSingle_RestartAboveHwmNoFreeRefund(t *testing.T) {
 	}
 }
 
-// TestDownloadMultipart_RestartAboveHwmNoFreeRefund pins the multipart
-// non-progress retry budget: each range performs exactly ONE advancing 206
-// attempt (which refunds once), followed only by BODYLESS attempts (no new
-// bytes -> no refund). The observed request count must therefore equal the
-// non-progress budget partCount*(Retries+1), not merely stay under the
-// absolute ceiling.
-//
-// The server sends protocol-valid responses (exact Content-Range and
-// Content-Length for the requested range, per issue #140's strict
-// validation), so the refund rule is exercised by real byte advances, not
-// by validation rejections. Multipart has no truncation path, so the
-// single-file "restart above the old hwm then bodyless failure earns a
-// free refund" counterexample cannot arise here: a bodyless attempt never
-// exceeds preHwm, so it can never refund under any variant. This test
-// therefore pins the current correct budget rule as a regression guard;
-// the discriminating case for the always-update-hwm fix is the single-file
-// TestDownloadSingle_RestartAboveHwmNoFreeRefund.
+// Each range gets one advancing, protocol-valid 206, then bodyless failures.
+// Assert the exact non-progress budget, not just the lifetime ceiling. Multipart
+// never truncates; the restart/high-water counterexample belongs to the single-path test.
 func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 	tmpDir := t.TempDir()
 	dst := filepath.Join(tmpDir, "blobs", "tmp-mpfree")
@@ -2287,9 +2236,7 @@ func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 			http.Error(w, "bad range", http.StatusBadRequest)
 			return
 		}
-		// Part 0 requests offsets below the midpoint; part 1 at/above it.
-		// Keying by part (not by the advancing start offset) lets each part
-		// perform its single advancing attempt exactly once.
+		// Key by range, not its changing start offset, to advance each range exactly once.
 		partIdx := 0
 		if start >= total/2 {
 			partIdx = 1
@@ -2300,7 +2247,6 @@ func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 		advanced[partIdx] = true
 		mu.Unlock()
 
-		// Valid protocol fields for the exact requested range.
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
 		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 		w.WriteHeader(http.StatusPartialContent)
@@ -2345,19 +2291,8 @@ func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 	}
 }
 
-// TestDownloadMultipart_FinalizationAbortBeforePublish verifies T3 on the
-// finalization boundary: when the part context is cancelled by an internal
-// abort at the moment finalization is about to begin (after 100% progress,
-// before the publish rename / strict hash), downloadMultipart must not
-// publish, must PRESERVE the staging file and its committed-range metadata
-// (the resumable data), and must return the cancellation. A user cancel
-// with the same callback still runs cleanupPartialsOnCancel and removes the
-// staging artifacts.
-//
-// The cancel is triggered deterministically from the emit callback on the
-// "file_finalizing" event, which downloadMultipart emits after the
-// cancelled-while-workers-running guard and immediately before the
-// finalization work starts — no timing/sleep dependence.
+// Cancel from file_finalizing before proof/publication: internal abort must
+// preserve staging and metadata, while explicit user cancellation cleans them up.
 func TestDownloadMultipart_FinalizationAbortBeforePublish(t *testing.T) {
 	setup := func(t *testing.T) (string, []byte) {
 		t.Helper()
@@ -2366,9 +2301,7 @@ func TestDownloadMultipart_FinalizationAbortBeforePublish(t *testing.T) {
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		// Seed a CURRENT-FORMAT complete staging record (version 4, all ranges
-		// Done) so the run reaches finalization without any transfer. Old
-		// formats are not resume state and are covered separately.
+		// Seed a pinned, all-Done v4 record so finalization needs no payload transfer.
 		full := bytes.Repeat([]byte("p"), 20_000)
 		seedRangedState(t, dst+".incomplete", "o/r", "fin.bin", 20_000,
 			[]RangeProgress{{Start: 0, End: 19_999, Committed: 20_000, Done: true}}, full)
@@ -2390,15 +2323,13 @@ func TestDownloadMultipart_FinalizationAbortBeforePublish(t *testing.T) {
 				w.Header().Set("Accept-Ranges", "bytes")
 				return
 			}
-			// The seeded CURRENT-format record is fully committed, so no
-			// payload bytes are requested before finalization.
 			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
 		}))
 		defer srv.Close()
 
 		emit := func(ev ProgressEvent) {
 			if ev.Event == "file_finalizing" && ev.Message == "finalizing" {
-				cancel(cause()) // abort exactly at the finalization boundary
+				cancel(cause())
 			}
 		}
 

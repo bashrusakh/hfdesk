@@ -3,11 +3,9 @@
 
 package hfdownloader
 
-// In-process serialization of staging-record transitions (issue #140).
-// Current-version cross-process exclusion is provided by the lifetime OS lock
-// in staging_oslock.go, which every shared staging mutator must hold. This
-// per-path gate serializes short metadata updates and is deliberately not a
-// persistent lock: age can never prove that a suspended holder will not resume.
+// The per-path metadata gate serializes intra-item record transitions. Shared
+// staging mutation also requires the destination's lifetime OS lock; a local
+// gate or record age cannot establish cross-process ownership.
 
 import (
 	"context"
@@ -18,14 +16,10 @@ import (
 	"time"
 )
 
-// stagingLockSuffix supplies a stable key for the per-path in-process gate.
 const stagingLockSuffix = ".lock"
 
 var (
-	// stagingLockWait bounds one acquisition of the local metadata gate. Critical
-	// sections only rewrite a small record, so a healthy holder releases far
-	// sooner; a longer wait means the holder is wedged and the caller must
-	// back off rather than block the download.
+	// stagingLockWait bounds acquisition of the local metadata gate.
 	stagingLockWait = 5 * time.Second
 
 	// stagingLockCleanupWait bounds the cleanup path's acquisition. Cleanup is
@@ -33,12 +27,10 @@ var (
 	stagingLockCleanupWait = 500 * time.Millisecond
 )
 
-// errStagingLockBusy reports that the local metadata gate stayed held for the
-// whole bounded acquisition window. Claimants translate it to
-// errBlobIncompleteOwned (the staging file is owned by someone else).
+// errStagingLockBusy means the local metadata gate exceeded its wait bound.
+// Claimants return errBlobIncompleteOwned rather than establishing a claim.
 var errStagingLockBusy = errors.New("staging metadata gate is held by another local writer")
 
-// stagingStateLock is one acquisition of a per-path in-process gate.
 type stagingStateLock struct {
 	path string
 	gate *stagingStateGate
@@ -54,14 +46,10 @@ var stagingStateGates = struct {
 	m map[string]*stagingStateGate
 }{m: make(map[string]*stagingStateGate)}
 
-// stagingLockPath derives the stable gate key from the staging record path.
 func stagingLockPath(metaPath string) string { return metaPath + stagingLockSuffix }
 
-// acquire waits at most wait for the local gate, while honoring cancellation.
-// It performs one non-blocking attempt first, so the free fast path never
-// blocks. The gate is intra-item state: while a destination's ownership domain
-// is held, no other writer of the same destination exists to contend with, so
-// the acquisition carries no download-slot signal (see download_slot.go).
+// acquire takes the bounded, cancellable per-path metadata gate. The destination
+// domain excludes foreign writers, so this intra-item wait needs no slot notice.
 func (l *stagingStateLock) acquire(ctx context.Context, wait time.Duration) error {
 	if wait <= 0 {
 		wait = stagingLockWait
@@ -74,7 +62,6 @@ func (l *stagingStateLock) acquire(ctx context.Context, wait time.Duration) erro
 	}
 	gate.refs++
 	stagingStateGates.Unlock()
-	// Free fast path.
 	select {
 	case gate.ch <- struct{}{}:
 		l.gate = gate
@@ -105,7 +92,6 @@ func releaseStagingStateGate(key string, gate *stagingStateGate) {
 	stagingStateGates.Unlock()
 }
 
-// release returns the local gate to its next waiter.
 func (l *stagingStateLock) release() {
 	if l.gate == nil {
 		return
@@ -115,23 +101,19 @@ func (l *stagingStateLock) release() {
 	l.gate = nil
 }
 
-// errStagingClaimLost reports that this process no longer owns the staging
-// record: a take-over replaced it while this writer was active. Every metadata
-// mutation checks ownership under the metadata gate, so a checkpoint can never
-// overwrite (and thereby steal back) a newer claim.
+// errStagingClaimLost refuses mutation of a missing or foreign claim.
+// Re-read identity under the metadata gate so a checkpoint cannot recreate
+// ownership or overwrite a replacement record.
 var errStagingClaimLost = errors.New("staging claim is no longer owned by this process")
 
-// claimRecordOwnedLocked reports whether the record still names this process
-// instance. The caller holds the metadata gate.
+// claimRecordOwnedLocked requires the caller to hold the metadata gate.
 func claimRecordOwnedLocked(metaPath string) bool {
 	meta, err := readStagingMeta(metaPath)
 	return err == nil && meta.Instance != "" && meta.Instance == processInstanceToken
 }
 
-// removeOwnedStagingLocked removes the record and its payload only while the
-// record still names this process instance. The caller holds the transition
-// lock and the DESTINATION's ownership domain. It returns false (removing
-// nothing) when the claim moved elsewhere.
+// removeOwnedStagingLocked checks record ownership before removal.
+// The caller must hold the destination domain and metadata gate.
 func removeOwnedStagingLocked(staging, metaPath string) bool {
 	if !claimRecordOwnedLocked(metaPath) {
 		return false
@@ -140,14 +122,8 @@ func removeOwnedStagingLocked(staging, metaPath string) bool {
 	return true
 }
 
-// removeStagingArtifactsOwned acquires the metadata gate and removes the
-// pair only if the record still names this process instance. Owner-side
-// discard paths (hash mismatch) use it so a writer that lost a stale claim
-// cannot delete the new owner's data. The caller must already hold the
-// DESTINATION's ownership domain, whose lifetime OS lock fences the pair. The
-// metadata gate is the only lock this helper takes: it is a pure in-process map
-// gate, not the flat/output-mode domain lock, and the caller already holds the
-// domain, so there is no self-conflict and no second OS lock.
+// removeStagingArtifactsOwned discards a pair under the metadata gate only if
+// it still names this claim. The caller must hold the destination domain.
 func removeStagingArtifactsOwned(staging, metaPath string) bool {
 	lock := &stagingStateLock{path: stagingLockPath(metaPath)}
 	if err := lock.acquire(context.Background(), stagingLockCleanupWait); err != nil {
@@ -158,10 +134,9 @@ func removeStagingArtifactsOwned(staging, metaPath string) bool {
 	return removeOwnedStagingLocked(staging, metaPath)
 }
 
-// writeStagingMeta writes a record through the metadata gate. It is the
-// safe primitive for callers that do not already hold the lock (tests and
-// one-off seeding); the downloader itself uses writeStagingMetaOwnedLocked so
-// it also enforces claim ownership.
+// writeStagingMeta takes the local gate for test/seeding writes; it does not
+// establish destination ownership. Downloader rewrites use
+// writeStagingMetaOwnedLocked under the held domain and metadata gate.
 func writeStagingMeta(metaPath string, meta *IncompleteMeta) error {
 	lock := &stagingStateLock{path: stagingLockPath(metaPath)}
 	if err := lock.acquire(context.Background(), stagingLockWait); err != nil {
@@ -171,10 +146,9 @@ func writeStagingMeta(metaPath string, meta *IncompleteMeta) error {
 	return writeStagingMetaFile(metaPath, meta)
 }
 
-// writeStagingMetaOwnedLocked rewrites the record only while it still names
-// this process instance. The caller holds the metadata gate. A missing or
-// replaced record means the claim was taken over: the write is refused with
-// errStagingClaimLost instead of silently recreating ownership.
+// writeStagingMetaOwnedLocked requires the metadata gate and destination
+// domain. Missing or foreign instance identity returns errStagingClaimLost
+// instead of recreating ownership.
 func writeStagingMetaOwnedLocked(metaPath string, meta *IncompleteMeta) error {
 	if !claimRecordOwnedLocked(metaPath) {
 		return errStagingClaimLost

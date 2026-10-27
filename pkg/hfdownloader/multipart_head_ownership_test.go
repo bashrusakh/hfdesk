@@ -3,31 +3,10 @@
 
 package hfdownloader
 
-// Cross-route artifact ownership at the MULTIPART HEAD fail-fast.
-//
-// downloadMultipart stages at <staging>.incomplete and creates no `.part` of
-// its own. In flat/output mode the destination's ownership domain is taken at
-// item level before the HEAD, so the multipart HEAD no longer runs unowned: a
-// concurrent single-route writer of the same destination excludes it, and the
-// multipart writer waits for the domain instead of reaching its HEAD.
-//
-// That fence does not make the OTHER route's staging the multipart route's
-// own, though. A permanent (401/403/404) HEAD response must still not touch the
-// single-request route's `<dst>.part` and `<dst>.part.meta`: those artifacts
-// belong to another route (possibly a LIVE writer of it) or to an earlier run.
-// Unlinking them would remove a live writer's open partial, whose later
-// publication then fails with ENOENT, and would let one route delete another
-// route's resume state.
-//
-// The cases below drive the real Download path. The first pre-creates the pair
-// while the domain is free and asserts it survives the fail-fast
-// byte-identically. The second keeps a live single-route writer blocked INSIDE
-// its payload GET (so its `.part` is still empty and its sidecar already
-// written) and starts a second, multipart writer of the same destination: it
-// must wait for the domain - running no HEAD and touching nothing - and may
-// run its own permanent-404 HEAD only after the first writer releases the
-// domain. The released first writer must publish its own bytes, which is only
-// possible when its staging inode was never unlinked.
+// A multipart HEAD failure must not remove the single-route `.part`/sidecar:
+// the destination domain excludes writers but does not transfer artifact
+// ownership between routes. Tests cover stale and live single-route partials
+// through the real Download path; the contention hook establishes ordering.
 
 import (
 	"bytes"
@@ -57,7 +36,6 @@ type crossRouteHeadHub struct {
 	gets      atomic.Int64
 }
 
-// newCrossRouteHeadHub starts the local server for one LFS file.
 func newCrossRouteHeadHub(t *testing.T, full []byte, rel string, gated bool) *crossRouteHeadHub {
 	t.Helper()
 	h := &crossRouteHeadHub{entered: make(chan struct{}), gate: make(chan struct{})}
@@ -91,8 +69,7 @@ func newCrossRouteHeadHub(t *testing.T, full []byte, rel string, gated bool) *cr
 		}
 	}))
 	t.Cleanup(func() {
-		// The gate is opened before the server is closed, so a still-blocked
-		// handler cannot keep the server from shutting down.
+		// Unblock handlers before closing the server.
 		h.open()
 		h.srv.Close()
 	})
@@ -104,10 +81,8 @@ func (h *crossRouteHeadHub) open() {
 	h.gateOnce.Do(func() { close(h.gate) })
 }
 
-// TestFlatModeMultipartHeadFailFastPreservesSingleRoutePartial pins the
-// decision rule: a multipart HEAD failure creates no `.part`, and any
-// `.part`/sidecar present belongs to the single-request route or to an earlier
-// run and is left byte-identically untouched.
+// A multipart HEAD failure owns no single-route .part or sidecar and must
+// leave an earlier run's pair untouched.
 func TestFlatModeMultipartHeadFailFastPreservesSingleRoutePartial(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
@@ -143,8 +118,6 @@ func TestFlatModeMultipartHeadFailFastPreservesSingleRoutePartial(t *testing.T) 
 		t.Errorf("payload GETs = %d, want 0: the fail-fast must happen before any transfer", got)
 	}
 
-	// The multipart route created no `.part`: the pair belongs to the
-	// single-request route and must survive untouched.
 	fi, serr := os.Stat(dst + ".part")
 	if serr != nil {
 		t.Fatalf("the fail-fast removed the single-request partial: %v", serr)
@@ -161,14 +134,9 @@ func TestFlatModeMultipartHeadFailFastPreservesSingleRoutePartial(t *testing.T) 
 	}
 }
 
-// TestFlatModeMultipartHeadFailFastDoesNotUnlinkLiveSingleWriter pins the
-// live-writer half of route ownership: a single-request writer holds the flat
-// destination's domain with an empty `.part` inside a blocked payload transfer
-// while a second (multipart) writer of the SAME destination runs. Under the
-// one-domain model the second writer is excluded at the destination domain
-// BEFORE its HEAD, so the stronger guarantee holds: it never reaches the
-// fail-fast, never unlinks the live writer's partial or sidecar, and the live
-// writer publishes successfully once it is released.
+// A live single writer excludes the multipart writer before HEAD. Its empty
+// partial and sidecar must survive until it publishes; the waiter then runs
+// HEAD and fails without disturbing the completed destination.
 func TestFlatModeMultipartHeadFailFastDoesNotUnlinkLiveSingleWriter(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -178,11 +146,9 @@ func TestFlatModeMultipartHeadFailFastDoesNotUnlinkLiveSingleWriter(t *testing.T
 	out := t.TempDir()
 	dst := legacyOutputDst(t, out)
 	hub := newCrossRouteHeadHub(t, full, "model.bin", true)
-	// The excluded writer must not wait the production budget.
 	shortBlobOwnershipWait(t, 250*time.Millisecond)
 
-	// Writer 1: the single-request route (a threshold above the item size),
-	// held inside its payload GET.
+	// Hold the single route inside its payload GET.
 	writer1 := make(chan flatModeOutcome, 1)
 	go func() {
 		writer1 <- runFlatModeDownload(context.Background(), flatModeSettings(out, hub.srv.URL, "1MB"))
@@ -195,9 +161,8 @@ func TestFlatModeMultipartHeadFailFastDoesNotUnlinkLiveSingleWriter(t *testing.T
 		t.Fatal("writer 1 never started its payload transfer")
 	}
 
-	// Precondition: writer 1 is inside the transfer - it holds the flat
-	// destination's domain - and its partial is the empty file the multipart
-	// fail-fast used to delete.
+	// The gated single writer holds the domain and has an empty partial with
+	// a persisted identity sidecar.
 	sidecarBefore, err := os.ReadFile(singlePartIdentityPath(dst))
 	if err != nil {
 		t.Fatalf("fixture precondition: writer 1 has no identity sidecar: %v", err)
@@ -210,9 +175,7 @@ func TestFlatModeMultipartHeadFailFastDoesNotUnlinkLiveSingleWriter(t *testing.T
 		t.Fatalf("fixture precondition: writer 1's partial is %d bytes, want the empty staging file", partBefore.Size())
 	}
 
-	// Writer 2: the multipart route of the SAME flat destination. Writer 1
-	// holds the destination's domain, so writer 2 waits for it and must not
-	// run its HEAD or touch the live writer's partial in the meantime.
+	// The multipart waiter must not reach HEAD while the single writer owns dst.
 	contended := installBlobDomainContentionProbe(t)
 	writer2 := make(chan flatModeOutcome, 1)
 	go func() {
@@ -231,7 +194,6 @@ func TestFlatModeMultipartHeadFailFastDoesNotUnlinkLiveSingleWriter(t *testing.T
 		t.Errorf("payload GETs = %d, want only writer 1's transfer while it holds the destination", got)
 	}
 
-	// The live writer's artifacts were not unlinked, and are byte-identical.
 	partAfter, serr := os.Stat(dst + ".part")
 	if serr != nil {
 		t.Fatalf("the waiting writer unlinked the live single-route writer's partial: %v", serr)
@@ -247,9 +209,8 @@ func TestFlatModeMultipartHeadFailFastDoesNotUnlinkLiveSingleWriter(t *testing.T
 		t.Errorf("the live writer's identity sidecar changed:\nbefore=%s\nafter=%s", sidecarBefore, sidecarAfter)
 	}
 
-	// Release writer 1: it publishes its own bytes. Its publication renames
-	// the very `.part` the old fail-fast used to unlink, so this is the
-	// end-to-end proof that its staging inode survived.
+	// Successful publication after release also checks that the original partial
+	// survived the waiting multipart writer.
 	hub.open()
 	var published flatModeOutcome
 	select {

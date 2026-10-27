@@ -3,13 +3,8 @@
 
 package hfdownloader
 
-// The fail-fast branches call removeEmptyPartialFile to decide whether the
-// identity sidecar may be removed together with a zero-byte partial. "Gone"
-// must mean GONE: only os.IsNotExist proves that there is nothing left for a
-// sidecar to describe. Any other stat failure (permission denied, a symlink
-// loop, an I/O error, ...) leaves the existence of the partial UNKNOWN, so the
-// sidecar must survive: removing it would make the next run unable to prove
-// the identity of bytes that may still be on disk, and it would discard them.
+// Sidecar cleanup requires proof the partial is gone. Any stat error other
+// than not-exist leaves its state unknown, so the identity record must survive.
 
 import (
 	"os"
@@ -73,7 +68,6 @@ func TestRemoveEmptyPartialFile(t *testing.T) {
 		if got := removeEmptyPartialFile(path); got {
 			t.Errorf("removeEmptyPartialFile(stat error %v) = true, want false: an unknown existence state must keep the identity sidecar", statErr)
 		}
-		// The path is left in place: the predicate must not remove it.
 		fi, lerr := os.Lstat(path)
 		if lerr != nil {
 			t.Fatalf("the stat-error path was removed: %v", lerr)

@@ -30,8 +30,7 @@ func TestStagingOwnershipProbeIsNonOwning(t *testing.T) {
 	}
 	lock.release()
 
-	// A concurrent probe-equivalent holds a shared lock. The probe must not
-	// mistake it for a writer (the old exclusive probe did).
+	// A concurrent shared probe must not be mistaken for an exclusive writer.
 	f, err := os.Open(stagingOwnershipLockPath(staging))
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +48,6 @@ func TestStagingOwnershipProbeIsNonOwning(t *testing.T) {
 	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 	f.Close()
 
-	// A real writer (exclusive) is busy.
 	owner, err := acquireStagingOwnershipLock(staging)
 	if err != nil {
 		t.Fatal(err)
@@ -102,11 +100,7 @@ func TestCheckBlobUnsupportedFlockProbeIsNotFree(t *testing.T) {
 	}
 
 	status, _, err := repo.CheckBlob(sha)
-	// The probe failed, so the ownership state is UNKNOWN. It must not be
-	// reported as "free"/stale (which would hand the file to a second
-	// writer) and it must not be reported as a proven live owner either
-	// (which would become a successful skip with the blob still missing).
-	// It is an observable error instead.
+	// Probe failure is unknown ownership: return an error, not stale/free or proven-live status.
 	if !errors.Is(err, ErrBlobOwnershipUnknown) || status != BlobOwnershipUnknown {
 		t.Fatalf("CheckBlob with ENOLCK probe = %v, %v; want an unknown-ownership error, not stale/free", status, err)
 	}

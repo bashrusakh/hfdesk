@@ -15,7 +15,6 @@ import (
 	"syscall"
 )
 
-// openStagingProbeHandle takes the lock file in the requested mode.
 func openStagingProbeHandle(path string, mode stagingProbeHoldMode) (stagingProbeHandle, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {

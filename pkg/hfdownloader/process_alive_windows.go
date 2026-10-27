@@ -11,8 +11,7 @@ import (
 )
 
 const (
-	// processQueryLimitedInformation is PROCESS_QUERY_LIMITED_INFORMATION,
-	// available since Windows Vista. It is enough to read the exit code.
+	// processQueryLimitedInformation is PROCESS_QUERY_LIMITED_INFORMATION, enough to query exit status.
 	processQueryLimitedInformation = 0x1000
 	// stillActive is STILL_ACTIVE, returned by GetExitCodeProcess for a
 	// running process.
@@ -22,13 +21,8 @@ const (
 	errorInvalidParameter = syscall.Errno(87)
 )
 
-// isProcessAlive reports whether a process with the given PID is still
-// running on this host. Unlike the Unix implementation it does not use
-// Signal(0): Go returns EWINDOWS for signal 0 on Windows, which would make
-// every live owner look dead. OpenProcess/GetExitCodeProcess is the real
-// platform check. Access-denied and other indeterminate failures are treated
-// as alive so a live owner is never displaced on an uncertain answer; an owner
-// whose same-host death cannot be proven is preserved rather than displaced.
+// isProcessAlive uses OpenProcess/GetExitCodeProcess: Signal(0) is unsupported
+// on Windows. Access-denied and other uncertain API failures count as alive.
 func isProcessAlive(pid int) bool {
 	if pid <= 0 {
 		return false

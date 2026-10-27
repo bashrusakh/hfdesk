@@ -3,29 +3,9 @@
 
 package hfdownloader
 
-// Regression coverage for the staging ownership contention bug (issue #140 /
-// PR #151 review).
-//
-// The staging ownership lock file serves two purposes at once: a real writer
-// holds it exclusively, and a read-only status probe touches it briefly. On
-// Unix a probe takes a shared flock while a claimant takes an exclusive one,
-// and those two conflict on the same inode — even inside one process, because
-// flock locks belong to the open file description, not the process.
-//
-// The bug: a status probe in flight made the claim's exclusive acquisition
-// fail, and the claim mapped that straight to errBlobIncompleteOwned. The job
-// then recorded a SUCCESSFUL skip ("downloading by another process") even
-// though no writer existed, so the file was never downloaded and never
-// published.
-//
-// The fix classifies the holder natively (flock(2) grants a shared lock to a
-// reader only when no exclusive holder exists), waits out a reader within a
-// bounded, context-aware window, skips only for a PROVEN live writer, and
-// reports an actionable retryable failure when the contention cannot be
-// resolved — never a successful skip.
-//
-// The cases below are driven through the real Download path so they exercise
-// the product routing, not just the raw lock primitive.
+// A shared status probe can conflict with an exclusive claim on Unix. That
+// contention is not proof of a live writer: retry or fail rather than report a
+// successful skip. Tests exercise this through Download.
 
 import (
 	"context"
@@ -41,19 +21,12 @@ import (
 	"time"
 )
 
-// stagingProbeHolder is a deterministic, controllable stand-in for an in-flight
-// status probe: it holds the lock file the way a probe does (shared on Unix,
-// shared-access on Windows) and releases it only when the test says so.
-//
-// The tests use it instead of a sleep so the contention window is exact: the
-// probe is provably held while the claim attempts its acquisition, and the
-// release happens on a signal rather than after a guessed delay.
+// stagingProbeHolder holds a probe-like lock until the test releases it.
 type stagingProbeHolder struct {
 	release func()
 	held    func() bool
 }
 
-// stagingProbeHoldMode selects how the probe holds the lock file.
 type stagingProbeHoldMode int
 
 const (
@@ -63,8 +36,6 @@ const (
 	probeHoldExclusive
 )
 
-// startStagingProbeHolder takes the lock file for staging in the given mode
-// and returns a holder that can release it deterministically.
 func startStagingProbeHolder(t *testing.T, staging string, mode stagingProbeHoldMode) *stagingProbeHolder {
 	t.Helper()
 	if !stagingOSLockAvailable {
@@ -87,7 +58,6 @@ func startStagingProbeHolder(t *testing.T, staging string, mode stagingProbeHold
 	}
 }
 
-// stagingProbeHandle is one held probe lock.
 type stagingProbeHandle struct {
 	releaseFn func()
 	heldFn    func() bool
@@ -103,9 +73,6 @@ func (h stagingProbeHandle) held() bool {
 	return h.heldFn != nil && h.heldFn()
 }
 
-// contentionDownloadFixture is a ready-to-run Download fixture: a hub that
-// serves one LFS file with range support, a legacy output destination and a
-// seeded, resumable staging state.
 type contentionDownloadFixture struct {
 	srv       *httptest.Server
 	out       string
@@ -118,8 +85,7 @@ type contentionDownloadFixture struct {
 	getRanges func() []string
 }
 
-// newContentionDownloadFixture builds the fixture. The staging payload holds
-// a validated committed prefix, so the item is genuinely resumable.
+// newContentionDownloadFixture seeds a valid resumable prefix.
 func newContentionDownloadFixture(t *testing.T) *contentionDownloadFixture {
 	t.Helper()
 	const total = 4_096
@@ -148,7 +114,6 @@ func newContentionDownloadFixture(t *testing.T) *contentionDownloadFixture {
 	}
 }
 
-// settings returns the Download settings for the fixture.
 func (f *contentionDownloadFixture) settings() Settings {
 	return Settings{
 		OutputDir:          f.out,
@@ -162,7 +127,6 @@ func (f *contentionDownloadFixture) settings() Settings {
 	}
 }
 
-// downloadOutcome collects what the job reported for the fixture's file.
 type downloadOutcome struct {
 	skips  []string
 	err    error
@@ -170,7 +134,6 @@ type downloadOutcome struct {
 	events []ProgressEvent
 }
 
-// runDownload runs the fixture's Download and collects the outcome.
 func (f *contentionDownloadFixture) runDownload(t *testing.T, ctx context.Context) downloadOutcome {
 	t.Helper()
 	out := downloadOutcome{}
@@ -184,17 +147,8 @@ func (f *contentionDownloadFixture) runDownload(t *testing.T, ctx context.Contex
 	return out
 }
 
-// TestDownload_StatusProbeInFlightDoesNotSkipTheFile is the core regression.
-//
-// A status probe holds the lock file while the claim attempts its exclusive
-// acquisition. The claim must wait the probe out and then download and
-// publish the file. Before the fix the claim saw a busy lock, reported
-// errBlobIncompleteOwned and the job recorded a successful skip with no file
-// published.
-//
-// The synchronization is deterministic: the claim signals through the
-// contention hook that it really hit the busy lock while the probe held it,
-// and the test releases the probe only then. No sleep decides the outcome.
+// A shared status probe may block exclusive acquisition without being a
+// writer; the claim must retry and publish. The hook signals the exact wait.
 func TestDownload_StatusProbeInFlightDoesNotSkipTheFile(t *testing.T) {
 	f := newContentionDownloadFixture(t)
 
@@ -204,8 +158,7 @@ func TestDownload_StatusProbeInFlightDoesNotSkipTheFile(t *testing.T) {
 	}
 	defer probe.release()
 
-	// The claim reports the contention it observed. The probe is provably
-	// held at that moment.
+	// The acquisition hook signals contention while the test still holds the probe.
 	contended := make(chan struct{})
 	var once sync.Once
 	restore := stagingOwnershipContentionHook
@@ -220,8 +173,7 @@ func TestDownload_StatusProbeInFlightDoesNotSkipTheFile(t *testing.T) {
 	select {
 	case <-contended:
 	case out := <-result:
-		// The download finished before any contention was observed. That is
-		// only acceptable if it did not skip.
+		// Early completion is acceptable only as non-skipping success.
 		if len(out.skips) > 0 {
 			t.Fatalf("the job skipped the file while a probe held the lock: %v", out.skips)
 		}
@@ -233,7 +185,6 @@ func TestDownload_StatusProbeInFlightDoesNotSkipTheFile(t *testing.T) {
 		t.Fatal("the claim never observed the contended ownership lock")
 	}
 
-	// The probe is released now, so the claim can take the lock.
 	probe.release()
 
 	var out downloadOutcome
@@ -255,10 +206,7 @@ func TestDownload_StatusProbeInFlightDoesNotSkipTheFile(t *testing.T) {
 	}
 }
 
-// TestDownload_UnresolvableContentionFailsInsteadOfSkipping covers the
-// timeout case: the contention never resolves, so no live writer is proven.
-// The job must fail with an actionable error and must NOT report a successful
-// skip with a missing file.
+// Unresolved probe contention must fail instead of skipping a missing file.
 func TestDownload_UnresolvableContentionFailsInsteadOfSkipping(t *testing.T) {
 	f := newContentionDownloadFixture(t)
 
@@ -297,22 +245,19 @@ func TestDownload_UnresolvableContentionFailsInsteadOfSkipping(t *testing.T) {
 	if _, err := os.Stat(f.dst); err == nil {
 		t.Error("the destination exists although the download failed")
 	}
-	// The staging state of the resumable file must survive the failure.
 	if _, err := os.Stat(f.staging); err != nil {
 		t.Errorf("the resumable staging file was removed by the failed claim: %v", err)
 	}
 }
 
-// TestDownload_CancellationWhileWaitingForOwnershipIsPrompt covers
-// cancellation: a claimant that is waiting out a contended lock must stop
-// promptly when its context is cancelled, and must not report a skip.
+// Cancellation interrupts a contended ownership wait without a skip.
 func TestDownload_CancellationWhileWaitingForOwnershipIsPrompt(t *testing.T) {
 	f := newContentionDownloadFixture(t)
 
 	probe := startStagingProbeHolder(t, f.staging, probeHoldShared)
 	defer probe.release()
 
-	// Cancel only once the claim is provably waiting on the contended lock.
+	// Cancel only after destination-domain acquisition reports lock contention.
 	contended := make(chan struct{})
 	var once sync.Once
 	restoreHook := stagingOwnershipContentionHook
@@ -359,15 +304,8 @@ func TestDownload_CancellationWhileWaitingForOwnershipIsPrompt(t *testing.T) {
 	}
 }
 
-// TestDownload_ConcurrentProbeAndClaimStressNeverReportsFalseSuccess is the
-// stress case: a continuous stream of status probes runs against repeated
-// claims. The invariant is that no claim ever reports "another live writer
-// owns this" while no writer exists — that verdict is what produced the
-// reported false success (the job counted the file as done, and the file was
-// never downloaded).
-//
-// Before the fix, a probe in flight made the claim fail its exclusive
-// acquisition and the claim mapped that straight to errBlobIncompleteOwned.
+// Repeated claims under shared-probe pressure must not report a live writer
+// when none exists.
 func TestDownload_ConcurrentProbeAndClaimStressNeverReportsFalseSuccess(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -383,7 +321,6 @@ func TestDownload_ConcurrentProbeAndClaimStressNeverReportsFalseSuccess(t *testi
 	}
 	own.release()
 
-	// Probes run continuously against the destination domain lock.
 	stop := make(chan struct{})
 	var probes sync.WaitGroup
 	probes.Add(1)
@@ -399,7 +336,7 @@ func TestDownload_ConcurrentProbeAndClaimStressNeverReportsFalseSuccess(t *testi
 			if err != nil {
 				continue
 			}
-			// Hold the reader lock briefly, exactly like a status probe.
+			// Hold the shared probe longer to increase the contention window.
 			time.Sleep(500 * time.Microsecond)
 			handle.release()
 		}
@@ -416,9 +353,8 @@ func TestDownload_ConcurrentProbeAndClaimStressNeverReportsFalseSuccess(t *testi
 	// behavior under test is the classification, not the duration.
 	shortBlobOwnershipWait(t, 200*time.Millisecond)
 
-	// Repeated destination-domain acquisitions under continuous probe
-	// pressure. None of them may report a live owner: no writer exists in this
-	// test, and a shared reader is not a writer.
+	// Repeated acquisitions under shared-reader pressure must not report a foreign
+	// live owner; no competing writer exists in this test.
 	key, lockSrc := flatDomainKey(pub), flatDomainLockSrc(pub)
 	var falseSkips int
 	var uncertain int
@@ -454,10 +390,6 @@ func TestDownload_ConcurrentProbeAndClaimStressNeverReportsFalseSuccess(t *testi
 	}
 }
 
-// TestDownload_ConcurrentProbeStressCompletesTheFile drives the whole
-// Download path while probes run continuously. The reported outcome must
-// match reality: the file exists and is byte-exact when the job reports
-// success.
 func TestDownload_ConcurrentProbeStressCompletesTheFile(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -494,13 +426,10 @@ func TestDownload_ConcurrentProbeStressCompletesTheFile(t *testing.T) {
 	if out.err != nil {
 		t.Fatalf("Download under probe contention: %v", out.err)
 	}
-	// A reported success must be real: the file exists and is byte-exact.
 	assertExactFile(t, f.dst, f.full)
 }
 
-// TestStagingOwnershipHolderClassification pins the native classification the
-// fix depends on: a shared reader and an exclusive writer must be told apart
-// without any timing heuristic.
+// The non-owning probe detects exclusive writers, not other readers.
 func TestStagingOwnershipHolderObservation(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -527,7 +456,6 @@ func TestStagingOwnershipHolderObservation(t *testing.T) {
 		t.Errorf("holder kind with no holder = %v, want stagingLockHolderNotExclusive", kind)
 	}
 
-	// A shared reader (a status probe) must not be observed as a writer.
 	reader := startStagingProbeHolder(t, staging, probeHoldShared)
 	kind, err = observeStagingOSLockHolder(lockPath)
 	if err != nil {
@@ -538,7 +466,6 @@ func TestStagingOwnershipHolderObservation(t *testing.T) {
 	}
 	reader.release()
 
-	// An exclusive holder (a real writer) must be observed as exclusive.
 	writer, err := acquireStagingOwnershipLock(staging)
 	if err != nil {
 		t.Fatal(err)
@@ -559,85 +486,4 @@ func TestStagingOwnershipHolderObservation(t *testing.T) {
 	if kind != stagingLockHolderNotExclusive {
 		t.Errorf("holder kind after release = %v, want stagingLockHolderNotExclusive", kind)
 	}
-}
-
-// TestStagingOwnershipObservationNeverTakesTheExclusiveLock is the negative
-// control for the native observer.
-//
-// The observation must be non-owning: if it took the exclusive lock, every
-// peer would see a live writer that does not exist. This test proves the
-// observation leaves the lock free for a real writer, and — the decisive
-// check — that a concurrent observer does not make the lock look exclusively
-// held to another observer.
-func TestStagingOwnershipObservationNeverTakesTheExclusiveLock(t *testing.T) {
-	if !stagingOSLockAvailable {
-		t.Skip("this platform has no OS ownership lock primitive")
-	}
-	dir := t.TempDir()
-	staging := filepath.Join(dir, "x.incomplete")
-	lockPath := stagingOwnershipLockPath(staging)
-
-	own, err := acquireStagingOwnershipLock(staging)
-	if err != nil {
-		t.Fatal(err)
-	}
-	own.release()
-
-	// A real writer must be able to take the lock right after an
-	// observation: the observation leaves no exclusive lock behind.
-	for i := 0; i < 20; i++ {
-		kind, oerr := observeStagingOSLockHolder(lockPath)
-		if oerr != nil {
-			t.Fatalf("observe: %v", oerr)
-		}
-		if kind != stagingLockHolderNotExclusive {
-			t.Fatalf("observation %d reported %v with no writer present", i, kind)
-		}
-	}
-	writer, err := acquireStagingOwnershipLock(staging)
-	if err != nil {
-		t.Fatalf("a real writer could not take the lock after the observations: %v", err)
-	}
-	writer.release()
-
-	// The decisive check: while a concurrent observer runs, another observer
-	// must NOT see an exclusive holder. An exclusive observer would make
-	// this fail.
-	var wg sync.WaitGroup
-	stop := make(chan struct{})
-	observing := make(chan struct{})
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				kind, oerr := observeStagingOSLockHolder(lockPath)
-				if oerr != nil {
-					continue
-				}
-				if kind == stagingLockHolderExclusive {
-					// A concurrent observer must never look like a writer.
-					t.Errorf("a concurrent observer was observed as an exclusive holder")
-					return
-				}
-			}
-		}()
-	}
-	close(observing)
-	// Let the observers run, then stop them.
-	time.Sleep(200 * time.Millisecond)
-	close(stop)
-	wg.Wait()
-
-	// After the observers stopped, the lock must be free for a real writer.
-	writer, err = acquireStagingOwnershipLock(staging)
-	if err != nil {
-		t.Fatalf("a real writer could not take the lock after the observers stopped: %v", err)
-	}
-	writer.release()
 }

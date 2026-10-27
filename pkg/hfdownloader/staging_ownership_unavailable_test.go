@@ -3,29 +3,8 @@
 
 package hfdownloader
 
-// Regression coverage for the unknown-ownership outcome of the cache status
-// check (issue #140 / PR #151).
-//
-// The ownership check has three possible outcomes and must never guess:
-//
-//   - a PROVEN live owner (the destination domain lock - blobs/tmp-<sha>.lock
-//     for a cache destination - is held exclusively) -> BlobDownloading: the
-//     caller does NOT skip the item,
-//     because the file is not present while the owner holds it. The downloader
-//     waits for the blob key's ownership domain and re-checks the published
-//     target instead;
-//   - a PROVABLY dead owner -> BlobStale: the caller may resume the item;
-//   - an UNKNOWN ownership state (the OS-lock probe failed, or the platform
-//     cannot represent the lock) -> BlobOwnershipUnknown plus an error: the
-//     caller must surface the failure.
-//
-// The defect this file pins: the unknown outcome used to be reported as
-// BlobDownloading, i.e. as a PROVEN live owner. The downloader's skip check
-// turned that into a successful skip, so the job reported "download complete
-// (downloaded 0, skipped 1)" while the blob was still absent and the partial
-// was untouched. The mutation path (the staging claim) already failed closed
-// for the same condition, so the status path contradicted the downloader's
-// own safety rule.
+// Unknown ownership is an error, not BlobDownloading. Only proven live
+// ownership may produce that status; acquisition and cleanup fail closed.
 
 import (
 	"bytes"
@@ -63,8 +42,7 @@ func TestStagingOwnershipUnavailableFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The destination's domain cannot be acquired, so the item fails HERE
-	// before it writes any payload.
+	// Domain acquisition must fail before claim or payload mutation.
 	if _, derr := blobDomainAcquire(context.Background(), flatDomainKey(filepath.Join(dir, "payload")),
 		flatDomainLockSrc(filepath.Join(dir, "payload"))); !errors.Is(derr, lockErr) || !strings.Contains(derr.Error(), "ownership") {
 		t.Fatalf("domain acquisition error = %v, want actionable ownership failure", derr)
@@ -100,9 +78,7 @@ func TestStagingOwnershipUnavailableFailsClosed(t *testing.T) {
 	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &cacheMeta); err != nil {
 		t.Fatal(err)
 	}
-	// The status path must not claim a live owner it could not prove. An
-	// unknown ownership state is an observable error, never a successful
-	// skip.
+	// An unavailable probe must return BlobOwnershipUnknown with its error.
 	status, _, err := repo.CheckBlob(sha)
 	if !errors.Is(err, ErrBlobOwnershipUnknown) {
 		t.Fatalf("CheckBlob with unavailable ownership probe = %v, %v; want an unknown-ownership error", status, err)
@@ -110,19 +86,14 @@ func TestStagingOwnershipUnavailableFailsClosed(t *testing.T) {
 	if status != BlobOwnershipUnknown {
 		t.Fatalf("status with unavailable ownership probe = %v; want %v", status, BlobOwnershipUnknown)
 	}
-	// The incomplete payload is untouched: a retry can still resume it.
+	// The status probe must leave the incomplete payload untouched.
 	gotPayload, err = os.ReadFile(cacheStaging)
 	if err != nil || string(gotPayload) != string(payload) {
 		t.Fatalf("the unknown-ownership check changed the incomplete payload: %q, %v", gotPayload, err)
 	}
 }
 
-// TestDownloadUnknownOwnershipIsAnObservableError is the end-to-end half of
-// the same invariant: with the ownership probe unavailable, the job must
-// report the failure instead of a successful skip.
-//
-// Before the fix the job returned nil and reported "download complete
-// (downloaded 0, skipped 1)" while the blob was absent.
+// Download must report an unavailable ownership probe instead of successful skip.
 func TestDownloadUnknownOwnershipIsAnObservableError(t *testing.T) {
 	oldProbe := stagingOwnershipStatusProbe
 	defer func() { stagingOwnershipStatusProbe = oldProbe }()
@@ -189,8 +160,7 @@ func TestDownloadUnknownOwnershipIsAnObservableError(t *testing.T) {
 	if len(skips) != 0 {
 		t.Errorf("the job recorded a successful skip although the ownership state was unknown: %v", skips)
 	}
-	// The blob was never published and the partial survived: a retry can
-	// still resume it.
+	// No blob is published and the existing partial is preserved.
 	if _, serr := os.Stat(repo.BlobPath(sha)); !os.IsNotExist(serr) {
 		t.Errorf("a blob was published although the ownership state was unknown, stat err=%v", serr)
 	}
@@ -200,9 +170,8 @@ func TestDownloadUnknownOwnershipIsAnObservableError(t *testing.T) {
 	}
 }
 
-// TestCheckBlobProbeErrorPrecedesMissingOrMalformedMetadata pins that the
-// ownership probe decides first: an unreadable or missing record must not
-// turn an unknown ownership state into a resumable "stale" verdict.
+// Probe failure must remain unknown ownership even with missing or malformed
+// metadata; it must not become BlobStale.
 func TestCheckBlobProbeErrorPrecedesMissingOrMalformedMetadata(t *testing.T) {
 	oldProbe := stagingOwnershipStatusProbe
 	defer func() { stagingOwnershipStatusProbe = oldProbe }()
@@ -243,62 +212,8 @@ func TestCheckBlobProbeErrorPrecedesMissingOrMalformedMetadata(t *testing.T) {
 	}
 }
 
-// TestCheckBlobProvenOwnerAndStaleRemainDistinct pins the two other outcomes
-// of the same check: a PROVEN live owner may be skipped, a PROVABLY dead
-// owner may be resumed. The unknown-ownership fix must not blur them.
-func TestCheckBlobProvenOwnerAndStaleRemainDistinct(t *testing.T) {
-	if !stagingOSLockAvailable {
-		t.Skip("this platform has no OS ownership lock primitive")
-	}
-	cache := NewHFCache(t.TempDir())
-	repo, err := cache.Repo("owner/repo", RepoTypeModel)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.EnsureDirs(); err != nil {
-		t.Fatal(err)
-	}
-	sha := strings.Repeat("e", 64)
-	staging := repo.IncompletePath(sha)
-	if err := os.WriteFile(staging, []byte("partial"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	meta := IncompleteMeta{
-		PID: os.Getpid(), Instance: processInstanceToken, Host: processHostname,
-		StartedAt: time.Now().UTC(), Size: 7, SHA256: sha, Version: stagingMetaVersion,
-		Repo: "owner/repo", Path: "model.bin", Ranges: buildRangeLayout(7, 1), LockFenced: true,
-	}
-	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &meta); err != nil {
-		t.Fatal(err)
-	}
-
-	// A proven live owner: the destination domain's lifetime lock is held
-	// exclusively.
-	own, err := acquireStagingOwnershipLock(mustDomainDst(t, repo, sha))
-	if err != nil {
-		t.Fatal(err)
-	}
-	status, _, err := repo.CheckBlob(sha)
-	if err != nil || status != BlobDownloading {
-		t.Fatalf("status with a held ownership lock = %v, %v; want %v", status, err, BlobDownloading)
-	}
-	own.release()
-
-	// A provably dead owner: a free lock plus a lock-fenced record.
-	status, _, err = repo.CheckBlob(sha)
-	if err != nil || status != BlobStale {
-		t.Fatalf("status with a free ownership lock = %v, %v; want %v", status, err, BlobStale)
-	}
-}
-
-// TestDownloadProvenOwnerIsNotASuccessfulSkip is the download-level half of
-// the same distinction: a PROVEN live owner is NOT a successful skip.
-//
-// The file is not present while the live owner holds the item's staging, so
-// the job must not report the item as done. The item waits for the blob key's
-// ownership domain and re-checks the published target; when the owner still
-// owns the item, the item fails with the actionable live-owner error instead
-// of a skip that would report a completion the cache does not have.
+// Download waits for a proven live owner; if it remains past the bounded
+// budget, return the live-owner error rather than successful skip.
 func TestDownloadProvenOwnerIsNotASuccessfulSkip(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")

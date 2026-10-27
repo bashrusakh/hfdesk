@@ -5,18 +5,11 @@
 
 package hfdownloader
 
-// Unix ownership lock: flock(2) on an open file description. LOCK_EX|LOCK_NB
-// is non-blocking; EWOULDBLOCK means a live owner. The lock is owned by the
-// open file description, so two separate opens of the same path in one process
-// also conflict (the in-process registry makes that a defensive property, not
-// the primary exclusion). Closing the descriptor releases the lock, including
-// when the process dies.
-//
-// Only the real lifetime writer takes LOCK_EX. Every observation uses
-// LOCK_SH, which is granted unless an exclusive holder exists: a refused
-// shared lock proves an exclusive holder, and a granted shared lock proves
-// none. An exclusive observer would itself be an exclusive holder and would
-// make every peer see a live writer that does not exist.
+// Unix flock ownership belongs to an open file description, so separate opens
+// conflict even in one process. Close/process exit releases the lock.
+// Only writers take LOCK_EX; observations use LOCK_SH so probes coexist.
+// A refused shared probe proves an exclusive holder; a refused exclusive
+// acquisition alone may mean either a writer or a temporary shared probe.
 
 import (
 	"errors"
@@ -24,8 +17,8 @@ import (
 	"syscall"
 )
 
-// stagingOSLockAvailable reports that this platform implements the OS
-// ownership lock (used by tests and documentation).
+// stagingOSLockAvailable means this build implements an OS ownership primitive;
+// individual filesystems may still refuse it.
 const stagingOSLockAvailable = true
 
 // stagingOwnershipProbeFlock is the status probe's flock operation. It is a
@@ -33,7 +26,6 @@ const stagingOSLockAvailable = true
 // depending on a particular mounted filesystem in tests.
 var stagingOwnershipProbeFlock = syscall.Flock
 
-// stagingOSLockHandle is one held flock descriptor.
 type stagingOSLockHandle struct {
 	f *os.File
 }
@@ -68,12 +60,9 @@ func (h stagingOSLockHandle) release() {
 	_ = h.f.Close()
 }
 
-// probeStagingOSLock reports whether the lock file exists and is held by a
-// writer. It takes a NON-OWNING shared lock (LOCK_SH|LOCK_NB): shared locks
-// coexist with each other, so concurrent probes never see each other as an
-// owner, while an exclusive writer's LOCK_EX makes the shared acquisition fail.
-// The lock is released immediately. It opens read-only without creating
-// anything and never acts as a writer itself.
+// probeStagingOSLock opens an existing file read-only and briefly takes
+// LOCK_SH|LOCK_NB. Probes coexist; refusal identifies an exclusive writer.
+// A missing file is not busy, and the probe creates nothing.
 func probeStagingOSLock(path string) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {

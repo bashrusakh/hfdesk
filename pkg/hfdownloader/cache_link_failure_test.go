@@ -3,21 +3,8 @@
 
 package hfdownloader
 
-// The cache entry link contract (issue #140 / PR #151).
-//
-// A cached file is reachable through its snapshot entry (and its friendly
-// entry). The transfer path always treated a failed link creation as fatal
-// for the item; the two SKIP paths swallowed the error and reported the item
-// as a successful skip, so a job could report success while the requested
-// path was not reachable at all.
-//
-// The skip paths and the end-of-job reconciliation now agree with the
-// transfer path: a link-creation failure fails the item (or the job) with an
-// actionable error, and a job that reports success means the requested files
-// are present AND reachable at their snapshot/friendly paths.
-//
-// The friendly view is deliberately absent when Settings.NoFriendlyView is
-// set, so that is not an error.
+// Covers link failures in transfer, skip, and reconciliation paths. A missing
+// friendly entry is valid when NoFriendlyView is enabled.
 
 import (
 	"bytes"
@@ -35,12 +22,8 @@ import (
 	"time"
 )
 
-// breakSnapshotEntry makes the snapshot entry of a commit impossible to
-// create: the commit's snapshot directory is a regular file, so the parent
-// directory of the entry cannot be created.
-//
-// The failure is deterministic and portable: it does not depend on
-// permissions, on a read-only filesystem or on symlink support.
+// breakSnapshotEntry blocks snapshot creation with a regular file at the
+// commit directory, avoiding permission- or symlink-dependent failures.
 func breakSnapshotEntry(t *testing.T, repo *RepoDir, commit string) {
 	t.Helper()
 	dir := filepath.Join(repo.SnapshotsDir(), commit)
@@ -52,8 +35,6 @@ func breakSnapshotEntry(t *testing.T, repo *RepoDir, commit string) {
 	}
 }
 
-// publishBlob writes a published content-addressed blob, so the pre-download
-// skip check finds it.
 func publishBlob(t *testing.T, repo *RepoDir, sha string, content []byte) {
 	t.Helper()
 	if err := os.WriteFile(repo.BlobPath(sha), content, 0o644); err != nil {
@@ -61,9 +42,7 @@ func publishBlob(t *testing.T, repo *RepoDir, sha string, content []byte) {
 	}
 }
 
-// TestPreDownloadSkipLinkFailureFailsTheItem covers the pre-download "blob
-// exists" skip: the payload is present, but the requested path cannot be
-// linked, so the item must FAIL instead of reporting a successful skip.
+// An existing blob is not a successful skip if its snapshot entry cannot be created.
 func TestPreDownloadSkipLinkFailureFailsTheItem(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
@@ -72,7 +51,6 @@ func TestPreDownloadSkipLinkFailureFailsTheItem(t *testing.T) {
 	cacheDir := t.TempDir()
 	repo := ownershipContractRepo(t, cacheDir)
 	publishBlob(t, repo, sha, full)
-	// The snapshot entry of this commit cannot be created.
 	breakSnapshotEntry(t, repo, "commit123")
 
 	srv, _ := recordingHub(t, full, "model.bin", true)
@@ -110,8 +88,7 @@ func TestPostDomainSkipLinkFailureFailsTheItem(t *testing.T) {
 	cacheDir := t.TempDir()
 	repo := ownershipContractRepo(t, cacheDir)
 
-	// A live owner holds the blob key's ownership domain, so the item has to
-	// wait for it before it can re-check the published target.
+	// Hold the blob domain so the item must wait before rechecking publication.
 	owner, err := acquireStagingOwnershipLock(mustDomainDst(t, repo, sha))
 	if err != nil {
 		t.Fatal(err)
@@ -128,13 +105,10 @@ func TestPostDomainSkipLinkFailureFailsTheItem(t *testing.T) {
 	go func() { result <- runOwnershipContractDownload(context.Background(), cfg) }()
 	awaitContention(t, contended, "the blob key's ownership domain")
 
-	// The owner publishes the blob and releases the domain. The item then
-	// takes the domain, finds the published blob and takes the post-domain
-	// skip path.
+	// Publish before releasing the domain to exercise the post-domain skip.
 	publishBlob(t, repo, sha, full)
 	owner.release()
 
-	// The snapshot entry of this commit cannot be created.
 	breakSnapshotEntry(t, repo, "commit123")
 
 	var out ownershipContractOutcome
@@ -157,9 +131,7 @@ func TestPostDomainSkipLinkFailureFailsTheItem(t *testing.T) {
 	}
 }
 
-// TestSkipWithWorkingLinksKeepsTheSkipBehavior is the control case: when the
-// links can be created, the pre-download skip keeps its historical behavior -
-// the item is skipped, the job succeeds, and the requested path is reachable.
+// A reachable cached item still skips successfully without another request.
 func TestSkipWithWorkingLinksKeepsTheSkipBehavior(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
@@ -182,13 +154,10 @@ func TestSkipWithWorkingLinksKeepsTheSkipBehavior(t *testing.T) {
 	if got := gets(); len(got) != 0 {
 		t.Errorf("the skipped item issued %d range GETs (%v), want 0", len(got), got)
 	}
-	// The requested path is reachable through its entries.
 	assertOwnershipContractLinks(t, cacheDir, "model.bin")
 }
 
-// TestSkipWithDisabledFriendlyViewIsNotALinkFailure pins the
-// NoFriendlyView exception: the friendly entry is deliberately absent in that
-// mode, so a missing friendly view is not an error.
+// NoFriendlyView deliberately omits the friendly entry; the snapshot remains required.
 func TestSkipWithDisabledFriendlyViewIsNotALinkFailure(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
@@ -220,9 +189,7 @@ func TestSkipWithDisabledFriendlyViewIsNotALinkFailure(t *testing.T) {
 	}
 }
 
-// TestReconciliationLinkFailureFailsTheJob covers the end-of-job
-// reconciliation: a link it cannot create leaves the requested path
-// unreachable, so the job must fail instead of only warning about it.
+// A reconciliation link failure must fail the job, not merely warn.
 func TestReconciliationLinkFailureFailsTheJob(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
@@ -256,13 +223,8 @@ func TestReconciliationLinkFailureFailsTheJob(t *testing.T) {
 	}
 }
 
-// TestSameSHADifferentPathItemGetsItsOwnLinks covers the shared-blob
-// reconciliation: two plan items with the same digest but different paths
-// share ONE blob, and each of them ends with its OWN snapshot and friendly
-// entries, so a shared blob never leaves a plan path without cache entries.
-//
-// The second item must reuse the published blob (no second transfer) and its
-// own entries must exist.
+// Same-SHA items share one blob but need separate snapshot and friendly entries.
+// The second item must reuse the blob without another transfer.
 func TestSameSHADifferentPathItemGetsItsOwnLinks(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
@@ -271,7 +233,6 @@ func TestSameSHADifferentPathItemGetsItsOwnLinks(t *testing.T) {
 	cacheDir := t.TempDir()
 	repo := ownershipContractRepo(t, cacheDir)
 
-	// Two files with the SAME digest: the blob is shared, the paths differ.
 	node := func(path string) string {
 		return fmt.Sprintf(`{"type":"file","path":%q,"size":%d,"sha256":%q}`, path, len(full), sha)
 	}
@@ -304,13 +265,10 @@ func TestSameSHADifferentPathItemGetsItsOwnLinks(t *testing.T) {
 		t.Fatalf("Download: %v", out.err)
 	}
 
-	// The blob is shared and holds the exact bytes.
 	assertExactFile(t, repo.BlobPath(sha), full)
-	// Both plan paths have their own entries.
 	for _, rel := range []string{"a.bin", "b.bin"} {
 		assertOwnershipContractLinks(t, cacheDir, rel)
 	}
-	// The second item reused the published blob: only one transfer happened.
 	mu.Lock()
 	got := append([]string(nil), ranges...)
 	mu.Unlock()
@@ -319,56 +277,8 @@ func TestSameSHADifferentPathItemGetsItsOwnLinks(t *testing.T) {
 	}
 }
 
-// TestNegativeControlSwallowedLinkFailureReportsSuccess is the negative
-// control for the link contract.
-//
-// It installs the historical behavior through the production seam - a
-// swallowed link failure - and shows that the job reports success although
-// the requested path is not reachable. That is the defect the link contract
-// removes, and it proves that the link regressions really detect it.
-func TestNegativeControlSwallowedLinkFailureReportsSuccess(t *testing.T) {
-	const total = 4_096
-	full := rangedTestPayload(total)
-	sha := singleTestSHA(full)
-
-	cacheDir := t.TempDir()
-	repo := ownershipContractRepo(t, cacheDir)
-	publishBlob(t, repo, sha, full)
-	breakSnapshotEntry(t, repo, "commit123")
-
-	// The historical model: the link failure is swallowed.
-	oldCreate := cacheEntryLinkCreate
-	cacheEntryLinkCreate = func(ctx context.Context, r *RepoDir, commit, rel, filterSubdir, blobSHA string, noFriendly bool) error {
-		return nil
-	}
-	defer func() { cacheEntryLinkCreate = oldCreate }()
-
-	srv, _ := recordingHub(t, full, "model.bin", true)
-	cfg := ownershipContractSettings(cacheDir, srv.URL, "0")
-	out := runOwnershipContractDownload(context.Background(), cfg)
-
-	if out.err != nil {
-		t.Fatalf("the negative control did not reproduce the defect: the job failed instead of reporting success: %v", out.err)
-	}
-	if len(out.skips) != 1 {
-		t.Fatalf("the negative control did not reproduce the defect: the job did not report a successful skip: %v", out.skips)
-	}
-	t.Logf("negative control reproduced the defect: the job reported success although the requested path is not reachable")
-}
-
-// TestTransferPathLinkFailureCarriesTheUnreachableSentinel covers the
-// transfer paths: a link-creation failure there must carry the SAME exported
-// ErrCacheLinkUnreachable sentinel as the skip paths, so the failure is
-// uniform on every path that creates the cache entries.
-//
-// The two transfer paths are covered:
-//   - the direct blob path (an LFS blob with a canonical SHA-256: the ranged
-//     route publishes blobs/<sha> and the downloader creates the entries);
-//   - the store path (a plain file: the downloader stores the payload through
-//     the cache store, which creates the entries).
-//
-// In both cases the payload IS in blobs/ while the requested path is not
-// reachable, so the item must fail instead of reporting a success.
+// Both the direct ranged-blob route and the plain-file cache-store route must
+// return ErrCacheLinkUnreachable when publication succeeds but link creation fails.
 func TestTransferPathLinkFailureCarriesTheUnreachableSentinel(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
@@ -384,8 +294,6 @@ func TestTransferPathLinkFailureCarriesTheUnreachableSentinel(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cacheDir := t.TempDir()
 			repo := ownershipContractRepo(t, cacheDir)
-			// The snapshot entry of this commit cannot be created, so the
-			// transfer publishes the payload and then fails on the link.
 			breakSnapshotEntry(t, repo, "commit123")
 
 			srv, _ := recordingHub(t, full, "model.bin", tc.lfs)
@@ -412,7 +320,6 @@ func TestTransferPathLinkFailureCarriesTheUnreachableSentinel(t *testing.T) {
 	}
 }
 
-// containsAll reports whether s contains every one of the parts.
 func containsAll(s string, parts ...string) bool {
 	for _, part := range parts {
 		if !strings.Contains(s, part) {

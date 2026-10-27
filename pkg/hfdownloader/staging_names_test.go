@@ -3,14 +3,6 @@
 
 package hfdownloader
 
-// The staging-artifact classification (issue #140 follow-up, group 2).
-//
-// The shape list is derived from the code that creates the names, so the
-// table below is the contract every consumer of the cache shares: a staging
-// artifact is never content, a canonical digest is the normal published blob,
-// and an unusual published name - which the public storage API accepts - is
-// content as well.
-
 import (
 	"strings"
 	"testing"
@@ -21,8 +13,7 @@ func TestStagingArtifactNameCoversEveryProducerShape(t *testing.T) {
 	other := strings.Repeat("b", 64)
 
 	staging := []string{
-		// The single-request staging destination and everything derived
-		// from it.
+		// Single-request staging names and derived artifacts.
 		"tmp-" + sha,
 		"tmp-" + sha + ".part",
 		"tmp-" + sha + ".part.meta",
@@ -87,8 +78,7 @@ func TestStagingArtifactNameCoversEveryProducerShape(t *testing.T) {
 		t.Error("the canonical blob name check does not recognize the canonical digest form")
 	}
 
-	// The shapes that are not producer names stay ordinary names: an empty
-	// prefix or suffix is not a producer's name.
+	// Incomplete staging-name shapes remain ordinary published names.
 	for _, name := range []string{"tmp-", "key.tmp-", ".tmp-tail", "abc123.gguf"} {
 		if IsStagingArtifactName(name) {
 			t.Errorf("non-producer name %q was classified as a staging artifact", name)

@@ -3,16 +3,9 @@
 
 package hfdownloader
 
-// Clean-framing completion across a single-path restart.
-//
-// The identity sidecar proves which OBJECT a `.part` belongs to; it does not
-// prove that the HTTP response body that wrote it ended cleanly. A process can
-// exit after the final WriteAt but before io.Copy observes EOF, so an
-// exactly-sized partial may still hold a torn final byte. A restart publishes
-// such a partial without a request only when the sidecar also records a
-// cleanly-framed completion. Otherwise it reserves the final byte and
-// revalidates it with the non-empty range [size-1, size); an error while that
-// revalidation body is still unframed keeps the final byte uncommitted.
+// Identity does not prove clean response framing. An exact-size partial without
+// framing proof must re-request the final byte and commit it only after a clean
+// response.
 
 import (
 	"context"
@@ -24,10 +17,6 @@ import (
 	"testing"
 )
 
-// TestDownloadSingle_CompletePartialWithoutFramingProofRevalidatesLastByte is
-// the restart regression: a matching, pinned, exactly-sized partial whose
-// sidecar does NOT record clean framing must not be published as-is. Only the
-// final byte is re-requested and the result is the exact served content.
 func TestDownloadSingle_CompletePartialWithoutFramingProofRevalidatesLastByte(t *testing.T) {
 	const total = 64
 	full := rangedTestPayload(total)
@@ -72,10 +61,8 @@ func TestDownloadSingle_CompletePartialWithoutFramingProofRevalidatesLastByte(t 
 	}
 }
 
-// TestDownloadSingle_RevalidationBodyErrorDoesNotPublishFinalByte is the
-// negative of the restart rule: the revalidation body delivers the final byte
-// and then aborts before clean framing. The item fails, nothing is published,
-// and the final byte stays uncommitted for a later retry/restart.
+// A final-byte revalidation that aborts before clean framing must fail without
+// publishing, leaving that byte uncommitted for the next attempt.
 func TestDownloadSingle_RevalidationBodyErrorDoesNotPublishFinalByte(t *testing.T) {
 	const total = 64
 	full := rangedTestPayload(total)
@@ -136,10 +123,8 @@ func TestDownloadSingle_RevalidationBodyErrorDoesNotPublishFinalByte(t *testing.
 	}
 }
 
-// TestDownloadSingle_OneByteCompletePartialWithoutFramingProofRevalidates is
-// the size-1 edge of the restart rule: the reserved final byte starts at
-// offset zero, so the revalidation must still be an explicit non-empty range
-// [0, 1) rather than an implicit full GET.
+// With a one-byte file, revalidation must still request explicit bytes=0-0,
+// not an implicit full GET.
 func TestDownloadSingle_OneByteCompletePartialWithoutFramingProofRevalidates(t *testing.T) {
 	full := []byte{0x7A}
 	dir := t.TempDir()
@@ -176,9 +161,8 @@ func TestDownloadSingle_OneByteCompletePartialWithoutFramingProofRevalidates(t *
 	assertExactFile(t, dst, full)
 }
 
-// TestDownloadSingle_CompletePartialWithFramingProofNeedsNoRequest pins the
-// positive side of the rule: a matching sidecar WITH the clean-framing proof
-// still publishes an exactly-sized partial without any network request.
+// Matching identity plus framing proof permits exact-size publication with no
+// network request.
 func TestDownloadSingle_CompletePartialWithFramingProofNeedsNoRequest(t *testing.T) {
 	const total = 64
 	full := rangedTestPayload(total)

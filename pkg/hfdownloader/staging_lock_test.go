@@ -3,12 +3,8 @@
 
 package hfdownloader
 
-// Cross-process ownership coverage for the issue #140 trust model (T4):
-//   - the local per-path metadata gate admits exactly one holder at a time,
-//     is bounded, and recovers an abandoned lock;
-//   - a real multi-process take-over race on one stale staging record produces
-//     exactly one writer, every range fetched once, and no loser deleting or
-//     replacing the winner's claim record.
+// Covers bounded metadata serialization and cross-process destination
+// ownership: contenders complete serially, with at most one writer at a time.
 
 import (
 	"bytes"
@@ -213,10 +209,8 @@ type stagingTakeoverChild struct {
 	out bytes.Buffer
 }
 
-// TestStagingTakeoverChildProcess is the re-executed contender used by
-// TestClaimStagingConcurrentTakeover. It acquires the destination's ownership
-// domain exactly like an item goroutine, then runs the multipart route under
-// it. It is skipped in an ordinary test run.
+// TestStagingTakeoverChildProcess is a re-exec helper for the contender test.
+// It acquires the destination domain before multipart work; ordinary runs skip it.
 func TestStagingTakeoverChildProcess(t *testing.T) {
 	if os.Getenv(stagingTakeoverChildEnv) != "1" {
 		t.Skip("helper process for TestClaimStagingConcurrentTakeover")
@@ -270,13 +264,9 @@ func TestStagingTakeoverChildProcess(t *testing.T) {
 	}
 }
 
-// TestClaimStagingConcurrentTakeover races several real OS processes for one
-// stale staging record. The destination's ownership domain must admit exactly
-// one writer at a time: the contenders serialize on it, the winner takes the
-// stale record over and publishes, and every later contender obtains the
-// destination afterwards and publishes its own exact bytes. At no point does a
-// contender observe a false live-owner verdict, and the stale record is never
-// left behind.
+// Real processes contend for one stale record and destination domain. Every
+// contender must complete without a false live-owner refusal, and final bytes
+// must match the payload with no stale record remaining.
 func TestClaimStagingConcurrentTakeover(t *testing.T) {
 	if os.Getenv(stagingTakeoverChildEnv) == "1" {
 		t.Skip("child process")
@@ -295,9 +285,8 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 	staging := dst + ".incomplete"
 	metaPath := staging + ".meta"
 
-	// Stale, fully resumable versioned record from a provably dead foreign
-	// owner. The payload bytes are garbage: every range is uncommitted, so the
-	// winner must fetch all of them.
+	// The dead-owner seed has unpinned identity and garbage payload. It must be
+	// discarded, then fetched completely under a fresh claim.
 	if err := os.WriteFile(staging, bytes.Repeat([]byte{0xA5}, total), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -344,15 +333,11 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 		mu.Lock()
 		ranges = append(ranges, r.Header.Get("Range"))
 		mu.Unlock()
-		// The winner issues its first range only AFTER downloadMultipart has
-		// opened and preallocated the staging payload, so this is the product
-		// signal that the payload exists. The claim record alone is written
-		// BEFORE that open, so reading the new record instance does not prove
-		// the payload is present: a takeover legitimately removes the
-		// unusable predecessor and recreates the payload afterwards.
+		// A first range request follows payload open/preallocation. A new record
+		// alone does not prove the payload has been recreated after discard.
 		firstOnce.Do(func() { close(firstRange) })
-		// Hold every body until the losers have finished their claim attempts,
-		// so the race is decided by ownership, not by how fast a body arrives.
+		// Hold range bodies while observing the first writer's claim; other contenders
+		// remain blocked on the destination domain.
 		<-release
 		content := full[start : end+1]
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
@@ -403,19 +388,15 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 		children[i].cmd = cmd
 	}
 
-	// Let the contenders reach the claim path, then release the barrier together.
+	// Release the child-process start barrier.
 	time.Sleep(300 * time.Millisecond)
 	if werr := os.WriteFile(goPath, nil, 0o644); werr != nil {
 		t.Fatal(werr)
 	}
 
-	// The contenders serialize on the destination's ownership domain: ONE of
-	// them holds it and is parked in a blocked range body, while the others
-	// wait for it (never take it over). Observe the winner's takeover of the
-	// stale record before releasing the server.
-	// Poll the record until the takeover replaces the stale seed. The winner
-	// is blocked in a range body, so the claimed record is stable here; the
-	// remove/recreate window and a partially written claim are expected states.
+	// Poll until the first domain holder replaces the stale seed. The record may
+	// be absent during discard/recreate, but installed records must be complete.
+	// Range bodies remain blocked until the server barrier is released.
 	var claimMeta IncompleteMeta
 	lastObserved := "record was never read"
 	claimDeadline := time.Now().Add(10 * time.Second)
@@ -446,14 +427,8 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// The replacement record is installed BEFORE downloadMultipart opens and
-	// preallocates the payload, so a stat right after the record read can land
-	// in the takeover's legitimate remove/recreate window (the unusable
-	// predecessor is removed, the fresh claim record is written, and the
-	// payload is only recreated when the winner opens it). Synchronize on the
-	// winner's FIRST RANGE REQUEST instead: it is sent only after the payload
-	// has been opened and preallocated, and every range body is parked until
-	// this test releases the server.
+	// Wait for the first range request before asserting payload existence:
+	// claim installation precedes payload open/preallocation.
 	select {
 	case <-firstRange:
 	case <-time.After(10 * time.Second):
@@ -474,10 +449,7 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 		}
 	}
 
-	// Every contender must complete: the one-destination-domain protocol
-	// serializes them instead of refusing the losers, so each later contender
-	// re-obtains the destination after the previous one releases it. No
-	// contender may observe a false live-owner verdict.
+	// All contenders must complete serially, never fail as a false live owner.
 	var unexpect []stagingTakeoverChildResult
 	delivered := 0
 	for _, p := range resultPaths {
@@ -502,8 +474,6 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 		t.Fatalf("%d contenders completed a delivery, want all %d", delivered, contenders)
 	}
 
-	// The stale seed was replaced by a current claim during the takeover, and
-	// no contender published the garbage seed bytes.
 	if _, serr := os.Stat(metaPath); serr == nil {
 		t.Errorf("the staging record survived the contenders' successful publications")
 	}

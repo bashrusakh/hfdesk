@@ -18,7 +18,6 @@ import (
 	"time"
 )
 
-// progressReader wraps an io.Reader and emits progress events during reads.
 type progressReader struct {
 	reader     io.Reader
 	total      int64
@@ -58,17 +57,13 @@ func (pr *progressReader) Read(p []byte) (n int, err error) {
 	return n, err
 }
 
-// multipartLayoutMetaPath returns the path of the pre-#140 multipart layout
-// record. The downloader no longer writes or reads it: only the cleanup and
-// the classification surfaces still know the name.
+// multipartLayoutMetaPath names the obsolete pre-#140 layout record, used only for cleanup.
 func multipartLayoutMetaPath(dst string) string {
 	return dst + ".parts.json"
 }
 
-// multipartPartFiles lists the legacy per-connection payload files for dst:
-// dst.part-NN for a non-empty run of digits, matching the pre-#140 %02d/%d
-// part naming. Non-digit suffixes are not download artifacts and are left
-// alone.
+// multipartPartFiles lists legacy dst.part-NN files with non-empty digit suffixes;
+// non-digit suffixes are not download artifacts.
 func multipartPartFiles(dst string) ([]string, error) {
 	dir := filepath.Dir(dst)
 	entries, err := os.ReadDir(dir)
@@ -84,8 +79,6 @@ func multipartPartFiles(dst string) ([]string, error) {
 		if entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
 			continue
 		}
-		// Only the legacy %02d/%d part index family; a user file such as
-		// "model.bin.part-notes" must not be swept up as a download artifact.
 		if !isAllDigits(strings.TrimPrefix(entry.Name(), prefix)) {
 			continue
 		}
@@ -110,10 +103,8 @@ func removeMultipartResumeFiles(dst string) error {
 	return nil
 }
 
-// skippedBlobLink records an HF-cache item that was skipped while another
-// writer owned or completed the shared blob. A later writer may have created
-// snapshot/friendly entries only for its own repository path, so Download
-// reconciles every skipped path once all files have finished.
+// skippedBlobLink tracks completed shared-blob items whose per-path cache links
+// are reconciled after all transfers finish.
 type skippedBlobLink struct {
 	commit       string
 	relativePath string
@@ -121,25 +112,13 @@ type skippedBlobLink struct {
 	sha256       string
 }
 
-// Download scans and downloads files from a HuggingFace repo.
-//
-// v3.0+: Files are stored in HuggingFace Hub cache structure by default:
-//   - Blobs: hub/models--{owner}--{repo}/blobs/{sha256}
-//   - Snapshots: hub/models--{owner}--{repo}/snapshots/{commit}/{path} (symlinks)
-//   - Friendly: models/{owner}/{repo}/{path} (symlinks)
-//
-// Legacy mode (OutputDir set): Falls back to flat directory structure.
-//
-// Cancellation: all loops/sleeps/requests are tied to ctx for fast abort.
+// Download scans and downloads repository files into the HF cache by default.
+// OutputDir selects flat mode only when CacheDir is unset. Requests honor ctx.
 func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc) (err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// The outcome of the whole job is recorded exactly once, here: every
-	// return path of the function passes through this deferred record. A
-	// cancelled job is not a failure, so it is reported separately; the
-	// successful outcome is reported at the end of the function, where the
-	// file counters are final.
+	// Record one terminal outcome; cancellation is distinct from failure.
 	defer func() {
 		if err == nil {
 			return
@@ -154,7 +133,6 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		return err
 	}
 
-	// Apply defaults
 	if job.Revision == "" {
 		job.Revision = "main"
 	}
@@ -165,20 +143,14 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		cfg.MaxActiveDownloads = runtime.GOMAXPROCS(0)
 	}
 
-	// Resolve the shared speed limiter. A caller-supplied SpeedLimiter (the
-	// server's process-wide limiter) wins; otherwise build a per-download one
-	// from MaxSpeed. When neither is set, cfg.SpeedLimiter stays nil and the
-	// copy sites read at full speed.
+	// Respect a caller's shared limiter; otherwise construct one from MaxSpeed.
 	if cfg.SpeedLimiter == nil {
 		if bps := ParseSize(cfg.MaxSpeed); bps > 0 {
 			cfg.SpeedLimiter = NewRateLimiter(bps)
 		}
 	}
 
-	// Determine storage mode: HF cache (new) vs flat directory (legacy)
-	// Use HF cache mode when:
-	// 1. --cache-dir is explicitly set, OR
-	// 2. --output is NOT set (default to HF cache)
+	// An explicit CacheDir wins; otherwise OutputDir selects flat mode.
 	useHFCache := cfg.CacheDir != "" || cfg.OutputDir == ""
 	var hfCache *HFCache
 	var repoDir *RepoDir
@@ -208,7 +180,6 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 			return fmt.Errorf("ensure repo dirs: %w", err)
 		}
 	} else {
-		// Legacy mode: use OutputDir
 		if cfg.OutputDir == "" {
 			cfg.OutputDir = "Storage"
 		}
@@ -258,7 +229,7 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		cfg.OnPlanComplete(completedPlan)
 	}
 
-	// Emit ALL plan_item events upfront so TUI knows total size immediately
+	// Emit plan events up front so the UI knows the total before transfer.
 	for _, item := range plan.Items {
 		displayRel := item.RelativePath
 		if job.AppendFilterSubdir && item.DestinationSubdir != "" {
@@ -267,8 +238,6 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		emit(ProgressEvent{Event: "plan_item", Path: displayRel, Total: item.Size})
 	}
 
-	// Ensure destination root exists (only for legacy mode)
-	// HF cache mode already created directories via repoDir.EnsureDirs()
 	if !useHFCache {
 		base, err := destinationBase(job, cfg)
 		if err != nil {
@@ -279,29 +248,18 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		}
 	}
 
-	// Overall concurrency limiter (ctx-aware acquisition). One token is one
-	// TRANSFER slot (see download_slot.go): an item that waits for another
-	// writer's ownership domain returns its token while it waits and takes it
-	// back before it transfers.
+	// A slot limits active transfers, not items waiting for destination ownership.
 	lim := make(chan struct{}, cfg.MaxActiveDownloads)
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(plan.Items))
 
-	// Job-scoped cancellable context. Every per-file context derives from it so
-	// that a permanent (fail-fast) file/part error — or a job-fatal security
-	// rejection — can terminate the whole job promptly instead of letting
-	// sibling files/parts keep downloading, retrying, or waiting until
-	// wg.Wait() returns. The cancel carries the original error as its cause, so
-	// a sibling that exits via its ctx path can tell an internal abort
-	// (preserve resumable bytes) apart from a user cancel/pause.
+	// A fatal item error cancels siblings; the cause distinguishes internal abort
+	// (preserve resumable bytes) from user cancellation or pause.
 	jobCtx, jobCancel := context.WithCancelCause(ctx)
 	defer jobCancel(nil)
 
-	// fatalErr records the first job-fatal error. It is surfaced to the caller
-	// in preference to the errCh drain so a sibling goroutine's "context
-	// canceled" (produced while unwinding from the abort) can never mask or
-	// precede the original permanent error.
+	// Prefer the original fatal error over sibling cancellation during unwind.
 	var (
 		fatalMu  sync.Mutex
 		fatalErr error
@@ -315,12 +273,9 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		jobCancel(abortError(err))
 	}
 
-	// To print "skip" only once per final path per run
 	var skipOnce sync.Map
 
-	// Skipped HF-cache items with a known blob SHA. Their snapshot/friendly
-	// entries are reconciled after every file finishes, because a shared blob
-	// winner only creates entries for its own path.
+	// Reconcile per-path links of skipped shared blobs after all transfers finish.
 	var (
 		skippedLinksMu  sync.Mutex
 		skippedLinks    []skippedBlobLink
@@ -347,8 +302,6 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	var skippedCount int64
 	var downloadedCount int64
 
-	// Build manifest during download (thread-safe)
-	// Manifest is always written unless explicitly disabled with NoManifest
 	var manifestBuilder *ManifestBuilder
 	var manifestMu sync.Mutex
 	if useHFCache && !cfg.NoManifest {
@@ -365,7 +318,6 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 
 LOOP:
 	for _, item := range plan.Items {
-		// Stop scheduling more work once canceled
 		select {
 		case <-jobCtx.Done():
 			break LOOP
@@ -374,7 +326,6 @@ LOOP:
 
 		it := item // capture for goroutine
 
-		// Acquire a slot or abort if canceled
 		select {
 		case lim <- struct{}{}:
 		case <-jobCtx.Done():
@@ -385,15 +336,9 @@ LOOP:
 		go func() {
 			defer wg.Done()
 
-			// Per-file context; ensures all inner loops stop on cancellation.
-			// It derives from jobCtx so a fatal error in a sibling file also
-			// stops this one promptly.
 			fileCtx, fileCancel := context.WithCancel(jobCtx)
-			// The item owns the slot acquired above through a LEASE, so it can
-			// return the slot while it WAITS for another writer's ownership
-			// domain and take it back before it transfers. The wait is
-			// signalled by the domain acquisition through this context (see
-			// download_slot.go and acquireBlobDomainWithin).
+			// Return the transfer slot while waiting for ownership; reacquire it
+			// before transferring.
 			lease := newDownloadSlotLease(fileCtx, lim)
 			defer fileCancel()
 			defer lease.release()
@@ -415,71 +360,31 @@ LOOP:
 					if it.SHA256 != "" {
 						status, _, err := repoDir.CheckBlob(it.SHA256)
 						if err != nil {
-							// The ownership of an existing incomplete
-							// download could not be determined (the
-							// OS-lock probe failed, or this platform
-							// cannot represent the lock). No live owner
-							// is proven, so this must NOT become a
-							// successful skip: the error travels the
-							// normal error channel and the incomplete
-							// payload is preserved.
+							// Unknown ownership is an error, not a skip; preserve the partial.
 							return false, "", fmt.Errorf("check %s: %w", finalRel, err)
 						}
 						if status == BlobComplete {
-							// The blob exists, but the requested path must also
-							// be REACHABLE through its snapshot entry (and its
-							// friendly entry). A link-creation failure is an
-							// actionable error for this item, exactly like the
-							// same failure on the transfer path: the two paths
-							// must agree inside one contract, and a job that
-							// reports success means the requested files are
-							// present AND reachable.
+							// The cached payload is insufficient if its requested links fail.
 							if err := cacheEntryLinkCreate(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, cfg.NoFriendlyView); err != nil {
 								return false, "", err
 							}
 							return true, "blob exists", nil
 						}
 						if status == BlobDownloading {
-							// A PROVEN live writer owns this blob key, so
-							// the file is NOT present. This must NOT
-							// become a successful skip: a job that
-							// reports success must mean the requested
-							// files are present. The item proceeds to the
-							// blob key's ownership domain, waits for the
-							// live owner (bounded) and re-checks the
-							// published blob afterwards, so a blob the
-							// owner publishes is reused instead of
-							// transferred a second time.
+							// Wait for the proven owner and re-check its target; do not skip yet.
 							return false, "", nil
 						}
 					}
 					return false, "", nil
 				}
-				// Download to temp location, will be moved to blob later.
-				// Use SHA256 as temp name to avoid collisions (e.g., multiple
-				// config.json files). Note: for an LFS blob with a canonical
-				// SHA the ranged multipart path does NOT use this dst as its
-				// staging location — it writes directly into
-				// blobs/<sha>.incomplete (the future blob) and publishes
-				// with a rename, so no tmp-<sha> restage ever runs for it.
-				// The dst below remains the caller-visible destination key
-				// (OnPartialFile registration, cleanup) and the staging
-				// target for the single-request path and non-LFS files.
+				// Use digest-keyed temp names when available; canonical multipart transfers
+				// stage directly at the blob instead.
 				tmpName := "tmp-" + it.SHA256
 				if it.SHA256 == "" {
-					// Path-derived names are STRUCTURALLY NON-CANONICAL: the
-					// "path-" prefix can never be a 64-hex digest, so this
-					// staging name can never look like a content-addressed
-					// tmp-<sha> name and its name-based destination domain
-					// (blobs/path-<sanitized>) can never reach a blob key or
-					// lock. Sanitize path separators to avoid collisions.
+					// The reserved path- prefix keeps this key distinct from SHA domains.
 					tmpName = "tmp-path-" + strings.ReplaceAll(it.RelativePath, "/", "_")
 				}
-				// Guard: SafeJoin so the remote-controlled temp name (SHA256
-				// or path-derived) cannot escape the blobs directory — the
-				// same containment the legacy branch applies to finalRel.
-				// SafeJoin's filepath.IsLocal check also makes this barrier
-				// visible to CodeQL's go/path-injection analysis.
+				// Confine the remote-derived temp name to blobs/.
 				safeDst, err := SafeJoin(repoDir.BlobsDir(), tmpName)
 				if err != nil {
 					fatal := fmt.Errorf("path traversal: %q would escape blobs directory", tmpName)
@@ -492,7 +397,6 @@ LOOP:
 				}
 				dst = safeDst
 			} else {
-				// Legacy mode: flat directory structure
 				base, err := destinationBase(job, cfg)
 				if err != nil {
 					fatal := fmt.Errorf("path traversal: %w", err)
@@ -503,8 +407,7 @@ LOOP:
 					}
 					return
 				}
-				// Guard: SafeJoin so finalRel (from HF Hub) cannot escape the
-				// output directory via path traversal.
+				// Confine the Hub-provided path to the output directory.
 				safeDst, err := SafeJoin(base, finalRel)
 				if err != nil {
 					fatal := fmt.Errorf("path traversal: %q would escape output directory", finalRel)
@@ -529,7 +432,6 @@ LOOP:
 				return
 			}
 
-			// Check if we can skip
 			alreadyOK, reason, err := skipCheck()
 			if err != nil {
 				select {
@@ -543,7 +445,6 @@ LOOP:
 				if _, loaded := skipOnce.LoadOrStore(finalRel, struct{}{}); !loaded {
 					emit(ProgressEvent{Event: "file_done", Path: finalRel, Message: "skip (" + reason + ")"})
 					atomic.AddInt64(&skippedCount, 1)
-					// Add to manifest (skipped files are still part of the download job)
 					if manifestBuilder != nil {
 						manifestMu.Lock()
 						manifestBuilder.AddFile(it.RelativePath, it.SHA256, it.Size, it.LFS)
@@ -569,25 +470,15 @@ LOOP:
 				"bytes", it.Size,
 			)
 
-			// Create a copy with updated RelativePath for progress display
 			itForIO := it
 			itForIO.RelativePath = finalRel
 
-			// Choose single/multipart path. In HF cache mode an LFS file
-			// with a canonical blob SHA stages its ranged download directly
-			// in blobs/<sha>.incomplete — the future blob itself — so
-			// finalization is a rename into blobs/<sha> plus link work,
-			// never a tmp-<sha> restage or an assembly copy. Non-LFS files
-			// and files without a canonical SHA keep the tmp-<sha> staging
-			// and the store path.
+			// Canonical-digest multipart items stage directly at the future blob;
+			// other transfers use the temp-and-store path.
 			blobDirect := useHFCache && canonicalSHA256(it.SHA256)
 			var mpOpts multipartOpts
-			// The resolved plan commit is part of the staging record's resume
-			// identity. The requested branch name is not enough: a moved
-			// branch could otherwise resume old bytes in Verify=size mode.
-			// The pinned flag says whether that commit was actually resolved;
-			// an unresolved revision pins nothing, so no bytes may be
-			// inherited from it.
+			// Resume identity uses the resolved plan commit, not a mutable branch name.
+			// An unresolved revision is unpinned and cannot authorize inherited bytes.
 			mpOpts.Commit = plan.Commit
 			mpOpts.CommitPinned = plan.CommitPinned
 			versionedStaging := dst + ".incomplete"
@@ -600,13 +491,8 @@ LOOP:
 				mpOpts.ContentAddressed = true
 				versionedStaging = mpOpts.Staging
 			}
-			// A CURRENT-FORMAT multipart resume pair must not be ignored (and
-			// later deleted) just because the current threshold routes a small
-			// item to the single-request path. Detect it before choosing the
-			// route; a ranged-capable item keeps the multipart route so the
-			// version-4 state is resumed. A partial download from an old or
-			// unsupported format is never resume state: it is discarded and the
-			// file is re-downloaded from zero.
+			// Keep ranged-capable items on multipart when current-format resume
+			// state exists; unsupported formats restart from zero.
 			resumeStaging := ""
 			if hasResumableStagingState(versionedStaging, versionedStaging+".meta", itForIO, job, plan.Commit, plan.CommitPinned) {
 				resumeStaging = versionedStaging
@@ -615,11 +501,8 @@ LOOP:
 			if !multipartRan && it.AcceptRanges && resumeStaging != "" {
 				multipartRan = true
 			}
-			// A server/plan without range support cannot consume multipart
-			// state. Do not silently delete it: warn, download the full file
-			// through the single path, and remove the obsolete versioned pair
-			// only after the final state is durable (claim-checked). The
-			// pre-#140 family is removed by the single-path success cleanup.
+			// Without range support, warn and remove versioned state only after
+			// durable single-path completion.
 			obsoleteVersionedStaging := ""
 			if !it.AcceptRanges && resumeStaging != "" {
 				obsoleteVersionedStaging = resumeStaging
@@ -630,60 +513,10 @@ LOOP:
 					finalRel)})
 			}
 
-			// The DESTINATION's ownership domain.
-			//
-			// Every cache destination owns exactly ONE name-based domain:
-			// a destination is blobs/tmp-<name>, its domain key is
-			// blobs/<name> and its domain lock is the persistent sibling
-			// blobs/tmp-<name>.lock. The writer and the cleanup of that
-			// destination derive the same identity.
-			//
-			// The two item classes are kept in separate staging SHAPES, so
-			// the name-based derivation cannot collide with a blob key:
-			//
-			//   - a content-addressed item stages at blobs/tmp-<sha>; its
-			//     name is the canonical SHA-256, so the domain is EXACTLY the
-			//     blob key's domain (key blobs/<sha>, lock
-			//     blobs/tmp-<sha>.lock) and the publication's holdsBlobKey
-			//     check keeps working unchanged.
-			//
-			//   - a path-derived item (no supplied digest, which the planner
-			//     allows) stages at blobs/tmp-path-<sanitized path>. "path-"
-			//     is not a hex digest, so its domain key is
-			//     blobs/path-<sanitized path> and its lock is
-			//     blobs/tmp-path-<sanitized path>.lock. Neither identity can
-			//     be reached by a canonical blob key/lock, and the staging
-			//     name can never equal a content-addressed tmp-<sha> name.
-			//     That is what prevents two digest-less items whose paths are
-			//     each other's content digests from holding the blob domains
-			//     each other's store needs, and it removes the staging-name
-			//     collision by construction.
-			//
-			// The domain is held for the WHOLE operation on the destination:
-			// the pre-download HEAD, the claim, the transfer, the publication,
-			// the store and the cancel cleanup. One acquisition covers every
-			// route, so no path runs unowned and no path takes the same lock a
-			// second time.
-			//
-			// The multipart claim trusts this domain instead of taking a lock
-			// of its own (see claimStaging): the second staging lock the
-			// earlier design acquired was redundant with this one, and in flat
-			// mode it was literally the same file, which is why the flat
-			// multipart route had to skip the item-level acquisition to avoid
-			// contending with itself.
-			//
-			// A PROVEN live owner of the destination is WAITED FOR (bounded
-			// and context-aware), not skipped: the file is not present while
-			// the owner holds the destination, so a skip would report a
-			// success the cache does not have.
-			//
-			// A FLAT/output-mode destination owns a domain as well. That
-			// namespace has no blobs/-style identity of its own, so the
-			// domain borrows the MULTIPART staging name: the destination's
-			// domain lock is the persistent sibling of
-			// <destination>.incomplete. Both routes and the cleanup therefore
-			// resolve ONE lock file, and no new artifact name appears next to
-			// the user's model file.
+			// Acquire one destination domain for all routes and cleanup. Cache keys
+			// derive from the temp name (tmp-<sha> or non-canonical tmp-path-); flat
+			// mode uses the persistent .incomplete.lock sibling. The claim reuses
+			// this fence, and waiters release their transfer slot. See doc.go.
 			var (
 				dlErr  error
 				domain *blobDomain
@@ -691,10 +524,6 @@ LOOP:
 			if useHFCache {
 				key, keyed := cacheDstDomainKey(dst)
 				if !keyed {
-					// A cache destination always has a domain. A destination
-					// that cannot be mapped to one would run without the
-					// exclusion its cleanup relies on, so the item fails
-					// instead of writing unprotected bytes.
 					dlErr = fmt.Errorf("resolve the ownership domain of %s: the destination is not a cache staging name", finalRel)
 				} else {
 					dom, derr := blobDomainAcquire(fileCtx, key, dst)
@@ -702,22 +531,9 @@ LOOP:
 					case derr == nil:
 						domain = dom
 						defer domain.release()
-						// The multipart route needs the held domain for every
-						// item, not only for a content-addressed one: its claim
-						// verifies the domain instead of taking a second lock,
-						// and the domain-exclusive publication tier needs it.
 						mpOpts.Domain = domain
-						// The published content-addressed target is the completion
-						// proof, so a blob published while this writer waited is
-						// reused instead of transferred again.
-						//
-						// A path-derived destination has no such proof: its
-						// completed bytes are moved into a content-addressed blob
-						// whose name is the digest computed at store time, which
-						// this writer cannot know before it transfers the file.
-						// The item therefore OBTAINS the file itself (these are
-						// small non-LFS files), and the store then reuses the
-						// already published blob instead of replacing it.
+						// Only a known digest supplies a target to re-check after waiting;
+						// otherwise transfer and let the store reuse any resulting blob.
 						if it.SHA256 != "" {
 							blobPath := repoDir.BlobPath(it.SHA256)
 							if _, serr := os.Stat(blobPath); serr == nil {
@@ -725,40 +541,14 @@ LOOP:
 							}
 						}
 					case errors.Is(derr, errStagingOwnershipBusy):
-						// A PROVEN live writer still holds the destination's
-						// ownership domain after the bounded wait. The file is
-						// NOT present, so this is an actionable failure for this
-						// item - never a successful skip and never a silent
-						// success.
 						dlErr = blobLiveOwnerError(it.SHA256, finalRel)
 					default:
-						// The lifetime ownership of this destination is
-						// unavailable: the OS lock is unsupported, denied, or the
-						// filesystem failed. The operation fails HERE, before the
-						// transfer writes any payload. An operation that cannot
-						// own its destination must not write bytes for it, and
-						// the partial data of an earlier run is preserved
-						// untouched.
+						// Never transfer without the ownership fence; preserve prior partials.
 						dlErr = fmt.Errorf("acquire the ownership domain of %s: %w", finalRel, derr)
 					}
 				}
 			} else {
-				// Flat/output mode: the destination owns ONE domain too, and
-				// both routes and the cleanup resolve that ONE identity.
-				//
-				// The domain's lifetime lock is the persistent sibling of the
-				// MULTIPART staging name: <destination>.incomplete.lock. The
-				// item takes that domain HERE, before the route decision and
-				// before the HEAD/claim, and holds it through the claim, the
-				// transfer, the publication and the cancel cleanup. Both routes
-				// therefore share one fence, and the multipart claim trusts it
-				// instead of taking the same file again (which would make the
-				// writer contend with itself).
-				//
-				// A PROVEN live owner of the destination is WAITED FOR
-				// (bounded and context-aware), never skipped: the file is not
-				// present while the owner holds the destination, so a skip
-				// would report a success the output directory does not have.
+				// Both flat transfer routes and cleanup share this persistent sibling lock.
 				flatDom := newFlatDestinationDomain(dst)
 				dom, derr := blobDomainAcquire(fileCtx, flatDom.key, flatDom.lockSrc)
 				switch {
@@ -767,18 +557,9 @@ LOOP:
 					defer domain.release()
 					mpOpts.Domain = domain
 				case errors.Is(derr, errStagingOwnershipBusy):
-					// A PROVEN live writer still holds the destination's
-					// ownership domain after the bounded wait. The file
-					// is NOT present, so this is an actionable failure for
-					// this item - never a successful skip and never a
-					// silent success.
 					dlErr = blobLiveOwnerError(it.SHA256, finalRel)
 				default:
-					// The lifetime ownership of this destination is
-					// unavailable: the OS lock is unsupported, denied, or the
-					// filesystem failed. The operation fails HERE, before the
-					// transfer writes any payload, and the partial data of an
-					// earlier run is preserved.
+					// Never transfer without the ownership fence; preserve prior partials.
 					dlErr = fmt.Errorf("acquire the ownership domain of %s: %w", finalRel, derr)
 				}
 			}
@@ -787,15 +568,9 @@ LOOP:
 			if blobDirect && multipartRan {
 				mpOpts.DirectBlobPublished = &directBlobPublished
 			}
-			// contentVerified reports that the downloader already proved the
-			// payload against it.SHA256 inside this call, before the publish
-			// rename (one pass at most): the ranged path's hash-on-write/final/
-			// pass, or the single path's pre-publication proof. For a
-			// known digest this is always true on success in Verify=sha256 and
-			// Verify=etag modes, so the caller must not repeat the hash (a
-			// post-publication hash could only observe corrupt published
-			// bytes). HEAD-ETag-only verification with no known digest remains
-			// the documented post-publication exception.
+			// contentVerified means a known digest was proven before publication;
+			// avoid a second hash. A HEAD-ETag-only check has no known digest and
+			// remains the post-publication exception.
 			var contentVerified bool
 			if dlErr == nil {
 				if multipartRan {
@@ -806,25 +581,12 @@ LOOP:
 				}
 			}
 			if blobDirect && multipartRan && !directBlobPublished {
-				// downloadMultipart delegated an unknown-size item to the
-				// single-request temp path, so storage must move that temp into
-				// the blob and create this item's links.
+				// Unknown size fell back to the single-path temp-and-store route.
 				multipartRan = false
 			}
 
-			// A published content-addressed blob is the completion proof:
-			// finish this item as an ordinary skip, exactly like the
-			// pre-download skip check does. The links for THIS item's path
-			// are created, so the requested file is present in the cache.
 			if errors.Is(dlErr, errBlobAlreadyComplete) {
 				if useHFCache && it.SHA256 != "" {
-					// The blob is complete; make sure this file's snapshot
-					// and friendly entries exist for its own path (a
-					// cross-repo dedup winner may have created entries only
-					// for its path). A link-creation failure is an actionable
-					// error for this item - the blob is present but the
-					// requested path is not reachable - and never a silent
-					// success.
 					if err := cacheEntryLinkCreate(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, cfg.NoFriendlyView); err != nil {
 						fatal := fmt.Errorf("download %s: %w", finalRel, err)
 						select {
@@ -849,16 +611,8 @@ LOOP:
 				}
 				return
 			}
-			// A live writer that still owns this item's staging is NOT a
-			// successful skip: the file is not present, so the item fails
-			// below with an actionable error instead of reporting a
-			// completion the cache does not have.
-			//
-			// An UNPROVEN record (a legacy/unfenced one, or one that cannot
-			// be read) keeps its own actionable message: no live owner is
-			// proven for it, so it must not be reported as "being
-			// downloaded by another process", and its message names the
-			// staging pair the operator has to remove to retry.
+			// Report proven live ownership as transient, but preserve the unproven-record
+			// error and its staging-pair recovery instructions.
 			if errors.Is(dlErr, errBlobIncompleteOwned) && !errors.Is(dlErr, ErrStagingOwnershipUnproven) {
 				dlErr = blobLiveOwnerError(it.SHA256, finalRel)
 			}
@@ -883,44 +637,13 @@ LOOP:
 				return
 			}
 
-			// The bytes are on disk. A strict verification or storing into
-			// the cache can still take local I/O time for a large file,
-			// during which no file_progress arrives. Mark the file as
-			// finalizing so the job doesn't look stuck at 100% (the
-			// post-loop "finalizing" event only covers work after every
-			// file is done).
+			// Final verification/store may be long local I/O with no progress
+			// events; expose the finalizing phase instead of appearing stuck.
 			emit(ProgressEvent{Event: "file_finalizing", Path: finalRel, Message: "verifying"})
 
-			// Post-download verification. Settings.Verify controls LFS
-			// verification too (issue #140 — deliberate semantics change),
-			// scoped to the normal transfer/finalization path:
-			//
-			//   none   — no post-download content hash; HTTP/range
-			//            protocol correctness still applied during transfer.
-			//   size   — (default) the exact expected-size invariant, plus
-			//            the complete validated transfer coverage both paths
-			//            already enforced; NO full-file SHA reread on the
-			//            normal path. Two pre-existing, documented
-			//            exceptions may still hash: the pre-download skip
-			//            check of an already-present file and the proof of
-			//            inherited single-path .part bytes — all before
-			//            publication.
-			//   sha256 — strict full-file SHA-256 against the known digest,
-			//            at most one pass, always before publication for a
-			//            known digest: the engine verified hash-on-write
-			//            (fresh sequential) or with one pass before the
-			//            rename. A mismatch never reaches dst/blobs/<sha>.
-			//   etag   — historical compatibility: a known SHA-256 digest is
-			//            proven with one pass before publication (the engine
-			//            reports contentVerified, so it is not repeated here).
-			//            Non-LFS ETag-only files have no known digest and keep
-			//            their historical no-post-check behavior. (The
-			//            HEAD-ETag fallback exists only in "sha256" mode; with
-			//            no known digest it remains a post-publication check
-			//            and can report a mismatch then.)
-			//
-			// Other values keep their historical compatible behavior for
-			// non-LFS files below.
+			// Settings.Verify also applies to LFS. contentVerified avoids repeating a
+			// required pre-publication proof; this layer checks size or the no-digest
+			// HEAD-ETag fallback. See doc.go for mode exceptions.
 			verifyPath := dst
 			if multipartRan && blobDirect {
 				verifyPath = mpOpts.Publish
@@ -928,14 +651,8 @@ LOOP:
 			if it.LFS && it.SHA256 != "" {
 				switch cfg.Verify {
 				case "none":
-					// No post-download content hash.
 				case "sha256", "etag":
-					// Known-digest proof is a pre-publication engine gate.
-					// contentVerified should therefore be true on success;
-					// the fallback stays for direct callers of unusual legacy
-					// configurations, but it must never be the normal path for
-					// a known digest (a post-publication hash cannot undo a
-					// published mismatch).
+					// Avoid a duplicate hash when the transfer already reported content proof.
 					if !contentVerified {
 						if err := verifySHA256Ctx(fileCtx, verifyPath, it.SHA256); err != nil {
 							downloadLog.Warn("verification failed",
@@ -952,11 +669,7 @@ LOOP:
 						}
 					}
 				default:
-					// "size" (the default) and any other legacy value: the
-					// exact-size invariant. A preallocated staging file can
-					// never satisfy this by size alone — the multipart path
-					// only reaches here with every range committed, and the
-					// single path wrote the file sequentially.
+					// The engine validates transfer coverage; check the final size.
 					if it.Size > 0 {
 						fi, err := os.Stat(verifyPath)
 						if err != nil || fi.Size() != it.Size {
@@ -986,14 +699,8 @@ LOOP:
 			} else if cfg.Verify == "sha256" && !contentVerified {
 				_, remoteSha, herr := headForETag(fileCtx, httpc, cfg.Token, itForIO)
 				if herr != nil {
-					// headForETag maps every non-2xx status (401/403
-					// included) to an optional-metadata miss with no error,
-					// so the ordinary miss path falls through and the actual
-					// file request stays authoritative. Only a genuine
-					// caller cancellation surfaces here, and it must fail
-					// this file promptly instead of pretending verification
-					// succeeded; a fail-fast status error, should one ever
-					// surface, is escalated job-fatal below.
+					// Non-2xx HEAD responses are metadata misses; cancellation and
+					// fail-fast errors still stop this file.
 					downloadLog.Warn("verification probe failed",
 						"repo", job.Repo,
 						"path", finalRel,
@@ -1025,25 +732,13 @@ LOOP:
 				}
 			}
 
-			// Move the completed bytes into the cache and create the
-			// snapshot/friendly entries. The store may hash a large file,
-			// so pass the per-file context: a sibling's fail-fast abort must
-			// not wait for it to finish.
+			// Pass fileCtx through cache hashing/store so a sibling's fatal error can
+			// interrupt long local I/O.
 			var finalSHA256 string
 			switch {
 			case blobDirect && multipartRan:
-				// The ranged downloader already renamed blobs/<sha>.incomplete
-				// onto blobs/<sha> (rename-only publish). Only the entries
-				// remain — metadata work, no payload copy.
-				//
-				// The entries are created through the SAME helper the skip
-				// paths use, so a link-creation failure carries the exported
-				// ErrCacheLinkUnreachable sentinel on every path that creates
-				// the cache entries, and the item fails the same way
-				// everywhere: the payload may be in blobs/, but the requested
-				// path is not reachable through it. The friendly entry stays
-				// deliberately absent when the friendly view is disabled,
-				// which is not an error.
+				// The ranged route already published the blob; create its required cache
+				// links. NoFriendlyView omits only the friendly entry, not the snapshot.
 				if err := cacheEntryLinkCreate(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, cfg.NoFriendlyView); err != nil {
 					select {
 					case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):
@@ -1054,9 +749,8 @@ LOOP:
 				finalSHA256 = it.SHA256
 			case useHFCache:
 				sha := it.SHA256
-				// The store publishes into the blob key's ownership domain,
-				// which this item already holds: the existence decision and
-				// the placement that follows it are one serialized step.
+				// The store reuses this domain when it covers the blob key, or acquires the
+				// computed blob's domain for a path-derived item before placement.
 				result, err := repoDir.storeDownloadedFileInDomain(fileCtx, dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView, domain)
 				if err != nil {
 					select {
@@ -1070,13 +764,8 @@ LOOP:
 				finalSHA256 = it.SHA256
 			}
 
-			// The single path may have been chosen because the server/plan has
-			// no range support while usable versioned staging state existed. The
-			// final file is now durable (and, for cache mode, stored); remove the
-			// obsolete pair claim-checked so a live owner's state is never deleted
-			// and no stale pair survives a successful download. The item still
-			// holds the destination's ownership domain, so no current-version
-			// writer of this destination can be using the pair.
+			// After successful single-path fallback, attempt claim-checked cleanup of
+			// obsolete ranged state while the destination domain is still held.
 			if obsoleteVersionedStaging != "" {
 				removeStagingArtifactsIfUnowned(obsoleteVersionedStaging, obsoleteVersionedStaging+".meta")
 			}
@@ -1109,17 +798,8 @@ LOOP:
 
 	wg.Wait()
 
-	// Reconcile skipped shared-blob paths once every writer has finished. A
-	// same-SHA/different-path item that skipped via BlobDownloading or a lost
-	// staging claim only becomes linkable after the winning writer publishes;
-	// create its own snapshot and friendly entries now so a shared blob does
-	// not leave later plan paths without cache entries.
-	//
-	// A link that cannot be created leaves the requested path unreachable, so
-	// the reconciliation reports it as a JOB ERROR instead of only a warning:
-	// a job must not finish "successful" with a missing path. The other duties
-	// of the reconciliation are unchanged: a link whose blob is not published
-	// yet is still skipped, and the remaining links are still reconciled.
+	// Reconcile each skipped shared blob's own snapshot/friendly paths after all
+	// transfers finish. Link failures fail the job; continue checking other links.
 	var reconcileErr error
 	if useHFCache && repoDir != nil {
 		skippedLinksMu.Lock()
@@ -1165,9 +845,6 @@ LOOP:
 		emit(ProgressEvent{Level: "error", Event: "error", Message: drainedErr.Error()})
 		return drainedErr
 	}
-	// A link the end-of-job reconciliation could not create leaves the
-	// requested path unreachable, so the job fails instead of reporting
-	// success with a missing path.
 	if reconcileErr != nil {
 		emit(ProgressEvent{Level: "error", Event: "error", Message: reconcileErr.Error()})
 		return reconcileErr
@@ -1230,18 +907,8 @@ LOOP:
 	return nil
 }
 
-// cleanupPartialsOnCancel removes the partial download artifacts for dst
-// when the caller's cancel-cleanup callback reports that the context was
-// cancelled for a non-resumable reason (explicit cancel, not pause). It
-// removes dst+".part" with its identity sidecar plus any legacy multipart
-// artifacts; the ranged path removes its own staging pair through
-// applyCancelCleanup instead, while it still owns the claim record.
-//
-// The caller must hold the destination's ownership domain: these artifacts
-// are removed under the destination's fence, so a cancelled job can never
-// delete the LIVE partial of another writer that meanwhile owns the
-// destination. A nil (released) domain means no fence is held, and the
-// artifacts are left alone.
+// cleanupPartialsOnCancel removes single/legacy partials after explicit cancel.
+// The caller holds the destination domain; ranged cleanup occurs under its claim.
 func cleanupPartialsOnCancel(cfg Settings, dst string, domain *blobDomain) {
 	if cfg.CleanupPartialsOnCancel == nil || !cfg.CleanupPartialsOnCancel() {
 		return
@@ -1250,17 +917,11 @@ func cleanupPartialsOnCancel(cfg Settings, dst string, domain *blobDomain) {
 		downloadLog.Warn("skip cancel cleanup: the destination ownership domain is not held", "path", dst)
 		return
 	}
-	// dst is derived upstream in Download() through SafeJoin in both modes:
-	// legacy mode joins the remote file path to the output directory, and HF
-	// cache mode joins the tmp-<sha> name to the blobs directory. SafeJoin
-	// rejects non-local values via filepath.IsLocal and proves containment
-	// with PathInside, so dst cannot name a file outside those roots.
+	// dst was confined to its destination root by SafeJoin in Download.
 	cleanupLegacyPartials(dst)
 }
 
-// cleanupLegacyPartials removes the pre-#140 multipart family and the single
-// dst+".part" prefix for dst. It never touches the ranged staging pair. The
-// single-request identity sidecar goes with the partial it describes.
+// cleanupLegacyPartials removes single-request and legacy multipart artifacts.
 func cleanupLegacyPartials(dst string) {
 	removePartialWithIdentity(dst)
 	if err := removeMultipartResumeFiles(dst); err != nil {
@@ -1268,14 +929,8 @@ func cleanupLegacyPartials(dst string) {
 	}
 }
 
-// removePartialWithIdentity removes the single-request partial of dst and the
-// identity sidecar that describes it.
-//
-// The sidecar goes only when the partial is actually GONE. An identity record
-// must not outlive the bytes it describes, and a partial that SURVIVES must
-// keep its record: without it the next run cannot prove which object the
-// bytes on disk belong to, so it discards them and the resumable progress is
-// lost even though the bytes are still there.
+// removePartialWithIdentity removes the sidecar only after removing the partial;
+// a surviving partial must retain the identity needed to resume it.
 func removePartialWithIdentity(dst string) {
 	// lgtm[go/path-injection]
 	if err := os.Remove(dst + ".part"); err != nil && !os.IsNotExist(err) {
@@ -1285,75 +940,11 @@ func removePartialWithIdentity(dst string) {
 	removeSinglePartIdentity(singlePartIdentityPath(dst))
 }
 
-// CleanupJobPartFiles removes the partial download artifacts
-// associated with the given list of per-file destinations. The
-// caller is responsible for tracking which dsts belong to a given
-// run via Settings.OnPartialFile; this helper then removes exactly
-// those dsts' partial files without scanning the repo, so a
-// concurrent job downloading into the same blobs directory or
-// output subtree is not disturbed.
-//
-// For each dst, the helper removes the partial files the downloader
-// would have produced for that dst, covering both artifact families:
-//
-//   - single path: dst+".part";
-//   - legacy multipart (pre-#140): dst+".part-NN" (any digit run) and
-//     dst+".parts.json";
-//   - ranged path (issue #140): dst+".incomplete" and
-//     dst+".incomplete.meta" — and, in HF cache mode where the ranged
-//     path stages an LFS blob under its blob key instead of the dst
-//     name, the derived blobs/<sha>.incomplete and .meta for a
-//     tmp-<sha> dst.
-//
-// In HF cache mode, dst is the temporary tmp-<sha> path under blobs/, so
-// the helper also removes dst itself for the window after the single
-// downloader has renamed the completed bytes to tmp-<sha> but before
-// StoreDownloadedFile has moved them into the final blob.
-//
-// OWNERSHIP: in HF cache mode every artifact above belongs to ONE cache
-// destination, and the destination's ownership domain is what a writer of
-// that destination holds while it works on it. The artifacts are therefore
-// removed only while that domain is held: a cleanup that removed them
-// without the domain could delete the LIVE partial of another writer (a
-// cancelled job whose destination meanwhile became owned by another job),
-// and that writer would keep writing to an unlinked inode and fail its later
-// publication with ENOENT. When a live owner holds the destination - in this
-// process or in another one - the artifacts are left alone and the contention
-// is reported. The job that owns the destination can still clean up its own
-// artifacts: its own writer releases the domain when it returns, and the
-// downloader's own cancel cleanup removes its staging while it still holds
-// the domain.
-//
-// The domain identity is the SAME for the writer and for the cleanup: it is
-// derived from the destination name (blobs/tmp-<name> -> domain key
-// blobs/<name>, lock file blobs/tmp-<name>.lock). For a content-addressed
-// destination the name is the SHA-256, so the domain is the blob key's domain.
-// For a path-derived destination the downloader allocates the structurally
-// non-canonical staging name blobs/tmp-path-<sanitized path>, so the key is
-// blobs/path-<sanitized path>: "path-" cannot be a canonical digest, so this
-// domain can never equal a blob key or lock, and the staging name can never
-// equal a content-addressed tmp-<sha> name. The cleanup therefore protects a
-// path-derived destination exactly like a content-addressed one while keeping
-// ONE name-based identity per destination.
-//
-// A legacy/output-mode destination is not cache-scoped: it has no blobs/
-// style internal identity of its own. It nevertheless owns ONE domain, and
-// that domain borrows the MULTIPART staging name: the destination's domain
-// lock is the persistent sibling of <destination>.incomplete. That is the
-// item-level destination-domain lock every route acquires exactly once,
-// before the HEAD/claim; the multipart claim takes no lock of its own. Both
-// routes and the cleanup therefore resolve the SAME lock file, so no new
-// artifact name appears next to the user's model file, and the cleanup
-// protects a flat destination exactly like a cache one: a live owner of the
-// destination keeps its .part/.incomplete/.meta artifacts, and the job that
-// owns the destination can still clean up its own.
-//
-// settings determines the mode (HF cache vs legacy) the same way
-// Download() does: HF cache is the default when neither CacheDir nor
-// OutputDir is set.
-//
-// All operations are best-effort: missing files are not an error, and
-// individual file removal failures are logged and skipped.
+// CleanupJobPartFiles removes artifacts for the exact destinations tracked by
+// the caller (typically via OnPartialFile); it does not scan the repository.
+// It acquires each destination domain and leaves artifacts untouched if
+// ownership cannot be established. Removal is best-effort. See doc.go for the
+// cache/flat artifact families and ownership contract.
 func CleanupJobPartFiles(settings Settings, dsts []string) error {
 	useHFCache := settings.CacheDir != "" || settings.OutputDir == ""
 	root := cleanupRoot(settings, useHFCache)
@@ -1362,24 +953,11 @@ func CleanupJobPartFiles(settings Settings, dsts []string) error {
 			downloadLog.Warn("skip cleanup for out-of-root partial destination", "path", dst)
 			continue
 		}
-		// Resolve the destination's ONE ownership domain: the SAME identity
-		// its writer holds. The artifacts below are removed only while that
-		// domain is held, so a cleanup can never delete the LIVE partial of
-		// another writer (a cancelled job whose destination meanwhile became
-		// owned by another job): that writer would keep writing to an
-		// unlinked inode and fail its later publication with ENOENT.
+		// Use the writer's domain so cleanup cannot unlink a live partial.
 		var key, lockSrc string
 		if useHFCache {
-			// Destination blobs/tmp-<name> means key blobs/<name> and lock
-			// blobs/tmp-<name>.lock. A path-derived destination is staged at
-			// blobs/tmp-path-<sanitized path>, so its key is
-			// blobs/path-<sanitized path>; "path-" cannot be a canonical
-			// digest, so the writer and this cleanup never derive a blob key.
 			k, ok := cacheDstDomainKey(dst)
 			if !ok {
-				// A cache destination that cannot be mapped to its domain has
-				// no fence this cleanup could hold: removing its artifacts
-				// would be an UNOWNED deletion.
 				downloadLog.Warn("skip cleanup of a cache destination with no derivable ownership domain", "path", dst)
 				continue
 			}
@@ -1390,10 +968,7 @@ func CleanupJobPartFiles(settings Settings, dsts []string) error {
 		}
 		domain, derr := blobDomainCleanupAcquire(context.Background(), key, lockSrc)
 		if derr != nil {
-			// A live owner holds the destination (in this process or in
-			// another one), or its ownership could not be established. The
-			// artifacts are left alone: not deleting is the safe choice,
-			// because the owner may be writing them right now.
+			// Preserve artifacts if an owner is live or ownership is uncertain.
 			downloadLog.Warn("skip cleanup of a destination owned by another live writer",
 				"path", dst, "error", derr)
 			continue
@@ -1410,20 +985,9 @@ func CleanupJobPartFiles(settings Settings, dsts []string) error {
 	return nil
 }
 
-// removeBlobStagingForTemp removes the blob-keyed staging artifacts the
-// ranged downloader creates for an LFS item whose HF-cache dst is the
-// tmp-<sha> temporary: blobs/<sha>.incomplete and its .meta. The staging
-// file lives under the blob key (so it IS the future blob), while the
-// caller-tracked dst keeps the tmp-<sha> name; this derivation bridges the
-// two without widening the OnPartialFile protocol. Dsts that are not
-// tmp-<canonical-sha> temporaries are left alone — a coincidentally named
-// file cannot contribute a canonical SHA, so nothing outside the
-// downloader's own naming scheme is ever touched.
-//
-// The caller must hold the destination's ownership domain, and the staging
-// path must be covered by it; otherwise nothing is removed. The pair itself
-// is removed through the record-checked cleanup, so a record that cannot be
-// proven dead preserves its bytes.
+// removeBlobStagingForTemp derives and removes blob-keyed ranged state for a
+// canonical tmp-<sha> destination. It requires the covering domain and uses
+// record-checked cleanup; other names are untouched.
 func removeBlobStagingForTemp(dst string, domain *blobDomain) {
 	base := filepath.Base(dst)
 	sha, ok := strings.CutPrefix(base, "tmp-")
@@ -1491,55 +1055,18 @@ func removeHFCacheTemp(dst string) {
 	}
 }
 
-// removePartialArtifacts removes all partial-file artifacts associated
-// with a single downloader dst, covering every artifact family the
-// downloader produces:
-//
-//   - the single-path partial (dst+".part") and its identity sidecar
-//     (dst+".part.meta");
-//   - legacy multipart parts (dst+".part-NN" for N any non-empty run of
-//     digits, matching the pre-#140 downloader's %02d/%d format) and the
-//     legacy layout metadata (dst+".parts.json");
-//   - the ranged staging file (dst+".incomplete") and its resume metadata
-//     (dst+".incomplete.meta").
-//
-// The caller must hold the destination's ownership domain: these artifacts
-// belong to ONE destination, and removing them without its fence could
-// delete another live writer's partial. The ranged pair is additionally
-// record-checked, because a record written outside the fence cannot be
-// proven dead by the domain alone.
-//
-// The blob-keyed staging an LFS ranged download uses in HF cache mode
-// (blobs/<sha>.incomplete) is derived separately by
-// removeBlobStagingForTemp, which CleanupJobPartFiles invokes.
-//
-// dst is already validated as residing inside the output subtree at
-// allocation time in Download() (via SafeJoin), so removing the
-// derived partial paths cannot escape the output directory. The
-// glob-style match for .part-NN is intentionally narrow: only the
-// recognized suffix family and a digit run, so a coincidentally
-// named "weights.part" or similar user file with a different base
-// (which would not appear in dsts) is not touched.
+// removePartialArtifacts removes single, legacy and ranged artifacts under
+// the caller-held domain, with record checks for ranged state. Blob-keyed
+// ranged state is handled separately by removeBlobStagingForTemp.
 func removePartialArtifacts(dst string) error {
-	// The single-path partial and the identity sidecar that describes it. The
-	// sidecar goes only when the partial is actually gone, so a partial that
-	// survives keeps the record that makes its bytes inheritable.
 	removePartialWithIdentity(dst)
-	// Ranged staging file and resume metadata (issue #140). The metadata goes
-	// first inside removeStagingArtifactsLocked so a crash cannot leave a
-	// record claiming a deleted payload.
 	removeStagingArtifactsIfUnowned(dst+".incomplete", dst+".incomplete.meta")
 	return removeLegacyMultipartParts(dst)
 }
 
-// removeLegacyMultipartParts removes the legacy multipart artifact family of
-// one downloader dst: the pre-#140 parts (dst+".part-NN" for N any non-empty
-// run of digits, matching the pre-#140 downloader's %02d/%d format) and the
-// legacy layout metadata (dst+".parts.json").
+// removeLegacyMultipartParts removes dst.part-NN (non-empty digit suffix)
+// and the obsolete dst.parts.json layout record.
 func removeLegacyMultipartParts(dst string) error {
-	// Multipart parts: glob the dst's directory for files matching
-	// dst+".part-NNN" pattern. This matches what the legacy downloader
-	// produced (the parts have indices 0..n-1).
 	dir := filepath.Dir(dst)
 	base := filepath.Base(dst)
 	prefix := base + ".part-"
@@ -1567,7 +1094,6 @@ func removeLegacyMultipartParts(dst string) error {
 			downloadLog.Warn("cleanup partial file failed", "path", full, "error", err)
 		}
 	}
-	// Legacy multipart layout metadata.
 	if err := os.Remove(dst + ".parts.json"); err != nil && !os.IsNotExist(err) {
 		downloadLog.Warn("cleanup partial file failed", "path", dst+".parts.json", "error", err)
 	}
@@ -1618,10 +1144,8 @@ func (a *abortCause) Unwrap() error { return a.err }
 // abortError wraps err so it can be used as an internal-abort cancel cause.
 func abortError(err error) error { return &abortCause{err: err} }
 
-// abortPartAttempt reports whether ctx was canceled by an internal fail-fast
-// abort (see abortCause) rather than a user cancel/pause/shutdown. Returning
-// without calling cleanupPartialsOnCancel preserves the resumable
-// .part/.incomplete bytes (and their resume metadata) for a later retry.
+// abortPartAttempt distinguishes internal fail-fast cancellation from user
+// cancellation, so resumable payloads and metadata survive sibling failure.
 func abortPartAttempt(ctx context.Context) bool {
 	var a *abortCause
 	return errors.As(context.Cause(ctx), &a)
@@ -1656,44 +1180,10 @@ func absoluteAttemptCeiling(retries int) int {
 	return (retries + 1) * maxAttemptsPerRetry
 }
 
-// downloadSingle downloads a file in a single request.
-//
-// Resume behavior: the bytes already on disk in <dst>.part are inherited only
-// when the identity sidecar <dst>.part.meta proves they belong to THIS item:
-// the record must exist, be readable and well-formed, name the same
-// repository, resolved commit, item path and expected size, and be PINNED
-// (the commit was actually resolved). A partial without a usable record, or
-// one recorded for another object or another revision, is discarded: the
-// transfer restarts from zero. When the record matches, the HTTP request
-// uses a Range header to fetch only the remaining bytes. An exactly-sized
-// partial is published without a request only when the matching sidecar also
-// records a cleanly-framed completion (io.Copy saw EOF at the exact expected
-// byte count); otherwise the final byte is reserved and re-requested as the
-// non-empty range [size-1, size), because written bytes alone do not prove
-// that the response body ended cleanly. Every ranged (206)
-// response is validated exactly like the multipart worker path: the status
-// must be 206, Content-Range must name the requested [pos, size-1] start/end
-// (and the expected total), Content-Length must match the requested length,
-// and a bounded writer refuses any byte outside that range. A short body is
-// rejected after the copy. If the server ignores the Range header and
-// responds with 200 (full body), the .part file is truncated and the download
-// restarts from zero. No resume is attempted when the expected size is
-// unknown (the range layout cannot be validated).
-//
-// The path inherits the same trust model as the ranged path. Before the rename,
-// the file must have exactly the expected size, and a known digest is proven
-// before publication: in Verify=sha256 and Verify=etag modes every single-path
-// transfer (fresh or resumed) gets one full-file SHA-256 pass, and in Verify=size
-// mode inherited .part bytes are proven once (the inherited-bytes exception).
-// A mismatch removes the partial and never
-// renames it onto the destination. Verify="none" inherits that mode's no-hash
-// semantics, and bytes written entirely by this run in Verify="size" mode need
-// no reread. Verification with no known digest, where the caller falls back to a
-// HEAD ETag, remains a post-publication check (historical behavior).
-//
-// The returned bool reports whether this call already proved the payload
-// against it.SHA256 before the rename, so the caller does not repeat the
-// full-file pass.
+// downloadSingle resumes dst.part only with a matching pinned sidecar and
+// validates response framing. An exact-size partial without clean-framing
+// proof revalidates its final byte. Required digest proofs run before rename;
+// the returned bool prevents a duplicate proof. See doc.go for Verify modes.
 func downloadSingle(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, it PlanItem, dst string, opts singleOpts, emit func(ProgressEvent)) (bool, error) {
 	const unboundedBody = int64(^uint64(0) >> 1)
 
@@ -1704,17 +1194,12 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	}
 	defer out.Close()
 
-	// The identity of the object this transfer is about. The sidecar next to
-	// the partial records it, so the next run can tell whether the bytes on
-	// disk belong to this object or to another one that shares the staging
-	// name (an item without a known digest is staged under a name derived
-	// from its path, and two revisions share that name too).
+	// Bind the partial to the object; path-derived names can be shared across
+	// objects and revisions.
 	identity := singleIdentityFor(job, it, opts)
 	sidecar := singlePartIdentityPath(dst)
 	recorded, rerr := readSinglePartIdentity(sidecar)
 	if rerr != nil {
-		// A record that cannot be read or understood authorizes nothing: the
-		// bytes on disk stay unproven and are discarded below.
 		downloadLog.Warn("single-part identity record is unusable",
 			"repo", job.Repo,
 			"path", it.RelativePath,
@@ -1729,21 +1214,12 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		return false, err
 	}
 	pos := fi.Size()
-	// inherited marks bytes this run did not write. A .part is a sequential
-	// prefix, so those bytes need the content proof below before publication
-	// unless the identity record proves which object they belong to.
+	// inherited marks the on-disk prefix that this run did not write.
 	inherited := pos > 0
 
-	// Bytes are inherited only when the identity record proves they belong
-	// to this exact object. Otherwise they are discarded: a size match is
-	// not an identity, and publishing another object's bytes (or another
-	// revision's) would corrupt the cache silently.
+	// A size match is not identity; discard prefixes without a matching record.
 	if pos > 0 && !singlePartialInheritable(recorded, identity, pos) {
 		if recorded == nil {
-			// No usable identity record (a sidecarless pre-#140 partial, an
-			// unreadable record, or an unsupported sidecar version): this is
-			// old or unproven state, so say so at warning level before
-			// starting from zero.
 			downloadLog.Warn("discarding old or unproven single-path partial; re-downloading from zero",
 				"repo", job.Repo,
 				"path", it.RelativePath,
@@ -1765,19 +1241,9 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		inherited = false
 	}
 
-	// The record is (re)written before any inherited byte is trusted, and
-	// after the unproven bytes are gone: it must describe exactly the partial
-	// that is on disk. A partial left by an interrupted run keeps this
-	// record, which is what makes the next run's decision possible.
-	//
-	// The clean-framing completion proof travels with the bytes it describes
-	// and only with them: it is carried over only for an exactly-sized partial
-	// that the recorded identity authorizes, and it is dropped for a fresh
-	// transfer, for an incomplete restart (the proof described a full body)
-	// and for a partial that is about to be discarded. It is not part of the
-	// identity comparison - a matching record still resumes the prefix - but
-	// an exactly-sized partial without it is not published without a request
-	// (see the exact-size branch below).
+	// Persist identity before trusting bytes. Framing proof carries only with a
+	// matching exact-size partial; without it the prefix may resume, but a full
+	// partial must revalidate its final byte.
 	sizeValid := !((it.Size > 0 && pos > it.Size) || (it.Size <= 0 && pos > 0))
 	identity.FramingComplete = it.Size > 0 && pos == it.Size && recorded != nil &&
 		recorded.FramingComplete && recorded.inheritableBy(identity)
@@ -1785,9 +1251,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		return false, fmt.Errorf("write single-part identity %s: %w", sidecar, err)
 	}
 
-	// An oversized partial is stale/corrupt. A partial with no known expected
-	// size cannot be range-validated at all, so it is discarded rather than
-	// guessed at (downloader correctness rule: never resume unknown layout).
+	// Discard oversized partials and any partial with unknown expected size.
 	if !sizeValid {
 		if err := out.Truncate(0); err != nil {
 			return false, err
@@ -1801,22 +1265,14 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	// (a one-byte file), where the ordinary resume rule would send a full GET.
 	forceLastByteRange := false
 
-	// If the partial already holds exactly the expected number of bytes, its
-	// bytes are still unproven: publish only after the exact-size check and,
-	// for inherited bytes, the content proof. Emit the full-progress reading
-	// before the finalization event so the UI does not sit below 100% through
-	// the proof/rename.
+	// An exact-size partial may finalize only with clean-framing proof.
 	if it.Size > 0 && pos == it.Size {
 		if identity.FramingComplete {
 			emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size})
 			return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)
 		}
-		// The file is exactly full, but no run recorded that the response
-		// body ended cleanly at that byte count. Written bytes alone are not
-		// proof of clean framing: a process can exit after the last WriteAt
-		// and before io.Copy observes EOF, leaving a torn final byte. Reserve
-		// that byte so the normal transfer path re-requests the non-empty
-		// range [size-1, size) and only a clean response commits it.
+		// Written size does not prove clean EOF. Reserve and re-request the final
+		// byte so a cleanly framed response commits the partial.
 		downloadLog.Info("revalidating unframed single-path final byte",
 			"repo", job.Repo,
 			"path", it.RelativePath,
@@ -1826,16 +1282,10 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 			return false, err
 		}
 		pos = it.Size - 1
-		// For a one-byte file the reserved range starts at zero, where the
-		// normal resume rule would send a full GET. Force the explicit
-		// non-empty [0, 1) range so the revalidation is always one cleanly
-		// framed ranged response, exactly like every other size.
 		forceLastByteRange = pos == 0
 	}
 	if pos > 0 {
 		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: pos, Total: it.Size})
-		// The bytes already on disk are reused: the next request asks for
-		// the remaining range only.
 		downloadLog.Info("resuming download",
 			"repo", job.Repo,
 			"path", it.RelativePath,
@@ -1854,19 +1304,10 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	attempt := 0
 	ceiling := absoluteAttemptCeiling(attempts)
 	var lastErr error
-	// The high-water mark prevents non-progress and ignored-Range restarts from
-	// refunding the budget. The separate lifetime retry ceiling limits retries
-	// once attempts return; it does not time-bound a request that keeps delivering
-	// data. An ignored-Range restart may record a higher mark but cannot earn a
-	// refund, so a following bodyless failure also earns none.
-	// hwm is the highest offset ever reached for this file, seeded with the
-	// initial on-disk offset.
+	// hwm tracks progress refunds; ignored-Range restarts update it without a
+	// refund. The lifetime ceiling applies only after requests return.
 	hwm := pos
-	// countedUpTo is the absolute end of the bytes already reported as
-	// progress, seeded with the inherited prefix. Progress therefore counts
-	// durable unique bytes: a failed attempt's written prefix is not counted
-	// again when the retry resumes from it, and an overflowing attempt's
-	// accepted bytes are not counted twice when the range is re-requested.
+	// Count unique durable bytes, including the inherited prefix, only once.
 	countedUpTo := pos
 	var lastEmit time.Time
 
@@ -1882,9 +1323,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		default:
 		}
 
-		// Each attempt gets its own cancellable context so the stall
-		// watchdog can abort just this attempt (closing the connection or
-		// HTTP/2 stream) without cancelling the whole job.
+		// The stall watchdog cancels this request without canceling the job.
 		attemptCtx, attemptCancel := context.WithCancel(ctx)
 
 		req, _ := http.NewRequestWithContext(attemptCtx, "GET", it.URL, nil)
@@ -1896,12 +1335,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		// waitResp carries a throttling response (429/503) whose Retry-After /
 		// RateLimit header must shape the next wait.
 		var waitResp *http.Response
-		// truncatedRestart is set when the server ignored our Range and
-		// answered 200 while resumable bytes were present, forcing a restart
-		// from zero. That is destructive rather than progress, so it must not
-		// refund the budget (and it bounds the ignored-Range growing-prefix
-		// server, which would otherwise advance the high-water mark on every
-		// attempt).
+		// Ignored-Range 200 restarts are destructive, not progress refunds.
 		truncatedRestart := false
 		// preHwm is the high-water mark as of the start of this attempt; the
 		// refund decision compares the final pos against it (see below).
@@ -1916,17 +1350,8 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 				lastErr = apiErr
 				resp.Body.Close()
 				if apiErr.IsFailFast() {
-					// Permanent for the whole job: no retry, no request
-					// storm. Remove any empty partial this attempt created
-					// before returning the actionable error.
-					//
-					// The identity sidecar goes ONLY with the partial it
-					// describes. A NON-EMPTY partial holds resumable bytes
-					// that the next run may inherit, and that run can only
-					// prove they belong to this object while the sidecar
-					// survives. Removing the record while the bytes stay
-					// would silently discard the progress a permanent (but
-					// eventually fixable) error made.
+					// Fail the job without retry. Remove only an empty partial; retain the
+					// sidecar whenever resumable bytes remain, so a later run keeps their identity.
 					attemptCancel()
 					out.Close()
 					if removeEmptyPartialFile(tmp) {
@@ -1968,9 +1393,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						resp.Body.Close()
 					}
 				} else {
-					// Full body: if we asked for a range and got 200, existing
-					// partial bytes are thrown away and the download restarts
-					// from zero. It is a destructive restart, not progress.
+					// An ignored Range restarts the partial from zero.
 					if pos > 0 {
 						truncatedRestart = true
 						if err := out.Truncate(0); err != nil {
@@ -1979,10 +1402,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 							return false, err
 						}
 						pos = 0
-						// The inherited bytes were just discarded: this run will
-						// write every byte from zero, so Verify=size must not
-						// perform the one-time inherited-bytes proof on the
-						// restarted transfer.
+						// The restart discarded inherited bytes, so they no longer require a proof.
 						inherited = false
 						countedUpTo = 0
 						lastEmit = time.Time{}
@@ -2027,14 +1447,9 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						}
 					}
 					if cerr == nil {
-						// io.Copy observed a clean end of the body AND every
-						// exact length check passed, so this run holds the
-						// clean-framing proof the partial lacked. Persist it
-						// before publication: a later restart that lands on an
-						// exactly-sized partial may then finalize without a
-						// request. A persistence failure only loses that
-						// restart optimization - this run's bytes are framed
-						// now - so it is a warning, not a publication error.
+						// Clean EOF and exact length establish framing. Persist that proof for the
+						// exact-size restart shortcut; failure loses only the shortcut, not this
+						// run's framing proof.
 						identity.FramingComplete = true
 						if werr := writeSinglePartIdentity(sidecar, identity); werr != nil {
 							downloadLog.Warn("cannot persist single-part clean-framing completion",
@@ -2044,10 +1459,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 								"error", werr,
 							)
 						}
-						// The file now has exactly the expected bytes (a ranged
-						// body covers [pos, size) and a full body covers
-						// [0, size)); finalizeSinglePartial re-checks the size
-						// and runs the inherited-bytes content proof.
+						// Framing is complete; finalization checks any known size and required digest.
 						attemptCancel()
 						emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
 							Downloaded: countedUpTo, Total: it.Size})
@@ -2068,11 +1480,8 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 							countedUpTo = base
 						}
 					} else {
-						// Advance by bytes actually written so the next retry
-						// resumes from the durable offset instead of
-						// duplicating them. Reaching the requested byte count is
-						// not proof of clean body framing: reserve the last byte
-						// and truncate it so retry/restart requests a non-empty range.
+						// Resume from bytes actually written, but roll back the final byte when an
+						// error prevents clean framing so the next attempt requests a non-empty range.
 						accepted := w.written
 						if it.Size > 0 && accepted == limit {
 							accepted--
@@ -2138,32 +1547,16 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	return false, lastErr
 }
 
-// singleProofStartHook is a test seam invoked at the very start of the
-// single-path known-digest content proof, immediately before
-// computeSHA256Ctx. It is nil in production. A regression test installs it to
-// cancel the context while the partial's writable handle is still open, so it
-// can prove that the explicit-cancel cleanup closes that handle before it
-// removes anything (Windows cannot unlink an open file).
+// singleProofStartHook lets tests cancel before hashing while the writable
+// partial is still open, exercising Windows close-before-cleanup ordering.
 var singleProofStartHook func(out *os.File)
 
-// finalizeSinglePartial publishes a .part that already holds exactly the
-// expected number of bytes. It is called only when this run observed a clean
-// end of the response body at that byte count, or when a matching sidecar
-// already recorded that clean-framing completion for the exact-sized partial;
-// written bytes alone never reach this gate. It is the single path's
-// publication gate: the
-// exact-size check runs first, then a known digest is proven with one
-// full-file SHA-256 pass before the rename whenever Verify is "sha256" or
-// "etag" (fresh or resumed), whenever the partial contains inherited bytes and
-// Verify is not "none" (the inherited-bytes exception for size mode),
-// whenever the identity is UNPINNED and Verify is not "none" (an unpinned
-// identity names a revision the endpoint did not resolve, so the bytes are not
-// bound to an immutable object and only the content proof can detect a moved
-// branch), or whenever the expected size is unknown but the item carries a
-// known digest (only the digest can prove an unconstrained stream). A mismatch
-// removes the partial and never renames it onto dst. The returned bool reports
-// whether that proof ran, so the caller does not repeat it. file_finalizing is
-// emitted before the slow proof so the UI sees the local-finalization window.
+// finalizeSinglePartial requires clean response framing (from this run or a
+// matching exact-size sidecar), checks any known size, and publishes the partial.
+// With a known digest, sha256/etag always prove before rename; other non-none
+// modes prove inherited bytes, unpinned identities and unknown-size streams.
+// A mismatch leaves dst untouched and attempts partial cleanup. The bool reports
+// completed proof; file_finalizing precedes the slow read.
 func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, it PlanItem, cfg Settings, inherited bool, opts singleOpts, emit func(ProgressEvent)) (bool, error) {
 	emit(ProgressEvent{Event: "file_finalizing", Path: it.RelativePath, Message: "verifying"})
 	cancelBeforePublish := func() error {
@@ -2189,13 +1582,6 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 		}
 	}
 	verified := false
-	// Known-digest modes always prove before publication (fresh or resumed);
-	// size mode proves inherited bytes or an unknown-size stream, neither of
-	// which can be trusted from size alone. An UNPINNED identity proves in
-	// every non-"none" mode as well: it names a revision the endpoint did not
-	// resolve to a commit, so the transferred bytes are not bound to an
-	// immutable object and a moved branch can only be caught by the content
-	// proof. Verify="none" is the opt-out.
 	proveKnownDigest := it.SHA256 != "" &&
 		(cfg.Verify == "sha256" || cfg.Verify == "etag" ||
 			(cfg.Verify != "none" && (it.Size <= 0 || inherited || !opts.CommitPinned)))
@@ -2206,15 +1592,8 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 		sum, err := computeSHA256Ctx(ctx, tmp)
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
-				// The content proof is the only pre-publication cancellation
-				// branch that reached the cleanup with the partial's writable
-				// handle still open. Close it before the explicit-cancel
-				// cleanup: Windows cannot unlink a file while this handle
-				// (opened without FILE_SHARE_DELETE) is open, so a cancelled
-				// proof would otherwise retain the whole .part and its identity
-				// sidecar. A double Close from the deferred close is harmless.
-				// Pause/internal aborts keep their bytes exactly as before; they
-				// only skip the cleanup below.
+				// Close before explicit-cancel cleanup: Windows cannot unlink this open
+				// partial. Pause/internal abort still preserves payload and sidecar.
 				_ = out.Close()
 				if !abortPartAttempt(ctx) {
 					cleanupPartialsOnCancel(cfg, dst, opts.Domain)
@@ -2227,12 +1606,9 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 			return false, err
 		}
 		if !strings.EqualFold(sum, it.SHA256) {
-			// Unproven bytes must never be published: the partial is removed so
-			// a retry starts from a clean prefix, and dst is left untouched.
+			// A mismatch must leave dst untouched; attempt to discard the bad partial.
 			_ = out.Close()
 			if rerr := os.Remove(tmp); rerr == nil || os.IsNotExist(rerr) {
-				// The identity record described the partial that is now gone:
-				// it must not outlive it.
 				removeSinglePartIdentity(tmp + ".meta")
 			}
 			return false, fmt.Errorf("sha256 verify failed: %s: expected %s got %s", it.RelativePath, it.SHA256, sum)
@@ -2248,9 +1624,7 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 	if err := os.Rename(tmp, dst); err != nil {
 		return false, err
 	}
-	// The identity record described the partial that has just been published.
-	// It must not outlive its partial: the published file is the content now,
-	// and a stale record would describe bytes that no longer exist.
+	// The published partial no longer needs its identity sidecar.
 	removeSinglePartIdentity(tmp + ".meta")
 	// Obsolete pre-#140 multipart artifacts for this destination must not
 	// survive a successful single-path finalization. Finalization already
@@ -2261,30 +1635,16 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 	return verified, nil
 }
 
-// removeEmptyPartialFile removes path when it exists and is empty. It is used
-// to clean up a zero-byte .part file that a fail-fast attempt created, without
-// touching a partial that predates the attempt and may hold resumable bytes.
-//
-// It reports whether the file is GONE afterwards: the caller uses it to decide
-// whether the identity sidecar that describes the partial may be removed as
-// well. A sidecar must not outlive its partial, and a partial that SURVIVES
-// must keep its sidecar, or the next run cannot prove the identity of the
-// bytes on disk and discards them.
+// removeEmptyPartialFile removes an empty partial and reports confirmed absence.
+// A false result preserves its identity sidecar for any surviving resume bytes.
 func removeEmptyPartialFile(path string) bool {
 	fi, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// The file is already gone: there is nothing left for a sidecar
-			// to describe.
 			return true
 		}
-		// The stat FAILED, so whether the partial still exists is UNKNOWN
-		// (a permission error, a symlink loop, an I/O error, ...). The caller
-		// uses this answer to decide whether the identity sidecar may be
-		// removed together with the partial. Removing a sidecar whose partial
-		// may still be on disk would make the next run unable to prove the
-		// identity of the surviving bytes and discard them, so the
-		// conservative answer is false: the sidecar survives.
+		// A failed stat does not prove absence; preserve the sidecar for possible
+		// surviving bytes.
 		downloadLog.Warn("cannot stat partial file; keeping its identity sidecar", "path", path, "error", err)
 		return false
 	}

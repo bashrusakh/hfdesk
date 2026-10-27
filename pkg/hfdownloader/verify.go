@@ -29,24 +29,14 @@ func (c contextReader) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
-// computeSHA256 computes and returns the SHA256 hash of a file.
 func computeSHA256(path string) (string, error) {
 	return computeSHA256Ctx(context.Background(), path)
 }
 
-// computeSHA256Ctx is computeSHA256 bounded by ctx: it aborts promptly with the
-// context error if ctx is cancelled while hashing. Existing ctx-free callers
-// keep using computeSHA256 (context.Background()).
-//
-// Every invocation is a full-file read, so it is counted in the
-// hashPassCount/hashPassBytes observability counters. Scoped to the NORMAL
-// transfer/finalization path, the issue #140 verification contract allows at
-// most ONE such pass per downloaded file in strict Verify=sha256 mode, and none
-// in Verify=size mode. Deliberate exceptions exist: the pre-download skip check
-// may hash an already-present destination, and inherited single-path .part
-// bytes (or a durable ProofPending / unpinned-identity gate) are proven before
-// publication even in size mode when the item carries a known digest
-// (Verify != "none").
+// computeSHA256Ctx checks cancellation between reads and returns the context
+// error if hashing is interrupted. computeSHA256 uses a background context.
+// Counters record each opened-file hash attempt and its initial logical size,
+// not necessarily bytes actually read when an attempt fails or is cancelled.
 func computeSHA256Ctx(ctx context.Context, path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -68,7 +58,6 @@ func computeSHA256Ctx(ctx context.Context, path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// verifySHA256 computes the SHA256 of a file and compares it to expected.
 func verifySHA256(path string, expected string) error {
 	return verifySHA256Ctx(context.Background(), path, expected)
 }
@@ -87,35 +76,23 @@ func verifySHA256Ctx(ctx context.Context, path string, expected string) error {
 	return nil
 }
 
-// shouldSkipLocal checks if a file already exists and matches expected hash/size.
-// Returns (skip, reason, error).
 func shouldSkipLocal(it PlanItem, dst string) (bool, string, error) {
 	return shouldSkipLocalCtx(context.Background(), it, dst)
 }
 
-// shouldSkipLocalCtx is shouldSkipLocal bounded by ctx. A multi-GB LFS hash can
-// otherwise run to completion after a sibling's permanent error cancelled the
-// job; with ctx it aborts promptly. Successful skip behavior is unchanged: a
-// cancelled ctx returns ctx.Err() so the caller surfaces the cancellation
-// instead of skipping.
-//
-// This is a PRE-DOWNLOAD decision over an already-present destination, not the
-// post-download verification path: a size-mode LFS file with a known digest is
-// hashed here to decide whether it can be skipped, while the normal
-// transfer/finalization path performs no SHA-256 reread in size mode.
+// shouldSkipLocalCtx makes the pre-download decision context-aware, so a long
+// existing-file hash stops after cancellation. Unlike normal size-mode transfer,
+// this skip check may hash an existing LFS destination.
 func shouldSkipLocalCtx(ctx context.Context, it PlanItem, dst string) (bool, string, error) {
 	fi, err := os.Stat(dst)
 	if err != nil {
-		// no file
 		return false, "", nil
 	}
 
-	// Quick size check first: if known and different, don't skip
 	if it.Size > 0 && fi.Size() != it.Size {
 		return false, "", nil
 	}
 
-	// LFS with known sha: compute and compare
 	if it.LFS && it.SHA256 != "" {
 		if err := verifySHA256Ctx(ctx, dst, it.SHA256); err == nil {
 			return true, "sha256 match", nil
@@ -123,11 +100,9 @@ func shouldSkipLocalCtx(ctx context.Context, it PlanItem, dst string) (bool, str
 			// Cancelled mid-verify: surface the cancellation, do not skip.
 			return false, "", verr
 		}
-		// size matched but sha mismatched -> re-download
 		return false, "", nil
 	}
 
-	// Non-LFS (or unknown sha): size match is sufficient
 	if it.Size > 0 && fi.Size() == it.Size {
 		return true, "size match", nil
 	}

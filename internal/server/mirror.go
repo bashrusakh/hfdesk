@@ -661,17 +661,13 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 			return err
 		}
 
-		// Guard: SafeJoin so the walked repository-relative path cannot escape
-		// the destination repository. SafeJoin's filepath.IsLocal check also
-		// makes this barrier visible to CodeQL's go/path-injection analysis.
+		// SafeJoin prevents the walked relative path from escaping the repo.
 		// The symlinked-parent check below still applies: SafeJoin is lexical
 		// and does not see symlinks.
 		dst, err := hfdownloader.SafeJoin(dstPath, rel)
 		if err != nil {
 			return fmt.Errorf("path traversal: %q would escape the destination repository: %w", rel, err)
 		}
-		// Staging payloads, records, their atomic-write temp and ownership lock
-		// files are not stored content; mirrors copy only finished blobs.
 		if !info.IsDir() && filepath.Dir(rel) == "blobs" && isBlobStagingArtifactName(info.Name()) {
 			return nil
 		}
@@ -705,7 +701,6 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 				return fmt.Errorf("refusing escaping symlink %s -> %s (resolves outside repo)", path, link)
 			}
 			os.Remove(dst)
-			// The link target is contained: an absolute target is rejected and the resolved target must stay inside repoPath.
 			// lgtm[go/path-injection]
 			return os.Symlink(link, dst)
 		}
@@ -744,23 +739,11 @@ func copyFileForMirror(src, dst string) error {
 	return out.Close()
 }
 
-// mirrorVerifyCoversEntry reports whether the mirror verification covers the
-// repository-relative entry. The production path covers every entry the copy
-// produces, so copy and verify always agree on the same set. It is a variable
-// so the negative control can install the historical blobs/-only scope and
-// prove that the copy/verify agreement regression is discriminating.
+// mirrorVerifyCoversEntry controls which copied entries are verified.
 var mirrorVerifyCoversEntry = func(rel string) bool { return true }
 
-// verifyRepoCache verifies that a copied repo matches the source.
-//
-// It verifies exactly the set the copy produces: every file of the repository
-// except the downloader staging artifacts INSIDE blobs/. The exclusion is
-// scoped to that namespace, so copy and verify always agree on the same set
-// and a legitimate file outside it - a snapshot entry named
-// "tokenizer.model.meta", for example - is copied AND verified.
-//
-// A snapshot entry is a link, and the copy reproduces the link, so the link
-// target is what has to match; a regular file is compared by size.
+// verifyRepoCache checks copied repository files, excluding staging in blobs/.
+// Symlinks are compared by target and regular files by size.
 func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 	dstPath, err := mirrorRepoDestination(repoPath, srcCache, dstCache)
 	if err != nil {
@@ -779,8 +762,6 @@ func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 		if err != nil {
 			return err
 		}
-		// Staging artifacts are not copied content and have no destination to
-		// verify. The exclusion is scoped to blobs/, exactly like the copy's.
 		if filepath.Dir(rel) == "blobs" && isBlobStagingArtifactName(info.Name()) {
 			return nil
 		}
@@ -788,18 +769,13 @@ func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 			return nil
 		}
 
-		// Guard: SafeJoin so the walked repository-relative path cannot escape
-		// the destination repository. SafeJoin's filepath.IsLocal check also
-		// makes this barrier visible to CodeQL's go/path-injection analysis.
 		dstFile, err := hfdownloader.SafeJoin(dstPath, rel)
 		if err != nil {
 			return fmt.Errorf("path traversal: %q would escape the destination repository: %w", rel, err)
 		}
 
 		if info.Mode()&os.ModeSymlink != 0 {
-			// A snapshot entry is a link and the copy reproduces the link, so
-			// the link target is what has to match. Only the parent chain is
-			// confined: the leaf IS the link.
+			// Confine parents, but leave the snapshot leaf as a symlink.
 			if err := mirrorNoSymlinkPath(srcCache, filepath.Dir(path)); err != nil {
 				return err
 			}

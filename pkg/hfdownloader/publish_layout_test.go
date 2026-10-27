@@ -3,28 +3,9 @@
 
 package hfdownloader
 
-// Regression coverage for the publication invariant of the ranged route
-// (issue #140 / PR #151, correction package B):
-//
-//   - publish() asserts, explicitly, that the range layout of the download
-//     covers the whole expected payload - every range Done and the committed
-//     total equal to the expected size - before it renames the staging
-//     payload onto the publish target;
-//   - publish() asserts, explicitly, that the staging PAYLOAD itself holds
-//     exactly the expected number of bytes before the same rename, so a
-//     record that claims a complete layout over a physically short file is
-//     refused as well;
-//   - an incomplete layout is refused with errStagingLayoutIncomplete and
-//     nothing is published: the staged bytes stay on disk for a resume;
-//   - a short payload is refused with errStagingPayloadSize and nothing is
-//     published: the staged bytes stay on disk for a resume;
-//   - a COMPLETE layout over a full-size payload still publishes, so neither
-//     guard over-refuses.
-//
-// The cases construct the stagingDownload through the package's own test
-// seams (the claim record, the ownership lock and the layout) and call
-// publish() directly. That is deterministic: no network, no timing, no
-// sleeps.
+// Tests that publication rejects an incomplete range layout or wrong-sized
+// payload, while still accepting a complete transfer. Cases seed state and
+// call publish directly, without network or timing.
 
 import (
 	"context"
@@ -35,8 +16,6 @@ import (
 	"time"
 )
 
-// completeRangeLayout returns the range layout of a fully transferred
-// payload: every range is Done and committed in full.
 func completeRangeLayout(size int64, n int) []RangeProgress {
 	ranges := buildRangeLayout(size, n)
 	for i := range ranges {
@@ -46,8 +25,6 @@ func completeRangeLayout(size int64, n int) []RangeProgress {
 	return ranges
 }
 
-// publishLayoutCase describes one seeded staging download and the layout the
-// publication must refuse.
 type publishLayoutCase struct {
 	name string
 	// live is the in-memory layout of the download.
@@ -60,19 +37,8 @@ type publishLayoutCase struct {
 	recordSize int64
 }
 
-// TestStagingPublishRefusesIncompleteLayout pins the publication invariant:
-// publish() must not rename a staging payload whose range layout does not
-// cover the whole expected payload.
-//
-// The guarantee used to rest only on control flow (every runRange nil-return
-// path is caught by the cancellation guard or by the errCh drain), which is
-// correct but implicit. The guard added to publish() makes it a checked
-// invariant, and this test is what proves the guard actually refuses: it
-// seeds an incomplete layout into a download and calls publish().
-//
-// The payload holds the FULL expected size here, so the layout is the only
-// thing that can refuse the publication: the physical size guard must not
-// mask the layout guard.
+// Publication must reject incomplete live or persisted layouts. The payload is
+// full-sized so the physical-size guard cannot mask the layout check.
 func TestStagingPublishRefusesIncompleteLayout(t *testing.T) {
 	const total = 4096
 	payload := make([]byte, total)
@@ -157,12 +123,9 @@ func TestStagingPublishRefusesIncompleteLayout(t *testing.T) {
 			if !errors.Is(err, errStagingLayoutIncomplete) {
 				t.Fatalf("publish with an incomplete layout = %v, want errStagingLayoutIncomplete", err)
 			}
-			// The target is NOT published: an incomplete payload must never
-			// reach the destination.
 			if _, serr := os.Stat(pub); !os.IsNotExist(serr) {
 				t.Errorf("publish created the destination from an incomplete layout, stat err=%v", serr)
 			}
-			// The staged bytes are preserved for a resume.
 			if _, serr := os.Stat(staging); serr != nil {
 				t.Errorf("the refused publish removed the staged payload: %v", serr)
 			}
@@ -170,16 +133,7 @@ func TestStagingPublishRefusesIncompleteLayout(t *testing.T) {
 	}
 }
 
-// TestStagingPublishRefusesShortPayload pins the physical size invariant:
-// publish() must not rename a staging payload that holds fewer bytes than the
-// expected size, even when the record and the live layout both claim a
-// COMPLETE transfer.
-//
-// The layout is the completion contract for the BYTES; the payload's own
-// length is the completion contract for the FILE. A record can describe a
-// complete layout while the file behind it is short, and publishing that file
-// would put a payload that disagrees with its own metadata on the
-// destination.
+// Even complete live and persisted layouts must not publish a physically short payload.
 func TestStagingPublishRefusesShortPayload(t *testing.T) {
 	const total = 4096
 	short := make([]byte, total/8)
@@ -226,11 +180,9 @@ func TestStagingPublishRefusesShortPayload(t *testing.T) {
 	if !errors.Is(err, errStagingPayloadSize) {
 		t.Fatalf("publish of a physically short payload = %v, want errStagingPayloadSize", err)
 	}
-	// Nothing is published.
 	if _, serr := os.Stat(pub); !os.IsNotExist(serr) {
 		t.Errorf("publish created the destination from a short payload, stat err=%v", serr)
 	}
-	// The staged bytes are preserved for a resume.
 	got, serr := os.ReadFile(staging)
 	if serr != nil {
 		t.Fatalf("the refused publish removed the staged payload: %v", serr)
@@ -240,10 +192,7 @@ func TestStagingPublishRefusesShortPayload(t *testing.T) {
 	}
 }
 
-// TestStagingPublishAcceptsCompleteLayout is the positive control of the
-// publication invariant: a download whose live AND persisted layout is
-// complete, over a payload that really holds the expected bytes, still
-// publishes. Neither guard may turn a finished transfer into a failure.
+// Positive control: complete live and persisted layouts over a full-sized payload still publish.
 func TestStagingPublishAcceptsCompleteLayout(t *testing.T) {
 	const total = 4096
 	payload := make([]byte, total)

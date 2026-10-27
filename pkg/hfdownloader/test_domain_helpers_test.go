@@ -3,14 +3,7 @@
 
 package hfdownloader
 
-// Test-only helpers for the one-destination-domain ownership model
-// (issue #140 / PR #151).
-//
-// Production always acquires the destination's ownership domain at item level
-// and passes it to downloadMultipart; the claim never acquires a lock of its
-// own. Direct callers in tests must therefore supply a domain of the same
-// identity. These helpers acquire one explicitly and release it when the test
-// ends. They are NOT production fallbacks: no production path can call them.
+// Test helpers explicitly acquire the same destination domain passed by Download.
 
 import (
 	"context"
@@ -19,10 +12,6 @@ import (
 	"testing"
 )
 
-// testDomainIdentity derives the ownership-domain identity of dst exactly like
-// the item path does: a cache destination (blobs/tmp-<name>) uses its
-// name-based key and destination, any other path uses the flat/output-mode
-// identity.
 func testDomainIdentity(dst string) (key, lockSrc string) {
 	if k, ok := cacheDstDomainKey(dst); ok {
 		return k, dst
@@ -31,14 +20,8 @@ func testDomainIdentity(dst string) (key, lockSrc string) {
 	return flat.key, flat.lockSrc
 }
 
-// Test-domain reuse: one test may call downloadMultipart several times for the
-// same destination (a failed publish followed by a resume, for example). The
-// item path acquires the domain once per item, so the helper hands out one
-// domain per (test, destination) and keeps it for the test's lifetime.
-//
-// A test that races several writers of ONE destination concurrently must not
-// share that reused domain: it acquires a fresh domain per writer with
-// acquireTestDomainFresh.
+// Cache one domain per test/destination. Concurrent-writer tests must acquire
+// distinct domains with acquireTestDomainFresh instead of reusing this cache.
 var testDomains = struct {
 	sync.Mutex
 	m map[testing.TB]map[string]*blobDomain
@@ -77,9 +60,8 @@ func acquireTestDomain(t testing.TB, dst string) *blobDomain {
 	return dom
 }
 
-// acquireTestDomainFresh acquires a NEW destination ownership domain for dst
-// and releases it when the test ends. Use it for each concurrent writer of one
-// destination.
+// acquireTestDomainFresh acquires an independent domain and releases it when
+// the test ends; use it instead of cached reuse for competing writers.
 func acquireTestDomainFresh(t testing.TB, dst string) *blobDomain {
 	t.Helper()
 	key, lockSrc := testDomainIdentity(dst)
@@ -101,10 +83,8 @@ func withTestDomain(t testing.TB, dst string, opts multipartOpts) multipartOpts 
 	return opts
 }
 
-// acquireTestStagingDomain acquires the flat/output-mode destination domain
-// whose multipart staging name is exactly staging. Direct claim tests name
-// their staging path independently of a destination, so the domain is derived
-// from the staging name.
+// acquireTestStagingDomain derives the flat destination domain from an explicitly
+// named staging path, for direct claim tests without a separate dst.
 func acquireTestStagingDomain(t testing.TB, staging string) *blobDomain {
 	t.Helper()
 	dst := strings.TrimSuffix(staging, ".incomplete")

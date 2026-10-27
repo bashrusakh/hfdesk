@@ -116,16 +116,6 @@ func safeDirectoryChain(name string) error {
 	return nil
 }
 
-// isIncompleteBlobPath reports whether a blob path names a downloader staging
-// artifact rather than a deletable published blob.
-//
-// The decision is the shared, exhaustive staging-shape classification (see
-// staging_names.go): every producer shape the downloader creates - the
-// single-request staging name and its partial and identity sidecar, the
-// ranged staging pair and its atomic record temp, the persistent ownership
-// locks, the legacy multipart family and the atomic copy temp - is refused.
-// A published blob whose name is not one of those shapes stays deletable,
-// exactly like the reserved-collision rule refuses the producer namespace.
 func (r *RepoDir) isIncompleteBlobPath(name string) bool {
 	return IsStagingArtifactName(filepath.Base(name))
 }

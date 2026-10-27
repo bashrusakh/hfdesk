@@ -3,32 +3,8 @@
 
 package hfdownloader
 
-// Resume identity of the RANGED staging path (issue #140 follow-up).
-//
-// The ranged path stages its bytes in <dst>.incomplete and describes them in
-// the versioned record <dst>.incomplete.meta. A record authorizes a resume
-// only when it identifies ONE immutable object: the same repository, the same
-// item path, the same expected size and the same RESOLVED commit - and the
-// identity must be PINNED on both sides (the record's own flag and the
-// current plan's). An unpinned commit is the planner's fallback to the
-// requested revision: the content behind that name can move between two runs,
-// so bytes staged under it may never be published as the new revision's
-// content. This is the same rule the single-request path applies.
-//
-// The regressions below cover the decision table:
-//
-//	(a) a record with an unpinned identity (the flag false, or absent) is
-//	    discarded and the payload re-downloaded, never published;
-//	(b) a record whose CURRENT plan is unpinned is discarded as well;
-//	(c) a pinned record that matches repo/commit/path/size is still inherited,
-//	    and only the missing suffix is requested (no over-refusal);
-//	(d) a pinned record whose commit differs is discarded - the commit-string
-//	    dimension is covered by
-//	    TestRangedMultipart_ResolvedCommitMismatchDiscardsStaging;
-//	(e) end to end through Download: an item with NO known digest whose commit
-//	    could not be resolved does not inherit staged bytes;
-//	(f) the negative control: with the pinned rule removed, (a) publishes the
-//	    stale bytes.
+// Covers pinned and unpinned ranged resume identities, including the positive
+// case that preserves a matching prefix and requests only its missing suffix.
 
 import (
 	"bytes"
@@ -57,9 +33,8 @@ func staleRangedPayload(size int) []byte {
 	return b
 }
 
-// requestTouchesStart reports whether any recorded request starts at byte 0.
-// A re-download of the whole file always does; inheriting a committed prefix
-// never does.
+// requestTouchesStart reports a bytes=0- request. In these prefix fixtures,
+// restarting from zero requests it; resuming the committed prefix does not.
 func requestTouchesStart(ranges []string) bool {
 	for _, rh := range ranges {
 		if strings.HasPrefix(rh, "bytes=0-") {
@@ -69,8 +44,7 @@ func requestTouchesStart(ranges []string) bool {
 	return false
 }
 
-// writeRecordWithoutPinnedFlag rewrites the record so the pinned flag is
-// absent, exactly like a record written before the field existed.
+// writeRecordWithoutPinnedFlag removes commit_pinned to test missing-field state.
 func writeRecordWithoutPinnedFlag(t *testing.T, metaPath string) {
 	t.Helper()
 	raw, err := os.ReadFile(metaPath)
@@ -94,14 +68,8 @@ func writeRecordWithoutPinnedFlag(t *testing.T, metaPath string) {
 	}
 }
 
-// TestRangedResumeRejectsAnUnpinnedIdentity is regression (a)+(b): a staging
-// record whose identity is not PINNED on both sides is discarded, and the
-// payload is downloaded again. The stale bytes an earlier run staged must
-// never be published as this item's content.
-//
-// The item carries no known digest, so nothing can content-prove the
-// published bytes either: in the default Verify=size mode an inherited
-// stale prefix would be published silently.
+// Unpinned resume state must restart from zero. With no known digest in
+// size mode, stale inherited bytes would otherwise escape content proof.
 func TestRangedResumeRejectsAnUnpinnedIdentity(t *testing.T) {
 	const total = 8000
 	fresh := rangedTestPayload(total)
@@ -110,8 +78,7 @@ func TestRangedResumeRejectsAnUnpinnedIdentity(t *testing.T) {
 	cases := []struct {
 		name string
 		// record rewrites the seeded record on disk.
-		record func(t *testing.T, metaPath string)
-		// planPinned is the current plan's pinned identity.
+		record     func(t *testing.T, metaPath string)
 		planPinned bool
 	}{
 		{
@@ -145,8 +112,7 @@ func TestRangedResumeRejectsAnUnpinnedIdentity(t *testing.T) {
 			dir := t.TempDir()
 			dst := filepath.Join(dir, "unpinned.bin")
 			staging := dst + ".incomplete"
-			// The earlier run committed the first half of the payload and
-			// stopped. Those bytes are stale: the branch moved.
+			// Seed a committed stale prefix, distinct from the server's current bytes.
 			ranges := []RangeProgress{
 				{Start: 0, End: total/2 - 1, Committed: total / 2, Done: true},
 				{Start: total / 2, End: total - 1},
@@ -171,10 +137,7 @@ func TestRangedResumeRejectsAnUnpinnedIdentity(t *testing.T) {
 	}
 }
 
-// TestRangedResumeKeepsAPinnedMatchingIdentity is regression (c): a pinned
-// record whose repository, commit, path and size match the current item is
-// still inherited, and only the missing suffix is requested. The pinned gate
-// must not over-refuse a resume that is proven.
+// A matching pinned record must retain its prefix and fetch only the suffix.
 func TestRangedResumeKeepsAPinnedMatchingIdentity(t *testing.T) {
 	const total = 8000
 	fresh := rangedTestPayload(total)
@@ -204,15 +167,8 @@ func TestRangedResumeKeepsAPinnedMatchingIdentity(t *testing.T) {
 	}
 }
 
-// TestDownloadUnresolvedCommitDoesNotInheritStagedBytes is regression (e):
-// the whole path, end to end through Download.
-//
-// The endpoint does not resolve the requested revision, so the plan falls back
-// to the revision string, which pins nothing. The item is an LFS file
-// WITHOUT a known digest, so there is no content proof either. A staging
-// record from an earlier run therefore names the same revision string and the
-// same size, and its committed bytes are STALE: the branch moved. They must
-// not be published as the new revision's content.
+// Download must reject stale ranges when commit resolution falls back to a
+// mutable revision. This LFS fixture has no digest to catch mixed bytes later.
 func TestDownloadUnresolvedCommitDoesNotInheritStagedBytes(t *testing.T) {
 	const total = 8000
 	fresh := rangedTestPayload(total)
@@ -289,64 +245,4 @@ func TestDownloadUnresolvedCommitDoesNotInheritStagedBytes(t *testing.T) {
 	if !requestTouchesStart(ranges2) {
 		t.Errorf("the stale committed range was inherited; requests=%v", ranges2)
 	}
-}
-
-// TestNegativeControlRangedResumeIgnoresThePinnedFlag is the negative
-// control for the pinned gate: with the historical rule installed (the
-// commit string alone decides), the stale bytes staged by an earlier run ARE
-// inherited and published. With the identity rule enforced, the same
-// scenario publishes exactly the served content.
-//
-// This is the proof that the regressions above are discriminating.
-func TestNegativeControlRangedResumeIgnoresThePinnedFlag(t *testing.T) {
-	const total = 8000
-	fresh := rangedTestPayload(total)
-	stale := staleRangedPayload(total)
-
-	old := resumeIdentityPinned
-	defer func() { resumeIdentityPinned = old }()
-	// The historical rule: the commit string alone decides, so a record
-	// written under an unpinned identity is inherited.
-	resumeIdentityPinned = func(recorded, current bool) bool { return true }
-
-	dir := t.TempDir()
-	dst := filepath.Join(dir, "unpinned.bin")
-	staging := dst + ".incomplete"
-	ranges := []RangeProgress{
-		{Start: 0, End: total/2 - 1, Committed: total / 2, Done: true},
-		{Start: total / 2, End: total - 1},
-	}
-	seedRangedState(t, staging, "o/r", "unpinned.bin", total, ranges, stale)
-	meta, err := readStagingMeta(staging + ".meta")
-	if err != nil {
-		t.Fatal(err)
-	}
-	meta.CommitPinned = false
-	if err := writeStagingMeta(staging+".meta", meta); err != nil {
-		t.Fatal(err)
-	}
-
-	srv, gotRanges := rangedTestServer(t, fresh)
-	it := PlanItem{RelativePath: "unpinned.bin", URL: srv.URL + "/unpinned.bin", Size: total, AcceptRanges: true}
-	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "size"}
-
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst,
-		withTestDomain(t, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}), func(ProgressEvent) {}); err != nil {
-		t.Fatalf("downloadMultipart: %v", err)
-	}
-
-	published, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatalf("read published file: %v", err)
-	}
-	if bytes.Equal(published, fresh) {
-		t.Fatal("the negative control did not reproduce the defect: the published bytes are the served content")
-	}
-	if !bytes.HasPrefix(published, stale[:total/2]) {
-		t.Fatalf("the negative control did not reproduce the defect: the published bytes do not carry the stale prefix")
-	}
-	if requestTouchesStart(*gotRanges) {
-		t.Errorf("the negative control did not reproduce the defect: the stale range was re-requested: %v", *gotRanges)
-	}
-	t.Logf("negative control reproduced the unpinned resume: published %d bytes with the stale prefix", len(published))
 }

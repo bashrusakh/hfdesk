@@ -267,16 +267,7 @@ func TestCleanupJobPartFiles_LegacyDst(t *testing.T) {
 	}
 }
 
-// TestCleanupJobPartFiles_LegacyRespectsUserNamedFiles covers the
-// "user file literally named .part" defensive concern: the helper
-// only touches files matching one of the dsts in the input list.
-// A user file `weights.part` that does not correspond to any tracked
-// dst is left alone, even when no other files are present.
-//
-// The previous scan-based implementation could have deleted a
-// "weights.part" file with a coincidental name; the per-dst list
-// makes the cleanup strictly scoped to the job's own in-flight
-// files and the standalone case is structurally impossible.
+// An empty tracked-destination set must leave user-named .part files alone.
 func TestCleanupJobPartFiles_LegacyRespectsUserNamedFiles(t *testing.T) {
 	tmpDir := t.TempDir()
 	repoDir := filepath.Join(tmpDir, "owner", "user-named")
@@ -343,12 +334,8 @@ func TestCleanupJobPartFiles_LegacyRejectsOutOfRootDst(t *testing.T) {
 	}
 }
 
-// TestCleanupJobPartFiles_HFCacheBlobStaging verifies the derivation that
-// bridges the caller-tracked tmp-<sha> dst and the blob-keyed staging the
-// ranged downloader uses for LFS files (issue #140): cleanup removes
-// blobs/<sha>.incomplete and its .meta for a tracked tmp-<sha> dst, plus
-// the dst-adjacent staging family, while unrelated .incomplete files
-// (other keys, non-canonical names) survive.
+// A tracked tmp-<sha> destination cleans its adjacent and blob-keyed ranged
+// staging, without touching other keys or non-canonical names.
 func TestCleanupJobPartFiles_HFCacheBlobStaging(t *testing.T) {
 	cacheDir := t.TempDir()
 	blobsDir := filepath.Join(cacheDir, "hub", "models--owner--repo", "blobs")
@@ -358,7 +345,6 @@ func TestCleanupJobPartFiles_HFCacheBlobStaging(t *testing.T) {
 	sha := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	otherSha := "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-	// Artifacts of the tracked dst tmp-<sha> must be removed...
 	tracked := map[string]string{
 		"tmp-" + sha:                      "completed temp window residue",
 		"tmp-" + sha + ".part":            "single-path partial",
@@ -367,7 +353,6 @@ func TestCleanupJobPartFiles_HFCacheBlobStaging(t *testing.T) {
 		"tmp-" + sha + ".incomplete":      "dst-adjacent staging payload",
 		"tmp-" + sha + ".incomplete.meta": "dst-adjacent staging metadata",
 	}
-	// ...while everything else survives.
 	survive := map[string]string{
 		otherSha + ".incomplete":         "another blob's staging",
 		otherSha + ".incomplete.meta":    "another blob's staging metadata",
@@ -387,8 +372,7 @@ func TestCleanupJobPartFiles_HFCacheBlobStaging(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// The .meta payloads identify current-version, lock-fenced records. A free
-	// OS lock therefore proves the prior writer is gone and permits cleanup.
+	// Lock-fenced records plus the free OS lock permit cleanup.
 
 	if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{filepath.Join(blobsDir, "tmp-"+sha)}); err != nil {
 		t.Fatalf("CleanupJobPartFiles: %v", err)
@@ -405,9 +389,6 @@ func TestCleanupJobPartFiles_HFCacheBlobStaging(t *testing.T) {
 	}
 }
 
-// TestCleanupJobPartFiles_LegacyRangedStaging verifies the legacy (flat
-// output) mode removes the ranged staging family for exactly the tracked
-// dsts: dst+".incomplete" and dst+".incomplete.meta".
 func TestCleanupJobPartFiles_LegacyRangedStaging(t *testing.T) {
 	tmpDir := t.TempDir()
 	repoDir := filepath.Join(tmpDir, "owner", "repo")

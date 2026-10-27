@@ -3,33 +3,8 @@
 
 package hfdownloader
 
-// Deterministic local-server coverage for the issue #140 ranged multipart
-// downloader. Every test runs against httptest servers (no network) and
-// covers one required case from the issue:
-//
-//  1. parallel ranges completing out of order → exact final bytes, direct
-//     writes into one staging file, no .part-NN payloads;
-//  2. wrong/missing Content-Range → reject before publication;
-//  3. short and oversized bodies → reject;
-//  4. cancellation mid-range → checkpoint never passes written data
-//     (TestDownloadMultipart_CancelMidStreamDoesNotClaim100 in
-//     flaky_test.go, which compares the committed total against the bytes
-//     the server actually delivered);
-//  5. restart resumes only missing/uncommitted bytes;
-//  6. a preallocated staging file at full logical size with missing ranges
-//     never looks complete;
-//  7. changing Concurrency across resume preserves committed bytes;
-//  8. Verify=size on an LFS file performs no SHA-256 file reread;
-//  9. Verify=sha256 detects corruption with exactly one final pass for a
-//     parallel transfer and never publishes corrupt bytes;
-//  10. a fresh Concurrency==1 strict transfer hashes on write (no second
-//     pass); a resumed sequential transfer falls back to one final pass;
-//  11. old/unsupported partials are discarded, never migrated or resumed
-//     (TestDownloadMultipart_OldMultipartArtifactsAreNotResumed in
-//     resume_test.go);
-//  12. two concurrent claims for the same staging file → only one writer;
-//  13. stall/retry/cancel/fail-fast behavior (robustness_test.go suite).
-
+// Local-server tests cover ranged framing, resume, verification, cancellation,
+// and concurrent ownership without external network access.
 import (
 	"bytes"
 	"context"
@@ -49,8 +24,6 @@ import (
 	"time"
 )
 
-// rangedTestPayload builds a deterministic payload where each byte is its
-// index mod 251.
 func rangedTestPayload(size int) []byte {
 	b := make([]byte, size)
 	for i := range b {
@@ -82,18 +55,11 @@ func rangedTestServer(t *testing.T, full []byte) (*httptest.Server, *[]string) {
 	return srv, &gotRanges
 }
 
-// rangedSeedCommit is the RESOLVED commit the seeded staging records carry.
-// A staging record authorizes a resume only under a PINNED identity, so the
-// seeded state names a resolved commit and states that it is pinned.
+// rangedSeedCommit is the immutable identity used by inheritable staging fixtures.
 const rangedSeedCommit = "1111111111111111111111111111111111111111"
 
-// seedRangedState writes a current-version staging record plus a preallocated staging
-// file whose committed intervals hold the correct payload bytes (and
-// garbage everywhere else), simulating an interrupted previous run.
-//
-// The record carries the resolved, PINNED identity (rangedSeedCommit): a
-// record written under an unpinned identity never authorizes inheriting its
-// bytes, so a resume fixture must state a pinned one.
+// seedRangedState writes a pinned current-format record and preallocated payload:
+// committed intervals contain full's bytes; all other bytes are garbage.
 func seedRangedState(t *testing.T, staging, repo, path string, size int64, ranges []RangeProgress, full []byte) {
 	t.Helper()
 	if err := os.WriteFile(staging, bytes.Repeat([]byte{0xA5}, int(size)), 0o644); err != nil {
@@ -134,7 +100,6 @@ func seedRangedState(t *testing.T, staging, repo, path string, size int64, range
 	}
 }
 
-// assertExactFile compares a file's content with want.
 func assertExactFile(t *testing.T, path string, want []byte) {
 	t.Helper()
 	got, err := os.ReadFile(path)
@@ -146,8 +111,6 @@ func assertExactFile(t *testing.T, path string, want []byte) {
 	}
 }
 
-// containsRange reports whether want appears among the recorded Range request
-// headers.
 func containsRange(ranges []string, want string) bool {
 	for _, r := range ranges {
 		if r == want {
@@ -157,9 +120,6 @@ func containsRange(ranges []string, want string) bool {
 	return false
 }
 
-// 1. Parallel ranges completing out of order must produce exact final
-// bytes, written directly into one staging file with no .part-NN payloads
-// and no assembly copy.
 func TestRangedMultipart_OutOfOrderRangesProduceExactBytes(t *testing.T) {
 	tmpDir := t.TempDir()
 	const total = 20_000
@@ -171,8 +131,7 @@ func TestRangedMultipart_OutOfOrderRangesProduceExactBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Hold range 0's response until every other range has been fully
-	// served, forcing the workers' writes to complete out of order.
+	// Hold range 0 until the server has served every other range.
 	var servedOthers atomic.Int32
 	releaseFirst := make(chan struct{})
 	var releaseOnce sync.Once
@@ -244,14 +203,12 @@ func TestRangedMultipart_OutOfOrderRangesProduceExactBytes(t *testing.T) {
 		t.Errorf("no .part-NN payload files may be created, got %v", files)
 	}
 
-	// The out-of-order invariant really held: range 0 was the last served.
+	// Every other range was served before range 0 was released.
 	if got := servedOthers.Load(); got != nRanges-1 {
 		t.Errorf("servedOthers = %d, want %d (range 0 must be released last)", got, nRanges-1)
 	}
 }
 
-// 2. Every ranged response must carry an exactly matching Content-Range;
-// anything else is rejected before publication.
 func TestRangedMultipart_RejectsBadContentRange(t *testing.T) {
 	const total = 8_000
 	full := rangedTestPayload(total)
@@ -325,7 +282,6 @@ func TestRangedMultipart_RejectsBadContentRange(t *testing.T) {
 				t.Errorf("error must identify the protocol violation, got %q", err.Error())
 			}
 
-			// No publication, and the staging record survives for resume.
 			if _, serr := os.Stat(dst); serr == nil {
 				t.Error("destination was published despite rejected ranged responses")
 			}
@@ -339,9 +295,6 @@ func TestRangedMultipart_RejectsBadContentRange(t *testing.T) {
 	}
 }
 
-// 3. Short and oversized bodies are errors. The oversized case is caught by
-// the header validation (a Content-Length longer than the requested range);
-// the bounded writer is unit-checked below for the residual in-copy case.
 func TestRangedMultipart_RejectsShortAndOversizedBody(t *testing.T) {
 	const total = 8_000
 	full := rangedTestPayload(total)
@@ -367,7 +320,6 @@ func TestRangedMultipart_RejectsShortAndOversizedBody(t *testing.T) {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
 			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
 			w.WriteHeader(http.StatusPartialContent)
-			// Send half the declared body, then abort.
 			w.Write(content[:len(content)/2])
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
@@ -458,13 +410,8 @@ func TestRangedMultipart_RejectsShortAndOversizedBody(t *testing.T) {
 	})
 }
 
-// TestRangedMultipart_RejectsOversizedChunkedBodyAfterRequestedBytes pins the
-// protocol hole where a 206 carries the exact Content-Range but no
-// Content-Length, delivers every requested byte, and then continues with extra
-// chunked bytes. The requested prefix is valid, so the former normalization
-// treated the range as complete and published the destination; the oversize is
-// a bounded-writer protocol violation and must instead fail the range, stay
-// not-Done in the record, and leave the staging state resumable.
+// An overlong chunked 206 must not mark the range Done or publish, even when
+// all requested bytes arrived before the excess.
 func TestRangedMultipart_RejectsOversizedChunkedBodyAfterRequestedBytes(t *testing.T) {
 	const total = 8_000
 	full := rangedTestPayload(total)
@@ -497,8 +444,7 @@ func TestRangedMultipart_RejectsOversizedChunkedBodyAfterRequestedBytes(t *testi
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
 				}
-				// Deliver every requested byte, flushed in small pieces so the
-				// bounded writer accepts exactly wantLen bytes...
+				// Flush all requested bytes before sending the oversized suffix.
 				for i := 0; i < len(full); i += 512 {
 					j := i + 512
 					if j > len(full) {
@@ -512,7 +458,6 @@ func TestRangedMultipart_RejectsOversizedChunkedBodyAfterRequestedBytes(t *testi
 					}
 					time.Sleep(200 * time.Microsecond)
 				}
-				// ...and then send bytes past the assigned range.
 				time.Sleep(20 * time.Millisecond)
 				_, _ = w.Write(bytes.Repeat([]byte{0xEE}, 4096))
 				if f, ok := w.(http.Flusher); ok {
@@ -552,8 +497,6 @@ func TestRangedMultipart_RejectsOversizedChunkedBodyAfterRequestedBytes(t *testi
 	}
 }
 
-// 5. A restart resumes only the missing/uncommitted bytes: no committed
-// interval is ever re-requested.
 func TestRangedMultipart_RestartResumesOnlyMissingBytes(t *testing.T) {
 	tmpDir := t.TempDir()
 	const total = 12_000
@@ -565,8 +508,6 @@ func TestRangedMultipart_RestartResumesOnlyMissingBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Simulate an interrupted previous run with a 3-range layout:
-	// range 0 fully done, range 1 half committed, range 2 untouched.
 	ranges := []RangeProgress{
 		{Start: 0, End: 3999, Committed: 4000, Done: true},
 		{Start: 4000, End: 7999, Committed: 2000},
@@ -611,9 +552,7 @@ func TestRangedMultipart_RestartResumesOnlyMissingBytes(t *testing.T) {
 	}
 }
 
-// 6. A preallocated staging file at the full logical size with missing
-// ranges must never look complete: the length is not evidence, only the
-// committed ranges are.
+// Preallocated file length is not evidence that all ranges are complete.
 func TestRangedMultipart_PreallocatedNeverLooksComplete(t *testing.T) {
 	t.Run("full-size staging with uncommitted ranges is refetched", func(t *testing.T) {
 		tmpDir := t.TempDir()
@@ -644,8 +583,6 @@ func TestRangedMultipart_PreallocatedNeverLooksComplete(t *testing.T) {
 			t.Fatalf("downloadMultipart: %v", err)
 		}
 
-		// The missing ranges were fetched even though the staging file
-		// already reported the full logical size.
 		if len(*gotRanges) == 0 {
 			t.Fatal("full-size staging was treated as complete; missing ranges were never fetched")
 		}
@@ -684,9 +621,6 @@ func TestRangedMultipart_PreallocatedNeverLooksComplete(t *testing.T) {
 	})
 }
 
-// 7. Changing Concurrency between runs must not invalidate committed bytes:
-// the persisted range contract stays authoritative and only missing bytes
-// are fetched with whatever worker count is configured.
 func TestRangedMultipart_ConcurrencyChangePreservesCommitted(t *testing.T) {
 	tmpDir := t.TempDir()
 	const total = 16_000
@@ -746,9 +680,8 @@ func TestRangedMultipart_ConcurrencyChangePreservesCommitted(t *testing.T) {
 	}
 }
 
-// fakeHubServer builds a local fake Hub serving one LFS file whose content
-// is `content` (or `corrupt` when non-nil). It returns the server and the
-// canonical SHA-256 of the content.
+// fakeHubServer serves one LFS file, substituting corrupt for ranges after the
+// first when non-nil. It returns the server, content digest and resolved commit.
 func fakeHubServer(t *testing.T, content, corrupt []byte) (*httptest.Server, string, string) {
 	t.Helper()
 	sum := sha256.Sum256(content)
@@ -786,12 +719,10 @@ func fakeHubServer(t *testing.T, content, corrupt []byte) (*httptest.Server, str
 	return srv, sha, "commit123"
 }
 
-// 8. Verify=size on an LFS file performs NO SHA-256 reread: the download
-// publishes the blob via direct ranged writes plus a rename, with zero
-// full-file hash passes.
+// Verify=size on LFS performs no normal full-file hash reread.
 func TestDownload_VerifySizeLFSNoSHAReread(t *testing.T) {
 	tmpDir := t.TempDir()
-	const size = 64 * 1024 // above the 1KB test threshold → multipart
+	const size = 64 * 1024
 	full := rangedTestPayload(size)
 	srv, sha, _ := fakeHubServer(t, full, nil)
 
@@ -817,7 +748,6 @@ func TestDownload_VerifySizeLFSNoSHAReread(t *testing.T) {
 		t.Errorf("Verify=size performed %d full-file hash passes; want 0", got)
 	}
 
-	// The blob was published directly from the staging file.
 	blob := filepath.Join(cacheDir, "hub", "models--o--r", "blobs", sha)
 	assertExactFile(t, blob, full)
 	if _, err := os.Stat(filepath.Join(cacheDir, "hub", "models--o--r", "blobs", "tmp-"+sha)); err == nil {
@@ -829,10 +759,8 @@ func TestDownload_VerifySizeLFSNoSHAReread(t *testing.T) {
 	}
 }
 
-// 9. Verify=sha256 detects corruption in a parallel transfer with exactly
-// ONE final full-file pass, and never publishes corrupt bytes: a mismatch
-// leaves the blob unpublished and removes the untrustworthy staging data
-// (explicit redownload policy).
+// Strict verification rejects corrupted parallel-transfer content with one
+// full-file pass.
 func TestDownload_VerifySHA256DetectsCorruption(t *testing.T) {
 	tmpDir := t.TempDir()
 	const size = 64 * 1024
@@ -877,10 +805,7 @@ func TestDownload_VerifySHA256DetectsCorruption(t *testing.T) {
 	}
 }
 
-// 10. A fresh Concurrency==1 strict transfer feeds the SHA-256 while the
-// bytes are written: zero additional full-file passes. A resumed sequential
-// transfer cannot restore the hash state and falls back to exactly one
-// final pass.
+// Fresh sequential strict transfers hash on write; resumed ones use one final pass.
 func TestRangedMultipart_SequentialHashOnWrite(t *testing.T) {
 	const total = 16_000
 	full := rangedTestPayload(total)
@@ -924,8 +849,7 @@ func TestRangedMultipart_SequentialHashOnWrite(t *testing.T) {
 		// run.
 		ranges := []RangeProgress{{Start: 0, End: total - 1, Committed: total / 2}}
 		seedRangedState(t, staging, "o/r", "seq-resume.bin", total, ranges, full)
-		// The item is an LFS blob with a digest, so the record must carry the
-		// same digest: a one-sided SHA is no longer resumable (S5).
+		// Match the record's digest identity to the plan.
 		seeded, err := readStagingMeta(staging + ".meta")
 		if err != nil {
 			t.Fatal(err)
@@ -955,27 +879,16 @@ func TestRangedMultipart_SequentialHashOnWrite(t *testing.T) {
 	})
 }
 
-// 12. Two concurrent claims for the same staging file: only one writer owns
-// it. The in-process registry serializes the two downloads; the loser
-// observes the winner's completed publish and skips with
-// errBlobAlreadyComplete — the server sees every range exactly once.
 func TestRangedMultipart_TwoClaimsOneWriter(t *testing.T) {
 	tmpDir := t.TempDir()
 	const total = 12_000
 	full := rangedTestPayload(total)
 	sum := sha256.Sum256(full)
-	// A content-addressed publish target is the one destination whose
-	// existence proves completion, so the loser of the claim can back off as
-	// errBlobAlreadyComplete when the winner publishes. An arbitrary
-	// destination is deliberately not completion proof (the caller's
-	// pre-download skip decision is authoritative there); that behavior is
-	// covered by TestDownload_LegacyExistingDestinationIsNotCompletion.
+	// Only the content-addressed target is completion proof for the loser.
 	blob := filepath.Join(tmpDir, "blobs", hex.EncodeToString(sum[:]))
 	if err := os.MkdirAll(filepath.Dir(blob), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Both claimants race the SAME blob key, so each acquires its own hold of
-	// the destination domain: the in-process slot serializes them.
 	key := blob
 	lockSrc := filepath.Join(filepath.Dir(blob), "tmp-"+filepath.Base(blob))
 
@@ -999,7 +912,7 @@ func TestRangedMultipart_TwoClaimsOneWriter(t *testing.T) {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
 		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
 		w.WriteHeader(http.StatusPartialContent)
-		// Serve slowly enough that both claimants get to race the claim.
+		// Slow the transfer to give the second acquisition a chance to contend.
 		const chunk = 512
 		for i := 0; i < len(content); i += chunk {
 			j := i + chunk
@@ -1030,8 +943,7 @@ func TestRangedMultipart_TwoClaimsOneWriter(t *testing.T) {
 	done := make(chan struct{})
 	results := make([]error, 2)
 	go func() { _, results[0] = run(); close(done) }()
-	// Give the first claimant a moment to win the claim, then race the
-	// second; it must not duplicate any write.
+	// Stagger the second acquisition; it must not duplicate range writes.
 	time.Sleep(20 * time.Millisecond)
 	_, results[1] = run()
 	<-done
@@ -1053,9 +965,7 @@ func TestRangedMultipart_TwoClaimsOneWriter(t *testing.T) {
 	}
 }
 
-// Cross-process half of the claim exclusion: a staging record owned by a
-// live FOREIGN process that holds the OS ownership lock means "owned" — the
-// claimant must not touch the staging.
+// An unfenced foreign-owner record is refused without modifying its staging payload.
 func TestRangedMultipart_ClaimSeesLiveForeignOwner(t *testing.T) {
 	tmpDir := t.TempDir()
 	const total = 8_000
@@ -1069,8 +979,7 @@ func TestRangedMultipart_ClaimSeesLiveForeignOwner(t *testing.T) {
 	if err := os.WriteFile(staging, full[:1000], 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// A live foreign PID: the parent of this test process is alive for the
-	// duration of the test.
+	// Use an available live foreign PID for the unfenced record.
 	foreign := os.Getppid()
 	if foreign == os.Getpid() || !isProcessAlive(foreign) {
 		t.Skip("no live foreign PID available for this test process")
@@ -1087,8 +996,7 @@ func TestRangedMultipart_ClaimSeesLiveForeignOwner(t *testing.T) {
 	if err := writeStagingMeta(staging+".meta", &meta); err != nil {
 		t.Fatal(err)
 	}
-	// The record is UNFENCED and its owner is a live foreign process, so the
-	// claim refuses it: no free lock may turn it into a take-over.
+	// An unfenced record of a live owner remains unproven and is refused.
 
 	// The size HEAD must succeed for the download to reach the claim; the
 	// body requests must never be reached (the claim refuses first).
@@ -1107,50 +1015,11 @@ func TestRangedMultipart_ClaimSeesLiveForeignOwner(t *testing.T) {
 	if !errors.Is(err, errBlobIncompleteOwned) {
 		t.Fatalf("error = %v, want errBlobIncompleteOwned for a live foreign owner", err)
 	}
-	// The foreign owner's staging data was left untouched.
 	assertExactFile(t, staging, full[:1000])
 }
 
-// The claim take-over path: a record from a dead owner with a valid
-// versioned range layout is resumed, not discarded.
-func TestRangedMultipart_ClaimTakesOverDeadOwner(t *testing.T) {
-	tmpDir := t.TempDir()
-	const total = 8_000
-	full := rangedTestPayload(total)
-
-	dst := filepath.Join(tmpDir, "dead.bin")
-	staging := dst + ".incomplete"
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	ranges := []RangeProgress{
-		{Start: 0, End: 3999, Committed: 4000, Done: true},
-		{Start: 4000, End: 7999},
-	}
-	seedRangedState(t, staging, "o/r", "dead.bin", total, ranges, full)
-	// seedRangedState writes our own PID and process instance token — the
-	// take-over case this test wants: a record from an earlier run of this
-	// process has no live writer, so the claim takes it over and resumes the
-	// committed range.
-
-	srv, gotRanges := rangedTestServer(t, full)
-	it := PlanItem{RelativePath: "dead.bin", URL: srv.URL + "/dead.bin", Size: total, AcceptRanges: true}
-	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
-
-	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}), func(ProgressEvent) {}); err != nil {
-		t.Fatalf("downloadMultipart: %v", err)
-	}
-	assertExactFile(t, dst, full)
-	// Only the missing range was fetched.
-	if len(*gotRanges) != 1 || (*gotRanges)[0] != "bytes=4000-7999" {
-		t.Errorf("resume after take-over must fetch only the missing range, got %v", *gotRanges)
-	}
-}
-
-// The claimant's side of the unproven-record rule: an UNFENCED record whose
-// live foreign owner cannot be proven dead is refused and preserved, even when
-// its payload looks stale. Record age is not an ownership signal; only the
-// destination domain plus same-host process evidence can decide.
+// Foreign unfenced records remain protected without same-host death proof,
+// regardless of age; a free new domain lock does not prove their owner gone.
 func TestRangedMultipart_UnfencedRecordRefusal(t *testing.T) {
 	foreign := os.Getppid()
 	if foreign == os.Getpid() || !isProcessAlive(foreign) {
@@ -1158,9 +1027,7 @@ func TestRangedMultipart_UnfencedRecordRefusal(t *testing.T) {
 	}
 	const total = 8_000
 
-	// seedForeignOwned stages a payload preallocated to the full size
-	// with a valid committed prefix [0, committed) and a versioned record
-	// owned by the live foreign PID.
+	// Seed a full-sized payload with a valid committed prefix and an unfenced foreign-PID record.
 	seedForeignOwned := func(t *testing.T, staging string, full []byte, committed int64) {
 		t.Helper()
 		if err := os.WriteFile(staging, bytes.Repeat([]byte{0xA5}, len(full)), 0o644); err != nil {
@@ -1207,14 +1074,13 @@ func TestRangedMultipart_UnfencedRecordRefusal(t *testing.T) {
 			t.Fatal(err)
 		}
 		seedForeignOwned(t, staging, full, 4000)
-		staleMtime(t, staging) // payload deliberately older than any age-based model
+		staleMtime(t, staging) // Old mtime must not authorize takeover.
 		before, err := os.ReadFile(staging)
 		if err != nil {
 			t.Fatal(err)
 		}
-		// The record is UNFENCED and its owner cannot be proven dead, so the
-		// claim refuses it: the record's identity rule protects it, independently
-		// of any free lock and of its age.
+		// A foreign unfenced record without owner-death proof is preserved despite
+		// its age and a free domain lock.
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodHead {
@@ -1269,8 +1135,7 @@ func TestRangedMultipart_UnfencedRecordRefusal(t *testing.T) {
 	})
 }
 
-// parseContentRange unit coverage, including the "/*" unsatisfied-total form
-// which matches the range but cannot confirm the total.
+// parseContentRange covers unknown totals (bytes start-end/*), which cannot confirm the expected size.
 func TestParseContentRange(t *testing.T) {
 	cases := []struct {
 		in       string
@@ -1310,13 +1175,8 @@ func TestParseContentRange(t *testing.T) {
 	}
 }
 
-// TestRangedMultipart_StrictHashSurvivesOverflowRetry covers M2: an oversized
-// chunked body on the first attempt is a protocol violation that does not
-// advance the durable offset, so the retry re-requests the same range. The
-// sequential hash-on-write state from the first attempt must be invalidated —
-// otherwise the retry feeds the same bytes into the hash a second time and no
-// valid retry can ever verify. The fallback is exactly one final full-file pass,
-// and progress must not count the overflowing attempt's bytes twice.
+// An overflowing response must not commit its range. A valid retry of the same
+// bytes invalidates hash-on-write and uses one final proof without double-counting progress.
 func TestRangedMultipart_StrictHashSurvivesOverflowRetry(t *testing.T) {
 	const total = 8_000
 	full := rangedTestPayload(total)
@@ -1367,8 +1227,7 @@ func TestRangedMultipart_StrictHashSurvivesOverflowRetry(t *testing.T) {
 			}
 			return
 		}
-		// Valid retry: the same exact range, served slowly enough that the
-		// progress ticker observes the bytes during the attempt.
+		// Serve the valid retry slowly to give the progress ticker time to sample it.
 		w.Header().Set("Content-Length", strconv.Itoa(len(full)))
 		w.WriteHeader(http.StatusPartialContent)
 		if f, ok := w.(http.Flusher); ok {

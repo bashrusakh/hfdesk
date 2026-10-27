@@ -5,11 +5,9 @@
 
 package hfdownloader
 
-// Platforms without a stdlib exclusive-file-lock primitive cannot safely
-// mutate shared ranged staging state. Claim/cleanup fail closed.
+// Without an OS ownership lock, destination acquisition and cleanup fail closed.
 
-// stagingOSLockAvailable reports that this platform implements the OS
-// ownership lock.
+// stagingOSLockAvailable is false: this platform has no ownership-lock implementation.
 const stagingOSLockAvailable = false
 
 // stagingOSLockHandle is never created on this platform.

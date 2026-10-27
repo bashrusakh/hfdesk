@@ -3,11 +3,6 @@
 
 package hfdownloader
 
-// Ownership-identity and claim-aware-cleanup coverage for the issue #140
-// correction set. The cleanup tests reproduce blocker 3a: a cancelled job must
-// not remove a staging payload/meta pair still owned by a live foreign claim,
-// while its own (same process instance) staging remains removable.
-
 import (
 	"context"
 	"fmt"
@@ -25,9 +20,7 @@ func writeRawStagingMeta(t *testing.T, metaPath, raw string) {
 	}
 }
 
-// TestRemoveStagingArtifacts_MetaFirstFailurePreservesPayload pins S3's
-// ordering consequence: if the record cannot be removed, the payload must be
-// preserved rather than left orphaned under a record that claims its bytes.
+// If the record cannot be removed, cleanup must preserve the payload it claims.
 func TestRemoveStagingArtifacts_MetaFirstFailurePreservesPayload(t *testing.T) {
 	tmpDir := t.TempDir()
 	staging := filepath.Join(tmpDir, "x.incomplete")
@@ -47,7 +40,6 @@ func TestRemoveStagingArtifacts_MetaFirstFailurePreservesPayload(t *testing.T) {
 	if _, err := os.Stat(staging); err != nil {
 		t.Fatalf("payload was removed after the record removal failed: %v", err)
 	}
-	// Once the record can be removed, the payload follows.
 	if err := os.RemoveAll(metaPath); err != nil {
 		t.Fatal(err)
 	}
@@ -156,9 +148,7 @@ func TestCleanupJobPartFiles_RespectsLiveClaim(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// A live in-process writer holds the destination's ownership domain.
-		// The cleanup's own domain acquisition must report that live owner
-		// instead of removing the pair.
+		// A held in-process destination domain must prevent cleanup of this pair.
 		key, keyed := cacheDstDomainKey(dst)
 		if !keyed {
 			t.Fatalf("the cache destination %s has no ownership-domain key", dst)
@@ -177,7 +167,6 @@ func TestCleanupJobPartFiles_RespectsLiveClaim(t *testing.T) {
 			}
 		}
 
-		// Once the domain is released, the same fixtures are removable.
 		owner.release()
 		if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{dst}); err != nil {
 			t.Fatalf("CleanupJobPartFiles after release: %v", err)
@@ -190,11 +179,8 @@ func TestCleanupJobPartFiles_RespectsLiveClaim(t *testing.T) {
 	})
 }
 
-// TestCheckBlob_OwnershipIdentity pins the CheckBlob consumer of the ownership
-// classification. A lock-fenced record on a platform with the OS lock is
-// authoritative: a free lock means the current-version owner is gone even when
-// the record carries our live PID. Unfenced records stay "downloading" unless
-// same-host process death can be proven.
+// CheckBlob treats a free lock as owner-death proof only for fenced records;
+// unfenced records require same-host process-death evidence.
 func TestCheckBlob_OwnershipIdentity(t *testing.T) {
 	tmpDir := t.TempDir()
 	cache := NewHFCache(tmpDir)
@@ -259,7 +245,6 @@ func TestCheckBlob_OwnershipIdentity(t *testing.T) {
 	}
 }
 
-// TestStagingMetaResumableIdentity pins S5's all-or-nothing identity rules.
 func TestStagingMetaResumableIdentity(t *testing.T) {
 	const size = int64(1000)
 	shaA := strings.Repeat("a", 64)

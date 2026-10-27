@@ -5,16 +5,13 @@
 
 package hfdownloader
 
-// Windows probe handle: the shared-access open stands for a read-only status
-// probe, the exclusive-share (deny-all) open stands for a real writer. Both
-// are real handles with the same share modes the production code uses, so the
-// test exercises the real Windows sharing semantics.
+// Use production-equivalent Windows handles: shared read/write access for a
+// status probe and deny-all sharing for the lifetime writer.
 
 import (
 	"syscall"
 )
 
-// openStagingProbeHandle opens the lock file in the requested mode.
 func openStagingProbeHandle(path string, mode stagingProbeHoldMode) (stagingProbeHandle, error) {
 	p, err := syscall.UTF16PtrFromString(path)
 	if err != nil {

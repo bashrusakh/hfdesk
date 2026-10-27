@@ -3,15 +3,8 @@
 
 package hfdownloader
 
-// Focused regression coverage for the ONE-destination-domain ownership model
-// (issue #140 / PR #151, P1 simplification):
-//
-//   - the multipart claim refuses to run without a held domain that covers its
-//     staging path (no production-accessible fallback);
-//   - a cache transfer holds ONLY the destination domain lock
-//     (blobs/tmp-<sha>.lock): the obsolete <staging>.lock fence is never taken;
-//   - CheckBlob interprets the destination domain lock, not the old staging
-//     lock, as the live-writer signal.
+// Covers fail-closed claims and confirms the destination lock—not the obsolete
+// staging lock—defines ownership.
 
 import (
 	"bytes"
@@ -26,10 +19,8 @@ import (
 	"time"
 )
 
-// TestClaimStagingRequiresCoveringDomain pins the claim's fail-closed
-// precondition: the claim does not take a lock of its own any more, so it must
-// be handed the destination domain that fences its staging path. A nil,
-// released or non-covering domain mutates nothing.
+// A nil, released, or non-covering destination domain must refuse the claim
+// without changing its record or payload; the claim acquires no domain itself.
 func TestClaimStagingRequiresCoveringDomain(t *testing.T) {
 	dir := t.TempDir()
 	staging := filepath.Join(dir, "guard.bin.incomplete")
@@ -65,18 +56,15 @@ func TestClaimStagingRequiresCoveringDomain(t *testing.T) {
 	if err := claim(nil); err == nil {
 		t.Fatal("claim without a destination ownership domain succeeded")
 	}
-	// A held domain of ANOTHER destination does not cover this staging path.
 	if err := claim(acquireTestDomain(t, filepath.Join(dir, "other.bin"))); err == nil {
 		t.Fatal("claim with a non-covering destination ownership domain succeeded")
 	}
-	// A released domain fences nothing.
 	released := acquireTestStagingDomain(t, staging)
 	released.release()
 	if err := claim(released); err == nil {
 		t.Fatal("claim with a released destination ownership domain succeeded")
 	}
 
-	// None of the refusals may have mutated the pair.
 	got, rerr := os.ReadFile(staging)
 	if rerr != nil || !bytes.Equal(got, payload) {
 		t.Errorf("the refused claims changed the staging payload: %q, %v", got, rerr)
@@ -90,10 +78,8 @@ func TestClaimStagingRequiresCoveringDomain(t *testing.T) {
 	}
 }
 
-// TestCacheTransferHoldsOnlyTheDestinationDomainLock pins the single fence of
-// a cache item: while the multipart transfer runs, the destination domain lock
-// blobs/tmp-<sha>.lock is held and the obsolete blobs/<sha>.incomplete.lock is
-// never created. After the publish only the persistent domain lock remains.
+// The transfer holds blobs/tmp-<sha>.lock, never the obsolete
+// blobs/<sha>.incomplete.lock; only the domain lock persists after publication.
 func TestCacheTransferHoldsOnlyTheDestinationDomainLock(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -161,11 +147,9 @@ func TestCacheTransferHoldsOnlyTheDestinationDomainLock(t *testing.T) {
 		t.Fatal("the transfer never started")
 	}
 
-	// The destination domain lock is held for the whole transfer.
 	if busy, berr := stagingOwnershipBusy(domainDst); berr != nil || !busy {
 		t.Errorf("destination domain lock while transferring = (%v, %v), want a held lock", busy, berr)
 	}
-	// The obsolete second fence is never created.
 	obsoleteLock := stagingOwnershipLockPath(repo.IncompletePath(sha))
 	if _, serr := os.Stat(obsoleteLock); !os.IsNotExist(serr) {
 		t.Errorf("the obsolete staging lock %s exists; the claim must not take a second fence (stat err=%v)",
@@ -183,8 +167,6 @@ func TestCacheTransferHoldsOnlyTheDestinationDomainLock(t *testing.T) {
 	}
 	assertExactFile(t, repo.BlobPath(sha), full)
 
-	// A successful publish leaves the destination and the persistent domain
-	// lock; the obsolete staging lock still does not exist.
 	blobsDir := repo.BlobsDir()
 	names := dirEntryNames(t, blobsDir)
 	want := map[string]bool{
@@ -201,10 +183,8 @@ func TestCacheTransferHoldsOnlyTheDestinationDomainLock(t *testing.T) {
 	}
 }
 
-// TestCheckBlobProbesTheDestinationDomain is the discriminating control for
-// the status query: the live-writer signal is the destination domain lock
-// blobs/tmp-<sha>.lock. Holding the OLD <staging>.lock proves nothing and must
-// not report a live writer; holding the domain does.
+// Holding only <staging>.lock must not report a writer; holding
+// blobs/tmp-<sha>.lock must report one.
 func TestCheckBlobProbesTheDestinationDomain(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -241,12 +221,11 @@ func TestCheckBlobProbesTheDestinationDomain(t *testing.T) {
 	if cerr != nil || status == BlobDownloading {
 		t.Fatalf("CheckBlob while only the obsolete staging lock is held = %v (err=%v), want not-downloading", status, cerr)
 	}
-	// A lock-fenced record plus a free DOMAIN is stale and resumable.
+	// A fenced record with a free destination domain is reported stale.
 	if status != BlobStale {
 		t.Errorf("status with a free destination domain = %v, want BlobStale", status)
 	}
 
-	// The destination domain is the signal: holding it reports a live writer.
 	domain, err := acquireStagingOwnershipLock(mustDomainDst(t, repo, sha))
 	if err != nil {
 		t.Fatal(err)
@@ -255,5 +234,9 @@ func TestCheckBlobProbesTheDestinationDomain(t *testing.T) {
 	domain.release()
 	if cerr != nil || status != BlobDownloading {
 		t.Fatalf("CheckBlob while the destination domain is held = %v (err=%v), want BlobDownloading", status, cerr)
+	}
+	status, _, cerr = repo.CheckBlob(sha)
+	if cerr != nil || status != BlobStale {
+		t.Fatalf("CheckBlob after releasing the destination domain = %v (err=%v), want BlobStale", status, cerr)
 	}
 }

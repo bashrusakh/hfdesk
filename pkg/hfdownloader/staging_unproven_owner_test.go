@@ -3,27 +3,8 @@
 
 package hfdownloader
 
-// Regression coverage for the operator-visible classification of an UNPROVEN
-// staging record (issue #140 / PR #151, correction package B).
-//
-// A blob-keyed staging record that was written without the lifetime
-// ownership lock fence (LockFenced=false, which no released version ever
-// wrote) or that cannot be read/parsed is refused by the claim. That refusal
-// is the owner-decided rule and it does not change: the record is preserved
-// and never taken over, because no age-based takeover and no takeover
-// without proof of same-host death is allowed.
-//
-// What was wrong is the REPORTING: the refusal surfaced through the same
-// sentinel and the same message as a PROVEN live owner, so the operator was
-// told "blob <sha> is being downloaded by another process; try again later"
-// for a state where no live writer was proven to exist. The two conditions
-// are now distinguishable: the unproven record carries its own sentinel
-// (ErrStagingOwnershipUnproven) and keeps its own message, which says what
-// the state is and names the staging pair the operator has to remove.
-//
-// The cases drive the real Download path, so they exercise the product
-// routing and the operator-visible error, and they are deterministic: the
-// seeded record is refused before any network transfer.
+// Covers the operator-visible distinction between a proven live owner and an
+// unproven record. Unproven state is preserved and rejected before transfer.
 
 import (
 	"context"
@@ -36,19 +17,6 @@ import (
 	"time"
 )
 
-// TestUnprovenStagingRecordIsNotReportedAsLiveOwner pins the operator-visible
-// distinction between the two refusals of a staging record:
-//
-//   - a PROVEN live owner keeps "being downloaded by another process; try
-//     again later" (the condition is transient, the owner may publish at any
-//     moment);
-//   - an UNPROVEN record (legacy/unfenced, or unreadable) says that its
-//     owner can be proven neither alive nor dead, that the partial is
-//     preserved, and that removing the staging pair is the recovery.
-//
-// It also pins that the unproven record's artifacts are preserved: the
-// staged payload and its record are byte-identical afterwards, nothing is
-// published, and no bytes are transferred.
 func TestUnprovenStagingRecordIsNotReportedAsLiveOwner(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
@@ -56,7 +24,6 @@ func TestUnprovenStagingRecordIsNotReportedAsLiveOwner(t *testing.T) {
 
 	cases := []struct {
 		name string
-		// seed writes the staging record of the case.
 		seed func(t *testing.T, metaPath string)
 	}{
 		{
@@ -141,9 +108,7 @@ func TestUnprovenStagingRecordIsNotReportedAsLiveOwner(t *testing.T) {
 			if dlErr == nil {
 				t.Fatalf("Download of an unproven staging record reported success; skips=%v", skips)
 			}
-			// The unproven refusal is distinguishable from the proven live
-			// owner: it carries its own sentinel, and it does NOT claim a
-			// proven live owner.
+			// Unproven ownership has its own sentinel and must not claim a proven live writer.
 			if !errors.Is(dlErr, ErrStagingOwnershipUnproven) {
 				t.Errorf("Download error = %v, want an unproven-ownership error", dlErr)
 			}
@@ -162,16 +127,13 @@ func TestUnprovenStagingRecordIsNotReportedAsLiveOwner(t *testing.T) {
 			if !strings.Contains(msg, staging) || !strings.Contains(msg, metaPath) {
 				t.Errorf("Download error = %q, want the staging pair %s / %s named", msg, staging, metaPath)
 			}
-			// Nothing else is exposed: the item's URL is not part of the
-			// message.
+			// The message must not disclose the item's endpoint URL.
 			if strings.Contains(msg, srv.URL) {
 				t.Errorf("Download error = %q, want no endpoint in the message", msg)
 			}
 			if len(skips) != 0 {
 				t.Errorf("the job recorded a successful skip although the record's owner is unproven: %v", skips)
 			}
-			// The artifacts are preserved: the refusal never takes the
-			// record over and never removes the partial.
 			got, rerr := os.ReadFile(staging)
 			if rerr != nil || string(got) != string(partial) {
 				t.Errorf("the unproven record's payload did not survive: %q, %v", got, rerr)
@@ -183,7 +145,6 @@ func TestUnprovenStagingRecordIsNotReportedAsLiveOwner(t *testing.T) {
 			if string(afterMeta) != string(beforeMeta) {
 				t.Errorf("the unproven record was rewritten:\nbefore %s\nafter  %s", beforeMeta, afterMeta)
 			}
-			// Nothing was published, and no bytes were transferred.
 			if _, serr := os.Stat(repo.BlobPath(sha)); !os.IsNotExist(serr) {
 				t.Errorf("a blob was published although the record's owner is unproven, stat err=%v", serr)
 			}
@@ -194,9 +155,7 @@ func TestUnprovenStagingRecordIsNotReportedAsLiveOwner(t *testing.T) {
 	}
 }
 
-// TestUnprovenAndLiveOwnerErrorsDiffer pins that the two refusals of a
-// staging record are told apart by their sentinel AND by their message, so
-// a caller can react to them differently.
+// Live-owner and unproven-state errors need distinct sentinels and recovery messages.
 func TestUnprovenAndLiveOwnerErrorsDiffer(t *testing.T) {
 	sha := strings.Repeat("a", 64)
 	staging := "/cache/hub/models--owner--model/blobs/" + sha + ".incomplete"
@@ -209,7 +168,6 @@ func TestUnprovenAndLiveOwnerErrorsDiffer(t *testing.T) {
 	if live.Error() == unproven.Error() {
 		t.Fatalf("the two refusals share one message: %q", live.Error())
 	}
-	// The live owner is transient: the operator is told to retry later.
 	if !errors.Is(live, errBlobOwnedByLiveWriter) {
 		t.Errorf("the live-owner error lost its sentinel: %v", live)
 	}
@@ -220,8 +178,7 @@ func TestUnprovenAndLiveOwnerErrorsDiffer(t *testing.T) {
 	if errors.Is(live, ErrStagingOwnershipUnproven) {
 		t.Errorf("the live-owner error carries the unproven sentinel: %v", live)
 	}
-	// The unproven record is not transient: the operator has to remove the
-	// staging pair.
+	// Unproven-state diagnostics name the staging pair for documented manual recovery.
 	if !errors.Is(unproven, ErrStagingOwnershipUnproven) {
 		t.Errorf("the unproven error lost its sentinel: %v", unproven)
 	}
@@ -238,23 +195,14 @@ func TestUnprovenAndLiveOwnerErrorsDiffer(t *testing.T) {
 	if !strings.Contains(unproven.Error(), staging) || !strings.Contains(unproven.Error(), metaPath) {
 		t.Errorf("the unproven message does not name the staging pair: %q", unproven.Error())
 	}
-	// Both refusals keep the shared "the staging file is not available to
-	// this writer" classification, so the callers that key on it keep
-	// working; only the unproven case carries the new sentinel.
+	// The unproven error also preserves the shared errBlobIncompleteOwned classification.
 	if !errors.Is(unproven, errBlobIncompleteOwned) {
 		t.Errorf("the unproven error lost the shared staging-unavailable classification: %v", unproven)
 	}
 }
 
-// TestUnprovenStagingReadErrorKeepsSentinelAndCause covers a record that
-// EXISTS but cannot be read for a reason other than not-exist, such as the
-// record path being a directory.
-//
-// The state is unproven for the same reason a malformed record is: the read
-// failure proves neither a live owner nor a dead one, so the partial is
-// preserved, the operator-visible message names the staging pair, and the
-// caller can still distinguish the state with ErrStagingOwnershipUnproven.
-// The underlying filesystem error stays inspectable as well.
+// An existing unreadable record is unproven, not absent: preserve its partial
+// and recovery diagnostic while retaining the filesystem cause for errors.As.
 func TestUnprovenStagingReadErrorKeepsSentinelAndCause(t *testing.T) {
 	staging := filepath.Join(t.TempDir(), "blob.incomplete")
 	metaPath := staging + ".meta"
@@ -283,7 +231,6 @@ func TestUnprovenStagingReadErrorKeepsSentinelAndCause(t *testing.T) {
 	if !strings.Contains(msg, staging) || !strings.Contains(msg, metaPath) {
 		t.Errorf("error = %q, want the staging pair %s / %s named", msg, staging, metaPath)
 	}
-	// The read failure is preserved, not replaced by the classification.
 	var pathErr *fs.PathError
 	if !errors.As(err, &pathErr) {
 		t.Errorf("error = %v, want the underlying filesystem error to stay inspectable", err)

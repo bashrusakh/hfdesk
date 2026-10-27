@@ -3,24 +3,9 @@
 
 package hfdownloader
 
-// Opt-in local-I/O benchmark for the issue #140 finalization path (run with
-// `go test -bench BenchmarkRangedFinalization ./pkg/hfdownloader/`). It is
-// deliberately NOT part of the ordinary CI test run: it streams a large
-// synthetic payload through a local httptest server and records the
-// network-complete → file-done wall time plus the staging bytes written
-// (including the transfer landing on disk) and full-file hash bytes read,
-// via the stagingWriteBytes / hashPassBytes observability counters.
-//
-// Expected shapes (S = file size):
-//
-//   - pre-#140 path: ≈3×S post-network local I/O (assembly copy writes S,
-//     the unconditional SHA reread reads S, on top of the transfer);
-//   - new path, Verify=size: stagingWriteBytes is ≈1×S (the transfer itself),
-//     extraLocalWrites is ≈0×S (no assembly copy), hashReadBytes is 0;
-//   - new path, Verify=sha256: ≈1×S hash read, no assembly write.
-//
-// The synthetic file size defaults to 1 GiB; set BENCHSIZE (bytes) to scale
-// it down on slow disks — the ratios are linear in S.
+// Opt-in local-I/O finalization benchmark:
+// go test -run '^$' -bench BenchmarkRangedFinalization ./pkg/hfdownloader/
+// BENCHSIZE sets payload bytes (default 1 GiB).
 
 import (
 	"context"
@@ -50,8 +35,6 @@ func newBenchHash() *benchHash               { return &benchHash{h: sha256.New()
 func benchHashWrite(bh *benchHash, p []byte) { _, _ = bh.h.Write(p) }
 func benchHashSum(bh *benchHash) string      { return hex.EncodeToString(bh.h.Sum(nil)) }
 
-// benchFileSize is the synthetic payload size: 1 GiB unless overridden via
-// the BENCHSIZE environment variable (bytes).
 func benchFileSize() int64 {
 	if v := os.Getenv("BENCHSIZE"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
@@ -61,10 +44,8 @@ func benchFileSize() int64 {
 	return 1 << 30
 }
 
-// benchPatternReader serves a deterministic repeating pattern without
-// materializing the whole payload in memory. off is the pattern offset of the
-// first byte, so a ranged response starts at the correct position within the
-// repeated block instead of restarting the block at every range.
+// benchPatternReader repeats block without materializing the payload. off
+// preserves the pattern position across independently requested ranges.
 type benchPatternReader struct {
 	remain int64
 	block  []byte
@@ -93,31 +74,18 @@ func (r *benchPatternReader) Read(p []byte) (int, error) {
 	return int(n), nil
 }
 
-// BenchmarkRangedFinalization measures the local finalization cost after
-// the network transfer completes, for the two verification modes that
-// matter. Reported metrics per iteration:
-//
-//   - stagingWriteBytes×S: total payload bytes written into the staging file,
-//     including the transfer itself landing on disk (a fresh transfer is
-//     ≈1×S, so this metric alone is not "extra" local I/O);
-//   - extraLocalWrites×S: stagingWriteBytes minus one file size, i.e. the
-//     extra local payload writes after the network transfer (assembly-style
-//     copies would show up here; the rename-only path is ≈0×S);
-//   - hashReadBytes×S: full-file SHA-256 bytes read (Verify=size ≈0×S,
-//     Verify=sha256 ≈1×S);
-//   - finalizeMs: network-complete → file-published wall time: from the last
-//     transferred byte (the file_finalizing signal) through the optional
-//     strict hash to the publish rename, stopping at that rename. It excludes
-//     caller-level work after downloadMultipart returns (cache snapshot/friendly
-//     link creation, the manifest, and other job finalization). This is the
-//     issue #140 finalization metric; it is reported alongside the byte counters
-//     so a slow local step is attributable rather than hidden in totalUs;
-//   - totalUs: the whole download's wall time (network + finalization on a
-//     loopback server, so the local I/O share dominates for large S).
+// BenchmarkRangedFinalization compares size and sha256 completion on loopback.
+// Per-iteration metrics (S is payload size):
+//   - stagingWriteBytes×S: all staging payload writes divided by S, including transfer.
+//   - extraLocalWrites×S: max(staging writes - S, 0) / S, not total local I/O.
+//   - hashReadBytes×S: counted full-file SHA reads / S (size: 0, sha256: 1 here).
+//   - finalizeMs: file_finalizing to successful publication, including optional
+//     proof and publication cleanup, excluding caller cache links and manifest.
+//   - totalUs: timed domain setup and downloadMultipart, including loopback transfer
+//     and finalization; not the top-level Download job.
 func BenchmarkRangedFinalization(b *testing.B) {
 	size := benchFileSize()
 
-	// 4 MiB pattern block; the payload is its repetition.
 	block := make([]byte, 4<<20)
 	for i := range block {
 		block[i] = byte(i % 251)
@@ -157,9 +125,6 @@ func BenchmarkRangedFinalization(b *testing.B) {
 	for _, mode := range []string{"size", "sha256"} {
 		b.Run("verify="+mode, func(b *testing.B) {
 			b.SetBytes(size)
-			// For the strict mode the item must be an LFS blob with its
-			// expected digest; compute the pattern's real SHA-256 once so
-			// the single post-range pass succeeds.
 			it := PlanItem{RelativePath: "bench.bin", Size: size, AcceptRanges: true}
 			if mode == "sha256" {
 				h := newBenchHash()

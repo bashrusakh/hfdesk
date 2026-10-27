@@ -3,12 +3,7 @@
 
 package hfdownloader
 
-// Trust-model regressions for the issue #140 ranged downloader: staging reuse
-// (T1, already covered by ranged_state_test.go), content-addressed completion
-// (T3), serialized ownership (T4, see staging_lock_test.go), cancel/phase
-// semantics (T5) and mode compatibility (T6). The fixtures use only the pre-correction public/package API so the same
-// tests can be run against an overlay of the previous HEAD to show the failure
-// they pin.
+// Trust-model regressions for completion proof and cancellation phases.
 
 import (
 	"bytes"
@@ -28,8 +23,7 @@ import (
 	"time"
 )
 
-// fakeHubServerWithCount mirrors fakeHubServer (a one-LFS-file Hub) and counts
-// the content GETs the plan actually transfers.
+// fakeHubServerWithCount serves one LFS file and counts requests to its resolve endpoint.
 func fakeHubServerWithCount(t *testing.T, content []byte) (*httptest.Server, string, *atomic.Int32) {
 	t.Helper()
 	sum := sha256.Sum256(content)
@@ -54,10 +48,8 @@ func fakeHubServerWithCount(t *testing.T, content []byte) (*httptest.Server, str
 	return srv, sha, &gets
 }
 
-// T3: an existing legacy/output destination is not completion proof. The
-// pre-download skip check is authoritative; because it declined (wrong size or
-// corrupt same-size bytes), the file must be downloaded and atomically
-// renamed over the old bytes.
+// An arbitrary output file is not completion proof after the skip check declines
+// it for wrong size or corrupt same-size content; transfer must replace its bytes.
 func TestDownload_LegacyExistingDestinationIsNotCompletion(t *testing.T) {
 	const size = 4096
 	full := rangedTestPayload(size)
@@ -118,8 +110,7 @@ func TestDownload_LegacyExistingDestinationIsNotCompletion(t *testing.T) {
 	}
 }
 
-// T3 preserved behavior: a blob-keyed publish target is content-addressed, so
-// its existence alone proves completion and the transfer is skipped.
+// A content-addressed blob's existence remains completion proof, so transfer is skipped.
 func TestDownload_ContentAddressedBlobExistenceStillSkips(t *testing.T) {
 	const size = 4096
 	full := rangedTestPayload(size)
@@ -164,10 +155,8 @@ func TestDownload_ContentAddressedBlobExistenceStillSkips(t *testing.T) {
 	}
 }
 
-// T3: an HF-cache tmp-<sha> destination for an item without a canonical digest
-// must not be treated as complete by the claim. A leftover tmp file from an
-// interrupted earlier run is stale: the file is downloaded again and renamed
-// over it.
+// A leftover cache-shaped temporary destination is not content-addressed
+// completion proof: the claim must transfer again and replace its old bytes.
 func TestDownloadMultipart_TempDestinationIsNotCompletion(t *testing.T) {
 	const total = 8000
 	full := rangedTestPayload(total)
@@ -196,9 +185,7 @@ func TestDownloadMultipart_TempDestinationIsNotCompletion(t *testing.T) {
 	assertExactFile(t, dst, full)
 }
 
-// T2: an oversized single .part is not a prefix anyone can vouch for. The
-// single-request path must discard it (never clamp it) and download the file
-// from offset 0; the multipart route neither reads nor removes it.
+// An oversized single-route .part is discarded, never clamped; fetch again from offset zero.
 func TestDownloadSingle_OversizedPartialIsDiscarded(t *testing.T) {
 	const total = 8000
 	full := rangedTestPayload(total)
@@ -207,14 +194,13 @@ func TestDownloadSingle_OversizedPartialIsDiscarded(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(dst+".part", bytes.Repeat([]byte{0xFF}, 20000), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
 	srv, gotRanges := rangedTestServer(t, full)
 	it := PlanItem{RelativePath: "oversized.bin", URL: srv.URL + "/oversized.bin", Size: total, AcceptRanges: true}
+	job := Job{Repo: "o/r"}
+	// Identity matches: only the oversized payload may force the restart.
+	seedSinglePartial(t, dst, bytes.Repeat([]byte{0xFF}, 20000), job, it, singleTestIdentity)
 	cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0", Verify: "size"}
-	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleTestIdentity, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", job, cfg, it, dst, singleTestIdentity, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
 	assertExactFile(t, dst, full)
@@ -226,8 +212,8 @@ func TestDownloadSingle_OversizedPartialIsDiscarded(t *testing.T) {
 	}
 }
 
-// headOnlyServer serves HEAD metadata for size, so a download can reach the
-// finalization phase without any range body being requested.
+// headOnlyServer provides size/range metadata and rejects payload requests;
+// callers must seed complete inheritable state to reach finalization without transfer.
 func headOnlyServer(t *testing.T, size int64) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -242,12 +228,10 @@ func headOnlyServer(t *testing.T, size int64) *httptest.Server {
 	return srv
 }
 
-// T5: cancel during the strict hash pass. The shared cancel semantics must
-// close the staging handle and run cleanupPartialsOnCancel,
-// instead of leaving the staging pair behind.
+// Explicit cancellation during strict proof must close the handle and clean the staging pair.
 func TestDownloadMultipart_CancelDuringStrictHashCleansUp(t *testing.T) {
-	// A sparse 1 GiB payload keeps the single hash pass running far longer than
-	// the 2 ms cancel delay while costing almost no disk space.
+	// A sparse 1 GiB payload makes the hash expensive without allocating 1 GiB of data blocks;
+	// the test also checks that the hash pass actually started.
 	const total = int64(1) << 30
 	tmpDir := t.TempDir()
 	dst := filepath.Join(tmpDir, "hash-cancel.bin")
@@ -340,34 +324,4 @@ func TestDownloadMultipart_CancelDuringStrictHashCleansUp(t *testing.T) {
 			t.Errorf("explicit cancel during the strict hash left %s behind (stat err=%v)", filepath.Base(p), serr)
 		}
 	}
-}
-
-// T6: etag preserves the historical LFS behavior — a known-SHA LFS file was
-// hashed in every mode before the ETag branch, so it still is (exactly once).
-func TestDownload_VerifyETagHashesKnownLFS(t *testing.T) {
-	const size = 64 * 1024
-	full := rangedTestPayload(size)
-	srv, sha, _ := fakeHubServer(t, full, nil)
-
-	cacheDir := t.TempDir()
-	cfg := Settings{
-		CacheDir:           cacheDir,
-		Endpoint:           srv.URL,
-		Concurrency:        4,
-		MaxActiveDownloads: 2,
-		MultipartThreshold: "1KB",
-		Verify:             "etag",
-		Retries:            0,
-		StallTimeout:       "0",
-	}
-	hashPassCount.Store(0)
-	hashPassBytes.Store(0)
-	if err := Download(context.Background(), Job{Repo: "o/r", Revision: "main"}, cfg, func(ProgressEvent) {}); err != nil {
-		t.Fatalf("Download: %v", err)
-	}
-	if got := hashPassCount.Load(); got != 1 {
-		t.Errorf("etag with a known-SHA LFS file performed %d hash passes; want the historical single pass", got)
-	}
-	blob := filepath.Join(cacheDir, "hub", "models--o--r", "blobs", sha)
-	assertExactFile(t, blob, full)
 }

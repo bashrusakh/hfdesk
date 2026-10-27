@@ -3,17 +3,8 @@
 
 package hfdownloader
 
-// Regression coverage for the publication ordering of known-digest
-// verification (issue #140, PR #151 follow-up): when the item carries a known
-// LFS SHA-256 and Verify is "sha256" or "etag", the strict full-file pass must
-// happen BEFORE the rename onto the final destination/blob. A mismatch must
-// therefore leave nothing published (legacy/output dst absent or its old
-// content preserved; no tmp-<sha>; no blobs/<sha>), and matching content must
-// publish normally with exactly one hash pass.
-//
-// The historical HEAD-ETag-only path (no known digest) is intentionally not
-// exercised here: it remains a post-publication check and is documented as the
-// exception.
+// Known LFS digests are proved before publication. No-digest HEAD-ETag
+// fallback is sha256-only, remains post-publication, and is outside these cases.
 
 import (
 	"bytes"
@@ -28,10 +19,8 @@ import (
 	"time"
 )
 
-// prePublishHub declares one LFS file with the SHA-256 of declared but serves
-// served for every payload response (plain and ranged). Both payloads must be
-// the same length so the transfer satisfies the exact-size/protocol contract
-// and only the content proof can reject it.
+// prePublishHub declares the digest of declared and serves served; callers
+// use equal-size payloads to isolate content proof from length validation.
 func prePublishHub(t *testing.T, declared, served []byte) *httptest.Server {
 	t.Helper()
 	sha := singleTestSHA(declared)
@@ -44,7 +33,6 @@ func prePublishHub(t *testing.T, declared, served []byte) *httptest.Server {
 				`[{"type":"file","path":"model.bin","size":%d,"lfs":{"oid":"%s","size":%d,"sha256":"%s"}}]`,
 				len(served), sha, len(served), sha)))
 		case strings.Contains(r.URL.Path, "/resolve/"):
-			// ServeContent honours Range and emits exact 206 responses.
 			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(served))
 		default:
 			http.NotFound(w, r)
@@ -60,10 +48,8 @@ func corruptSameSize(full []byte) []byte {
 	return bad
 }
 
-// TestDownloadSingle_KnownDigestProvenBeforePublish pins the single path:
-// Verify=sha256 and Verify=etag must both prove a known digest before the
-// rename, so a same-size corrupt transfer leaves no destination (and, in cache
-// mode, no tmp-<sha> and no published blob).
+// Both sha256 and etag must reject same-size known-digest corruption before
+// the single-path rename, leaving neither a destination nor cached payload.
 func TestDownloadSingle_KnownDigestProvenBeforePublish(t *testing.T) {
 	const size = 4_096
 	good := rangedTestPayload(size)
@@ -160,11 +146,8 @@ func TestDownloadSingle_KnownDigestProvenBeforePublish(t *testing.T) {
 	})
 }
 
-// TestDownloadMultipart_ETagKnownDigestProvenBeforePublish pins the ranged
-// blob-direct path: Verify=etag with a known digest must complete its one full
-// pass before renaming blobs/<sha>.incomplete onto blobs/<sha>. A mismatch must
-// not leave corrupt bytes at the content-addressed key (which CheckBlob would
-// trust forever), nor a tmp-<sha> intermediate.
+// ETag mode must prove a known digest before publishing the ranged payload.
+// A mismatch must leave neither the content-addressed blob nor a tmp-<sha> restage.
 func TestDownloadMultipart_ETagKnownDigestProvenBeforePublish(t *testing.T) {
 	const size = 64 * 1024 // above the 1KB threshold → multipart
 	good := rangedTestPayload(size)

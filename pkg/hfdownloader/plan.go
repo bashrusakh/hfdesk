@@ -206,12 +206,8 @@ type PlanItem struct {
 type Plan struct {
 	Items  []PlanItem `json:"items"`
 	Commit string     `json:"commit,omitempty"` // Commit hash for this plan (for HF cache snapshots)
-	// CommitPinned reports whether Commit is a RESOLVED, immutable commit
-	// identity. It is false when the planner could not resolve the requested
-	// revision and fell back to the revision string, which pins nothing: the
-	// branch may have moved, so the content behind that name is not fixed. A
-	// resume that inherits bytes from an earlier run requires a pinned
-	// identity on both sides.
+	// CommitPinned is true only when Commit is a resolved immutable revision.
+	// Resume requires pinned identities in both the record and current plan.
 	CommitPinned bool `json:"commit_pinned,omitempty"`
 }
 
@@ -253,31 +249,13 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		repoInfo = &RepoInfo{}
 	}
 	commitSHA := repoInfo.SHA
-	// A resolved commit SHA names an immutable revision; the requested
-	// revision string does not. The distinction decides whether a resume may
-	// inherit bytes staged by an earlier run, so it travels with the plan.
 	commitPinned := commitSHA != ""
 	if commitSHA == "" {
 		commitSHA = job.Revision // fallback
 	}
 
-	// THE TRANSFER IS PINNED TO THE RESOLVED COMMIT.
-	//
-	// A resolved commit is an immutable identity, so the WHOLE transfer is
-	// built from it: the tree walk that discovers the files AND every
-	// per-file URL. Both halves must name the same identity. Walking the
-	// requested revision while fetching the commit (or the other way round)
-	// re-opens the hole the resolved commit closes: a branch that moves
-	// between the info call and the transfer would change the file set or the
-	// bytes behind the name the plan recorded, and the identity the staging
-	// record stores (the resolved commit) would then describe content that
-	// was never transferred.
-	//
-	// When the endpoint resolves NO commit (a custom or mirror endpoint that
-	// does not answer the revision API), nothing can be pinned: the requested
-	// revision is used exactly as before. The integrity hole that leaves
-	// open is closed by the downloader instead, which requires a content
-	// proof for an unpinned identity (see requiresPrePublicationProof).
+	// Use one resolved commit for the tree and file URLs. Without one, retain the
+	// requested revision; known-digest transfers require proof unless Verify=none.
 	transferJob := job
 	if commitPinned {
 		transferJob.Revision = commitSHA
@@ -606,9 +584,7 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// marker any more than the direct model-selection branches do.
 		matchedFilter = filterAttribution(matchedFilter, job.ExactMatch)
 
-		// Build URL and file size. The URL names the SAME identity the tree
-		// walk used: the resolved commit when the plan pinned one, the
-		// requested revision otherwise.
+		// Use the same identity as the tree walk.
 		var urlStr string
 		if isLFS {
 			urlStr = lfsURL(cfg.Endpoint, transferJob, rel)
