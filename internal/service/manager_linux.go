@@ -804,8 +804,10 @@ func (m *systemdManager) registrationRunning(ctx context.Context) (bool, error) 
 // registration alone does not switch the process that already runs: systemd
 // keeps executing the old program until the unit is restarted. A failure of
 // that restart or of the verification restores the previous registration and
-// starts the previous instance again, so the machine never keeps a
-// registration it failed to put into service.
+// brings the previous instance back into service, so the machine never keeps a
+// registration it failed to put into service. The restore reports the previous
+// instance as started again only when the supervisor was observed running it:
+// the exit status of a restart is not a running instance.
 func (m *systemdManager) register(ctx context.Context, opts InstallOptions, account *user.User, created map[string][]string, previous previousRegistration) error {
 	// The instance runs as the service account, so the directories it owns
 	// belong to it.
@@ -835,7 +837,7 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 	}
 	if err := m.restartAndVerify(ctx, opts.Executable); err != nil {
 		if restoreErr := m.restorePreviousRegistration(ctx, previous); restoreErr != nil {
-			return fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration could not be restored: %v)", err, restoreErr)
+			return fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration could not be put back into service: %v)", err, restoreErr)
 		}
 		return fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration was restored and the previous instance was started again)", err)
 	}
@@ -849,6 +851,13 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 // restart below starts the previous program rather than the new one. The
 // restored file is read back before the restart: a caller is only told that
 // the previous registration was restored when the file really holds it again.
+//
+// A restart that the supervisor accepted is not a running instance: the
+// supervisor reports a restart of a Type=simple unit as soon as the process was
+// forked, so a unit that dies right away still ends the command with a success.
+// The running state is therefore read back before the restore is reported, and
+// a restart that was issued but not confirmed is returned as an error that says
+// exactly that.
 //
 // The restore is best effort and never replaces the original failure: a
 // failed restore is reported with the outcome of the restore, so a caller
@@ -866,7 +875,13 @@ func (m *systemdManager) restorePreviousRegistration(ctx context.Context, previo
 		return nil
 	}
 	if _, err := m.runSystemctl(cleanup, "restart", unitName); err != nil {
-		return fmt.Errorf("the previous instance could not be started again: %w", err)
+		return fmt.Errorf("the registration was restored, but the restart of the previous instance was refused: %w", err)
+	}
+	// The restored registration names the program the previous instance ran.
+	// A unit whose command line cannot be read names no program, so the
+	// running state alone is verified then.
+	if err := m.verifyRunningExecutable(cleanup, parseUnit(string(previous.content)).ExecStart); err != nil {
+		return fmt.Errorf("the registration was restored and the restart of the previous instance was issued, but the restart was not confirmed: %w", err)
 	}
 	return nil
 }
@@ -934,6 +949,10 @@ func (m *systemdManager) restartVerifyWait() time.Duration {
 // succeeds only when the supervisor reports the reloaded unit active with the
 // new program, after the restart was requested.
 //
+// An empty executable checks the running state alone: a registration whose
+// command line names no program has no program to compare, and the caller then
+// reports the state it observed instead of a program it does not know.
+//
 // The wait is bounded by the shutdown budget of the service layer and the
 // context of the installation: an instance that does not come up within it is
 // a failed installation, not a success that is reported from the registration
@@ -950,12 +969,19 @@ func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable
 		} else {
 			show := parseSystemdShow(out)
 			path := execStartPath(out)
-			if show.State == StateRunning && path == executable {
+			if show.State == StateRunning && (executable == "" || path == executable) {
 				return nil
 			}
-			detail = fmt.Sprintf("the supervisor reports the state %q with the program %q", show.State, path)
+			if executable == "" {
+				detail = fmt.Sprintf("the supervisor reports the state %q", show.State)
+			} else {
+				detail = fmt.Sprintf("the supervisor reports the state %q with the program %q", show.State, path)
+			}
 		}
 		if !time.Now().Before(deadline) {
+			if executable == "" {
+				return fmt.Errorf("the %s is not active within %s: %s", unitName, budget, detail)
+			}
 			return fmt.Errorf("the restarted %s does not run %q within %s: %s", unitName, executable, budget, detail)
 		}
 		select {

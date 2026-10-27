@@ -3595,6 +3595,12 @@ func TestSystemdRestartVerifyWaitIsTheShutdownBudget(t *testing.T) {
 // failure of the first restart while the restore of the previous registration
 // still succeeds.
 //
+// A restart reports the state it leaves behind: when
+// HFDESK_TEST_SYSTEMCTL_RESTARTED names a marker file, the supervisor creates it
+// on the first restart and reports HFDESK_TEST_SYSTEMCTL_ACTIVE_AFTER_RESTART
+// from then on. A restart returns as soon as the unit was forked, so a test can
+// drive a restart that is accepted while the unit is dead.
+//
 // The log path is returned. It is written even when the supervisor is asked
 // for a property only, so a test can tell a restart from a state query.
 func systemdRecordingSupervisor(t *testing.T) string {
@@ -3611,6 +3617,9 @@ fi
 case "$1" in
 show)
 	active="${HFDESK_TEST_SYSTEMCTL_ACTIVE:-inactive}"
+	if [ -n "$HFDESK_TEST_SYSTEMCTL_RESTARTED" ] && [ -e "$HFDESK_TEST_SYSTEMCTL_RESTARTED" ] && [ -n "$HFDESK_TEST_SYSTEMCTL_ACTIVE_AFTER_RESTART" ]; then
+		active="$HFDESK_TEST_SYSTEMCTL_ACTIVE_AFTER_RESTART"
+	fi
 	sub=dead
 	if [ "$active" = "active" ]; then
 		sub=running
@@ -3631,6 +3640,9 @@ restart)
 		: > "$HFDESK_TEST_SYSTEMCTL_RESTART_MARKER"
 		echo "the fake supervisor refuses the restart" >&2
 		exit 1
+	fi
+	if [ -n "$HFDESK_TEST_SYSTEMCTL_RESTARTED" ]; then
+		: > "$HFDESK_TEST_SYSTEMCTL_RESTARTED" || exit 1
 	fi
 	exit 0
 	;;
@@ -3819,8 +3831,9 @@ func TestSystemdReinstallOfAStoppedUnitDoesNotStartIt(t *testing.T) {
 
 // TestSystemdFailedRestartRestoresThePreviousRegistration checks that a
 // restart the supervisor refuses neither leaves the new registration behind
-// nor keeps the instance down: the previous unit file is written back and the
-// previous instance is started again.
+// nor keeps the instance down: the previous unit file is written back, the
+// previous instance is started again and the running state of the restore is
+// verified before it is reported.
 func TestSystemdFailedRestartRestoresThePreviousRegistration(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	root := t.TempDir()
@@ -3829,8 +3842,12 @@ func TestSystemdFailedRestartRestoresThePreviousRegistration(t *testing.T) {
 	previous := systemdExistingOptions(t, oldExecutable, root)
 
 	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	// The supervisor reports the running state the restore comes back to:
+	// the refused restart never reached the verification of the new
+	// executable, so the program it reports is the one of the restored
+	// registration.
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
-	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", oldExecutable)
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_RESTART_FAIL_ONCE", "1")
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_RESTART_MARKER", filepath.Join(t.TempDir(), "restart"))
 
@@ -3840,6 +3857,11 @@ func TestSystemdFailedRestartRestoresThePreviousRegistration(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "the previous registration was restored") {
 		t.Errorf("Install() = %q, want an error that reports the restored registration", err)
+	}
+	// The restart of the restore is verified, so the sentence that names
+	// the started instance is allowed here.
+	if !strings.Contains(err.Error(), "the previous instance was started again") {
+		t.Errorf("Install() = %q, want the verified restart of the previous instance", err)
 	}
 
 	content, readErr := os.ReadFile(unitPath)
@@ -3861,7 +3883,8 @@ func TestSystemdFailedRestartRestoresThePreviousRegistration(t *testing.T) {
 // TestSystemdUnverifiedRestartRestoresThePreviousRegistration checks that a
 // restart which does not put the new executable into service is a failed
 // installation: a registration alone never reports success, the previous unit
-// file is restored and the previous instance is started again.
+// file is restored and the previous instance is started again, which is
+// verified before it is reported.
 func TestSystemdUnverifiedRestartRestoresThePreviousRegistration(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	root := t.TempDir()
@@ -3886,6 +3909,9 @@ func TestSystemdUnverifiedRestartRestoresThePreviousRegistration(t *testing.T) {
 	if !strings.Contains(err.Error(), "the previous registration was restored") {
 		t.Errorf("Install() = %q, want an error that reports the restored registration", err)
 	}
+	if !strings.Contains(err.Error(), "the previous instance was started again") {
+		t.Errorf("Install() = %q, want the verified restart of the previous instance", err)
+	}
 
 	content, readErr := os.ReadFile(unitPath)
 	if readErr != nil {
@@ -3898,6 +3924,109 @@ func TestSystemdUnverifiedRestartRestoresThePreviousRegistration(t *testing.T) {
 	calls := systemdSupervisorCalls(t, logPath)
 	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 2 {
 		t.Errorf("the unit was restarted %d times, want the failed restart and the restore:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
+// TestSystemdRestoreThatIsNotConfirmedIsNotReportedAsStartedAgain checks that a
+// restart of the restored registration which the supervisor accepted but which
+// left the unit down is not reported as a started instance: the error says that
+// the registration was restored and that the restart was issued, and it never
+// claims that the previous instance runs again.
+func TestSystemdRestoreThatIsNotConfirmedIsNotReportedAsStartedAgain(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+
+	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	// The unit runs before the installation, and the restart of the failure
+	// leaves it down: the supervisor accepts every restart, and
+	// `systemctl restart` returns as soon as the unit was forked, so its
+	// exit status is not a running instance.
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", oldExecutable)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_RESTARTED", filepath.Join(t.TempDir(), "restarted"))
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE_AFTER_RESTART", "inactive")
+	m.restartWait = 250 * time.Millisecond
+
+	_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+	if err == nil {
+		t.Fatal("Install() = nil, want the unconfirmed state of the new executable")
+	}
+	for _, want := range []string{
+		"the registration was restored",
+		"the restart of the previous instance was issued",
+		"but the restart was not confirmed",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "the previous instance was started again") {
+		t.Errorf("Install() = %q, want no claim that the previous instance was started again", err)
+	}
+
+	content, readErr := os.ReadFile(unitPath)
+	if readErr != nil {
+		t.Fatalf("read the unit file: %v", readErr)
+	}
+	if string(content) != previousUnit {
+		t.Errorf("the unit file was not restored:\n%s\nwant\n%s", content, previousUnit)
+	}
+
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 2 {
+		t.Errorf("the unit was restarted %d times, want the failed attempt and the restore:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
+// TestSystemdRestoreOfAUnitWithoutAProgramVerifiesTheState checks that a restore
+// whose registration names no program verifies the running state alone: there is
+// no program to compare, so the rollback reports what the supervisor observed
+// and never a program it does not know.
+func TestSystemdRestoreOfAUnitWithoutAProgramVerifiesTheState(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	path := filepath.Join(root, "etc", "systemd", "user", unitName)
+	// A registration whose command line cannot be read: the section holds
+	// no ExecStart, so the restored registration names no program.
+	content := []byte("[Unit]\nDescription=HFDesk\n\n[Service]\nWorkingDirectory=" + root + "\n")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create the unit directory: %v", err)
+	}
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatalf("write the unit file: %v", err)
+	}
+
+	m := &systemdManager{scope: ScopeUser}
+	m.restartWait = 250 * time.Millisecond
+	previous := previousRegistration{path: path, content: content, existed: true, running: true}
+
+	// A supervisor that reports the unit active is enough: the restore
+	// reports a started instance without comparing a program.
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	if err := m.restorePreviousRegistration(context.Background(), previous); err != nil {
+		t.Fatalf("restorePreviousRegistration() = %v, want the verified running state", err)
+	}
+
+	// The state is verified and not assumed: a unit the supervisor does not
+	// report active is a restore that was not confirmed.
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+	err := m.restorePreviousRegistration(context.Background(), previous)
+	if err == nil {
+		t.Fatal("restorePreviousRegistration() = nil, want the unconfirmed state of the restored unit")
+	}
+	if !strings.Contains(err.Error(), "is not active") {
+		t.Errorf("restorePreviousRegistration() = %q, want an error that names the state it verified", err)
+	}
+	if !strings.Contains(err.Error(), "the restart of the previous instance was issued") {
+		t.Errorf("restorePreviousRegistration() = %q, want an error that reports the issued restart", err)
+	}
+
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 2 {
+		t.Errorf("the unit was restarted %d times, want the restore of each call:\n%s", got, strings.Join(calls, "\n"))
 	}
 }
 
