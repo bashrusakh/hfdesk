@@ -4,11 +4,20 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
 // ptrOf is a small helper for tests to build a pointer to a literal
@@ -359,5 +368,151 @@ func TestDismissJob_ConcurrentJobSameRepoNotDisturbed(t *testing.T) {
 	}
 	if _, err := os.Stat(jobBDst + ".part"); err != nil {
 		t.Errorf("Job B dst was removed by Job A's dismiss: %v", err)
+	}
+}
+
+// --- Local branch variant: the commit-scoped staging area ---
+
+// branchStagingFileName is the name the downloader gives one file's staging
+// file inside the commit-scoped staging directory: the digest of the file's
+// repository-relative path. The test derives it the same way, so it can find
+// the partial the transfer leaves behind.
+func branchStagingFileName(rel string) string {
+	sum := sha256.Sum256([]byte(rel))
+	return "f-" + hex.EncodeToString(sum[:])
+}
+
+// newStagingBranchHub serves the minimal Hub API a local branch variant
+// needs, with a raw body that stalls after a few bytes: the transfer stays in
+// flight, so the downloader holds an open partial file in the staging area
+// while the job runs.
+func newStagingBranchHub(t *testing.T, commit, rel string) *httptest.Server {
+	t.Helper()
+	body := "branch-variant-weights"
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/revision/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"sha":%q}`, commit)
+		case strings.Contains(r.URL.Path, "/tree/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `[{"type":"file","path":%q,"size":%d}]`, rel, len(body))
+		case strings.Contains(r.URL.Path, "/raw/"):
+			// The body stalls: the transfer is still running, so its
+			// partial file is on disk.
+			_, _ = io.WriteString(w, body[:4])
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+// waitForFile waits until path exists, so the test observes the partial of a
+// transfer that is really in flight.
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s did not appear", path)
+}
+
+// TestCancelJob_LocalBranchVariantPausedRemovesStagingPartials pins the
+// pause → cancel cleanup of a local branch variant.
+//
+// A local branch variant transfers into the app-owned, commit-scoped staging
+// area and publishes the verified bytes into the payload afterwards, so the
+// partial of an interrupted transfer lives in the staging tree, not next to
+// the payload file. The downloader registers that staging path through
+// Settings.OnPartialFile, and the server's cleanup derives the partial names
+// (.part, .part-NN, .parts.json) from the registered path, so cancelling a
+// paused job removes the staging artifacts.
+//
+// The removal stays inside the local root: the cleanup's root is the job's
+// local directory, so a file of the same name outside it survives.
+func TestCancelJob_LocalBranchVariantPausedRemovesStagingPartials(t *testing.T) {
+	const (
+		revision = "4.00bpw"
+		commit   = "2222222222222222222222222222222222222222"
+		rel      = "config.json"
+	)
+	root := t.TempDir()
+	cacheDir := t.TempDir()
+	hub := newStagingBranchHub(t, commit, rel)
+	defer hub.Close()
+	wsHub := NewWSHub()
+	go wsHub.Run()
+	mgr := newTestJobManager(t, Config{
+		CacheDir:     cacheDir,
+		LocalDir:     root,
+		Endpoint:     hub.URL,
+		MaxActive:    1,
+		StallTimeout: "0",
+	}, wsHub)
+
+	job, _, err := mgr.CreateJob(DownloadRequest{
+		Repo:          presenceRepo,
+		Revision:      revision,
+		BranchVariant: true,
+	})
+	if err != nil {
+		t.Fatalf("create branch variant job: %v", err)
+	}
+
+	// The staging partial of the in-flight transfer.
+	stagingDir := filepath.Join(root, hfdownloader.BranchVariantLocalSpaceName, presenceRepo, "staging", revision, commit)
+	partial := filepath.Join(stagingDir, branchStagingFileName(rel)+".part")
+	waitForFile(t, partial)
+
+	// A file of the same name outside the local root: the cleanup removes the
+	// registered path, not every file of that name.
+	outside := filepath.Join(cacheDir, branchStagingFileName(rel)+".part")
+	if err := os.WriteFile(outside, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !mgr.PauseJob(job.ID) {
+		t.Fatal("PauseJob should succeed for a running job")
+	}
+	// The download goroutine has to be gone before the cancel: only then is
+	// the server's paused-job cleanup the only thing that can remove the
+	// partial.
+	runDone := make(chan struct{})
+	go func() { mgr.runWG.Wait(); close(runDone) }()
+	select {
+	case <-runDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the paused download did not unwind")
+	}
+	if j, _ := mgr.GetJob(job.ID); j == nil || j.Status != JobStatusPaused {
+		t.Fatalf("job status = %+v, want paused", j)
+	}
+	// A pause keeps the partial: the resume is what reuses it.
+	if _, err := os.Stat(partial); err != nil {
+		t.Fatalf("the paused job's staging partial is gone: %v", err)
+	}
+
+	if !mgr.CancelJob(job.ID) {
+		t.Fatal("CancelJob should succeed for a paused job")
+	}
+	if j, _ := mgr.GetJob(job.ID); j == nil || j.Status != JobStatusCancelled {
+		t.Fatalf("job status = %+v, want cancelled", j)
+	}
+
+	// The staging partial is gone.
+	if _, err := os.Stat(partial); !os.IsNotExist(err) {
+		t.Errorf("staging partial %s was not cleaned up (err=%v)", partial, err)
+	}
+	// The file outside the local root survives.
+	if _, err := os.Stat(outside); err != nil {
+		t.Errorf("a file outside the local root was removed by the cleanup: %v", err)
 	}
 }

@@ -65,6 +65,10 @@ func newFlatModeGatedHubWithRevision(t *testing.T, full []byte, rel string, lfs,
 		case strings.Contains(r.URL.Path, "/tree/"):
 			_, _ = w.Write([]byte("[" + node + "]"))
 		case strings.Contains(r.URL.Path, "/resolve/") || strings.Contains(r.URL.Path, "/raw/"):
+			if r.Header.Get("X-HFDesk-Addressing-Probe") == "1" {
+				http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+				return
+			}
 			if r.Method == http.MethodGet {
 				h.payloads.Add(1)
 				h.enterOnce.Do(func() { close(h.entered) })
@@ -271,6 +275,11 @@ func TestDownloadFlatModeUnknownSizeHandoffUsesOneDomain(t *testing.T) {
 			_, _ = w.Write([]byte("[" + node + "]"))
 		case strings.Contains(r.URL.Path, "/resolve/") && r.Method == http.MethodHead:
 			w.Header().Set("Accept-Ranges", "bytes")
+		case strings.Contains(r.URL.Path, "/resolve/") && r.Header.Get("X-HFDesk-Addressing-Probe") == "1":
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(full)))
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(full[:1])
 		case strings.Contains(r.URL.Path, "/resolve/") && r.Method == http.MethodGet:
 			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
 			_, _ = w.Write(full)

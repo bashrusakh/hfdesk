@@ -45,6 +45,10 @@ func TestPlanRepo_PaginationOriginBoundary(t *testing.T) {
 							_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "cafebabe"})
 							return
 						}
+						if strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/") {
+							http.NotFound(w, r) // optional capability probes are not tree pages
+							return
+						}
 						page := treeReqs.Add(1)
 						if r.URL.Path != treePath || page > 2 || (page == 2 && r.URL.Query().Get("cursor") != "2") {
 							t.Errorf("unexpected tree request: %s", r.URL)
@@ -305,8 +309,14 @@ func TestPlanRepo_TerminalTreeFailsFast(t *testing.T) {
 			if err == nil || err.Error() != want {
 				t.Errorf("error = %v, want %q", err, want)
 			}
-			if n := treeReqs.Load(); n != 1 {
-				t.Errorf("tree requests = %d, want exactly 1 (no retry on %d)", n, status)
+			wantTreeRequests := int64(1)
+			if status == http.StatusNotFound {
+				// A custom endpoint's commit-tree 404 is compared with the
+				// requested-revision tree before fallback is rejected.
+				wantTreeRequests = 2
+			}
+			if n := treeReqs.Load(); n != wantTreeRequests {
+				t.Errorf("tree requests = %d, want %d (no retry on %d)", n, wantTreeRequests, status)
 			}
 		})
 	}
@@ -348,6 +358,10 @@ func TestPlanRepo_PaginationCompletion(t *testing.T) {
 				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					if strings.Contains(r.URL.Path, "/revision/") {
 						_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "cafebabe"})
+						return
+					}
+					if strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/") {
+						http.NotFound(w, r)
 						return
 					}
 					if !strings.Contains(r.URL.Path, "/tree/") {
@@ -416,6 +430,10 @@ func TestPlanRepo_BackslashDirectoryPreservesFileValidation(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if strings.Contains(r.URL.Path, "/revision/") {
 					_ = json.NewEncoder(w).Encode(RepoInfo{SHA: "cafebabe"})
+					return
+				}
+				if strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/") {
+					http.NotFound(w, r)
 					return
 				}
 				reqs.Add(1)

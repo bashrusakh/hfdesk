@@ -15,6 +15,16 @@ import (
 	"github.com/bashrusakh/hfdesk/internal/hubtree"
 )
 
+// endpointStatusError retains the direct endpoint status for the narrow
+// commit-addressing compatibility classifier while preserving diagnostics.
+type endpointStatusError struct {
+	status int
+	err    error
+}
+
+func (e *endpointStatusError) Error() string { return e.err.Error() }
+func (e *endpointStatusError) Unwrap() error { return e.err }
+
 // DefaultEndpoint is the default HuggingFace Hub URL.
 // Can be overridden via Settings.Endpoint for mirrors or enterprise deployments.
 // Credits: Custom endpoint feature suggested by windtail (#38)
@@ -143,11 +153,11 @@ func walkTree(ctx context.Context, httpc *http.Client, token, endpoint string, j
 		StatusErr: func(resp *http.Response) error {
 			switch resp.StatusCode {
 			case http.StatusUnauthorized:
-				return fmt.Errorf("401 unauthorized: repo requires token or you do not have access (visit %s)", agreementURL(endpoint, job))
+				return &endpointStatusError{status: resp.StatusCode, err: fmt.Errorf("401 unauthorized: repo requires token or you do not have access (visit %s)", agreementURL(endpoint, job))}
 			case http.StatusForbidden:
-				return fmt.Errorf("403 forbidden: please accept the repository terms: %s", agreementURL(endpoint, job))
+				return &endpointStatusError{status: resp.StatusCode, err: fmt.Errorf("403 forbidden: please accept the repository terms: %s", agreementURL(endpoint, job))}
 			default:
-				return fmt.Errorf("tree API failed: %s", resp.Status)
+				return &endpointStatusError{status: resp.StatusCode, err: fmt.Errorf("tree API failed: %s", resp.Status)}
 			}
 		},
 	}
@@ -241,7 +251,7 @@ func fetchRepoInfo(ctx context.Context, httpc *http.Client, token, endpoint stri
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("repo info API failed: %s", resp.Status)
+		return nil, &endpointStatusError{status: resp.StatusCode, err: fmt.Errorf("repo info API failed: %s", resp.Status)}
 	}
 
 	var info RepoInfo
@@ -249,4 +259,39 @@ func fetchRepoInfo(ctx context.Context, httpc *http.Client, token, endpoint stri
 		return nil, err
 	}
 	return &info, nil
+}
+
+// probeAddressing performs a bounded GET probe without following redirects.
+// It classifies only a direct repository-endpoint 404 as missing addressing;
+// auth, transport, redirect and other status outcomes remain inconclusive.
+func probeAddressing(ctx context.Context, httpc *http.Client, token, rawURL string, size int64, followRedirects bool) (status int, usable bool, location string, err error) {
+	probeClient := *httpc
+	if !followRedirects {
+		probeClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return 0, false, "", err
+	}
+	addAuth(req, token)
+	req.Header.Set("Range", "bytes=0-0")
+	req.Header.Set("Accept-Encoding", "identity")
+	// This identifies a bounded, disposable preflight request to endpoints and
+	// diagnostics. Its response is never used as payload; transfer requests do
+	// not carry the marker.
+	req.Header.Set("X-HFDesk-Addressing-Probe", "1")
+	resp, err := probeClient.Do(req)
+	if err != nil {
+		return 0, false, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent {
+		// Read no payload bytes: the probe establishes endpoint/method support,
+		// not the transfer's content proof. Closing promptly bounds ignored ranges.
+		return resp.StatusCode, true, resp.Header.Get("Location"), nil
+	}
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && size == 0 {
+		return resp.StatusCode, true, resp.Header.Get("Location"), nil
+	}
+	return resp.StatusCode, false, resp.Header.Get("Location"), nil
 }

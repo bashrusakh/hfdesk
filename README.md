@@ -33,8 +33,9 @@ HFDesk runs as a small local web server and gives you a desktop-style browser UI
 ## Highlights
 
 - Search models and datasets directly from the Hugging Face Hub.
-- Analyze repositories before downloading, including GGUF quantizations, file groups, RAM estimates, and recommended picks.
+- Analyze repositories before downloading, including GGUF quantizations, EXL2/EXL3 branch variants, file groups, RAM estimates, and recommended picks.
 - Correctly groups sharded GGUF files into one quantization option.
+- Download EXL2/EXL3 bitrate branches as `branchVariant` whole-branch downloads: they skip the shared friendly view and keep content-addressed blobs and per-commit snapshots, so two variants with identical file names never overwrite each other.
 - Parallel resumable downloads with retries, progress events, and active job tracking.
 - Standard Hugging Face cache layout or LM Studio-style local files under `<folder>/<owner>/<model>`.
 - Optionally route downloads into per-type folders (LLM/GGUF, LLM/Safetensors, Audio, Diffusion, Embedding).

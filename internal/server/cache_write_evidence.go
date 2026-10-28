@@ -13,10 +13,15 @@ import (
 
 // writeDecisionJob is the manager-owned portion of a reservation decision.
 // It intentionally excludes progress, listeners and other presentation data.
+//
+// It carries every field that shapes where the job writes: the destination
+// root, the storage mode, the repository folder override and the branch
+// variant flag, because the branch variant writes into the app-owned reserved
+// space instead of the ordinary repository tree.
 type writeDecisionJob struct {
 	id, repo, revision, output, hub, local, localRepo string
 	status                                            JobStatus
-	starting, flat, dataset, exact                    bool
+	starting, flat, dataset, exact, branchVariant     bool
 	filters, excludes                                 []string
 	generation                                        int
 	createdAt                                         int64
@@ -58,7 +63,8 @@ func decisionJob(j *Job) writeDecisionJob {
 	return writeDecisionJob{id: j.ID, repo: j.Repo, revision: j.Revision, output: j.OutputDir,
 		hub: j.HubDir, local: j.LocalDir, localRepo: j.LocalRepo, status: j.Status,
 		starting: j.starting, flat: j.Flat, dataset: j.IsDataset, exact: j.ExactMatch,
-		filters: append([]string(nil), j.Filters...), excludes: append([]string(nil), j.Excludes...),
+		branchVariant: j.BranchVariant,
+		filters:       append([]string(nil), j.Filters...), excludes: append([]string(nil), j.Excludes...),
 		generation: j.generation, createdAt: j.CreatedAt.UnixNano()}
 }
 
@@ -240,9 +246,9 @@ func decisionDescriptorKey(d writeDecisionJob) string {
 		ID, Repo, Revision, Output, Hub, Local, LocalRepo string
 		Filters, Excludes                                 []string
 		Generation                                        int
-		Exact, Flat, Dataset                              bool
+		Exact, Flat, Dataset, BranchVariant               bool
 		ActivityID                                        uint64
-	}{d.id, d.repo, d.revision, d.output, d.hub, d.local, d.localRepo, d.filters, d.excludes, d.generation, d.exact, d.flat, d.dataset, d.activityID})
+	}{d.id, d.repo, d.revision, d.output, d.hub, d.local, d.localRepo, d.filters, d.excludes, d.generation, d.exact, d.flat, d.dataset, d.branchVariant, d.activityID})
 	return string(b)
 }
 
@@ -267,7 +273,8 @@ func decisionLookupKey(descriptor writeDecisionJob) string {
 func jobFromDecision(d writeDecisionJob) *Job {
 	return &Job{ID: d.id, Repo: d.repo, Revision: d.revision, OutputDir: d.output, HubDir: d.hub,
 		LocalDir: d.local, LocalRepo: d.localRepo, Status: d.status, starting: d.starting,
-		Flat: d.flat, IsDataset: d.dataset, ExactMatch: d.exact, Filters: append([]string(nil), d.filters...),
+		Flat: d.flat, IsDataset: d.dataset, ExactMatch: d.exact, BranchVariant: d.branchVariant,
+		Filters:  append([]string(nil), d.filters...),
 		Excludes: append([]string(nil), d.excludes...), generation: d.generation}
 }
 

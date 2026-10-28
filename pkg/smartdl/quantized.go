@@ -9,7 +9,6 @@ import (
 	"strings"
 )
 
-// Quantization method descriptions.
 var quantMethodDescriptions = map[string]string{
 	"gptq":         "GPTQ - GPU-accelerated post-training quantization",
 	"awq":          "AWQ - Activation-aware Weight Quantization",
@@ -21,24 +20,35 @@ var quantMethodDescriptions = map[string]string{
 	"eetq":         "EETQ - Easy and Efficient Quantization",
 }
 
+// recognizedNonEXLMethod reports whether method is a quantization method this
+// analyzer recognizes and that is not EXL2/EXL3. quantMethodDescriptions is the
+// single source of truth for recognized methods; an unfamiliar string is
+// unknown evidence, not a known-negative.
+func recognizedNonEXLMethod(method string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(method))
+	if normalized == "" {
+		return false
+	}
+	if _, recognized := quantMethodDescriptions[normalized]; !recognized {
+		return false
+	}
+	switch normalized {
+	case "exl2", "exl3":
+		return false
+	default:
+		return true
+	}
+}
+
 // analyzeQuantized analyzes GPTQ/AWQ/EXL2 quantized models.
 func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 	info := &QuantizedInfo{}
 
-	// Parse quantize_config.json
-	config, ok := metadata["quantize_config.json"].(map[string]interface{})
-	if !ok {
-		config, ok = metadata["quantization_config.json"].(map[string]interface{})
-	}
-	if !ok {
-		// Try config.json for some quantized models
-		config, ok = metadata["config.json"].(map[string]interface{})
-		if !ok {
-			return nil
-		}
+	config := quantizationConfig(metadata)
+	if config == nil {
+		return nil
 	}
 
-	// Detect quantization method
 	if method, ok := config["quant_method"].(string); ok {
 		info.Method = method
 		if desc, exists := quantMethodDescriptions[method]; exists {
@@ -130,7 +140,6 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 		info.Symmetric = symm
 	}
 
-	// AWQ specific fields
 	if zeroPoint, ok := config["zero_point"].(bool); ok {
 		info.ZeroPoint = zeroPoint
 	}
@@ -139,12 +148,10 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 		info.Version = version
 	}
 
-	// EXL2 specific
 	if bpw, ok := config["bits_per_weight"].(float64); ok {
 		info.BitsPerWeight = bpw
 	}
 
-	// Module quantization info
 	if modules, ok := config["modules_to_not_convert"].([]interface{}); ok {
 		for _, m := range modules {
 			if s, ok := m.(string); ok {
@@ -153,10 +160,8 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 		}
 	}
 
-	// Backend compatibility
 	info.Backends = detectBackends(info)
 
-	// Get model architecture from config.json if available
 	if configJson, ok := metadata["config.json"].(map[string]interface{}); ok {
 		if arch, ok := configJson["architectures"].([]interface{}); ok && len(arch) > 0 {
 			if s, ok := arch[0].(string); ok {
@@ -164,7 +169,6 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 			}
 		}
 
-		// Model size for VRAM estimation
 		if hiddenSize, ok := configJson["hidden_size"].(float64); ok {
 			if numLayers, ok := configJson["num_hidden_layers"].(float64); ok {
 				info.EstimatedVRAM = estimateVRAM(int(hiddenSize), int(numLayers), info.Bits)
@@ -173,6 +177,39 @@ func analyzeQuantized(metadata map[string]interface{}) *QuantizedInfo {
 	}
 
 	return info
+}
+
+func quantizationConfig(metadata map[string]interface{}) map[string]interface{} {
+	for _, path := range []string{"quantize_config.json", "quantization_config.json"} {
+		if config, ok := metadata[path].(map[string]interface{}); ok {
+			return config
+		}
+	}
+	config, ok := metadata["config.json"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	if nested, ok := config["quantization_config"].(map[string]interface{}); ok {
+		return nested
+	}
+	return config
+}
+
+// hasQuantizationConfig reports whether the metadata contains a dedicated
+// quantization file or a nested config.json quantization object. A legacy
+// top-level config.json map alone is not enough to opt into type projection.
+func hasQuantizationConfig(metadata map[string]interface{}) bool {
+	for _, path := range []string{"quantize_config.json", "quantization_config.json"} {
+		if _, ok := metadata[path].(map[string]interface{}); ok {
+			return true
+		}
+	}
+	config, ok := metadata["config.json"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	_, ok = config["quantization_config"].(map[string]interface{})
+	return ok
 }
 
 // declaredWidth reports whether a field exists and whether its value is a
@@ -241,7 +278,6 @@ func expertBitRange(value interface{}) (minBits, maxBits float64, complete bool)
 	return minBits, maxBits, complete
 }
 
-// detectBackends returns compatible inference backends.
 func detectBackends(info *QuantizedInfo) []string {
 	var backends []string
 
@@ -277,7 +313,6 @@ func estimateVRAM(hiddenSize, numLayers, bits int) int64 {
 	// params ≈ 12 * hidden_size^2 * num_layers (simplified)
 	paramsApprox := int64(12) * int64(hiddenSize) * int64(hiddenSize) * int64(numLayers)
 
-	// Bytes per parameter based on bit width
 	bytesPerParam := float64(bits) / 8.0
 
 	// Add 20% overhead for KV cache and activations
@@ -286,17 +321,14 @@ func estimateVRAM(hiddenSize, numLayers, bits int) int64 {
 	return vram
 }
 
-// IsGPTQ checks if the model uses GPTQ quantization.
 func IsGPTQ(info *QuantizedInfo) bool {
 	return info.Method == "gptq"
 }
 
-// IsAWQ checks if the model uses AWQ quantization.
 func IsAWQ(info *QuantizedInfo) bool {
 	return info.Method == "awq"
 }
 
-// IsEXL2 checks if the model uses EXL2 quantization.
 func IsEXL2(info *QuantizedInfo) bool {
 	return info.Method == "exl2"
 }
@@ -325,7 +357,6 @@ func QuantizedToSelectableItems(info *QuantizedInfo, files []FileInfo) []Selecta
 
 	var items []SelectableItem
 
-	// Check for safetensors vs bin files
 	hasSafetensors := false
 	hasPytorchBin := false
 	var safetensorsSize, pytorchBinSize int64
@@ -341,7 +372,6 @@ func QuantizedToSelectableItems(info *QuantizedInfo, files []FileInfo) []Selecta
 		}
 	}
 
-	// Add format options if both are available
 	if hasSafetensors && hasPytorchBin {
 		items = append(items, SelectableItem{
 			ID:           "safetensors",

@@ -324,6 +324,12 @@ func TestAnalyzer_TreeURL(t *testing.T) {
 			revision: "v1.0.0",
 			expected: "https://huggingface.co/api/models/owner/repo/tree/v1.0.0",
 		},
+		{
+			name:     "branch path revision is one escaped segment",
+			repo:     "owner/repo",
+			revision: "feature/4.00bpw",
+			expected: "https://huggingface.co/api/models/owner/repo/tree/feature%2F4.00bpw",
+		},
 	}
 
 	for _, tt := range tests {

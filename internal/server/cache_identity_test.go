@@ -169,6 +169,13 @@ func cacheDownloadFixture(t *testing.T, first string) (*httptest.Server, []byte,
 		case strings.Contains(r.URL.Path, "/tree/"):
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"type": "file", "path": "weights.safetensors", "size": len(body), "lfs": map[string]any{"oid": hash, "size": len(body)}}})
 		case strings.Contains(r.URL.Path, "/resolve/"):
+			if r.Header.Get("X-HFDesk-Addressing-Probe") == "1" {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(body)))
+				w.Header().Set("Content-Length", "1")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(body[:1])
+				return
+			}
 			if r.Method != "HEAD" && gets.Add(1) == 1 {
 				close(reached)
 				if first == "pause" {

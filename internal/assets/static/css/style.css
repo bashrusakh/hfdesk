@@ -862,6 +862,35 @@ a {
   padding: 24px;
 }
 
+.analysis-warning {
+  margin-bottom: 18px;
+  padding: 10px 12px;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  border-radius: var(--radius-sm);
+  background: rgba(245, 158, 11, 0.08);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.analysis-warning-message {
+  color: var(--color-text);
+}
+
+.analysis-warning-message + .analysis-warning-message {
+  margin-top: 4px;
+}
+
+.analysis-warning-causes {
+  margin-top: 4px;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+}
+
+.analysis-warning-retry {
+  margin-top: 8px;
+}
+
 .analysis-section {
   margin-bottom: 24px;
 }

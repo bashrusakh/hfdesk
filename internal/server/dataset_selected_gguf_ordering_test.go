@@ -56,6 +56,11 @@ func TestPlanUnknownDatasetGGUFSelectedDeleteOrdering(t *testing.T) {
 								_, _ = fmt.Fprint(w, `[{"type":"file","path":"train.csv","size":5},{"type":"file","path":"model-test.gguf","size":5},{"type":"file","path":"model-train.gguf","size":5}]`)
 							case <-r.Context().Done():
 							}
+						case (strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/")) && r.Header.Get("X-HFDesk-Addressing-Probe") == "1":
+							w.Header().Set("Content-Range", "bytes 0-0/5")
+							w.Header().Set("Content-Length", "1")
+							w.WriteHeader(http.StatusPartialContent)
+							_, _ = w.Write([]byte("d"))
 						case strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/"):
 							select {
 							case rawStarted <- struct{}{}:

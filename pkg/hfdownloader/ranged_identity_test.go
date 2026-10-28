@@ -242,7 +242,7 @@ func TestDownloadUnresolvedCommitDoesNotInheritStagedBytes(t *testing.T) {
 	mu.Lock()
 	ranges2 := append([]string(nil), gotRanges...)
 	mu.Unlock()
-	if !requestTouchesStart(ranges2) {
-		t.Errorf("the stale committed range was inherited; requests=%v", ranges2)
+	if len(ranges2) != 1 || ranges2[0] != "" {
+		t.Errorf("unpinned transfer requests = %v, want one full zero-start GET", ranges2)
 	}
 }

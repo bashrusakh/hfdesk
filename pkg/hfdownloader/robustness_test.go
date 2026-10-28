@@ -111,7 +111,7 @@ func TestDownloadSingle_StalledTransferAbortsAndResumes(t *testing.T) {
 	}
 
 	start := time.Now()
-	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ProgressEvent) {})
+	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Commit: "stall-test-commit", CommitPinned: true}, func(ProgressEvent) {})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("downloadSingle: %v", err)
@@ -210,7 +210,7 @@ func TestDownloadSingle_MultiStallProgressResetsBudget(t *testing.T) {
 	}
 
 	start := time.Now()
-	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Commit: "stall-test-commit", CommitPinned: true}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
@@ -812,6 +812,9 @@ func TestDownload_PermanentStatusFailsFast(t *testing.T) {
 					json.NewEncoder(w).Encode(RepoInfo{SHA: "abc123"})
 				case r.URL.Path == "/api/models/o/r/tree/abc123":
 					json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "config.json", Size: 128}})
+				case r.URL.Path == "/o/r/raw/abc123/config.json" && r.Header.Get("X-HFDesk-Addressing-Probe") == "1":
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte("x"))
 				case r.URL.Path == "/o/r/raw/abc123/config.json":
 					mu.Lock()
 					fileGets++
@@ -1418,7 +1421,7 @@ func TestDownloadSingle_OscillatingIgnoredRangeDoesNotRefund(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ProgressEvent) {})
+		done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Commit: "retry-test-commit", CommitPinned: true}, func(ProgressEvent) {})
 	}()
 
 	// Bound the test: a regression that refunds the budget forever would hang.
@@ -1856,7 +1859,7 @@ func TestDownloadSingle_GrowingPrefixBounded(t *testing.T) {
 		done := make(chan error, 1)
 		start := time.Now()
 		go func() {
-			done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ProgressEvent) {})
+			done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Commit: "retry-test-commit", CommitPinned: true}, func(ProgressEvent) {})
 		}()
 
 		var err error
@@ -1933,7 +1936,7 @@ func TestDownloadSingle_GrowingPrefixBounded(t *testing.T) {
 		done := make(chan error, 1)
 		start := time.Now()
 		go func() {
-			done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ProgressEvent) {})
+			done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Commit: "retry-test-commit", CommitPinned: true}, func(ProgressEvent) {})
 		}()
 
 		select {
@@ -2017,7 +2020,7 @@ func TestDownloadSingle_AppendCeilingBounded(t *testing.T) {
 	done := make(chan error, 1)
 	start := time.Now()
 	go func() {
-		done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ProgressEvent) {})
+		done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Commit: "retry-test-commit", CommitPinned: true}, func(ProgressEvent) {})
 	}()
 
 	select {
@@ -2189,7 +2192,7 @@ func TestDownloadSingle_RestartAboveHwmNoFreeRefund(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ProgressEvent) {})
+		done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Commit: "retry-test-commit", CommitPinned: true}, func(ProgressEvent) {})
 	}()
 
 	select {
@@ -2706,6 +2709,10 @@ func TestDownload_VerifyHeadAuthMiss(t *testing.T) {
 				headReqs++
 				mu.Unlock()
 				w.WriteHeader(headStatus)
+			case strings.HasSuffix(r.URL.Path, "config.json") && r.Header.Get("X-HFDesk-Addressing-Probe") == "1":
+				// Optional commit-addressing capability probe, not a payload transfer.
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(body[:1])
 			case strings.HasSuffix(r.URL.Path, "config.json"):
 				mu.Lock()
 				fileGets++

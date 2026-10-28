@@ -5,8 +5,10 @@ package hfdownloader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"path"
 	"path/filepath"
 	"strings"
@@ -209,6 +211,34 @@ type Plan struct {
 	// CommitPinned is true only when Commit is a resolved immutable revision.
 	// Resume requires pinned identities in both the record and current plan.
 	CommitPinned bool `json:"commit_pinned,omitempty"`
+	// CommitResolved reports whether Commit came from a successful Hub
+	// revision response rather than the job's revision-name fallback. Branch
+	// variants require a resolved commit so their content-addressed blobs and
+	// per-commit snapshots cannot be confused with another revision.
+	CommitResolved bool `json:"commitResolved,omitempty"`
+}
+
+// safeCommitName reports whether commit is a single, non-escaping path
+// component. A real Hub commit is a hex SHA, but callers may also see fixture
+// or mirror values; accepting any plain name keeps ordinary behavior while
+// still rejecting separators, traversal segments, and control characters
+// before the value is used as snapshots/<commit> or a variant metadata
+// directory.
+func safeCommitName(commit string) bool {
+	if commit == "" || len(commit) > 128 || commit == "." || commit == ".." {
+		return false
+	}
+	for _, r := range commit {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r == '.', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // PlanRepo builds the file list without downloading.
@@ -229,8 +259,24 @@ func PlanRepo(ctx context.Context, job Job, cfg Settings) (*Plan, error) {
 	return scanRepo(ctx, httpc, cfg.Token, job, cfg)
 }
 
+type planAddressingMode struct {
+	revision string
+	commit   string
+	pinned   bool
+	resolved bool
+}
+
+const (
+	addressingProbeTimeout = 250 * time.Millisecond
+	addressingProbeBudget  = 3 * time.Second
+)
+
 // scanRepo walks the repo tree and builds a download plan.
 func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings) (*Plan, error) {
+	return scanRepoMode(ctx, httpc, token, job, cfg, nil)
+}
+
+func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, forced *planAddressingMode) (*Plan, error) {
 	var items []PlanItem
 	seen := make(map[string]struct{})      // ensure each relative path appears once in the plan
 	seenLower := make(map[string]struct{}) // ensure each path appears at most once modulo case
@@ -242,30 +288,48 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	directFilterMatch := false
 	datasetMembershipMatch := false
 
-	// Fetch actual commit SHA for the revision
-	repoInfo, err := fetchRepoInfo(ctx, httpc, token, cfg.Endpoint, job)
-	if err != nil {
-		// Fall back to revision name if API call fails (e.g., some mirrors)
-		repoInfo = &RepoInfo{}
+	mode := planAddressingMode{revision: job.Revision, commit: job.Revision}
+	custom := isCustomHubEndpoint(cfg.Endpoint)
+	if forced != nil {
+		mode = *forced
+	} else {
+		repoInfo, infoErr := fetchRepoInfo(ctx, httpc, token, cfg.Endpoint, job)
+		if infoErr != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if !custom || !isEndpointStatus(infoErr, http.StatusNotFound) {
+				return nil, infoErr
+			}
+		} else if repoInfo != nil {
+			mode.commit = repoInfo.SHA
+			mode.resolved = safeCommitName(repoInfo.SHA)
+			mode.pinned = mode.resolved
+			if mode.pinned {
+				mode.revision = repoInfo.SHA
+			}
+		}
+		if !mode.pinned {
+			mode.revision = job.Revision
+			mode.commit = job.Revision
+			mode.resolved = false
+		}
 	}
-	commitSHA := repoInfo.SHA
-	commitPinned := commitSHA != ""
-	if commitSHA == "" {
-		commitSHA = job.Revision // fallback
+	if job.BranchVariant && !mode.pinned {
+		return nil, fmt.Errorf("branch variant %q requires a resolved commit from the Hub", job.Revision)
 	}
+	commitSHA, commitPinned, commitResolved := mode.commit, mode.pinned, mode.resolved
 
 	// Use one resolved commit for the tree and file URLs. Without one, retain the
 	// requested revision; known-digest transfers require proof unless Verify=none.
 	transferJob := job
-	if commitPinned {
-		transferJob.Revision = commitSHA
-	}
+	transferJob.Revision = mode.revision
 
 	// Collect every file node first. We need the full list before building the
 	// plan so we can detect a GGUF-only download and skip companion files that
 	// a self-contained GGUF doesn't need.
 	var fileNodes []hfNode
-	err = walkTree(ctx, httpc, token, cfg.Endpoint, transferJob, "", func(n hfNode) error {
+	err := walkTree(ctx, httpc, token, cfg.Endpoint, transferJob, "", func(n hfNode) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -290,6 +354,11 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		return nil
 	})
 	if err != nil {
+		if forced == nil && custom && !job.BranchVariant && mode.pinned && isEndpointStatus(err, http.StatusNotFound) &&
+			confirmedRevisionStillResolves(ctx, httpc, token, cfg.Endpoint, job, mode.commit) {
+			fallback := planAddressingMode{revision: job.Revision, commit: job.Revision}
+			return scanRepoMode(ctx, httpc, token, job, cfg, &fallback)
+		}
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -452,7 +521,6 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		}
 		rel := n.Path
 
-		// Deduplicate by relative path
 		if _, ok := seen[rel]; ok {
 			continue
 		}
@@ -670,7 +738,140 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
 		return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
 	}
-	return &Plan{Items: items, Commit: commitSHA, CommitPinned: commitPinned}, nil
+	plan := &Plan{Items: items, Commit: commitSHA, CommitPinned: commitPinned, CommitResolved: commitResolved}
+	if forced == nil && custom && !job.BranchVariant && mode.pinned {
+		probeDeadline := time.Now().Add(addressingProbeBudget)
+		useHFCache := cfg.CacheDir != "" || cfg.OutputDir == ""
+		var probeRepoDir *RepoDir
+		if useHFCache {
+			if cache, err := cfg.BuildHFCache(); err == nil {
+				repoType := RepoTypeModel
+				if job.IsDataset {
+					repoType = RepoTypeDataset
+				}
+				repoID := job.Repo
+				if job.LocalRepo != "" {
+					repoID = job.LocalRepo
+				}
+				probeRepoDir, _ = cache.Repo(repoID, repoType)
+			}
+		}
+		for _, item := range plan.Items {
+			if !addressingProbeSafeForCache(probeRepoDir, useHFCache, item) {
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			remaining := time.Until(probeDeadline)
+			if remaining <= 0 {
+				break
+			}
+			timeout := addressingProbeTimeout
+			if remaining < timeout {
+				timeout = remaining
+			}
+			probeCtx, cancelProbe := context.WithTimeout(ctx, timeout)
+			status, usable, location, probeErr := probeAddressing(probeCtx, httpc, token, item.URL, item.Size, false)
+			cancelProbe()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if probeErr != nil || !((status == http.StatusNotFound && !usable) || redirectTargetsRevision(item.URL, location, job, job.Revision)) {
+				continue
+			}
+			branchJob := job
+			branchURL := rawURL(cfg.Endpoint, branchJob, item.RelativePath)
+			if item.LFS {
+				branchURL = lfsURL(cfg.Endpoint, branchJob, item.RelativePath)
+			}
+			remaining = time.Until(probeDeadline)
+			if remaining <= 0 {
+				break
+			}
+			timeout = addressingProbeTimeout
+			if remaining < timeout {
+				timeout = remaining
+			}
+			probeCtx, cancelProbe = context.WithTimeout(ctx, timeout)
+			_, branchUsable, _, branchErr := probeAddressing(probeCtx, httpc, token, branchURL, item.Size, true)
+			cancelProbe()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if branchErr != nil || !branchUsable || !confirmedRevisionStillResolves(ctx, httpc, token, cfg.Endpoint, job, mode.commit) {
+				continue
+			}
+			fallback := planAddressingMode{revision: job.Revision, commit: job.Revision}
+			return scanRepoMode(ctx, httpc, token, job, cfg, &fallback)
+		}
+	}
+	return plan, nil
+}
+
+func isCustomHubEndpoint(endpoint string) bool {
+	return strings.TrimRight(getEndpoint(endpoint), "/") != strings.TrimRight(DefaultEndpoint, "/")
+}
+
+func isEndpointStatus(err error, status int) bool {
+	var statusErr *endpointStatusError
+	return errors.As(err, &statusErr) && statusErr.status == status
+}
+
+func confirmedRevisionStillResolves(ctx context.Context, httpc *http.Client, token, endpoint string, job Job, commit string) bool {
+	info, err := fetchRepoInfo(ctx, httpc, token, endpoint, job)
+	return err == nil && info != nil && safeCommitName(info.SHA) && info.SHA == commit
+}
+
+func redirectTargetsRevision(sourceURL, location string, job Job, revision string) bool {
+	if location == "" {
+		return false
+	}
+	source, err := url.Parse(sourceURL)
+	if err != nil {
+		return false
+	}
+	targetRef, err := url.Parse(location)
+	if err != nil {
+		return false
+	}
+	target := source.ResolveReference(targetRef)
+	path := target.EscapedPath()
+	if job.IsDataset {
+		return strings.Contains(path, "/datasets/"+job.Repo+"/raw/"+url.PathEscape(revision)+"/") ||
+			strings.Contains(path, "/datasets/"+job.Repo+"/resolve/"+url.PathEscape(revision)+"/")
+	}
+	return strings.Contains(path, "/"+job.Repo+"/raw/"+url.PathEscape(revision)+"/") ||
+		strings.Contains(path, "/"+job.Repo+"/resolve/"+url.PathEscape(revision)+"/")
+}
+
+// addressingProbeSafeForCache avoids issuing even a read-only capability GET
+// when a content-addressed cache item is already complete or its ownership
+// state is busy/unknown. The ordinary skip/ownership path remains authoritative.
+func addressingProbeSafeForCache(repoDir *RepoDir, useHFCache bool, item PlanItem) bool {
+	if item.SHA256 == "" {
+		if !useHFCache {
+			return true
+		}
+		if repoDir == nil {
+			return false
+		}
+		tmpName := "tmp-path-" + strings.ReplaceAll(item.RelativePath, "/", "_")
+		dst, err := SafeJoin(repoDir.BlobsDir(), tmpName)
+		if err != nil {
+			return false
+		}
+		busy, err := stagingOwnershipStatusProbe(dst)
+		return err == nil && !busy
+	}
+	if !useHFCache {
+		return true
+	}
+	if repoDir == nil {
+		return false
+	}
+	status, _, err := repoDir.CheckBlob(item.SHA256)
+	return err == nil && status == BlobMissing
 }
 
 // isGGUFFilePath reports whether a path names a GGUF artifact, including the
@@ -1174,16 +1375,64 @@ func isREADMEPath(filePath string) bool {
 	}
 }
 
-// destinationBase returns the base output directory for a job.
+// localDownloadBase returns the destination directory of a local (flat)
+// download.
+//
+// An ordinary download writes into the repository directory; a branch variant
+// writes into the app-owned reserved space. The two never share a
+// constructor, and the reserved-name refusal lives here, in the local
+// download's destination resolver, so the app's own space cannot be
+// rejected by it (see refuseReservedLocalOwner).
+func localDownloadBase(job Job, cfg Settings, space *BranchVariantLocalSpace) (string, error) {
+	if !job.BranchVariant {
+		// The refusal is on the owner component only: the reserved space is
+		// one level deeper than the repository directory, so a repository
+		// whose NAME is the reserved name still lives in its own subtree and
+		// never collides with the space.
+		if err := refuseReservedLocalOwner(localRepoFolder(job)); err != nil {
+			return "", err
+		}
+		return destinationBase(job, cfg)
+	}
+	if space == nil {
+		return "", errors.New("branch variant space is not resolved")
+	}
+	return space.PayloadDir(job.Revision)
+}
+
+// destinationBase returns the base output directory of an ordinary local
+// download.
+//
+// It is a pure path computation: the reserved-name refusal belongs to the
+// local download's destination resolver (see localDownloadBase).
 func destinationBase(job Job, cfg Settings) (string, error) {
 	// LocalRepo overrides the folder name: use it when the files are fetched
 	// from an upstream repo but should be stored alongside another model's files
 	// (e.g. mmproj from a base model saved next to the current model's quants).
-	repoForPath := job.Repo
+	return DestinationBase(cfg.OutputDir, localRepoFolder(job))
+}
+
+// localRepoFolder returns the repository folder a local download writes into:
+// the LocalRepo redirection when it is set, the job's repository otherwise.
+func localRepoFolder(job Job) string {
 	if job.LocalRepo != "" {
-		repoForPath = job.LocalRepo
+		return job.LocalRepo
 	}
-	return DestinationBase(cfg.OutputDir, repoForPath)
+	return job.Repo
+}
+
+// refuseReservedLocalOwner refuses a repository whose owner component is the
+// reserved app-owned branch-variant space name: an ordinary download would
+// then write into the app's own space.
+func refuseReservedLocalOwner(repo string) error {
+	owner, _, ok := strings.Cut(repo, "/")
+	if !ok {
+		return nil
+	}
+	if IsBranchVariantReservedName(owner) {
+		return fmt.Errorf("repository owner %q is reserved for the app's branch-variant storage", owner)
+	}
+	return nil
 }
 
 // ScanPlan scans a repository and emits plan_item events via the progress callback.
@@ -1195,6 +1444,10 @@ func ScanPlan(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	}
 
 	if progress != nil {
+		if !plan.CommitPinned {
+			progress(ProgressEvent{Time: time.Now().UTC(), Level: "warn", Event: "warning", Repo: job.Repo, Revision: job.Revision,
+				Message: "revision is not pinned to an immutable commit; the plan is revision-addressed"})
+		}
 		for _, item := range plan.Items {
 			progress(ProgressEvent{
 				Time:     time.Now().UTC(),

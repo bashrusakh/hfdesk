@@ -238,7 +238,7 @@ func newPlainHub(t *testing.T, total int, sha string, body []byte) (*httptest.Se
 		case strings.Contains(r.URL.Path, "/tree/"):
 			_, _ = w.Write([]byte("[" + lfsTreeNode("model.bin", total, sha) + "]"))
 		case strings.Contains(r.URL.Path, "/resolve/"):
-			if r.Method == http.MethodGet {
+			if r.Method == http.MethodGet && r.Header.Get("X-HFDesk-Addressing-Probe") != "1" {
 				mu.Lock()
 				served++
 				mu.Unlock()

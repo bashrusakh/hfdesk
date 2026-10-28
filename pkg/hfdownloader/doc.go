@@ -316,9 +316,36 @@ owner — that owner is still writing to it.
 
 Resolve one commit for the tree walk and every per-file URL (`lfsURL`, `rawURL`);
 otherwise a moving branch can make the recorded identity describe different
-files or bytes. If repo info fails or has no SHA, keep the requested revision
-as fallback identity and mark it unpinned. No staged bytes are inherited; a
-known digest with `Verify != "none"` requires the Publication content proof.
+files or bytes. Hugging Face and commit-capable endpoints stay pinned. Branch
+variants are always pinned and fail before destination reservation if the
+endpoint cannot resolve their revision.
+
+An ordinary custom endpoint may use the established revision-name fallback
+only when commit addressing is confirmed unavailable. A valid revision response
+without a SHA or a direct revision-lookup 404, followed by a successful
+validated tree for the requested branch, retains the existing unresolved
+endpoint mode. When metadata resolves to commit A, a direct commit-addressed
+tree/file 404 qualifies only when the matching requested-branch operation
+succeeds and a fresh metadata lookup still resolves the branch to A. File
+probes are bounded GETs with a one-byte range, use the same path/authentication,
+and preserve ordinary CDN redirects. A redirect that explicitly rewrites A to
+the mutable branch is not accepted as pinned. Transport, cancellation,
+authentication, throttling, server, decode, redirect, or other inconclusive
+errors never authorize fallback. Branch variants never fall back.
+
+Mode selection finishes before `OnPlanComplete` or `plan_item` events. On a
+qualifying incompatibility the complete candidate is rebuilt from the branch
+tree and all final URLs use that same branch mode; transfer errors never switch
+the mode mid-job. An unpinned plan records the requested revision as its
+effective identity, does not inherit staged bytes, and uses the single-request
+route with every retry starting from byte zero. The output is revision-addressed,
+not an immutable commit snapshot: no commit is written into the manifest or
+`refs/<revision>`. Branch movement can yield files from different moments and
+cannot be made immutable by this compatibility exception. A known digest with
+`Verify != "none"` still requires the Publication content proof; `Verify=none`
+does not gain a hash requirement. Probe failures that do not prove branch-only
+support are optional diagnostics and do not gate cached skips or otherwise
+working pinned transfers.
 
 The single-request path needs an identity sidecar because its staging name is not
 an identity: path-derived items and revisions can share one name, and size alone

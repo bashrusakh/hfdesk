@@ -87,6 +87,10 @@ func TestDownload_AppendFilterResumesVersionedStateAfterThresholdIncrease(t *tes
 		case r.Method == http.MethodHead && strings.HasSuffix(r.URL.Path, "/model-Q4_K_M.gguf"):
 			w.Header().Set("Content-Length", fmt.Sprint(size))
 			w.Header().Set("Accept-Ranges", "bytes")
+		case r.Method == http.MethodGet && r.Header.Get("X-HFDesk-Addressing-Probe") == "1":
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", size))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(full[:1])
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/model-Q4_K_M.gguf"):
 			ranges.Add(1)
 			requested.Store(r.Header.Get("Range"))

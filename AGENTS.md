@@ -171,8 +171,13 @@ or job ownership behavior. This section is the agent-level summary; when it and
   matching identity pinned on both sides (repo, commit, path, size, through the
   one shared `resumeIdentity.matches` rule); the single-path exact-size shortcut
   also requires `framing_complete`. The whole transfer (tree walk and every
-  per-file URL) is pinned to the resolved commit; an unpinned identity inherits
-  nothing and is content-proved before publication. An oversized `.part` is
+  per-file URL) is pinned to the resolved commit. Ordinary custom endpoints may
+  select a confirmed branch-only mode before plan callbacks/reservations; it
+  rebuilds the whole plan, inherits no partials, retries from zero, and makes no
+  immutable snapshot/ref/manifest claim. Arbitrary network/auth/server errors
+  never downgrade, transfers never switch modes mid-job, and branch variants
+  remain pinned. Known-digest proof still follows `Settings.Verify`. An
+  oversized `.part` is
   discarded, never clamped. The sidecar goes only when its partial is actually
   gone; only a not-exist `stat` proves that.
 - Only a content-addressed `blobs/<known-sha>` target is completion proof by

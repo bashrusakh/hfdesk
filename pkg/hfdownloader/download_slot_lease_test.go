@@ -96,6 +96,10 @@ func newSlotLeaseHub(t *testing.T, files []slotLeaseFile, gateFirst bool) *slotL
 				http.NotFound(w, r)
 				return
 			}
+			if r.Header.Get("X-HFDesk-Addressing-Probe") == "1" {
+				http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body))
+				return
+			}
 			if r.Method == http.MethodHead {
 				if h.omitSize[rel] {
 					// Keep range support while leaving size unresolved.

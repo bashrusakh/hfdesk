@@ -54,6 +54,10 @@ func newCrossRouteHeadHub(t *testing.T, full []byte, rel string, gated bool) *cr
 				http.NotFound(w, r)
 				return
 			}
+			if r.Header.Get("X-HFDesk-Addressing-Probe") == "1" {
+				http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+				return
+			}
 			h.gets.Add(1)
 			if gated {
 				h.enterOnce.Do(func() { close(h.entered) })

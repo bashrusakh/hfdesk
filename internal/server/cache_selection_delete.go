@@ -163,11 +163,33 @@ func frozenMutationOverlapsRawEntryWithKey(frozen frozenMutationPath, incoming s
 	return pathKeysOverlap(frozen.key, key(entry))
 }
 
+// jobDestinationBase returns the directory a job writes into.
+//
+// An ordinary local job writes into its repository directory below the local
+// root. A local branch variant does not: the downloader writes the branch
+// payload into the app-owned reserved space, so modeling it as a writer of
+// the ordinary repository tree would invent a conflict with that tree and
+// miss the space it really writes. The space owns that layout, so the
+// destination is resolved through it and names the very path the downloader
+// writes to.
 func jobDestinationBase(job *Job) string {
 	if job.Flat || job.LocalDir != "" {
 		root := job.LocalDir
 		if root == "" {
 			root = job.OutputDir
+		}
+		if job.BranchVariant {
+			// The space is built from the job's repository, like the downloader
+			// builds it.
+			space, err := hfdownloader.NewBranchVariantLocalSpace(root, job.Repo)
+			if err != nil {
+				return ""
+			}
+			payload, err := space.PayloadDir(job.Revision)
+			if err != nil {
+				return ""
+			}
+			return payload
 		}
 		repo := job.Repo
 		if job.LocalRepo != "" {
@@ -982,6 +1004,13 @@ func hfJobRepoDir(job *Job) (*hfdownloader.RepoDir, error) {
 	return repo, nil
 }
 
+// jobPlannedWriteEntries enumerates the destinations a job's plan writes.
+//
+// The entries are the plan's relative paths under the job's destination, so
+// they follow jobDestinationBase: an ordinary local job's entries land in its
+// repository directory, and a local branch variant's entries land in the
+// reserved payload directory the downloader really writes to. An HF-cache job
+// also lists its per-commit snapshot path, the other place it writes.
 func jobPlannedWriteEntries(job *Job, plan hfdownloader.Plan) ([]string, bool) {
 	base := jobDestinationBase(job)
 	if base == "" {

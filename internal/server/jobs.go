@@ -47,10 +47,11 @@ type Job struct {
 	OutputDir          string            `json:"outputDir"`
 	HubDir             string            `json:"hubDir,omitempty"` // Exact frozen Hub; OutputDir remains the friendly/app root.
 	DestinationWarning string            `json:"destinationWarning,omitempty"`
-	LocalDir           string            `json:"localDir,omitempty"`   // Effective local-dir for this job (per-request or server-global)
-	LocalRepo          string            `json:"localRepo,omitempty"`  // Override destination folder name (used for upstream mmproj)
-	Flat               bool              `json:"flat,omitempty"`       // Save real files (flat mode) instead of HF cache layout
-	ExactMatch         bool              `json:"exactMatch,omitempty"` // Match filters by whole name segment, not substring
+	LocalDir           string            `json:"localDir,omitempty"`      // Effective local-dir for this job (per-request or server-global)
+	LocalRepo          string            `json:"localRepo,omitempty"`     // Override destination folder name (used for upstream mmproj)
+	BranchVariant      bool              `json:"branchVariant,omitempty"` // Whole EXL branch selected by revision
+	Flat               bool              `json:"flat,omitempty"`          // Save real files (flat mode) instead of HF cache layout
+	ExactMatch         bool              `json:"exactMatch,omitempty"`    // Match filters by whole name segment, not substring
 	Status             JobStatus         `json:"status"`
 	Phase              string            `json:"phase,omitempty"` // sub-state while running, e.g. "finalizing"
 	Progress           JobProgress       `json:"progress"`
@@ -197,7 +198,6 @@ const wsBroadcastMinGap = 250 * time.Millisecond
 var errJobManagerStopping = errors.New("job manager is stopping")
 var errJobManagerPersistenceClosed = errors.New("job manager persistence is closed")
 
-// NewJobManager creates a new job manager.
 func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
 	return newJobManagerWithStatePath(cfg.captureCacheEnvironment(), wsHub, JobsStatePath())
 }
@@ -382,7 +382,6 @@ func (m *JobManager) saveStateAndLog() {
 	}
 }
 
-// generateID creates a short random ID.
 func generateID() string {
 	b := make([]byte, 6)
 	rand.Read(b)
@@ -441,7 +440,6 @@ func (m *JobManager) cloneJobLocked(j *Job) *Job {
 		j.partialFilesMu.Unlock()
 	}
 
-	// Deep-copy slices/pointers.
 	if j.Filters != nil {
 		clone.Filters = append([]string(nil), j.Filters...)
 	}
@@ -484,10 +482,10 @@ func stringSlicesEqual(a, b []string) bool {
 	return true
 }
 
-// CreateJob creates a new download job.
-// Returns existing job only when repo, revision, dataset, destination and
-// filters match an active job. Different filters on the same repo (e.g.
-// Q4_K_M vs mmproj-f16) create independent jobs.
+// CreateJob creates a new download job, or returns the existing one when
+// repo, revision, dataset, destination and filters match an active job.
+// Different filters on the same repo (e.g. Q4_K_M vs mmproj-f16) create
+// independent jobs.
 //
 // The destination is resolved from the current settings at creation and
 // frozen on the job: later settings changes never move an existing job's
@@ -560,6 +558,7 @@ resolveRequest:
 			existing.Flat == flat &&
 			pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) &&
 			existing.LocalRepo == req.LocalRepo &&
+			existing.BranchVariant == req.BranchVariant &&
 			existing.ExactMatch == req.ExactMatch &&
 			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
 			stringSlicesEqual(existing.Filters, req.Filters) &&
@@ -571,22 +570,23 @@ resolveRequest:
 	}
 
 	job := &Job{
-		ID:         generateID(),
-		Repo:       req.Repo,
-		Revision:   revision,
-		IsDataset:  req.Dataset,
-		Filters:    req.Filters,
-		Excludes:   req.Excludes,
-		OutputDir:  outputDir,
-		HubDir:     hubDir,
-		LocalDir:   effectiveLocalDir,
-		LocalRepo:  req.LocalRepo,
-		Flat:       flat,
-		ExactMatch: req.ExactMatch,
-		RouteKey:   routeKey,
-		Status:     JobStatusQueued,
-		CreatedAt:  time.Now(),
-		Progress:   JobProgress{},
+		ID:            generateID(),
+		Repo:          req.Repo,
+		Revision:      revision,
+		IsDataset:     req.Dataset,
+		Filters:       req.Filters,
+		Excludes:      req.Excludes,
+		OutputDir:     outputDir,
+		HubDir:        hubDir,
+		LocalDir:      effectiveLocalDir,
+		LocalRepo:     req.LocalRepo,
+		BranchVariant: req.BranchVariant,
+		Flat:          flat,
+		ExactMatch:    req.ExactMatch,
+		RouteKey:      routeKey,
+		Status:        JobStatusQueued,
+		CreatedAt:     time.Now(),
+		Progress:      JobProgress{},
 		// partialFilesMu is allocated at job creation so cloneJobLocked
 		// can read it without a nil check; the tracker map is left
 		// nil until runJob wires it.
@@ -656,6 +656,7 @@ resolveRequest:
 			if existing.Repo == req.Repo && existing.Revision == revision && existing.IsDataset == req.Dataset &&
 				pathIdentityKey(existing.OutputDir) == reqDestKey && existing.Flat == flat &&
 				pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) && existing.LocalRepo == req.LocalRepo &&
+				existing.BranchVariant == req.BranchVariant &&
 				existing.ExactMatch == req.ExactMatch && (existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
 				stringSlicesEqual(existing.Filters, req.Filters) && stringSlicesEqual(existing.Excludes, req.Excludes) {
 				a.Close()
@@ -1008,7 +1009,6 @@ func (m *JobManager) DeleteJob(id string) bool {
 	}
 	m.opWG.Add(1)
 
-	// Cancel if running
 	if job.cancel != nil && (job.Status == JobStatusQueued || job.Status == JobStatusRunning) {
 		job.cancel()
 	}
@@ -1506,7 +1506,6 @@ const speedWindow = 10 * time.Second
 // derived from it) jump around. Samples are throttled to a few per second so
 // the window stays small. now is passed in for deterministic testing.
 func updateJobSpeed(job *Job, transferred int64, now time.Time) {
-	// Throttle to a few samples per second.
 	if n := len(job.speedSamples); n > 0 && now.Sub(job.speedSamples[n-1].t) < 400*time.Millisecond {
 		return
 	}
@@ -1688,7 +1687,6 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 	}
 }
 
-// runJob executes the download job.
 func (m *JobManager) runJob(job *Job, activityID uint64) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer func() {
@@ -1703,7 +1701,6 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		m.runWG.Done()
 	}()
 
-	// Increment generation and store our generation number
 	m.mu.Lock()
 	if m.fenced {
 		job.starting = false
@@ -1725,7 +1722,6 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 	m.mu.Unlock()
 	m.notifyListeners(startSnap)
 
-	// Create download job and settings
 	dlJob := hfdownloader.Job{
 		Repo:               job.Repo,
 		Revision:           job.Revision,
@@ -1735,6 +1731,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		ExactMatch:         job.ExactMatch,
 		AppendFilterSubdir: false,
 		LocalRepo:          job.LocalRepo,
+		BranchVariant:      job.BranchVariant,
 	}
 
 	// Snapshot the manager config under the lock: a concurrent POST /api/settings
@@ -1847,10 +1844,8 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		m.notifyListeners(progressSnap)
 	}
 
-	// Run the download
 	err := hfdownloader.Run(ctx, dlJob, settings, progressFunc)
 
-	// Update final status
 	m.mu.Lock()
 	// Don't update status if:
 	// 1. Job was paused (user intentionally stopped it)

@@ -43,7 +43,7 @@ func recordingHub(t *testing.T, full []byte, rel string, lfs bool) (*httptest.Se
 		case strings.Contains(r.URL.Path, "/tree/"):
 			_, _ = w.Write([]byte("[" + node + "]"))
 		case strings.Contains(r.URL.Path, "/resolve/") || strings.Contains(r.URL.Path, "/raw/"):
-			if r.Method == http.MethodGet {
+			if r.Method == http.MethodGet && r.Header.Get("X-HFDesk-Addressing-Probe") != "1" {
 				mu.Lock()
 				ranges = append(ranges, r.Header.Get("Range"))
 				mu.Unlock()

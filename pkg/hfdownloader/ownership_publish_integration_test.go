@@ -255,7 +255,7 @@ func TestDownloadSingle_FinalByteRequiresResponseFraming(t *testing.T) {
 	dst := filepath.Join(dir, "final-byte.bin")
 	it := PlanItem{RelativePath: "final-byte.bin", URL: srv.URL, Size: total}
 	cfg := Settings{Verify: "size", Retries: 1, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}
-	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Commit: "framing-test-commit", CommitPinned: true}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadSingle: %v (clean final-byte framing retry should recover)", err)
 	}
 	assertExactFile(t, dst, full)
@@ -541,6 +541,11 @@ func TestDownloadUnknownSizeLFSStoresSinglePathFallbackCorrectly(t *testing.T) {
 					// Both tree Size and LFS.Size are intentionally omitted.
 					node := fmt.Sprintf(`{"type":"file","path":"unknown.bin","lfs":{"oid":%q,"sha256":%q}}`, sha, sha)
 					_, _ = w.Write([]byte("[" + node + "]"))
+				case strings.Contains(r.URL.Path, "/resolve/") && r.Header.Get("X-HFDesk-Addressing-Probe") == "1":
+					w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(tc.body)))
+					w.Header().Set("Content-Length", "1")
+					w.WriteHeader(http.StatusPartialContent)
+					_, _ = w.Write(tc.body[:1])
 				case strings.Contains(r.URL.Path, "/resolve/") && r.Method == http.MethodHead:
 					// The HEAD advertises range support but omits Content-Length too.
 					heads.Add(1)

@@ -335,12 +335,18 @@ func testDownloadSameProcessSiblingWriter(t *testing.T, threshold string) {
 		case strings.Contains(r.URL.Path, "/tree/"):
 			_, _ = w.Write([]byte("[" + lfsTreeNode("model.bin", total, sha) + "]"))
 		case strings.Contains(r.URL.Path, "/resolve/"):
+			if r.Header.Get("X-HFDesk-Addressing-Probe") == "1" {
+				http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+				return
+			}
 			if r.Method == http.MethodGet {
-				mu.Lock()
-				ranges = append(ranges, r.Header.Get("Range"))
-				mu.Unlock()
-				getOnce.Do(func() { close(firstGet) })
-				<-release
+				if r.Header.Get("Range") != "bytes=0-0" {
+					mu.Lock()
+					ranges = append(ranges, r.Header.Get("Range"))
+					mu.Unlock()
+					getOnce.Do(func() { close(firstGet) })
+					<-release
+				}
 			}
 			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
 		default:

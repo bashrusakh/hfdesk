@@ -112,6 +112,10 @@ func TestCacheTransferHoldsOnlyTheDestinationDomainLock(t *testing.T) {
 		case strings.Contains(r.URL.Path, "/tree/"):
 			_, _ = w.Write([]byte("[" + node + "]"))
 		case strings.Contains(r.URL.Path, "/resolve/"):
+			if r.Header.Get("X-HFDesk-Addressing-Probe") == "1" {
+				http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+				return
+			}
 			if r.Method == http.MethodGet {
 				enterOnce.Do(func() { close(entered) })
 				select {

@@ -4,6 +4,9 @@
 package hfdownloader
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -268,6 +271,72 @@ func TestShouldSkipLocal(t *testing.T) {
 		// Actually, size 0 != 4, so it won't match
 		if skip {
 			t.Error("should not skip when expected size is 0")
+		}
+	})
+}
+
+// TestShouldSkipLocalByHash pins the branch variant's skip rule: a branch
+// variant is pinned to the commit its plan resolved, so a published file may
+// be reused only when its content is proven to be that commit's content.
+//
+// The rule is compared with the ordinary rule on the same file, so the
+// preserved ordinary behavior and the branch variant's stricter behavior
+// cannot drift apart unnoticed.
+func TestShouldSkipLocalByHash(t *testing.T) {
+	tmpDir := t.TempDir()
+	content := []byte("same length, other bytes")
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+	filePath := filepath.Join(tmpDir, "branchVariant.txt")
+	if err := os.WriteFile(filePath, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("matching digest skips with the ordinary reason", func(t *testing.T) {
+		item := PlanItem{RelativePath: "test.txt", Size: int64(len(content)), SHA256: digest}
+		skip, reason, err := shouldSkipLocalByHashCtx(context.Background(), item, filePath)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !skip {
+			t.Fatal("should skip when the content hash matches")
+		}
+		// The reason is the one the ordinary path reports for a
+		// hash-verified skip.
+		if reason != "sha256 match" {
+			t.Errorf("reason = %q, want 'sha256 match'", reason)
+		}
+	})
+
+	t.Run("mismatching digest does not skip on equal size", func(t *testing.T) {
+		other := sha256.Sum256([]byte("other bytes, same length"))
+		item := PlanItem{RelativePath: "test.txt", Size: int64(len(content)), SHA256: hex.EncodeToString(other[:])}
+		skip, _, err := shouldSkipLocalByHashCtx(context.Background(), item, filePath)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if skip {
+			t.Error("should not skip when the content hash does not match")
+		}
+		// The ordinary rule is unchanged: the same file is still reused on
+		// size equality there.
+		ordinarySkip, ordinaryReason, err := shouldSkipLocal(item, filePath)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !ordinarySkip || ordinaryReason != "size match" {
+			t.Errorf("ordinary skip = %v (%q), want true ('size match')", ordinarySkip, ordinaryReason)
+		}
+	})
+
+	t.Run("unknown digest does not skip on equal size", func(t *testing.T) {
+		item := PlanItem{RelativePath: "test.txt", Size: int64(len(content))}
+		skip, _, err := shouldSkipLocalByHashCtx(context.Background(), item, filePath)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if skip {
+			t.Error("should not skip when no content hash is known")
 		}
 	})
 }

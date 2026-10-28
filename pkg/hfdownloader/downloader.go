@@ -5,6 +5,8 @@ package hfdownloader
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -176,8 +178,10 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		if err != nil {
 			return fmt.Errorf("create repo dir: %w", err)
 		}
-		if err := repoDir.EnsureDirs(); err != nil {
-			return fmt.Errorf("ensure repo dirs: %w", err)
+		if !job.BranchVariant {
+			if err := repoDir.EnsureDirs(); err != nil {
+				return fmt.Errorf("ensure repo dirs: %w", err)
+			}
 		}
 	} else {
 		if cfg.OutputDir == "" {
@@ -205,6 +209,10 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 			progress(ev)
 		}
 	}
+	failBranchVariant := func(err error) error {
+		emit(ProgressEvent{Level: "error", Event: "error", Message: err.Error()})
+		return err
+	}
 
 	emit(ProgressEvent{Event: "scan_start", Message: "scanning repo"})
 
@@ -212,7 +220,37 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 
 	plan, err := scanRepo(ctx, httpc, cfg.Token, job, cfg)
 	if err != nil {
+		if job.BranchVariant {
+			return failBranchVariant(err)
+		}
 		return err
+	}
+	var localSpace *BranchVariantLocalSpace
+	if job.BranchVariant {
+		if !plan.CommitPinned || !plan.CommitResolved {
+			return failBranchVariant(fmt.Errorf("branch variant %q requires a pinned resolved commit", job.Revision))
+		}
+		if useHFCache {
+			if err := repoDir.EnsureDirs(); err != nil {
+				return failBranchVariant(fmt.Errorf("ensure repo dirs: %w", err))
+			}
+		} else {
+			space, err := NewBranchVariantLocalSpace(cfg.OutputDir, job.Repo)
+			if err != nil {
+				return failBranchVariant(fmt.Errorf("resolve branch variant space: %w", err))
+			}
+			localSpace = &space
+			if err := space.InvalidateRecords(job.Revision); err != nil {
+				return failBranchVariant(fmt.Errorf("invalidate prior branch variant completion records: %w", err))
+			}
+			if err := space.ensureStagingTree(job.Revision, plan.Commit); err != nil {
+				return failBranchVariant(fmt.Errorf("unsafe branch variant layout: %w", err))
+			}
+		}
+	}
+	friendlyView := !cfg.NoFriendlyView && !job.BranchVariant
+	if !plan.CommitPinned {
+		emit(ProgressEvent{Level: "warn", Event: "warning", Message: "revision is not pinned to an immutable commit; partial bytes will not be resumed across calls and cache metadata is revision-addressed"})
 	}
 	var plannedBytes int64
 	for _, item := range plan.Items {
@@ -239,7 +277,7 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	}
 
 	if !useHFCache {
-		base, err := destinationBase(job, cfg)
+		base, err := localDownloadBase(job, cfg, localSpace)
 		if err != nil {
 			return err
 		}
@@ -304,16 +342,26 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 
 	var manifestBuilder *ManifestBuilder
 	var manifestMu sync.Mutex
-	if useHFCache && !cfg.NoManifest {
+	if job.BranchVariant || (useHFCache && !cfg.NoManifest) {
 		manifestBuilder = NewManifestBuilder(job, cfg.Command)
-		manifestBuilder.SetCommit(plan.Commit)
-		// RepoPath describes the selected physical repository, relative to the
-		// friendly root when possible (absolute on different Windows volumes).
-		rel, err := filepath.Rel(hfCache.Root, repoDir.Path())
-		if err != nil {
-			rel = repoDir.Path()
+		if plan.CommitPinned {
+			manifestBuilder.SetCommit(plan.Commit)
 		}
-		manifestBuilder.manifest.RepoPath = filepath.ToSlash(rel)
+		if useHFCache {
+			// RepoPath describes the selected physical repository, relative to the
+			// friendly root when possible (absolute on different Windows volumes).
+			rel, err := filepath.Rel(hfCache.Root, repoDir.Path())
+			if err != nil {
+				rel = repoDir.Path()
+			}
+			manifestBuilder.manifest.RepoPath = filepath.ToSlash(rel)
+		} else if job.BranchVariant {
+			repoPath, err := localSpace.PayloadRepoPath(job.Revision)
+			if err != nil {
+				return fmt.Errorf("branch variant revision %q: %w", job.Revision, err)
+			}
+			manifestBuilder.manifest.RepoPath = repoPath
+		}
 	}
 
 LOOP:
@@ -352,6 +400,7 @@ LOOP:
 			}
 
 			var dst string
+			var publishPath string
 			var skipCheck func() (bool, string, error)
 
 			if useHFCache {
@@ -365,7 +414,7 @@ LOOP:
 						}
 						if status == BlobComplete {
 							// The cached payload is insufficient if its requested links fail.
-							if err := cacheEntryLinkCreate(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, cfg.NoFriendlyView); err != nil {
+							if err := cacheEntryLinkCreate(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, !friendlyView); err != nil {
 								return false, "", err
 							}
 							return true, "blob exists", nil
@@ -383,6 +432,9 @@ LOOP:
 				if it.SHA256 == "" {
 					// The reserved path- prefix keeps this key distinct from SHA domains.
 					tmpName = "tmp-path-" + strings.ReplaceAll(it.RelativePath, "/", "_")
+					if job.BranchVariant {
+						tmpName = branchVariantStagingName(job.Revision, plan.Commit, it)
+					}
 				}
 				// Confine the remote-derived temp name to blobs/.
 				safeDst, err := SafeJoin(repoDir.BlobsDir(), tmpName)
@@ -397,7 +449,7 @@ LOOP:
 				}
 				dst = safeDst
 			} else {
-				base, err := destinationBase(job, cfg)
+				base, err := localDownloadBase(job, cfg, localSpace)
 				if err != nil {
 					fatal := fmt.Errorf("path traversal: %w", err)
 					setFatalErr(fatal)
@@ -408,7 +460,7 @@ LOOP:
 					return
 				}
 				// Confine the Hub-provided path to the output directory.
-				safeDst, err := SafeJoin(base, finalRel)
+				publishPath, err = SafeJoin(base, finalRel)
 				if err != nil {
 					fatal := fmt.Errorf("path traversal: %q would escape output directory", finalRel)
 					setFatalErr(fatal)
@@ -418,9 +470,23 @@ LOOP:
 					}
 					return
 				}
-				dst = safeDst
+				if job.BranchVariant {
+					dst, err = localSpace.stagingPath(job.Revision, plan.Commit, finalRel)
+					if err != nil {
+						select {
+						case errCh <- fmt.Errorf("resolve branch variant staging path: %w", err):
+						default:
+						}
+						return
+					}
+				} else {
+					dst = publishPath
+				}
 				skipCheck = func() (bool, string, error) {
-					return shouldSkipLocalCtx(fileCtx, it, dst)
+					if job.BranchVariant {
+						return shouldSkipLocalByHashCtx(fileCtx, it, publishPath)
+					}
+					return shouldSkipLocalCtx(fileCtx, it, publishPath)
 				}
 			}
 
@@ -447,7 +513,11 @@ LOOP:
 					atomic.AddInt64(&skippedCount, 1)
 					if manifestBuilder != nil {
 						manifestMu.Lock()
-						manifestBuilder.AddFile(it.RelativePath, it.SHA256, it.Size, it.LFS)
+						blobHash := it.SHA256
+						if !useHFCache {
+							blobHash = ""
+						}
+						manifestBuilder.AddFile(it.RelativePath, blobHash, it.Size, it.LFS)
 						manifestMu.Unlock()
 					}
 				}
@@ -497,7 +567,7 @@ LOOP:
 			if hasResumableStagingState(versionedStaging, versionedStaging+".meta", itForIO, job, plan.Commit, plan.CommitPinned) {
 				resumeStaging = versionedStaging
 			}
-			multipartRan := it.Size >= thresholdBytes && it.AcceptRanges
+			multipartRan := plan.CommitPinned && it.Size >= thresholdBytes && it.AcceptRanges
 			if !multipartRan && it.AcceptRanges && resumeStaging != "" {
 				multipartRan = true
 			}
@@ -587,7 +657,7 @@ LOOP:
 
 			if errors.Is(dlErr, errBlobAlreadyComplete) {
 				if useHFCache && it.SHA256 != "" {
-					if err := cacheEntryLinkCreate(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, cfg.NoFriendlyView); err != nil {
+					if err := cacheEntryLinkCreate(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, !friendlyView); err != nil {
 						fatal := fmt.Errorf("download %s: %w", finalRel, err)
 						select {
 						case errCh <- fatal:
@@ -605,7 +675,11 @@ LOOP:
 					atomic.AddInt64(&skippedCount, 1)
 					if manifestBuilder != nil {
 						manifestMu.Lock()
-						manifestBuilder.AddFile(it.RelativePath, it.SHA256, it.Size, it.LFS)
+						blobHash := it.SHA256
+						if !useHFCache {
+							blobHash = ""
+						}
+						manifestBuilder.AddFile(it.RelativePath, blobHash, it.Size, it.LFS)
 						manifestMu.Unlock()
 					}
 				}
@@ -739,7 +813,7 @@ LOOP:
 			case blobDirect && multipartRan:
 				// The ranged route already published the blob; create its required cache
 				// links. NoFriendlyView omits only the friendly entry, not the snapshot.
-				if err := cacheEntryLinkCreate(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, cfg.NoFriendlyView); err != nil {
+				if err := cacheEntryLinkCreate(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, !friendlyView); err != nil {
 					select {
 					case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):
 					default:
@@ -751,7 +825,7 @@ LOOP:
 				sha := it.SHA256
 				// The store reuses this domain when it covers the blob key, or acquires the
 				// computed blob's domain for a path-derived item before placement.
-				result, err := repoDir.storeDownloadedFileInDomain(fileCtx, dst, it.RelativePath, plan.Commit, sha, filterSubdir, cfg.NoFriendlyView, domain)
+				result, err := repoDir.storeDownloadedFileInDomain(fileCtx, dst, it.RelativePath, plan.Commit, sha, filterSubdir, !friendlyView, domain)
 				if err != nil {
 					select {
 					case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):
@@ -761,6 +835,15 @@ LOOP:
 				}
 				finalSHA256 = result.SHA256 // Use computed SHA256 from store result
 			default:
+				if job.BranchVariant {
+					if err := publishBranchVariantFile(dst, publishPath); err != nil {
+						select {
+						case errCh <- fmt.Errorf("publish branch variant file %s: %w", finalRel, err):
+						default:
+						}
+						return
+					}
+				}
 				finalSHA256 = it.SHA256
 			}
 
@@ -782,7 +865,11 @@ LOOP:
 			// Add to manifest with actual LFS info from API and final SHA256
 			if manifestBuilder != nil {
 				manifestMu.Lock()
-				manifestBuilder.AddFile(it.RelativePath, finalSHA256, it.Size, it.LFS)
+				blobHash := finalSHA256
+				if !useHFCache {
+					blobHash = ""
+				}
+				manifestBuilder.AddFile(it.RelativePath, blobHash, it.Size, it.LFS)
 				manifestMu.Unlock()
 			}
 
@@ -810,7 +897,7 @@ LOOP:
 			if cerr != nil || status != BlobComplete {
 				continue
 			}
-			if err := cacheEntryLinkCreate(jobCtx, repoDir, link.commit, link.relativePath, link.filterSubdir, link.sha256, cfg.NoFriendlyView); err != nil {
+			if err := cacheEntryLinkCreate(jobCtx, repoDir, link.commit, link.relativePath, link.filterSubdir, link.sha256, !friendlyView); err != nil {
 				if reconcileErr == nil {
 					reconcileErr = err
 				}
@@ -858,7 +945,7 @@ LOOP:
 	// script, manifest) can take a while — copying the friendly view on
 	// filesystems without symlink support is the slow part — so signal the
 	// phase to the UI instead of leaving the job stuck at 100%.
-	if useHFCache && repoDir != nil && !cfg.NoFriendlyView {
+	if useHFCache && repoDir != nil && friendlyView {
 		emit(ProgressEvent{Event: "finalizing", Message: "finalizing"})
 	}
 
@@ -869,11 +956,16 @@ LOOP:
 		if ref == "" {
 			ref = "main"
 		}
-		if err := repoDir.WriteRef(ref, plan.Commit); err != nil {
-			emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to write ref: %v", err)})
+		if plan.CommitPinned {
+			if err := repoDir.WriteRef(ref, plan.Commit); err != nil {
+				if job.BranchVariant {
+					return failBranchVariant(fmt.Errorf("write ref %q: %w", ref, err))
+				}
+				emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to write ref: %v", err)})
+			}
 		}
 		// Ensure friendly directory structure exists (unless disabled)
-		if !cfg.NoFriendlyView {
+		if friendlyView {
 			if err := repoDir.EnsureFriendlyDir(); err != nil {
 				emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to create friendly dir: %v", err)})
 			}
@@ -881,17 +973,33 @@ LOOP:
 	}
 
 	// Write/update the rebuild shell script if using HF cache (unless friendly view disabled)
-	if hfCache != nil && !cfg.NoFriendlyView {
+	if hfCache != nil && friendlyView {
 		if _, err := hfCache.WriteRebuildScript(); err != nil {
 			emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to write rebuild script: %v", err)})
 		}
 	}
 
 	// Write manifest file (hfd.yaml) if using HF cache (unless friendly view disabled)
-	if manifestBuilder != nil && repoDir != nil && !cfg.NoFriendlyView {
+	if manifestBuilder != nil && repoDir != nil && friendlyView {
 		manifest := manifestBuilder.Build()
 		if _, err := manifest.Write(repoDir.FriendlyPath()); err != nil {
 			emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to write manifest: %v", err)})
+		}
+	}
+	if job.BranchVariant {
+		manifest := manifestBuilder.Build()
+		var manifestDir string
+		var err error
+		if useHFCache {
+			manifestDir, err = BranchVariantManifestDir(repoDir, job.Revision, plan.Commit)
+		} else {
+			manifestDir, err = localSpace.RecordDir(job.Revision, plan.Commit)
+		}
+		if err == nil {
+			_, err = manifest.Write(manifestDir)
+		}
+		if err != nil {
+			return failBranchVariant(fmt.Errorf("write branch variant completion manifest: %w", err))
 		}
 	}
 
@@ -905,6 +1013,21 @@ LOOP:
 		"skipped", skippedCount,
 	)
 	return nil
+}
+
+func branchVariantStagingName(revision, commit string, item PlanItem) string {
+	if canonicalSHA256(item.SHA256) {
+		return "tmp-" + item.SHA256
+	}
+	sum := sha256.Sum256([]byte(revision + "\x00" + commit + "\x00" + item.RelativePath))
+	return "tmp-path-" + hex.EncodeToString(sum[:])
+}
+
+func publishBranchVariantFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	return os.Rename(src, dst)
 }
 
 // cleanupPartialsOnCancel removes single/legacy partials after explicit cancel.
@@ -1312,6 +1435,20 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	var lastEmit time.Time
 
 	for {
+		unpinnedRestart := !opts.CommitPinned && attempt > 0
+		if unpinnedRestart {
+			// A mutable branch identity cannot authorize stitching bytes from
+			// separate responses. Retry the complete file from byte zero.
+			if err := out.Truncate(0); err != nil {
+				return false, err
+			}
+			pos, countedUpTo = 0, 0
+			forceLastByteRange = false
+			identity.FramingComplete = false
+			if err := writeSinglePartIdentity(sidecar, identity); err != nil {
+				return false, fmt.Errorf("write single-part identity %s: %w", sidecar, err)
+			}
+		}
 		select {
 		case <-ctx.Done():
 			out.Close()
@@ -1336,7 +1473,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		// RateLimit header must shape the next wait.
 		var waitResp *http.Response
 		// Ignored-Range 200 restarts are destructive, not progress refunds.
-		truncatedRestart := false
+		truncatedRestart := unpinnedRestart
 		// preHwm is the high-water mark as of the start of this attempt; the
 		// refund decision compares the final pos against it (see below).
 		preHwm := hwm
