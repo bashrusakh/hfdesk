@@ -40,7 +40,13 @@ type fakeManager struct {
 	opErr error
 }
 
-func (m fakeManager) Install(context.Context, service.InstallOptions) error { return m.opErr }
+func (m fakeManager) Install(_ context.Context, opts service.InstallOptions) (service.InstallOptions, error) {
+	if m.opErr != nil {
+		return service.InstallOptions{}, m.opErr
+	}
+	// Without an existing registration the request is the registration.
+	return opts, nil
+}
 
 func (m fakeManager) Uninstall(context.Context) error { return m.opErr }
 
@@ -2523,4 +2529,211 @@ func sourceLinesWith(source, text string) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// TestInstallExplicitFieldsMarksOnlyTheNamedFlags checks the marker of an
+// explicitly named field.
+//
+// Only a flag the parser saw on the command line counts: the default of a
+// flag set is a fallback for an installation without a registration, so it
+// must never be reported as a setting of the request. The --listen flag keeps
+// its default without being marked.
+//
+// An explicit cache root without a hub directory resolves the hub directory
+// to "<cache>/hub", so the resolved directory is marked as well: it is the
+// value the request asked for and not a default of the scope.
+func TestInstallExplicitFieldsMarksOnlyTheNamedFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want service.InstallFieldSet
+		// checkDefault reports whether the case checks the default of the
+		// --listen flag as well.
+		checkDefault bool
+	}{
+		{
+			name:         "no flag at all",
+			args:         nil,
+			want:         service.InstallFieldSet{},
+			checkDefault: true,
+		},
+		{
+			name: "the default listen address is not a named one",
+			args: []string{"--listen", service.DefaultListen},
+			want: service.InstallFieldSet{Listen: true},
+		},
+		{
+			name: "a named cache root moves the hub directory with it",
+			args: []string{"--cache-dir", "/srv/cache"},
+			want: service.InstallFieldSet{CacheDir: true, HubDir: true},
+		},
+		{
+			name: "a named hub directory stays a separate field",
+			args: []string{"--hub-dir", "/mnt/hub"},
+			want: service.InstallFieldSet{HubDir: true},
+		},
+		{
+			name: "both cache directories are named",
+			args: []string{"--cache-dir", "/srv/cache", "--hub-dir", "/mnt/hub"},
+			want: service.InstallFieldSet{CacheDir: true, HubDir: true},
+		},
+		{
+			name: "every path flag is named",
+			args: []string{
+				"--config", "/srv/hfdesk/hfdesk.json",
+				"--state-dir", "/srv/hfdesk/state",
+				"--log-dir", "/srv/hfdesk/log",
+				"--local-dir", "/srv/hfdesk/models",
+			},
+			want: service.InstallFieldSet{Config: true, StateDir: true, LogDir: true, LocalDir: true},
+		},
+		{
+			name: "the service account is named",
+			args: []string{"--service-user", "hfdesk-svc"},
+			want: service.InstallFieldSet{ServiceUser: true},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			flags := installFlags{}
+			fs := newInstallFlagSet(&flags)
+			if err := fs.Parse(tc.args); err != nil {
+				t.Fatalf("parse %v: %v", tc.args, err)
+			}
+
+			if got := installExplicitFields(fs); got != tc.want {
+				t.Errorf("installExplicitFields() = %+v, want %+v", got, tc.want)
+			}
+			if tc.checkDefault && flags.listen != service.DefaultListen {
+				t.Errorf("the listen flag = %q, want its default %q", flags.listen, service.DefaultListen)
+			}
+		})
+	}
+}
+
+// recordingInstallManager records the options of the installation it is asked
+// to register and answers with the effective options of the registration.
+//
+// effective is what the manager reports as written; nil means the request is
+// written unchanged, which is what a manager without an existing registration
+// does.
+type recordingInstallManager struct {
+	fakeManager
+	options   *service.InstallOptions
+	effective *service.InstallOptions
+}
+
+func (m recordingInstallManager) Install(_ context.Context, opts service.InstallOptions) (service.InstallOptions, error) {
+	if m.options != nil {
+		*m.options = opts
+	}
+	if m.fakeManager.opErr != nil {
+		return service.InstallOptions{}, m.fakeManager.opErr
+	}
+	if m.effective != nil {
+		return *m.effective, nil
+	}
+	return opts, nil
+}
+
+// TestServiceInstallPassesTheNamedFieldsToTheManager checks that the command
+// line marks the fields it named and leaves every other field unmarked, so the
+// service layer keeps the settings of an existing registration. The resolved
+// hub directory of a named cache root is marked as well.
+func TestServiceInstallPassesTheNamedFieldsToTheManager(t *testing.T) {
+	usePlatform(t, "linux")
+	program := filepath.Join(t.TempDir(), "hfdesk")
+	if err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cacheRoot := filepath.Join(t.TempDir(), "cache")
+
+	var got service.InstallOptions
+	useFakeManager(t, recordingInstallManager{
+		fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+		options:     &got,
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := runServiceCommand([]string{
+		"install", "--system", "--executable", program, "--cache-dir", cacheRoot,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("the installation must be accepted, got the exit code %d:\n%s", code, stderr.String())
+	}
+
+	if got.Executable != program {
+		t.Errorf("the executable is %q, want %q", got.Executable, program)
+	}
+	if got.CacheDir != cacheRoot {
+		t.Errorf("the cache root is %q, want the named %q", got.CacheDir, cacheRoot)
+	}
+	if want := filepath.Join(cacheRoot, "hub"); got.HubDir != want {
+		t.Errorf("the hub dir is %q, want the resolved %q", got.HubDir, want)
+	}
+	want := service.InstallFieldSet{CacheDir: true, HubDir: true}
+	if got.Explicit != want {
+		t.Errorf("the explicit fields = %+v, want %+v", got.Explicit, want)
+	}
+	if got.Listen != service.DefaultListen {
+		t.Errorf("the listen address is %q, want the default %q", got.Listen, service.DefaultListen)
+	}
+}
+
+// TestServiceInstallSummaryReportsTheEffectiveRegistration checks that the
+// summary describes the registration the manager wrote and not the request.
+//
+// A reinstall keeps every setting the command line did not name: the manager
+// returns the merged options, and the summary has to report them. A summary
+// built from the request would tell the user that a preserved bind address,
+// path or cache layout was reset to the default of the scope.
+func TestServiceInstallSummaryReportsTheEffectiveRegistration(t *testing.T) {
+	program := filepath.Join(t.TempDir(), "hfdesk")
+	if err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	effective := service.InstallOptions{
+		Scope:      service.ScopeSystem,
+		Executable: program,
+		Listen:     "127.0.0.1:19090",
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk", "hfdesk.json"),
+			StateDir:   filepath.Join(root, "var", "lib", "hfdesk"),
+			LogDir:     filepath.Join(root, "var", "log", "hfdesk"),
+		},
+		CacheDir: filepath.Join(root, "cache"),
+		HubDir:   filepath.Join(root, "cache", "hub"),
+		LocalDir: filepath.Join(root, "models"),
+	}
+	useFakeManager(t, recordingInstallManager{
+		fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+		effective:   &effective,
+	})
+
+	var stdout, stderr bytes.Buffer
+	// The command line names the executable and nothing else: every other
+	// value of the registration is one the user named in an earlier
+	// installation.
+	code := runServiceCommand([]string{"install", "--system", "--executable", program}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("the installation must be accepted, got the exit code %d:\n%s", code, stderr.String())
+	}
+
+	for _, field := range []struct {
+		name string
+		want string
+	}{
+		{"Executable", effective.Executable},
+		{"Listen", effective.Listen},
+		{"Config file", effective.Paths.ConfigFile},
+		{"State dir", effective.Paths.StateDir},
+		{"Log dir", effective.Paths.LogDir},
+		{"Cache root", effective.CacheDir},
+		{"Hub dir", effective.HubDir},
+	} {
+		if got := summaryField(stdout.String(), field.name); got != field.want {
+			t.Errorf("the summary reports %s %q, want the effective %q", field.name, got, field.want)
+		}
+	}
 }

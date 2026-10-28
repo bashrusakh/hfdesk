@@ -979,7 +979,7 @@ func TestLaunchdLifecycle(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	if err := launchd.Install(ctx, opts); err != nil {
+	if _, err := launchd.Install(ctx, opts); err != nil {
 		t.Fatalf("Install(): %v", err)
 	}
 	if _, err := os.Stat(launchd.plistPath()); err != nil {
@@ -1046,7 +1046,7 @@ func TestLaunchdLifecycle(t *testing.T) {
 
 	// The installation of a second time does not fail and does not create a
 	// second registration.
-	if err := launchd.Install(ctx, opts); err != nil {
+	if _, err := launchd.Install(ctx, opts); err != nil {
 		t.Fatalf("Install() a second time: %v", err)
 	}
 	status, err = launchd.Status(ctx)
@@ -1405,7 +1405,7 @@ func TestLaunchdSystemInstallRefusesTheHomeOfTheUser(t *testing.T) {
 		LocalDir: "/var/lib/hfdesk/models",
 	}
 
-	err = launchd.Install(context.Background(), opts)
+	_, err = launchd.Install(context.Background(), opts)
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of the home directory of the user")
 	}
@@ -1497,7 +1497,7 @@ func TestLaunchdSystemInstallRefusesAMissingServiceAccount(t *testing.T) {
 		},
 	}
 
-	err = launchd.Install(context.Background(), opts)
+	_, err = launchd.Install(context.Background(), opts)
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of a missing service account")
 	}
@@ -2057,7 +2057,7 @@ func TestLaunchdSystemInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T)
 		LocalDir: filepath.Join(root, "models"),
 	}
 
-	err = launchd.Install(context.Background(), opts)
+	_, err = launchd.Install(context.Background(), opts)
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of a cache directory the account cannot write to")
 	}
@@ -3088,7 +3088,7 @@ func TestLaunchdFailedInstallRemovesTheDirectoriesItCreated(t *testing.T) {
 
 	opts := darwinTempInstallOptions(t, root)
 	m := darwinStatusManager(t)
-	if err := m.Install(context.Background(), opts); err == nil {
+	if _, err := m.Install(context.Background(), opts); err == nil {
 		t.Fatal("Install() = nil, want the failure of the supervisor")
 	}
 
@@ -3124,7 +3124,7 @@ func TestLaunchdFailedInstallKeepsADirectoryThatExistedBefore(t *testing.T) {
 
 	opts := darwinTempInstallOptions(t, root)
 	m := darwinStatusManager(t)
-	if err := m.Install(context.Background(), opts); err == nil {
+	if _, err := m.Install(context.Background(), opts); err == nil {
 		t.Fatal("Install() = nil, want the failure of the supervisor")
 	}
 
@@ -3170,7 +3170,7 @@ func TestLaunchdFailedInstallKeepsACreatedDirectoryThatHoldsData(t *testing.T) {
 	// The fake supervisor writes a marker into the state directory, so the
 	// directory holds data when the installation fails.
 	t.Setenv("HFDESK_TEST_MARKER_DIR", state)
-	err := m.Install(context.Background(), opts)
+	_, err := m.Install(context.Background(), opts)
 	if err == nil {
 		t.Fatal("Install() = nil, want the failure of the supervisor")
 	}
@@ -3220,7 +3220,7 @@ func TestLaunchdFailedInstallRemovesTheDirectoriesOfAFailedPreparation(t *testin
 	opts.Paths.LogDir = string(filepath.Separator)
 
 	m := darwinStatusManager(t)
-	err := m.Install(context.Background(), opts)
+	_, err := m.Install(context.Background(), opts)
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of the log directory")
 	}
@@ -3253,7 +3253,7 @@ func TestLaunchdSuccessfulInstallKeepsItsDirectories(t *testing.T) {
 
 	opts := darwinTempInstallOptions(t, root)
 	m := darwinStatusManager(t)
-	if err := m.Install(context.Background(), opts); err != nil {
+	if _, err := m.Install(context.Background(), opts); err != nil {
 		t.Fatalf("Install() = %v, want nil", err)
 	}
 

@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -705,7 +706,7 @@ func TestSystemdUserIntegrationCycle(t *testing.T) {
 		_, _ = m.runSystemctl(cleanupCtx, "daemon-reload")
 	})
 
-	if err := m.Install(ctx, opts); err != nil {
+	if _, err := m.Install(ctx, opts); err != nil {
 		t.Fatalf("Install() = %v, want nil", err)
 	}
 
@@ -942,7 +943,7 @@ func TestSystemdSystemInstallRefusesTheHomeOfTheUser(t *testing.T) {
 		LocalDir: "/var/lib/hfdesk/models",
 	}
 
-	err = m.Install(context.Background(), opts)
+	_, err = m.Install(context.Background(), opts)
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of the home directory of the user")
 	}
@@ -1064,6 +1065,65 @@ func TestSystemdStatusReportsAMissingExecutable(t *testing.T) {
 			t.Errorf("the unit file holds no ExecStart directive:\n%s", content)
 		}
 	})
+}
+
+// TestSystemdStatusKeepsTheRunningFactOfABrokenRegistration checks that the
+// status of a registration whose program is gone keeps the running fact of the
+// supervisor next to the broken diagnosis.
+//
+// systemd keeps the process it started, so deleting the program stops the next
+// start and not the instance. The state therefore stays broken, and the detail
+// says whether the instance still runs, so a caller that has to know whether
+// anything serves does not read "broken" as "nothing runs".
+func TestSystemdStatusKeepsTheRunningFactOfABrokenRegistration(t *testing.T) {
+	cases := []struct {
+		name string
+		// active is the state the supervisor reports.
+		active string
+		// wantRunning is the running fact of that state.
+		wantRunning bool
+	}{
+		{"the instance still runs", "active", true},
+		{"the instance does not run", "inactive", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := systemdRecordingSupervisor(t)
+			missing := filepath.Join(t.TempDir(), "bin", "hfdesk")
+			opts := systemdExistingOptions(t, missing, t.TempDir())
+			m, _, _ := systemdExistingInstallation(t, opts)
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", tc.active)
+
+			status, err := m.Status(context.Background())
+			if err != nil {
+				t.Fatalf("Status() = %v, want nil", err)
+			}
+			if status.State != StateBroken {
+				t.Errorf("the state = %q, want the diagnosis %q of the registration", status.State, StateBroken)
+			}
+			if status.Running != tc.wantRunning {
+				t.Errorf("the running fact = %v, want %v", status.Running, tc.wantRunning)
+			}
+			if !strings.Contains(status.Detail, missing) {
+				t.Errorf("the detail = %q, want it to name the missing program %q", status.Detail, missing)
+			}
+			if got := strings.Contains(status.Detail, "the instance still runs"); got != tc.wantRunning {
+				t.Errorf("the detail = %q, want the running fact %v to be described", status.Detail, tc.wantRunning)
+			}
+
+			// The running fact comes from the supervisor, so a broken
+			// registration is asked about as well.
+			shows := 0
+			for _, call := range systemdSupervisorCalls(t, logPath) {
+				if strings.HasPrefix(strings.TrimPrefix(call, "--user "), "show ") {
+					shows++
+				}
+			}
+			if shows != 1 {
+				t.Errorf("the supervisor was asked for the state %d times, want once", shows)
+			}
+		})
+	}
 }
 
 // systemdStatus registers a unit with the given arguments in a temporary
@@ -1356,7 +1416,7 @@ func TestSystemdInstallRefusesAMissingServiceAccount(t *testing.T) {
 		ServiceUser: missing,
 	}
 
-	err = m.Install(context.Background(), opts)
+	_, err = m.Install(context.Background(), opts)
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of the missing service account")
 	}
@@ -1775,7 +1835,7 @@ func TestSystemdInstallRefusesAPreExistingDirectory(t *testing.T) {
 		},
 	}
 
-	err = m.Install(context.Background(), opts)
+	_, err = m.Install(context.Background(), opts)
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of the pre-existing state directory")
 	}
@@ -2678,7 +2738,7 @@ func TestSystemdInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T) {
 		ServiceUser: account.Username,
 	}
 
-	err := m.Install(context.Background(), opts)
+	_, err := m.Install(context.Background(), opts)
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of the cache directory")
 	}
@@ -2740,7 +2800,7 @@ func TestSystemdInstallRefusesAControlCharacterInAPath(t *testing.T) {
 		LocalDir: filepath.Join(root, "var", "lib", "hf\ndesk"),
 	}
 
-	err := m.Install(context.Background(), opts)
+	_, err := m.Install(context.Background(), opts)
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of a path with a control character")
 	}
@@ -2915,7 +2975,7 @@ func TestSystemdFailedInstallRemovesTheDirectoriesItCreated(t *testing.T) {
 
 	opts := systemdTempInstallOptions(t, root)
 	m := &systemdManager{scope: ScopeUser}
-	if err := m.Install(context.Background(), opts); err == nil {
+	if _, err := m.Install(context.Background(), opts); err == nil {
 		t.Fatal("Install() = nil, want the failure of the supervisor")
 	}
 
@@ -2952,7 +3012,7 @@ func TestSystemdFailedInstallKeepsADirectoryThatExistedBefore(t *testing.T) {
 
 	opts := systemdTempInstallOptions(t, root)
 	m := &systemdManager{scope: ScopeUser}
-	if err := m.Install(context.Background(), opts); err == nil {
+	if _, err := m.Install(context.Background(), opts); err == nil {
 		t.Fatal("Install() = nil, want the failure of the supervisor")
 	}
 
@@ -2991,7 +3051,7 @@ func TestSystemdFailedInstallKeepsACreatedDirectoryThatHoldsData(t *testing.T) {
 	// The error of the failed supervisor call is the error the caller
 	// gets: the cleanup of the directories never replaces it.
 	t.Setenv("HFDESK_TEST_MARKER_DIR", t.TempDir())
-	wantErr := m.reloadAndEnable(context.Background())
+	wantErr := m.reloadAndEnable(context.Background(), enablementPersistent)
 	if wantErr == nil {
 		t.Fatal("the fake supervisor did not fail")
 	}
@@ -2999,7 +3059,7 @@ func TestSystemdFailedInstallKeepsACreatedDirectoryThatHoldsData(t *testing.T) {
 	// The fake supervisor writes a marker into the state directory, so the
 	// directory holds data when the installation fails.
 	t.Setenv("HFDESK_TEST_MARKER_DIR", state)
-	err := m.Install(context.Background(), opts)
+	_, err := m.Install(context.Background(), opts)
 	if err == nil {
 		t.Fatal("Install() = nil, want the failure of the supervisor")
 	}
@@ -3050,7 +3110,7 @@ func TestSystemdFailedInstallRemovesTheDirectoriesOfAFailedPreparation(t *testin
 	opts.Paths.LogDir = string(filepath.Separator)
 
 	m := &systemdManager{scope: ScopeUser}
-	err := m.Install(context.Background(), opts)
+	_, err := m.Install(context.Background(), opts)
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of the log directory")
 	}
@@ -3084,7 +3144,7 @@ func TestSystemdSuccessfulInstallKeepsItsDirectories(t *testing.T) {
 
 	opts := systemdTempInstallOptions(t, root)
 	m := &systemdManager{scope: ScopeUser}
-	if err := m.Install(context.Background(), opts); err != nil {
+	if _, err := m.Install(context.Background(), opts); err != nil {
 		t.Fatalf("Install() = %v, want nil", err)
 	}
 
@@ -3354,5 +3414,1217 @@ func TestSystemdUserScopeLifecycleNeedsNoRoot(t *testing.T) {
 	}
 	if err := m.Restart(ctx); err != nil {
 		t.Errorf("Restart() = %v, want nil for a user scope instance", err)
+	}
+}
+
+// TestDefaultInstallOptionsNamesNothing checks the constructor of a request
+// that names nothing: the defaults of the scope are filled and no field is
+// marked explicit, so an installation over an existing registration keeps
+// every setting of it.
+func TestDefaultInstallOptionsNamesNothing(t *testing.T) {
+	for _, scope := range []Scope{ScopeUser, ScopeSystem} {
+		t.Run(string(scope), func(t *testing.T) {
+			paths, err := DefaultPaths(scope)
+			if err != nil {
+				t.Fatalf("DefaultPaths(%q) = %v, want nil", scope, err)
+			}
+			cacheRoot, hubDir := DefaultCacheDirs(scope, paths)
+
+			opts := DefaultInstallOptions(scope, "/usr/local/bin/hfdesk")
+			if opts.Scope != scope {
+				t.Errorf("the scope is %q, want %q", opts.Scope, scope)
+			}
+			if opts.Executable != "/usr/local/bin/hfdesk" {
+				t.Errorf("the executable is %q, want the named one", opts.Executable)
+			}
+			if opts.Listen != DefaultListen {
+				t.Errorf("the listen address is %q, want %q", opts.Listen, DefaultListen)
+			}
+			if opts.Paths != paths {
+				t.Errorf("the paths are %+v, want %+v", opts.Paths, paths)
+			}
+			if opts.CacheDir != cacheRoot || opts.HubDir != hubDir {
+				t.Errorf("the cache layout is %q/%q, want %q/%q", opts.CacheDir, opts.HubDir, cacheRoot, hubDir)
+			}
+			if opts.LocalDir != "" || opts.ServiceUser != "" {
+				t.Errorf("the request names a local dir or an account: %+v", opts)
+			}
+			if opts.Explicit != (InstallFieldSet{}) {
+				t.Errorf("the request marks fields explicit: %+v", opts.Explicit)
+			}
+		})
+	}
+}
+
+// installOptionsForMerge returns a fully populated installation with the
+// given prefix in every path.
+func installOptionsForMerge(prefix, executable string) InstallOptions {
+	return InstallOptions{
+		Scope:      ScopeUser,
+		Executable: executable,
+		Listen:     prefix + "-listen",
+		Paths: runtimepaths.Paths{
+			ConfigFile: prefix + "/etc/hfdesk.json",
+			StateDir:   prefix + "/var",
+			LogDir:     prefix + "/var/log",
+		},
+		CacheDir:    prefix + "/cache",
+		HubDir:      prefix + "/cache/hub",
+		LocalDir:    prefix + "/models",
+		ServiceUser: prefix + "-account",
+	}
+}
+
+// TestMergeInstallOptionsKeepsTheRegistration checks the precedence of a
+// reinstall: a field the request did not name keeps the value of the existing
+// registration, even when the request carries a default of the scope.
+func TestMergeInstallOptionsKeepsTheRegistration(t *testing.T) {
+	requested := installOptionsForMerge("/default", "/new/bin/hfdesk")
+	existing := installOptionsForMerge("/registered", "/old/bin/hfdesk")
+
+	merged := mergeInstallOptions(requested, existing)
+
+	if merged.Executable != requested.Executable {
+		t.Errorf("the executable is %q, want the one of the request %q", merged.Executable, requested.Executable)
+	}
+	want := existing
+	want.Executable = requested.Executable
+	if !reflect.DeepEqual(merged, want) {
+		t.Errorf("mergeInstallOptions() =\n%+v\nwant\n%+v", merged, want)
+	}
+}
+
+// TestMergeInstallOptionsHonoursTheExplicitFields checks that a field the
+// request named itself wins over the existing registration.
+func TestMergeInstallOptionsHonoursTheExplicitFields(t *testing.T) {
+	requested := installOptionsForMerge("/named", "/new/bin/hfdesk")
+	requested.Explicit = InstallFieldSet{
+		Listen:      true,
+		Config:      true,
+		StateDir:    true,
+		LogDir:      true,
+		CacheDir:    true,
+		HubDir:      true,
+		LocalDir:    true,
+		ServiceUser: true,
+	}
+	existing := installOptionsForMerge("/registered", "/old/bin/hfdesk")
+
+	merged := mergeInstallOptions(requested, existing)
+
+	if !reflect.DeepEqual(merged, requested) {
+		t.Errorf("mergeInstallOptions() =\n%+v\nwant the request\n%+v", merged, requested)
+	}
+}
+
+// TestMergeInstallOptionsUsesTheDefaultsOnAFirstInstall checks that an
+// installation without a registration installs exactly what the request
+// says: every unmarked field falls back to the default of the request.
+func TestMergeInstallOptionsUsesTheDefaultsOnAFirstInstall(t *testing.T) {
+	requested := installOptionsForMerge("/default", "/new/bin/hfdesk")
+
+	merged := mergeInstallOptions(requested, InstallOptions{})
+
+	if !reflect.DeepEqual(merged, requested) {
+		t.Errorf("mergeInstallOptions() =\n%+v\nwant the request\n%+v", merged, requested)
+	}
+}
+
+// TestMergeInstallOptionsResolvesEachFieldOnItsOwn checks that every field is
+// merged separately: naming one field never drags another one with it. The
+// cache root and the hub directory are separate fields of the layer; the
+// command line resolves their coupling before the request reaches it.
+func TestMergeInstallOptionsResolvesEachFieldOnItsOwn(t *testing.T) {
+	requested := installOptionsForMerge("/named", "/new/bin/hfdesk")
+	requested.Explicit.CacheDir = true
+	existing := installOptionsForMerge("/registered", "/old/bin/hfdesk")
+
+	merged := mergeInstallOptions(requested, existing)
+
+	if merged.CacheDir != requested.CacheDir {
+		t.Errorf("the cache root is %q, want the named one %q", merged.CacheDir, requested.CacheDir)
+	}
+	if merged.HubDir != existing.HubDir {
+		t.Errorf("the hub dir is %q, want the registered one %q", merged.HubDir, existing.HubDir)
+	}
+	if merged.Listen != existing.Listen || merged.Paths != existing.Paths || merged.LocalDir != existing.LocalDir || merged.ServiceUser != existing.ServiceUser {
+		t.Errorf("mergeInstallOptions() named more than the cache root:\n%+v", merged)
+	}
+}
+
+// TestSystemdRegistrationOptionsRecoversTheRegistration checks that the
+// options of an existing registration are read back from the unit file the
+// supervisor holds: the argument vector carries the paths and the bind
+// address, the identity directive carries the account of a machine-wide
+// instance.
+func TestSystemdRegistrationOptionsRecoversTheRegistration(t *testing.T) {
+	opts := systemdTestOptions(t, ScopeSystem)
+	opts.ServiceUser = "hfdesk-svc"
+
+	unit, err := renderUnit(opts, nil)
+	if err != nil {
+		t.Fatalf("renderUnit() = %v, want nil", err)
+	}
+
+	got := registrationOptions(parseUnit(unit), ScopeSystem)
+	want := opts
+	want.Executable = opts.Executable
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("registrationOptions() =\n%+v\nwant\n%+v", got, want)
+	}
+}
+
+// TestSystemdRegistrationOptionsNameNoAccountForAUserScope checks that a
+// user scope registration never recovers an account: the instance runs as the
+// user of the session, whatever an old command line named.
+func TestSystemdRegistrationOptionsNameNoAccountForAUserScope(t *testing.T) {
+	opts := systemdTestOptions(t, ScopeUser)
+	opts.ServiceUser = "hfdesk-svc"
+
+	unit, err := renderUnit(opts, nil)
+	if err != nil {
+		t.Fatalf("renderUnit() = %v, want nil", err)
+	}
+
+	if got := registrationOptions(parseUnit(unit), ScopeUser).ServiceUser; got != "" {
+		t.Errorf("the account of a user scope registration = %q, want none", got)
+	}
+}
+
+// TestSystemdExecStartPath checks the program path of the ExecStart property
+// the supervisor reports.
+func TestSystemdExecStartPath(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{
+			name:   "a running invocation",
+			output: "LoadState=loaded\nExecStart={ path=/opt/hfdesk/bin/hfdesk ; argv[]=/opt/hfdesk/bin/hfdesk service run ; ignore_errors=no ; pid=42 }\n",
+			want:   "/opt/hfdesk/bin/hfdesk",
+		},
+		{
+			name:   "a path with spaces",
+			output: "ExecStart={ path=/opt/hf desk/bin/hfdesk ; argv[]=/opt/hf desk/bin/hfdesk ; ignore_errors=no }\n",
+			want:   "/opt/hf desk/bin/hfdesk",
+		},
+		{
+			name:   "an invocation without arguments",
+			output: "ExecStart={ path=/bin/true ; ignore_errors=no }\n",
+			want:   "/bin/true",
+		},
+		{
+			name:   "an empty property",
+			output: "ExecStart={ path= ; argv[]= }\n",
+			want:   "",
+		},
+		{
+			name:   "no property at all",
+			output: "LoadState=not-found\n",
+			want:   "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := execStartPath(tc.output); got != tc.want {
+				t.Errorf("execStartPath(%q) = %q, want %q", tc.output, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSystemdRestartVerifyWaitIsTheShutdownBudget checks that the verification
+// of a restarted instance is bounded by the shutdown budget of the service
+// layer, so the wait covers the orderly shutdown of the old process.
+func TestSystemdRestartVerifyWaitIsTheShutdownBudget(t *testing.T) {
+	if got := (&systemdManager{}).restartVerifyWait(); got != ShutdownBudget {
+		t.Errorf("restartVerifyWait() = %s, want the shutdown budget %s", got, ShutdownBudget)
+	}
+	if got := (&systemdManager{restartWait: time.Second}).restartVerifyWait(); got != time.Second {
+		t.Errorf("restartVerifyWait() = %s, want the wait of the manager %s", got, time.Second)
+	}
+}
+
+// systemdRecordingSupervisor replaces systemctl with a fake supervisor that
+// records every call and answers the state query of an installation.
+//
+// The reported state is HFDESK_TEST_SYSTEMCTL_ACTIVE, and the program of its
+// ExecStart property is HFDESK_TEST_SYSTEMCTL_EXECUTABLE. A restart fails once
+// when HFDESK_TEST_SYSTEMCTL_RESTART_FAIL_ONCE is "1", so a test can drive the
+// failure of the first restart while the restore of the previous registration
+// still succeeds.
+//
+// A restart reports the state it leaves behind: when
+// HFDESK_TEST_SYSTEMCTL_RESTARTED names a marker file, the supervisor creates it
+// on the first restart and reports HFDESK_TEST_SYSTEMCTL_ACTIVE_AFTER_RESTART
+// from then on. A restart returns as soon as the unit was forked, so a test can
+// drive a restart that is accepted while the unit is dead. When
+// HFDESK_TEST_SYSTEMCTL_RESTART_COUNT names a file, the number of restarts is
+// written to it; the program of the ExecStart property is then reported as
+// HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_RESTART from the second restart on, so a
+// test can drive a restart of an update and a restart of a restore that bring
+// different programs into service.
+//
+// The readiness probe is replaced for the run of the test: the fake supervisor
+// forks no instance, so no server of the instance answers on the registered
+// address. A test that drives the probe installs one of its own after this
+// helper returned.
+//
+// The enablement that "is-enabled" reports is HFDESK_TEST_SYSTEMCTL_ENABLED_STATE:
+// "enabled" (the default) and "enabled-runtime" exit with a zero status, so the
+// unit counts as enabled for boot, and every other state ("disabled", "masked",
+// "masked-runtime") exits with a non-zero status, so a test can drive a repeat
+// installation of a unit its administrator disabled or of a masked unit that the
+// installation refuses. "static", "indirect", "alias" and "linked" exit with a
+// zero status as well, the way the real supervisor answers them, so a test proves
+// that the printed state and not the status decides. "masked" is a persistent
+// mask, which the fake supervisor reports while a unit file may exist;
+// "masked-runtime" is the state of a unit masked at runtime, which a test
+// combines with an absent unit file, because the mask lives in /run and leaves
+// nothing at the unit path. "not-found" is what a fresh machine reports for a
+// unit it does not know. An "enable" that fails once
+// HFDESK_TEST_SYSTEMCTL_ENABLE_FAIL is "1" drives the failure of an installation
+// that cannot enable its registration; "enable --runtime" fails with it.
+//
+// The log path is returned. It is written even when the supervisor is asked
+// for a property only, so a test can tell a restart from a state query.
+func systemdRecordingSupervisor(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	script := `#!/bin/sh
+if [ -n "$HFDESK_TEST_SYSTEMCTL_LOG" ]; then
+	printf '%s\n' "$*" >> "$HFDESK_TEST_SYSTEMCTL_LOG" || exit 1
+fi
+if [ "$1" = "--user" ]; then
+	shift
+fi
+case "$1" in
+is-enabled)
+	state="${HFDESK_TEST_SYSTEMCTL_ENABLED_STATE:-enabled}"
+	echo "$state"
+	case "$state" in
+	enabled|enabled-runtime|static|indirect|alias|linked)
+		# The supervisor exits zero for every one of these states, and only
+		# "enabled" and "enabled-runtime" are enablements: the printed
+		# state decides what an installation keeps.
+		exit 0
+		;;
+	esac
+	exit 1
+	;;
+enable)
+	if [ "$HFDESK_TEST_SYSTEMCTL_ENABLE_FAIL" = "1" ]; then
+		echo "the fake supervisor refuses the enable" >&2
+		exit 1
+	fi
+	exit 0
+	;;
+show)
+	active="${HFDESK_TEST_SYSTEMCTL_ACTIVE:-inactive}"
+	if [ -n "$HFDESK_TEST_SYSTEMCTL_RESTARTED" ] && [ -e "$HFDESK_TEST_SYSTEMCTL_RESTARTED" ] && [ -n "$HFDESK_TEST_SYSTEMCTL_ACTIVE_AFTER_RESTART" ]; then
+		active="$HFDESK_TEST_SYSTEMCTL_ACTIVE_AFTER_RESTART"
+	fi
+	sub=dead
+	if [ "$active" = "active" ]; then
+		sub=running
+	fi
+	if [ "$active" = "activating" ]; then
+		sub=start-pre
+	fi
+	echo "LoadState=loaded"
+	echo "ActiveState=$active"
+	echo "SubState=$sub"
+	exe="$HFDESK_TEST_SYSTEMCTL_EXECUTABLE"
+	if [ -n "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT" ] && [ -n "$HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_RESTART" ] && [ -e "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT" ] && [ "$(cat "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT")" -ge 2 ]; then
+		exe="$HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_RESTART"
+	fi
+	if [ -n "$exe" ]; then
+		echo "ExecStart={ path=$exe ; argv[]=$exe service run ; ignore_errors=no }"
+	fi
+	exit 0
+	;;
+restart)
+	if [ -n "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT" ]; then
+		count=0
+		if [ -e "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT" ]; then
+			count=$(cat "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT")
+		fi
+		count=$((count + 1))
+		printf '%s' "$count" > "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT" || exit 1
+	fi
+	if [ "$HFDESK_TEST_SYSTEMCTL_RESTART_FAIL_ONCE" = "1" ] && [ ! -e "$HFDESK_TEST_SYSTEMCTL_RESTART_MARKER" ]; then
+		: > "$HFDESK_TEST_SYSTEMCTL_RESTART_MARKER"
+		echo "the fake supervisor refuses the restart" >&2
+		exit 1
+	fi
+	if [ -n "$HFDESK_TEST_SYSTEMCTL_RESTARTED" ]; then
+		: > "$HFDESK_TEST_SYSTEMCTL_RESTARTED" || exit 1
+	fi
+	exit 0
+	;;
+esac
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(dir, "systemctl"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write the fake supervisor: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_LOG", logPath)
+	// The fake supervisor forks no instance, so the readiness probe of the
+	// service layer is replaced for the run of the test. A test that drives
+	// the probe installs its own after this helper returned.
+	previous := serviceReadinessProbe
+	serviceReadinessProbe = func(string) error { return nil }
+	t.Cleanup(func() { serviceReadinessProbe = previous })
+	return logPath
+}
+
+// systemdSupervisorCalls returns the lines the fake supervisor recorded.
+func systemdSupervisorCalls(t *testing.T, logPath string) []string {
+	t.Helper()
+	content, err := os.ReadFile(logPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("read the supervisor log: %v", err)
+	}
+	return strings.Split(strings.TrimSuffix(string(content), "\n"), "\n")
+}
+
+// systemdSupervisorCallsTo counts the calls of the fake supervisor that equal
+// the given command. The scope prefix of the manager is ignored, so a test
+// names the command the way the manager issues it.
+func systemdSupervisorCallsTo(calls []string, command ...string) int {
+	want := strings.Join(command, " ")
+	count := 0
+	for _, call := range calls {
+		if strings.TrimPrefix(call, "--user ") == want {
+			count++
+		}
+	}
+	return count
+}
+
+// systemdExistingInstallation writes the unit file of an existing user scope
+// registration and returns the manager, the path and the content of the unit.
+//
+// The configuration directory of the user is a temporary directory, so the
+// test never touches the registration of the user who runs the test.
+func systemdExistingInstallation(t *testing.T, opts InstallOptions) (*systemdManager, string, string) {
+	t.Helper()
+	systemdTempInstallEnvironment(t)
+	m := &systemdManager{scope: ScopeUser}
+	path, err := m.unitPath()
+	if err != nil {
+		t.Fatalf("unitPath() = %v, want nil", err)
+	}
+	unit, err := renderUnit(opts, nil)
+	if err != nil {
+		t.Fatalf("renderUnit() = %v, want nil", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create the unit directory: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(unit), 0o644); err != nil {
+		t.Fatalf("write the unit file: %v", err)
+	}
+	return m, path, unit
+}
+
+// systemdExistingOptions returns a user scope registration whose settings all
+// differ from the defaults of the scope, so a reinstall over it proves which
+// values were kept.
+func systemdExistingOptions(t *testing.T, executable, root string) InstallOptions {
+	t.Helper()
+	return InstallOptions{
+		Scope:      ScopeUser,
+		Executable: executable,
+		Listen:     "127.0.0.1:19090",
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk", "hfdesk.json"),
+			StateDir:   filepath.Join(root, "var", "lib", "hfdesk"),
+			LogDir:     filepath.Join(root, "var", "log", "hfdesk"),
+		},
+		CacheDir: filepath.Join(root, "cache"),
+		HubDir:   filepath.Join(root, "cache", "hub"),
+		LocalDir: filepath.Join(root, "models"),
+	}
+}
+
+// TestSystemdReinstallOfARunningUnitSwitchesTheExecutable checks that an
+// installation over a running registration keeps every setting the request
+// did not name, points the registration at the new executable and restarts the
+// instance, so the running process is the new program.
+func TestSystemdReinstallOfARunningUnitSwitchesTheExecutable(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+
+	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+
+	requested := DefaultInstallOptions(ScopeUser, newExecutable)
+	effective, err := m.Install(context.Background(), requested)
+	if err != nil {
+		t.Fatalf("Install() = %v, want nil", err)
+	}
+	// The manager reports the registration it wrote: every setting the
+	// request did not name is the one of the previous registration, and
+	// the executable is the new one.
+	wantEffective := previous
+	wantEffective.Executable = newExecutable
+	if !reflect.DeepEqual(effective, wantEffective) {
+		t.Errorf("Install() returned\n%+v\nwant the effective registration\n%+v", effective, wantEffective)
+	}
+
+	content, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("read the unit file: %v", err)
+	}
+	unit := parseUnit(string(content))
+	if unit.ExecStart != newExecutable {
+		t.Errorf("the registered executable is %q, want %q", unit.ExecStart, newExecutable)
+	}
+	for _, kept := range []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"the listen address", unit.listen(), previous.Listen},
+		{"the config file", unit.flagValue("--config"), previous.Paths.ConfigFile},
+		{"the state dir", unit.paths().StateDir, previous.Paths.StateDir},
+		{"the log dir", unit.flagValue("--log-dir"), previous.Paths.LogDir},
+		{"the cache root", unit.flagValue("--cache-dir"), previous.CacheDir},
+		{"the hub dir", unit.flagValue("--hub-dir"), previous.HubDir},
+		{"the local dir", unit.flagValue("--local-dir"), previous.LocalDir},
+	} {
+		if kept.got != kept.want {
+			t.Errorf("%s = %q, want the registered %q", kept.name, kept.got, kept.want)
+		}
+	}
+	if string(content) == previousUnit {
+		t.Error("the unit file was not rewritten for the new executable")
+	}
+
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 1 {
+		t.Errorf("the unit was restarted %d times, want exactly once after the reload:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
+// TestSystemdReinstallOfAStoppedUnitDoesNotStartIt checks that a registration
+// that was stopped stays stopped: an installation never starts an instance
+// that was not running.
+func TestSystemdReinstallOfAStoppedUnitDoesNotStartIt(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+
+	m, unitPath, _ := systemdExistingInstallation(t, previous)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+
+	if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
+		t.Fatalf("Install() = %v, want nil", err)
+	}
+
+	content, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("read the unit file: %v", err)
+	}
+	if got := parseUnit(string(content)).ExecStart; got != newExecutable {
+		t.Errorf("the registered executable is %q, want %q", got, newExecutable)
+	}
+
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 0 {
+		t.Errorf("a stopped instance was restarted %d times:\n%s", got, strings.Join(calls, "\n"))
+	}
+	if got := systemdSupervisorCallsTo(calls, "start", unitName); got != 0 {
+		t.Errorf("a stopped instance was started %d times:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
+// TestSystemdFailedRestartRestoresThePreviousRegistration checks that a
+// restart the supervisor refuses neither leaves the new registration behind
+// nor keeps the instance down: the previous unit file is written back, the
+// previous instance is started again and the running state of the restore is
+// verified before it is reported.
+func TestSystemdFailedRestartRestoresThePreviousRegistration(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+
+	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	// The supervisor reports the running state the restore comes back to:
+	// the refused restart never reached the verification of the new
+	// executable, so the program it reports is the one of the restored
+	// registration.
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", oldExecutable)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_RESTART_FAIL_ONCE", "1")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_RESTART_MARKER", filepath.Join(t.TempDir(), "restart"))
+
+	_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+	if err == nil {
+		t.Fatal("Install() = nil, want the failure of the restart")
+	}
+	if !strings.Contains(err.Error(), "the previous registration was restored") {
+		t.Errorf("Install() = %q, want an error that reports the restored registration", err)
+	}
+	// The restart of the restore is verified, so the sentence that names
+	// the started instance is allowed here.
+	if !strings.Contains(err.Error(), "the previous instance was started again") {
+		t.Errorf("Install() = %q, want the verified restart of the previous instance", err)
+	}
+
+	content, readErr := os.ReadFile(unitPath)
+	if readErr != nil {
+		t.Fatalf("read the unit file: %v", readErr)
+	}
+	if string(content) != previousUnit {
+		t.Errorf("the unit file was not restored:\n%s\nwant\n%s", content, previousUnit)
+	}
+
+	calls := systemdSupervisorCalls(t, logPath)
+	// The failed restart and the restart that brings the previous
+	// instance back.
+	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 2 {
+		t.Errorf("the unit was restarted %d times, want the failed restart and the restore:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
+// TestSystemdUnverifiedRestartRestoresThePreviousRegistration checks that a
+// restart which does not put the new executable into service is a failed
+// installation: a registration alone never reports success, the previous unit
+// file is restored and the previous instance is started again, which is
+// verified before it is reported.
+func TestSystemdUnverifiedRestartRestoresThePreviousRegistration(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+
+	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	// The supervisor keeps reporting the old program: the restart
+	// succeeds, but the instance never runs the new executable.
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", oldExecutable)
+	m.restartWait = 250 * time.Millisecond
+
+	_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+	if err == nil {
+		t.Fatal("Install() = nil, want the failed verification of the new executable")
+	}
+	if !strings.Contains(err.Error(), "does not run") {
+		t.Errorf("Install() = %q, want an error that names the executable the instance does not run", err)
+	}
+	if !strings.Contains(err.Error(), "the previous registration was restored") {
+		t.Errorf("Install() = %q, want an error that reports the restored registration", err)
+	}
+	if !strings.Contains(err.Error(), "the previous instance was started again") {
+		t.Errorf("Install() = %q, want the verified restart of the previous instance", err)
+	}
+
+	content, readErr := os.ReadFile(unitPath)
+	if readErr != nil {
+		t.Fatalf("read the unit file: %v", readErr)
+	}
+	if string(content) != previousUnit {
+		t.Errorf("the unit file was not restored:\n%s\nwant\n%s", content, previousUnit)
+	}
+
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 2 {
+		t.Errorf("the unit was restarted %d times, want the failed restart and the restore:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
+// TestSystemdActiveUnitThatDoesNotServeIsAFailedUpdate checks that a restarted
+// instance counts as verified only when it really serves.
+//
+// The supervisor reports the unit active with the registered program, which is
+// all a Type=simple unit proves: the process was forked. The instance of the
+// test does not answer, the way a process that died on a bind error does not, so
+// the update is a failure: the previous registration is restored and the
+// previous instance is started again, which is verified before it is reported.
+func TestSystemdActiveUnitThatDoesNotServeIsAFailedUpdate(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+
+	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	// The supervisor reports what a restarted simple unit reports: the unit
+	// is active with the program it was started with, and the restart of the
+	// restore brings the previous program back.
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_RESTART", oldExecutable)
+	m.restartWait = 250 * time.Millisecond
+
+	// The instance of the new registration does not answer: the probe fails
+	// until the restore restarted the previous instance, and the instance of
+	// the restored registration answers.
+	restartCount := filepath.Join(t.TempDir(), "restarts")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_RESTART_COUNT", restartCount)
+	serviceReadinessProbe = func(listen string) error {
+		count := 0
+		if content, err := os.ReadFile(restartCount); err == nil {
+			count, _ = strconv.Atoi(strings.TrimSpace(string(content)))
+		}
+		if count < 2 {
+			return errors.New("dial tcp " + probeServiceAddress(listen) + ": connect: connection refused")
+		}
+		return nil
+	}
+
+	_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+	if err == nil {
+		t.Fatal("Install() = nil, want the failure of the verification of the instance that does not serve")
+	}
+	for _, want := range []string{
+		"does not answer on",
+		previous.Listen,
+		"the previous registration was restored",
+		"the previous instance was started again",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
+		}
+	}
+
+	content, readErr := os.ReadFile(unitPath)
+	if readErr != nil {
+		t.Fatalf("read the unit file: %v", readErr)
+	}
+	if string(content) != previousUnit {
+		t.Errorf("the unit file was not restored:\n%s\nwant\n%s", content, previousUnit)
+	}
+
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 2 {
+		t.Errorf("the unit was restarted %d times, want the failed update and the restore:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
+// TestSystemdVerifiedRestartProbesTheListenAddressOfTheUnit checks that the
+// readiness probe asks the address the registration names.
+//
+// The address is read from the unit that was written, not from the request of
+// the installation: a reinstall keeps the listen address of the registration,
+// and the probe has to reach that instance.
+func TestSystemdVerifiedRestartProbesTheListenAddressOfTheUnit(t *testing.T) {
+	systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+
+	m, _, _ := systemdExistingInstallation(t, previous)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+
+	var probed []string
+	serviceReadinessProbe = func(listen string) error {
+		probed = append(probed, listen)
+		return nil
+	}
+
+	if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
+		t.Fatalf("Install() = %v, want nil", err)
+	}
+	if len(probed) == 0 {
+		t.Fatal("the readiness probe was never called for a restarted instance")
+	}
+	for _, listen := range probed {
+		if listen != previous.Listen {
+			t.Errorf("the readiness probe asked %q, want the listen address of the registration %q", listen, previous.Listen)
+		}
+	}
+}
+
+// TestSystemdRestoreThatIsNotConfirmedIsNotReportedAsStartedAgain checks that a
+// restart of the restored registration which the supervisor accepted but which
+// left the unit down is not reported as a started instance: the error says that
+// the registration was restored and that the restart was issued, and it never
+// claims that the previous instance runs again.
+func TestSystemdRestoreThatIsNotConfirmedIsNotReportedAsStartedAgain(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+
+	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	// The unit runs before the installation, and the restart of the failure
+	// leaves it down: the supervisor accepts every restart, and
+	// `systemctl restart` returns as soon as the unit was forked, so its
+	// exit status is not a running instance.
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", oldExecutable)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_RESTARTED", filepath.Join(t.TempDir(), "restarted"))
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE_AFTER_RESTART", "inactive")
+	m.restartWait = 250 * time.Millisecond
+
+	_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+	if err == nil {
+		t.Fatal("Install() = nil, want the unconfirmed state of the new executable")
+	}
+	for _, want := range []string{
+		"the registration was restored",
+		"the restart of the previous instance was issued",
+		"but the restart was not confirmed",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "the previous instance was started again") {
+		t.Errorf("Install() = %q, want no claim that the previous instance was started again", err)
+	}
+
+	content, readErr := os.ReadFile(unitPath)
+	if readErr != nil {
+		t.Fatalf("read the unit file: %v", readErr)
+	}
+	if string(content) != previousUnit {
+		t.Errorf("the unit file was not restored:\n%s\nwant\n%s", content, previousUnit)
+	}
+
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 2 {
+		t.Errorf("the unit was restarted %d times, want the failed attempt and the restore:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
+// TestSystemdRestoreOfAUnitWithoutAProgramVerifiesTheState checks that a restore
+// whose registration names no program verifies the running state alone: there is
+// no program to compare, so the rollback reports what the supervisor observed
+// and never a program it does not know.
+func TestSystemdRestoreOfAUnitWithoutAProgramVerifiesTheState(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	path := filepath.Join(root, "etc", "systemd", "user", unitName)
+	// A registration whose command line cannot be read: the section holds
+	// no ExecStart, so the restored registration names no program.
+	content := []byte("[Unit]\nDescription=HFDesk\n\n[Service]\nWorkingDirectory=" + root + "\n")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create the unit directory: %v", err)
+	}
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatalf("write the unit file: %v", err)
+	}
+
+	m := &systemdManager{scope: ScopeUser}
+	m.restartWait = 250 * time.Millisecond
+	previous := previousRegistration{path: path, content: content, existed: true, running: true}
+
+	// A supervisor that reports the unit active is enough: the restore
+	// reports a started instance without comparing a program.
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	if err := m.restorePreviousRegistration(context.Background(), previous); err != nil {
+		t.Fatalf("restorePreviousRegistration() = %v, want the verified running state", err)
+	}
+
+	// The state is verified and not assumed: a unit the supervisor does not
+	// report active is a restore that was not confirmed.
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+	err := m.restorePreviousRegistration(context.Background(), previous)
+	if err == nil {
+		t.Fatal("restorePreviousRegistration() = nil, want the unconfirmed state of the restored unit")
+	}
+	if !strings.Contains(err.Error(), "is not active") {
+		t.Errorf("restorePreviousRegistration() = %q, want an error that names the state it verified", err)
+	}
+	if !strings.Contains(err.Error(), "the restart of the previous instance was issued") {
+		t.Errorf("restorePreviousRegistration() = %q, want an error that reports the issued restart", err)
+	}
+
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 2 {
+		t.Errorf("the unit was restarted %d times, want the restore of each call:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
+// TestSystemdFreshInstallNeverStartsTheInstance checks the documented
+// behaviour of a first installation: the registration is written and enabled,
+// and starting stays the explicit, separate command.
+//
+// A fresh machine knows no unit: "is-enabled" prints "not-found" and exits with
+// a non-zero status. The installation reads the enablement anyway, because a
+// runtime mask leaves no unit file either, and a "not-found" is not a mask: the
+// first installation proceeds and enables the registration it writes.
+func TestSystemdFreshInstallNeverStartsTheInstance(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	root := t.TempDir()
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLED_STATE", "not-found")
+
+	m := &systemdManager{scope: ScopeUser}
+	if _, err := m.Install(context.Background(), systemdTempInstallOptions(t, root)); err != nil {
+		t.Fatalf("Install() = %v, want nil", err)
+	}
+
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "enable", unitName); got != 1 {
+		t.Errorf("the unit was enabled %d times, want once:\n%s", got, strings.Join(calls, "\n"))
+	}
+	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 0 {
+		t.Errorf("a first installation restarted the unit %d times:\n%s", got, strings.Join(calls, "\n"))
+	}
+	if got := systemdSupervisorCallsTo(calls, "start", unitName); got != 0 {
+		t.Errorf("a first installation started the unit %d times:\n%s", got, strings.Join(calls, "\n"))
+	}
+	// A first installation has no registration whose enablement it could
+	// keep, but it asks for the enablement before it writes the unit file:
+	// that is how a runtime mask, which leaves no unit file, is found. A
+	// "not-found" answer is not a mask and the installation proceeds.
+	if got := systemdSupervisorCallsTo(calls, "is-enabled", unitName); got != 1 {
+		t.Errorf("a first installation read the enablement %d times, want once:\n%s", got, strings.Join(calls, "\n"))
+	}
+	enabledAt := systemdSupervisorCallIndex(calls, "is-enabled", unitName)
+	reloadAt := systemdSupervisorCallIndex(calls, "daemon-reload")
+	if enabledAt < 0 || enabledAt > reloadAt {
+		t.Errorf("the enablement was read at %d and the supervisor was reloaded at %d, want the read before the reload:\n%s", enabledAt, reloadAt, strings.Join(calls, "\n"))
+	}
+}
+
+// systemdSupervisorCallIndex returns the index of the first call of the fake
+// supervisor that equals the given command, and -1 when it was never called.
+// The scope prefix of the manager is ignored.
+func systemdSupervisorCallIndex(calls []string, command ...string) int {
+	want := strings.Join(command, " ")
+	for i, call := range calls {
+		if strings.TrimPrefix(call, "--user ") == want {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestSystemdReinstallKeepsTheAutostartStateOfTheUnit checks that a repeat
+// installation keeps the autostart state it finds, including its mode.
+//
+// A first installation enables the registration for boot. A repeat installation
+// must not undo the decision of an administrator: a unit that was enabled before
+// is enabled again, a unit that was disabled is left alone, and a unit an
+// administrator enabled for this boot only ("systemctl enable --runtime") is
+// enabled at runtime again instead of being made permanent. A masked unit is
+// refused instead of being replaced, see TestSystemdInstallRefusesAMaskedUnit.
+// The "static", "indirect", "alias" and "linked" states exit with a zero status
+// of the supervisor and are not enablements either: the printed state decides,
+// not the status. The supervisor is reloaded in every case, so it picks the new
+// unit file up, and the enablement is read before the unit file is written, so
+// the state that is kept is the state of the unit the installation replaces.
+func TestSystemdReinstallKeepsTheAutostartStateOfTheUnit(t *testing.T) {
+	cases := []struct {
+		name string
+		// state is the enablement the supervisor reports for the unit
+		// that is installed already.
+		state string
+		// wantEnabled is how often the installation may enable the unit
+		// persistently.
+		wantEnabled int
+		// wantRuntime is how often the installation may enable the unit
+		// for this boot only.
+		wantRuntime int
+	}{
+		{"a unit that is enabled", "enabled", 1, 0},
+		{"a unit that is enabled for this boot only", "enabled-runtime", 0, 1},
+		{"a unit that is disabled", "disabled", 0, 0},
+		{"a unit that is static", "static", 0, 0},
+		{"a unit that is indirect", "indirect", 0, 0},
+		{"a unit that is an alias", "alias", 0, 0},
+		{"a unit that is linked", "linked", 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := systemdRecordingSupervisor(t)
+			root := t.TempDir()
+			oldExecutable := systemdTestExecutable(t)
+			newExecutable := systemdTestExecutable(t)
+			previous := systemdExistingOptions(t, oldExecutable, root)
+
+			m, _, _ := systemdExistingInstallation(t, previous)
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLED_STATE", tc.state)
+
+			if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
+				t.Fatalf("Install() = %v, want nil for a unit that was %q before", err, tc.state)
+			}
+
+			calls := systemdSupervisorCalls(t, logPath)
+			if got := systemdSupervisorCallsTo(calls, "enable", unitName); got != tc.wantEnabled {
+				t.Errorf("the unit was enabled permanently %d times, want %d for a unit that was %q before:\n%s", got, tc.wantEnabled, tc.state, strings.Join(calls, "\n"))
+			}
+			if got := systemdSupervisorCallsTo(calls, "enable", "--runtime", unitName); got != tc.wantRuntime {
+				t.Errorf("the unit was enabled at runtime %d times, want %d for a unit that was %q before:\n%s", got, tc.wantRuntime, tc.state, strings.Join(calls, "\n"))
+			}
+			if got := systemdSupervisorCallsTo(calls, "daemon-reload"); got == 0 {
+				t.Errorf("the supervisor was never reloaded:\n%s", strings.Join(calls, "\n"))
+			}
+			enabledAt := systemdSupervisorCallIndex(calls, "is-enabled", unitName)
+			reloadAt := systemdSupervisorCallIndex(calls, "daemon-reload")
+			if enabledAt < 0 {
+				t.Fatalf("the enablement of the registration was never read:\n%s", strings.Join(calls, "\n"))
+			}
+			if enabledAt > reloadAt {
+				t.Errorf("the enablement was read after the supervisor was reloaded, the state of the replaced unit is not the state that was kept:\n%s", strings.Join(calls, "\n"))
+			}
+		})
+	}
+}
+
+// TestSystemdEnablementOfThePrintedState checks the mapping of the printed
+// state of "systemctl is-enabled" onto the enablement an installation keeps.
+//
+// The status of the supervisor is not the answer: "is-enabled" exits zero for
+// "static", "indirect", "alias" and "linked" as well, and a plain "enable" of
+// one of those would either fail the installation or enable a unit for a boot
+// nobody asked for. Only "enabled" and "enabled-runtime" are kept, and the mask
+// is a refusal of its own.
+func TestSystemdEnablementOfThePrintedState(t *testing.T) {
+	cases := []struct {
+		state string
+		want  enablementMode
+	}{
+		{"enabled", enablementPersistent},
+		{"enabled-runtime", enablementRuntime},
+		{"disabled", enablementNone},
+		{"masked", enablementNone},
+		{"masked-runtime", enablementNone},
+		{"static", enablementNone},
+		{"indirect", enablementNone},
+		{"alias", enablementNone},
+		{"linked", enablementNone},
+		{"not-found", enablementNone},
+		{"", enablementNone},
+		{"a state of a later release", enablementNone},
+	}
+	for _, tc := range cases {
+		t.Run(tc.state, func(t *testing.T) {
+			facts := enablementOf(tc.state)
+			if facts.mode != tc.want {
+				t.Errorf("enablementOf(%q).mode = %d, want %d", tc.state, facts.mode, tc.want)
+			}
+			wantMasked := tc.state == "masked" || tc.state == "masked-runtime"
+			if facts.masked != wantMasked {
+				t.Errorf("enablementOf(%q).masked = %v, want %v", tc.state, facts.masked, wantMasked)
+			}
+		})
+	}
+}
+
+// TestSystemdInstallRefusesAMaskedUnit checks that an installation over a
+// persistently masked unit is refused instead of replacing the mask.
+//
+// A masked unit is a symbolic link to /dev/null, and writing the unit file over
+// it would unmask the unit silently: the administrator who masked it would lose
+// that decision without noticing. The installation therefore refuses before it
+// writes the unit file and before it touches the supervisor, the unit path keeps
+// the mask, and the error names the command that unmask the unit in the scope of
+// the manager. See TestSystemdInstallRefusesARuntimeMaskedUnit for a mask that
+// leaves no unit file at all.
+func TestSystemdInstallRefusesAMaskedUnit(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+
+	m, unitPath, _ := systemdExistingInstallation(t, previous)
+	// A masked unit is a link to /dev/null. Replace the unit file of the test
+	// registration with exactly that shape, so a write over the path would be
+	// visible as a replacement of the mask.
+	if err := os.Remove(unitPath); err != nil {
+		t.Fatalf("remove the unit file: %v", err)
+	}
+	if err := os.Symlink(os.DevNull, unitPath); err != nil {
+		t.Fatalf("mask the unit: %v", err)
+	}
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", oldExecutable)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLED_STATE", "masked")
+
+	request := systemdTempInstallOptions(t, root)
+	request.Executable = newExecutable
+	_, err := m.Install(context.Background(), request)
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of an installation over a masked unit")
+	}
+	for _, want := range []string{
+		unitName,
+		"is masked",
+		"does not replace the mask",
+		"systemctl --user unmask " + unitName,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
+		}
+	}
+
+	// The unit path is untouched: it still holds the mask.
+	info, lstatErr := os.Lstat(unitPath)
+	if lstatErr != nil {
+		t.Fatalf("the unit path is gone after the refused installation: %v", lstatErr)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the unit path is no mask any more (mode %s), want a symbolic link", info.Mode())
+	}
+	if target, readErr := os.Readlink(unitPath); readErr != nil || target != os.DevNull {
+		t.Errorf("the unit path points at %q (error: %v), want the mask %q", target, readErr, os.DevNull)
+	}
+
+	// The refusal happened before the unit file was written and before the
+	// installation touched the supervisor: no directory of the instance was
+	// created either.
+	if _, statErr := os.Stat(filepath.Join(root, "etc")); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("the refused installation created the directory %q (stat error: %v)", filepath.Join(root, "etc"), statErr)
+	}
+	calls := systemdSupervisorCalls(t, logPath)
+	for _, command := range [][]string{
+		{"daemon-reload"},
+		{"enable", unitName},
+		{"restart", unitName},
+		{"stop", unitName},
+	} {
+		if got := systemdSupervisorCallsTo(calls, command...); got != 0 {
+			t.Errorf("the refused installation called %q %d times:\n%s", strings.Join(command, " "), got, strings.Join(calls, "\n"))
+		}
+	}
+}
+
+// TestSystemdInstallRefusesARuntimeMaskedUnit checks that an installation over a
+// unit that is masked at runtime is refused as well.
+//
+// A runtime mask ("systemctl mask --runtime") lives in /run and leaves no file at
+// the unit path, so the installation reads the unit file of a fresh machine and
+// would register the unit while the mask stays in place: nothing is clobbered,
+// but the new registration cannot start. The mask is only visible through the
+// supervisor, which reports "masked-runtime" with a non-zero status, so the
+// enablement is read whether or not a unit file exists. The refusal happens
+// before any directory is created, before the unit file is written and before the
+// supervisor is reloaded, enabled, restarted or asked to stop anything, and the
+// error names the command that removes the mask.
+func TestSystemdInstallRefusesARuntimeMaskedUnit(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	root := t.TempDir()
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLED_STATE", "masked-runtime")
+
+	m := &systemdManager{scope: ScopeUser}
+	_, err := m.Install(context.Background(), systemdTempInstallOptions(t, root))
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of an installation over a runtime masked unit")
+	}
+	for _, want := range []string{
+		unitName,
+		"is masked",
+		"does not replace the mask",
+		"systemctl --user unmask " + unitName,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
+		}
+	}
+
+	// No unit file was created: the runtime mask left no file at the path,
+	// and the refused installation writes none. The directory of the unit
+	// file is not created either, so the refusal came before the write.
+	unitPath, pathErr := m.unitPath()
+	if pathErr != nil {
+		t.Fatalf("unitPath() = %v, want nil", pathErr)
+	}
+	if _, statErr := os.Stat(unitPath); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("the refused installation created the unit file %q (stat error: %v)", unitPath, statErr)
+	}
+	if _, statErr := os.Stat(filepath.Dir(unitPath)); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("the refused installation created the unit directory %q (stat error: %v)", filepath.Dir(unitPath), statErr)
+	}
+
+	// No directory of the instance was created either, so the refusal came
+	// before the directories were prepared.
+	if entries, readErr := os.ReadDir(root); readErr != nil {
+		t.Fatalf("read the root of the installation: %v", readErr)
+	} else if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Errorf("the refused installation created %v below %q, want no directory at all", names, root)
+	}
+
+	// The enablement is the only question the installation asked: the state
+	// of a registration that does not exist is not read, and nothing was
+	// reloaded, enabled, restarted or stopped.
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "is-enabled", unitName); got != 1 {
+		t.Errorf("the enablement was read %d times, want once before the refusal:\n%s", got, strings.Join(calls, "\n"))
+	}
+	for _, call := range calls {
+		if strings.TrimPrefix(call, "--user ") != "is-enabled "+unitName {
+			t.Errorf("the refused installation called the supervisor with %q, want only the read of the enablement:\n%s", call, strings.Join(calls, "\n"))
+		}
+	}
+	for _, command := range [][]string{
+		{"daemon-reload"},
+		{"enable", unitName},
+		{"restart", unitName},
+		{"stop", unitName},
+	} {
+		if got := systemdSupervisorCallsTo(calls, command...); got != 0 {
+			t.Errorf("the refused installation called %q %d times:\n%s", strings.Join(command, " "), got, strings.Join(calls, "\n"))
+		}
+	}
+}
+
+// TestSystemdEnablementFailureIsAFailedInstallation checks that the enable of a
+// first installation keeps its error handling: a registration the supervisor
+// refuses to enable is a failed installation, and the unit file the
+// installation wrote is removed again.
+//
+// The registration of a first installation is enabled for the boot of the
+// scope, so an installation that cannot enable it is not the registration the
+// user asked for. The failure is reported and the rollback leaves no unit file
+// behind.
+func TestSystemdEnablementFailureIsAFailedInstallation(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	root := t.TempDir()
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLE_FAIL", "1")
+
+	m := &systemdManager{scope: ScopeUser}
+	_, err := m.Install(context.Background(), systemdTempInstallOptions(t, root))
+	if err == nil {
+		t.Fatal("Install() = nil, want the failure of the enable")
+	}
+	if !strings.Contains(err.Error(), "enable") {
+		t.Errorf("Install() = %q, want an error that names the refused enable", err)
+	}
+
+	path, pathErr := m.unitPath()
+	if pathErr != nil {
+		t.Fatalf("unitPath() = %v, want nil", pathErr)
+	}
+	if _, statErr := os.Stat(path); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("the unit file %q is still there after the failed installation (stat error: %v)", path, statErr)
+	}
+
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "enable", unitName); got != 1 {
+		t.Errorf("the unit was enabled %d times, want the one enable the installation attempted:\n%s", got, strings.Join(calls, "\n"))
 	}
 }

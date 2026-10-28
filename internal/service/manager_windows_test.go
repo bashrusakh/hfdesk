@@ -7,6 +7,7 @@ package service
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -23,6 +24,7 @@ import (
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 
+	"github.com/bashrusakh/hfdesk/internal/pe"
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/internal/server"
 )
@@ -79,6 +81,106 @@ func TestBuildSCMConfigUsesTheLeastPrivilegedAccount(t *testing.T) {
 	}
 	if config.DisplayName == "" || config.Description == "" {
 		t.Errorf("DisplayName = %q and Description = %q, want both of them to be set", config.DisplayName, config.Description)
+	}
+}
+
+// TestSCMDisabledRunningRefusalRefusesBeforeItStopsTheInstance checks the
+// decision an installation makes about a running instance whose start type is
+// disabled.
+//
+// A service can run with a disabled start type; the installation stops it to
+// put the new program into service, and Windows refuses to start a disabled
+// service again, so the installation would leave the machine without a service
+// that ran before. The decision refuses a running or starting instance with a
+// disabled start type and allows every other state, including a stopped
+// instance, because the installation does not start a service that was stopped.
+func TestSCMDisabledRunningRefusalRefusesBeforeItStopsTheInstance(t *testing.T) {
+	cases := []struct {
+		name      string
+		present   bool
+		state     svc.State
+		startType uint32
+		refused   bool
+	}{
+		{"a running instance with a disabled start", true, svc.Running, mgr.StartDisabled, true},
+		{"a starting instance with a disabled start", true, svc.StartPending, mgr.StartDisabled, true},
+		{"a stopped instance with a disabled start", true, svc.Stopped, mgr.StartDisabled, false},
+		{"a stopping instance with a disabled start", true, svc.StopPending, mgr.StartDisabled, false},
+		{"a running instance with a manual start", true, svc.Running, mgr.StartManual, false},
+		{"a running instance with an automatic start", true, svc.Running, mgr.StartAutomatic, false},
+		{"a stopped instance with a manual start", true, svc.Stopped, mgr.StartManual, false},
+		{"an absent registration", false, svc.Stopped, mgr.StartDisabled, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			running := scmInstanceRan(tc.present, tc.state)
+			err := scmDisabledRunningRefusal(tc.present, running, tc.startType)
+			if !tc.refused {
+				if err != nil {
+					t.Fatalf("scmDisabledRunningRefusal(%v, %v, %d) = %v, want nil", tc.present, running, tc.startType, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("scmDisabledRunningRefusal(%v, %v, %d) = nil, want the refusal of the installation", tc.present, running, tc.startType)
+			}
+			for _, want := range []string{
+				"is running, but its start type is disabled",
+				"Windows will not start it again after the installation stops it",
+				"Set the start type to manual or automatic",
+				`"sc config hfdesk start= demand"`,
+				"run the installation again",
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the refusal %q does not mention %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestSCMConfigWithAutostartKeepsTheStateOfTheRegistration checks that a repeat
+// installation writes the autostart state the registration already has.
+//
+// The start type of a registration is a setting of the machine: an
+// administrator may have switched the service to a manual or a disabled start,
+// so it does not start at boot, or to a delayed automatic start. A reinstall
+// with a new binary is not the place to undo that decision, so the update of the
+// configuration carries the state of the registration and not the automatic
+// start a first installation uses.
+func TestSCMConfigWithAutostartKeepsTheStateOfTheRegistration(t *testing.T) {
+	config := buildSCMConfig(scmTestOptions())
+	cases := []struct {
+		name     string
+		previous mgr.Config
+	}{
+		{"an automatic start", mgr.Config{StartType: mgr.StartAutomatic}},
+		{"a manual start", mgr.Config{StartType: mgr.StartManual}},
+		{"a disabled start", mgr.Config{StartType: mgr.StartDisabled}},
+		{"a delayed automatic start", mgr.Config{StartType: mgr.StartAutomatic, DelayedAutoStart: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scmConfigWithAutostart(config, tc.previous)
+			if got.StartType != tc.previous.StartType {
+				t.Errorf("StartType = %d, want the start type %d of the registration", got.StartType, tc.previous.StartType)
+			}
+			if got.DelayedAutoStart != tc.previous.DelayedAutoStart {
+				t.Errorf("DelayedAutoStart = %v, want %v of the registration", got.DelayedAutoStart, tc.previous.DelayedAutoStart)
+			}
+			// The autostart state is the only part of the configuration the
+			// repeat installation keeps: the rest is the registration the
+			// installation writes.
+			if got.BinaryPathName != config.BinaryPathName {
+				t.Errorf("BinaryPathName = %q, want the command line %q of the installation", got.BinaryPathName, config.BinaryPathName)
+			}
+			if got.ServiceStartName != config.ServiceStartName {
+				t.Errorf("ServiceStartName = %q, want %q", got.ServiceStartName, config.ServiceStartName)
+			}
+			if got.ErrorControl != config.ErrorControl || got.ServiceType != config.ServiceType {
+				t.Errorf("the configuration = %+v, want the service type and error control of the installation", got)
+			}
+		})
 	}
 }
 
@@ -607,9 +709,11 @@ func TestSCMLifecycle(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	if err := service.Install(ctx, opts); err != nil {
+	if _, err := service.Install(ctx, opts); err != nil {
 		t.Fatalf("Install() = %v, want nil", err)
 	}
+	// The registration carries the failure recovery of the instance.
+	scmTestCheckRecoveryActions(t)
 
 	status, err := service.Status(ctx)
 	if err != nil {
@@ -639,15 +743,50 @@ func TestSCMLifecycle(t *testing.T) {
 
 	// A second installation updates the registration instead of creating
 	// a second one.
-	if err := service.Install(ctx, opts); err != nil {
+	if _, err := service.Install(ctx, opts); err != nil {
 		t.Fatalf("the second Install() = %v, want nil", err)
 	}
+	// The failure recovery is configured on the update path as well: an
+	// updated registration whose recovery was lost would not be restarted
+	// after a crash either.
+	scmTestCheckRecoveryActions(t)
 	status, err = service.Status(ctx)
 	if err != nil {
 		t.Fatalf("Status() = %v, want nil", err)
 	}
 	if status.Executable != opts.Executable {
 		t.Errorf("the registered executable = %q, want %q", status.Executable, opts.Executable)
+	}
+
+	// An installation that names one setting keeps the others: only the
+	// named bind address moves, the runtime paths of the instance stay what
+	// the previous installation wrote. The request names no path at all, so
+	// the paths of the registration are what the installation uses.
+	named := InstallOptions{
+		Scope:      ScopeSystem,
+		Executable: opts.Executable,
+		Explicit:   InstallFieldSet{Listen: true},
+		Listen:     "127.0.0.1:18080",
+	}
+	effective, err := service.Install(ctx, named)
+	if err != nil {
+		t.Fatalf("the Install() of a named listen address = %v, want nil", err)
+	}
+	if effective.Listen != named.Listen {
+		t.Errorf("the effective listen address = %q, want the named one %q", effective.Listen, named.Listen)
+	}
+	if effective.Paths != opts.Paths {
+		t.Errorf("the effective paths = %+v, want the kept ones %+v", effective.Paths, opts.Paths)
+	}
+	status, err = service.Status(ctx)
+	if err != nil {
+		t.Fatalf("Status() = %v, want nil", err)
+	}
+	if status.Listen != named.Listen {
+		t.Errorf("the registered listen address = %q, want the named one %q", status.Listen, named.Listen)
+	}
+	if status.Paths != opts.Paths {
+		t.Errorf("the registered paths = %+v, want the kept ones %+v", status.Paths, opts.Paths)
 	}
 
 	// Stopping an instance that does not run is a stable success.
@@ -673,6 +812,51 @@ func TestSCMLifecycle(t *testing.T) {
 	// The removal of an absent registration is a clean success.
 	if err := service.Uninstall(ctx); err != nil {
 		t.Errorf("the second Uninstall() = %v, want nil", err)
+	}
+}
+
+// scmTestCheckRecoveryActions checks that the registration of the instance
+// carries the failure recovery of the platform.
+//
+// The check reads the recovery from the service control manager, so it proves
+// what the registration really holds and not what the installation meant to
+// write. The switch for the non-crash failures is part of the policy as well:
+// the handler of the instance reports a failed start, a failed host and a
+// failed stop with an error code, and only the switch makes the platform
+// recover those failures.
+func scmTestCheckRecoveryActions(t *testing.T) {
+	t.Helper()
+	manager, err := mgr.Connect()
+	if err != nil {
+		t.Fatalf("mgr.Connect() = %v, want nil", err)
+	}
+	defer manager.Disconnect()
+	handle, err := manager.OpenService(ServiceName)
+	if err != nil {
+		t.Fatalf("OpenService(%q) = %v, want nil", ServiceName, err)
+	}
+	defer handle.Close()
+
+	actions, err := handle.RecoveryActions()
+	if err != nil {
+		t.Fatalf("RecoveryActions() = %v, want nil", err)
+	}
+	if !reflect.DeepEqual(actions, scmRecoveryActions()) {
+		t.Errorf("the recovery actions of the registration = %v, want %v", actions, scmRecoveryActions())
+	}
+	period, err := handle.ResetPeriod()
+	if err != nil {
+		t.Fatalf("ResetPeriod() = %v, want nil", err)
+	}
+	if period != scmRecoveryResetPeriod {
+		t.Errorf("the reset period of the registration = %d seconds, want %d", period, scmRecoveryResetPeriod)
+	}
+	nonCrash, err := handle.RecoveryActionsOnNonCrashFailures()
+	if err != nil {
+		t.Fatalf("RecoveryActionsOnNonCrashFailures() = %v, want nil", err)
+	}
+	if !nonCrash {
+		t.Error("the registration recovers a crash only, want the recovery of a non-crash failure as well: an instance that reports its failure has to be restarted")
 	}
 }
 
@@ -703,6 +887,9 @@ func TestSCMStatusFromRegistrationReportsTheStateAndTheCommandLine(t *testing.T)
 	}
 	if status.State != StateRunning {
 		t.Errorf("the state = %q, want %q", status.State, StateRunning)
+	}
+	if !status.Running {
+		t.Error("a running instance is reported as not running")
 	}
 	if status.Scope != ScopeSystem {
 		t.Errorf("the scope = %q, want %q", status.Scope, ScopeSystem)
@@ -777,6 +964,47 @@ func TestSCMStatusFromABrokenRegistrationNamesTheMissingExecutable(t *testing.T)
 	}
 	if !strings.Contains(status.Detail, missing) {
 		t.Errorf("the detail = %q, want the path of the missing executable %q", status.Detail, missing)
+	}
+	if status.Running {
+		t.Error("a stopped instance is reported as running")
+	}
+}
+
+// TestSCMStatusFromABrokenRegistrationThatRunsKeepsTheRunningFact checks that a
+// registration whose executable is gone is reported as broken while the instance
+// it started still runs.
+//
+// The service control manager keeps the process it started: deleting the program
+// stops the next start, not the instance. The state stays the diagnosis of the
+// registration, and the running fact is carried next to it, so a caller that has
+// to know whether anything serves does not read "broken" as "nothing runs".
+func TestSCMStatusFromABrokenRegistrationThatRunsKeepsTheRunningFact(t *testing.T) {
+	root := t.TempDir()
+	missing := filepath.Join(root, "gone", "hfdesk.exe")
+	opts := scmTestOptions()
+	opts.Executable = missing
+
+	facts := scmRegistrationFacts{
+		present:     true,
+		state:       svc.Running,
+		processID:   4242,
+		commandLine: scmCommandLine(opts),
+	}
+
+	status, err := scmStatusFrom(ScopeSystem, facts)
+	if err != nil {
+		t.Fatalf("scmStatusFrom() = %v, want nil", err)
+	}
+	if status.State != StateBroken {
+		t.Errorf("the state = %q, want the diagnosis %q of the registration", status.State, StateBroken)
+	}
+	if !status.Running {
+		t.Error("a registration the supervisor reports as running is reported as not running")
+	}
+	for _, want := range []string{missing, "the instance still runs"} {
+		if !strings.Contains(status.Detail, want) {
+			t.Errorf("the detail = %q, want it to mention %q", status.Detail, want)
+		}
 	}
 }
 
@@ -893,11 +1121,13 @@ func TestSCMStatusFromKeepsTheOtherSupervisorStates(t *testing.T) {
 		name  string
 		state svc.State
 		want  State
+		// wantRunning is the running fact of the same supervisor answer.
+		wantRunning bool
 	}{
-		{"running", svc.Running, StateRunning},
-		{"start pending", svc.StartPending, StateStarting},
-		{"stop pending", svc.StopPending, StateStopping},
-		{"paused", svc.Paused, StateUnknown},
+		{"running", svc.Running, StateRunning, true},
+		{"start pending", svc.StartPending, StateStarting, true},
+		{"stop pending", svc.StopPending, StateStopping, false},
+		{"paused", svc.Paused, StateUnknown, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -921,6 +1151,9 @@ func TestSCMStatusFromKeepsTheOtherSupervisorStates(t *testing.T) {
 			}
 			if status.State != tc.want {
 				t.Errorf("the state = %q, want %q", status.State, tc.want)
+			}
+			if status.Running != tc.wantRunning {
+				t.Errorf("the running fact = %v, want %v", status.Running, tc.wantRunning)
 			}
 			if status.Detail != "" {
 				t.Errorf("the detail = %q, want none", status.Detail)
@@ -2093,6 +2326,120 @@ func TestPreflightDataPathRefusesADirectoryThatGrantsOnlyTheChildren(t *testing.
 	}
 }
 
+// TestPreflightExecutableImageRefusesAFileThatIsNotAProgram proves that an
+// installation refuses a file that is not a Windows program: a text file
+// renamed to hfdesk.exe is not a program the service control manager could
+// start.
+func TestPreflightExecutableImageRefusesAFileThatIsNotAProgram(t *testing.T) {
+	path := scmTestExecutable(t, []byte(strings.Repeat("this is not a Windows program\n", 8)))
+
+	err := preflightExecutableImage(path)
+	if err == nil {
+		t.Fatal("preflightExecutableImage accepted a file that is not a Windows program")
+	}
+	if !scmTestNamesPath(err.Error(), path) {
+		t.Errorf("preflightExecutableImage(%q) = %v, want an error that names the file", path, err)
+	}
+	if !strings.Contains(err.Error(), "not a Windows executable") {
+		t.Errorf("preflightExecutableImage(%q) = %v, want an error that says the file is not a Windows executable", path, err)
+	}
+}
+
+// TestPreflightExecutableImageRefusesATruncatedProgram proves that a program
+// whose header was cut off is refused: a download that ended in the middle of
+// the header is not a program the service control manager could start.
+func TestPreflightExecutableImageRefusesATruncatedProgram(t *testing.T) {
+	image := scmTestPEImage(pe.MachineAMD64)
+	// The image ends before the PE header its DOS header points at.
+	path := scmTestExecutable(t, image[:scmTestDosHeaderSize])
+
+	err := preflightExecutableImage(path)
+	if err == nil {
+		t.Fatal("preflightExecutableImage accepted a truncated program")
+	}
+	if !strings.Contains(err.Error(), "unexpected EOF") {
+		t.Errorf("preflightExecutableImage(%q) = %v, want the truncated header to be reported", path, err)
+	}
+}
+
+// TestPreflightExecutableImageRefusesAProgramOfAnotherArchitecture proves
+// that an installation refuses a program that was built for another
+// architecture than the process that installs it, and that a process
+// architecture without a comparison only requires a PE image.
+func TestPreflightExecutableImageComparesTheMachineOfTheProcess(t *testing.T) {
+	cases := []struct {
+		name    string
+		arch    string
+		machine uint16
+		wantErr bool
+	}{
+		{"AMD64 image for an AMD64 process", "amd64", pe.MachineAMD64, false},
+		{"ARM64 image for an AMD64 process", "amd64", pe.MachineARM64, true},
+		{"ARM64 image for an ARM64 process", "arm64", pe.MachineARM64, false},
+		{"AMD64 image for an ARM64 process", "arm64", pe.MachineAMD64, true},
+		// The installation has no comparison for this architecture of
+		// the process: the file is still required to be a PE image.
+		{"ARM64 image for a 386 process", "386", pe.MachineARM64, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := scmTestExecutable(t, scmTestPEImage(tc.machine))
+
+			err := preflightExecutableImageFor(path, tc.arch)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("preflightExecutableImageFor(%q, %q) = %v, want nil", path, tc.arch, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("preflightExecutableImageFor(%q, %q) = nil, want the refusal of the architecture 0x%04X", path, tc.arch, tc.machine)
+			}
+			if !scmTestNamesPath(err.Error(), path) {
+				t.Errorf("preflightExecutableImageFor(%q, %q) = %v, want an error that names the file", path, tc.arch, err)
+			}
+			if !strings.Contains(err.Error(), "another architecture") {
+				t.Errorf("preflightExecutableImageFor(%q, %q) = %v, want an error that says the program is built for another architecture", path, tc.arch, err)
+			}
+		})
+	}
+}
+
+// TestPreflightExecutableImageRequiresAPEImageForAnArchitectureWithoutAComparison
+// proves that the architecture without a comparison is no way around the check
+// of the file: a file that is not a program is refused as well.
+func TestPreflightExecutableImageRequiresAPEImageForAnArchitectureWithoutAComparison(t *testing.T) {
+	path := scmTestExecutable(t, []byte(strings.Repeat("this is not a Windows program\n", 8)))
+
+	if err := preflightExecutableImageFor(path, "386"); err == nil {
+		t.Fatal("preflightExecutableImageFor accepted a file that is not a Windows program")
+	}
+}
+
+// TestSCMProcessMachineNamesTheArchitecturesOfTheImages proves that only the
+// architectures HFDesk ships have a machine type the installation compares.
+func TestSCMProcessMachineNamesTheArchitecturesOfTheImages(t *testing.T) {
+	cases := map[string]struct {
+		machine uint16
+		known   bool
+	}{
+		"amd64": {pe.MachineAMD64, true},
+		"arm64": {pe.MachineARM64, true},
+		"386":   {0, false},
+		"wasm":  {0, false},
+		"":      {0, false},
+	}
+	for arch, want := range cases {
+		machine, known := scmProcessMachine(arch)
+		if known != want.known {
+			t.Errorf("scmProcessMachine(%q) known = %v, want %v", arch, known, want.known)
+		}
+		if machine != want.machine {
+			t.Errorf("scmProcessMachine(%q) machine = 0x%04X, want 0x%04X", arch, machine, want.machine)
+		}
+	}
+}
+
 // TestApplyRegistrationReportsTheEffectiveCacheDir checks that the status
 // reports the cache root the instance uses: the cache directory of the
 // config file of the instance wins over the registered one.
@@ -2546,6 +2893,44 @@ func scmTestSetDACL(t *testing.T, path, sddl string) {
 	}
 }
 
+// The layout of the PE image the tests synthesize.
+const (
+	// scmTestDosHeaderSize is the size of the DOS header, the part of an
+	// image the offset of the PE header is read from.
+	scmTestDosHeaderSize = 64
+	// scmTestPeHeaderOffset is the offset of the PE header in the
+	// synthesized image.
+	scmTestPeHeaderOffset = 0x80
+	// scmTestPeHeaderSize is the size of the PE signature and of the COFF
+	// header that follows it.
+	scmTestPeHeaderSize = 24
+)
+
+// scmTestPEImage builds a PE image of the given machine type.
+//
+// Only the fields the installation reads are filled in: the DOS header, the PE
+// signature and the machine type of the COFF header. The rest of the image is
+// zero, which is enough for the machine type to be read.
+func scmTestPEImage(machine uint16) []byte {
+	image := make([]byte, scmTestPeHeaderOffset+scmTestPeHeaderSize)
+	copy(image[0:], []byte("MZ"))
+	binary.LittleEndian.PutUint32(image[0x3C:], scmTestPeHeaderOffset)
+	copy(image[scmTestPeHeaderOffset:], []byte("PE\x00\x00"))
+	binary.LittleEndian.PutUint16(image[scmTestPeHeaderOffset+4:], machine)
+	return image
+}
+
+// scmTestExecutable writes data as hfdesk.exe into a temporary directory and
+// returns its path.
+func scmTestExecutable(t *testing.T, data []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "hfdesk.exe")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write %q: %v", path, err)
+	}
+	return path
+}
+
 // scmTestInstallOptions returns the options of an installation whose
 // directories live below the given root.
 //
@@ -2711,7 +3096,7 @@ func TestSCMFailedInstallRemovesTheDirectoriesItCreated(t *testing.T) {
 	scmTestRefuseLocalDir(t, opts)
 
 	service := &scmManager{scope: ScopeSystem}
-	if err := service.Install(context.Background(), opts); err == nil {
+	if _, err := service.Install(context.Background(), opts); err == nil {
 		t.Fatal("Install() = nil, want the refusal of the local directory")
 	}
 
@@ -2770,7 +3155,7 @@ func TestSCMFailedInstallKeepsADirectoryThatExistedBefore(t *testing.T) {
 	owner, permissions := scmTestSecurity(t, opts.LocalDir)
 
 	service := &scmManager{scope: ScopeSystem}
-	if err := service.Install(context.Background(), opts); err == nil {
+	if _, err := service.Install(context.Background(), opts); err == nil {
 		t.Fatal("Install() = nil, want the refusal of the local directory")
 	}
 
@@ -2865,7 +3250,7 @@ func TestSCMFailedInstallReportsTheOriginalError(t *testing.T) {
 	}
 
 	service := &scmManager{scope: ScopeSystem}
-	err := service.Install(context.Background(), opts)
+	_, err := service.Install(context.Background(), opts)
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of the local directory")
 	}
@@ -2926,7 +3311,7 @@ func TestSCMSuccessfulInstallKeepsItsDirectories(t *testing.T) {
 	})
 
 	service := &scmManager{scope: ScopeSystem}
-	if err := service.Install(context.Background(), opts); err != nil {
+	if _, err := service.Install(context.Background(), opts); err != nil {
 		t.Fatalf("Install() = %v, want nil", err)
 	}
 
@@ -2959,5 +3344,782 @@ func TestSCMSuccessfulInstallKeepsItsDirectories(t *testing.T) {
 		if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("the directory %q exists after the successful installation (stat error: %v), want none: the instance creates it when it runs", dir, err)
 		}
+	}
+}
+
+// TestSCMRegistrationOptionsRecoversTheRegistration checks that the options of
+// an existing registration are read back from the command line the service
+// control manager holds: the program, the bind address, the runtime paths and
+// the cache layout.
+//
+// The recovery is what makes an installation over an existing registration keep
+// the settings the instance really runs with.
+func TestSCMRegistrationOptionsRecoversTheRegistration(t *testing.T) {
+	cases := []struct {
+		name string
+		opts InstallOptions
+	}{
+		{"the full layout", scmTestOptions()},
+		{
+			name: "without a cache layout",
+			opts: func() InstallOptions {
+				opts := scmTestOptions()
+				opts.CacheDir = ""
+				opts.HubDir = ""
+				opts.LocalDir = ""
+				return opts
+			}(),
+		},
+		{
+			name: "with a path that carries a space",
+			opts: func() InstallOptions {
+				opts := scmTestOptions()
+				opts.Executable = filepath.Join("C:\\Program Files", "HFDesk", "hfdesk.exe")
+				opts.Paths.StateDir = filepath.Join("C:\\Program Files", "HFDesk", "state")
+				return opts
+			}(),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scmRegistrationOptions(scmCommandLine(tc.opts), ScopeSystem)
+			if !reflect.DeepEqual(got, tc.opts) {
+				t.Errorf("scmRegistrationOptions() =\n%+v\nwant\n%+v", got, tc.opts)
+			}
+			if got.Explicit != (InstallFieldSet{}) {
+				t.Errorf("the recovered options mark fields explicit: %+v", got.Explicit)
+			}
+			// The account of a Windows instance is the built-in
+			// LocalService account and never a setting of the
+			// registration.
+			if got.ServiceUser != "" {
+				t.Errorf("the recovered account = %q, want none", got.ServiceUser)
+			}
+		})
+	}
+}
+
+// TestSCMRegistrationOptionsOfADamagedRegistrationNameNothing checks that a
+// registration that carries no readable command line records no setting.
+//
+// An installation is the way a damaged registration is repaired, so the
+// recovery never fails: the options are empty, and the merge falls back to the
+// defaults of the request.
+func TestSCMRegistrationOptionsOfADamagedRegistrationNameNothing(t *testing.T) {
+	for _, commandLine := range []string{"", "   "} {
+		got := scmRegistrationOptions(commandLine, ScopeSystem)
+		want := InstallOptions{Scope: ScopeSystem}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("scmRegistrationOptions(%q) =\n%+v\nwant\n%+v", commandLine, got, want)
+		}
+	}
+}
+
+// TestSCMReinstallKeepsTheRegistrationOfTheInstance checks the merge of a
+// request with the registration of the instance: a setting the request did not
+// name keeps the value the instance runs with, and only the program comes from
+// the request.
+func TestSCMReinstallKeepsTheRegistrationOfTheInstance(t *testing.T) {
+	registered := scmTestOptions()
+	registered.Executable = filepath.Join("C:\\Old\\HFDesk", "hfdesk.exe")
+	registered.Listen = "127.0.0.1:9090"
+
+	existing := scmRegistrationOptions(scmCommandLine(registered), ScopeSystem)
+
+	// A request that names nothing but the new program: the defaults of the
+	// scope apply only where the registration has no value of its own.
+	requested := InstallOptions{
+		Scope:      ScopeSystem,
+		Executable: filepath.Join("C:\\New\\HFDesk", "hfdesk.exe"),
+		Listen:     DefaultListen,
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join("C:\\ProgramData", "HFDesk", "hfdesk.json"),
+			StateDir:   filepath.Join("C:\\ProgramData", "HFDesk"),
+			LogDir:     filepath.Join("C:\\ProgramData", "HFDesk", "logs"),
+		},
+		CacheDir: filepath.Join("C:\\ProgramData", "HFDesk", "cache"),
+		HubDir:   filepath.Join("C:\\ProgramData", "HFDesk", "cache", "hub"),
+	}
+
+	merged := mergeInstallOptions(requested, existing)
+
+	if merged.Executable != requested.Executable {
+		t.Errorf("the executable = %q, want the one of the request %q", merged.Executable, requested.Executable)
+	}
+	if merged.Listen != registered.Listen {
+		t.Errorf("the listen address = %q, want the registered one %q", merged.Listen, registered.Listen)
+	}
+	if merged.Paths != registered.Paths {
+		t.Errorf("the paths = %+v, want the registered ones %+v", merged.Paths, registered.Paths)
+	}
+	if merged.CacheDir != registered.CacheDir || merged.HubDir != registered.HubDir || merged.LocalDir != registered.LocalDir {
+		t.Errorf("the cache layout = %q/%q/%q, want the registered one %q/%q/%q",
+			merged.CacheDir, merged.HubDir, merged.LocalDir, registered.CacheDir, registered.HubDir, registered.LocalDir)
+	}
+}
+
+// TestSCMReinstallHonoursTheExplicitFields checks that a setting the request
+// named itself wins over the registration of the instance.
+func TestSCMReinstallHonoursTheExplicitFields(t *testing.T) {
+	registered := scmTestOptions()
+	existing := scmRegistrationOptions(scmCommandLine(registered), ScopeSystem)
+
+	requested := InstallOptions{
+		Scope:      ScopeSystem,
+		Executable: filepath.Join("C:\\New\\HFDesk", "hfdesk.exe"),
+		Explicit: InstallFieldSet{
+			Listen:   true,
+			Config:   true,
+			StateDir: true,
+			LogDir:   true,
+			CacheDir: true,
+			HubDir:   true,
+			LocalDir: true,
+		},
+		Listen: "127.0.0.1:7070",
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join("C:\\Named", "hfdesk.json"),
+			StateDir:   filepath.Join("C:\\Named", "state"),
+			LogDir:     filepath.Join("C:\\Named", "log"),
+		},
+		CacheDir: filepath.Join("C:\\Named", "cache"),
+		HubDir:   filepath.Join("C:\\Named", "cache", "hub"),
+		LocalDir: filepath.Join("C:\\Named", "models"),
+	}
+
+	merged := mergeInstallOptions(requested, existing)
+	if !reflect.DeepEqual(merged, requested) {
+		t.Errorf("mergeInstallOptions() =\n%+v\nwant the request\n%+v", merged, requested)
+	}
+}
+
+// TestSCMRecoveryActionsRestartTheFailedInstance checks the failure recovery
+// of the registration: the platform restarts an instance that ended without
+// reporting its stop, after five, thirty and sixty seconds, and it forgets the
+// failures of the instance after one day.
+//
+// The platform never reboots the machine and never runs a command for a failed
+// instance: only a restart of the instance is one of the actions.
+func TestSCMRecoveryActionsRestartTheFailedInstance(t *testing.T) {
+	actions := scmRecoveryActions()
+	want := []mgr.RecoveryAction{
+		{Type: mgr.ServiceRestart, Delay: 5 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 30 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 60 * time.Second},
+	}
+	if !reflect.DeepEqual(actions, want) {
+		t.Errorf("scmRecoveryActions() = %v, want %v", actions, want)
+	}
+	for _, action := range actions {
+		switch action.Type {
+		case mgr.ServiceRestart:
+		case mgr.NoAction, mgr.ComputerReboot, mgr.RunCommand:
+			t.Errorf("the recovery action %v is not a restart of the instance", action)
+		}
+		if action.Delay < 0 {
+			t.Errorf("the recovery action %v has a negative delay", action)
+		}
+	}
+
+	if scmRecoveryResetPeriod != 24*60*60 {
+		t.Errorf("the reset period = %d seconds, want one day (86400)", scmRecoveryResetPeriod)
+	}
+}
+
+// TestSCMRecoveryDecisionKeepsARegisteredPolicy checks what an installation does
+// with the failure recovery of a registration: the policy of HFDesk is configured
+// only when the registration has none, and a policy that is registered already is
+// kept, because a repeat installation keeps the settings of the instance and an
+// administrator may have set a policy of their own.
+//
+// A read that fails does not skip the required policy: a service without recovery
+// is the state the installation exists to prevent, so the policy of HFDesk is
+// configured then.
+func TestSCMRecoveryDecisionKeepsARegisteredPolicy(t *testing.T) {
+	administrator := []mgr.RecoveryAction{
+		{Type: mgr.ServiceRestart, Delay: 10 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 10 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 10 * time.Second},
+	}
+	readFailure := errors.New("the failure actions of the registration cannot be read")
+
+	tests := []struct {
+		name     string
+		existing []mgr.RecoveryAction
+		readErr  error
+		want     scmRecoveryDecision
+	}{
+		{"a registration without actions", nil, nil, scmRecoveryConfigure},
+		{"an empty list of actions", []mgr.RecoveryAction{}, nil, scmRecoveryConfigure},
+		{"the policy of HFDesk is registered already", scmRecoveryActions(), nil, scmRecoveryKeep},
+		{"a policy of an administrator", administrator, nil, scmRecoveryKeep},
+		{"an explicitly registered policy of no action", []mgr.RecoveryAction{{Type: mgr.NoAction}}, nil, scmRecoveryKeep},
+		{"a read that fails", nil, readFailure, scmRecoveryConfigure},
+		{"a read that fails although actions were returned", administrator, readFailure, scmRecoveryConfigure},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := scmRecoveryDecisionFor(test.existing, test.readErr); got != test.want {
+				t.Errorf("scmRecoveryDecisionFor(%v, %v) = %v, want %v",
+					test.existing, test.readErr, got, test.want)
+			}
+		})
+	}
+}
+
+// TestSCMSameExecutablePath checks the comparison of two paths that name a
+// program: the platform stores the path of a program in the case and the
+// spelling it was given, so the comparison is case-insensitive and made on the
+// cleaned path.
+func TestSCMSameExecutablePath(t *testing.T) {
+	cases := []struct {
+		name string
+		a    string
+		b    string
+		want bool
+	}{
+		{"the same path", `C:\ProgramData\HFDesk\hfdesk.exe`, `C:\ProgramData\HFDesk\hfdesk.exe`, true},
+		{"another case", `C:\ProgramData\HFDesk\hfdesk.exe`, `c:\programdata\hfdesk\HFDESK.EXE`, true},
+		{"a redundant part of the path", `C:\ProgramData\HFDesk\hfdesk.exe`, `C:\ProgramData\HFDesk\.\hfdesk.exe`, true},
+		{"another program in the same directory", `C:\ProgramData\HFDesk\hfdesk.exe`, `C:\ProgramData\HFDesk\hfdesk-old.exe`, false},
+		{"another directory", `C:\ProgramData\HFDesk\hfdesk.exe`, `C:\ProgramData\HFDesk2\hfdesk.exe`, false},
+		{"a program below the directory", `C:\ProgramData\HFDesk\hfdesk.exe`, `C:\ProgramData\HFDesk\bin\hfdesk.exe`, false},
+		{"an empty path against a program", "", `C:\ProgramData\HFDesk\hfdesk.exe`, false},
+		{"a program against an empty path", `C:\ProgramData\HFDesk\hfdesk.exe`, "", false},
+		{"two empty paths", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scmSameExecutablePath(tc.a, tc.b); got != tc.want {
+				t.Errorf("scmSameExecutablePath(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+			if got := scmSameExecutablePath(tc.b, tc.a); got != tc.want {
+				t.Errorf("scmSameExecutablePath(%q, %q) = %v, want %v", tc.b, tc.a, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSCMInstanceRan checks the classification of the state of a registration
+// before an installation.
+//
+// Only an instance that runs, or that is still starting, is restarted by the
+// installation. A stopped, broken, absent or stopping instance is left alone:
+// an installation never starts a service that was not running, and it never
+// brings back a service the user stopped.
+func TestSCMInstanceRan(t *testing.T) {
+	cases := []struct {
+		name    string
+		present bool
+		state   svc.State
+		want    bool
+	}{
+		{"running", true, svc.Running, true},
+		{"starting", true, svc.StartPending, true},
+		{"stopped", true, svc.Stopped, false},
+		{"stopping", true, svc.StopPending, false},
+		{"paused", true, svc.Paused, false},
+		{"pause pending", true, svc.PausePending, false},
+		{"continue pending", true, svc.ContinuePending, false},
+		{"an unknown state", true, svc.State(4711), false},
+		{"a running state without a registration", false, svc.Running, false},
+		{"a stopped state without a registration", false, svc.Stopped, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scmInstanceRan(tc.present, tc.state); got != tc.want {
+				t.Errorf("scmInstanceRan(%v, %v) = %v, want %v", tc.present, tc.state, got, tc.want)
+			}
+		})
+	}
+}
+
+// fakeSCMConfiguration is the configuration of a registration of a test.
+//
+// It implements scmConfiguration, so the failure path of an update can be driven
+// without a registration of its own. A refused write can apply the configuration
+// first, which is what the platform leaves behind when a later call of the
+// non-atomic update fails, and a read can be refused as well. The fake has no
+// start and no stop: the failure path of an update never touches the running
+// instance, and a type that cannot do it proves that.
+type fakeSCMConfiguration struct {
+	// config is the configuration the registration holds.
+	config mgr.Config
+	// writes are the configurations the writes tried to store, in order.
+	writes []mgr.Config
+	// writeErrs are the errors of the writes, per call: a missing entry
+	// keeps the write. A refused write stores the configuration first when
+	// applyBeforeRefusing is set, so a partial update can be simulated.
+	writeErrs []error
+	// applyBeforeRefusing stores a configuration before its write refuses
+	// it.
+	applyBeforeRefusing bool
+	// readErr is the error of every read.
+	readErr error
+	// partialReadErr is the error of a read that happens while the
+	// registration still holds the configuration of the refused update:
+	// the update is the first write and the restore is the second one, so a
+	// read between them is refused and the read-back of the restore is
+	// answered. It models an observation of the partially changed
+	// registration, which the failure path must not depend on.
+	partialReadErr error
+}
+
+// UpdateConfig records the write and returns the error of the call.
+func (f *fakeSCMConfiguration) UpdateConfig(config mgr.Config) error {
+	index := len(f.writes)
+	f.writes = append(f.writes, config)
+	var err error
+	if index < len(f.writeErrs) {
+		err = f.writeErrs[index]
+	}
+	if err == nil || f.applyBeforeRefusing {
+		f.config = config
+	}
+	return err
+}
+
+// Config returns the configuration the registration holds.
+func (f *fakeSCMConfiguration) Config() (mgr.Config, error) {
+	if f.readErr != nil {
+		return mgr.Config{}, f.readErr
+	}
+	// The update is the first write and the restore the second one: a read
+	// of the configuration between them is refused.
+	if f.partialReadErr != nil && len(f.writes) == 1 {
+		return mgr.Config{}, f.partialReadErr
+	}
+	return f.config, nil
+}
+
+// TestSCMFailedUpdateConfigRestoresThePreviousConfiguration checks the failure
+// path of a configuration write that the platform refuses.
+//
+// Service.UpdateConfig is not atomic: the command line can be replaced before a
+// later call of the same update fails. The failure path always attempts the
+// restore, even when the registration cannot be observed first, and the report
+// says exactly what was proved: a restore whose write and read-back succeeded, a
+// restore that failed, and a read-back that failed all name their outcome, and
+// the original failure stays the error the caller gets.
+func TestSCMFailedUpdateConfigRestoresThePreviousConfiguration(t *testing.T) {
+	previousConfig := mgr.Config{
+		ServiceType:      windows.SERVICE_WIN32_OWN_PROCESS,
+		StartType:        mgr.StartAutomatic,
+		ErrorControl:     mgr.ErrorNormal,
+		BinaryPathName:   `C:\old\hfdesk.exe service run --listen 127.0.0.1:8080`,
+		ServiceStartName: scmLocalServiceAccount,
+	}
+	requestedConfig := buildSCMConfig(scmTestOptions())
+	updateErr := errors.New("the service control manager refused the description")
+	restoreErr := errors.New("the service control manager refused the command line")
+	readErr := errors.New("the service control manager is gone")
+
+	cases := []struct {
+		name string
+		// fake is the registration the update is written to.
+		fake *fakeSCMConfiguration
+		// want is a sentence the report has to carry.
+		want []string
+		// wantUnproven is true when the report must not claim a restore.
+		wantUnproven bool
+	}{
+		{
+			name: "the configuration is restored",
+			fake: &fakeSCMConfiguration{
+				config:              previousConfig,
+				writeErrs:           []error{updateErr},
+				applyBeforeRefusing: true,
+			},
+			want: []string{"update the registration", updateErr.Error(), "was restored"},
+		},
+		{
+			name: "the restore also fails",
+			fake: &fakeSCMConfiguration{
+				config:              previousConfig,
+				writeErrs:           []error{updateErr, restoreErr},
+				applyBeforeRefusing: true,
+			},
+			want:         []string{"update the registration", updateErr.Error(), "may be partially changed", "could not be restored or verified", restoreErr.Error()},
+			wantUnproven: true,
+		},
+		{
+			name: "the restore cannot be read back",
+			fake: &fakeSCMConfiguration{
+				config:              previousConfig,
+				writeErrs:           []error{updateErr},
+				applyBeforeRefusing: true,
+				readErr:             readErr,
+			},
+			want:         []string{"update the registration", updateErr.Error(), "may be partially changed", "could not be restored or verified", readErr.Error()},
+			wantUnproven: true,
+		},
+		{
+			// The preliminary observation of the old failure path is
+			// gone: a fake that refuses a read of the partially changed
+			// registration still reaches the restore, and the restore's
+			// read-back proves the previous command line.
+			name: "a failed observation does not prevent the restore",
+			fake: &fakeSCMConfiguration{
+				config:              previousConfig,
+				writeErrs:           []error{updateErr},
+				applyBeforeRefusing: true,
+				partialReadErr:      readErr,
+			},
+			want: []string{"update the registration", updateErr.Error(), "was restored"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &scmManager{scope: ScopeSystem}
+			previous := previousSCMRegistration{present: true, config: previousConfig}
+
+			err := m.updateRegistrationConfig(tc.fake, requestedConfig, previous)
+			if err == nil {
+				t.Fatal("updateRegistrationConfig() = nil, want the failure of the update")
+			}
+			if !errors.Is(err, updateErr) {
+				t.Errorf("updateRegistrationConfig() = %v, want the original failure wrapped", err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("updateRegistrationConfig() = %q, want it to mention %q", err, want)
+				}
+			}
+			if tc.wantUnproven && strings.Contains(err.Error(), "was restored") {
+				t.Errorf("updateRegistrationConfig() = %q, want no claim that the configuration was restored", err)
+			}
+
+			// The update wrote once and the restore is always the second
+			// write: a failed observation never prevents the repair.
+			if len(tc.fake.writes) != 2 {
+				t.Fatalf("the registration was written %d times, want the update and the restore", len(tc.fake.writes))
+			}
+			if !scmSameRegistration(tc.fake.writes[0].BinaryPathName, requestedConfig.BinaryPathName) {
+				t.Errorf("the first write carries %q, want the requested registration", tc.fake.writes[0].BinaryPathName)
+			}
+			if !scmSameRegistration(tc.fake.writes[1].BinaryPathName, previousConfig.BinaryPathName) {
+				t.Errorf("the second write carries %q, want the previous registration", tc.fake.writes[1].BinaryPathName)
+			}
+		})
+	}
+}
+
+// TestSCMFailedUpdateConfigKeepsASuccessfulWrite checks that a configuration
+// write the platform accepts needs no restore and reports no failure.
+func TestSCMFailedUpdateConfigKeepsASuccessfulWrite(t *testing.T) {
+	previousConfig := mgr.Config{BinaryPathName: `C:\old\hfdesk.exe service run`}
+	requestedConfig := buildSCMConfig(scmTestOptions())
+	registration := &fakeSCMConfiguration{config: previousConfig}
+
+	m := &scmManager{scope: ScopeSystem}
+	if err := m.updateRegistrationConfig(registration, requestedConfig, previousSCMRegistration{present: true, config: previousConfig}); err != nil {
+		t.Fatalf("updateRegistrationConfig() = %v, want nil", err)
+	}
+	if len(registration.writes) != 1 {
+		t.Errorf("the registration was written %d times, want the update only", len(registration.writes))
+	}
+}
+
+// TestSCMSameRegistration checks the comparison of two command lines of a
+// registration: the program is compared like every other path, and the
+// arguments are compared as they are.
+func TestSCMSameRegistration(t *testing.T) {
+	opts := scmTestOptions()
+	commandLine := scmCommandLine(opts)
+
+	otherArgs := opts
+	otherArgs.Listen = "127.0.0.1:9090"
+
+	otherProgram := opts
+	otherProgram.Executable = filepath.Join("C:\\Program Files", "HFDesk", "hfdesk.exe")
+
+	// The platform stores the path of a program in the case it was given:
+	// the same registration in another case is the same registration.
+	otherCase := opts
+	otherCase.Executable = strings.ToUpper(opts.Executable)
+
+	cases := []struct {
+		name string
+		got  string
+		want string
+		same bool
+	}{
+		{"the same command line", commandLine, commandLine, true},
+		{"the same registration in another case", scmCommandLine(otherCase), commandLine, true},
+		{"another bind address", scmCommandLine(otherArgs), commandLine, false},
+		{"another program", scmCommandLine(otherProgram), commandLine, false},
+		{"a command line that cannot be read", "", commandLine, false},
+		{"two command lines that cannot be read", "", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scmSameRegistration(tc.got, tc.want); got != tc.same {
+				t.Errorf("scmSameRegistration(%q, %q) = %v, want %v", tc.got, tc.want, got, tc.same)
+			}
+		})
+	}
+}
+
+// desktopVerifyBudget is the independent outer wait of the desktop service
+// helper (internal/desktop/service_helper_windows.go, serviceVerifyBudget).
+//
+// The desktop package imports this one, so this test cannot read the value back
+// without an import cycle; the number is repeated here to prove that the
+// verification of a single start still fits inside the wait that wraps an
+// update.
+const desktopVerifyBudget = 60 * time.Second
+
+// TestSCMVerifyWaitCoversTheReadinessWait checks that the wait for a restarted
+// instance to run the registered program is sized above the readiness wait of
+// the instance.
+//
+// The service control manager reports a started instance as running only after
+// the instance itself waited for its HTTP server, so a verification that gave up
+// at the readiness budget would fail a start that is still inside its own
+// budget. The wait is derived from that budget, and it stays inside the
+// independent outer wait of the desktop helper that wraps an update.
+func TestSCMVerifyWaitCoversTheReadinessWait(t *testing.T) {
+	if scmVerifyTimeout <= scmReadinessTimeout {
+		t.Errorf("the verify wait of the manager = %s, want more than the readiness budget %s: the instance reports the running state only after it waited for its HTTP server", scmVerifyTimeout, scmReadinessTimeout)
+	}
+	if scmVerifyTimeout > desktopVerifyBudget {
+		t.Errorf("the verify wait of the manager = %s, want at most the outer wait %s of the desktop service helper", scmVerifyTimeout, desktopVerifyBudget)
+	}
+	if scmVerifyPollInterval <= 0 || scmVerifyPollInterval > scmVerifyTimeout {
+		t.Errorf("the verify poll interval = %s, want a positive pause inside the wait %s", scmVerifyPollInterval, scmVerifyTimeout)
+	}
+}
+
+// scmRollbackSuccessClaim is the phrase that reports the previous instance as in
+// service again. It is the claim a restart rollback may only make for a verified
+// restart, so the test of the outcome sentences looks for exactly this phrase.
+const scmRollbackSuccessClaim = "the previous instance was started again"
+
+// TestSCMRestartRollbackSentence checks that the outcome of a restart rollback is
+// only described as far as the rollback proved it.
+//
+// The sentence is the whole report a caller reads next to the failure of the
+// installation, so it is the place the truthfulness rule lives: the previous
+// instance is only reported as started again for a verified restart, a
+// registration that could not name its program is reported as such, and a
+// registration that could not be put back is never reported as restored. The
+// stop of the instance of the failed installation comes before the restore, and
+// the sentence of a failed stop says so: the registration of the failed
+// installation is kept, because its instance may still run.
+func TestSCMRestartRollbackSentence(t *testing.T) {
+	const stopReason = "the instance did not stop within 2m0s"
+	const restoreReason = "the service control manager refused the write of the registration"
+	const startReason = `the instance does not run "C:\\ProgramData\\HFDesk\\hfdesk.exe" within 2m0s`
+
+	stopped := scmRestartRollback{stopped: true}
+	restored := scmRestartRollback{stopped: true, restored: true}
+	programKnown := scmRestartRollback{stopped: true, restored: true, programKnown: true}
+	started := scmRestartRollback{stopped: true, restored: true, programKnown: true, started: true}
+
+	cases := []struct {
+		name string
+		// facts are the observations of the rollback up to the step that did
+		// not reach its goal.
+		facts scmRestartRollback
+		// reason is the detail the rollback embeds for a step that failed.
+		reason string
+		// want contains the phrases the sentence has to carry.
+		want []string
+		// verified reports whether the sentence may claim the previous
+		// instance as started again.
+		verified bool
+	}{
+		{
+			name:     "the instance of the failed installation did not stop",
+			facts:    scmRestartRollback{},
+			reason:   stopReason,
+			want:     []string{"was kept", "was not proven to be stopped", stopReason, "the previous registration was not restored"},
+			verified: false,
+		},
+		{
+			name:     "the previous registration could not be put back",
+			facts:    stopped,
+			reason:   restoreReason,
+			want:     []string{"was stopped", "could not be put back", restoreReason},
+			verified: false,
+		},
+		{
+			name:     "the restored registration names no program",
+			facts:    restored,
+			reason:   "",
+			want:     []string{"was stopped", "was restored", "names no program", "no instance was started", "is stopped"},
+			verified: false,
+		},
+		{
+			name:     "the previous instance was not proven to be in service again",
+			facts:    programKnown,
+			reason:   startReason,
+			want:     []string{"was stopped", "was restored", "was not proven to be in service again", startReason},
+			verified: false,
+		},
+		{
+			name:     "the started instance was not proven to be the previous program",
+			facts:    started,
+			reason:   "",
+			want:     []string{"was stopped", "was restored", "was not proven to be the previous program", "the image of the process could not be read"},
+			verified: false,
+		},
+		{
+			name:     "the previous instance was started again",
+			facts:    scmRestartRollback{stopped: true, restored: true, programKnown: true, started: true, verified: true},
+			reason:   "",
+			want:     []string{"was stopped", "was restored", scmRollbackSuccessClaim, "the failure recovery of the registration was not part of the restore"},
+			verified: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sentence := scmRestartRollbackSentence(tc.facts, tc.reason)
+			if sentence == "" {
+				t.Fatal("scmRestartRollbackSentence() is empty, want the outcome of the rollback")
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(sentence, want) {
+					t.Errorf("the sentence %q does not carry %q", sentence, want)
+				}
+			}
+			// The success claim is only made for a verified restart: every
+			// other outcome reports what it proved instead.
+			if claimed := strings.Contains(sentence, scmRollbackSuccessClaim); claimed != tc.verified {
+				t.Errorf("the sentence %q claims the previous instance was started again = %v, want %v", sentence, claimed, tc.verified)
+			}
+			// A rollback that did not prove the stop never claims the
+			// restore: the registration of the failed installation is the
+			// one that describes the process that may still run.
+			if !tc.facts.stopped && strings.Contains(sentence, "the configuration of the previous registration was restored") {
+				t.Errorf("the sentence %q claims the previous configuration was restored while the instance of the failed installation was not proven to be stopped", sentence)
+			}
+		})
+	}
+}
+
+// TestSCMConfigExecutableNamesTheProgramOfTheRegistration checks the decision
+// that tells a restored registration with a program from one without.
+//
+// The restart rollback starts the previous program again only when the restored
+// registration names it. A command line that cannot be read names no program, so
+// the rollback reports the restored registration and the state of the instance
+// instead of claiming a start it never made.
+func TestSCMConfigExecutableNamesTheProgramOfTheRegistration(t *testing.T) {
+	opts := scmTestOptions()
+	readable := mgr.Config{BinaryPathName: scmCommandLine(opts)}
+
+	if got := scmConfigExecutable(readable); got != opts.Executable {
+		t.Errorf("scmConfigExecutable(a readable command line) = %q, want %q", got, opts.Executable)
+	}
+
+	// The same program in another case is still the program of the registration:
+	// the comparison of the image of a process is made without regard to the
+	// case of the path.
+	otherCase := opts
+	otherCase.Executable = strings.ToUpper(opts.Executable)
+	got := scmConfigExecutable(mgr.Config{BinaryPathName: scmCommandLine(otherCase)})
+	if got == "" {
+		t.Fatal("scmConfigExecutable(a command line in another case) = \"\", want the program of the registration")
+	}
+	if !scmSameExecutablePath(got, opts.Executable) {
+		t.Errorf("scmConfigExecutable(a command line in another case) = %q, want the same program as %q", got, opts.Executable)
+	}
+
+	// A registration whose command line is empty names no program: that is the
+	// registration a failed installation can leave behind, and the rollback
+	// reports it instead of starting an instance it cannot name.
+	if got := scmConfigExecutable(mgr.Config{BinaryPathName: ""}); got != "" {
+		t.Errorf("scmConfigExecutable(an empty command line) = %q, want no program", got)
+	}
+}
+
+// TestSCMProcessExcluded checks the decision that keeps a process of the failed
+// attempt from being taken for the running instance.
+//
+// The installation excludes the process it replaced; the restart rollback
+// excludes the process of the failed attempt next to it. A process identifier of
+// zero names no process, so it never excludes one: the caller passes the process
+// the service control manager reported even when it reported none.
+func TestSCMProcessExcluded(t *testing.T) {
+	cases := []struct {
+		name      string
+		exclude   []uint32
+		processID uint32
+		want      bool
+	}{
+		{"no excluded process", nil, 4711, false},
+		{"the process of the attempt", []uint32{4711}, 4711, true},
+		{"another process", []uint32{4711}, 4712, false},
+		{"the process of the failed attempt next to the replaced one", []uint32{4710, 4711}, 4711, true},
+		{"a replaced process the manager reported as none", []uint32{0, 4711}, 4711, true},
+		{"no process at all", []uint32{0}, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scmProcessExcluded(tc.exclude, tc.processID); got != tc.want {
+				t.Errorf("scmProcessExcluded(%v, %d) = %v, want %v", tc.exclude, tc.processID, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSCMStopOfAnInstanceThatIsStoppedIsACleanNoOp checks the first step of the
+// restart rollback on an instance that does not run.
+//
+// The rollback stops the instance of the failed installation before it restores
+// the registration. An instance the failed installation never started, or one
+// whose process already ended, is stopped already: the stop is a clean no-op with
+// no control delivered, so the restore proceeds instead of failing over a service
+// that has nothing to stop.
+func TestSCMStopOfAnInstanceThatIsStoppedIsACleanNoOp(t *testing.T) {
+	handle := &scmTestServiceControl{state: svc.Stopped}
+
+	manager := &scmManager{scope: ScopeSystem}
+	if err := manager.stopService(context.Background(), handle); err != nil {
+		t.Fatalf("stopService() = %v, want nil for an instance that does not run", err)
+	}
+	if handle.controls != 0 {
+		t.Errorf("the stop control was delivered %d times, want none for an instance that does not run", handle.controls)
+	}
+	if handle.state != svc.Stopped {
+		t.Errorf("the state of the instance = %v, want %v", handle.state, svc.Stopped)
+	}
+}
+
+// TestSCMStartAndVerifyExcludesEveryProcessOfTheAttempt checks the seam the
+// restart rollback needs at compile time.
+//
+// The verification of a start takes the processes it must not accept as the
+// running instance, so the installation excludes the process it replaced and the
+// rollback excludes the process of the failed attempt next to it. A verification
+// that could only exclude one process would let the rollback accept the process
+// it did not start.
+//
+// The sequence itself (stop the instance of the failed installation, restore the
+// registration, start the previous program, verify it) needs a registration of
+// the service control manager: a test cannot create one without an elevated
+// shell, so the sequence is only proven on a machine that runs the elevated
+// tests.
+func TestSCMStartAndVerifyExcludesEveryProcessOfTheAttempt(t *testing.T) {
+	var start func(*scmManager, context.Context, *mgr.Service, string, ...uint32) (scmImageCheck, error) = (*scmManager).startAndVerify
+	var verify func(*scmManager, context.Context, *mgr.Service, string, ...uint32) (scmImageCheck, error) = (*scmManager).verifyRunningExecutable
+	if start == nil || verify == nil {
+		t.Fatal("the verification of a start is gone, the restart rollback cannot prove the instance it started")
+	}
+
+	// The rollback excludes the process the installation replaced and the
+	// process of the failed attempt: the exclusion list it passes keeps the
+	// process it did not start out of the answer.
+	exclude := []uint32{4710, 4711}
+	if !scmProcessExcluded(exclude, 4711) {
+		t.Errorf("scmProcessExcluded(%v, 4711) = false, want the process of the failed attempt excluded", exclude)
+	}
+	if !scmProcessExcluded(exclude, 4710) {
+		t.Errorf("scmProcessExcluded(%v, 4710) = false, want the replaced process excluded", exclude)
+	}
+	if scmProcessExcluded(exclude, 4712) {
+		t.Errorf("scmProcessExcluded(%v, 4712) = true, want the process the rollback started accepted", exclude)
 	}
 }

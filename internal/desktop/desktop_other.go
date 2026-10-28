@@ -13,3 +13,13 @@ package desktop
 func Run(o Options) error {
 	return ErrUnsupportedPlatform
 }
+
+// RunServiceAction reports that the elevated service helper is only supported
+// on Windows.
+//
+// The helper drives the service control manager of Windows, so the other
+// platforms have nothing it could perform. The service of those platforms is
+// driven by the service command of the headless binary.
+func RunServiceAction(_ ServiceActionOptions) error {
+	return ErrUnsupportedServiceAction
+}

@@ -139,6 +139,11 @@ func TestServeUsesCallerListener(t *testing.T) {
 
 // TestServeBrowserURLUsesLoopbackForWildcardBind proves that a wildcard bind
 // yields a browser-safe loopback URL with the effective port.
+//
+// The listener of the IPv4 wildcard is a dual-stack socket that reports the IPv6
+// wildcard on some platforms. The server is configured with no address of its
+// own, so the wildcard is the empty one and the URL names 127.0.0.1, which the
+// dual-stack listener accepts.
 func TestServeBrowserURLUsesLoopbackForWildcardBind(t *testing.T) {
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "jobs.json"))
 	registerTestJobManagerCleanup(t, m)
@@ -161,7 +166,7 @@ func TestServeBrowserURLUsesLoopbackForWildcardBind(t *testing.T) {
 	}
 	want := "http://127.0.0.1:" + strconv.Itoa(port)
 	if got := s.BrowserURL(); got != want {
-		t.Errorf("BrowserURL() = %q, want %q", got, want)
+		t.Errorf("BrowserURL() = %q, want %q for the bound address %s", got, want, s.BoundAddr())
 	}
 
 	cancel()
@@ -293,7 +298,8 @@ func TestBrowserURLDerivation(t *testing.T) {
 		want string
 	}{
 		{name: "wildcard ipv4", host: "0.0.0.0", port: 8080, want: "http://127.0.0.1:8080"},
-		{name: "wildcard ipv6", host: "::", port: 8080, want: "http://127.0.0.1:8080"},
+		{name: "wildcard ipv6", host: "::", port: 8080, want: "http://[::1]:8080"},
+		{name: "wildcard ipv6 in its long spelling", host: "0:0:0:0:0:0:0:0", port: 8080, want: "http://[::1]:8080"},
 		{name: "empty host", host: "", port: 8080, want: "http://127.0.0.1:8080"},
 		{name: "loopback", host: "127.0.0.1", port: 8080, want: "http://127.0.0.1:8080"},
 		{name: "lan address", host: "192.168.1.5", port: 8080, want: "http://192.168.1.5:8080"},
@@ -303,6 +309,41 @@ func TestBrowserURLDerivation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := browserURLFor(tc.host, tc.port); got != tc.want {
 				t.Errorf("browserURLFor(%q, %d) = %q, want %q", tc.host, tc.port, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBrowserURLFollowsTheConfiguredWildcardFamily proves that the loopback
+// address of a wildcard bind follows the configured address and not the socket
+// the platform chose.
+//
+// The listener of the IPv4 wildcard is a dual-stack socket that reports the IPv6
+// wildcard on some platforms, so a URL derived from the bound spelling alone
+// would name ::1 on a machine whose IPv6 loopback is disabled, where only
+// 127.0.0.1 reaches the listener. The operator asked for the IPv4 wildcard, so
+// the URL names 127.0.0.1; a configuration of the IPv6 wildcard names ::1, which
+// an IPv6-only listener needs. A concrete bound host is never replaced, and a
+// configuration without a wildcard leaves the bound spelling in place.
+func TestBrowserURLFollowsTheConfiguredWildcardFamily(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		configured string
+		bound      string
+		want       string
+	}{
+		{name: "the IPv4 wildcard that the platform reports as dual-stack", configured: "0.0.0.0", bound: "::", want: "http://127.0.0.1:8080"},
+		{name: "the IPv6 wildcard of the configuration", configured: "::", bound: "::", want: "http://[::1]:8080"},
+		{name: "no configured address", configured: "", bound: "::", want: "http://127.0.0.1:8080"},
+		{name: "a concrete bound host", configured: "::", bound: "192.168.1.5", want: "http://192.168.1.5:8080"},
+		{name: "a concrete configured host that is not wildcard", configured: "localhost", bound: "::", want: "http://[::1]:8080"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Server{config: Config{Addr: tc.configured}}
+			s.setBoundAddr(&net.TCPAddr{IP: net.ParseIP(tc.bound), Port: 8080})
+			if got := s.BrowserURL(); got != tc.want {
+				t.Errorf("BrowserURL() = %q, want %q for the bound host %q of the configured address %q",
+					got, tc.want, tc.bound, tc.configured)
 			}
 		})
 	}

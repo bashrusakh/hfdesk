@@ -197,6 +197,16 @@ func run(o Options, logPath string) (err error) {
 		showSubsystemWarning(subsystemWarningText)
 	}
 
+	// The Windows service binds the same address, so the gate reads the
+	// registration before the application is created: a launch that finds one
+	// asks the user what to do and ends without starting a server. It runs
+	// after the logging pipeline (its records are the support material of the
+	// launch) and before app.New, the first step that can create a server. A
+	// launch that ends here publishes no state.
+	if !serviceGate() {
+		return nil
+	}
+
 	application, err := app.New(o.App, o.Version)
 	if err != nil {
 		reportStartupFailure("HFDesk could not start",
@@ -375,6 +385,24 @@ func run(o Options, logPath string) (err error) {
 			// comes up.
 			go guard.runBackground(func() {
 				showRuntimeWindow(window, url, webview2Ready)
+			})
+		},
+		install: func() {
+			// The confirmation, the prompt of the user account control and
+			// the graceful shutdown all take a moment, and the shutdown has
+			// to run outside the message loop of the tray. The action
+			// therefore runs on a goroutine of its own.
+			//
+			// The host quits only after a successful launch of the elevated
+			// helper: a refused prompt or a missing console program leaves
+			// the running desktop untouched. The quit is the quit of the
+			// menu and of the signal handler, so the server is stopped
+			// through the graceful path before the process ends, and the
+			// helper starts the service only after this process exited.
+			go guard.runBackground(func() {
+				if installServiceFromTray() {
+					requestQuit()
+				}
 			})
 		},
 		quit: requestQuit,

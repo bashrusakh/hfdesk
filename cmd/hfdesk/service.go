@@ -518,6 +518,11 @@ type installFlags struct {
 	localDir    string
 	serviceUser string
 	executable  string
+	// explicit marks the flags the parser saw on the command line. The
+	// default of a flag set is only a fallback for an installation
+	// without a registration, so it must never overwrite the settings of
+	// an existing one.
+	explicit service.InstallFieldSet
 }
 
 // buildInstallOptions assembles the options of an installation from the
@@ -528,9 +533,10 @@ type installFlags struct {
 // directory: the parent of the config file is the directory the
 // installation prepares.
 //
-// The cache directories are derived from the runtime paths, so they are
-// resolved after the overrides: a machine-wide instance keeps its cache
-// inside its own state root even when the state root was overridden.
+// The cache directories are derived from the runtime paths of the request,
+// so a fresh machine-wide instance keeps its cache inside its own state
+// root. A reinstall that names only one path inherits the cache directory of
+// the registration, because an unnamed setting is kept.
 //
 // The cache root and the hub directory are one layout, so an explicit cache
 // root moves the hub directory with it: a registration that names a cache
@@ -595,6 +601,7 @@ func buildInstallOptions(scope service.Scope, flags installFlags, executable str
 	return service.InstallOptions{
 		Scope:       scope,
 		Executable:  executable,
+		Explicit:    flags.explicit,
 		Listen:      listen,
 		Paths:       paths,
 		CacheDir:    cacheRoot,
@@ -604,15 +611,48 @@ func buildInstallOptions(scope service.Scope, flags installFlags, executable str
 	}, nil
 }
 
-// serviceInstall registers the service with the platform supervisor of the
-// scope.
+// installExplicitFields returns the fields the command line named
+// explicitly.
 //
-// The command validates its own arguments before it touches the system. It
-// never starts the instance itself: the supervisor may start a registration
-// that asks for it (a LaunchAgent with RunAtLoad starts it), so the summary
-// reports the state that was reached instead of a fixed claim.
-func serviceInstall(args []string, stdout io.Writer) error {
-	flags := installFlags{}
+// Only a flag the parser saw on the command line counts. The default of a
+// flag is a value the request only carries as a fallback for an installation
+// without a registration, so it must never overwrite the setting of an
+// existing one: reinstalling with a new --executable alone keeps the bind
+// address, the paths, the cache layout and the account of the instance.
+//
+// The --listen flag keeps its default, so an installation without the flag
+// reports no explicit bind address while the options still carry the default
+// of the scope.
+//
+// An explicit cache root without a hub directory moves the hub directory with
+// it (see buildInstallOptions), so the hub directory counts as named as well:
+// the resolved "<cache>/hub" is the value the request asked for.
+func installExplicitFields(fs *flag.FlagSet) service.InstallFieldSet {
+	visited := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+
+	fields := service.InstallFieldSet{
+		Listen:      visited["listen"],
+		Config:      visited["config"],
+		StateDir:    visited["state-dir"],
+		LogDir:      visited["log-dir"],
+		CacheDir:    visited["cache-dir"],
+		HubDir:      visited["hub-dir"],
+		LocalDir:    visited["local-dir"],
+		ServiceUser: visited["service-user"],
+	}
+	if fields.CacheDir && !fields.HubDir {
+		fields.HubDir = true
+	}
+	return fields
+}
+
+// newInstallFlagSet registers the flags of "service install" and returns the
+// flag set that owns them.
+//
+// The flag set is built in one place, so the parser of the command line and
+// the markers of an explicit field never drift apart.
+func newInstallFlagSet(flags *installFlags) *flag.FlagSet {
 	fs := flag.NewFlagSet("hfdesk service install", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	registerScopeFlags(fs, &flags.scopeFlags)
@@ -625,6 +665,19 @@ func serviceInstall(args []string, stdout io.Writer) error {
 	fs.StringVar(&flags.localDir, "local-dir", "", "absolute path of the flat output directory")
 	fs.StringVar(&flags.serviceUser, "service-user", "", "account the machine-wide instance runs as (the machine-wide scope of Linux and macOS; the account cannot be chosen on Windows)")
 	fs.StringVar(&flags.executable, "executable", "", "absolute path of the binary to register (default: the invoked binary)")
+	return fs
+}
+
+// serviceInstall registers the service with the platform supervisor of the
+// scope.
+//
+// The command validates its own arguments before it touches the system. It
+// never starts the instance itself: the supervisor may start a registration
+// that asks for it (a LaunchAgent with RunAtLoad starts it), so the summary
+// reports the state that was reached instead of a fixed claim.
+func serviceInstall(args []string, stdout io.Writer) error {
+	flags := installFlags{}
+	fs := newInstallFlagSet(&flags)
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -636,6 +689,11 @@ func serviceInstall(args []string, stdout io.Writer) error {
 	if rest := fs.Args(); len(rest) > 0 {
 		return newServiceUsageError(fmt.Errorf("unexpected argument %q, the command takes flags only", rest[0]))
 	}
+
+	// The fields the user named are read back from the parser, so a
+	// default of the flag set is never mistaken for a setting of the
+	// request.
+	flags.explicit = installExplicitFields(fs)
 
 	scope, err := resolveScope(flags.user, flags.system)
 	if err != nil {
@@ -677,15 +735,21 @@ func serviceInstall(args []string, stdout io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := mgr.Install(ctx, opts); err != nil {
+	effective, err := mgr.Install(ctx, opts)
+	if err != nil {
 		return err
 	}
 
-	writeInstallSummary(stdout, ctx, mgr, scope, opts)
+	writeInstallSummary(stdout, ctx, mgr, scope, effective)
 	return nil
 }
 
 // writeInstallSummary prints what was registered.
+//
+// The options are the effective installation the manager returned, not the
+// request: an installation over an existing registration keeps the settings
+// the request did not name, so the summary reports what the registration
+// really holds instead of what the command line asked for.
 //
 // The path of the registration and the state of the instance are known only
 // after the installation, so both are read back from the supervisor.

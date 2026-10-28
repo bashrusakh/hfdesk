@@ -191,9 +191,9 @@ func (m *launchdManager) target() string {
 // resolved and validated before any directory is created and before the
 // property list is written, so a refused installation leaves nothing behind
 // and every shell reports the same reason.
-func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) error {
+func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) (InstallOptions, error) {
 	if err := ValidateInstallOptions(opts); err != nil {
-		return err
+		return opts, err
 	}
 	// A machine-wide instance must not adopt the state of the user who
 	// runs the install command. The check runs before the elevation
@@ -201,7 +201,7 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) error
 	// list is written: a refused installation leaves nothing behind, and
 	// every platform reports the same reason for the same command line.
 	if err := m.checkSystemPaths(opts); err != nil {
-		return err
+		return opts, err
 	}
 	// The service account of a machine-wide instance is resolved before
 	// anything is created: an account that does not exist is a refusal with
@@ -209,20 +209,20 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) error
 	// identity the machine does not know.
 	account, err := m.resolveAccount(opts)
 	if err != nil {
-		return err
+		return opts, err
 	}
 	// A directory the user named outside of the state directory of the
 	// instance has to be writable by the account. The check runs before the
 	// directories of the instance are created, so a refused installation
 	// leaves nothing behind.
 	if err := m.checkNamedDirs(opts, account); err != nil {
-		return err
+		return opts, err
 	}
 	// The elevation requirement is checked before any directory is created:
 	// a permission error of the machine-wide directories is a much less
 	// readable answer than the real reason.
 	if err := m.requireElevated("an installation"); err != nil {
-		return err
+		return opts, err
 	}
 	// The directories the installation is about to create are remembered
 	// before they are created, so the account is given the ownership of
@@ -239,16 +239,16 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) error
 		// before it failed: they are removed again, so a failed attempt
 		// leaves the machine as it was.
 		removeCreatedDirs(createdDirOrder(opts, created))
-		return err
+		return opts, err
 	}
 	// The installation owns the directories it created from here on: a
 	// failure removes them again, so a failed installation never leaves
 	// the directories of the instance behind.
 	if err := m.register(ctx, opts, account, created); err != nil {
 		removeCreatedDirs(createdDirOrder(opts, created))
-		return err
+		return opts, err
 	}
-	return nil
+	return opts, nil
 }
 
 // register writes the registration of the instance and hands it to the
@@ -486,7 +486,9 @@ func (m *launchdManager) Restart(ctx context.Context) error {
 //
 // The description of the instance comes from the property list that is on
 // disk, so the status describes the registration and not the intent of the
-// caller. The state comes from launchd itself.
+// caller. The state comes from launchd itself, and so does the running fact:
+// a registration whose program is gone is reported as broken even while the
+// job it started still runs.
 func (m *launchdManager) Status(ctx context.Context) (Status, error) {
 	path := m.plistPath()
 	status := Status{
@@ -532,12 +534,23 @@ func (m *launchdManager) Status(ctx context.Context) (Status, error) {
 		status.State, status.Detail = launchdStatusState(m.target(), output)
 	}
 
+	// The state the supervisor reports is also the running fact of the
+	// instance: a job that runs is running, and one that is waiting to start
+	// is about to run. The fact is kept next to the diagnosis below, so a
+	// registration whose program was deleted is reported as broken while its
+	// process still serves.
+	status.Running = runningState(status.State)
+
 	// A registration that points at a program that is gone is broken: the
 	// instance can never run again until it is installed again.
 	if status.Executable != "" {
 		if _, err := os.Stat(status.Executable); err != nil {
 			status.State = StateBroken
-			status.Detail = fmt.Sprintf("the registered executable %s does not exist", status.Executable)
+			detail := fmt.Sprintf("the registered executable %s does not exist", status.Executable)
+			if status.Running {
+				detail += brokenRunningDetail
+			}
+			status.Detail = detail
 		}
 	}
 	return status, nil

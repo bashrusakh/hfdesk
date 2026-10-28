@@ -105,7 +105,10 @@ const (
 	// StateFailed means the service failed.
 	StateFailed State = "failed"
 	// StateBroken means the service is registered, but its executable is
-	// gone.
+	// gone. The instance itself can still be running: a supervisor keeps
+	// the process it started, and only the next start fails. The running
+	// fact is therefore carried by Status.Running and not by this state,
+	// which stays the diagnosis of the registration.
 	StateBroken State = "broken"
 	// StateUnknown means the supervisor did not report a usable state.
 	StateUnknown State = "unknown"
@@ -115,6 +118,15 @@ const (
 type Status struct {
 	// State is the lifecycle state of the instance.
 	State State
+	// Running is the supervisor's own fact: the instance runs now. It is
+	// read from the same supervisor answer as State, and it is separate
+	// from it because the two answer different questions: State classifies
+	// the registration, and a registration whose executable is gone is
+	// broken (`StateBroken`) even while its process still serves. A
+	// consumer that has to know whether anything serves reads this; a
+	// manager that does not report the fact leaves State as the only
+	// evidence.
+	Running bool
 	// Scope is the installation scope of the instance.
 	Scope Scope
 	// Name is the supervisor-visible service name/label.
@@ -135,12 +147,63 @@ type Status struct {
 	Detail string
 }
 
+// runningState reports whether a lifecycle state means the instance runs: it
+// serves, or it is on its way up and about to serve. It is the state side of
+// Status.Running, which the platform managers fill from the same supervisor
+// answer as State, so the two never describe different reads.
+//
+// The stopping state is not a running one: an instance on its way down is
+// treated like a stopped one, so a caller never reports that it serves.
+func runningState(state State) bool {
+	return state == StateRunning || state == StateStarting
+}
+
+// brokenRunningDetail is appended to the detail of a registration that is
+// broken while its instance still runs.
+//
+// The supervisor keeps the process it started, so the instance serves although
+// the registration can never start it again. The sentence is written once and
+// used by every platform manager, so the three cannot describe the same state
+// differently.
+const brokenRunningDetail = " (the instance still runs, but the registration cannot start it again)"
+
+// InstallFieldSet marks the fields of an InstallOptions that a request set
+// explicitly.
+//
+// A reinstall keeps every setting the request did not name, so an unmarked
+// field only applies when the existing registration has no value of its own.
+// The executable is never part of the set: it always comes from the request.
+type InstallFieldSet struct {
+	// Listen marks a bind address the request named.
+	Listen bool
+	// Config marks a config file the request named.
+	Config bool
+	// StateDir marks a state directory the request named.
+	StateDir bool
+	// LogDir marks a log directory the request named.
+	LogDir bool
+	// CacheDir marks a cache root the request named.
+	CacheDir bool
+	// HubDir marks a hub directory the request named, or the hub directory
+	// a named cache root resolved to (<cache>/hub): that directory is the
+	// value the request asked for, not a default of the scope.
+	HubDir bool
+	// LocalDir marks an output directory the request named.
+	LocalDir bool
+	// ServiceUser marks a service account the request named.
+	ServiceUser bool
+}
+
 // InstallOptions describes one service installation.
 type InstallOptions struct {
 	// Scope is the installation scope.
 	Scope Scope
 	// Executable is the absolute path of the hfdesk binary.
 	Executable string
+	// Explicit marks the fields the request named itself. See
+	// InstallFieldSet: an unmarked field never overrides the value of an
+	// existing registration.
+	Explicit InstallFieldSet
 	// Listen is the host:port to bind.
 	Listen string
 	// Paths are the absolute config/state/log paths of the instance.
@@ -163,6 +226,65 @@ type InstallOptions struct {
 	// the supervisor starts the instance with, and the installation
 	// refuses to register an instance whose account does not exist.
 	ServiceUser string
+}
+
+// DefaultInstallOptions returns the options of an installation that names
+// nothing: the default listen address, paths and cache layout of the scope.
+//
+// No field is marked explicit, so a caller without a command line (the desktop
+// host) asks for "the defaults, nothing named" and never resets an existing
+// registration. A scope the platform lacks yields empty paths, which
+// ValidateInstallOptions rejects before anything is written.
+func DefaultInstallOptions(scope Scope, executable string) InstallOptions {
+	opts := InstallOptions{
+		Scope:      scope,
+		Executable: executable,
+		Listen:     DefaultListen,
+	}
+	paths, err := DefaultPaths(scope)
+	if err != nil {
+		return opts
+	}
+	opts.Paths = paths
+	opts.CacheDir, opts.HubDir = DefaultCacheDirs(scope, paths)
+	return opts
+}
+
+// mergeInstallOptions returns the effective options of an installation over
+// an existing registration.
+//
+// A named field of the request wins; an unmarked one keeps the value of the
+// registration when it names one and the request default otherwise, so a first
+// installation behaves exactly like the request says. The executable and the
+// scope always come from the request: the other scope is another registration
+// and is never merged.
+func mergeInstallOptions(requested, existing InstallOptions) InstallOptions {
+	merged := requested
+	if !requested.Explicit.Listen && existing.Listen != "" {
+		merged.Listen = existing.Listen
+	}
+	if !requested.Explicit.Config && existing.Paths.ConfigFile != "" {
+		merged.Paths.ConfigFile = existing.Paths.ConfigFile
+	}
+	if !requested.Explicit.StateDir && existing.Paths.StateDir != "" {
+		merged.Paths.StateDir = existing.Paths.StateDir
+	}
+	if !requested.Explicit.LogDir && existing.Paths.LogDir != "" {
+		merged.Paths.LogDir = existing.Paths.LogDir
+	}
+	if !requested.Explicit.CacheDir && existing.CacheDir != "" {
+		merged.CacheDir = existing.CacheDir
+	}
+	if !requested.Explicit.HubDir && existing.HubDir != "" {
+		merged.HubDir = existing.HubDir
+	}
+	if !requested.Explicit.LocalDir && existing.LocalDir != "" {
+		merged.LocalDir = existing.LocalDir
+	}
+	if !requested.Explicit.ServiceUser && existing.ServiceUser != "" {
+		merged.ServiceUser = existing.ServiceUser
+	}
+	return merged
 }
 
 // DefaultServiceUser returns the default account a machine-wide instance
@@ -221,8 +343,12 @@ func SupportsNamedServiceAccount() bool {
 // semantics and the validation; the platform implementations own the
 // supervisor details.
 type Manager interface {
-	// Install registers the service with the platform supervisor.
-	Install(ctx context.Context, opts InstallOptions) error
+	// Install registers the service with the platform supervisor and
+	// returns the installation as it was written: a reinstall reports what
+	// the instance runs with, a wholesale replacement the request. On error
+	// the returned options describe no effective installation and must not
+	// be reported as one.
+	Install(ctx context.Context, opts InstallOptions) (InstallOptions, error)
 	// Uninstall removes the registration of the service.
 	Uninstall(ctx context.Context) error
 	// Start starts the registered service.
@@ -287,6 +413,43 @@ func ParseListen(addr string) (string, int, error) {
 		return "", 0, fmt.Errorf("service: invalid listen address %q: port %d is out of range (1-65535)", addr, port)
 	}
 	return host, port, nil
+}
+
+// LocalAddress returns the address a client of the same machine reaches the
+// listener of listen with.
+//
+// A wildcard bind has no address a client can connect to: 0.0.0.0 and :: fail
+// with WSAEADDRNOTAVAIL on Windows and EADDRNOTAVAIL elsewhere. Such a bind is
+// replaced with the loopback address of the same family, which the listener
+// accepts like any other client; an empty host becomes the IPv4 loopback.
+// Every other host is kept, including "localhost".
+//
+// The port is always kept, and the rule has one owner: the readiness probe
+// dials the address this function returns and the desktop host opens the URL of
+// it, so the address a start is verified on and the address a browser is sent
+// to cannot differ. An address without a host and port is an error.
+func LocalAddress(listen string) (string, error) {
+	addr := strings.TrimSpace(listen)
+	if addr == "" {
+		addr = DefaultListen
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("service: invalid listen address %q: %w", addr, err)
+	}
+	if port == "" {
+		return "", fmt.Errorf("service: invalid listen address %q: the port is empty", addr)
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	} else if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		if ip.To4() != nil {
+			host = "127.0.0.1"
+		} else {
+			host = "::1"
+		}
+	}
+	return net.JoinHostPort(host, port), nil
 }
 
 // IsLoopbackListen reports whether the address binds a loopback interface.
