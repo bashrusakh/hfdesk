@@ -104,6 +104,10 @@ const (
 // scmStopBudget bounds the graceful stop; a test shortens it.
 var scmStopBudget = scmStopTimeout
 
+// scmVerifyBudget bounds the wait for a restarted instance to run; a test
+// shortens it.
+var scmVerifyBudget = scmVerifyTimeout
+
 // scmManager drives the service control manager of HFDesk.
 //
 // The manager registers the instance as a machine-wide service, it starts
@@ -1008,12 +1012,17 @@ func (m *scmManager) verifyRunningExecutable(ctx context.Context, handle *mgr.Se
 	return check, err
 }
 
+// scmQueryStatus reads the state of the instance during a verification. The
+// variable is the seam of the test: a test verifies without a registration of
+// the service control manager.
+var scmQueryStatus = (*mgr.Service).Query
+
 // verifyRunningExecutableVersion also waits for the expected version.
 func (m *scmManager) verifyRunningExecutableVersion(ctx context.Context, handle *mgr.Service, executable, listen, expectedVersion string, exclude ...uint32) (scmImageCheck, bool, error) {
-	deadline := time.Now().Add(scmVerifyTimeout)
+	deadline := time.Now().Add(scmVerifyBudget)
 	detail := "the service control manager did not report the instance as running"
 	for {
-		status, err := handle.Query()
+		status, err := scmQueryStatus(handle)
 		switch {
 		case err != nil:
 			detail = fmt.Sprintf("the state of %s cannot be read: %v", ServiceName, err)
@@ -1039,11 +1048,14 @@ func (m *scmManager) verifyRunningExecutableVersion(ctx context.Context, handle 
 					return check, false, fmt.Errorf("the instance does not run the expected version: %w", probeErr)
 				}
 				detail = fmt.Sprintf("the instance does not answer on %s: %v", probeAddressOrListen(listen), probeErr)
+			} else {
+				// The image read did not settle the question: its reason is
+				// the only detail there is.
+				detail = reason
 			}
-			detail = reason
 		}
 		if !time.Now().Before(deadline) {
-			return scmImageUnverified, false, fmt.Errorf("the instance does not run %q within %s: %s", executable, scmVerifyTimeout, detail)
+			return scmImageUnverified, false, fmt.Errorf("the instance does not run %q within %s: %s", executable, scmVerifyBudget, detail)
 		}
 		select {
 		case <-ctx.Done():

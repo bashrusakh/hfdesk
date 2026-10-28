@@ -704,6 +704,15 @@ func shortenSCMStopBudget(t *testing.T, budget time.Duration) {
 	t.Cleanup(func() { scmStopBudget = previous })
 }
 
+// shortenSCMVerifyBudget shortens the wait of a verification that never
+// settles.
+func shortenSCMVerifyBudget(t *testing.T, budget time.Duration) {
+	t.Helper()
+	previous := scmVerifyBudget
+	scmVerifyBudget = budget
+	t.Cleanup(func() { scmVerifyBudget = previous })
+}
+
 // scmTestRunningPrevious returns the registration an installation replaces: an
 // instance that ran before the installation and carries the previous program.
 func scmTestRunningPrevious() previousSCMRegistration {
@@ -4300,6 +4309,57 @@ func TestSCMVerifyWaitCoversTheReadinessWait(t *testing.T) {
 	}
 	if scmVerifyPollInterval <= 0 || scmVerifyPollInterval > scmVerifyTimeout {
 		t.Errorf("the verify poll interval = %s, want a positive pause inside the wait %s", scmVerifyPollInterval, scmVerifyTimeout)
+	}
+}
+
+// TestSCMVerifyRunningExecutableKeepsTheProbeCause checks that the failure of
+// the readiness probe reaches the timeout error.
+//
+// The service control manager reports the instance as running with the image of
+// the test process, so the probe is the only step that fails. The error has to
+// name the address and the probe failure: a verification that keeps only the
+// empty reason of a settled image read hides why the instance never came up.
+func TestSCMVerifyRunningExecutableKeepsTheProbeCause(t *testing.T) {
+	processID := uint32(os.Getpid())
+	executable, err := queryProcessImageName(processID)
+	if err != nil {
+		t.Fatalf("the image of the test process: %v", err)
+	}
+
+	previousQuery := scmQueryStatus
+	t.Cleanup(func() { scmQueryStatus = previousQuery })
+	scmQueryStatus = func(*mgr.Service) (svc.Status, error) {
+		return svc.Status{State: svc.Running, ProcessId: processID}, nil
+	}
+
+	previousProbe := serviceInstallProbe
+	t.Cleanup(func() { serviceInstallProbe = previousProbe })
+	probeErr := errors.New("the health endpoint did not answer")
+	probed := false
+	serviceInstallProbe = func(string, string) (bool, error) {
+		probed = true
+		return false, probeErr
+	}
+
+	shortenSCMVerifyBudget(t, 10*time.Millisecond)
+
+	const listen = "127.0.0.1:8080"
+	check, verified, err := (&scmManager{scope: ScopeSystem}).verifyRunningExecutableVersion(
+		context.Background(), &mgr.Service{}, executable, listen, "1.2.3",
+	)
+	if err == nil {
+		t.Fatal("verifyRunningExecutableVersion() = nil, want the timeout of the instance that does not answer")
+	}
+	if !probed {
+		t.Fatalf("verifyRunningExecutableVersion() = %q before the readiness probe was asked", err)
+	}
+	if check != scmImageUnverified || verified {
+		t.Errorf("verifyRunningExecutableVersion() = %d, %t, want %d, false", check, verified, scmImageUnverified)
+	}
+	for _, want := range []string{listen, probeErr.Error()} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("verifyRunningExecutableVersion() = %q, want an error that mentions %q", err, want)
+		}
 	}
 }
 
