@@ -3656,6 +3656,13 @@ type fakeSCMConfiguration struct {
 	applyBeforeRefusing bool
 	// readErr is the error of every read.
 	readErr error
+	// partialReadErr is the error of a read that happens while the
+	// registration still holds the configuration of the refused update:
+	// the update is the first write and the restore is the second one, so a
+	// read between them is refused and the read-back of the restore is
+	// answered. It models an observation of the partially changed
+	// registration, which the failure path must not depend on.
+	partialReadErr error
 }
 
 // UpdateConfig records the write and returns the error of the call.
@@ -3677,6 +3684,11 @@ func (f *fakeSCMConfiguration) Config() (mgr.Config, error) {
 	if f.readErr != nil {
 		return mgr.Config{}, f.readErr
 	}
+	// The update is the first write and the restore the second one: a read
+	// of the configuration between them is refused.
+	if f.partialReadErr != nil && len(f.writes) == 1 {
+		return mgr.Config{}, f.partialReadErr
+	}
 	return f.config, nil
 }
 
@@ -3684,11 +3696,11 @@ func (f *fakeSCMConfiguration) Config() (mgr.Config, error) {
 // path of a configuration write that the platform refuses.
 //
 // Service.UpdateConfig is not atomic: the command line can be replaced before a
-// later call of the same update fails. The failure path reads the registration
-// back and restores the configuration it replaced, and the report says exactly
-// what was proved: a restore that was read back, a restore that failed, and a
-// read that failed all name their outcome, and the original failure stays the
-// error the caller gets.
+// later call of the same update fails. The failure path always attempts the
+// restore, even when the registration cannot be observed first, and the report
+// says exactly what was proved: a restore whose write and read-back succeeded, a
+// restore that failed, and a read-back that failed all name their outcome, and
+// the original failure stays the error the caller gets.
 func TestSCMFailedUpdateConfigRestoresThePreviousConfiguration(t *testing.T) {
 	previousConfig := mgr.Config{
 		ServiceType:      windows.SERVICE_WIN32_OWN_PROCESS,
@@ -3700,6 +3712,7 @@ func TestSCMFailedUpdateConfigRestoresThePreviousConfiguration(t *testing.T) {
 	requestedConfig := buildSCMConfig(scmTestOptions())
 	updateErr := errors.New("the service control manager refused the description")
 	restoreErr := errors.New("the service control manager refused the command line")
+	readErr := errors.New("the service control manager is gone")
 
 	cases := []struct {
 		name string
@@ -3709,10 +3722,6 @@ func TestSCMFailedUpdateConfigRestoresThePreviousConfiguration(t *testing.T) {
 		want []string
 		// wantUnproven is true when the report must not claim a restore.
 		wantUnproven bool
-		// noRestoreWrite is true when the registration is written once
-		// only: a read that fails cannot be followed by a restore that
-		// would be read back anyway.
-		noRestoreWrite bool
 	}{
 		{
 			name: "the configuration is restored",
@@ -3730,20 +3739,33 @@ func TestSCMFailedUpdateConfigRestoresThePreviousConfiguration(t *testing.T) {
 				writeErrs:           []error{updateErr, restoreErr},
 				applyBeforeRefusing: true,
 			},
-			want:         []string{"update the registration", updateErr.Error(), "may be partially changed", restoreErr.Error()},
+			want:         []string{"update the registration", updateErr.Error(), "may be partially changed", "could not be restored or verified", restoreErr.Error()},
 			wantUnproven: true,
 		},
 		{
-			name: "the registration cannot be read back",
+			name: "the restore cannot be read back",
 			fake: &fakeSCMConfiguration{
 				config:              previousConfig,
 				writeErrs:           []error{updateErr},
 				applyBeforeRefusing: true,
-				readErr:             errors.New("the service control manager is gone"),
+				readErr:             readErr,
 			},
-			want:           []string{"update the registration", updateErr.Error(), "may be partially changed", "could not be read back"},
-			wantUnproven:   true,
-			noRestoreWrite: true,
+			want:         []string{"update the registration", updateErr.Error(), "may be partially changed", "could not be restored or verified", readErr.Error()},
+			wantUnproven: true,
+		},
+		{
+			// The preliminary observation of the old failure path is
+			// gone: a fake that refuses a read of the partially changed
+			// registration still reaches the restore, and the restore's
+			// read-back proves the previous command line.
+			name: "a failed observation does not prevent the restore",
+			fake: &fakeSCMConfiguration{
+				config:              previousConfig,
+				writeErrs:           []error{updateErr},
+				applyBeforeRefusing: true,
+				partialReadErr:      readErr,
+			},
+			want: []string{"update the registration", updateErr.Error(), "was restored"},
 		},
 	}
 	for _, tc := range cases {
@@ -3767,20 +3789,13 @@ func TestSCMFailedUpdateConfigRestoresThePreviousConfiguration(t *testing.T) {
 				t.Errorf("updateRegistrationConfig() = %q, want no claim that the configuration was restored", err)
 			}
 
-			// The update wrote once, and the restore is the second write
-			// whenever the registration could be read back.
-			wantWrites := 2
-			if tc.noRestoreWrite {
-				wantWrites = 1
-			}
-			if len(tc.fake.writes) != wantWrites {
-				t.Fatalf("the registration was written %d times, want %d", len(tc.fake.writes), wantWrites)
+			// The update wrote once and the restore is always the second
+			// write: a failed observation never prevents the repair.
+			if len(tc.fake.writes) != 2 {
+				t.Fatalf("the registration was written %d times, want the update and the restore", len(tc.fake.writes))
 			}
 			if !scmSameRegistration(tc.fake.writes[0].BinaryPathName, requestedConfig.BinaryPathName) {
 				t.Errorf("the first write carries %q, want the requested registration", tc.fake.writes[0].BinaryPathName)
-			}
-			if tc.noRestoreWrite {
-				return
 			}
 			if !scmSameRegistration(tc.fake.writes[1].BinaryPathName, previousConfig.BinaryPathName) {
 				t.Errorf("the second write carries %q, want the previous registration", tc.fake.writes[1].BinaryPathName)

@@ -654,23 +654,22 @@ func (m *scmManager) updateRegistrationConfig(registration scmConfiguration, con
 	return failedUpdateRestore(registration, previous, failure)
 }
 
-// failedUpdateRestore reads the registration back after a refused update and
-// restores the configuration the installation replaced.
+// failedUpdateRestore restores the configuration the installation replaced
+// after an update the platform refused.
 //
-// The outcome is what was observed, never what was attempted: a restore that
-// was read back is reported as restored, and a read that fails, or a restore
-// that fails, is reported as a registration that may be partially changed
-// together with the reason. A registration that cannot be read back is not
-// written back either: the failure path never claims a restore it could not
-// prove, so the reason of the read is what the caller gets. The original failure
-// stays the error the caller gets, and the running instance is never stopped or
-// started here: the refused write did not touch it.
+// The repair is always attempted: a failed observation never prevents it,
+// because the previous configuration is in memory and the update may already
+// have replaced the command line. The outcome is what was observed, never what
+// was attempted: the previous configuration is reported as restored only when
+// the restore's own write and read-back proved its command line, and a restore
+// that fails, or whose read-back fails, is reported as a registration that may
+// be partially changed and whose previous configuration could not be restored
+// or verified, together with the reason. The original failure stays the error
+// the caller gets, and the running instance is never stopped or started here:
+// the refused write did not touch it.
 func failedUpdateRestore(registration scmConfiguration, previous previousSCMRegistration, failure error) error {
-	if _, err := registration.Config(); err != nil {
-		return fmt.Errorf("%w (the registration of %s may be partially changed: its configuration could not be read back: %v)", failure, ServiceName, err)
-	}
 	if err := restoreSCMConfig(registration, previous); err != nil {
-		return fmt.Errorf("%w (the registration of %s may be partially changed: the previous configuration could not be restored: %v)", failure, ServiceName, err)
+		return fmt.Errorf("%w (the registration of %s may be partially changed: the previous configuration could not be restored or verified: %v)", failure, ServiceName, err)
 	}
 	return fmt.Errorf("%w (the configuration of the previous registration of %s was restored; the running instance was not touched)", failure, ServiceName)
 }
