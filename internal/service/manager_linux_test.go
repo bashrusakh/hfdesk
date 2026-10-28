@@ -2992,7 +2992,7 @@ func TestSystemdFailedInstallKeepsACreatedDirectoryThatHoldsData(t *testing.T) {
 	// The error of the failed supervisor call is the error the caller
 	// gets: the cleanup of the directories never replaces it.
 	t.Setenv("HFDESK_TEST_MARKER_DIR", t.TempDir())
-	wantErr := m.reloadAndEnable(context.Background())
+	wantErr := m.reloadAndEnable(context.Background(), true)
 	if wantErr == nil {
 		t.Fatal("the fake supervisor did not fail")
 	}
@@ -3611,6 +3611,14 @@ func TestSystemdRestartVerifyWaitIsTheShutdownBudget(t *testing.T) {
 // address. A test that drives the probe installs one of its own after this
 // helper returned.
 //
+// The enablement that "is-enabled" reports is HFDESK_TEST_SYSTEMCTL_ENABLED_STATE:
+// "enabled" (the default) exits with a zero status, so the unit counts as
+// enabled for boot, and every other state ("disabled", "masked") exits with a
+// non-zero status, so a test can drive a repeat installation of a unit its
+// administrator disabled or masked. An "enable" that fails once
+// HFDESK_TEST_SYSTEMCTL_ENABLE_FAIL is "1" drives the failure of an
+// installation that cannot enable its registration.
+//
 // The log path is returned. It is written even when the supervisor is asked
 // for a property only, so a test can tell a restart from a state query.
 func systemdRecordingSupervisor(t *testing.T) string {
@@ -3625,6 +3633,21 @@ if [ "$1" = "--user" ]; then
 	shift
 fi
 case "$1" in
+is-enabled)
+	state="${HFDESK_TEST_SYSTEMCTL_ENABLED_STATE:-enabled}"
+	echo "$state"
+	if [ "$state" = "enabled" ]; then
+		exit 0
+	fi
+	exit 1
+	;;
+enable)
+	if [ "$HFDESK_TEST_SYSTEMCTL_ENABLE_FAIL" = "1" ]; then
+		echo "the fake supervisor refuses the enable" >&2
+		exit 1
+	fi
+	exit 0
+	;;
 show)
 	active="${HFDESK_TEST_SYSTEMCTL_ACTIVE:-inactive}"
 	if [ -n "$HFDESK_TEST_SYSTEMCTL_RESTARTED" ] && [ -e "$HFDESK_TEST_SYSTEMCTL_RESTARTED" ] && [ -n "$HFDESK_TEST_SYSTEMCTL_ACTIVE_AFTER_RESTART" ]; then
@@ -4185,5 +4208,121 @@ func TestSystemdFreshInstallNeverStartsTheInstance(t *testing.T) {
 	}
 	if got := systemdSupervisorCallsTo(calls, "start", unitName); got != 0 {
 		t.Errorf("a first installation started the unit %d times:\n%s", got, strings.Join(calls, "\n"))
+	}
+	// A first installation has no registration whose enablement it could
+	// keep: it enables the registration it writes, and it never asks for a
+	// state that does not exist.
+	if got := systemdSupervisorCallsTo(calls, "is-enabled", unitName); got != 0 {
+		t.Errorf("a first installation read an enablement %d times, want none:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
+// systemdSupervisorCallIndex returns the index of the first call of the fake
+// supervisor that equals the given command, and -1 when it was never called.
+// The scope prefix of the manager is ignored.
+func systemdSupervisorCallIndex(calls []string, command ...string) int {
+	want := strings.Join(command, " ")
+	for i, call := range calls {
+		if strings.TrimPrefix(call, "--user ") == want {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestSystemdReinstallKeepsTheAutostartStateOfTheUnit checks that a repeat
+// installation keeps the autostart state it finds.
+//
+// A first installation enables the registration for boot. A repeat installation
+// must not undo the decision of an administrator: a unit that was enabled before
+// is enabled again, so the new unit file keeps starting at boot, and a unit that
+// is disabled or masked is left alone. The supervisor is reloaded in every case,
+// so it picks the new unit file up, and the enablement is read before the unit
+// file is written, so the state that is kept is the state of the unit the
+// installation replaces.
+func TestSystemdReinstallKeepsTheAutostartStateOfTheUnit(t *testing.T) {
+	cases := []struct {
+		name string
+		// state is the enablement the supervisor reports for the unit
+		// that is installed already.
+		state string
+		// wantEnabled is how often the installation may enable the unit.
+		wantEnabled int
+	}{
+		{"a unit that is enabled", "enabled", 1},
+		{"a unit that is disabled", "disabled", 0},
+		{"a masked unit", "masked", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := systemdRecordingSupervisor(t)
+			root := t.TempDir()
+			oldExecutable := systemdTestExecutable(t)
+			newExecutable := systemdTestExecutable(t)
+			previous := systemdExistingOptions(t, oldExecutable, root)
+
+			m, _, _ := systemdExistingInstallation(t, previous)
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLED_STATE", tc.state)
+
+			if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
+				t.Fatalf("Install() = %v, want nil for a unit that was %q before", err, tc.state)
+			}
+
+			calls := systemdSupervisorCalls(t, logPath)
+			if got := systemdSupervisorCallsTo(calls, "enable", unitName); got != tc.wantEnabled {
+				t.Errorf("the unit was enabled %d times, want %d for a unit that was %q before:\n%s", got, tc.wantEnabled, tc.state, strings.Join(calls, "\n"))
+			}
+			if got := systemdSupervisorCallsTo(calls, "daemon-reload"); got == 0 {
+				t.Errorf("the supervisor was never reloaded:\n%s", strings.Join(calls, "\n"))
+			}
+			enabledAt := systemdSupervisorCallIndex(calls, "is-enabled", unitName)
+			reloadAt := systemdSupervisorCallIndex(calls, "daemon-reload")
+			if enabledAt < 0 {
+				t.Fatalf("the enablement of the registration was never read:\n%s", strings.Join(calls, "\n"))
+			}
+			if enabledAt > reloadAt {
+				t.Errorf("the enablement was read after the supervisor was reloaded, the state of the replaced unit is not the state that was kept:\n%s", strings.Join(calls, "\n"))
+			}
+		})
+	}
+}
+
+// TestSystemdEnablementFailureIsAFailedInstallation checks that the enable of a
+// first installation keeps its error handling: a registration the supervisor
+// refuses to enable is a failed installation, and the unit file the
+// installation wrote is removed again.
+//
+// The registration of a first installation is enabled for the boot of the
+// scope, so an installation that cannot enable it is not the registration the
+// user asked for. The failure is reported and the rollback leaves no unit file
+// behind.
+func TestSystemdEnablementFailureIsAFailedInstallation(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	root := t.TempDir()
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLE_FAIL", "1")
+
+	m := &systemdManager{scope: ScopeUser}
+	_, err := m.Install(context.Background(), systemdTempInstallOptions(t, root))
+	if err == nil {
+		t.Fatal("Install() = nil, want the failure of the enable")
+	}
+	if !strings.Contains(err.Error(), "enable") {
+		t.Errorf("Install() = %q, want an error that names the refused enable", err)
+	}
+
+	path, pathErr := m.unitPath()
+	if pathErr != nil {
+		t.Fatalf("unitPath() = %v, want nil", pathErr)
+	}
+	if _, statErr := os.Stat(path); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("the unit file %q is still there after the failed installation (stat error: %v)", path, statErr)
+	}
+
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "enable", unitName); got != 1 {
+		t.Errorf("the unit was enabled %d times, want the one enable the installation attempted:\n%s", got, strings.Join(calls, "\n"))
 	}
 }

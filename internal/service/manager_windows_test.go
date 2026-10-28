@@ -84,6 +84,51 @@ func TestBuildSCMConfigUsesTheLeastPrivilegedAccount(t *testing.T) {
 	}
 }
 
+// TestSCMConfigWithAutostartKeepsTheStateOfTheRegistration checks that a repeat
+// installation writes the autostart state the registration already has.
+//
+// The start type of a registration is a setting of the machine: an
+// administrator may have switched the service to a manual or a disabled start,
+// so it does not start at boot, or to a delayed automatic start. A reinstall
+// with a new binary is not the place to undo that decision, so the update of the
+// configuration carries the state of the registration and not the automatic
+// start a first installation uses.
+func TestSCMConfigWithAutostartKeepsTheStateOfTheRegistration(t *testing.T) {
+	config := buildSCMConfig(scmTestOptions())
+	cases := []struct {
+		name     string
+		previous mgr.Config
+	}{
+		{"an automatic start", mgr.Config{StartType: mgr.StartAutomatic}},
+		{"a manual start", mgr.Config{StartType: mgr.StartManual}},
+		{"a disabled start", mgr.Config{StartType: mgr.StartDisabled}},
+		{"a delayed automatic start", mgr.Config{StartType: mgr.StartAutomatic, DelayedAutoStart: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scmConfigWithAutostart(config, tc.previous)
+			if got.StartType != tc.previous.StartType {
+				t.Errorf("StartType = %d, want the start type %d of the registration", got.StartType, tc.previous.StartType)
+			}
+			if got.DelayedAutoStart != tc.previous.DelayedAutoStart {
+				t.Errorf("DelayedAutoStart = %v, want %v of the registration", got.DelayedAutoStart, tc.previous.DelayedAutoStart)
+			}
+			// The autostart state is the only part of the configuration the
+			// repeat installation keeps: the rest is the registration the
+			// installation writes.
+			if got.BinaryPathName != config.BinaryPathName {
+				t.Errorf("BinaryPathName = %q, want the command line %q of the installation", got.BinaryPathName, config.BinaryPathName)
+			}
+			if got.ServiceStartName != config.ServiceStartName {
+				t.Errorf("ServiceStartName = %q, want %q", got.ServiceStartName, config.ServiceStartName)
+			}
+			if got.ErrorControl != config.ErrorControl || got.ServiceType != config.ServiceType {
+				t.Errorf("the configuration = %+v, want the service type and error control of the installation", got)
+			}
+		})
+	}
+}
+
 func TestSCMCommandLineCarriesNoCredential(t *testing.T) {
 	opts := scmTestOptions()
 	// Every field of the options that could carry a credential carries

@@ -4,10 +4,12 @@
 package service
 
 import (
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -44,27 +46,149 @@ func TestProbeServiceAddressMapsTheWildcardBindOntoTheLoopback(t *testing.T) {
 	}
 }
 
-// TestProbeServiceReadyReachesAServingInstance checks the readiness probe
-// against a server of the test.
+// TestProbeServiceReadyAcceptsTheHealthDocumentOfTheInstance checks the
+// readiness probe against the health answer of HFDesk.
 //
-// The server answers with the status of the basic authentication of the
-// instance: the probe accepts every answer, because the point of the probe is
-// that an HTTP server listens on the address and not that it answers with a
-// particular code. The health endpoint of the instance is the one the probe
-// asks.
-func TestProbeServiceReadyReachesAServingInstance(t *testing.T) {
+// The endpoint answers with the healthy status and the version of the instance,
+// and the probe accepts exactly that answer: the address really serves the
+// instance that was started. The probe asks the health endpoint with the
+// request of a client that carries no access data, so it never sends the
+// credential of the config file of the instance.
+func TestProbeServiceReadyAcceptsTheHealthDocumentOfTheInstance(t *testing.T) {
 	path := make(chan string, 1)
+	authorization := make(chan string, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path <- r.URL.Path
+		authorization <- r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ok","version":"1.2.3","time":"2025-01-01T00:00:00Z","endpoint":"https://huggingface.co"}`)
+	}))
+	defer server.Close()
+
+	if err := probeServiceReady(server.Listener.Addr().String()); err != nil {
+		t.Fatalf("probeServiceReady(%q) = %v, want nil for the health answer of the instance", server.Listener.Addr(), err)
+	}
+	if got := <-path; got != "/api/health" {
+		t.Errorf("the probe asked %q, want the health endpoint of the instance", got)
+	}
+	if got := <-authorization; got != "" {
+		t.Errorf("the probe sent the credential %q, want no access data at all", got)
+	}
+}
+
+// TestProbeServiceReadyAcceptsTheChallengeOfTheInstance checks that a protected
+// instance is accepted without a credential.
+//
+// The basic authentication of the instance refuses a request without a
+// credential with the challenge of HFDesk. That challenge is the evidence that
+// the server on the address is the instance, and the probe needs no credential
+// to observe it.
+func TestProbeServiceReadyAcceptsTheChallengeOfTheInstance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="HFDesk"`)
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
 	defer server.Close()
 
 	if err := probeServiceReady(server.Listener.Addr().String()); err != nil {
-		t.Fatalf("probeServiceReady(%q) = %v, want nil for a server that answers", server.Listener.Addr(), err)
+		t.Fatalf("probeServiceReady(%q) = %v, want nil for the challenge of the instance", server.Listener.Addr(), err)
 	}
-	if got := <-path; got != "/api/health" {
-		t.Errorf("the probe asked %q, want the health endpoint of the instance", got)
+}
+
+// TestProbeServiceReadyRejectsAServerThatIsNotTheInstance checks that the probe
+// proves the instance and not merely an HTTP server.
+//
+// A program that listens on the port of the instance is not the instance: only
+// the health document of HFDesk and the challenge of its basic authentication
+// are accepted, and every other answer is a failure that names the address and
+// the reason. A server that answers with a status and a body of its own is the
+// state the probe exists to refuse.
+func TestProbeServiceReadyRejectsAServerThatIsNotTheInstance(t *testing.T) {
+	cases := []struct {
+		name string
+		// handler answers the request of the probe the way the foreign
+		// program does.
+		handler http.HandlerFunc
+		// want is a fragment of the failure that names what the probe
+		// refused.
+		want string
+	}{
+		{
+			name: "a 200 with a JSON document that is not the health document",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"message":"hello"}`)
+			},
+			want: `the status ""`,
+		},
+		{
+			name: "a 200 without a version of the instance",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"status":"ok","version":""}`)
+			},
+			want: "reports no version",
+		},
+		{
+			name: "a 200 with a body that is no JSON at all",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, "<!doctype html><title>another server</title>")
+			},
+			want: "does not answer the health document",
+		},
+		{
+			name: "a 200 of an unhealthy instance",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"status":"degraded","version":"1.2.3"}`)
+			},
+			want: `the status "degraded"`,
+		},
+		{
+			name: "a 404 of another program",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				http.NotFound(w, r)
+			},
+			want: "404",
+		},
+		{
+			name: "a 500 of another program",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			want: "500",
+		},
+		{
+			name: "a 401 without the challenge of the instance",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusUnauthorized)
+			},
+			want: "challenge",
+		},
+		{
+			name: "a 401 with another realm",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("WWW-Authenticate", `Basic realm="Admin"`)
+				w.WriteHeader(http.StatusUnauthorized)
+			},
+			want: `realm=\"Admin\"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(tc.handler)
+			defer server.Close()
+
+			err := probeServiceReady(server.Listener.Addr().String())
+			if err == nil {
+				t.Fatalf("probeServiceReady(%q) = nil, want the failure of an answer that is not the instance", server.Listener.Addr())
+			}
+			for _, want := range []string{"does not answer as the HFDesk server", tc.want} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("probeServiceReady() = %q, want an error that mentions %q", err, want)
+				}
+			}
+		})
 	}
 }
 
@@ -106,7 +230,8 @@ func TestProbeServiceReadyReachesAWildcardListener(t *testing.T) {
 				t.Skipf("the address %q cannot be bound: %v", tc.bind, err)
 			}
 			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusUnauthorized)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"status":"ok","version":"dev"}`)
 			})}
 			go func() {
 				_ = server.Serve(listener)

@@ -426,9 +426,9 @@ func TestResolveOptionsReadsTheRegisteredArguments(t *testing.T) {
 
 // scmTestServe starts an HTTP server of the test on the given address.
 //
-// The server answers the readiness probe of the handler, so the handler
-// reports the instance as running without the real host of the service. The
-// server is closed when the test ends.
+// The server answers the readiness probe of the handler with the health
+// document of HFDesk, so the handler reports the instance as running without
+// the real host of the service. The server is closed when the test ends.
 func scmTestServe(t *testing.T, addr string) {
 	t.Helper()
 	listener, err := net.Listen("tcp", addr)
@@ -436,7 +436,11 @@ func scmTestServe(t *testing.T, addr string) {
 		t.Fatalf("Listen(%q) = %v, want nil", addr, err)
 	}
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		// The probe of an instance proves the server and not merely a
+		// listener: an answer that is not the health document of HFDesk is
+		// a failed readiness.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","version":"test"}`))
 	})}
 	go func() {
 		_ = server.Serve(listener)

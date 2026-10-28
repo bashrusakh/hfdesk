@@ -164,6 +164,11 @@ func newPlatformManager(scope Scope) (Manager, error) {
 // request: an installation is the only way a new binary reaches the
 // registration.
 //
+// The autostart state of the registration is kept as well: a service an
+// administrator switched to a manual or a disabled start is not turned back into
+// an automatic one by a repeat installation, and a delayed automatic start stays
+// delayed. Only a first installation is written with the automatic start.
+//
 // The state of the instance is restricted before the registration is
 // written: every directory the installation created carries the restrictive
 // descriptor, so the directories the instance creates inside them inherit
@@ -390,6 +395,11 @@ func scmRegistrationOptions(commandLine string, scope Scope) InstallOptions {
 // updated otherwise: a second registration never exists, so the instance keeps
 // its identity and the status keeps describing one service.
 //
+// The autostart state of a registration is a setting of the machine: an update
+// writes the start type and the delayed start the registration already has, so a
+// service an administrator switched to a manual or a disabled start stays that
+// way. Only a first installation is written with the automatic start.
+//
 // The directories of the instance are already created when the function is
 // called. A failure after the registration was written restores the
 // configuration of the previous registration: the caller removes the
@@ -446,6 +456,14 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 			previous.processID = status.ProcessId
 		}
 		previous.config = previousConfig
+
+		// The autostart state of the registration is a setting of the
+		// machine: an administrator may have switched the service to a
+		// manual or a disabled start, or to a delayed automatic start, and
+		// a repeat installation keeps the state it finds. Only a first
+		// installation is written with the automatic start of
+		// buildSCMConfig.
+		config = scmConfigWithAutostart(config, previousConfig)
 
 		if err := handle.UpdateConfig(config); err != nil {
 			return fmt.Errorf("service: update the registration of %s: %w", ServiceName, err)
@@ -2843,6 +2861,13 @@ func isElevatedProcess() bool {
 // buildSCMConfig builds the configuration of the registration of the
 // instance.
 //
+// The configuration is the one a first installation writes: the registration
+// starts the instance automatically at the boot of the machine. A repeat
+// installation keeps the autostart state of the registration it replaces (see
+// scmConfigWithAutostart): the start type of a registration is a setting of the
+// machine, and an administrator may have switched the service to a manual or a
+// disabled start, or to a delayed automatic start.
+//
 // The configuration carries no credential at all: the service runs as
 // LocalService, an account without a password, and the instance reads its
 // token from its own config file.
@@ -2862,6 +2887,22 @@ func buildSCMConfig(opts InstallOptions) mgr.Config {
 		// field does not control the create path.
 		BinaryPathName: scmCommandLine(opts),
 	}
+}
+
+// scmConfigWithAutostart returns the configuration an update of a registration
+// writes: the configuration of the installation with the autostart state the
+// registration already has.
+//
+// A repeat installation keeps the autostart state it finds. An administrator
+// may have switched the service to a manual or a disabled start, so it does not
+// start at boot, or to a delayed automatic start; a reinstall with a new binary
+// is not the place to undo that decision. The two fields are the whole autostart
+// state of a registration: the update of the configuration writes both of them,
+// so they are kept together.
+func scmConfigWithAutostart(config, previous mgr.Config) mgr.Config {
+	config.StartType = previous.StartType
+	config.DelayedAutoStart = previous.DelayedAutoStart
+	return config
 }
 
 // scmCommandLine renders the command line the registration carries: the

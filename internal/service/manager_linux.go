@@ -607,7 +607,14 @@ func (m *systemdManager) grantInstanceDirs(opts InstallOptions, account *user.Us
 //
 // The installation validates first, merges its options with an existing
 // registration, writes the unit file atomically, reloads the supervisor and
-// enables the unit for the boot of the scope.
+// enables the unit for the boot of the scope when the installation has to.
+//
+// A first installation enables the registration for the boot of the scope: a
+// unit that is installed is a unit that starts with the machine. A repeat
+// installation keeps the autostart state it finds: a unit an administrator
+// disabled or masked is not enabled again, and a unit that was enabled before
+// stays enabled, so a reinstall with a new binary never undoes the decision of
+// the administrator.
 //
 // An installation that replaces a registration keeps every setting the
 // request did not name: the registration describes the instance that runs,
@@ -700,6 +707,11 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 			return opts, err
 		}
 		previous.running = running
+		// The enablement of the registration is read before the unit file
+		// is written: a repeat installation keeps the autostart state it
+		// finds. A first installation has no state to read, and it enables
+		// the registration it writes.
+		previous.enabled = m.registrationEnabled(ctx)
 	}
 	// The directories the installation is about to create are remembered
 	// before they are created, so the account is given the ownership of
@@ -741,6 +753,11 @@ type previousRegistration struct {
 	// Only such an instance is restarted; an absent content never carries
 	// this flag.
 	running bool
+	// enabled reports whether the supervisor had the unit enabled for the
+	// boot of the scope. The flag is read for a registration that existed:
+	// a first installation carries none and enables the registration it
+	// writes.
+	enabled bool
 }
 
 // registrationOptions returns the installation options a unit registers.
@@ -791,6 +808,29 @@ func (m *systemdManager) registrationRunning(ctx context.Context) (bool, error) 
 	return state == StateRunning || state == StateStarting, nil
 }
 
+// registrationEnabled reports whether the supervisor had the unit enabled for
+// the boot of the scope.
+//
+// The answer comes from the supervisor and not from the file system: an
+// enablement is the links the supervisor keeps for the [Install] section of the
+// unit, and only the supervisor knows them. "systemctl is-enabled" exits with a
+// zero status for a unit that is enabled for boot and with a non-zero status
+// for every state that is not: a disabled unit, a masked unit and a unit the
+// supervisor does not know.
+//
+// A read that fails is reported as not enabled: "is-enabled" exits with a
+// non-zero status for every state that is not an enablement, and a supervisor
+// that cannot be asked is no evidence of an enabled unit. A repeat installation
+// then leaves the autostart state of the unit alone instead of enabling a unit
+// its administrator disabled or masked; a supervisor that cannot be reached at
+// all still fails the installation at the reload that follows.
+func (m *systemdManager) registrationEnabled(ctx context.Context) bool {
+	if _, err := m.runSystemctl(ctx, "is-enabled", unitName); err != nil {
+		return false
+	}
+	return true
+}
+
 // register writes the registration of the instance and hands it to the
 // supervisor.
 //
@@ -799,6 +839,11 @@ func (m *systemdManager) registrationRunning(ctx context.Context) (bool, error) 
 // restored and the directories the installation created are removed by the
 // caller, so a failed installation leaves no half configured unit and no
 // empty directories behind.
+//
+// The unit is enabled for boot when the installation has to enable it: a first
+// installation enables the registration for the boot of the scope, and a repeat
+// installation keeps the autostart state it finds, so the enablement of a
+// registration an administrator decided on survives the reinstall.
 //
 // A replaced registration that was running is restarted and verified. A
 // registration alone does not switch the process that already runs: systemd
@@ -826,7 +871,12 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 	if err := writeUnitFile(previous.path, unit); err != nil {
 		return err
 	}
-	if err := m.reloadAndEnable(ctx); err != nil {
+	// A first installation enables the registration for the boot of the
+	// scope; a repeat installation keeps the autostart state it finds. A
+	// unit an administrator disabled or masked is therefore not enabled
+	// again, and a unit that was enabled before stays enabled.
+	enable := !previous.existed || previous.enabled
+	if err := m.reloadAndEnable(ctx, enable); err != nil {
 		m.rollbackUnit(ctx, previous.path, previous.content, previous.existed)
 		return err
 	}
@@ -1147,11 +1197,23 @@ func (m *systemdManager) checkSystemPaths(opts InstallOptions) error {
 	return nil
 }
 
-// reloadAndEnable makes the supervisor aware of the unit file and enables
-// the unit for the boot of the scope.
-func (m *systemdManager) reloadAndEnable(ctx context.Context) error {
+// reloadAndEnable makes the supervisor aware of the unit file and enables the
+// unit for the boot of the scope when the installation has to.
+//
+// The reload always happens: the supervisor has to pick up the unit file the
+// installation just wrote, whether the unit was there before or not.
+//
+// The enable is the autostart of the registration: a first installation enables
+// the registration for boot, and a repeat installation keeps the autostart state
+// it finds. The caller therefore asks for the enable only when there was no
+// registration before or when the registration was enabled before, so a unit an
+// administrator disabled or masked is never enabled again by a reinstall.
+func (m *systemdManager) reloadAndEnable(ctx context.Context, enable bool) error {
 	if _, err := m.runSystemctl(ctx, "daemon-reload"); err != nil {
 		return err
+	}
+	if !enable {
+		return nil
 	}
 	if _, err := m.runSystemctl(ctx, "enable", unitName); err != nil {
 		return err
