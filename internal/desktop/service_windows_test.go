@@ -1114,7 +1114,7 @@ func TestServiceHelperInstallRemovesTheRegistrationOfAFailedFirstInstallation(t 
 	if strings.Contains((*messages)[0].text, "hfdesk service uninstall") {
 		t.Errorf("the report %q names a removal although the registration was removed", (*messages)[0].text)
 	}
-	if strings.Contains((*messages)[0].text, "%ProgramFiles%") {
+	if strings.Contains((*messages)[0].text, `NT AUTHORITY\LocalService`) {
 		t.Errorf("the report %q names a program folder although the registration was removed", (*messages)[0].text)
 	}
 }
@@ -1152,7 +1152,7 @@ func TestServiceHelperInstallKeepsAnExistingRegistrationWhenTheStartFails(t *tes
 		"stays installed, but it does not run",
 		"elevated shell",
 		`"hfdesk service uninstall"`,
-		`%ProgramFiles%`,
+		`NT AUTHORITY\LocalService`,
 	} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
@@ -1488,7 +1488,7 @@ func TestServiceHelperStartReportsTheRefusedStartAndTheStatusCommand(t *testing.
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
 		}
 	}
-	for _, unwanted := range []string{status.Executable, `%ProgramFiles%`} {
+	for _, unwanted := range []string{status.Executable, `NT AUTHORITY\LocalService`} {
 		if strings.Contains((*messages)[0].text, unwanted) {
 			t.Errorf("the report %q names %q, want no folder guidance on a registration that already ran", (*messages)[0].text, unwanted)
 		}
@@ -1518,7 +1518,7 @@ func TestServiceHelperInstallNamesTheEffectiveProgram(t *testing.T) {
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the failure of the installation", len(*messages))
 	}
-	for _, want := range []string{console, `%ProgramFiles%`} {
+	for _, want := range []string{console, `NT AUTHORITY\LocalService`} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
 		}

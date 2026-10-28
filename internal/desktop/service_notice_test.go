@@ -324,16 +324,19 @@ func TestServiceActionFailureTextIsTheResultTheCauseAndOneAction(t *testing.T) {
 
 // TestServiceActionFailureTextNamesTheFolderOfTheProgram proves that the report of
 // a failed installation names the program the action could not put into service
-// and the one repair of a program that only the installing user can read.
+// and the access the folder of that program needs.
 //
-// An update and a start report leave the folder out: they describe a registration
-// that already ran, so the folder of the program is not the likely cause there.
+// The sentence states the requirement and does not tell the user to move the
+// program: the Windows service runs as LocalService, so that account must be able
+// to read the program and to traverse its folder. An update and a start report
+// leave the folder out: they describe a registration that already ran, so the
+// folder of the program is not the likely cause there.
 func TestServiceActionFailureTextNamesTheFolderOfTheProgram(t *testing.T) {
 	reason := errors.New("the service control manager refused the registration")
 	const program = `C:\portable\hfdesk.exe`
 
 	text := serviceActionFailureText(serviceActionInstall, reason, program)
-	for _, want := range []string{program, `%ProgramFiles%`, "try again"} {
+	for _, want := range []string{program, `NT AUTHORITY\LocalService`, "must be able to read", "traverse the folder"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("the report of the installation is %q, want it to mention %q", text, want)
 		}
@@ -341,17 +344,17 @@ func TestServiceActionFailureTextNamesTheFolderOfTheProgram(t *testing.T) {
 
 	for _, action := range []serviceAction{serviceActionUpdate, serviceActionStart} {
 		text := serviceActionFailureText(action, reason, program)
-		for _, unwanted := range []string{program, `%ProgramFiles%`} {
+		for _, unwanted := range []string{program, `NT AUTHORITY\LocalService`} {
 			if strings.Contains(text, unwanted) {
 				t.Errorf("the report of %q is %q, want no %q for a registration that already ran", action, text, unwanted)
 			}
 		}
 	}
 
-	// A caller that does not know the program still names the repair: the
+	// A caller that does not know the program still names the requirement: the
 	// guidance is not withheld because one path of the action has no program.
 	unknown := serviceActionFailureText(serviceActionInstall, reason, "")
-	if !strings.Contains(unknown, "If the program sits in a folder only you can read") {
+	if !strings.Contains(unknown, "must be able to read the program and to traverse the folder that holds it") {
 		t.Errorf("the report without a program is %q, want the general form of the guidance", unknown)
 	}
 }
@@ -387,7 +390,7 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 	// A registration that was removed again is no program folder the user has
 	// to check, and no registration to remove: the report stays with the
 	// desktop app the user starts again.
-	for _, unwanted := range []string{"hfdesk service uninstall", "%ProgramFiles%", program} {
+	for _, unwanted := range []string{"hfdesk service uninstall", `NT AUTHORITY\LocalService`, program} {
 		if strings.Contains(removed, unwanted) {
 			t.Errorf("the report of the removed registration %q names %q, want neither a removal nor a folder of a registration that is gone", removed, unwanted)
 		}
@@ -402,7 +405,7 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 		`"hfdesk service uninstall"`,
 		"elevated shell",
 		program,
-		`%ProgramFiles%`,
+		`NT AUTHORITY\LocalService`,
 	} {
 		if !strings.Contains(kept, want) {
 			t.Errorf("the report of the kept registration %q does not mention %q", kept, want)
@@ -419,7 +422,7 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 		`"hfdesk service uninstall"`,
 		"elevated shell",
 		program,
-		`%ProgramFiles%`,
+		`NT AUTHORITY\LocalService`,
 	} {
 		if !strings.Contains(failed, want) {
 			t.Errorf("the report of the failed removal %q does not mention %q", failed, want)
@@ -440,7 +443,7 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 		`"hfdesk service uninstall"`,
 		"elevated shell",
 		program,
-		`%ProgramFiles%`,
+		`NT AUTHORITY\LocalService`,
 	} {
 		if !strings.Contains(skipped, want) {
 			t.Errorf("the report of the skipped removal %q does not mention %q", skipped, want)

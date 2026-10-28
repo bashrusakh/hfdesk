@@ -402,20 +402,22 @@ func serviceInstallFailureText(err error, program string, aftermath serviceInsta
 	return text
 }
 
-// serviceFolderAccessText returns the sentence that helps when the failed
-// installation could not run the program because of its folder.
+// serviceFolderAccessText returns the sentence that names the access the folder
+// of the program needs.
 //
-// A machine-wide service runs under its own account, so a program in a folder
+// A machine-wide service runs under its own account, so the program in a folder
 // only the installing user can read is not reachable for the instance. The
-// sentence names the program the action tried to put into service and the one
-// repair the user can make. It belongs to the reports of an installation only: an
-// update and a start describe a registration that already ran.
+// sentence names the program the action tried to put into service and states
+// the requirement: that account must be able to read the program and to
+// traverse its folder. It is a statement and not an instruction, because the
+// repair belongs to the user. It belongs to the reports of an installation only:
+// an update and a start describe a registration that already ran.
 func serviceFolderAccessText(program string) string {
 	subject := "the program"
 	if program != "" {
 		subject = program
 	}
-	return "If " + subject + " sits in a folder only you can read, move it to %ProgramFiles% and try again."
+	return `The Windows service runs as NT AUTHORITY\LocalService, so that account must be able to read ` + subject + ` and to traverse the folder that holds it.`
 }
 
 // serviceLaunchFailedText returns the report of a failed launch of the elevated
