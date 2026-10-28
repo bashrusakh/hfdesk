@@ -69,11 +69,22 @@ var serviceReadinessProbe = probeServiceReady
 // config file.
 //
 // Every other answer is a failure, and a start counts only when this probe
-// accepted the instance itself.
+// accepted the instance itself. The probe does not follow redirects: a 3xx is
+// returned as it is and rejected, so a foreign server cannot point the probe at
+// the health document of a real HFDesk elsewhere.
 func probeServiceReady(listen string) error {
 	addr := probeServiceAddress(listen)
 
-	client := &http.Client{Timeout: serviceProbeTimeout}
+	// A redirect is not an answer of the instance: a foreign server on the
+	// address could point the probe at a real HFDesk elsewhere and the probe
+	// would accept the health document of that other instance. The last
+	// response is returned as it is, so a 3xx fails the status switch below.
+	client := &http.Client{
+		Timeout: serviceProbeTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := client.Get("http://" + addr + serviceProbePath)
 	if err != nil {
 		return err

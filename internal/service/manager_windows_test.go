@@ -84,6 +84,61 @@ func TestBuildSCMConfigUsesTheLeastPrivilegedAccount(t *testing.T) {
 	}
 }
 
+// TestSCMDisabledRunningRefusalRefusesBeforeItStopsTheInstance checks the
+// decision an installation makes about a running instance whose start type is
+// disabled.
+//
+// A service can run with a disabled start type; the installation stops it to
+// put the new program into service, and Windows refuses to start a disabled
+// service again, so the installation would leave the machine without a service
+// that ran before. The decision refuses a running or starting instance with a
+// disabled start type and allows every other state, including a stopped
+// instance, because the installation does not start a service that was stopped.
+func TestSCMDisabledRunningRefusalRefusesBeforeItStopsTheInstance(t *testing.T) {
+	cases := []struct {
+		name      string
+		present   bool
+		state     svc.State
+		startType uint32
+		refused   bool
+	}{
+		{"a running instance with a disabled start", true, svc.Running, mgr.StartDisabled, true},
+		{"a starting instance with a disabled start", true, svc.StartPending, mgr.StartDisabled, true},
+		{"a stopped instance with a disabled start", true, svc.Stopped, mgr.StartDisabled, false},
+		{"a stopping instance with a disabled start", true, svc.StopPending, mgr.StartDisabled, false},
+		{"a running instance with a manual start", true, svc.Running, mgr.StartManual, false},
+		{"a running instance with an automatic start", true, svc.Running, mgr.StartAutomatic, false},
+		{"a stopped instance with a manual start", true, svc.Stopped, mgr.StartManual, false},
+		{"an absent registration", false, svc.Stopped, mgr.StartDisabled, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			running := scmInstanceRan(tc.present, tc.state)
+			err := scmDisabledRunningRefusal(tc.present, running, tc.startType)
+			if !tc.refused {
+				if err != nil {
+					t.Fatalf("scmDisabledRunningRefusal(%v, %v, %d) = %v, want nil", tc.present, running, tc.startType, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("scmDisabledRunningRefusal(%v, %v, %d) = nil, want the refusal of the installation", tc.present, running, tc.startType)
+			}
+			for _, want := range []string{
+				"is running, but its start type is disabled",
+				"Windows will not start it again after the installation stops it",
+				"set the start type to manual or automatic",
+				`"sc config hfdesk start= demand"`,
+				"run the installation again",
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the refusal %q does not mention %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 // TestSCMConfigWithAutostartKeepsTheStateOfTheRegistration checks that a repeat
 // installation writes the autostart state the registration already has.
 //

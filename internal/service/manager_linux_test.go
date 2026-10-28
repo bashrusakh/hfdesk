@@ -3615,9 +3615,9 @@ func TestSystemdRestartVerifyWaitIsTheShutdownBudget(t *testing.T) {
 // "enabled" (the default) exits with a zero status, so the unit counts as
 // enabled for boot, and every other state ("disabled", "masked") exits with a
 // non-zero status, so a test can drive a repeat installation of a unit its
-// administrator disabled or masked. An "enable" that fails once
-// HFDESK_TEST_SYSTEMCTL_ENABLE_FAIL is "1" drives the failure of an
-// installation that cannot enable its registration.
+// administrator disabled or of a masked unit that the installation refuses. An
+// "enable" that fails once HFDESK_TEST_SYSTEMCTL_ENABLE_FAIL is "1" drives the
+// failure of an installation that cannot enable its registration.
 //
 // The log path is returned. It is written even when the supervisor is asked
 // for a property only, so a test can tell a restart from a state query.
@@ -4236,9 +4236,10 @@ func systemdSupervisorCallIndex(calls []string, command ...string) int {
 // A first installation enables the registration for boot. A repeat installation
 // must not undo the decision of an administrator: a unit that was enabled before
 // is enabled again, so the new unit file keeps starting at boot, and a unit that
-// is disabled or masked is left alone. The supervisor is reloaded in every case,
-// so it picks the new unit file up, and the enablement is read before the unit
-// file is written, so the state that is kept is the state of the unit the
+// is disabled is left alone. A masked unit is refused instead of being replaced,
+// see TestSystemdInstallRefusesAMaskedUnit. The supervisor is reloaded in every
+// case, so it picks the new unit file up, and the enablement is read before the
+// unit file is written, so the state that is kept is the state of the unit the
 // installation replaces.
 func TestSystemdReinstallKeepsTheAutostartStateOfTheUnit(t *testing.T) {
 	cases := []struct {
@@ -4251,7 +4252,6 @@ func TestSystemdReinstallKeepsTheAutostartStateOfTheUnit(t *testing.T) {
 	}{
 		{"a unit that is enabled", "enabled", 1},
 		{"a unit that is disabled", "disabled", 0},
-		{"a masked unit", "masked", 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -4286,6 +4286,84 @@ func TestSystemdReinstallKeepsTheAutostartStateOfTheUnit(t *testing.T) {
 				t.Errorf("the enablement was read after the supervisor was reloaded, the state of the replaced unit is not the state that was kept:\n%s", strings.Join(calls, "\n"))
 			}
 		})
+	}
+}
+
+// TestSystemdInstallRefusesAMaskedUnit checks that an installation over a masked
+// unit is refused instead of replacing the mask.
+//
+// A masked unit is a symbolic link to /dev/null, and writing the unit file over
+// it would unmask the unit silently: the administrator who masked it would lose
+// that decision without noticing. The installation therefore refuses before it
+// writes the unit file and before it touches the supervisor, the unit path keeps
+// the mask, and the error names the command that unmask the unit in the scope of
+// the manager.
+func TestSystemdInstallRefusesAMaskedUnit(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+
+	m, unitPath, _ := systemdExistingInstallation(t, previous)
+	// A masked unit is a link to /dev/null. Replace the unit file of the test
+	// registration with exactly that shape, so a write over the path would be
+	// visible as a replacement of the mask.
+	if err := os.Remove(unitPath); err != nil {
+		t.Fatalf("remove the unit file: %v", err)
+	}
+	if err := os.Symlink(os.DevNull, unitPath); err != nil {
+		t.Fatalf("mask the unit: %v", err)
+	}
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", oldExecutable)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLED_STATE", "masked")
+
+	request := systemdTempInstallOptions(t, root)
+	request.Executable = newExecutable
+	_, err := m.Install(context.Background(), request)
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of an installation over a masked unit")
+	}
+	for _, want := range []string{
+		unitName,
+		"is masked",
+		"does not replace the mask",
+		"systemctl --user unmask " + unitName,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
+		}
+	}
+
+	// The unit path is untouched: it still holds the mask.
+	info, lstatErr := os.Lstat(unitPath)
+	if lstatErr != nil {
+		t.Fatalf("the unit path is gone after the refused installation: %v", lstatErr)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the unit path is no mask any more (mode %s), want a symbolic link", info.Mode())
+	}
+	if target, readErr := os.Readlink(unitPath); readErr != nil || target != os.DevNull {
+		t.Errorf("the unit path points at %q (error: %v), want the mask %q", target, readErr, os.DevNull)
+	}
+
+	// The refusal happened before the unit file was written and before the
+	// installation touched the supervisor: no directory of the instance was
+	// created either.
+	if _, statErr := os.Stat(filepath.Join(root, "etc")); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("the refused installation created the directory %q (stat error: %v)", filepath.Join(root, "etc"), statErr)
+	}
+	calls := systemdSupervisorCalls(t, logPath)
+	for _, command := range [][]string{
+		{"daemon-reload"},
+		{"enable", unitName},
+		{"restart", unitName},
+		{"stop", unitName},
+	} {
+		if got := systemdSupervisorCallsTo(calls, command...); got != 0 {
+			t.Errorf("the refused installation called %q %d times:\n%s", strings.Join(command, " "), got, strings.Join(calls, "\n"))
+		}
 	}
 }
 

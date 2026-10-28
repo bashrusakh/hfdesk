@@ -611,7 +611,8 @@ func (m *systemdManager) grantInstanceDirs(opts InstallOptions, account *user.Us
 //
 // A first installation enables the registration for the boot of the scope; a
 // repeat installation keeps the autostart state it finds, so a unit an
-// administrator disabled or masked is never enabled again (see reloadAndEnable).
+// administrator disabled is never enabled again, and a masked unit refuses the
+// installation instead of being replaced (see reloadAndEnable).
 //
 // An installation that replaces a registration keeps every setting the request
 // did not name, so a reinstall with a new binary resets no bind address, paths,
@@ -698,8 +699,13 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 		}
 		previous.running = running
 		// The enablement is read before the unit file is written: a repeat
-		// installation keeps the autostart state it finds.
-		previous.enabled = m.registrationEnabled(ctx)
+		// installation keeps the autostart state it finds, and a masked unit
+		// is refused instead of silently unmasked.
+		enablement := m.registrationEnablement(ctx)
+		if enablement.masked {
+			return opts, m.maskedUnitRefusal()
+		}
+		previous.enabled = enablement.enabled
 	}
 	// The directories the installation is about to create are remembered
 	// before they are created, so the account is given the ownership of
@@ -789,20 +795,50 @@ func (m *systemdManager) registrationRunning(ctx context.Context) (bool, error) 
 	return state == StateRunning || state == StateStarting, nil
 }
 
-// registrationEnabled reports whether the supervisor had the unit enabled for
+// registrationEnablement is what the supervisor reports about the enablement of
+// the unit.
+type registrationEnablement struct {
+	// enabled reports whether the supervisor had the unit enabled for the
+	// boot of the scope.
+	enabled bool
+	// masked reports whether the unit is masked. A masked unit is a link to
+	// /dev/null, so writing the unit file would replace the mask and silently
+	// undo the decision of an administrator.
+	masked bool
+}
+
+// registrationEnablement reads whether the supervisor had the unit enabled for
 // the boot of the scope.
 //
 // The answer comes from the supervisor, not from the file system: an
 // enablement is the links the supervisor keeps for the [Install] section, and
 // only the supervisor knows them. "systemctl is-enabled" exits zero only for an
-// enabled unit, so a failed read is reported as not enabled; a repeat
+// enabled unit and prints the state either way, so a non-zero status alone is
+// not an unreadable supervisor: the printed state decides whether the unit is
+// masked, and a failed read is otherwise reported as not enabled; a repeat
 // installation then leaves the autostart state alone, and a supervisor that
 // cannot be reached still fails the installation at the reload.
-func (m *systemdManager) registrationEnabled(ctx context.Context) bool {
-	if _, err := m.runSystemctl(ctx, "is-enabled", unitName); err != nil {
-		return false
+func (m *systemdManager) registrationEnablement(ctx context.Context) registrationEnablement {
+	out, err := m.runSystemctl(ctx, "is-enabled", unitName)
+	state := strings.TrimSpace(out)
+	facts := registrationEnablement{
+		masked: state == "masked" || state == "masked-runtime",
 	}
-	return true
+	if err != nil {
+		return facts
+	}
+	facts.enabled = true
+	return facts
+}
+
+// maskedUnitRefusal returns the error of an installation over a masked unit.
+//
+// The installation never replaces the mask: writing the unit file would unmask
+// the unit silently, so the administrator who masked it would lose that
+// decision without noticing. The error names the unit, the refusal and the
+// command that unmask it, with the scope prefix the manager uses for systemctl.
+func (m *systemdManager) maskedUnitRefusal() error {
+	return fmt.Errorf("service: the unit %s is masked: an installation does not replace the mask. Unmask it with %q and run the installation again", unitName, m.supervisorHint()+" unmask "+unitName)
 }
 
 // register writes the registration of the instance and hands it to the
@@ -1131,7 +1167,8 @@ func (m *systemdManager) checkSystemPaths(opts InstallOptions) error {
 // unit for the boot of the scope when the installation has to. The reload always
 // happens; the enable is only asked for a first installation or a registration
 // that was enabled before, so a reinstall never re-enables a unit an
-// administrator disabled or masked.
+// administrator disabled. A masked unit is refused before this point, so it
+// never reaches the reload.
 func (m *systemdManager) reloadAndEnable(ctx context.Context, enable bool) error {
 	if _, err := m.runSystemctl(ctx, "daemon-reload"); err != nil {
 		return err

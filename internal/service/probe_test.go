@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -231,6 +232,41 @@ func TestProbeServiceReadyRejectsAServerThatIsNotTheInstance(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestProbeServiceReadyDoesNotFollowARedirect checks that a redirect is not an
+// answer of the instance.
+//
+// A foreign server on the address can answer with a 302 to a real HFDesk
+// elsewhere. A client that follows redirects would then accept the health
+// document of that other instance, so the probe must return the 3xx as it is
+// and reject it; the redirect target is never requested.
+func TestProbeServiceReadyDoesNotFollowARedirect(t *testing.T) {
+	var targetRequests atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ok","version":"1.2.3"}`)
+	}))
+	defer target.Close()
+
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+server.HealthPath, http.StatusFound)
+	}))
+	defer foreign.Close()
+
+	err := probeServiceReady(foreign.Listener.Addr().String())
+	if err == nil {
+		t.Fatalf("probeServiceReady(%q) = nil, want the failure of the redirect", foreign.Listener.Addr())
+	}
+	for _, want := range []string{"does not answer as the HFDesk server", "302"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("probeServiceReady() = %q, want an error that mentions %q", err, want)
+		}
+	}
+	if got := targetRequests.Load(); got != 0 {
+		t.Errorf("the redirect target was requested %d times, want none", got)
 	}
 }
 

@@ -383,6 +383,15 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 		}
 		previous.config = previousConfig
 
+		// A running instance with a disabled start type cannot be put into
+		// service again after the installation stops it: the service control
+		// manager refuses to start a disabled service. The installation
+		// refuses before it writes the registration, so the instance keeps
+		// running.
+		if err := scmDisabledRunningRefusal(previous.present, previous.running, previousConfig.StartType); err != nil {
+			return err
+		}
+
 		// An administrator may have switched the service to a manual, a
 		// disabled or a delayed start, and a repeat installation keeps the
 		// state it finds.
@@ -700,6 +709,24 @@ func scmInstanceRan(present bool, state svc.State) bool {
 	default:
 		return false
 	}
+}
+
+// scmDisabledRunningRefusal returns the refusal of an installation that would
+// stop a running instance whose start type is disabled.
+//
+// A service can run while its start type is disabled: the start type is a
+// setting of the registration and the instance keeps running when an
+// administrator disables it. The installation stops the instance to put the new
+// program into service, and the service control manager refuses to start a
+// disabled service, so the instance would stay stopped and the rollback could
+// not bring it back either. The installation refuses before the registration is
+// written and before the instance is stopped. A stopped instance with a disabled
+// start type is allowed: the installation does not start it.
+func scmDisabledRunningRefusal(present, running bool, startType uint32) error {
+	if !present || !running || startType != mgr.StartDisabled {
+		return nil
+	}
+	return fmt.Errorf("service: %s is running, but its start type is disabled: Windows will not start it again after the installation stops it. Set the start type to manual or automatic, for example with \"sc config %s start= demand\", and run the installation again", ServiceName, ServiceName)
 }
 
 // scmImageCheck is how much of the running instance an installation could prove.
