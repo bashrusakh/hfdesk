@@ -323,18 +323,38 @@ func serviceNotInstalledText(action serviceAction) string {
 		there + " Install it from the tray of the desktop app first."
 }
 
+// The commands that a failure report of a service action ends with.
+//
+// A report is the result, the cause and one next action, so each command is
+// written once here instead of being repeated by every report: a report either
+// leaves the user with a state to read or with a registration to keep or remove,
+// never with both.
+const (
+	// serviceStatusCommandText is the next action of a report that cannot
+	// say which state the action left: the state of the service has to be
+	// read before anything else is decided.
+	serviceStatusCommandText = `Run "hfdesk service status" from an elevated shell to read the current state of the service.`
+
+	// serviceUninstallCommandText is the next action of a report that left a
+	// registration behind: whether the registration is kept is the decision
+	// of the user.
+	serviceUninstallCommandText = `If you do not want to keep the registration, remove it from an elevated shell with "hfdesk service uninstall".`
+)
+
 // serviceActionFailureText returns the report of a failed service action.
 //
-// The report carries the underlying error, so the user can see what the
-// service control manager refused, and what the attempt did not confirm about
-// the state afterwards. It never claims that a registration was restored: a
-// failure can happen after the registration was written, and the state of the
-// service has to be read before it is described.
+// The report is the action that failed, the error the service control manager
+// returned, and the one next action of the state the attempt left. It never
+// claims that a registration was restored: a failure can happen after the
+// registration was written, so an installation report names a registration that
+// may remain instead of one that exists, and a report of an update or a start
+// points at the state instead of asserting one.
 //
-// The report also names what to check when the service account cannot use the
-// program: the helper installs no logging pipeline, so the failure report is
-// the only surface this reason has. program is the program of the action, empty
-// when the caller does not know it.
+// An installation report carries the folder of its program as well: a
+// machine-wide service runs under an own account, so a program in a folder only
+// the installing user can read is the common reason a first installation fails.
+// An update and a start report leave that out: they describe a registration that
+// already ran.
 //
 // An installation that wrote a registration and could not start it does not end
 // here: the registration may have been removed again, and
@@ -344,101 +364,88 @@ func serviceActionFailureText(action serviceAction, err error, program string) s
 	if err != nil {
 		detail = err.Error()
 	}
-	access := serviceAccountAccessText(program)
 
 	switch action {
 	case serviceActionInstall:
 		return "HFDesk could not install the Windows service.\n\n" + detail + "\n\n" +
-			"This attempt did not confirm the service as running. The settings, jobs and models of the desktop app were not touched. " +
-			access + "\n\n" +
-			"A registration may remain: a previous one, or the one this attempt wrote while its instance could not be proven stopped. " +
-			"While a registration exists, every launch of the desktop app ends at the service gate and starts no server of its own. " +
-			"If you do not want to keep it, remove it from an elevated shell with \"hfdesk service uninstall\".\n\n" +
-			"Run \"hfdesk service status\" to read the current state of the service."
+			"A registration may remain.\n\n" +
+			serviceFolderAccessText(program) + "\n\n" +
+			serviceUninstallCommandText
 	case serviceActionUpdate:
 		return "HFDesk could not update the Windows service.\n\n" + detail + "\n\n" +
-			"The desktop app and the service keep separate data: the settings, jobs and models of the desktop app were not touched. " +
-			access + "\n\n" +
-			"Run \"hfdesk service status\" to read the current state of the service."
+			serviceStatusCommandText
 	default:
 		return "HFDesk could not start the Windows service.\n\n" + detail + "\n\n" +
-			"The start attempt was not confirmed. " +
-			access + "\n\n" +
-			"Run \"hfdesk service status\" to read the current state of the service."
+			"The start was not confirmed.\n\n" +
+			serviceStatusCommandText
 	}
 }
 
 // serviceInstallFailureText returns the report of an installation that wrote the
-// registration and did not confirm the service as running.
+// registration and did not start it.
 //
-// The report depends on what the failed installation left on the machine, and it
-// says so: a registration that this action wrote is removed again, so the user
-// reads that HFDesk is not installed and that the desktop app starts normally
-// again. A registration that was there before the action, or one whose state
-// before the action could not be read, stays in place, and the report names what
-// remains and the elevated command that removes it. The same holds for a
-// registration that was not removed because its instance still runs or starts, or
-// because its state could not be read; the report says what remains and never
-// claims that the instance stopped. A removal that failed is reported with its
-// reason and with the same command, because the registration is still there.
+// The report is the result, the error of the failed start, and the outcome of the
+// attempt in the words of what the registration may do next: a registration that
+// this action wrote is removed again, so the user starts the desktop app normally
+// again; a registration that was there before the action, one whose state before
+// the action could not be read, one whose removal was skipped because its
+// instance may still run, and one whose removal failed all stay, so the user
+// decides whether to keep them. The outcome of a removal that failed names its
+// reason.
 //
-// The account and program guidance of a failed installation is part of every
-// outcome: it is the reason a first installation commonly fails, and it is what
-// makes a second attempt work.
+// The folder of the program is part of the outcomes where the registration stays:
+// a start that failed there may have failed because the account of the service
+// cannot read the program, and the registration that remains is the one the next
+// attempt uses.
 func serviceInstallFailureText(err error, program string, aftermath serviceInstallAftermath, removalErr error) string {
 	detail := ""
 	if err != nil {
 		detail = err.Error()
 	}
-	access := serviceAccountAccessText(program)
 
+	stays := true
 	var outcome string
 	switch {
 	case errors.Is(removalErr, errServiceRemovalSkipped):
 		outcome = "The registration of this attempt was not removed, because the service may still be running, starting or stopping, or its state could not be read. " +
 			"The registration stays in place.\n\n" +
-			"While that registration exists, every launch of the desktop app ends at the service gate and starts no server of its own. " +
-			"Remove it from an elevated shell with \"hfdesk service uninstall\" if you do not want to keep it."
+			serviceUninstallCommandText
 	case aftermath == serviceInstallRemovalFailed:
 		outcome = "The registration of this attempt could not be removed again: HFDesk stays installed as a Windows service although it does not run."
 		if removalErr != nil {
 			outcome += "\n\nThe removal failed: " + removalErr.Error()
 		}
-		outcome += "\n\nWhile that registration exists, every launch of the desktop app ends at the service gate and starts no server of its own. " +
-			"Remove it from an elevated shell with \"hfdesk service uninstall\"."
+		outcome += "\n\n" + serviceUninstallCommandText
 	case aftermath == serviceInstallRemoved:
-		outcome = "The registration of this attempt was removed again: HFDesk is not installed as a Windows service, and you can start the desktop app normally again.\n\n" +
-			"Only the registration was removed. The data directory of the service, if this attempt created one, stays where it is."
+		stays = false
+		outcome = "The registration of this attempt was removed again: HFDesk is not installed as a Windows service, so start the desktop app normally again."
 	default:
 		outcome = "The registration was left in place: it was installed before this attempt, or its state before the attempt could not be read. " +
 			"The service stays installed, but it does not run.\n\n" +
-			"While that registration exists, every launch of the desktop app ends at the service gate and starts no server of its own. " +
-			"Remove it from an elevated shell with \"hfdesk service uninstall\" if you do not want to keep it."
+			serviceUninstallCommandText
 	}
 
-	return "HFDesk could not install the Windows service.\n\n" + detail + "\n\n" + outcome + "\n\n" +
-		"The settings, jobs and models of the desktop app were not touched. " +
-		access + "\n\n" +
-		"Run \"hfdesk service status\" to read the current state of the service."
+	text := "HFDesk registered the service but could not start it.\n\n" + detail + "\n\n" + outcome
+	if stays {
+		text += "\n\n" + serviceFolderAccessText(program)
+	}
+	return text
 }
 
-// serviceAccountAccessText returns the sentence that names what to check when
-// the service account cannot use the program of the registration.
+// serviceFolderAccessText returns the sentence that helps when the failed
+// installation could not run the program because of its folder.
 //
-// The machine-wide service runs as NT AUTHORITY\LocalService, so a program in a
-// folder of the user who installed it is not reachable for the instance: the
-// account has to be able to read the program and to traverse its folder. The
-// sentence is guidance and not a check of its own: the action reports the
-// failure it got and names the reason the user can repair.
-func serviceAccountAccessText(program string) string {
-	text := `The Windows service runs as NT AUTHORITY\LocalService, so that account must be able to read`
+// A machine-wide service runs under its own account, so a program in a folder
+// only the installing user can read is not reachable for the instance. The
+// sentence names the program the action tried to put into service and the one
+// repair the user can make. It belongs to the reports of an installation only: an
+// update and a start describe a registration that already ran.
+func serviceFolderAccessText(program string) string {
+	subject := "the program"
 	if program != "" {
-		text += " " + program
-	} else {
-		text += " the program"
+		subject = program
 	}
-	return text + " and to traverse its folder. If the program sits in a folder only you can read, " +
-		"move it to a folder the service can read, for example under %ProgramFiles%, and install again."
+	return "If " + subject + " sits in a folder only you can read, move it to %ProgramFiles% and try again."
 }
 
 // serviceLaunchFailedText returns the report of a failed launch of the elevated

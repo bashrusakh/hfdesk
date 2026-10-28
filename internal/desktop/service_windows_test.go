@@ -1106,8 +1106,6 @@ func TestServiceHelperInstallRemovesTheRegistrationOfAFailedFirstInstallation(t 
 		"the service did not start",
 		"not installed as a Windows service",
 		"start the desktop app normally again",
-		console,
-		`NT AUTHORITY\LocalService`,
 	} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
@@ -1115,6 +1113,9 @@ func TestServiceHelperInstallRemovesTheRegistrationOfAFailedFirstInstallation(t 
 	}
 	if strings.Contains((*messages)[0].text, "hfdesk service uninstall") {
 		t.Errorf("the report %q names a removal although the registration was removed", (*messages)[0].text)
+	}
+	if strings.Contains((*messages)[0].text, "%ProgramFiles%") {
+		t.Errorf("the report %q names a program folder although the registration was removed", (*messages)[0].text)
 	}
 }
 
@@ -1151,7 +1152,7 @@ func TestServiceHelperInstallKeepsAnExistingRegistrationWhenTheStartFails(t *tes
 		"stays installed, but it does not run",
 		"elevated shell",
 		`"hfdesk service uninstall"`,
-		`NT AUTHORITY\LocalService`,
+		`%ProgramFiles%`,
 	} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
@@ -1424,8 +1425,8 @@ func TestServiceHelperReportsAWaitThatTimesOut(t *testing.T) {
 	if !strings.Contains((*messages)[0].text, "did not exit") {
 		t.Errorf("the report %q does not carry the reason of the failure", (*messages)[0].text)
 	}
-	if !strings.Contains((*messages)[0].text, "did not confirm the service as running") {
-		t.Errorf("the report %q does not say that the attempt did not confirm the service", (*messages)[0].text)
+	if !strings.Contains((*messages)[0].text, "A registration may remain.") {
+		t.Errorf("the report %q does not state the state the attempt may have left", (*messages)[0].text)
 	}
 }
 
@@ -1456,14 +1457,15 @@ func TestServiceHelperStartReportsAMissingRegistration(t *testing.T) {
 	}
 }
 
-// TestServiceHelperStartNamesTheProgramTheServiceCouldNotRun proves that a start
-// the service control manager refused names the registered program and the
-// account of the service.
+// TestServiceHelperStartReportsTheRefusedStartAndTheStatusCommand proves that a
+// start the service control manager refused is reported as the result, the reason
+// and the one command that reads the state of the service.
 //
-// The helper installs no logging pipeline, so the message box is the only
-// surface the reason has: a program in a folder the service account cannot read
-// otherwise leaves the user with the state message of the supervisor alone.
-func TestServiceHelperStartNamesTheProgramTheServiceCouldNotRun(t *testing.T) {
+// The helper installs no logging pipeline, so the message box is the only surface
+// the reason has. The folder and program guidance belongs to the reports of an
+// installation: a start describes a registration that already ran, so the report
+// stays with the state it left.
+func TestServiceHelperStartReportsTheRefusedStartAndTheStatusCommand(t *testing.T) {
 	status := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
 	status.Executable = `C:\Users\ada\HFDesk\hfdesk.exe`
 	manager := &fakeServiceManager{
@@ -1481,16 +1483,21 @@ func TestServiceHelperStartNamesTheProgramTheServiceCouldNotRun(t *testing.T) {
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the failure of the start", len(*messages))
 	}
-	for _, want := range []string{status.Executable, `NT AUTHORITY\LocalService`, `%ProgramFiles%`} {
+	for _, want := range []string{"the service control manager refused the start", "The start was not confirmed.", "hfdesk service status"} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+		}
+	}
+	for _, unwanted := range []string{status.Executable, `%ProgramFiles%`} {
+		if strings.Contains((*messages)[0].text, unwanted) {
+			t.Errorf("the report %q names %q, want no folder guidance on a registration that already ran", (*messages)[0].text, unwanted)
 		}
 	}
 }
 
 // TestServiceHelperInstallNamesTheEffectiveProgram proves that a failed
 // installation names the program the registration was asked to run, so the user
-// can check the folder of that program against the account of the service.
+// can check the folder of that program.
 func TestServiceHelperInstallNamesTheEffectiveProgram(t *testing.T) {
 	const console = `C:\portable\hfdesk.exe`
 	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
@@ -1511,7 +1518,7 @@ func TestServiceHelperInstallNamesTheEffectiveProgram(t *testing.T) {
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the failure of the installation", len(*messages))
 	}
-	for _, want := range []string{console, `NT AUTHORITY\LocalService`} {
+	for _, want := range []string{console, `%ProgramFiles%`} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
 		}

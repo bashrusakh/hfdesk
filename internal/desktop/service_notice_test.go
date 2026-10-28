@@ -256,32 +256,28 @@ func TestServiceInstalledTextNamesTheProgramTheAddressAndTheData(t *testing.T) {
 	}
 }
 
-// TestServiceActionFailureTextCarriesTheReasonAndTheUntouchedData proves that a
-// failed service action reports the underlying error and what the attempt did
-// not confirm, instead of asserting a state it may not have observed.
+// TestServiceActionFailureTextIsTheResultTheCauseAndOneAction proves that a
+// failed service action reports the underlying error, the state the attempt left
+// and exactly one next action, instead of asserting a state it may not have
+// observed.
 //
-// The desktop and the service keep separate data, so a failed action never
-// touches the settings, jobs and models of the desktop app. The report says so,
-// and it never claims that a registration was restored: a failure can happen
-// after it was written.
+// The report never claims that a registration was restored: a failure can happen
+// after it was written. An installation names the removal of a registration that
+// may remain, an update and a start name the command that reads the state they
+// could not observe, and no report carries both commands.
 //
-// The report also names the account the service runs as and the program the
-// action could not put into service: the helper installs no logging pipeline,
-// so this box is the only surface the reason has.
-func TestServiceActionFailureTextCarriesTheReasonAndTheUntouchedData(t *testing.T) {
+// The separate data of the desktop app is part of the confirmation and of the
+// gate, not of a failure report: the report is result, cause and one action.
+func TestServiceActionFailureTextIsTheResultTheCauseAndOneAction(t *testing.T) {
 	reason := errors.New("the service control manager refused the registration")
 	const program = `C:\portable\hfdesk.exe`
 
 	install := serviceActionFailureText(serviceActionInstall, reason, program)
 	for _, want := range []string{
 		reason.Error(),
-		"did not confirm the service as running",
-		"were not touched",
-		"A registration may remain",
-		"service gate",
+		"A registration may remain.",
 		`"hfdesk service uninstall"`,
 		"elevated shell",
-		"hfdesk service status",
 	} {
 		if !strings.Contains(install, want) {
 			t.Errorf("the report %q does not mention %q", install, want)
@@ -292,53 +288,70 @@ func TestServiceActionFailureTextCarriesTheReasonAndTheUntouchedData(t *testing.
 	if strings.Contains(install, "A registration is installed") || strings.Contains(install, "a registration remains") {
 		t.Errorf("the report %q claims that a registration exists", install)
 	}
+	// One report carries one command: the state of a failed installation is
+	// described by the report itself, so the removal is its only next action.
+	if strings.Contains(install, "hfdesk service status") {
+		t.Errorf("the report %q names a second next action next to the removal", install)
+	}
+	if strings.Contains(install, "were not touched") {
+		t.Errorf("the report %q repeats the separate data of the desktop app", install)
+	}
 
 	update := serviceActionFailureText(serviceActionUpdate, reason, program)
-	for _, want := range []string{reason.Error(), "were not touched", "hfdesk service status"} {
+	for _, want := range []string{reason.Error(), "hfdesk service status"} {
 		if !strings.Contains(update, want) {
 			t.Errorf("the report %q does not mention %q", update, want)
 		}
 	}
-	if strings.Contains(update, "A registration may remain") {
-		t.Errorf("the report of the update %q carries the outcome of a failed installation", update)
+	for _, unwanted := range []string{"registration may remain", "hfdesk service uninstall", "were not touched"} {
+		if strings.Contains(update, unwanted) {
+			t.Errorf("the report of the update %q carries %q, want the state it left and one command", update, unwanted)
+		}
 	}
 
 	start := serviceActionFailureText(serviceActionStart, reason, program)
-	for _, want := range []string{reason.Error(), "start attempt was not confirmed", "hfdesk service status"} {
+	for _, want := range []string{reason.Error(), "The start was not confirmed.", "hfdesk service status"} {
 		if !strings.Contains(start, want) {
 			t.Errorf("the report %q does not mention %q", start, want)
 		}
 	}
-	if strings.Contains(start, "A registration may remain") {
-		t.Errorf("the report of the start %q carries the outcome of a failed installation", start)
+	for _, unwanted := range []string{"registration may remain", "hfdesk service uninstall", "were not touched"} {
+		if strings.Contains(start, unwanted) {
+			t.Errorf("the report of the start %q carries %q, want the state it left and one command", start, unwanted)
+		}
 	}
 }
 
-// TestServiceActionFailureTextNamesWhatToCheckForTheServiceAccount proves that
-// the report of a failed installation, update and start names the account of the
-// service, the program of the action and what the user can do when the account
-// cannot use the folder of the program.
-func TestServiceActionFailureTextNamesWhatToCheckForTheServiceAccount(t *testing.T) {
+// TestServiceActionFailureTextNamesTheFolderOfTheProgram proves that the report of
+// a failed installation names the program the action could not put into service
+// and the one repair of a program that only the installing user can read.
+//
+// An update and a start report leave the folder out: they describe a registration
+// that already ran, so the folder of the program is not the likely cause there.
+func TestServiceActionFailureTextNamesTheFolderOfTheProgram(t *testing.T) {
 	reason := errors.New("the service control manager refused the registration")
 	const program = `C:\portable\hfdesk.exe`
 
-	for _, action := range []serviceAction{serviceActionInstall, serviceActionUpdate, serviceActionStart} {
+	text := serviceActionFailureText(serviceActionInstall, reason, program)
+	for _, want := range []string{program, `%ProgramFiles%`, "try again"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the report of the installation is %q, want it to mention %q", text, want)
+		}
+	}
+
+	for _, action := range []serviceAction{serviceActionUpdate, serviceActionStart} {
 		text := serviceActionFailureText(action, reason, program)
-		for _, want := range []string{`NT AUTHORITY\LocalService`, program, `%ProgramFiles%`, "and install again"} {
-			if !strings.Contains(text, want) {
-				t.Errorf("the report of %q is %q, want it to mention %q", action, text, want)
+		for _, unwanted := range []string{program, `%ProgramFiles%`} {
+			if strings.Contains(text, unwanted) {
+				t.Errorf("the report of %q is %q, want no %q for a registration that already ran", action, text, unwanted)
 			}
 		}
 	}
 
-	// A caller that does not know the program still names the account: the
-	// guidance is not withheld because one path of the action has no
-	// program yet.
-	unknown := serviceActionFailureText(serviceActionStart, reason, "")
-	if !strings.Contains(unknown, `NT AUTHORITY\LocalService`) {
-		t.Errorf("the report without a program is %q, want it to name the service account", unknown)
-	}
-	if !strings.Contains(unknown, "must be able to read the program and to traverse its folder") {
+	// A caller that does not know the program still names the repair: the
+	// guidance is not withheld because one path of the action has no program.
+	unknown := serviceActionFailureText(serviceActionInstall, reason, "")
+	if !strings.Contains(unknown, "If the program sits in a folder only you can read") {
 		t.Errorf("the report without a program is %q, want the general form of the guidance", unknown)
 	}
 }
@@ -355,33 +368,41 @@ func TestServiceActionFailureTextNamesWhatToCheckForTheServiceAccount(t *testing
 // command: the registration is still there.
 func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing.T) {
 	reason := errors.New("the service did not start")
-	const program = `C:\portable\hfdesk.exe`
+	const (
+		program = `C:\portable\hfdesk.exe`
+		result  = "registered the service but could not start it"
+	)
 
 	removed := serviceInstallFailureText(reason, program, serviceInstallRemoved, nil)
 	for _, want := range []string{
+		result,
 		reason.Error(),
 		"not installed as a Windows service",
 		"start the desktop app normally again",
-		program,
-		`NT AUTHORITY\LocalService`,
 	} {
 		if !strings.Contains(removed, want) {
 			t.Errorf("the report of the removed registration %q does not mention %q", removed, want)
 		}
 	}
-	if strings.Contains(removed, "hfdesk service uninstall") {
-		t.Errorf("the report of the removed registration %q names a removal that is not needed", removed)
+	// A registration that was removed again is no program folder the user has
+	// to check, and no registration to remove: the report stays with the
+	// desktop app the user starts again.
+	for _, unwanted := range []string{"hfdesk service uninstall", "%ProgramFiles%", program} {
+		if strings.Contains(removed, unwanted) {
+			t.Errorf("the report of the removed registration %q names %q, want neither a removal nor a folder of a registration that is gone", removed, unwanted)
+		}
 	}
 
 	kept := serviceInstallFailureText(reason, program, serviceInstallKept, nil)
 	for _, want := range []string{
+		result,
 		reason.Error(),
 		"left in place",
 		"stays installed, but it does not run",
 		`"hfdesk service uninstall"`,
 		"elevated shell",
 		program,
-		`NT AUTHORITY\LocalService`,
+		`%ProgramFiles%`,
 	} {
 		if !strings.Contains(kept, want) {
 			t.Errorf("the report of the kept registration %q does not mention %q", kept, want)
@@ -391,13 +412,14 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 	removalErr := errors.New("the registration is marked for deletion")
 	failed := serviceInstallFailureText(reason, program, serviceInstallRemovalFailed, removalErr)
 	for _, want := range []string{
+		result,
 		reason.Error(),
 		"could not be removed again",
 		removalErr.Error(),
 		`"hfdesk service uninstall"`,
 		"elevated shell",
 		program,
-		`NT AUTHORITY\LocalService`,
+		`%ProgramFiles%`,
 	} {
 		if !strings.Contains(failed, want) {
 			t.Errorf("the report of the failed removal %q does not mention %q", failed, want)
@@ -409,16 +431,16 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 	// the service may still be running or coming up.
 	skipped := serviceInstallFailureText(reason, program, serviceInstallKept, errServiceRemovalSkipped)
 	for _, want := range []string{
+		result,
 		reason.Error(),
 		"not removed",
 		"may still be running, starting or stopping",
 		"state could not be read",
 		"stays in place",
-		"service gate",
 		`"hfdesk service uninstall"`,
 		"elevated shell",
 		program,
-		`NT AUTHORITY\LocalService`,
+		`%ProgramFiles%`,
 	} {
 		if !strings.Contains(skipped, want) {
 			t.Errorf("the report of the skipped removal %q does not mention %q", skipped, want)
@@ -426,6 +448,25 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 	}
 	if strings.Contains(skipped, "it does not run") {
 		t.Errorf("the report of the skipped removal %q claims that the service stopped", skipped)
+	}
+
+	// The outcome of the installation is the whole state of the service, so
+	// no report of it asks the user to read a state it just described, and no
+	// report of it repeats the separate data of the desktop app.
+	for _, outcome := range []struct {
+		name string
+		text string
+	}{
+		{"removed", removed},
+		{"kept", kept},
+		{"failed", failed},
+		{"skipped", skipped},
+	} {
+		for _, unwanted := range []string{"hfdesk service status", "were not touched"} {
+			if strings.Contains(outcome.text, unwanted) {
+				t.Errorf("the report of the %s registration %q names %q, want the outcome and one action", outcome.name, outcome.text, unwanted)
+			}
+		}
 	}
 }
 
