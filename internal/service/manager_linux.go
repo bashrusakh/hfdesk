@@ -8,13 +8,16 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -692,6 +695,11 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	if err := m.requireRoot("an installation"); err != nil {
 		return opts, err
 	}
+	// The program is checked before anything is read or written, so a refused
+	// program creates no directory, rewrites no unit and stops no instance.
+	if err := m.preflight(opts, account); err != nil {
+		return opts, err
+	}
 	// The state of the replaced registration is read before the unit file
 	// is written: only a running instance is restarted, a stopped one has
 	// to stay stopped.
@@ -744,10 +752,12 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	// The installation owns the directories it created from here on: a
 	// failure removes them again, so a failed installation never leaves
 	// the directories of the instance behind.
-	if err := m.register(ctx, opts, account, created, previous); err != nil {
+	verified, err := m.register(ctx, opts, account, created, previous)
+	if err != nil {
 		removeCreatedDirs(createdDirOrder(opts, created))
 		return opts, err
 	}
+	opts.VersionVerified = verified
 	return opts, nil
 }
 
@@ -917,24 +927,22 @@ func (m *systemdManager) maskedUnitRefusal() error {
 // A replaced registration that was running is restarted and verified; a failure
 // of that restart or of the verification restores the previous registration and
 // brings the previous instance back into service. The restore reports a started
-// instance only when the supervisor was observed running it.
-func (m *systemdManager) register(ctx context.Context, opts InstallOptions, account *user.User, created map[string][]string, previous previousRegistration) error {
+// instance only when the supervisor was observed running it. The result reports
+// whether the restarted instance reported the expected version.
+func (m *systemdManager) register(ctx context.Context, opts InstallOptions, account *user.User, created map[string][]string, previous previousRegistration) (bool, error) {
 	// The instance runs as the service account, so the directories it owns
 	// belong to it.
 	if err := m.grantInstanceDirs(opts, account, created); err != nil {
-		return err
-	}
-	if err := m.preflight(opts); err != nil {
-		return err
+		return false, err
 	}
 
 	unit, err := renderUnit(opts, account)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if err := writeUnitFile(previous.path, unit); err != nil {
-		return err
+		return false, err
 	}
 	// A first installation enables the unit for boot; a repeat installation
 	// keeps the autostart state it finds, in the mode it found it.
@@ -944,20 +952,21 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 	}
 	if err := m.reloadAndEnable(ctx, enable); err != nil {
 		m.rollbackUnit(ctx, previous.path, previous.content, previous.existed)
-		return err
+		return false, err
 	}
 	if !previous.running {
 		// A first installation and a stopped instance stay stopped:
 		// starting is an explicit, separate command.
-		return nil
+		return false, nil
 	}
-	if err := m.restartAndVerify(ctx, opts.Executable, parseUnit(unit).listen()); err != nil {
+	verified, err := m.restartAndVerify(ctx, opts.Executable, parseUnit(unit).listen(), opts.ExpectedVersion)
+	if err != nil {
 		if restoreErr := m.restorePreviousRegistration(ctx, previous); restoreErr != nil {
-			return fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration could not be put back into service: %v)", err, restoreErr)
+			return false, fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration could not be put back into service: %v)", err, restoreErr)
 		}
-		return fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration was restored and the previous instance was started again)", err)
+		return false, fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration was restored and the previous instance was started again)", err)
 	}
-	return nil
+	return verified, nil
 }
 
 // restorePreviousRegistration restores the registration an installation
@@ -991,7 +1000,7 @@ func (m *systemdManager) restorePreviousRegistration(ctx context.Context, previo
 	// whose command line cannot be read names no program, so only the running
 	// state and the probe of its bind address are verified then.
 	restored := parseUnit(string(previous.content))
-	if err := m.verifyRunningExecutable(cleanup, restored.ExecStart, restored.listen()); err != nil {
+	if _, err := m.verifyRunningExecutable(cleanup, restored.ExecStart, restored.listen(), ""); err != nil {
 		return fmt.Errorf("the registration was restored and the restart of the previous instance was issued, but the restart was not confirmed: %w", err)
 	}
 	return nil
@@ -1020,11 +1029,11 @@ func verifyRestoredUnit(previous previousRegistration) error {
 // new executable and that the instance serves on the listen address of the
 // unit. The restart is what switches the running process, which keeps the image
 // it was started from; the listen address comes from the unit that was written.
-func (m *systemdManager) restartAndVerify(ctx context.Context, executable, listen string) error {
+func (m *systemdManager) restartAndVerify(ctx context.Context, executable, listen, expectedVersion string) (bool, error) {
 	if _, err := m.runSystemctl(ctx, "restart", unitName); err != nil {
-		return fmt.Errorf("service: restart %s: %w", unitName, err)
+		return false, fmt.Errorf("service: restart %s: %w", unitName, err)
 	}
-	return m.verifyRunningExecutable(ctx, executable, listen)
+	return m.verifyRunningExecutable(ctx, executable, listen, expectedVersion)
 }
 
 // restartPollInterval is the interval between two checks whether a restarted
@@ -1057,7 +1066,8 @@ func (m *systemdManager) restartVerifyWait() time.Duration {
 //
 // An empty executable checks the running state and the probe alone, and the
 // wait is bounded by the shutdown budget and the context of the installation.
-func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable, listen string) error {
+// The result reports whether a known expected version was compared and seen.
+func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable, listen, expectedVersion string) (bool, error) {
 	budget := m.restartVerifyWait()
 	deadline := time.Now().Add(budget)
 	address := probeServiceAddress(listen)
@@ -1080,8 +1090,13 @@ func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable
 			default:
 				// The supervisor reports the instance the registration
 				// names; the instance itself has to answer before the
-				// start counts.
-				if probeErr := serviceReadinessProbe(listen); probeErr != nil {
+				// start counts. A version mismatch ends the wait at once:
+				// the version of a running instance does not change.
+				verified, probeErr := serviceInstallProbe(listen, expectedVersion)
+				if probeErr != nil {
+					if errors.Is(probeErr, errServiceVersionMismatch) {
+						return false, fmt.Errorf("the restarted %s does not run the expected version: %w", unitName, probeErr)
+					}
 					probeFailed = true
 					if executable == "" {
 						detail = fmt.Sprintf("the supervisor reports the state %q, but the instance does not answer on %s: %v", show.State, address, probeErr)
@@ -1089,23 +1104,23 @@ func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable
 						detail = fmt.Sprintf("the supervisor reports the state %q with the program %q, but the instance does not answer on %s: %v", show.State, path, address, probeErr)
 					}
 				} else {
-					return nil
+					return verified, nil
 				}
 			}
 		}
 		if !time.Now().Before(deadline) {
 			switch {
 			case probeFailed:
-				return fmt.Errorf("the restarted %s does not answer on %s within %s: %s", unitName, address, budget, detail)
+				return false, fmt.Errorf("the restarted %s does not answer on %s within %s: %s", unitName, address, budget, detail)
 			case executable == "":
-				return fmt.Errorf("the %s is not active within %s: %s", unitName, budget, detail)
+				return false, fmt.Errorf("the %s is not active within %s: %s", unitName, budget, detail)
 			default:
-				return fmt.Errorf("the restarted %s does not run %q within %s: %s", unitName, executable, budget, detail)
+				return false, fmt.Errorf("the restarted %s does not run %q within %s: %s", unitName, executable, budget, detail)
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return false, ctx.Err()
 		case <-time.After(restartPollInterval):
 		}
 	}
@@ -1149,8 +1164,9 @@ func trimExecStartPath(value string) string {
 }
 
 // preflight rejects an installation the supervisor could not run: a missing
-// supervisor, an unusable bind address or an executable that cannot be run.
-func (m *systemdManager) preflight(opts InstallOptions) error {
+// supervisor, an unusable bind address or an executable that the account of the
+// scope cannot run.
+func (m *systemdManager) preflight(opts InstallOptions, account *user.User) error {
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		return fmt.Errorf("service: systemctl is not available: %w", err)
 	}
@@ -1167,7 +1183,173 @@ func (m *systemdManager) preflight(opts InstallOptions) error {
 	if info.Mode().Perm()&0o111 == 0 {
 		return fmt.Errorf("service: executable %q is not executable", opts.Executable)
 	}
+	if err := checkExecutableFormat(opts.Executable); err != nil {
+		return err
+	}
+
+	// A user scope unit runs as the installing user; a machine-wide one runs
+	// as the resolved account. An unreadable identity proves no denial.
+	if account == nil && m.scope == ScopeUser {
+		if current, err := user.Current(); err == nil {
+			account = current
+		}
+	}
+	if account == nil {
+		return nil
+	}
+	identity, err := linuxAccessAccount(account)
+	if err != nil {
+		return nil
+	}
+	if err := checkExecutableAccess(opts.Executable, identity); err != nil {
+		return fmt.Errorf("service: executable %q is not usable by the account %q: %w", opts.Executable, account.Username, err)
+	}
 	return nil
+}
+
+// checkExecutableAccess reports whether the account can read and execute the
+// program and traverse its parents. Only a definite denial is an error: an
+// access that cannot be read proves nothing. Root needs an execute bit only.
+func checkExecutableAccess(path string, identity accessAccount) error {
+	resolved, err := resolvePath(path)
+	if err != nil {
+		return nil
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return nil
+	}
+	if identity.UID == 0 {
+		if info.Mode().Perm()&0o111 == 0 {
+			return errExecutableNotUsable
+		}
+		return nil
+	}
+	if effectivePermission(info, identity)&0o500 != 0o500 {
+		return errExecutableNotUsable
+	}
+	for _, dir := range []string{filepath.Dir(resolved), filepath.Dir(filepath.Clean(path))} {
+		ok, err := accountCanTraverse(dir, identity)
+		if err != nil {
+			return nil
+		}
+		if !ok {
+			return errExecutableNotReachable
+		}
+	}
+	return nil
+}
+
+// errExecutableNotUsable reports a program the account cannot read and execute.
+var errExecutableNotUsable = errors.New("the account cannot read and execute it")
+
+// errExecutableNotReachable reports an untraversable parent of the program.
+var errExecutableNotReachable = errors.New("the account cannot reach it through the parent directories")
+
+// checkExecutableFormat rejects a program the platform demonstrably cannot run:
+// a PE or Mach-O image and an ELF of another class, byte order or machine.
+// Scripts stay valid.
+func checkExecutableFormat(path string) error {
+	header, err := readExecutableHeader(path)
+	if err != nil {
+		// An unreadable header proves no format; the access check refuses it.
+		return nil
+	}
+	if len(header) >= 2 && header[0] == 'M' && header[1] == 'Z' {
+		return fmt.Errorf("service: executable %q is a Windows program and cannot run on this platform", path)
+	}
+	if len(header) >= 4 {
+		switch binary.BigEndian.Uint32(header[:4]) {
+		case 0xfeedface, 0xcefaedfe, 0xfeedfacf, 0xcffaedfe, 0xcafebabe, 0xbebafeca:
+			return fmt.Errorf("service: executable %q is a Mach-O program and cannot run on this platform", path)
+		}
+	}
+	if len(header) < 4 || header[0] != 0x7f || header[1] != 'E' || header[2] != 'L' || header[3] != 'F' {
+		return nil
+	}
+	if len(header) < 20 {
+		return fmt.Errorf("service: executable %q is a truncated ELF program", path)
+	}
+	class, data := header[4], header[5]
+	order, ok := elfByteOrder(data)
+	if !ok {
+		return fmt.Errorf("service: executable %q is an ELF program with the unknown byte order %d", path, data)
+	}
+	machine := order.Uint16(header[18:20])
+	want, known := elfMachine(runtime.GOARCH)
+	if !known {
+		return nil
+	}
+	if class != want.class || data != want.data || machine != want.machine {
+		return fmt.Errorf("service: executable %q is built for another platform: ELF class %d, byte order %d, machine 0x%04X; this host is %s", path, class, data, machine, runtime.GOARCH)
+	}
+	return nil
+}
+
+func readExecutableHeader(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	header := make([]byte, 20)
+	n, err := io.ReadFull(file, header)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, err
+	}
+	return header[:n], nil
+}
+
+func elfByteOrder(data byte) (binary.ByteOrder, bool) {
+	switch data {
+	case 1:
+		return binary.LittleEndian, true
+	case 2:
+		return binary.BigEndian, true
+	default:
+		return nil, false
+	}
+}
+
+type linuxELF struct {
+	class   byte
+	data    byte
+	machine uint16
+}
+
+// elfMachine returns the ELF identity of a Go architecture; a missing entry is
+// not compared.
+func elfMachine(arch string) (linuxELF, bool) {
+	switch arch {
+	case "386":
+		return linuxELF{class: 1, data: 1, machine: 3}, true
+	case "amd64":
+		return linuxELF{class: 2, data: 1, machine: 62}, true
+	case "arm":
+		return linuxELF{class: 1, data: 1, machine: 40}, true
+	case "arm64":
+		return linuxELF{class: 2, data: 1, machine: 183}, true
+	case "loong64":
+		return linuxELF{class: 2, data: 1, machine: 258}, true
+	case "mips":
+		return linuxELF{class: 1, data: 2, machine: 8}, true
+	case "mipsle":
+		return linuxELF{class: 1, data: 1, machine: 8}, true
+	case "mips64":
+		return linuxELF{class: 2, data: 2, machine: 8}, true
+	case "mips64le":
+		return linuxELF{class: 2, data: 1, machine: 8}, true
+	case "ppc64":
+		return linuxELF{class: 2, data: 2, machine: 21}, true
+	case "ppc64le":
+		return linuxELF{class: 2, data: 1, machine: 21}, true
+	case "riscv64":
+		return linuxELF{class: 2, data: 1, machine: 243}, true
+	case "s390x":
+		return linuxELF{class: 2, data: 2, machine: 22}, true
+	default:
+		return linuxELF{}, false
+	}
 }
 
 // checkSystemPaths rejects a machine-wide installation that would adopt the

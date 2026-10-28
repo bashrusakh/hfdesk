@@ -8,6 +8,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -16,6 +17,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -3642,6 +3644,228 @@ func TestSystemdRestartVerifyWaitIsTheShutdownBudget(t *testing.T) {
 	}
 	if got := (&systemdManager{restartWait: time.Second}).restartVerifyWait(); got != time.Second {
 		t.Errorf("restartVerifyWait() = %s, want the wait of the manager %s", got, time.Second)
+	}
+}
+
+// TestSystemdCheckExecutableAccess checks the effective access of the account
+// that runs the unit: through its user, its primary group or a supplementary
+// group, and the refusal of a missing read bit, execute bit or parent traversal.
+func TestSystemdCheckExecutableAccess(t *testing.T) {
+	// The program lives directly in the temporary root, so an identity that
+	// is not the owner can traverse every parent of the machine.
+	tmpInfo, err := os.Stat("/tmp")
+	if err != nil || tmpInfo.Mode().Perm()&0o001 == 0 {
+		t.Skip("skipping: the temporary root is not traversable by another account")
+	}
+	file, err := os.CreateTemp("/tmp", "hfdesk-access-")
+	if err != nil {
+		t.Skipf("skipping: a program cannot be created in the temporary root: %v", err)
+	}
+	executable := file.Name()
+	if _, err := file.WriteString("#!/bin/sh\nexit 0\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(executable) })
+	if err := os.Chmod(executable, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skipf("the file system does not report an owner: %v", info.Sys())
+	}
+	uid, gid := int(stat.Uid), int(stat.Gid)
+
+	for _, tc := range []struct {
+		name     string
+		mode     os.FileMode
+		identity accessAccount
+		want     error
+	}{
+		{"the owner", 0o750, accessAccount{UID: uid, GID: gid + 1}, nil},
+		{"the primary group", 0o750, accessAccount{UID: uid + 1, GID: gid}, nil},
+		{"a supplementary group", 0o750, accessAccount{UID: uid + 1, GID: gid + 1, Groups: []int{gid}}, nil},
+		{"a program without the execute bit", 0o600, accessAccount{UID: uid, GID: gid}, errExecutableNotUsable},
+		{"a program without the read bit", 0o111, accessAccount{UID: uid, GID: gid}, errExecutableNotUsable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.Chmod(executable, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := checkExecutableAccess(executable, tc.identity); !errors.Is(err, tc.want) {
+				t.Errorf("checkExecutableAccess(%04o) = %v, want %v", tc.mode, err, tc.want)
+			}
+		})
+	}
+
+	t.Run("a parent directory without traverse", func(t *testing.T) {
+		// The program is below a directory the account cannot enter, while
+		// the installing process still reaches it: the parent is owned by
+		// the process and the account is another identity.
+		root, err := os.MkdirTemp("/tmp", "hfdesk-parent-")
+		if err != nil {
+			t.Skipf("skipping: a directory cannot be created in the temporary root: %v", err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(root) })
+		if err := os.Chmod(root, 0o711); err != nil {
+			t.Fatal(err)
+		}
+		parent := filepath.Join(root, "parent")
+		if err := os.Mkdir(parent, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		blocked := filepath.Join(parent, "hfdesk")
+		if err := os.WriteFile(blocked, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		err = checkExecutableAccess(blocked, accessAccount{UID: uid + 1, GID: gid + 1})
+		if !errors.Is(err, errExecutableNotReachable) {
+			t.Errorf("checkExecutableAccess() = %v, want the refusal of the parent traversal", err)
+		}
+	})
+}
+
+// TestSystemdInstallRefusesAnExecutableTheAccountCannotRun checks that a refused
+// program fails the installation before the supervisor is asked to act and before
+// the unit file or a directory is written.
+func TestSystemdInstallRefusesAnExecutableTheAccountCannotRun(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	root := t.TempDir()
+
+	opts := systemdTempInstallOptions(t, root)
+	if err := os.Chmod(opts.Executable, 0o001); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &systemdManager{scope: ScopeUser}
+	_, err := m.Install(context.Background(), opts)
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of a program the account cannot run")
+	}
+	account := systemdCurrentAccount(t)
+	for _, want := range []string{opts.Executable, account.Username, "not usable by the account"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Install() = %v, want %q in the refusal", err, want)
+		}
+	}
+
+	path, pathErr := m.unitPath()
+	if pathErr != nil {
+		t.Fatalf("unitPath() = %v, want nil", pathErr)
+	}
+	if _, statErr := os.Stat(path); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("the refused installation wrote the unit file %q: %v", path, statErr)
+	}
+	for _, dir := range instanceDirs(opts) {
+		if _, statErr := os.Stat(dir.path); !errors.Is(statErr, fs.ErrNotExist) {
+			t.Errorf("the refused installation created the %s %q: %v", dir.name, dir.path, statErr)
+		}
+	}
+
+	calls := systemdSupervisorCalls(t, logPath)
+	for _, command := range []string{"daemon-reload", "enable", "restart", "start"} {
+		if got := systemdSupervisorCallsTo(calls, command, unitName); got != 0 {
+			t.Errorf("the refused installation issued %q %d times:\n%s", command, got, strings.Join(calls, "\n"))
+		}
+	}
+}
+
+// TestSystemdCheckExecutableFormat checks that a program of another platform
+// is refused and a script or a matching ELF program stays valid.
+func TestSystemdCheckExecutableFormat(t *testing.T) {
+	write := func(t *testing.T, content []byte) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "hfdesk")
+		if err := os.WriteFile(path, content, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	if err := checkExecutableFormat(write(t, []byte("#!/bin/sh\nexit 0\n"))); err != nil {
+		t.Errorf("checkExecutableFormat(script) = %v, want nil", err)
+	}
+	for _, tc := range []struct {
+		name    string
+		content []byte
+	}{
+		{"a Windows program", []byte("MZ\x90\x00")},
+		{"a Mach-O program", []byte{0xcf, 0xfa, 0xed, 0xfe}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := checkExecutableFormat(write(t, tc.content)); err == nil {
+				t.Fatalf("checkExecutableFormat(%s) = nil, want the refusal of the foreign program", tc.name)
+			}
+		})
+	}
+
+	want, known := elfMachine(runtime.GOARCH)
+	if !known {
+		return
+	}
+	mismatch := make([]byte, 20)
+	copy(mismatch, []byte{0x7f, 'E', 'L', 'F'})
+	mismatch[4] = want.class
+	mismatch[5] = want.data
+	var order binary.ByteOrder = binary.LittleEndian
+	if want.data == 2 {
+		order = binary.BigEndian
+	}
+	order.PutUint16(mismatch[18:20], want.machine+1)
+	if err := checkExecutableFormat(write(t, mismatch)); err == nil {
+		t.Error("checkExecutableFormat(mismatched ELF) = nil, want the refusal of the other machine")
+	}
+
+	if running, err := os.Executable(); err == nil {
+		if err := checkExecutableFormat(running); err != nil {
+			t.Errorf("checkExecutableFormat(%q) = %v, want nil for the running program", running, err)
+		}
+	}
+}
+
+// TestSystemdVerifyRunningExecutableChecksTheExpectedVersion checks that the
+// installation verification compares a known version and ends the wait at
+// once for a mismatch.
+func TestSystemdVerifyRunningExecutableChecksTheExpectedVersion(t *testing.T) {
+	_ = systemdRecordingSupervisor(t)
+	executable := systemdTestExecutable(t)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", executable)
+
+	previous := serviceInstallProbe
+	t.Cleanup(func() { serviceInstallProbe = previous })
+
+	var gotExpected string
+	serviceInstallProbe = func(listen, expected string) (bool, error) {
+		gotExpected = expected
+		return true, nil
+	}
+	m := &systemdManager{scope: ScopeUser, restartWait: time.Second}
+	verified, err := m.verifyRunningExecutable(context.Background(), executable, "127.0.0.1:8080", "1.2.3")
+	if err != nil || !verified {
+		t.Fatalf("verifyRunningExecutable() = %t, %v, want the verified version", verified, err)
+	}
+	if gotExpected != "1.2.3" {
+		t.Errorf("the probe was asked for the version %q, want %q", gotExpected, "1.2.3")
+	}
+
+	serviceInstallProbe = func(string, string) (bool, error) {
+		return false, fmt.Errorf("%w: the health endpoint reports another version", errServiceVersionMismatch)
+	}
+	verified, err = m.verifyRunningExecutable(context.Background(), executable, "127.0.0.1:8080", "1.2.3")
+	if err == nil || verified {
+		t.Fatalf("verifyRunningExecutable() = %t, %v, want the version mismatch", verified, err)
+	}
+	if !errors.Is(err, errServiceVersionMismatch) {
+		t.Errorf("verifyRunningExecutable() = %v, want the version mismatch", err)
 	}
 }
 

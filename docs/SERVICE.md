@@ -563,21 +563,26 @@ replaces the other.
   starts it and verifies that it runs — that the server on the registered
   address answers as HFDesk, with the health document of the instance or, for a
   protected instance, its Basic-auth challenge — and reports the result in a
-  message box.
+  message box. A desktop release also passes the version of that release as the
+  expected version, and its report names a version only when the started
+  instance reported it; a local desktop build names no release and claims none.
   A declined prompt or a missing console program changes nothing and leaves the
   desktop app running.
 
   An installation that registered the service and then failed to start it, or
   failed to verify the start, does not leave the user with a registration that
-  serves nothing: when the machine had no registration before, and the state
-  read after the failure reports a service that is neither running nor still
-  starting or stopping, the helper removes that registration again — the
-  registration only, the data stays where it is — and the report says that the
-  desktop app can be started normally again. A service that is running, starting
-  or stopping at that read, a state that cannot be read then, a registration
-  that existed before the attempt, and a machine whose state could not be read
-  before the attempt, keep their registration, and the report says what stays
-  and names `hfdesk service uninstall` from an elevated shell instead.
+  serves nothing: the installation reports whether it **created** the
+  registration, and only a registration it created is removed again — and only
+  when the state read after the failure is settled and does not serve. The
+  removal takes the registration only, the data stays where it is, and the
+  report says that the desktop app can be started normally again. Every other
+  case keeps its registration and names `hfdesk service uninstall` from an
+  elevated shell instead: a registration that existed before the attempt or
+  appeared between the read-only lookup of the manager and its write, and a
+  service that is running, starting or stopping at that read. A state that
+  cannot be read is not a stopped service: the report says that the start could
+  not be confirmed and that the service may be running, starting or stopped,
+  instead of claiming that it does not run.
 - **No second server.** Once the helper is started, the desktop app stops its
   own server through the graceful shutdown and ends. The helper starts the
   service only after that process has exited, so the desktop app and the service
@@ -794,6 +799,17 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   automatic start) and asks for another installation. A stopped Windows service
   with a disabled start type is allowed, because the installation does not start
   it.
+- **The program is checked before anything is touched.** An installation
+  inspects the program before it writes a registration, creates a directory or
+  stops a running instance: a Windows or a Mach-O image and an ELF of another
+  class, byte order or machine are refused on Linux, and the account the
+  instance runs as must be able to read and execute the program and to traverse
+  its parent directories — the mode bits for the service account of the scope on
+  Linux, the access control lists of the program and of its parents for
+  `LocalService` on Windows. Only a definite denial refuses, and the error names
+  the account and the access it lacks; rights that cannot be read prove no
+  denial. The check never changes a permission: it reports what is missing and
+  leaves the grant to the operator.
 - **The running state decides the restart.** An instance that runs, or is
   starting, is stopped and started again on the new program, and the
   installation succeeds only when the supervisor reports it running with the
@@ -814,14 +830,22 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   no credential, so a foreign program that happens to listen on the port is not
   mistaken for the restarted instance. The probe does not follow redirects: a
   `3xx` answer is returned as it is and rejected, so a foreign server cannot
-  point the probe at the health document of a real HFDesk on another address. A
-  probe that does not succeed within the budget is a failed update that rolls
-  back. An instance that was stopped, failed, or absent is **not** started:
-  `install` never starts a service that was not running, and starting stays an
-  explicit `service start`. A registration that is `broken` follows the running
-  fact and not the state: an instance the supervisor still runs is restarted on
-  the new program like any other running one, and a broken registration whose
-  instance is gone is not started.
+  point the probe at the health document of a real HFDesk on another address.
+  The probe asks the listen address of the same machine directly and never
+  through a proxy configured in the environment, so an ambient proxy cannot
+  fail a healthy instance. When the build version of the new program is known,
+  the installation compares it too: an installation run from the registered
+  binary knows its own build version, the desktop host passes the version of the
+  release it installs, and a mismatch fails the update at once because the
+  version of a running instance does not change — while `--executable`, a local
+  `dev` build and an instance behind Basic auth prove readiness without a
+  version. A probe that does not succeed within the budget is a failed update
+  that rolls back. An instance that was stopped, failed, or absent is **not**
+  started: `install` never starts a service that was not running, and starting
+  stays an explicit `service start`. A registration that is `broken` follows the
+  running fact and not the state: an instance the supervisor still runs is
+  restarted on the new program like any other running one, and a broken
+  registration whose instance is gone is not started.
 - **A failure says what it restored.** A failure before the registration is
   written leaves a running instance untouched. A failure after the registration
   was written restores the previous registration: its configuration is written

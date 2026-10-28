@@ -226,6 +226,13 @@ type InstallOptions struct {
 	// the supervisor starts the instance with, and the installation
 	// refuses to register an instance whose account does not exist.
 	ServiceUser string
+	// ExpectedVersion is the version the started instance must report; empty
+	// and "dev" leave readiness as it was.
+	ExpectedVersion string
+	// Created and VersionVerified are results of Manager.Install, not inputs: a
+	// caller may remove only a registration the installation created itself.
+	Created         bool
+	VersionVerified bool
 }
 
 // DefaultInstallOptions returns the options of an installation that names
@@ -345,9 +352,9 @@ func SupportsNamedServiceAccount() bool {
 type Manager interface {
 	// Install registers the service with the platform supervisor and
 	// returns the installation as it was written: a reinstall reports what
-	// the instance runs with, a wholesale replacement the request. On error
-	// the returned options describe no effective installation and must not
-	// be reported as one.
+	// the instance runs with, a wholesale replacement the request, and Created
+	// whether this call wrote the registration. On error the returned options
+	// describe no effective installation and must not be reported as one.
 	Install(ctx context.Context, opts InstallOptions) (InstallOptions, error)
 	// Uninstall removes the registration of the service.
 	Uninstall(ctx context.Context) error

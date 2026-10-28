@@ -101,17 +101,18 @@ func TestRunArgsUsesDefaultListenWhenUnset(t *testing.T) {
 
 // installOptionStringFields are the string fields of InstallOptions.
 //
-// Every one of them carries the scope, a path, the bind address or the
-// account of an instance. The type carries no credential field at all, so a
-// registration can never carry one.
+// Every one of them carries the scope, a path, the bind address, the account
+// or the build version of an instance. The type carries no credential field at
+// all, so a registration can never carry one.
 var installOptionStringFields = map[string]bool{
-	"Scope":       true,
-	"Executable":  true,
-	"Listen":      true,
-	"CacheDir":    true,
-	"HubDir":      true,
-	"LocalDir":    true,
-	"ServiceUser": true,
+	"Scope":           true,
+	"Executable":      true,
+	"Listen":          true,
+	"CacheDir":        true,
+	"HubDir":          true,
+	"LocalDir":        true,
+	"ServiceUser":     true,
+	"ExpectedVersion": true,
 }
 
 // TestInstallOptionsCarryNoCredentialField checks that the options of an

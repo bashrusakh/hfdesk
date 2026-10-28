@@ -360,15 +360,12 @@ func TestServiceActionFailureTextNamesTheFolderOfTheProgram(t *testing.T) {
 }
 
 // TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft proves that
-// the report of an installation whose service did not run states what happened
-// to the registration.
+// the report of an installation whose service did not start states what the
+// cleanup observed.
 //
-// A failed first installation removes its own registration again, so the report
-// says that HFDesk is not installed and that the desktop app starts normally
-// again. A registration that was there before, or whose state before could not be
-// read, stays, and the report names what remains and the elevated command that
-// removes it. A removal that failed is reported with its reason and with the same
-// command: the registration is still there.
+// A registration this installation created and removed is gone; one it did not
+// create, could not read or could not remove stays and is named with the elevated
+// command, without ever claiming that the service does not run.
 func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing.T) {
 	reason := errors.New("the service did not start")
 	const (
@@ -376,7 +373,7 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 		result  = "registered the service but could not start it"
 	)
 
-	removed := serviceInstallFailureText(reason, program, serviceInstallRemoved, nil)
+	removed := serviceInstallFailureText(reason, program, serviceInstallCleanup{aftermath: serviceInstallRemoved})
 	for _, want := range []string{
 		result,
 		reason.Error(),
@@ -396,12 +393,14 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 		}
 	}
 
-	kept := serviceInstallFailureText(reason, program, serviceInstallKept, nil)
+	kept := serviceInstallFailureText(reason, program, serviceInstallCleanup{aftermath: serviceInstallKept})
 	for _, want := range []string{
 		result,
 		reason.Error(),
 		"left in place",
-		"stays installed, but it does not run",
+		"not created by this installation",
+		"The start could not be confirmed",
+		"may be running, starting or stopped",
 		`"hfdesk service uninstall"`,
 		"elevated shell",
 		program,
@@ -411,9 +410,17 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 			t.Errorf("the report of the kept registration %q does not mention %q", kept, want)
 		}
 	}
+	if strings.Contains(kept, "it does not run") {
+		t.Errorf("the report of the kept registration %q claims that the service stopped although its state was not read", kept)
+	}
 
 	removalErr := errors.New("the registration is marked for deletion")
-	failed := serviceInstallFailureText(reason, program, serviceInstallRemovalFailed, removalErr)
+	failed := serviceInstallFailureText(reason, program, serviceInstallCleanup{
+		aftermath:  serviceInstallRemovalFailed,
+		read:       true,
+		status:     service.Status{State: service.StateStopped},
+		removalErr: removalErr,
+	})
 	for _, want := range []string{
 		result,
 		reason.Error(),
@@ -429,28 +436,50 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 		}
 	}
 
-	// A removal that was not attempted because the instance could not be
-	// proven stopped says what remains instead of claiming that it stopped:
-	// the service may still be running or coming up.
-	skipped := serviceInstallFailureText(reason, program, serviceInstallKept, errServiceRemovalSkipped)
+	// A removal that was skipped because the state could not be read says so
+	// and never claims that the service stopped.
+	unreadable := serviceInstallFailureText(reason, program, serviceInstallCleanup{
+		aftermath:  serviceInstallKept,
+		read:       true,
+		statusErr:  errors.New("the service control manager did not answer"),
+		removalErr: errServiceRemovalSkipped,
+	})
 	for _, want := range []string{
 		result,
 		reason.Error(),
 		"not removed",
-		"may still be running, starting or stopping",
-		"state could not be read",
+		"state of the service could not be read",
+		"The start could not be confirmed",
+		"may be running, starting or stopped",
 		"stays in place",
 		`"hfdesk service uninstall"`,
 		"elevated shell",
 		program,
 		`NT AUTHORITY\LocalService`,
 	} {
-		if !strings.Contains(skipped, want) {
-			t.Errorf("the report of the skipped removal %q does not mention %q", skipped, want)
+		if !strings.Contains(unreadable, want) {
+			t.Errorf("the report of the unreadable state %q does not mention %q", unreadable, want)
 		}
 	}
-	if strings.Contains(skipped, "it does not run") {
-		t.Errorf("the report of the skipped removal %q claims that the service stopped", skipped)
+	if strings.Contains(unreadable, "it does not run") {
+		t.Errorf("the report of the unreadable state %q claims that the service stopped", unreadable)
+	}
+
+	// A removal that was skipped because the instance is still stopping says
+	// what is known and does not claim that the service stopped either.
+	pending := serviceInstallFailureText(reason, program, serviceInstallCleanup{
+		aftermath:  serviceInstallKept,
+		read:       true,
+		status:     service.Status{State: service.StateStopping},
+		removalErr: errServiceRemovalSkipped,
+	})
+	for _, want := range []string{"not removed", "still stopping", "The start could not be confirmed", "stays in place"} {
+		if !strings.Contains(pending, want) {
+			t.Errorf("the report of the pending state %q does not mention %q", pending, want)
+		}
+	}
+	if strings.Contains(pending, "it does not run") {
+		t.Errorf("the report of the pending state %q claims that the service stopped", pending)
 	}
 
 	// The outcome of the installation is the whole state of the service, so
@@ -463,7 +492,8 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 		{"removed", removed},
 		{"kept", kept},
 		{"failed", failed},
-		{"skipped", skipped},
+		{"unreadable", unreadable},
+		{"pending", pending},
 	} {
 		for _, unwanted := range []string{"hfdesk service status", "were not touched"} {
 			if strings.Contains(outcome.text, unwanted) {

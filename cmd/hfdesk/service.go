@@ -726,6 +726,8 @@ func serviceInstall(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// A named path is another program until its health endpoint answers.
+	opts.ExpectedVersion = expectedInstallVersion(executable)
 
 	mgr, err := newServiceManager(scope)
 	if err != nil {
@@ -742,6 +744,31 @@ func serviceInstall(args []string, stdout io.Writer) error {
 
 	writeInstallSummary(stdout, ctx, mgr, scope, effective)
 	return nil
+}
+
+// expectedInstallVersion returns the build version of the registered program
+// when that program is the running binary itself. A local build ("dev") and a
+// named --executable are not a version the installation may demand.
+func expectedInstallVersion(executable string) string {
+	if Version == "" || Version == "dev" {
+		return ""
+	}
+	running, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	registered, err := os.Stat(executable)
+	if err != nil {
+		return ""
+	}
+	current, err := os.Stat(running)
+	if err != nil {
+		return ""
+	}
+	if !os.SameFile(registered, current) {
+		return ""
+	}
+	return Version
 }
 
 // writeInstallSummary prints what was registered.
@@ -1345,5 +1372,7 @@ func runServiceHost(ctx context.Context, args []string) error {
 	if err != nil {
 		return newServiceUsageError(err)
 	}
+	// The health endpoint reports the version of this build.
+	opts.Version = Version
 	return service.RunProcess(ctx, opts)
 }

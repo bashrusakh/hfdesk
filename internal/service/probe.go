@@ -5,6 +5,7 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -48,6 +49,9 @@ const (
 	// the server on the address is the instance; the whole header is compared,
 	// because a challenge of another realm describes another server.
 	serviceProbeAuthChallenge = server.BasicAuthChallenge
+
+	// serviceProbeDevVersion is the version of an un-flagged local build.
+	serviceProbeDevVersion = "dev"
 )
 
 // serviceReadinessProbe is the readiness probe a manager uses to verify that a
@@ -58,6 +62,25 @@ const (
 // fake supervisor replaces the probe, because no server of the instance answers
 // then.
 var serviceReadinessProbe = probeServiceReady
+
+// serviceProbeTransport keeps the same-machine probe off the environment proxy.
+var serviceProbeTransport = &http.Transport{
+	Proxy:           nil,
+	IdleConnTimeout: serviceProbeTimeout,
+}
+
+// errServiceVersionMismatch reports another version, which cannot change, so a
+// wait ends at once.
+var errServiceVersionMismatch = errors.New("the instance reports another version")
+
+// serviceInstallProbe verifies a restarted instance during an installation; it
+// is a variable so a test can drive the verification without a server.
+var serviceInstallProbe = func(listen, expectedVersion string) (bool, error) {
+	if expectedVersion == "" || expectedVersion == serviceProbeDevVersion {
+		return false, serviceReadinessProbe(listen)
+	}
+	return probeServiceReadyForVersion(listen, expectedVersion)
+}
 
 // probeServiceReady reports whether the address answers as the HFDesk server.
 //
@@ -73,21 +96,34 @@ var serviceReadinessProbe = probeServiceReady
 // returned as it is and rejected, so a foreign server cannot point the probe at
 // the health document of a real HFDesk elsewhere.
 func probeServiceReady(listen string) error {
+	_, err := probeServiceReadyForVersion(listen, "")
+	return err
+}
+
+// probeServiceReadyForVersion also compares the version the health document
+// reports. The second result is true only for a comparison that matched: an
+// empty expectation and an authentication challenge carry no version.
+func probeServiceReadyForVersion(listen, expectedVersion string) (bool, error) {
 	addr := probeServiceAddress(listen)
+	expectedVersion = strings.TrimSpace(expectedVersion)
+	if expectedVersion == serviceProbeDevVersion {
+		expectedVersion = ""
+	}
 
 	// A redirect is not an answer of the instance: a foreign server on the
 	// address could point the probe at a real HFDesk elsewhere and the probe
 	// would accept the health document of that other instance. The last
 	// response is returned as it is, so a 3xx fails the status switch below.
 	client := &http.Client{
-		Timeout: serviceProbeTimeout,
+		Timeout:   serviceProbeTimeout,
+		Transport: serviceProbeTransport,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
 	resp, err := client.Get("http://" + addr + serviceProbePath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer resp.Body.Close()
 
@@ -95,27 +131,33 @@ func probeServiceReady(listen string) error {
 	case http.StatusOK:
 		health, err := readServiceHealth(resp.Body)
 		if err != nil {
-			return serviceNotAnswering(addr, err)
+			return false, serviceNotAnswering(addr, err)
 		}
 		if health.Status != serviceProbeHealthStatus {
-			return serviceNotAnswering(addr, fmt.Errorf("the health endpoint reports the status %q", health.Status))
+			return false, serviceNotAnswering(addr, fmt.Errorf("the health endpoint reports the status %q", health.Status))
 		}
 		if health.Version == "" {
-			return serviceNotAnswering(addr, fmt.Errorf("the health endpoint reports no version of the instance"))
+			return false, serviceNotAnswering(addr, fmt.Errorf("the health endpoint reports no version of the instance"))
 		}
-		return nil
+		if expectedVersion == "" {
+			return false, nil
+		}
+		if health.Version != expectedVersion {
+			return false, serviceNotAnswering(addr, fmt.Errorf("%w: the health endpoint reports the version %q instead of %q", errServiceVersionMismatch, health.Version, expectedVersion))
+		}
+		return true, nil
 	case http.StatusUnauthorized:
 		// The instance protects its API with basic authentication. A request
 		// without a credential is refused with the challenge of the instance,
 		// which is the evidence that the server on the address is HFDesk.
 		if challenge := resp.Header.Get("WWW-Authenticate"); challenge != serviceProbeAuthChallenge {
-			return serviceNotAnswering(addr, fmt.Errorf("the health endpoint answered %s with the challenge %q instead of the challenge of the instance", resp.Status, challenge))
+			return false, serviceNotAnswering(addr, fmt.Errorf("the health endpoint answered %s with the challenge %q instead of the challenge of the instance", resp.Status, challenge))
 		}
-		// The refusal carries no document of interest: drain the body.
+		// The challenge carries no version: drain the body, unverified.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, serviceProbeBodyLimit))
-		return nil
+		return false, nil
 	default:
-		return serviceNotAnswering(addr, fmt.Errorf("the health endpoint answered with the status %s", resp.Status))
+		return false, serviceNotAnswering(addr, fmt.Errorf("the health endpoint answered with the status %s", resp.Status))
 	}
 }
 

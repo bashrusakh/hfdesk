@@ -101,6 +101,9 @@ const (
 	scmMaxImagePathLength = 32 * 1024
 )
 
+// scmStopBudget bounds the graceful stop; a test shortens it.
+var scmStopBudget = scmStopTimeout
+
 // scmManager drives the service control manager of HFDesk.
 //
 // The manager registers the instance as a machine-wide service, it starts
@@ -176,7 +179,8 @@ func newPlatformManager(scope Scope) (Manager, error) {
 // empty; a directory that existed before is never touched.
 //
 // The returned options are the registration as written: the merged options of a
-// reinstall, or the request of a first installation.
+// reinstall, or the request of a first installation. Created reports whether this
+// call wrote the registration.
 func (m *scmManager) Install(ctx context.Context, opts InstallOptions) (InstallOptions, error) {
 	// The registration is read before a directory is created: the merge of
 	// the request needs the settings the instance runs with, and only an
@@ -196,6 +200,11 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) (InstallO
 	// a permission error of the machine-wide directories is a much less
 	// readable answer than the real reason.
 	if err := requireElevated("an installation"); err != nil {
+		return opts, err
+	}
+	// The program is checked before the first write, so a refused program leaves
+	// the instance unchanged. A check that cannot read the rights refuses none.
+	if err := preflightExecutableAccess(opts.Executable); err != nil {
 		return opts, err
 	}
 	// The paths the installation is about to create are remembered before
@@ -237,10 +246,14 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) (InstallO
 
 	// The registration is written and put into service. A failure restores
 	// the previous registration, so the caller never keeps a registration
-	// the installation failed to put into service.
-	if err := m.register(ctx, manager, opts, previous); err != nil {
+	// the installation failed to put into service; only a registration this
+	// call wrote may be removed after a failed start.
+	created, versionVerified, err := m.register(ctx, manager, opts, previous)
+	if err != nil {
 		return opts, fail(err)
 	}
+	opts.Created = created
+	opts.VersionVerified = versionVerified
 
 	// The event log source carries the diagnostics of the instance. A
 	// source that cannot be registered is not a failed installation: the
@@ -342,7 +355,9 @@ func scmRegistrationOptions(commandLine string, scope Scope) InstallOptions {
 // restarted and verified, and a failure of that restart stops the instance the
 // installation started, restores the previous configuration and brings the
 // previous program back into service.
-func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts InstallOptions, previous previousSCMRegistration) error {
+//
+// The results report who created the registration and whether the version matched.
+func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts InstallOptions, previous previousSCMRegistration) (bool, bool, error) {
 	config := buildSCMConfig(opts)
 	handle, err := manager.OpenService(ServiceName)
 	created := false
@@ -353,23 +368,24 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 	case errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST):
 		handle, err = manager.CreateService(ServiceName, opts.Executable, config, RunArgs(opts)...)
 		if err != nil {
-			return fmt.Errorf("service: register %s: %w", ServiceName, err)
+			return false, false, fmt.Errorf("service: register %s: %w", ServiceName, err)
 		}
 		created = true
 		// A first installation replaces nothing: a failed one removes the
 		// registration it created instead of restoring one.
 		previous = previousSCMRegistration{}
 	default:
-		return fmt.Errorf("service: open the registration of %s: %w", ServiceName, err)
+		return false, false, fmt.Errorf("service: open the registration of %s: %w", ServiceName, err)
 	}
 	defer handle.Close()
+	target := scmServiceRecoveryTarget{manager: m, handle: handle}
 
 	if !created {
 		// The configuration of the registration is read before it is
 		// changed, so a failure after the write can put it back as it was.
 		previousConfig, err := handle.Config()
 		if err != nil {
-			return fmt.Errorf("service: read the registration of %s: %w", ServiceName, err)
+			return false, false, fmt.Errorf("service: read the registration of %s: %w", ServiceName, err)
 		}
 		if !previous.present {
 			// The registration appeared between the read-only lookup and
@@ -378,7 +394,7 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 			// restarted.
 			status, err := handle.Query()
 			if err != nil {
-				return scmRefused("an installation", fmt.Errorf("service: query the state of %s: %w", ServiceName, err))
+				return false, false, scmRefused("an installation", fmt.Errorf("service: query the state of %s: %w", ServiceName, err))
 			}
 			previous.present = true
 			previous.running = scmInstanceRan(true, status.State)
@@ -392,7 +408,7 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 		// refuses before it writes the registration, so the instance keeps
 		// running.
 		if err := scmDisabledRunningRefusal(previous.present, previous.running, previousConfig.StartType); err != nil {
-			return err
+			return false, false, err
 		}
 
 		// An administrator may have switched the service to a manual, a
@@ -401,7 +417,7 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 		config = scmConfigWithAutostart(config, previousConfig)
 
 		if err := m.updateRegistrationConfig(handle, config, previous); err != nil {
-			return err
+			return false, false, err
 		}
 		log.Printf("service: %s is installed already, the registration was updated", ServiceName)
 		logEvent(eventLogInfo, fmt.Sprintf("hfdesk: the registration of %s was updated", ServiceName))
@@ -412,29 +428,30 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 	// policy that is registered already is kept, so a reinstall never resets
 	// what the instance or an administrator decided.
 	if err := configureSCMRecovery(handle); err != nil {
-		return m.rollbackInstallation(ctx, handle, previous, scmRollbackRegistration,
+		return created, false, m.rollbackInstallation(ctx, target, previous, scmRollbackRegistration,
 			fmt.Errorf("service: configure the failure recovery of %s: %w", ServiceName, err))
 	}
 
 	if !previous.running {
 		// A first installation and an instance that was not running stay
 		// stopped: starting is an explicit, separate command.
-		return nil
+		return created, false, nil
 	}
 
 	// The instance ran before the installation, so it has to run the new
 	// program afterwards. The graceful stop completes before the new process
 	// is started, so the two instances never compete for the bind address.
-	if err := m.stopService(ctx, handle); err != nil {
-		// The instance could not be stopped. The registration is put back
-		// and the instance is left alone: an installation never fights a
-		// running instance.
-		return m.rollbackInstallation(ctx, handle, previous, scmRollbackRegistration,
+	outcome, err := m.stopService(ctx, target)
+	if err != nil {
+		// Only an undelivered control proves the instance keeps running; an
+		// accepted or unreadable stop may still put it down, so the rollback
+		// settles it instead of leaving the machine without its instance.
+		return created, false, m.rollbackInstallation(ctx, target, previous, scmStopRollbackMode(outcome),
 			fmt.Errorf("service: stop the running instance of %s: %w", ServiceName, err))
 	}
-	check, err := m.startAndVerify(ctx, handle, opts.Executable, previous.processID)
+	check, versionVerified, err := m.startAndVerifyVersion(ctx, handle, opts.Executable, opts.Listen, opts.ExpectedVersion, previous.processID)
 	if err != nil {
-		return m.rollbackInstallation(ctx, handle, previous, scmRollbackRestart,
+		return created, false, m.rollbackInstallation(ctx, target, previous, scmRollbackRestart,
 			fmt.Errorf("service: the installation did not put the new executable into service: %w", err))
 	}
 	if check != scmImageVerified {
@@ -445,8 +462,9 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 		message := fmt.Sprintf("hfdesk: %s runs the registered program %s, the image of the process was not readable from the shell of the installation", ServiceName, opts.Executable)
 		log.Printf("service: %s", message)
 		logEvent(eventLogWarning, message)
+		versionVerified = false
 	}
-	return nil
+	return created, versionVerified, nil
 }
 
 // scmRollbackMode tells a rollback how much of the previous installation to put
@@ -462,7 +480,28 @@ const (
 	// writes the previous registration back and brings the previous program of
 	// a running instance back into service.
 	scmRollbackRestart
+	// scmRollbackStop settles a stop the installation accepted or that may
+	// still put the instance down.
+	scmRollbackStop
+	// scmRollbackUndeliveredStop restores the registration after a stop that
+	// was never delivered. No control reached the instance, so the restore
+	// does not touch the running process.
+	scmRollbackUndeliveredStop
 )
+
+// scmStopRollbackMode returns the rollback a failed stop needs: an accepted or
+// unreadable stop may still put the instance down, while an undelivered control
+// leaves it running behind a registration that has to be restored.
+func scmStopRollbackMode(outcome scmStopOutcome) scmRollbackMode {
+	switch outcome {
+	case scmStopUnsettled:
+		return scmRollbackStop
+	case scmStopNotDelivered:
+		return scmRollbackUndeliveredStop
+	default:
+		return scmRollbackRegistration
+	}
+}
 
 // rollbackInstallation restores the configuration of the registration a failed
 // installation replaced.
@@ -471,18 +510,22 @@ const (
 // reported next to it. The restore is the configuration and not the whole
 // registration: the failure recovery is left as the installation configured it.
 //
-// The running instance is only touched when the installation switched it. The
-// restart rollback stops the instance the failed installation started before
-// the previous registration is written back, so the registration and the
-// process that runs never describe different programs. The restore runs on a
-// context that the caller cannot cancel.
-func (m *scmManager) rollbackInstallation(ctx context.Context, handle *mgr.Service, previous previousSCMRegistration, mode scmRollbackMode, failure error) error {
-	if mode == scmRollbackRestart && previous.present && previous.running {
-		// The installation switched the running instance, so the rollback
-		// has to switch it back.
-		return m.rollbackRestart(ctx, handle, previous, failure)
+// The running instance is only touched when the installation switched it, or
+// when its stop may still put it down; the stop is proven before the restore.
+// A stop that was never delivered is not such a case: the restore does not
+// touch the process, and the previous registration describes it again.
+func (m *scmManager) rollbackInstallation(ctx context.Context, target scmRecoveryTarget, previous previousSCMRegistration, mode scmRollbackMode, failure error) error {
+	if previous.present && previous.running {
+		switch mode {
+		case scmRollbackRestart:
+			return m.rollbackRestart(ctx, target, previous, failure, scmRollbackStartedInstance)
+		case scmRollbackStop:
+			return m.rollbackRestart(ctx, target, previous, failure, scmRollbackPreviousInstance)
+		case scmRollbackUndeliveredStop:
+			return m.rollbackUndeliveredStop(ctx, target, previous, failure)
+		}
 	}
-	if err := restoreSCMRegistration(handle, previous); err != nil {
+	if err := restoreSCMRegistration(target, previous); err != nil {
 		return fmt.Errorf("%w (the registration of the failed installation could not be put back: %v)", failure, err)
 	}
 	if !previous.present {
@@ -493,6 +536,17 @@ func (m *scmManager) rollbackInstallation(ctx context.Context, handle *mgr.Servi
 	return fmt.Errorf("%w (the configuration of the previous registration was restored, the running instance was not restarted; the failure recovery of the registration is not part of the restore)", failure)
 }
 
+type scmRollbackAttempt int
+
+const (
+	scmRollbackStartedInstance scmRollbackAttempt = iota
+	// scmRollbackPreviousInstance is an instance that may still run.
+	scmRollbackPreviousInstance
+	// scmRollbackUndeliveredInstance is the instance the failed installation
+	// replaced, whose stop was never delivered.
+	scmRollbackUndeliveredInstance
+)
+
 // scmRestartRollback is what the restart rollback of a failed installation
 // proved about the machine.
 //
@@ -501,8 +555,8 @@ func (m *scmManager) rollbackInstallation(ctx context.Context, handle *mgr.Servi
 // configuration and the running instance, not the whole registration: the
 // restore leaves the failure recovery in place.
 type scmRestartRollback struct {
-	// stopped reports whether the instance the failed installation started
-	// was proven to be stopped.
+	// attempt names the instance the rollback had to settle.
+	attempt scmRollbackAttempt
 	stopped bool
 	// restored reports whether the configuration of the previous
 	// registration is in place again. The failure recovery is not part of
@@ -514,11 +568,17 @@ type scmRestartRollback struct {
 	// started reports whether the instance was started again and the start
 	// was accepted.
 	started bool
+	// running reports that the state of the instance was read as running
+	// after the restore. A stop that was never delivered leaves it running.
+	running bool
 	// verified reports whether the running process was proven to be the
 	// previous program, in a process that is none of the processes of the
 	// failed attempt.
 	verified bool
 }
+
+// scmStopStatusHint is the next step after a stop that was not settled.
+const scmStopStatusHint = `run "hfdesk service status" to read the state of the service before another start`
 
 // scmRestartRollbackSentence returns the sentence that reports the proven
 // outcome of a restart rollback next to the failure of the installation.
@@ -527,36 +587,65 @@ type scmRestartRollback struct {
 // for a state the rollback did not reach: the claim that the previous instance
 // was started again is made for a verified rollback only, and the sentence of a
 // completed rollback says that the failure recovery stays in place.
+//
+// A stop that was never delivered is reported as the restore it is: the instance
+// was not asked to stop, so the restore needed no stop and the sentence names
+// the running state instead.
 func scmRestartRollbackSentence(facts scmRestartRollback, reason string) string {
+	previousInstance := facts.attempt == scmRollbackPreviousInstance || facts.attempt == scmRollbackUndeliveredInstance
+	if facts.attempt == scmRollbackUndeliveredInstance {
+		switch {
+		case !facts.restored:
+			return fmt.Sprintf("no stop control was delivered to the instance the failed installation replaced, but the configuration of the previous registration could not be put back: %s", reason)
+		case facts.running:
+			return "no stop control was delivered to the instance the failed installation replaced and the configuration of the previous registration was restored; the instance still runs and no instance was started"
+		case !facts.stopped:
+			return fmt.Sprintf("no stop control was delivered to the instance the failed installation replaced and the configuration of the previous registration was restored, but the running state of the instance could not be confirmed, so no instance was started: %s; %s", reason, scmStopStatusHint)
+		}
+	}
 	switch {
 	case !facts.stopped:
-		// The instance of the failed installation was not proven to be
-		// stopped. Its registration is kept: it is the registration that
-		// describes the program of the process that runs, and restoring the
-		// previous one now would leave a registration that names another
-		// program than the one that runs.
-		return fmt.Sprintf("the registration of the failed installation was kept because the instance it started was not proven to be stopped: %s: the previous registration was not restored", reason)
+		// No instance is started: a second one would compete with it.
+		if previousInstance {
+			return fmt.Sprintf("the registration of the failed installation was kept because the instance it replaced was not proven to be stopped: %s: the previous registration was not restored and no instance was started; %s", reason, scmStopStatusHint)
+		}
+		return fmt.Sprintf("the registration of the failed installation was kept because the instance it started was not proven to be stopped: %s: the previous registration was not restored and no instance was started; %s", reason, scmStopStatusHint)
 	case !facts.restored:
+		if previousInstance {
+			return fmt.Sprintf("the previous instance was proven stopped, but the previous registration could not be put back: %s", reason)
+		}
 		return fmt.Sprintf("the instance of the failed installation was stopped, but the previous registration could not be put back: %s", reason)
 	case !facts.programKnown:
 		// The restored registration carries a command line that cannot be
 		// read, so there is no program to start: the rollback reports the
 		// registration and the state of the instance and never claims a
 		// start it did not make.
+		if previousInstance {
+			return fmt.Sprintf("the previous instance was proven stopped and the configuration of the previous registration was restored, but the restored registration names no program, so no instance was started: the instance of %s is stopped", ServiceName)
+		}
 		return fmt.Sprintf("the instance of the failed installation was stopped and the configuration of the previous registration was restored, but the restored registration names no program, so no instance was started: the instance of %s is stopped", ServiceName)
 	case !facts.started:
 		// The start was refused, or it was accepted and the instance never
 		// proved to run the previous program. Neither is a claim about the
 		// program that runs: the reason names what was observed.
+		if previousInstance {
+			return fmt.Sprintf("the previous instance was proven stopped and the configuration of the previous registration was restored, but the previous instance was not proven to be in service again: %s", reason)
+		}
 		return fmt.Sprintf("the instance of the failed installation was stopped and the configuration of the previous registration was restored, but the previous instance was not proven to be in service again: %s", reason)
 	case !facts.verified:
+		if previousInstance {
+			return "the previous instance was proven stopped and the configuration of the previous registration was restored and an instance was started, but the running process was not proven to be the previous program: the image of the process could not be read"
+		}
 		return "the instance of the failed installation was stopped and the configuration of the previous registration was restored and an instance was started, but the running process was not proven to be the previous program: the image of the process could not be read"
 	default:
+		if previousInstance {
+			return "the previous instance was proven stopped, the configuration of the previous registration was restored and the previous instance was started again; the failure recovery of the registration was not part of the restore and stays as the installation left it"
+		}
 		return "the instance of the failed installation was stopped, the configuration of the previous registration was restored and the previous instance was started again; the failure recovery of the registration was not part of the restore and stays as the installation left it"
 	}
 }
 
-// rollbackRestart stops the instance of the failed installation, restores the
+// rollbackRestart stops the instance the rollback has to remove, restores the
 // previous registration and brings the previous instance back into service.
 //
 // The instance is stopped before the previous registration is written back,
@@ -568,11 +657,11 @@ func scmRestartRollbackSentence(facts scmRestartRollback, reason string) string 
 // installation left it, and the sentence says exactly that. The previous
 // program is started again only when the restored registration names it, and
 // the restart is reported as a success only when it was verified.
-func (m *scmManager) rollbackRestart(ctx context.Context, handle *mgr.Service, previous previousSCMRegistration, failure error) error {
+func (m *scmManager) rollbackRestart(ctx context.Context, target scmRecoveryTarget, previous previousSCMRegistration, failure error, attempt scmRollbackAttempt) error {
 	// The caller may have cancelled the context, the machine still has to be
 	// put back the way it was.
 	cleanup := context.WithoutCancel(ctx)
-	facts := scmRestartRollback{}
+	facts := scmRestartRollback{attempt: attempt}
 	report := func(reason string) error {
 		return fmt.Errorf("%w (%s)", failure, scmRestartRollbackSentence(facts, reason))
 	}
@@ -580,31 +669,108 @@ func (m *scmManager) rollbackRestart(ctx context.Context, handle *mgr.Service, p
 	// The process of the failed attempt is read before it is stopped: the
 	// verification below excludes it, so a process the rollback did not start
 	// is never taken for the previous instance.
-	failedProcessID := scmRunningProcessID(handle)
+	failedProcessID := scmRunningProcessID(target)
 
-	if err := m.stopService(cleanup, handle); err != nil {
+	if _, err := m.stopService(cleanup, target); err != nil {
 		return report(err.Error())
 	}
 	facts.stopped = true
 
-	if err := restoreSCMRegistration(handle, previous); err != nil {
+	if err := restoreSCMConfig(target, previous); err != nil {
+		return report(err.Error())
+	}
+	facts.restored = true
+	return startPreviousProgram(cleanup, target, previous, &facts, report, previous.processID, failedProcessID)
+}
+
+// rollbackUndeliveredStop restores the registration after a stop that was never
+// delivered and brings the previous instance back into service only when its
+// state proved it stopped.
+//
+// No stop control reached the instance, so it was never asked to stop: writing
+// the previous configuration back does not touch the process, and the restored
+// registration names the program it was started from again. The state is read
+// after the restore: a running instance needs nothing more, a settled stopped
+// one is started and verified, and an unreadable or unsettled state is reported
+// without a start.
+func (m *scmManager) rollbackUndeliveredStop(ctx context.Context, target scmRecoveryTarget, previous previousSCMRegistration, failure error) error {
+	// The machine still has to be put back after the caller cancelled.
+	cleanup := context.WithoutCancel(ctx)
+	facts := scmRestartRollback{attempt: scmRollbackUndeliveredInstance}
+	report := func(reason string) error {
+		return fmt.Errorf("%w (%s)", failure, scmRestartRollbackSentence(facts, reason))
+	}
+
+	if err := restoreSCMConfig(target, previous); err != nil {
 		return report(err.Error())
 	}
 	facts.restored = true
 
+	status, err := target.Query()
+	if err != nil {
+		return report(err.Error())
+	}
+	switch status.State {
+	case svc.Running:
+		facts.running = true
+		return report("")
+	case svc.Stopped:
+		facts.stopped = true
+	default:
+		return report(fmt.Sprintf("the state of the instance was %v", status.State))
+	}
+	return startPreviousProgram(cleanup, target, previous, &facts, report, previous.processID)
+}
+
+// startPreviousProgram starts the program of the restored registration and
+// records what the start proved. A registration that names no program has
+// nothing to start; the caller's report says that.
+func startPreviousProgram(ctx context.Context, target scmRecoveryTarget, previous previousSCMRegistration, facts *scmRestartRollback, report func(string) error, exclude ...uint32) error {
 	executable := scmConfigExecutable(previous.config)
 	if executable == "" {
 		return report("")
 	}
 	facts.programKnown = true
-
-	check, err := m.startAndVerify(cleanup, handle, executable, previous.processID, failedProcessID)
+	check, err := target.StartAndVerify(ctx, executable, exclude...)
 	if err != nil {
 		return report(err.Error())
 	}
 	facts.started = true
 	facts.verified = check == scmImageVerified
 	return report("")
+}
+
+// scmRecoveryTarget is the registration a failed installation restores. The
+// interface lets the recovery run without a real registration.
+type scmRecoveryTarget interface {
+	scmServiceControl
+	scmConfiguration
+	Delete() error
+	StartAndVerify(ctx context.Context, executable string, exclude ...uint32) (scmImageCheck, error)
+}
+
+// scmServiceRecoveryTarget is the recovery target of a real registration.
+type scmServiceRecoveryTarget struct {
+	manager *scmManager
+	handle  *mgr.Service
+}
+
+func (t scmServiceRecoveryTarget) Query() (svc.Status, error) { return t.handle.Query() }
+
+func (t scmServiceRecoveryTarget) Control(cmd svc.Cmd) (svc.Status, error) {
+	return t.handle.Control(cmd)
+}
+
+func (t scmServiceRecoveryTarget) UpdateConfig(config mgr.Config) error {
+	return t.handle.UpdateConfig(config)
+}
+
+func (t scmServiceRecoveryTarget) Config() (mgr.Config, error) { return t.handle.Config() }
+
+func (t scmServiceRecoveryTarget) Delete() error { return t.handle.Delete() }
+
+func (t scmServiceRecoveryTarget) StartAndVerify(ctx context.Context, executable string, exclude ...uint32) (scmImageCheck, error) {
+	return t.manager.startAndVerify(ctx, t.handle, executable, exclude...)
 }
 
 // scmRunningProcessID returns the process of the running instance, zero when the
@@ -614,7 +780,7 @@ func (m *scmManager) rollbackRestart(ctx context.Context, handle *mgr.Service, p
 // installation, so the verification of the restart can tell it apart from the
 // instance the rollback starts. A state that cannot be read names no process
 // either: the stop that follows reports the refusal.
-func scmRunningProcessID(handle *mgr.Service) uint32 {
+func scmRunningProcessID(handle scmServiceControl) uint32 {
 	status, err := handle.Query()
 	if err != nil {
 		return 0
@@ -681,14 +847,14 @@ func failedUpdateRestore(registration scmConfiguration, previous previousSCMRegi
 // written back, which proves the command line and thus the program of the
 // instance. The write back leaves the failure recovery as the installation
 // configured it.
-func restoreSCMRegistration(handle *mgr.Service, previous previousSCMRegistration) error {
+func restoreSCMRegistration(target scmRecoveryTarget, previous previousSCMRegistration) error {
 	if !previous.present {
-		if err := handle.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+		if err := target.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
 			return fmt.Errorf("service: remove the registration of %s: %w", ServiceName, err)
 		}
 		return nil
 	}
-	return restoreSCMConfig(handle, previous)
+	return restoreSCMConfig(target, previous)
 }
 
 // restoreSCMConfig writes the configuration of the previous registration back
@@ -818,10 +984,16 @@ const (
 // startAndVerify starts the instance and verifies that it runs the given
 // program in a process that is not one of the excluded ones.
 func (m *scmManager) startAndVerify(ctx context.Context, handle *mgr.Service, executable string, exclude ...uint32) (scmImageCheck, error) {
+	check, _, err := m.startAndVerifyVersion(ctx, handle, executable, "", "", exclude...)
+	return check, err
+}
+
+// startAndVerifyVersion also verifies the version the health endpoint reports.
+func (m *scmManager) startAndVerifyVersion(ctx context.Context, handle *mgr.Service, executable, listen, expectedVersion string, exclude ...uint32) (scmImageCheck, bool, error) {
 	if err := handle.Start(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
-		return scmImageUnverified, scmRefused("a start", fmt.Errorf("service: start %s: %w", ServiceName, err))
+		return scmImageUnverified, false, scmRefused("a start", fmt.Errorf("service: start %s: %w", ServiceName, err))
 	}
-	return m.verifyRunningExecutable(ctx, handle, executable, exclude...)
+	return m.verifyRunningExecutableVersion(ctx, handle, executable, listen, expectedVersion, exclude...)
 }
 
 // verifyRunningExecutable waits until the instance runs the given program in a
@@ -832,6 +1004,12 @@ func (m *scmManager) startAndVerify(ctx context.Context, handle *mgr.Service, ex
 // program proves nothing while a process of the failed attempt still runs. The
 // wait is bounded by the verification budget and the context.
 func (m *scmManager) verifyRunningExecutable(ctx context.Context, handle *mgr.Service, executable string, exclude ...uint32) (scmImageCheck, error) {
+	check, _, err := m.verifyRunningExecutableVersion(ctx, handle, executable, "", "", exclude...)
+	return check, err
+}
+
+// verifyRunningExecutableVersion also waits for the expected version.
+func (m *scmManager) verifyRunningExecutableVersion(ctx context.Context, handle *mgr.Service, executable, listen, expectedVersion string, exclude ...uint32) (scmImageCheck, bool, error) {
 	deadline := time.Now().Add(scmVerifyTimeout)
 	detail := "the service control manager did not report the instance as running"
 	for {
@@ -850,19 +1028,36 @@ func (m *scmManager) verifyRunningExecutable(ctx context.Context, handle *mgr.Se
 		default:
 			settled, check, reason := scmReadRunningImage(handle, status.ProcessId, executable)
 			if settled {
-				return check, nil
+				if check != scmImageVerified || expectedVersion == "" {
+					return check, false, nil
+				}
+				verified, probeErr := serviceInstallProbe(listen, expectedVersion)
+				if probeErr == nil {
+					return check, verified, nil
+				}
+				if errors.Is(probeErr, errServiceVersionMismatch) {
+					return check, false, fmt.Errorf("the instance does not run the expected version: %w", probeErr)
+				}
+				detail = fmt.Sprintf("the instance does not answer on %s: %v", probeAddressOrListen(listen), probeErr)
 			}
 			detail = reason
 		}
 		if !time.Now().Before(deadline) {
-			return scmImageUnverified, fmt.Errorf("the instance does not run %q within %s: %s", executable, scmVerifyTimeout, detail)
+			return scmImageUnverified, false, fmt.Errorf("the instance does not run %q within %s: %s", executable, scmVerifyTimeout, detail)
 		}
 		select {
 		case <-ctx.Done():
-			return scmImageUnverified, ctx.Err()
+			return scmImageUnverified, false, ctx.Err()
 		case <-time.After(scmVerifyPollInterval):
 		}
 	}
+}
+
+func probeAddressOrListen(listen string) string {
+	if listen == "" {
+		return "the instance"
+	}
+	return probeServiceAddress(listen)
 }
 
 // scmProcessExcluded reports whether a process is one the verification must not
@@ -1260,7 +1455,7 @@ func (m *scmManager) uninstall(ctx context.Context, state scmRegistrationState, 
 	// A running instance is stopped before the registration is removed:
 	// the service control manager refuses to delete a service that is
 	// still running.
-	if err := m.stopService(ctx, handle); err != nil {
+	if _, err := m.stopService(ctx, handle); err != nil {
 		return err
 	}
 	if err := handle.Delete(); err != nil {
@@ -1317,7 +1512,8 @@ func (m *scmManager) Stop(ctx context.Context) error {
 	defer manager.Disconnect()
 	defer handle.Close()
 
-	return m.stopService(ctx, handle)
+	_, err = m.stopService(ctx, handle)
+	return err
 }
 
 // Restart stops and starts the registered instance.
@@ -1336,7 +1532,7 @@ func (m *scmManager) Restart(ctx context.Context) error {
 	defer manager.Disconnect()
 	defer handle.Close()
 
-	if err := m.stopService(ctx, handle); err != nil {
+	if _, err := m.stopService(ctx, handle); err != nil {
 		return err
 	}
 	if err := handle.Start(); err != nil {
@@ -1774,6 +1970,18 @@ type scmServiceControl interface {
 	Control(c svc.Cmd) (svc.Status, error)
 }
 
+// scmStopOutcome tells what a failed stop proved.
+type scmStopOutcome int
+
+const (
+	scmStopSettled scmStopOutcome = iota
+	// scmStopNotDelivered reports a stop no control reached: the instance was
+	// never asked to stop.
+	scmStopNotDelivered
+	// scmStopUnsettled reports a stop that may still put the instance down.
+	scmStopUnsettled
+)
+
 // stopService stops the instance and waits for the graceful shutdown to
 // finish.
 //
@@ -1790,17 +1998,29 @@ type scmServiceControl interface {
 //
 // The wait is bounded by the shared budget of the service layer, so the
 // outcome is the same on every machine: the instance stopped, or the wait
-// is over and the instance is still running.
-func (m *scmManager) stopService(ctx context.Context, handle scmServiceControl) error {
-	deadline := time.Now().Add(scmStopTimeout)
+// is over and the instance is still running. A failure distinguishes a control
+// that was never delivered from one that may still stop the instance: a state
+// that cannot be read before any control was accepted proves no delivery.
+func (m *scmManager) stopService(ctx context.Context, handle scmServiceControl) (scmStopOutcome, error) {
+	deadline := time.Now().Add(scmStopBudget)
 	delivered := false
+	stopping := false
 	for {
 		status, err := handle.Query()
 		if err != nil {
-			return scmRefused("a stop", fmt.Errorf("service: query the state of %s: %w", ServiceName, err))
+			// An accepted control, or an instance that was seen stopping, may
+			// still put the instance down. Before that the error proves no
+			// stop was requested.
+			if delivered || stopping {
+				return scmStopUnsettled, scmRefused("a stop", fmt.Errorf("service: query the state of %s: %w", ServiceName, err))
+			}
+			return scmStopNotDelivered, scmRefused("a stop", fmt.Errorf("service: query the state of %s: %w", ServiceName, err))
+		}
+		if status.State == svc.StopPending {
+			stopping = true
 		}
 		if status.State == svc.Stopped {
-			return nil
+			return scmStopSettled, nil
 		}
 		if !delivered {
 			if _, err := handle.Control(svc.Stop); err != nil {
@@ -1808,15 +2028,15 @@ func (m *scmManager) stopService(ctx context.Context, handle scmServiceControl) 
 				case errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE):
 					// The instance is not running: the wanted state
 					// already holds.
-					return nil
+					return scmStopSettled, nil
 				case errors.Is(err, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL):
-					// The instance is still starting and the
-					// supervisor refuses the control. The
-					// control is delivered again inside the
-					// wait.
-					log.Printf("service: %s is still starting (the state of the instance is %v), the stop request is delivered again", ServiceName, status.State)
+					// The control is delivered again inside the wait.
+					log.Printf("service: %s does not accept a stop control (the state of the instance is %v), the stop request is delivered again", ServiceName, status.State)
 				default:
-					return scmRefused("a stop", fmt.Errorf("service: stop %s: %w", ServiceName, err))
+					if status.State == svc.StopPending {
+						return scmStopUnsettled, scmRefused("a stop", fmt.Errorf("service: stop %s: %w", ServiceName, err))
+					}
+					return scmStopNotDelivered, scmRefused("a stop", fmt.Errorf("service: stop %s: %w", ServiceName, err))
 				}
 			} else {
 				// The supervisor accepted the control: the instance
@@ -1825,11 +2045,17 @@ func (m *scmManager) stopService(ctx context.Context, handle scmServiceControl) 
 			}
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("service: %s did not stop within %s (the state of the instance was %v)", ServiceName, scmStopTimeout, status.State)
+			if delivered || status.State == svc.StopPending {
+				return scmStopUnsettled, fmt.Errorf("service: %s did not stop within %s (the state of the instance was %v)", ServiceName, scmStopBudget, status.State)
+			}
+			return scmStopNotDelivered, fmt.Errorf("service: %s did not stop within %s (the state of the instance was %v)", ServiceName, scmStopBudget, status.State)
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			if delivered || status.State == svc.StopPending {
+				return scmStopUnsettled, ctx.Err()
+			}
+			return scmStopNotDelivered, ctx.Err()
 		case <-time.After(scmStopPollInterval):
 		}
 	}
@@ -1912,6 +2138,154 @@ func scmProcessMachine(arch string) (machine uint16, known bool) {
 		return pe.MachineARM64, true
 	default:
 		return 0, false
+	}
+}
+
+// scmExecutableAccess is what the access check of the registered program proved.
+type scmExecutableAccess int
+
+const (
+	scmExecutableAccessInconclusive scmExecutableAccess = iota
+	scmExecutableAccessAllowed
+	scmExecutableAccessDenied
+)
+
+var scmCheckExecutableAccess = scmExecutableAccessOf
+
+// preflightExecutableAccess refuses a program the account cannot read and
+// execute, and a parent it cannot traverse. An unreadable descriptor is not a
+// denial: the installation reports that it could not check.
+func preflightExecutableAccess(executable string) error {
+	access, reason := scmCheckExecutableAccess(executable)
+	switch access {
+	case scmExecutableAccessDenied:
+		return fmt.Errorf("service: executable %q is not usable by the account the instance runs as (%s): %s: grant the account read and execute access to the program and traverse access to the directories above it, or choose a program the account can use", executable, scmServiceIdentityName, reason)
+	case scmExecutableAccessInconclusive:
+		log.Printf("service: the access rights of the executable %q cannot be read (%s): the installation cannot tell whether %s can execute it", executable, reason, scmServiceIdentityName)
+	}
+	return nil
+}
+
+func scmExecutableAccessOf(executable string) (scmExecutableAccess, string) {
+	identity := scmServiceIdentity()
+	resolved, err := scmResolvePath(executable)
+	if err != nil {
+		return scmExecutableAccessInconclusive, fmt.Sprintf("the real location of the program cannot be read: %v", err)
+	}
+	sddl, err := scmReadServiceAccess(resolved)
+	if err != nil {
+		return scmExecutableAccessInconclusive, fmt.Sprintf("the access control list of the program cannot be read: %v", err)
+	}
+	if err := sddlGrantsExecutable(sddl, identity); err != nil {
+		return scmExecutableAccessDenied, err.Error()
+	}
+	for _, dir := range scmParentDirs(resolved) {
+		sddl, err := scmReadServiceAccess(dir)
+		if err != nil {
+			return scmExecutableAccessInconclusive, fmt.Sprintf("the access control list of %q cannot be read: %v", dir, err)
+		}
+		if err := sddlGrantsTraverse(sddl, identity); err != nil {
+			return scmExecutableAccessDenied, fmt.Sprintf("%q: %v", dir, err)
+		}
+	}
+	return scmExecutableAccessAllowed, ""
+}
+
+// scmParentDirs returns the directories above a path, the immediate parent first.
+func scmParentDirs(path string) []string {
+	var dirs []string
+	current := filepath.Dir(filepath.Clean(path))
+	for {
+		dirs = append(dirs, current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			return dirs
+		}
+		current = parent
+	}
+}
+
+const (
+	scmAccessRead uint32 = 1 << iota
+	scmAccessExecute
+)
+
+func sddlGrantsExecutable(sddl string, identity scmIdentitySIDs) error {
+	return sddlGrantsAccess(sddl, identity, scmAccessRead|scmAccessExecute, sddlMaskExecutableRights)
+}
+
+func sddlGrantsTraverse(sddl string, identity scmIdentitySIDs) error {
+	return sddlGrantsAccess(sddl, identity, scmAccessExecute, sddlMaskExecuteRights)
+}
+
+func sddlGrantsAccess(sddl string, identity scmIdentitySIDs, needed uint32, mask func(uint32) uint32) error {
+	if strings.Contains(strings.ToUpper(sddl), "NO_ACCESS_CONTROL") {
+		// A NULL DACL grants every account full access.
+		return nil
+	}
+	var (
+		allowed bool
+		granted uint32
+	)
+	for _, ace := range parseSDDLAces(sddl) {
+		if ace.inheritOnly() {
+			continue
+		}
+		if !ace.coversIdentity(identity) {
+			continue
+		}
+		switch ace.kind {
+		case "D", "OD":
+			denied := mask(ace.rights) & needed
+			if denied == 0 {
+				continue
+			}
+			return fmt.Errorf("the access control list denies the account %s the %s%s", scmServiceIdentityName, sddlAccessName(denied), identity.note())
+		case "A", "OA":
+			allowed = true
+			granted |= mask(ace.rights)
+		}
+	}
+	switch {
+	case !allowed:
+		return fmt.Errorf("the access control list grants the account %s no access%s", scmServiceIdentityName, identity.note())
+	case granted&needed != needed:
+		return fmt.Errorf("the access control list grants the account %s no %s%s", scmServiceIdentityName, sddlAccessName(needed&^granted), identity.note())
+	}
+	return nil
+}
+
+func sddlMaskExecutableRights(mask uint32) uint32 {
+	if mask&windows.GENERIC_ALL != 0 {
+		return scmAccessRead | scmAccessExecute
+	}
+	var rights uint32
+	if mask&(windows.GENERIC_READ|windows.FILE_READ_DATA) != 0 {
+		rights |= scmAccessRead
+	}
+	if mask&(windows.GENERIC_EXECUTE|windows.FILE_EXECUTE) != 0 {
+		rights |= scmAccessExecute
+	}
+	return rights
+}
+
+func sddlMaskExecuteRights(mask uint32) uint32 {
+	if mask&(windows.GENERIC_ALL|windows.GENERIC_EXECUTE|windows.FILE_EXECUTE) != 0 {
+		return scmAccessExecute
+	}
+	return 0
+}
+
+func sddlAccessName(rights uint32) string {
+	switch {
+	case rights&scmAccessRead != 0 && rights&scmAccessExecute != 0:
+		return "read and execute access"
+	case rights&scmAccessRead != 0:
+		return "read access"
+	case rights&scmAccessExecute != 0:
+		return "execute access"
+	default:
+		return "access"
 	}
 }
 

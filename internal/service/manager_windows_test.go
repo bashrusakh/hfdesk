@@ -604,12 +604,42 @@ type scmTestServiceControl struct {
 	// refusals is the number of times the registration refuses the stop
 	// control.
 	refusals int
-	// controls counts the delivered stop controls.
+	// controls counts the stop controls the registration received.
 	controls int
+	// queryErr is the failure of every read of the state.
+	queryErr error
+	// queryErrs are the failures of the next reads, in order; a read after
+	// them answers. They take precedence over queryErr.
+	queryErrs []error
+	// queryAfterControlErr is the failure of a read after a stop control was
+	// delivered.
+	queryAfterControlErr error
+	// controlErr is the failure of the stop control.
+	controlErr error
+	// pendingAfterControl reports whether an accepted control leaves the
+	// instance in the stopping state instead of stopping it.
+	pendingAfterControl bool
+	// stateAfterControl is the state an accepted control leaves, when set.
+	stateAfterControl svc.State
+	// onControl is called after a control request was sent.
+	onControl func()
 }
 
 // Query returns the state of the registration.
 func (c *scmTestServiceControl) Query() (svc.Status, error) {
+	if len(c.queryErrs) > 0 {
+		err := c.queryErrs[0]
+		c.queryErrs = c.queryErrs[1:]
+		if err != nil {
+			return svc.Status{State: c.state}, err
+		}
+	}
+	if c.queryErr != nil {
+		return svc.Status{State: c.state}, c.queryErr
+	}
+	if c.controls > 0 && c.queryAfterControlErr != nil {
+		return svc.Status{State: c.state}, c.queryAfterControlErr
+	}
 	return svc.Status{State: c.state}, nil
 }
 
@@ -617,12 +647,27 @@ func (c *scmTestServiceControl) Query() (svc.Status, error) {
 //
 // The control is refused while the registration has refusals left: the
 // instance is still starting then. The control that is accepted stops the
-// instance.
+// instance, unless the test asks for an instance that stays in the stopping
+// state.
 func (c *scmTestServiceControl) Control(cmd svc.Cmd) (svc.Status, error) {
 	c.controls++
+	if c.onControl != nil {
+		c.onControl()
+	}
+	if c.controlErr != nil {
+		return svc.Status{State: c.state}, c.controlErr
+	}
 	if c.refusals > 0 {
 		c.refusals--
 		return svc.Status{State: c.state}, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL
+	}
+	if c.stateAfterControl != 0 {
+		c.state = c.stateAfterControl
+		return svc.Status{State: c.state}, nil
+	}
+	if c.pendingAfterControl {
+		c.state = svc.StopPending
+		return svc.Status{State: c.state}, nil
 	}
 	c.state = svc.Stopped
 	return svc.Status{State: svc.Stopped}, nil
@@ -640,7 +685,7 @@ func TestSCMStopRetriesTheControlOfAnInstanceThatIsStillStarting(t *testing.T) {
 	handle := &scmTestServiceControl{state: svc.StartPending, refusals: 2}
 
 	manager := &scmManager{scope: ScopeSystem}
-	if err := manager.stopService(context.Background(), handle); err != nil {
+	if _, err := manager.stopService(context.Background(), handle); err != nil {
 		t.Fatalf("stopService() = %v, want nil: the refusal of a starting instance is not the end of the stop", err)
 	}
 	if handle.controls < 3 {
@@ -648,6 +693,295 @@ func TestSCMStopRetriesTheControlOfAnInstanceThatIsStillStarting(t *testing.T) {
 	}
 	if handle.state != svc.Stopped {
 		t.Errorf("the state of the instance = %v, want %v", handle.state, svc.Stopped)
+	}
+}
+
+// shortenSCMStopBudget shortens the wait of a stop that never settles.
+func shortenSCMStopBudget(t *testing.T, budget time.Duration) {
+	t.Helper()
+	previous := scmStopBudget
+	scmStopBudget = budget
+	t.Cleanup(func() { scmStopBudget = previous })
+}
+
+// scmTestRunningPrevious returns the registration an installation replaces: an
+// instance that ran before the installation and carries the previous program.
+func scmTestRunningPrevious() previousSCMRegistration {
+	opts := scmTestOptions()
+	return previousSCMRegistration{
+		present:   true,
+		running:   true,
+		processID: 4710,
+		config:    mgr.Config{BinaryPathName: scmCommandLine(opts)},
+		options:   opts,
+	}
+}
+
+// scmTestRecoveryTarget is a registration a failed installation restores. It
+// implements the recovery target without a real registration, which a test
+// cannot create without an elevated shell.
+type scmTestRecoveryTarget struct {
+	scmTestServiceControl
+	// config is the configuration the registration holds.
+	config mgr.Config
+	// writes are the configurations written back, in order.
+	writes []mgr.Config
+	// deletes is the number of removals.
+	deletes int
+	// starts is the number of starts of the previous program.
+	starts int
+	// started is the program the rollback started.
+	started string
+	// excluded are the processes the start verification had to exclude.
+	excluded []uint32
+}
+
+// UpdateConfig records the configuration written back.
+func (t *scmTestRecoveryTarget) UpdateConfig(config mgr.Config) error {
+	t.writes = append(t.writes, config)
+	t.config = config
+	return nil
+}
+
+// Config returns the configuration the registration holds.
+func (t *scmTestRecoveryTarget) Config() (mgr.Config, error) { return t.config, nil }
+
+// Delete records the removal of the registration.
+func (t *scmTestRecoveryTarget) Delete() error {
+	t.deletes++
+	return nil
+}
+
+// StartAndVerify records the start of the previous program.
+func (t *scmTestRecoveryTarget) StartAndVerify(_ context.Context, executable string, exclude ...uint32) (scmImageCheck, error) {
+	t.starts++
+	t.started = executable
+	t.excluded = append([]uint32(nil), exclude...)
+	return scmImageVerified, nil
+}
+
+// TestSCMStopThatDoesNotSettleIsNotReportedAsRunning checks that an accepted stop
+// is never reported as a running instance: the delivered control decides the
+// outcome, not a later read of the state.
+func TestSCMStopThatDoesNotSettleIsNotReportedAsRunning(t *testing.T) {
+	cases := []struct {
+		name    string
+		prepare func(t *testing.T, handle *scmTestServiceControl) context.Context
+		wantErr string
+	}{
+		{"cancellation", func(t *testing.T, handle *scmTestServiceControl) context.Context {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			handle.onControl = cancel
+			return ctx
+		}, ""},
+		{"query error", func(t *testing.T, handle *scmTestServiceControl) context.Context {
+			handle.queryAfterControlErr = errors.New("the service control manager did not answer")
+			return context.Background()
+		}, "did not answer"},
+		{"timeout", func(t *testing.T, handle *scmTestServiceControl) context.Context {
+			shortenSCMStopBudget(t, 10*time.Millisecond)
+			return context.Background()
+		}, "did not stop within"},
+		// The accepted control decides the classification, even when a later
+		// read still reports the running state.
+		{"running read after the control", func(t *testing.T, handle *scmTestServiceControl) context.Context {
+			shortenSCMStopBudget(t, 10*time.Millisecond)
+			handle.stateAfterControl = svc.Running
+			return context.Background()
+		}, "did not stop within"},
+		{"already stopping", func(t *testing.T, handle *scmTestServiceControl) context.Context {
+			shortenSCMStopBudget(t, 10*time.Millisecond)
+			handle.state = svc.StopPending
+			handle.refusals = 100
+			return context.Background()
+		}, "did not stop within"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handle := &scmTestServiceControl{state: svc.Running, pendingAfterControl: true}
+			outcome, err := (&scmManager{scope: ScopeSystem}).stopService(tc.prepare(t, handle), handle)
+			if outcome != scmStopUnsettled {
+				t.Errorf("the outcome = %d, want the unsettled stop", outcome)
+			}
+			switch {
+			case err == nil:
+				t.Fatal("stopService() = nil, want a failed stop")
+			case tc.wantErr == "" && !errors.Is(err, context.Canceled):
+				t.Errorf("stopService() = %v, want the cancellation of the wait", err)
+			case tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr):
+				t.Errorf("stopService() = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestSCMRollbackSettlesTheStopItInherits checks the rollback of a failed stop: a
+// control that was never delivered restores the registration and starts the
+// previous instance again only when the state proved it stopped, while a stop
+// that may still put the instance down keeps the registration and starts
+// nothing.
+func TestSCMRollbackSettlesTheStopItInherits(t *testing.T) {
+	shortenSCMStopBudget(t, 10*time.Millisecond)
+	readErr := errors.New("the service control manager did not answer")
+	cases := []struct {
+		name        string
+		mode        scmRollbackMode
+		controlErr  error
+		queryErr    error
+		queryErrs   []error
+		state       svc.State
+		settle      bool
+		wantOutcome scmStopOutcome
+		wantWrites  int
+		wantStarts  int
+		wantReports []string
+	}{
+		{
+			name:        "a control that was never delivered",
+			controlErr:  errors.New("the service control manager refused the stop"),
+			wantOutcome: scmStopNotDelivered,
+			wantWrites:  1,
+			wantReports: []string{"the configuration of the previous registration was restored", "the instance still runs", "no instance was started"},
+		},
+		{
+			name:        "the previous instance then stops",
+			settle:      true,
+			wantOutcome: scmStopUnsettled,
+			wantWrites:  1,
+			wantStarts:  1,
+			wantReports: []string{"the previous instance was proven stopped", scmRollbackSuccessClaim},
+		},
+		{
+			name:        "a stop that stays pending",
+			wantOutcome: scmStopUnsettled,
+			wantReports: []string{"was not proven to be stopped", "no instance was started", "hfdesk service status", "did not stop within"},
+		},
+		{
+			name:        "a state that cannot be read",
+			queryErr:    readErr,
+			wantOutcome: scmStopNotDelivered,
+			wantWrites:  1,
+			wantReports: []string{"the configuration of the previous registration was restored", "the running state of the instance could not be confirmed", "no instance was started", "hfdesk service status", "did not answer"},
+		},
+		{
+			name:        "a state that cannot be read first and then reads as running",
+			queryErrs:   []error{readErr},
+			wantOutcome: scmStopNotDelivered,
+			wantWrites:  1,
+			wantReports: []string{"the configuration of the previous registration was restored", "the instance still runs", "no instance was started"},
+		},
+		{
+			name:        "a state that cannot be read first and then reads as stopped",
+			queryErrs:   []error{readErr},
+			state:       svc.Stopped,
+			wantOutcome: scmStopNotDelivered,
+			wantWrites:  1,
+			wantStarts:  1,
+			wantReports: []string{"the previous instance was proven stopped", "the configuration of the previous registration was restored", scmRollbackSuccessClaim},
+		},
+		{
+			name:        "a state that cannot be read first and then stays stopping",
+			queryErrs:   []error{readErr},
+			state:       svc.StopPending,
+			wantOutcome: scmStopNotDelivered,
+			wantWrites:  1,
+			wantReports: []string{"the configuration of the previous registration was restored", "the running state of the instance could not be confirmed", "no instance was started", "hfdesk service status"},
+		},
+		{
+			name:        "the instance of a failed start",
+			mode:        scmRollbackRestart,
+			wantOutcome: scmStopUnsettled,
+			wantReports: []string{"the instance it started was not proven to be stopped"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := &scmTestRecoveryTarget{}
+			target.state = svc.Running
+			target.pendingAfterControl = true
+			target.controlErr = tc.controlErr
+			target.queryErr = tc.queryErr
+			target.queryErrs = tc.queryErrs
+			if tc.state != 0 {
+				target.state = tc.state
+			}
+			manager := &scmManager{scope: ScopeSystem}
+			previous := scmTestRunningPrevious()
+			failure := errors.New("the stop did not settle")
+
+			outcome, err := manager.stopService(context.Background(), target)
+			if err == nil {
+				t.Fatal("stopService() = nil, want a failed stop")
+			}
+			if outcome != tc.wantOutcome {
+				t.Errorf("stopService() outcome = %d, want %d", outcome, tc.wantOutcome)
+			}
+			mode := tc.mode
+			if mode == scmRollbackRegistration {
+				mode = scmStopRollbackMode(outcome)
+			}
+			if tc.settle {
+				// The accepted control reaches the stopped state after the
+				// failed call returned, and the supervisor answers again.
+				target.state = svc.Stopped
+				target.queryAfterControlErr = nil
+			}
+			controlsBeforeRollback := target.controls
+			rollbackErr := manager.rollbackInstallation(context.Background(), target, previous, mode, failure)
+			if rollbackErr == nil || !errors.Is(rollbackErr, failure) {
+				t.Fatalf("rollbackInstallation() = %v, want the original failure wrapped", rollbackErr)
+			}
+			if outcome == scmStopNotDelivered && target.controls != controlsBeforeRollback {
+				t.Errorf("the rollback delivered %d stop controls after a stop that was never delivered, want none", target.controls-controlsBeforeRollback)
+			}
+			if len(target.writes) != tc.wantWrites {
+				t.Errorf("the rollback wrote %d configurations, want %d", len(target.writes), tc.wantWrites)
+			}
+			for _, write := range target.writes {
+				if !scmSameRegistration(write.BinaryPathName, previous.config.BinaryPathName) {
+					t.Errorf("the rollback wrote %q, want the previous command line %q", write.BinaryPathName, previous.config.BinaryPathName)
+				}
+			}
+			if target.starts != tc.wantStarts || target.deletes != 0 {
+				t.Errorf("the rollback started %d instances and removed %d registrations, want %d starts and no removal",
+					target.starts, target.deletes, tc.wantStarts)
+			}
+			if tc.wantStarts == 1 && (!slices.Contains(target.excluded, previous.processID) ||
+				target.started != scmTestOptions().Executable) {
+				t.Errorf("the rollback started %q excluding %v, want the previous program without the process %d",
+					target.started, target.excluded, previous.processID)
+			}
+			for _, want := range tc.wantReports {
+				if !strings.Contains(rollbackErr.Error(), want) {
+					t.Errorf("the report %q does not mention %q", rollbackErr, want)
+				}
+			}
+		})
+	}
+}
+
+// TestSCMRollbackOfAFailureOutsideTheInstanceRestoresTheRegistration checks that
+// a failure that never touched the running instance puts the previous
+// configuration back and leaves the instance alone.
+func TestSCMRollbackOfAFailureOutsideTheInstanceRestoresTheRegistration(t *testing.T) {
+	target := &scmTestRecoveryTarget{}
+	target.state = svc.Running
+	previous := scmTestRunningPrevious()
+	failure := errors.New("the failure recovery could not be configured")
+
+	err := (&scmManager{scope: ScopeSystem}).rollbackInstallation(context.Background(), target, previous, scmRollbackRegistration, failure)
+	if err == nil || !errors.Is(err, failure) {
+		t.Fatalf("rollbackInstallation() = %v, want the original failure wrapped", err)
+	}
+	if len(target.writes) != 1 || target.starts != 0 || target.controls != 0 || target.deletes != 0 {
+		t.Errorf("the rollback wrote %d configurations, started %d instances, delivered %d controls and removed %d registrations, want one write and no other change",
+			len(target.writes), target.starts, target.controls, target.deletes)
+	}
+	for _, want := range []string{"the configuration of the previous registration was restored", "the running instance was not restarted"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the report %q does not mention %q", err, want)
+		}
 	}
 }
 
@@ -2326,6 +2660,78 @@ func TestPreflightDataPathRefusesADirectoryThatGrantsOnlyTheChildren(t *testing.
 	}
 }
 
+// TestSCMPreflightExecutableAccess checks that a definite denial refuses, an
+// allowed descriptor passes and an unreadable one refuses nothing.
+func TestSCMPreflightExecutableAccess(t *testing.T) {
+	previous := scmCheckExecutableAccess
+	t.Cleanup(func() { scmCheckExecutableAccess = previous })
+
+	executable := `C:\ProgramData\HFDesk\hfdesk.exe`
+	cases := []struct {
+		name    string
+		access  scmExecutableAccess
+		reason  string
+		wantErr bool
+	}{
+		{"allowed", scmExecutableAccessAllowed, "", false},
+		{"denied", scmExecutableAccessDenied, "the test denies the access", true},
+		{"inconclusive", scmExecutableAccessInconclusive, "the test cannot read the descriptor", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scmCheckExecutableAccess = func(string) (scmExecutableAccess, string) {
+				return tc.access, tc.reason
+			}
+			err := preflightExecutableAccess(executable)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("preflightExecutableAccess() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("preflightExecutableAccess() = nil, want the refusal of the program")
+			}
+			for _, want := range []string{executable, scmServiceIdentityName, tc.reason, "read and execute"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("preflightExecutableAccess() = %v, want %q in the refusal", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestSDDLGrantsExecutable checks the read and execute access of a program and
+// the traverse access of a parent directory.
+func TestSDDLGrantsExecutable(t *testing.T) {
+	identity := scmDocumentedIdentitySIDs()
+	for _, tc := range []struct {
+		name     string
+		sddl     string
+		exec     bool
+		traverse bool
+	}{
+		{"full control", "D:P(A;;FA;;;LS)", true, true},
+		{"the generic read and execute", "D:P(A;;GR;;;LS)(A;;GX;;;LS)", true, true},
+		{"the read and execute rights", "D:P(A;;FR;;;LS)(A;;FX;;;LS)", true, true},
+		{"the generic execute", "D:P(A;;GX;;;LS)", false, true},
+		{"execute only", "D:P(A;;FX;;;LS)", false, true},
+		{"read only", "D:P(A;;FR;;;LS)", false, false},
+		{"a denied execute next to full control", "D:P(D;;FX;;;LS)(A;;FA;;;LS)", false, false},
+		{"an inherit only entry", "D:P(A;OICIIO;FA;;;LS)", false, false},
+		{"a null DACL", "D:NO_ACCESS_CONTROL", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := sddlGrantsExecutable(tc.sddl, identity); (err != nil) == tc.exec {
+				t.Errorf("sddlGrantsExecutable(%q) = %v, want a refusal = %t", tc.sddl, err, !tc.exec)
+			}
+			if err := sddlGrantsTraverse(tc.sddl, identity); (err != nil) == tc.traverse {
+				t.Errorf("sddlGrantsTraverse(%q) = %v, want a refusal = %t", tc.sddl, err, !tc.traverse)
+			}
+		})
+	}
+}
+
 // TestPreflightExecutableImageRefusesAFileThatIsNotAProgram proves that an
 // installation refuses a file that is not a Windows program: a text file
 // renamed to hfdesk.exe is not a program the service control manager could
@@ -2944,6 +3350,13 @@ func scmTestInstallOptions(t *testing.T, root string) InstallOptions {
 	if _, err := os.Stat(executable); err != nil {
 		t.Skipf("the test program %s is not available: %v", executable, err)
 	}
+	// The ACL of the system program is not the subject of the tests that
+	// install it: the access check has tests of its own.
+	previousAccess := scmCheckExecutableAccess
+	scmCheckExecutableAccess = func(string) (scmExecutableAccess, string) {
+		return scmExecutableAccessAllowed, ""
+	}
+	t.Cleanup(func() { scmCheckExecutableAccess = previousAccess })
 	return InstallOptions{
 		Scope:      ScopeSystem,
 		Executable: executable,
@@ -3910,11 +4323,15 @@ func TestSCMRestartRollbackSentence(t *testing.T) {
 	const stopReason = "the instance did not stop within 2m0s"
 	const restoreReason = "the service control manager refused the write of the registration"
 	const startReason = `the instance does not run "C:\\ProgramData\\HFDesk\\hfdesk.exe" within 2m0s`
+	const readReason = "the service control manager did not answer"
 
 	stopped := scmRestartRollback{stopped: true}
 	restored := scmRestartRollback{stopped: true, restored: true}
 	programKnown := scmRestartRollback{stopped: true, restored: true, programKnown: true}
 	started := scmRestartRollback{stopped: true, restored: true, programKnown: true, started: true}
+	undeliveredRestored := scmRestartRollback{attempt: scmRollbackUndeliveredInstance, restored: true}
+	undeliveredRunning := scmRestartRollback{attempt: scmRollbackUndeliveredInstance, restored: true, running: true}
+	undeliveredStopped := scmRestartRollback{attempt: scmRollbackUndeliveredInstance, stopped: true, restored: true, programKnown: true, started: true, verified: true}
 
 	cases := []struct {
 		name string
@@ -3934,6 +4351,13 @@ func TestSCMRestartRollbackSentence(t *testing.T) {
 			facts:    scmRestartRollback{},
 			reason:   stopReason,
 			want:     []string{"was kept", "was not proven to be stopped", stopReason, "the previous registration was not restored"},
+			verified: false,
+		},
+		{
+			name:     "the instance the failed installation replaced did not stop",
+			facts:    scmRestartRollback{attempt: scmRollbackPreviousInstance},
+			reason:   stopReason,
+			want:     []string{"instance it replaced was not proven to be stopped", stopReason, "no instance was started", "hfdesk service status"},
 			verified: false,
 		},
 		{
@@ -3971,6 +4395,41 @@ func TestSCMRestartRollbackSentence(t *testing.T) {
 			want:     []string{"was stopped", "was restored", scmRollbackSuccessClaim, "the failure recovery of the registration was not part of the restore"},
 			verified: true,
 		},
+		{
+			name:     "the previous instance was started again after its stop",
+			facts:    scmRestartRollback{attempt: scmRollbackPreviousInstance, stopped: true, restored: true, programKnown: true, started: true, verified: true},
+			reason:   "",
+			want:     []string{"the previous instance was proven stopped", "was restored", scmRollbackSuccessClaim},
+			verified: true,
+		},
+		{
+			name:     "a stop that was never delivered and the instance still runs",
+			facts:    undeliveredRunning,
+			reason:   "",
+			want:     []string{"no stop control was delivered", "was restored", "still runs", "no instance was started"},
+			verified: false,
+		},
+		{
+			name:     "a stop that was never delivered and the state cannot be read",
+			facts:    undeliveredRestored,
+			reason:   readReason,
+			want:     []string{"no stop control was delivered", "was restored", "could not be confirmed", "no instance was started", "hfdesk service status", readReason},
+			verified: false,
+		},
+		{
+			name:     "a stop that was never delivered and the previous registration could not be put back",
+			facts:    scmRestartRollback{attempt: scmRollbackUndeliveredInstance},
+			reason:   restoreReason,
+			want:     []string{"no stop control was delivered", "could not be put back", restoreReason},
+			verified: false,
+		},
+		{
+			name:     "the previous instance was stopped after its stop was never delivered",
+			facts:    undeliveredStopped,
+			reason:   "",
+			want:     []string{"the previous instance was proven stopped", "was restored", scmRollbackSuccessClaim},
+			verified: true,
+		},
 	}
 
 	for _, tc := range cases {
@@ -3990,9 +4449,10 @@ func TestSCMRestartRollbackSentence(t *testing.T) {
 				t.Errorf("the sentence %q claims the previous instance was started again = %v, want %v", sentence, claimed, tc.verified)
 			}
 			// A rollback that did not prove the stop never claims the
-			// restore: the registration of the failed installation is the
-			// one that describes the process that may still run.
-			if !tc.facts.stopped && strings.Contains(sentence, "the configuration of the previous registration was restored") {
+			// restore, unless the stop was never delivered: there was no
+			// control that could have put the instance down.
+			undelivered := tc.facts.attempt == scmRollbackUndeliveredInstance
+			if !tc.facts.stopped && !undelivered && strings.Contains(sentence, "the configuration of the previous registration was restored") {
 				t.Errorf("the sentence %q claims the previous configuration was restored while the instance of the failed installation was not proven to be stopped", sentence)
 			}
 		})
@@ -4077,7 +4537,7 @@ func TestSCMStopOfAnInstanceThatIsStoppedIsACleanNoOp(t *testing.T) {
 	handle := &scmTestServiceControl{state: svc.Stopped}
 
 	manager := &scmManager{scope: ScopeSystem}
-	if err := manager.stopService(context.Background(), handle); err != nil {
+	if _, err := manager.stopService(context.Background(), handle); err != nil {
 		t.Fatalf("stopService() = %v, want nil for an instance that does not run", err)
 	}
 	if handle.controls != 0 {

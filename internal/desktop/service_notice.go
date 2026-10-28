@@ -358,16 +358,25 @@ func serviceActionFailureText(action serviceAction, err error, program string) s
 	}
 }
 
+// serviceInstallCleanup is what the cleanup of a failed installation left on the
+// machine and what it observed, so the report claims only what was read.
+type serviceInstallCleanup struct {
+	aftermath serviceInstallAftermath
+	// status is meaningful only when read reports true.
+	status     service.Status
+	read       bool
+	statusErr  error
+	removalErr error
+}
+
 // serviceInstallFailureText returns the report of an installation that wrote the
 // registration and did not start it.
 //
-// The outcome is stated in what the registration may do next: a registration
-// this action wrote is removed again, so the user starts the desktop app
-// normally again; a registration that was there before, one whose state could
-// not be read, one whose removal was skipped and one whose removal failed all
-// stay, so the user decides whether to keep them. The folder of the program is
-// part of the outcomes where the registration stays.
-func serviceInstallFailureText(err error, program string, aftermath serviceInstallAftermath, removalErr error) string {
+// The report never claims that the service does not run unless the cleanup
+// observed a settled state that does not serve: a running, starting or
+// unreadable instance may still serve after the failed start. The folder of the
+// program is part of the outcomes where the registration stays.
+func serviceInstallFailureText(err error, program string, cleanup serviceInstallCleanup) string {
 	detail := ""
 	if err != nil {
 		detail = err.Error()
@@ -376,23 +385,39 @@ func serviceInstallFailureText(err error, program string, aftermath serviceInsta
 	stays := true
 	var outcome string
 	switch {
-	case errors.Is(removalErr, errServiceRemovalSkipped):
-		outcome = "The registration of this attempt was not removed, because the service may still be running, starting or stopping, or its state could not be read. " +
-			"The registration stays in place.\n\n" +
-			serviceUninstallCommandText
-	case aftermath == serviceInstallRemovalFailed:
+	case cleanup.aftermath == serviceInstallRemovalFailed:
 		outcome = "The registration of this attempt could not be removed again: HFDesk stays installed as a Windows service although it does not run."
-		if removalErr != nil {
-			outcome += "\n\nThe removal failed: " + removalErr.Error()
+		if cleanup.removalErr != nil {
+			outcome += "\n\nThe removal failed: " + cleanup.removalErr.Error()
 		}
 		outcome += "\n\n" + serviceUninstallCommandText
-	case aftermath == serviceInstallRemoved:
+	case cleanup.aftermath == serviceInstallRemoved:
 		stays = false
 		outcome = "The registration of this attempt was removed again: HFDesk is not installed as a Windows service, so start the desktop app normally again."
-	default:
-		outcome = "The registration was left in place: it was installed before this attempt, or its state before the attempt could not be read. " +
-			"The service stays installed, but it does not run.\n\n" +
+	case cleanup.read && cleanup.statusErr != nil:
+		outcome = "The registration of this attempt was not removed, because the state of the service could not be read. The start could not be confirmed: the service may be running, starting or stopped. " +
+			"The registration stays in place.\n\n" +
 			serviceUninstallCommandText
+	case cleanup.read && cleanup.status.State == service.StateStarting:
+		outcome = "The registration of this attempt was not removed, because the service is still starting. The start could not be confirmed. " +
+			"The registration stays in place.\n\n" +
+			serviceUninstallCommandText
+	case cleanup.read && serviceStatusRunning(cleanup.status):
+		outcome = "The registration of this attempt was not removed, because the service reports that it is running. The start could not be confirmed. " +
+			"The registration stays in place.\n\n" +
+			serviceUninstallCommandText
+	case cleanup.read && !serviceStateSettled(cleanup.status.State):
+		outcome = "The registration of this attempt was not removed, because the service is still stopping. The start could not be confirmed. " +
+			"The registration stays in place.\n\n" +
+			serviceUninstallCommandText
+	case !cleanup.read:
+		outcome = "The registration was left in place: it was not created by this installation. The start could not be confirmed; the service may be running, starting or stopped.\n\n" +
+			serviceUninstallCommandText
+	default:
+		// The cleanup removes a settled state that does not serve; this branch
+		// keeps the report truthful if it ever returns one unremoved.
+		outcome = fmt.Sprintf("The registration of this attempt was left in place; its state was read as %q.\n\n%s",
+			cleanup.status.State, serviceUninstallCommandText)
 	}
 
 	text := "HFDesk registered the service but could not start it.\n\n" + detail + "\n\n" + outcome

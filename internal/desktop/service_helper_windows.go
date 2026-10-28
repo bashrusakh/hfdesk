@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/service"
@@ -126,33 +127,17 @@ func RunServiceAction(o ServiceActionOptions) error {
 //
 // A failed first installation must not trap the user: the service gate ends
 // every later launch, so a registration that serves nothing keeps the desktop
-// app from starting its own server. The state of the machine is therefore read
-// before the installation, and only a registration this action wrote is removed
-// again when the start or its verification fails. A registration that existed
-// before and a state that could not be read are never touched.
+// app from starting its own server. Only a registration this action created is
+// removed again when the start fails; one that existed before, or that appeared
+// between the manager's lookup and its write, is never touched.
 func installWindowsService(action serviceAction, version string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceActionBudget)
 	defer cancel()
 
-	opts, manager, err := serviceInstallation()
+	opts, manager, err := serviceInstallation(version)
 	if err != nil {
 		reportServiceFailure(action, err, "")
 		return err
-	}
-
-	// The state before the installation decides what a failure may remove: a
-	// registration that existed before the action is not this action's to
-	// delete, and a state that cannot be read is not evidence of a machine
-	// without a service. The installation proceeds either way; only the
-	// removal after a failure depends on this read.
-	before, beforeErr := manager.Status(ctx)
-	freshInstall := beforeErr == nil && before.State == service.StateNotInstalled
-	if beforeErr != nil {
-		desktopLog.Warn("the state of the service before the installation cannot be read",
-			"error", beforeErr)
-	} else {
-		desktopLog.Info("the state of the service before the installation",
-			"state", string(before.State), "freshInstall", freshInstall)
 	}
 
 	installed, err := manager.Install(ctx, opts)
@@ -162,16 +147,15 @@ func installWindowsService(action serviceAction, version string) error {
 	}
 	program := serviceProgram(installed, opts)
 
-	// The failure of the start and the failure of its verification are the
-	// same outcome for the user: the service does not run, and what happens
-	// to the registration depends on whether this action wrote it.
+	// Both failures are the same outcome for the user: the start could not be
+	// confirmed, and the cleanup depends on who created the registration.
 	fail := func(err error) error {
-		aftermath, removalErr := removeFailedInstallation(ctx, manager, freshInstall)
+		cleanup := removeFailedInstallation(ctx, manager, installed.Created)
 		desktopLog.Error("the service action failed",
 			"action", string(action), "error", err, "program", program,
-			"aftermath", aftermath.String(), "removalError", removalErr)
+			"aftermath", cleanup.aftermath.String(), "removalError", cleanup.removalErr)
 		showMessage(serviceFailureCaption(action),
-			serviceInstallFailureText(err, program, aftermath, removalErr), windows.MB_ICONERROR)
+			serviceInstallFailureText(err, program, cleanup), windows.MB_ICONERROR)
 		return err
 	}
 
@@ -187,9 +171,10 @@ func installWindowsService(action serviceAction, version string) error {
 	// reports none is not a reason to report an empty program: the request is
 	// what the registration was made from.
 	report := serviceProgram(installed, opts)
-	desktopLog.Info("the service is installed", "executable", report, "listen", status.Listen)
+	desktopLog.Info("the service is installed", "executable", report, "listen", status.Listen,
+		"versionVerified", installed.VersionVerified)
 	showMessage(serviceInstalledCaption,
-		serviceInstalledText(version, report, status.Paths.StateDir, serviceWebAddress(status)),
+		serviceInstalledText(verifiedVersion(installed), report, status.Paths.StateDir, serviceWebAddress(status)),
 		windows.MB_ICONINFORMATION)
 	return nil
 }
@@ -197,44 +182,54 @@ func installWindowsService(action serviceAction, version string) error {
 // removeFailedInstallation removes the registration of a failed installation and
 // reports what is left on the machine.
 //
-// freshInstall reports whether the registration was written by this action, and
-// only that registration is removed, and only the registration: the data
-// directory stays where it is.
+// created reports whether the registration was written by this action, and only
+// that registration is removed: never the data directory, and never one that
+// existed before or appeared between the lookup and the write.
 //
 // A destructive step is taken only on a state that was observed: the state is
 // read again, and the registration is removed only when it reports a settled
 // state that does not serve. A running or still starting instance is never torn
 // down, and a state that cannot be read is not evidence of a stopped service.
+// The observation is returned, so the report claims only what was read.
 //
 // The removal runs on a context that is never cancelled with the action, so a
 // spent action budget cannot keep the registration behind.
-func removeFailedInstallation(ctx context.Context, manager service.Manager, freshInstall bool) (serviceInstallAftermath, error) {
-	if !freshInstall {
-		desktopLog.Info("the registration of the service is left in place: it was not written by this installation")
-		return serviceInstallKept, nil
+func removeFailedInstallation(ctx context.Context, manager service.Manager, created bool) serviceInstallCleanup {
+	cleanup := serviceInstallCleanup{aftermath: serviceInstallKept}
+	if !created {
+		desktopLog.Info("the registration of the service is left in place: it was not created by this installation")
+		return cleanup
 	}
 
 	removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), serviceRemovalBudget)
 	defer cancel()
 
+	cleanup.read = true
 	status, err := manager.Status(removeCtx)
 	if err != nil {
 		desktopLog.Warn("the state of the failed installation cannot be read: the registration is left in place",
 			"error", err)
-		return serviceInstallKept, errServiceRemovalSkipped
+		cleanup.statusErr = err
+		cleanup.removalErr = errServiceRemovalSkipped
+		return cleanup
 	}
+	cleanup.status = status
 	if serviceStatusRunning(status) || !serviceStateSettled(status.State) {
 		desktopLog.Info("the instance of the failed installation is running or still in transition: the registration is left in place",
 			"state", string(status.State), "running", status.Running)
-		return serviceInstallKept, errServiceRemovalSkipped
+		cleanup.removalErr = errServiceRemovalSkipped
+		return cleanup
 	}
 
 	if err := manager.Uninstall(removeCtx); err != nil {
 		desktopLog.Error("the registration of the failed installation could not be removed", "error", err)
-		return serviceInstallRemovalFailed, err
+		cleanup.aftermath = serviceInstallRemovalFailed
+		cleanup.removalErr = err
+		return cleanup
 	}
 	desktopLog.Info("the registration of the failed installation was removed again")
-	return serviceInstallRemoved, nil
+	cleanup.aftermath = serviceInstallRemoved
+	return cleanup
 }
 
 // updateWindowsService re-registers the service from the folder of the helper
@@ -252,7 +247,7 @@ func updateWindowsService(action serviceAction, version string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceActionBudget)
 	defer cancel()
 
-	opts, manager, err := serviceInstallation()
+	opts, manager, err := serviceInstallation(version)
 	if err != nil {
 		reportServiceFailure(action, err, "")
 		return err
@@ -293,9 +288,10 @@ func updateWindowsService(action serviceAction, version string) error {
 	desktopLog.Info("the service is updated",
 		"executable", report,
 		"state", string(status.State),
-		"wasRunning", wasRunning)
+		"wasRunning", wasRunning,
+		"versionVerified", installed.VersionVerified)
 	showMessage(serviceUpdatedCaption,
-		serviceUpdatedText(version, report, status.Paths.StateDir,
+		serviceUpdatedText(verifiedVersion(installed), report, status.Paths.StateDir,
 			serviceWebAddress(status), serviceStatusRunning(status)),
 		windows.MB_ICONINFORMATION)
 	return nil
@@ -345,7 +341,10 @@ func startWindowsService(action serviceAction) error {
 // program in the folder of the helper. The desktop host names no value of its
 // own, so an installation over an existing registration keeps the settings the
 // instance already runs with.
-func serviceInstallation() (service.InstallOptions, service.Manager, error) {
+//
+// A release build knows the version of the console program it selected; a local
+// build ("dev") names no release and passes no expectation.
+func serviceInstallation(version string) (service.InstallOptions, service.Manager, error) {
 	executable, err := desktopExecutable()
 	if err != nil {
 		return service.InstallOptions{}, nil, err
@@ -358,7 +357,20 @@ func serviceInstallation() (service.InstallOptions, service.Manager, error) {
 	if err != nil {
 		return service.InstallOptions{}, nil, fmt.Errorf("the service control manager of Windows is not available: %w", err)
 	}
-	return service.DefaultInstallOptions(service.ScopeSystem, console), manager, nil
+	opts := service.DefaultInstallOptions(service.ScopeSystem, console)
+	if version = strings.TrimSpace(version); version != "" && version != "dev" {
+		opts.ExpectedVersion = version
+	}
+	return opts, manager, nil
+}
+
+// verifiedVersion returns the version the installation really compared with the
+// health endpoint, so a report never names a version the instance did not prove.
+func verifiedVersion(installed service.InstallOptions) string {
+	if !installed.VersionVerified {
+		return ""
+	}
+	return installed.ExpectedVersion
 }
 
 // waitForServiceState waits for the service to reach the expected state.

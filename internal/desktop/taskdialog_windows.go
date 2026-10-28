@@ -6,6 +6,7 @@
 package desktop
 
 import (
+	"encoding/binary"
 	"fmt"
 	"runtime"
 	"unsafe"
@@ -64,7 +65,37 @@ func showTaskDialogChoice(prompt serviceChoicePrompt) serviceChoice {
 // controls of Windows.
 var taskDialogIndirect = windows.NewLazySystemDLL("comctl32.dll").NewProc("TaskDialogIndirect")
 
-// taskDialogButton is the TASKDIALOG_BUTTON of the Windows API.
+// TASKDIALOG_BUTTON and TASKDIALOGCONFIG are declared between pshpack1.h and
+// poppack.h in CommCtrl.h, so no member is padded and a Go struct cannot mirror
+// them; both records are marshalled into packed byte buffers instead. The sizes
+// follow from eight 4-byte and sixteen pointer-size members; a test pins the
+// offsets.
+const (
+	taskDialogPointerSize = int(unsafe.Sizeof(uintptr(0)))
+	taskDialogConfigSize  = 8*4 + 16*taskDialogPointerSize
+	taskDialogButtonSize  = 4 + taskDialogPointerSize
+)
+
+// packedRecord appends a value in the little-endian order and the width of the
+// SDK member.
+type packedRecord []byte
+
+func (r *packedRecord) u32(v uint32) {
+	*r = binary.LittleEndian.AppendUint32(*r, v)
+}
+
+func (r *packedRecord) i32(v int32) {
+	r.u32(uint32(v))
+}
+
+func (r *packedRecord) uptr(v uintptr) {
+	if taskDialogPointerSize == 4 {
+		r.u32(uint32(v))
+		return
+	}
+	*r = binary.LittleEndian.AppendUint64(*r, uint64(v))
+}
+
 type taskDialogButton struct {
 	// id is the command id the dialog reports for the button.
 	id int32
@@ -72,80 +103,75 @@ type taskDialogButton struct {
 	text *uint16
 }
 
-// taskDialogConfig is the TASKDIALOGCONFIG of the Windows API.
-//
-// The struct mirrors the C declaration field by field, in the C order, and it
-// declares no padding field of its own. The 64-bit ABI pads only where an
-// eight-byte member (a pointer, HWND, HINSTANCE or HICON) must be aligned, and
-// Go aligns a pointer to eight bytes for exactly the same reason, so the two
-// layouts agree without help. Adjacent 32-bit members keep their four-byte
-// slots: dwFlags and dwCommonButtons share one eight-byte slot, and so do
-// nDefaultButton with cRadioButtons and cxWidth with the trailing padding of
-// the struct. Spelling the padding out instead shifts every following field by
-// four bytes: the dialog would read cButtons out of the low half of pButtons,
-// pButtons out of a count, and the process would crash.
-//
-// The layout is checked by a test with unsafe.Offsetof, so a wrong struct fails
-// in CI instead of failing at runtime:
-//
-//	cbSize 0, hwndParent 8, hInstance 16, dwFlags 24, dwCommonButtons 28,
-//	pszWindowTitle 32, mainIcon 40, pszMainInstruction 48, pszContent 56,
-//	cButtons 64, pButtons 72, nDefaultButton 80, cRadioButtons 84,
-//	pRadioButtons 88, nDefaultRadioButton 96, pszVerificationText 104,
-//	pszExpandedInformation 112, pszExpandedControlText 120,
-//	pszCollapsedControlText 128, footerIcon 136, pszFooter 144,
-//	pfCallback 152, lpCallbackData 160, cxWidth 168, size 176.
+// taskDialogConfig holds the values of a TASKDIALOGCONFIG record; cbSize,
+// cButtons and pButtons are derived by marshalTaskDialogConfig.
 type taskDialogConfig struct {
-	// cbSize is the size of the struct. The API uses it to tell the
-	// versions of the struct apart.
-	cbSize uint32
-	// hwndParent is the owner of the dialog.
-	hwndParent uintptr
-	// hInstance is the instance that holds the resources of the dialog.
-	hInstance uintptr
-	// dwFlags are the TDF_* flags.
-	dwFlags uint32
-	// dwCommonButtons are the standard buttons of the dialog. The service
-	// gate uses custom buttons instead, so the field stays zero.
-	dwCommonButtons uint32
-	// pszWindowTitle is the caption of the dialog.
-	pszWindowTitle *uint16
-	// mainIcon is the union of hMainIcon and pszMainIcon.
-	mainIcon uintptr
-	// pszMainInstruction is the instruction line of the dialog.
-	pszMainInstruction *uint16
-	// pszContent is the content of the dialog.
-	pszContent *uint16
-	// cButtons is the number of custom buttons.
-	cButtons uint32
-	// pButtons is the array of custom buttons.
-	pButtons *taskDialogButton
-	// nDefaultButton is the id of the default button.
-	nDefaultButton int32
-	// cRadioButtons is the number of radio buttons.
-	cRadioButtons uint32
-	// pRadioButtons is the array of radio buttons.
-	pRadioButtons *taskDialogButton
-	// nDefaultRadioButton is the index of the default radio button.
-	nDefaultRadioButton int32
-	// pszVerificationText is the label of the verification check box.
-	pszVerificationText *uint16
-	// pszExpandedInformation is the content of the expander.
-	pszExpandedInformation *uint16
-	// pszExpandedControlText is the label of the expander.
-	pszExpandedControlText *uint16
-	// pszCollapsedControlText is the label of the collapsed expander.
+	hwndParent              uintptr
+	hInstance               uintptr
+	dwFlags                 uint32
+	dwCommonButtons         uint32
+	pszWindowTitle          *uint16
+	mainIcon                uintptr
+	pszMainInstruction      *uint16
+	pszContent              *uint16
+	nDefaultButton          int32
+	cRadioButtons           uint32
+	pRadioButtons           uintptr
+	nDefaultRadioButton     int32
+	pszVerificationText     *uint16
+	pszExpandedInformation  *uint16
+	pszExpandedControlText  *uint16
 	pszCollapsedControlText *uint16
-	// footerIcon is the union of hFooterIcon and pszFooterIcon.
-	footerIcon uintptr
-	// pszFooter is the footer of the dialog.
-	pszFooter *uint16
-	// pfCallback is the callback of the dialog.
-	pfCallback uintptr
-	// lpCallbackData is the data of the callback.
-	lpCallbackData uintptr
-	// cxWidth is the width of the dialog.
-	cxWidth uint32
+	footerIcon              uintptr
+	pszFooter               *uint16
+	pfCallback              uintptr
+	lpCallbackData          uintptr
+	cxWidth                 uint32
+}
+
+func marshalTaskDialogButtons(buttons []taskDialogButton) []byte {
+	record := make(packedRecord, 0, len(buttons)*taskDialogButtonSize)
+	for _, button := range buttons {
+		record.i32(button.id)
+		record.uptr(uintptr(unsafe.Pointer(button.text)))
+	}
+	return record
+}
+
+// marshalTaskDialogConfig packs a TASKDIALOGCONFIG and the button array its
+// pButtons field points at.
+func marshalTaskDialogConfig(cfg taskDialogConfig, buttons []taskDialogButton) (configRecord, buttonRecord []byte) {
+	buttonRecord = marshalTaskDialogButtons(buttons)
+	record := make(packedRecord, 0, taskDialogConfigSize)
+	record.u32(uint32(taskDialogConfigSize))
+	record.uptr(cfg.hwndParent)
+	record.uptr(cfg.hInstance)
+	record.u32(cfg.dwFlags)
+	record.u32(cfg.dwCommonButtons)
+	record.uptr(uintptr(unsafe.Pointer(cfg.pszWindowTitle)))
+	record.uptr(cfg.mainIcon)
+	record.uptr(uintptr(unsafe.Pointer(cfg.pszMainInstruction)))
+	record.uptr(uintptr(unsafe.Pointer(cfg.pszContent)))
+	record.u32(uint32(len(buttons)))
+	if len(buttonRecord) == 0 {
+		record.uptr(0)
+	} else {
+		record.uptr(uintptr(unsafe.Pointer(&buttonRecord[0])))
+	}
+	record.i32(cfg.nDefaultButton)
+	record.u32(cfg.cRadioButtons)
+	record.uptr(cfg.pRadioButtons)
+	record.i32(cfg.nDefaultRadioButton)
+	record.uptr(uintptr(unsafe.Pointer(cfg.pszVerificationText)))
+	record.uptr(uintptr(unsafe.Pointer(cfg.pszExpandedInformation)))
+	record.uptr(uintptr(unsafe.Pointer(cfg.pszExpandedControlText)))
+	record.uptr(uintptr(unsafe.Pointer(cfg.pszCollapsedControlText)))
+	record.uptr(cfg.footerIcon)
+	record.uptr(uintptr(unsafe.Pointer(cfg.pszFooter)))
+	record.uptr(cfg.pfCallback)
+	record.uptr(cfg.lpCallbackData)
+	record.u32(cfg.cxWidth)
+	return record, buttonRecord
 }
 
 // taskDialogChoice shows the service gate as a task dialog.
@@ -188,26 +214,24 @@ func taskDialogChoice(prompt serviceChoicePrompt) (serviceChoice, error) {
 		{id: serviceGateUpdateButtonID, text: updateLabel},
 		{id: serviceGateCancelButtonID, text: cancelLabel},
 	}
-	config := taskDialogConfig{
-		cbSize:             uint32(unsafe.Sizeof(taskDialogConfig{})),
+	configRecord, buttonRecord := marshalTaskDialogConfig(taskDialogConfig{
 		dwFlags:            tdfAllowDialogCancellation,
 		pszWindowTitle:     title,
 		pszMainInstruction: instruction,
 		pszContent:         content,
-		cButtons:           uint32(len(buttons)),
-		pButtons:           &buttons[0],
 		nDefaultButton:     serviceGateOpenButtonID,
-	}
+	}, buttons[:])
 
 	var pressed int32
 	result, _, _ := taskDialogIndirect.Call(
-		uintptr(unsafe.Pointer(&config)),
+		uintptr(unsafe.Pointer(&configRecord[0])),
 		uintptr(unsafe.Pointer(&pressed)),
 		0,
 		0,
 	)
-	// The strings and the buttons are read by the dialog during the call,
-	// so they are held until the call returned.
+	// The dialog reads the records and the UTF-16 strings during the call.
+	runtime.KeepAlive(buttonRecord)
+	runtime.KeepAlive(configRecord)
 	runtime.KeepAlive(buttons)
 	runtime.KeepAlive(cancelLabel)
 	runtime.KeepAlive(updateLabel)

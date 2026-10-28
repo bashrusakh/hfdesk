@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -132,9 +133,15 @@ func TestProbeServiceReadyAcceptsTheChallengeOfTheInstance(t *testing.T) {
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
 	defer instance.Close()
+	addr := instance.Listener.Addr().String()
 
-	if err := probeServiceReady(instance.Listener.Addr().String()); err != nil {
-		t.Fatalf("probeServiceReady(%q) = %v, want nil for the challenge of the instance", instance.Listener.Addr(), err)
+	if err := probeServiceReady(addr); err != nil {
+		t.Fatalf("probeServiceReady(%q) = %v, want nil for the challenge of the instance", addr, err)
+	}
+	// The challenge carries no health document, so it proves readiness but no
+	// version.
+	if verified, err := probeServiceReadyForVersion(addr, "1.2.3"); err != nil || verified {
+		t.Errorf("probeServiceReadyForVersion(%q) = %t, %v, want the challenge without a verified version", addr, verified, err)
 	}
 }
 
@@ -267,6 +274,126 @@ func TestProbeServiceReadyDoesNotFollowARedirect(t *testing.T) {
 	}
 	if got := targetRequests.Load(); got != 0 {
 		t.Errorf("the redirect target was requested %d times, want none", got)
+	}
+}
+
+// TestProbeServiceReadyDoesNotUseTheProxyForANonLoopbackAddress checks that a
+// probe of a LAN address reaches the instance directly instead of through the
+// proxy of the environment.
+func TestProbeServiceReadyDoesNotUseTheProxyForANonLoopbackAddress(t *testing.T) {
+	host := nonLoopbackIPv4(t)
+
+	var proxyRequests atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyRequests.Add(1)
+		http.Error(w, "the probe used the proxy", http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatalf("parse the proxy URL: %v", err)
+	}
+
+	// Every address outside loopback goes through the proxy of the environment.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = func(req *http.Request) (*url.URL, error) {
+		if ip := net.ParseIP(req.URL.Hostname()); ip != nil && ip.IsLoopback() {
+			return nil, nil
+		}
+		return proxyURL, nil
+	}
+	previous := http.DefaultTransport
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = previous })
+
+	var instanceRequests atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		instanceRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ok","version":"1.2.3"}`)
+	})
+
+	listener, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("listen on every interface: %v", err)
+	}
+	instance := httptest.NewUnstartedServer(handler)
+	_ = instance.Listener.Close()
+	instance.Listener = listener
+	instance.Start()
+	defer instance.Close()
+
+	port := listener.Addr().(*net.TCPAddr).Port
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Skipf("the non-loopback address %s of the machine is not reachable: %v", addr, err)
+	}
+	_ = conn.Close()
+
+	if err := probeServiceReady(addr); err != nil {
+		t.Fatalf("probeServiceReady(%q) = %v, want nil for the instance on the LAN address", addr, err)
+	}
+	if got := proxyRequests.Load(); got != 0 {
+		t.Errorf("the proxy received %d requests, want none for a probe of the same machine", got)
+	}
+	if got := instanceRequests.Load(); got == 0 {
+		t.Error("the instance received no request, want the direct probe")
+	}
+}
+
+// nonLoopbackIPv4 returns an address of a local interface that is not
+// loopback.
+func nonLoopbackIPv4(t *testing.T) string {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skipf("the addresses of the machine cannot be read: %v", err)
+	}
+	for _, addr := range addrs {
+		ipnet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := ipnet.IP.To4()
+		if ip == nil || ip.IsLoopback() || !ip.IsGlobalUnicast() {
+			continue
+		}
+		return ip.String()
+	}
+	t.Skip("skipping: the machine has no non-loopback IPv4 address")
+	return ""
+}
+
+// TestProbeServiceReadyVerifiesTheExpectedVersion checks the version evidence of
+// a readiness probe: an expectation that matches verifies, a mismatch fails, and
+// an empty or local-build expectation proves readiness without a version.
+func TestProbeServiceReadyVerifiesTheExpectedVersion(t *testing.T) {
+	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ok","version":"1.2.3"}`)
+	}))
+	defer instance.Close()
+	addr := instance.Listener.Addr().String()
+
+	verified, err := probeServiceReadyForVersion(addr, "1.2.3")
+	if err != nil || !verified {
+		t.Fatalf("probeServiceReadyForVersion(%q, %q) = %t, %v, want a verified version", addr, "1.2.3", verified, err)
+	}
+
+	verified, err = probeServiceReadyForVersion(addr, "1.3.0")
+	if err == nil || verified {
+		t.Fatalf("probeServiceReadyForVersion(%q, %q) = %t, %v, want the mismatch", addr, "1.3.0", verified, err)
+	}
+	if !strings.Contains(err.Error(), "1.2.3") || !strings.Contains(err.Error(), "1.3.0") {
+		t.Errorf("probeServiceReadyForVersion() = %v, want both versions in the mismatch", err)
+	}
+
+	for _, expected := range []string{"", "dev"} {
+		verified, err := probeServiceReadyForVersion(addr, expected)
+		if err != nil || verified {
+			t.Errorf("probeServiceReadyForVersion(%q, %q) = %t, %v, want readiness without a verified version", addr, expected, verified, err)
+		}
 	}
 }
 

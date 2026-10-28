@@ -13,7 +13,9 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -24,6 +26,7 @@ import (
 
 	"github.com/bashrusakh/hfdesk/internal/app"
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
+	"github.com/bashrusakh/hfdesk/internal/server"
 	"github.com/bashrusakh/hfdesk/internal/service"
 )
 
@@ -1984,6 +1987,65 @@ func TestRunPathReturnsAfterTheContextIsCancelled(t *testing.T) {
 	}
 }
 
+// TestServiceRunReportsTheBuildVersionOnTheHealthEndpoint checks that the host
+// path the supervisor starts reports the version of its build on the health
+// endpoint, which is the version an installation compares.
+func TestServiceRunReportsTheBuildVersionOnTheHealthEndpoint(t *testing.T) {
+	previousVersion := Version
+	Version = "1.2.3"
+	t.Cleanup(func() { Version = previousVersion })
+	previousServerVersion := server.Version
+	t.Cleanup(func() { server.Version = previousServerVersion })
+
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	t.Cleanup(runtimepaths.Reset)
+
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(freeLoopbackPort(t)))
+	args := []string{
+		"--config", filepath.Join(stateDir, "hfdesk.json"),
+		"--state-dir", stateDir,
+		"--log-dir", filepath.Join(stateDir, "logs"),
+		"--listen", addr,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- runServiceHost(ctx, args) }()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	var lastErr error
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		resp, err := client.Get("http://" + addr + "/api/health")
+		if err != nil {
+			lastErr = err
+		} else {
+			body, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			switch {
+			case readErr != nil:
+				lastErr = readErr
+			case resp.StatusCode != http.StatusOK:
+				lastErr = fmt.Errorf("status %d: %s", resp.StatusCode, body)
+			case !strings.Contains(string(body), `"version":"1.2.3"`):
+				lastErr = fmt.Errorf("the health endpoint does not report the build version: %s", body)
+			default:
+				cancel()
+				if err := <-done; err != nil {
+					t.Fatalf("runServiceHost() = %v, want nil", err)
+				}
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancel()
+	<-done
+	t.Fatalf("the health endpoint never reported the build version: %v", lastErr)
+}
+
 // freeLoopbackPort returns a port of the loopback interface that is free at
 // the moment.
 //
@@ -2676,6 +2738,68 @@ func TestServiceInstallPassesTheNamedFieldsToTheManager(t *testing.T) {
 	}
 	if got.Listen != service.DefaultListen {
 		t.Errorf("the listen address is %q, want the default %q", got.Listen, service.DefaultListen)
+	}
+}
+
+// TestServiceInstallPassesTheVersionOfTheRunningProgram checks the version
+// evidence of an installation: the running binary names its build version, while
+// an explicit other program and a local build pass no expectation.
+func TestServiceInstallPassesTheVersionOfTheRunningProgram(t *testing.T) {
+	usePlatform(t, "linux")
+
+	cases := []struct {
+		name       string
+		version    string
+		executable func(t *testing.T) string
+		want       string
+	}{
+		{
+			name:    "the running program of a release build",
+			version: "1.2.3",
+			want:    "1.2.3",
+		},
+		{
+			name:    "a local build",
+			version: "dev",
+			want:    "",
+		},
+		{
+			name:    "an explicitly named other program",
+			version: "1.2.3",
+			executable: func(t *testing.T) string {
+				path := filepath.Join(t.TempDir(), "hfdesk")
+				if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			previousVersion := Version
+			Version = tc.version
+			t.Cleanup(func() { Version = previousVersion })
+
+			var got service.InstallOptions
+			useFakeManager(t, recordingInstallManager{
+				fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+				options:     &got,
+			})
+
+			args := []string{"install"}
+			if tc.executable != nil {
+				args = append(args, "--executable", tc.executable(t))
+			}
+			var stdout, stderr bytes.Buffer
+			if code := runServiceCommand(args, &stdout, &stderr); code != 0 {
+				t.Fatalf("the installation must be accepted, got the exit code %d:\n%s", code, stderr.String())
+			}
+			if got.ExpectedVersion != tc.want {
+				t.Errorf("the expected version is %q, want %q", got.ExpectedVersion, tc.want)
+			}
+		})
 	}
 }
 
