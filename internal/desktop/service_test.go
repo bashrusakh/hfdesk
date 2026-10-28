@@ -15,9 +15,10 @@ import (
 //
 // A service binds the address of its registration. A wildcard address is the
 // same bind as every other spelling of "every interface", and a browser of the
-// machine reaches such a service through the loopback interface. The URL is
-// derived from the registration, so an installation that moved the service to
-// another port is opened on that port and not on a default.
+// machine reaches such a service through the loopback interface of the same
+// family: the address the readiness probe verifies is the address the user is
+// sent to. The URL is derived from the registration, so an installation that
+// moved the service to another port is opened on that port and not on a default.
 func TestServiceURLReturnsTheAddressABrowserCanOpen(t *testing.T) {
 	tests := []struct {
 		name string
@@ -25,7 +26,7 @@ func TestServiceURLReturnsTheAddressABrowserCanOpen(t *testing.T) {
 		want string
 	}{
 		{"every IPv4 interface", "0.0.0.0:8080", "http://127.0.0.1:8080"},
-		{"every IPv6 interface", "[::]:8080", "http://127.0.0.1:8080"},
+		{"every IPv6 interface", "[::]:8080", "http://[::1]:8080"},
 		{"no host", ":8080", "http://127.0.0.1:8080"},
 		{"loopback", "127.0.0.1:18080", "http://127.0.0.1:18080"},
 		{"IPv6 loopback", "[::1]:18080", "http://[::1]:18080"},
@@ -47,10 +48,11 @@ func TestServiceURLReturnsTheAddressABrowserCanOpen(t *testing.T) {
 }
 
 // TestServiceURLRejectsAnAddressWithoutAHostAndPort proves that the gate never
-// invents an address: a registration that cannot be read as a host and a port
-// is an error the caller reports, not a URL the user is sent to.
+// invents an address: a registration that cannot be read as a host and a port,
+// and one that names no address at all, is an error the caller reports, not a URL
+// the user is sent to.
 func TestServiceURLRejectsAnAddressWithoutAHostAndPort(t *testing.T) {
-	for _, addr := range []string{"", "   ", "8080", "127.0.0.1"} {
+	for _, addr := range []string{"", "   ", "8080", "127.0.0.1", "127.0.0.1:"} {
 		if url, err := serviceURL(addr); err == nil {
 			t.Errorf("serviceURL(%q) = %q, want an error", addr, url)
 		}

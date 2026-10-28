@@ -409,6 +409,50 @@ func ParseListen(addr string) (string, int, error) {
 	return host, port, nil
 }
 
+// LocalAddress returns the address a client of the same machine reaches the
+// listener of listen with.
+//
+// A wildcard bind has no address a client can connect to: 0.0.0.0 and :: are the
+// addresses every interface of the machine answers on, and a connect() to them
+// fails with WSAEADDRNOTAVAIL on Windows and with EADDRNOTAVAIL elsewhere. Such
+// a bind is therefore replaced with the loopback address of the same family,
+// which the listener accepts like any other client. An empty host binds every
+// interface of every family as well, and is replaced with the IPv4 loopback
+// address, which a dual-stack listener accepts. Every other host is kept
+// unchanged, including the literal host name "localhost": a client resolves it to
+// the loopback interface itself.
+//
+// The port of the listen address is always kept: a client of this function has to
+// reach the instance of that address and not another one.
+//
+// The rule has one owner: the readiness probe dials the address this function
+// returns and the desktop host opens the URL of it, so the address a start is
+// verified on and the address a browser is sent to cannot differ. An address that
+// carries no host and port cannot be mapped and is an error.
+func LocalAddress(listen string) (string, error) {
+	addr := strings.TrimSpace(listen)
+	if addr == "" {
+		addr = DefaultListen
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("service: invalid listen address %q: %w", addr, err)
+	}
+	if port == "" {
+		return "", fmt.Errorf("service: invalid listen address %q: the port is empty", addr)
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	} else if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		if ip.To4() != nil {
+			host = "127.0.0.1"
+		} else {
+			host = "::1"
+		}
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
 // IsLoopbackListen reports whether the address binds a loopback interface.
 // It is true for a loopback IP literal (127.0.0.0/8 or ::1) and for the
 // literal host name "localhost". Every other address, including the wildcard

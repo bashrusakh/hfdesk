@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -21,9 +20,11 @@ import (
 // therefore asks the instance itself, and a start that was reported by the
 // supervisor counts only when the HTTP server of the instance answers.
 //
-// The probe is platform neutral: it dials the bind address of the instance and
-// it sends a request to the health endpoint of the instance, so every platform
-// verifies a restart with the same check.
+// The probe is platform neutral: it asks the bind address of the instance with
+// the request of a client, so every platform verifies a restart with the same
+// check. The request of a bounded HTTP client is the whole check: a client whose
+// timeout expires, and one whose connection is refused, both report the address
+// as not serving.
 
 const (
 	// serviceProbeTimeout bounds a single readiness probe.
@@ -99,11 +100,6 @@ var serviceReadinessProbe = probeServiceReady
 // counts only when this probe accepted the instance itself.
 func probeServiceReady(listen string) error {
 	addr := probeServiceAddress(listen)
-	conn, err := net.DialTimeout("tcp", addr, serviceProbeTimeout)
-	if err != nil {
-		return err
-	}
-	_ = conn.Close()
 
 	client := &http.Client{Timeout: serviceProbeTimeout}
 	resp, err := client.Get("http://" + addr + serviceProbePath)
@@ -182,38 +178,16 @@ func serviceNotAnswering(addr string, reason error) error {
 }
 
 // probeServiceAddress maps the bind address of the instance onto the address
-// the readiness probe dials.
+// the readiness probe asks.
 //
-// A wildcard bind has no address a client can connect to: 0.0.0.0 and :: are
-// the addresses every interface of the machine answers on, and a connect() to
-// them fails with WSAEADDRNOTAVAIL on Windows and with EADDRNOTAVAIL
-// elsewhere. The probe therefore dials the loopback address of the same
-// family, which a wildcard listener accepts like any other client. Every other
-// host is used unchanged.
-//
-// The port of the bind address is always kept: the probe has to reach the
-// server of the instance and not another one.
+// The mapping is owned by LocalAddress, so the probe asks the same address the
+// desktop host opens in the browser of the user. An address that cannot be
+// mapped is used unchanged: the request then reports the error of the address
+// itself.
 func probeServiceAddress(listen string) string {
-	addr := strings.TrimSpace(listen)
-	if addr == "" {
-		addr = DefaultListen
-	}
-	host, port, err := net.SplitHostPort(addr)
+	addr, err := LocalAddress(listen)
 	if err != nil {
-		// An address that carries no port cannot be mapped: it is used
-		// unchanged, so the probe reports the error of the dial itself.
-		return addr
+		return strings.TrimSpace(listen)
 	}
-	switch host {
-	case "0.0.0.0":
-		host = "127.0.0.1"
-	case "::":
-		host = "::1"
-	case "":
-		// An empty host binds every interface of every family. The
-		// probe uses the loopback address of the IPv4 family, which a
-		// dual-stack listener accepts.
-		host = "127.0.0.1"
-	}
-	return net.JoinHostPort(host, port)
+	return addr
 }

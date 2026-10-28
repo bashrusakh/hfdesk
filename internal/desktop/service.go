@@ -6,7 +6,6 @@ package desktop
 import (
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -180,40 +179,30 @@ func serviceStateSettled(state service.State) bool {
 	return state != service.StateStarting && state != service.StateStopping
 }
 
-// serviceLoopbackHost is the host a browser of the machine reaches the
-// service through.
-const serviceLoopbackHost = "127.0.0.1"
-
 // serviceURL returns the browser URL of a service that listens on addr.
 //
 // The registration carries the address the service really binds. A wildcard
-// address is mapped onto the loopback interface, because that is the address
-// the browser of the user reaches the machine through: 0.0.0.0, :: and every
-// other spelling of "every interface" are the same bind, and an empty host
-// binds every interface as well. The literal host name "localhost" is kept:
-// the browser resolves it to the loopback interface itself, and the operator
-// of the machine may have a reason to name it.
+// address has no address a browser can open, so the address is taken from
+// service.LocalAddress: the loopback interface of the same family, which is the
+// address the readiness probe verifies the service on. The name "localhost" and
+// every concrete host are kept: a browser resolves localhost to the loopback
+// interface itself, and the operator of the machine may have a reason to name
+// it.
 //
 // An address that cannot be read as a host and a port is an error: the caller
-// reports it instead of opening a URL it invented.
+// reports it instead of opening a URL it invented. A registration without any
+// address is an error as well, because LocalAddress would name the default
+// address of a service that is not this one.
 func serviceURL(addr string) (string, error) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
 		return "", errors.New("the registration names no listen address")
 	}
-	host, port, err := net.SplitHostPort(addr)
+	local, err := service.LocalAddress(addr)
 	if err != nil {
 		return "", fmt.Errorf("the registered listen address %q cannot be read: %w", addr, err)
 	}
-	if port == "" {
-		return "", fmt.Errorf("the registered listen address %q carries no port", addr)
-	}
-	if host == "" {
-		host = serviceLoopbackHost
-	} else if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
-		host = serviceLoopbackHost
-	}
-	return "http://" + net.JoinHostPort(host, port), nil
+	return "http://" + local, nil
 }
 
 // The file names of the two Windows programs of HFDesk.

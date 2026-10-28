@@ -17,13 +17,14 @@ import (
 )
 
 // TestProbeServiceAddressMapsTheWildcardBindOntoTheLoopback checks the address
-// the readiness probe dials.
+// the readiness probe asks.
 //
 // A wildcard bind has no address a client can connect to: 0.0.0.0 and :: are
 // the addresses every interface answers on, and a connect() to them fails with
 // WSAEADDRNOTAVAIL on Windows and EADDRNOTAVAIL elsewhere. The probe therefore
-// dials the loopback address of the same family, and every other host is used
-// unchanged.
+// asks the loopback address of the same family, and every other host is used
+// unchanged. An address without a port cannot be mapped and is passed through,
+// so the request reports the error of the address.
 func TestProbeServiceAddressMapsTheWildcardBindOntoTheLoopback(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -38,6 +39,8 @@ func TestProbeServiceAddressMapsTheWildcardBindOntoTheLoopback(t *testing.T) {
 		{"an address of the network", "192.168.1.5:8080", "192.168.1.5:8080"},
 		{"a host name", "localhost:8080", "localhost:8080"},
 		{"no address at all", "", DefaultListen},
+		{"an address without a port", "127.0.0.1", "127.0.0.1"},
+		{"an address that is no host and port", "8080", "8080"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -45,6 +48,43 @@ func TestProbeServiceAddressMapsTheWildcardBindOntoTheLoopback(t *testing.T) {
 				t.Errorf("probeServiceAddress(%q) = %q, want %q", tc.listen, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestLocalAddressIsTheRuleTheProbeAsks proves the exported address rule the
+// probe and the desktop host share.
+//
+// The probe is the only caller of probeServiceAddress, so the rule has to hold
+// without it as well: an empty listen is the default address of a service, a
+// wildcard is the loopback of its family, and an address that cannot be read as
+// a host and a port is an error instead of an address a caller would dial.
+func TestLocalAddressIsTheRuleTheProbeAsks(t *testing.T) {
+	cases := []struct {
+		listen string
+		want   string
+	}{
+		{"", DefaultListen},
+		{"  0.0.0.0:8080  ", "127.0.0.1:8080"},
+		{"[::]:8080", "[::1]:8080"},
+		{":8080", "127.0.0.1:8080"},
+		{"localhost:8080", "localhost:8080"},
+		{"[::1]:8080", "[::1]:8080"},
+	}
+	for _, tc := range cases {
+		got, err := LocalAddress(tc.listen)
+		if err != nil {
+			t.Errorf("LocalAddress(%q) = %v, want %q", tc.listen, err, tc.want)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("LocalAddress(%q) = %q, want %q", tc.listen, got, tc.want)
+		}
+	}
+
+	for _, listen := range []string{"8080", "127.0.0.1", "127.0.0.1:"} {
+		if got, err := LocalAddress(listen); err == nil {
+			t.Errorf("LocalAddress(%q) = %q, want the error of an address without a host and port", listen, got)
+		}
 	}
 }
 
