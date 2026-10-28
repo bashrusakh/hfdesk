@@ -486,7 +486,9 @@ func (m *launchdManager) Restart(ctx context.Context) error {
 //
 // The description of the instance comes from the property list that is on
 // disk, so the status describes the registration and not the intent of the
-// caller. The state comes from launchd itself.
+// caller. The state comes from launchd itself, and so does the running fact:
+// a registration whose program is gone is reported as broken even while the
+// job it started still runs.
 func (m *launchdManager) Status(ctx context.Context) (Status, error) {
 	path := m.plistPath()
 	status := Status{
@@ -532,12 +534,23 @@ func (m *launchdManager) Status(ctx context.Context) (Status, error) {
 		status.State, status.Detail = launchdStatusState(m.target(), output)
 	}
 
+	// The state the supervisor reports is also the running fact of the
+	// instance: a job that runs is running, and one that is waiting to start
+	// is about to run. The fact is kept next to the diagnosis below, so a
+	// registration whose program was deleted is reported as broken while its
+	// process still serves.
+	status.Running = runningState(status.State)
+
 	// A registration that points at a program that is gone is broken: the
 	// instance can never run again until it is installed again.
 	if status.Executable != "" {
 		if _, err := os.Stat(status.Executable); err != nil {
 			status.State = StateBroken
-			status.Detail = fmt.Sprintf("the registered executable %s does not exist", status.Executable)
+			detail := fmt.Sprintf("the registered executable %s does not exist", status.Executable)
+			if status.Running {
+				detail += brokenRunningDetail
+			}
+			status.Detail = detail
 		}
 	}
 	return status, nil

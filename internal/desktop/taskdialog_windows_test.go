@@ -131,29 +131,34 @@ func TestShellExecuteInfoLayoutMatchesTheWindowsAPI(t *testing.T) {
 // the other fails here.
 func TestServiceGateChoiceForButtonMapsTheFirstButtonOntoItsLabel(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		state service.State
-		label string
-		want  serviceChoice
+		name    string
+		state   service.State
+		running bool
+		label   string
+		want    serviceChoice
 	}{
 		{name: "running", state: service.StateRunning, label: "Open HFDesk", want: serviceChoiceOpen},
 		{name: "starting", state: service.StateStarting, label: "Open HFDesk", want: serviceChoiceOpen},
 		{name: "stopped", state: service.StateStopped, label: "Start service", want: serviceChoiceStart},
 		{name: "failed", state: service.StateFailed, label: "Start service", want: serviceChoiceStart},
 		{name: "broken", state: service.StateBroken, label: "Start service", want: serviceChoiceStart},
+		// The registration is broken but the instance it started still
+		// runs: the state alone would offer the start of a service that
+		// already serves.
+		{name: "broken but running", state: service.StateBroken, running: true, label: "Open HFDesk", want: serviceChoiceOpen},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			prompt := serviceChoicePrompt{State: tc.state}
+			prompt := serviceChoicePrompt{State: tc.state, Running: tc.running}
 			if got := serviceGateOpenLabel(prompt); got != tc.label {
-				t.Errorf("the first button of the %s service is labelled %q, want %q", tc.state, got, tc.label)
+				t.Errorf("the first button of the %s service is labelled %q, want %q", tc.name, got, tc.label)
 			}
 
-			choice, err := serviceGateChoiceForButton(tc.state, serviceGateOpenButtonID)
+			choice, err := serviceGateChoiceForButton(prompt, serviceGateOpenButtonID)
 			if err != nil {
-				t.Fatalf("the first button of the %s service returned an error: %v", tc.state, err)
+				t.Fatalf("the first button of the %s service returned an error: %v", tc.name, err)
 			}
 			if choice != tc.want {
-				t.Errorf("the first button of the %s service performs %v, want %v", tc.state, choice, tc.want)
+				t.Errorf("the first button of the %s service performs %v, want %v", tc.name, choice, tc.want)
 			}
 		})
 	}
@@ -163,27 +168,31 @@ func TestServiceGateChoiceForButtonMapsTheFirstButtonOntoItsLabel(t *testing.T) 
 // maps onto the update and that every way of leaving the dialog changes
 // nothing.
 func TestServiceGateChoiceForButtonMapsTheOtherIds(t *testing.T) {
-	if choice, err := serviceGateChoiceForButton(service.StateRunning, serviceGateUpdateButtonID); err != nil || choice != serviceChoiceUpdate {
+	if choice, err := serviceGateChoiceForButton(serviceChoicePrompt{State: service.StateRunning}, serviceGateUpdateButtonID); err != nil || choice != serviceChoiceUpdate {
 		t.Errorf("the update button returned (%v, %v), want the update", choice, err)
 	}
 
-	// Both states matter for the cancel ids as well: the answer may never
+	// Both statuses matter for the cancel ids as well: the answer may never
 	// depend on the state when the user did not ask for an action.
-	for _, state := range []service.State{service.StateRunning, service.StateStopped} {
+	for _, prompt := range []serviceChoicePrompt{
+		{State: service.StateRunning},
+		{State: service.StateStopped},
+		{State: service.StateBroken, Running: true},
+	} {
 		for _, pressed := range []int32{serviceGateCancelButtonID, messageBoxCancel, 0} {
-			choice, err := serviceGateChoiceForButton(state, pressed)
+			choice, err := serviceGateChoiceForButton(prompt, pressed)
 			if err != nil {
-				t.Errorf("the cancel id %d of the %s service returned an error: %v", pressed, state, err)
+				t.Errorf("the cancel id %d of the %s service returned an error: %v", pressed, prompt.State, err)
 			}
 			if choice != serviceChoiceCancel {
-				t.Errorf("the cancel id %d of the %s service performs %v, want no action", pressed, state, choice)
+				t.Errorf("the cancel id %d of the %s service performs %v, want no action", pressed, prompt.State, choice)
 			}
 		}
 	}
 
 	// An id the dialog never sends is reported instead of guessed: a button
 	// the host does not know must not start or open anything.
-	choice, err := serviceGateChoiceForButton(service.StateStopped, 999)
+	choice, err := serviceGateChoiceForButton(serviceChoicePrompt{State: service.StateStopped}, 999)
 	if err == nil {
 		t.Error("the unknown button returned no error")
 	} else if !strings.Contains(err.Error(), "999") {

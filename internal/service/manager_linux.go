@@ -610,12 +610,13 @@ func (m *systemdManager) grantInstanceDirs(opts InstallOptions, account *user.Us
 // enables the unit for the boot of the scope when the installation has to.
 //
 // A first installation enables the registration for the boot of the scope; a
-// repeat installation keeps the autostart state it finds, so a unit an
-// administrator disabled is never enabled again, and a masked unit refuses the
-// installation instead of being replaced (see reloadAndEnable). The mask is
-// asked of the supervisor and not of the file system, so a runtime mask, which
-// lives in /run and leaves no file at the unit path, refuses the installation
-// as well.
+// repeat installation keeps the autostart state it finds, including a
+// runtime-only enablement, so a unit an administrator disabled is never enabled
+// again, a unit enabled with `systemctl enable --runtime` stays enabled at
+// runtime, and a masked unit refuses the installation instead of being replaced
+// (see reloadAndEnable). The mask is asked of the supervisor and not of the file
+// system, so a runtime mask, which lives in /run and leaves no file at the unit
+// path, refuses the installation as well.
 //
 // An installation that replaces a registration keeps every setting the request
 // did not name, so a reinstall with a new binary resets no bind address, paths,
@@ -710,15 +711,17 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	// be registered while it stays masked and cannot start.
 	//
 	// A masked unit is refused instead of silently unmasked, and a repeat
-	// installation keeps the autostart state it finds. A fresh machine is
-	// unaffected: "is-enabled" answers "not-found", which is not a mask, and
-	// a first installation enables the registration it writes anyway.
+	// installation keeps the autostart state it finds, in its mode: a unit
+	// enabled for this boot only stays enabled for this boot only. A fresh
+	// machine is unaffected: "is-enabled" answers "not-found", which is not a
+	// mask, and a first installation enables the registration it writes
+	// anyway.
 	enablement := m.registrationEnablement(ctx)
 	if enablement.masked {
 		return opts, m.maskedUnitRefusal()
 	}
 	if existed {
-		previous.enabled = enablement.enabled
+		previous.enablement = enablement.mode
 	}
 	// The directories the installation is about to create are remembered
 	// before they are created, so the account is given the ownership of
@@ -759,9 +762,10 @@ type previousRegistration struct {
 	// running reports whether the instance ran before the installation.
 	// Only such an instance is restarted.
 	running bool
-	// enabled reports whether the supervisor had the unit enabled for boot.
-	// Only a registration that existed carries the flag.
-	enabled bool
+	// enablement is the autostart state the supervisor reported for the
+	// registration, in its mode. Only a registration that existed carries
+	// it.
+	enablement enablementMode
 }
 
 // registrationOptions returns the installation options a unit registers.
@@ -805,15 +809,16 @@ func (m *systemdManager) registrationRunning(ctx context.Context) (bool, error) 
 	state := parseSystemdShow(out).State
 	// A starting instance already runs: it is about to reach the running
 	// state, and a reinstall has to switch it to the new program as well.
-	return state == StateRunning || state == StateStarting, nil
+	return runningState(state), nil
 }
 
 // registrationEnablement is what the supervisor reports about the enablement of
 // the unit.
 type registrationEnablement struct {
-	// enabled reports whether the supervisor had the unit enabled for the
-	// boot of the scope.
-	enabled bool
+	// mode is the autostart state the supervisor reported for the unit.
+	// Only an enabled unit is enabled again by a repeat installation, and
+	// the mode is kept: a runtime-only enablement stays runtime-only.
+	mode enablementMode
 	// masked reports whether the unit is masked, persistently or at
 	// runtime. A persistent mask is a link to /dev/null, so writing the
 	// unit file would replace the mask and silently undo the decision of
@@ -823,17 +828,59 @@ type registrationEnablement struct {
 	masked bool
 }
 
+// enablementMode is the autostart state of a unit, as far as an installation is
+// concerned: whether the unit is enabled for the boot of the scope, and whether
+// that enablement survives a reboot.
+type enablementMode int
+
+const (
+	// enablementNone means the unit is not enabled for boot, or the
+	// supervisor reported a state no installation can keep. The
+	// installation then enables nothing.
+	enablementNone enablementMode = iota
+	// enablementPersistent means the unit is enabled for boot and stays
+	// enabled across reboots.
+	enablementPersistent
+	// enablementRuntime means the unit is enabled for this boot only: an
+	// administrator ran `systemctl enable --runtime`.
+	enablementRuntime
+)
+
+// enablementOf returns the enablement the printed state of "systemctl
+// is-enabled" describes.
+//
+// The printed state decides, not the exit status: "is-enabled" exits zero for
+// "static", "indirect", "alias" and "linked" as well, and none of those is an
+// enablement an installation could keep. Only "enabled" and "enabled-runtime"
+// are enablements, and they differ in whether they survive a reboot, so the
+// installation preserves the mode instead of running a plain "enable".
+func enablementOf(state string) registrationEnablement {
+	switch state {
+	case "enabled":
+		return registrationEnablement{mode: enablementPersistent}
+	case "enabled-runtime":
+		return registrationEnablement{mode: enablementRuntime}
+	case "masked", "masked-runtime":
+		return registrationEnablement{masked: true}
+	default:
+		// "disabled", "not-found", "static", "indirect", "alias",
+		// "linked", an empty answer and a state a later release adds all
+		// name no enablement to keep.
+		return registrationEnablement{}
+	}
+}
+
 // registrationEnablement reads whether the supervisor had the unit enabled for
-// the boot of the scope.
+// the boot of the scope, and in which mode.
 //
 // The answer comes from the supervisor, not from the file system: an
 // enablement is the links the supervisor keeps for the [Install] section, and
-// only the supervisor knows them. "systemctl is-enabled" exits zero only for an
-// enabled unit and prints the state either way, so a non-zero status alone is
-// not an unreadable supervisor: the printed state decides whether the unit is
-// masked, and a failed read is otherwise reported as not enabled; a repeat
-// installation then leaves the autostart state alone, and a supervisor that
-// cannot be reached still fails the installation at the reload.
+// only the supervisor knows them. The printed state decides, so a state that
+// exits zero without being an enablement ("static", "indirect", "alias",
+// "linked") is not taken for one. A supervisor that cannot be reached prints
+// nothing and describes no enablement either, which leaves the autostart state
+// alone on a repeat installation, and the unreachable supervisor still fails the
+// installation at the reload.
 //
 // The mask is part of the answer for the same reason: a persistent mask is a
 // link to /dev/null at the unit path, but a runtime mask ("systemctl mask
@@ -841,16 +888,8 @@ type registrationEnablement struct {
 // only visible through the supervisor. A fresh machine reports "not-found" and
 // is not masked, which is what a first installation needs.
 func (m *systemdManager) registrationEnablement(ctx context.Context) registrationEnablement {
-	out, err := m.runSystemctl(ctx, "is-enabled", unitName)
-	state := strings.TrimSpace(out)
-	facts := registrationEnablement{
-		masked: state == "masked" || state == "masked-runtime",
-	}
-	if err != nil {
-		return facts
-	}
-	facts.enabled = true
-	return facts
+	out, _ := m.runSystemctl(ctx, "is-enabled", unitName)
+	return enablementOf(strings.TrimSpace(out))
 }
 
 // maskedUnitRefusal returns the error of an installation over a masked unit.
@@ -898,8 +937,11 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 		return err
 	}
 	// A first installation enables the unit for boot; a repeat installation
-	// keeps the autostart state it finds.
-	enable := !previous.existed || previous.enabled
+	// keeps the autostart state it finds, in the mode it found it.
+	enable := enablementPersistent
+	if previous.existed {
+		enable = previous.enablement
+	}
 	if err := m.reloadAndEnable(ctx, enable); err != nil {
 		m.rollbackUnit(ctx, previous.path, previous.content, previous.existed)
 		return err
@@ -1186,20 +1228,29 @@ func (m *systemdManager) checkSystemPaths(opts InstallOptions) error {
 }
 
 // reloadAndEnable makes the supervisor aware of the unit file and enables the
-// unit for the boot of the scope when the installation has to. The reload always
-// happens; the enable is only asked for a first installation or a registration
-// that was enabled before, so a reinstall never re-enables a unit an
-// administrator disabled. A masked unit is refused before this point, so it
-// never reaches the reload.
-func (m *systemdManager) reloadAndEnable(ctx context.Context, enable bool) error {
+// unit for the boot of the scope in the mode the installation keeps. The reload
+// always happens; the enable is only asked for a first installation or a
+// registration that was enabled before, so a reinstall never re-enables a unit
+// an administrator disabled.
+//
+// The mode is part of what is kept: a unit an administrator enabled at runtime
+// ("systemctl enable --runtime", which survives no reboot) is enabled at runtime
+// again, so a repeat installation neither makes that enablement permanent nor
+// drops it. A masked unit is refused before this point, so it never reaches the
+// reload.
+func (m *systemdManager) reloadAndEnable(ctx context.Context, mode enablementMode) error {
 	if _, err := m.runSystemctl(ctx, "daemon-reload"); err != nil {
 		return err
 	}
-	if !enable {
-		return nil
-	}
-	if _, err := m.runSystemctl(ctx, "enable", unitName); err != nil {
-		return err
+	switch mode {
+	case enablementPersistent:
+		if _, err := m.runSystemctl(ctx, "enable", unitName); err != nil {
+			return err
+		}
+	case enablementRuntime:
+		if _, err := m.runSystemctl(ctx, "enable", "--runtime", unitName); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1424,7 +1475,10 @@ func (m *systemdManager) currentState(ctx context.Context) (State, bool) {
 // address and the runtime paths come from the registered unit, not from the
 // current intent of the caller. A registered executable that is gone is
 // reported as broken, so a moved or deleted binary is never reported as a
-// running service.
+// healthy registration. The state stays the diagnosis of the registration: the
+// instance the supervisor started can still run, and Status.Running carries that
+// fact, so a caller that has to know whether anything serves does not read the
+// broken state as "nothing runs".
 //
 // The name of the status is the label of the service ("hfdesk"), not the
 // name of the unit file ("hfdesk.service"): the label is the identity the
@@ -1461,20 +1515,33 @@ func (m *systemdManager) Status(ctx context.Context) (Status, error) {
 	// reports none.
 	status.CacheDir = EffectiveCacheDir(unit.flagValue("--config"), unit.flagValue("--cache-dir"))
 
+	// The state of the supervisor is read before the registration is judged:
+	// the running fact answers a question of its own, and a registration
+	// whose executable is gone can still have a live process. A supervisor
+	// that cannot be reached is not a failure for a broken registration: the
+	// registration is described by the unit file alone then.
+	out, showErr := m.runSystemctl(ctx, "show", unitName,
+		"--property=LoadState", "--property=ActiveState", "--property=SubState")
+	show := systemdShow{State: StateUnknown}
+	if showErr == nil {
+		show = parseSystemdShow(out)
+		status.Running = runningState(show.State)
+	}
+
 	if broken, detail := brokenExecutable(status.Executable); broken {
 		status.State = StateBroken
+		if status.Running {
+			detail += brokenRunningDetail
+		}
 		status.Detail = detail
 		return status, nil
 	}
 
-	out, err := m.runSystemctl(ctx, "show", unitName,
-		"--property=LoadState", "--property=ActiveState", "--property=SubState")
-	if err != nil {
+	if showErr != nil {
 		status.State = StateUnknown
-		status.Detail = err.Error()
-		return status, err
+		status.Detail = showErr.Error()
+		return status, showErr
 	}
-	show := parseSystemdShow(out)
 	status.State = show.State
 	switch status.State {
 	case StateNotInstalled:

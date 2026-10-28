@@ -223,9 +223,9 @@ func removeFailedInstallation(ctx context.Context, manager service.Manager, fres
 			"error", err)
 		return serviceInstallKept, errServiceRemovalSkipped
 	}
-	if serviceStateRunning(status.State) || !serviceStateSettled(status.State) {
+	if serviceStatusRunning(status) || !serviceStateSettled(status.State) {
 		desktopLog.Info("the instance of the failed installation is running or still in transition: the registration is left in place",
-			"state", string(status.State))
+			"state", string(status.State), "running", status.Running)
 		return serviceInstallKept, errServiceRemovalSkipped
 	}
 
@@ -266,7 +266,7 @@ func updateWindowsService(action serviceAction, version string) error {
 	if before.State == service.StateNotInstalled {
 		return reportServiceNotInstalled(action)
 	}
-	wasRunning := serviceStateRunning(before.State)
+	wasRunning := serviceStatusRunning(before)
 
 	installed, err := manager.Install(ctx, opts)
 	if err != nil {
@@ -279,9 +279,13 @@ func updateWindowsService(action serviceAction, version string) error {
 		if wasRunning {
 			expected = "running"
 		}
+		beforeText := fmt.Sprintf("was %q before the update", before.State)
+		if wasRunning {
+			beforeText = "was running before the update"
+		}
 		reportServiceFailure(action, fmt.Errorf(
-			"the update must leave the service %s, because it was %q before the update: %w",
-			expected, before.State, err), serviceProgram(installed, opts))
+			"the update must leave the service %s, because it %s: %w",
+			expected, beforeText, err), serviceProgram(installed, opts))
 		return err
 	}
 
@@ -292,7 +296,7 @@ func updateWindowsService(action serviceAction, version string) error {
 		"wasRunning", wasRunning)
 	showMessage(serviceUpdatedCaption,
 		serviceUpdatedText(version, report, status.Paths.StateDir,
-			serviceWebAddress(status), serviceStateRunning(status.State)),
+			serviceWebAddress(status), serviceStatusRunning(status)),
 		windows.MB_ICONINFORMATION)
 	return nil
 }
@@ -363,6 +367,10 @@ func serviceInstallation() (service.InstallOptions, service.Manager, error) {
 // expectation, so an action that already holds does not wait. A pending state is
 // not a result: a started instance is reported as starting first, and the
 // caller reports what it read after the instance settled.
+//
+// The expectation is checked against the supervisor's running fact: a
+// registration whose program is gone is reported as broken while its process
+// still serves, and such a service is running for the action that is waiting.
 func waitForServiceState(ctx context.Context, manager service.Manager, wantRunning bool) (service.Status, error) {
 	deadline := time.Now().Add(serviceVerifyBudget)
 	for {
@@ -370,7 +378,7 @@ func waitForServiceState(ctx context.Context, manager service.Manager, wantRunni
 		if err != nil {
 			return status, fmt.Errorf("the state of the service cannot be read: %w", err)
 		}
-		if serviceStateRunning(status.State) == wantRunning && serviceStateSettled(status.State) {
+		if serviceStatusRunning(status) == wantRunning && serviceStateSettled(status.State) {
 			return status, nil
 		}
 		if !time.Now().Before(deadline) {
@@ -378,8 +386,8 @@ func waitForServiceState(ctx context.Context, manager service.Manager, wantRunni
 			if wantRunning {
 				expected = "running"
 			}
-			return status, fmt.Errorf("the service reports the state %q after %s, want a settled %s state",
-				status.State, serviceVerifyBudget, expected)
+			return status, fmt.Errorf("the service reports the state %q (running: %t) after %s, want a settled %s state",
+				status.State, status.Running, serviceVerifyBudget, expected)
 		}
 		select {
 		case <-ctx.Done():

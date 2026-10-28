@@ -102,6 +102,7 @@ func serviceGate() bool {
 
 	prompt := serviceChoicePrompt{
 		State:   status.State,
+		Running: status.Running,
 		Listen:  status.Listen,
 		DataDir: status.Paths.StateDir,
 		Detail:  status.Detail,
@@ -111,6 +112,7 @@ func serviceGate() bool {
 	}
 	desktopLog.Info("the Windows service is installed",
 		"state", string(status.State),
+		"running", status.Running,
 		"url", prompt.URL,
 		"dataDir", prompt.DataDir)
 

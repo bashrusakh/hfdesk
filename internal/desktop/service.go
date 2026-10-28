@@ -140,6 +140,11 @@ const (
 type serviceChoicePrompt struct {
 	// State is the state the service control manager reports.
 	State service.State
+	// Running is the supervisor's own running fact of the status the
+	// prompt was built from. A registration whose program is gone is
+	// reported as broken while its process still serves, so the running
+	// fact decides the first button together with the state.
+	Running bool
 	// Listen is the registered listen address of the service.
 	Listen string
 	// URL is the browser URL derived from Listen. It is empty when the
@@ -161,6 +166,29 @@ type serviceChoicePrompt struct {
 // treated like a stopped one and is never reported as serving.
 func serviceStateRunning(state service.State) bool {
 	return state == service.StateRunning || state == service.StateStarting
+}
+
+// serviceStatusRunning reports whether a status describes a service that runs.
+//
+// The supervisor's own fact comes first: a registration whose program is gone
+// is reported as broken while the instance it started still serves, and such a
+// status has to be taken for a running service. The state is the fallback of a
+// manager that does not report the fact, which keeps the classification as the
+// only evidence for it.
+func serviceStatusRunning(status service.Status) bool {
+	if status.Running {
+		return true
+	}
+	return serviceStateRunning(status.State)
+}
+
+// servicePromptRunning reports whether the service of a prompt runs.
+//
+// The prompt carries the running fact of the status it was built from, so the
+// question of the gate, the label of its first button and the action behind it
+// are three renderings of one decision.
+func servicePromptRunning(prompt serviceChoicePrompt) bool {
+	return prompt.Running || serviceStateRunning(prompt.State)
 }
 
 // serviceStateSettled reports whether the state is a state that lasts.

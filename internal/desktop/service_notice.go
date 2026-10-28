@@ -104,7 +104,7 @@ func installServiceText(dataDir string) string {
 // serviceGateInstruction returns the main instruction of the choice dialog of
 // the service gate.
 func serviceGateInstruction(prompt serviceChoicePrompt) string {
-	if serviceStateRunning(prompt.State) {
+	if servicePromptRunning(prompt) {
 		return "The HFDesk service is running."
 	}
 	return "The HFDesk service is installed, but it is not running."
@@ -118,7 +118,7 @@ func serviceGateInstruction(prompt serviceChoicePrompt) string {
 // fallback share it, so the two cannot tell the user different things.
 func serviceGateContent(prompt serviceChoicePrompt) string {
 	var text string
-	if serviceStateRunning(prompt.State) && prompt.URL != "" {
+	if servicePromptRunning(prompt) && prompt.URL != "" {
 		text += "The web UI of the service is at " + prompt.URL + ".\n\n"
 	}
 	if prompt.Detail != "" {
@@ -177,7 +177,7 @@ func serviceGateUnreadableText(err error) string {
 // serviceGateOpenLabel returns the label of the first button of the choice
 // dialog.
 func serviceGateOpenLabel(prompt serviceChoicePrompt) string {
-	if serviceStateRunning(prompt.State) {
+	if servicePromptRunning(prompt) {
 		return "Open HFDesk"
 	}
 	return "Start service"
@@ -197,7 +197,7 @@ const (
 // starts the service and which one updates it.
 func serviceGateFallbackChoices(prompt serviceChoicePrompt) string {
 	open := "open HFDesk in your default browser"
-	if !serviceStateRunning(prompt.State) {
+	if !servicePromptRunning(prompt) {
 		open = "start the service"
 	}
 	return "Choose Yes to " + open + ".\n" +

@@ -336,9 +336,12 @@ func scmRegistrationOptions(commandLine string, scope Scope) InstallOptions {
 // The directories of the instance are already created when the function is
 // called. A failure after the registration was written restores the previous
 // configuration; the caller removes the directories the installation created. A
-// replaced registration that was running is restarted and verified, and a
-// failure of that restart stops the instance the installation started, restores
-// the previous configuration and brings the previous program back into service.
+// configuration write the platform refuses is read back and the previous
+// configuration is restored, so a registration the platform mutated before the
+// failure is not left half changed. A replaced registration that was running is
+// restarted and verified, and a failure of that restart stops the instance the
+// installation started, restores the previous configuration and brings the
+// previous program back into service.
 func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts InstallOptions, previous previousSCMRegistration) error {
 	config := buildSCMConfig(opts)
 	handle, err := manager.OpenService(ServiceName)
@@ -397,8 +400,8 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 		// state it finds.
 		config = scmConfigWithAutostart(config, previousConfig)
 
-		if err := handle.UpdateConfig(config); err != nil {
-			return fmt.Errorf("service: update the registration of %s: %w", ServiceName, err)
+		if err := m.updateRegistrationConfig(handle, config, previous); err != nil {
+			return err
 		}
 		log.Printf("service: %s is installed already, the registration was updated", ServiceName)
 		logEvent(eventLogInfo, fmt.Sprintf("hfdesk: the registration of %s was updated", ServiceName))
@@ -619,13 +622,66 @@ func scmRunningProcessID(handle *mgr.Service) uint32 {
 	return status.ProcessId
 }
 
+// scmConfiguration is the part of a registration the installation writes.
+//
+// The interface is the seam of the test: the update of a registration and the
+// restore of a failed update are the two places that write the configuration,
+// so a Windows test can drive a registration that was mutated and then refused,
+// and a restore that fails as well, without a registration of its own.
+// "golang.org/x/sys/windows/svc/mgr".Service implements it.
+type scmConfiguration interface {
+	// UpdateConfig writes the configuration of the registration.
+	UpdateConfig(config mgr.Config) error
+	// Config reads the configuration of the registration.
+	Config() (mgr.Config, error)
+}
+
+// updateRegistrationConfig writes the configuration of an update and reports a
+// truthful outcome when the platform refuses it.
+//
+// Service.UpdateConfig is not atomic: it writes the program, then the account,
+// the delayed auto start and the description in separate calls, so a later call
+// can fail after the command line of the registration was already replaced. The
+// running instance is not touched by that write, and it is not touched here
+// either: the failure path never stops or starts anything, it puts the previous
+// configuration back and says what it proved.
+func (m *scmManager) updateRegistrationConfig(registration scmConfiguration, config mgr.Config, previous previousSCMRegistration) error {
+	err := registration.UpdateConfig(config)
+	if err == nil {
+		return nil
+	}
+	failure := fmt.Errorf("service: update the registration of %s: %w", ServiceName, err)
+	return failedUpdateRestore(registration, previous, failure)
+}
+
+// failedUpdateRestore reads the registration back after a refused update and
+// restores the configuration the installation replaced.
+//
+// The outcome is what was observed, never what was attempted: a restore that
+// was read back is reported as restored, and a read that fails, or a restore
+// that fails, is reported as a registration that may be partially changed
+// together with the reason. A registration that cannot be read back is not
+// written back either: the failure path never claims a restore it could not
+// prove, so the reason of the read is what the caller gets. The original failure
+// stays the error the caller gets, and the running instance is never stopped or
+// started here: the refused write did not touch it.
+func failedUpdateRestore(registration scmConfiguration, previous previousSCMRegistration, failure error) error {
+	if _, err := registration.Config(); err != nil {
+		return fmt.Errorf("%w (the registration of %s may be partially changed: its configuration could not be read back: %v)", failure, ServiceName, err)
+	}
+	if err := restoreSCMConfig(registration, previous); err != nil {
+		return fmt.Errorf("%w (the registration of %s may be partially changed: the previous configuration could not be restored: %v)", failure, ServiceName, err)
+	}
+	return fmt.Errorf("%w (the configuration of the previous registration of %s was restored; the running instance was not touched)", failure, ServiceName)
+}
+
 // restoreSCMRegistration puts the configuration of the registration back that a
 // failed installation replaced.
 //
 // A registration of a first installation is removed. A replaced registration is
-// written back and read back afterwards, which proves the command line and thus
-// the program of the instance. The write back leaves the failure recovery as
-// the installation configured it.
+// written back, which proves the command line and thus the program of the
+// instance. The write back leaves the failure recovery as the installation
+// configured it.
 func restoreSCMRegistration(handle *mgr.Service, previous previousSCMRegistration) error {
 	if !previous.present {
 		if err := handle.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
@@ -633,10 +689,25 @@ func restoreSCMRegistration(handle *mgr.Service, previous previousSCMRegistratio
 		}
 		return nil
 	}
-	if err := handle.UpdateConfig(previous.config); err != nil {
+	return restoreSCMConfig(handle, previous)
+}
+
+// restoreSCMConfig writes the configuration of the previous registration back
+// and reads it back afterwards.
+//
+// It is the one place the configuration of a replaced registration is restored:
+// the rollback of a failed installation and the failure path of a refused update
+// both call it, so the two cannot drift apart. The read back proves the command
+// line and thus the program of the instance; the failure recovery is not part of
+// the configuration this restores.
+func restoreSCMConfig(registration scmConfiguration, previous previousSCMRegistration) error {
+	if !previous.present {
+		return errors.New("service: the failed installation created the registration, so there is no configuration to restore")
+	}
+	if err := registration.UpdateConfig(previous.config); err != nil {
 		return fmt.Errorf("service: write the previous registration of %s back: %w", ServiceName, err)
 	}
-	config, err := handle.Config()
+	config, err := registration.Config()
 	if err != nil {
 		return fmt.Errorf("service: read the restored registration of %s back: %w", ServiceName, err)
 	}
@@ -693,12 +764,15 @@ func scmSameExecutablePath(a, b string) bool {
 	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
 }
 
-// scmInstanceRan reports whether the instance ran before an installation.
+// scmInstanceRan reports whether a supervisor state means the instance runs,
+// or is about to: it is running or starting. A registration that is not there
+// does not run, and neither does one that is stopping: it already reached its
+// wanted state, so an installation leaves it alone.
 //
-// A registration that is not there does not run, and neither does one that is
-// stopping: it already reached its wanted state, so an installation leaves it
-// alone. A running or starting instance runs: a reinstall has to switch it to
-// the new program as well.
+// The two callers ask the same question of two reads: an installation asks it
+// about the state before it changed the registration, and the status asks it
+// about the state it just read, where it is the supervisor's running fact of a
+// registration that may be broken.
 func scmInstanceRan(present bool, state svc.State) bool {
 	if !present {
 		return false
@@ -1415,6 +1489,10 @@ func scmLookupError(what string, err error) error {
 // An instance that never ran is reported as stopped: the manager reports
 // the code of a service that was never started for it, and that code is no
 // failure of the instance.
+//
+// The running fact of the state is carried as Status.Running next to the
+// diagnosis: a registration whose program was deleted is reported as broken
+// while the process the manager started keeps serving.
 func scmStatusFrom(scope Scope, facts scmRegistrationFacts) (Status, error) {
 	status := scmBaseStatus(scope)
 	if !facts.present {
@@ -1428,8 +1506,17 @@ func scmStatusFrom(scope Scope, facts scmRegistrationFacts) (Status, error) {
 	}
 	applyRegistration(&status, registration)
 
+	// The running fact is read from the same supervisor answer as the state,
+	// before the registration is judged: the service control manager keeps a
+	// process running after its program was deleted, so a broken
+	// registration can still serve.
+	status.Running = scmInstanceRan(true, facts.state)
+
 	if broken, detail := scmBrokenRegistration(status.Executable); broken {
 		status.State = StateBroken
+		if status.Running {
+			detail += brokenRunningDetail
+		}
 		status.Detail = detail
 		return status, nil
 	}

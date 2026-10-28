@@ -105,7 +105,10 @@ const (
 	// StateFailed means the service failed.
 	StateFailed State = "failed"
 	// StateBroken means the service is registered, but its executable is
-	// gone.
+	// gone. The instance itself can still be running: a supervisor keeps
+	// the process it started, and only the next start fails. The running
+	// fact is therefore carried by Status.Running and not by this state,
+	// which stays the diagnosis of the registration.
 	StateBroken State = "broken"
 	// StateUnknown means the supervisor did not report a usable state.
 	StateUnknown State = "unknown"
@@ -115,6 +118,15 @@ const (
 type Status struct {
 	// State is the lifecycle state of the instance.
 	State State
+	// Running is the supervisor's own fact: the instance runs now. It is
+	// read from the same supervisor answer as State, and it is separate
+	// from it because the two answer different questions: State classifies
+	// the registration, and a registration whose executable is gone is
+	// broken (`StateBroken`) even while its process still serves. A
+	// consumer that has to know whether anything serves reads this; a
+	// manager that does not report the fact leaves State as the only
+	// evidence.
+	Running bool
 	// Scope is the installation scope of the instance.
 	Scope Scope
 	// Name is the supervisor-visible service name/label.
@@ -134,6 +146,26 @@ type Status struct {
 	// Detail is a human-readable detail, e.g. the last error.
 	Detail string
 }
+
+// runningState reports whether a lifecycle state means the instance runs: it
+// serves, or it is on its way up and about to serve. It is the state side of
+// Status.Running, which the platform managers fill from the same supervisor
+// answer as State, so the two never describe different reads.
+//
+// The stopping state is not a running one: an instance on its way down is
+// treated like a stopped one, so a caller never reports that it serves.
+func runningState(state State) bool {
+	return state == StateRunning || state == StateStarting
+}
+
+// brokenRunningDetail is appended to the detail of a registration that is
+// broken while its instance still runs.
+//
+// The supervisor keeps the process it started, so the instance serves although
+// the registration can never start it again. The sentence is written once and
+// used by every platform manager, so the three cannot describe the same state
+// differently.
+const brokenRunningDetail = " (the instance still runs, but the registration cannot start it again)"
 
 // InstallFieldSet marks the fields of an InstallOptions that a request set
 // explicitly.

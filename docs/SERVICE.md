@@ -291,7 +291,7 @@ directory of the instance is the real log sink on macOS.
 
 | Command | Effect | A service that is not installed |
 |---|---|---|
-| `install` | Registers the service with the supervisor and enables it for the boot of the scope on a **first** installation; a **repeat** installation keeps the autostart state the registration already has — an enabled systemd unit stays enabled, a disabled one is not enabled again, a masked unit (persistent or `--runtime`) refuses the installation, and a Windows registration keeps its start type and its delayed-auto-start flag, while a running Windows service with a disabled start type refuses the installation. A macOS LaunchAgent starts the instance as soon as it is registered (`RunAtLoad`); a systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is updated in place on Windows and Linux — the settings the command does not name again are kept, a running instance is restarted on the new program, and a stopped one stays stopped — and replaced on macOS (see [Upgrades](#upgrades)). | It creates the registration. |
+| `install` | Registers the service with the supervisor and enables it for the boot of the scope on a **first** installation; a **repeat** installation keeps the autostart state the registration already has, including a runtime-only enablement — an enabled systemd unit stays enabled (and a unit enabled with `systemctl enable --runtime` is enabled at runtime again instead of being made permanent), a disabled one is not enabled again, a masked unit (persistent or `--runtime`) refuses the installation, and a Windows registration keeps its start type and its delayed-auto-start flag, while a running Windows service with a disabled start type refuses the installation. A macOS LaunchAgent starts the instance as soon as it is registered (`RunAtLoad`); a systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is updated in place on Windows and Linux — the settings the command does not name again are kept, a running instance is restarted on the new program, and a stopped one stays stopped — and replaced on macOS (see [Upgrades](#upgrades)). | It creates the registration. |
 | `uninstall` | Removes the **registration only**. | Clean success: the registration is already gone. |
 | `start` | Starts the registered service. | **Error** that says the service is not installed. |
 | `stop` | Stops the registered service. | Clean success: there is nothing running to stop. |
@@ -389,6 +389,12 @@ state of the service is `running`, `stopped`, `starting` or `stopping`, and with
 `1` when the state is `not-installed`, `broken`, `failed` or `unknown`, so a
 script can branch on it.
 
+The code follows the **state**, not the running fact: a registration that is
+`broken` exits with `1` even when the instance it started still runs, because the
+registration cannot start that instance again. Read the `State` and the `Detail`
+of the output to tell a broken registration that still serves from one that does
+not (see [Diagnosing a broken registration](#diagnosing-a-broken-registration)).
+
 The internal `run` mode is the exception in practice: it is the foreground host
 of the instance, so it only ends when the supervisor stops the instance. It ends
 with the same three codes.
@@ -404,14 +410,16 @@ with the same three codes.
 | `starting` / `stopping` | The supervisor is transitioning. |
 | `running` | The service is running. |
 | `failed` | The service failed. |
-| `broken` | Registered, but its executable is gone. |
+| `broken` | Registered, but its executable is gone. The instance the supervisor started can still be running; the `Detail` says so. |
 | `unknown` | The supervisor did not report a usable state. |
 
 A registration points at an **absolute executable path**. If the binary is
 moved or deleted, the registration stays in place but cannot run: `status`
-reports the registration as `broken` and names the missing executable, rather
-than reporting a running service. The fix is to restore the binary at the
-registered path, or to reinstall the service from the new path:
+reports the registration as `broken` and names the missing executable, and the
+detail says whether the instance still runs — a supervisor keeps the process it
+started, so deleting the program stops the next start and not the running
+instance. The fix is to restore the binary at the registered path, or to
+reinstall the service from the new path:
 
 ```bash
 hfdesk service status             # shows the broken registration
@@ -584,7 +592,8 @@ replaces the other.
   | Registered state | Buttons |
   |---|---|
   | running | **Open HFDesk** / **Update service** / **Cancel** |
-  | stopped, failed or broken | **Start service** / **Update service** / **Cancel** |
+  | broken, but the instance still runs | **Open HFDesk** / **Update service** / **Cancel** |
+  | stopped, failed, or broken without a running instance | **Start service** / **Update service** / **Cancel** |
 
   A service that reports `starting` or `stopping` is not asked about: the
   launch waits for the state to settle and then asks about the state it
@@ -605,8 +614,10 @@ replaces the other.
   its settings and its running state: a running service keeps running on the new
   program, and a stopped service stays stopped. A registration that is broken or
   stopped is therefore re-pointed at the new program by an update, but it serves
-  nothing until it is started explicitly (`Start service`, or
-  `hfdesk service start`).
+  nothing until its program is restored and it is started explicitly (`Start
+  service`, or `hfdesk service start`). A broken registration whose instance
+  still runs is the exception: the update keeps that instance running on the new
+  program, and the report names the address it serves.
 - **The dialog** is a Windows task dialog, which needs the common controls
   version 6 that the embedded application manifest declares. A locally built
   binary without that resource still works: it falls back to a message box that
@@ -761,7 +772,10 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   registration and not of the command: a repeat installation writes the
   autostart state the registration already has, so a reinstall with a new binary
   never undoes a decision of an administrator. An enabled systemd unit stays
-  enabled, and a unit that is disabled is not enabled again; on Windows the start
+  enabled, and a unit that is disabled is not enabled again; a unit enabled with
+  `systemctl enable --runtime` keeps exactly that runtime-only enablement and is
+  enabled again with `--runtime`, so a repeat installation never turns it into a
+  permanent one. On Windows the start
   type and the delayed-auto-start flag are written back as they are, so a manual
   or a disabled start stays manual or disabled and a delayed automatic start
   stays delayed. Only a **first** installation enables the registration it
@@ -802,20 +816,30 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   `3xx` answer is returned as it is and rejected, so a foreign server cannot
   point the probe at the health document of a real HFDesk on another address. A
   probe that does not succeed within the budget is a failed update that rolls
-  back. An instance that was stopped,
-  failed, broken or absent is **not** started: `install` never starts a service
-  that was not running, and starting stays an explicit `service start`.
+  back. An instance that was stopped, failed, or absent is **not** started:
+  `install` never starts a service that was not running, and starting stays an
+  explicit `service start`. A registration that is `broken` follows the running
+  fact and not the state: an instance the supervisor still runs is restarted on
+  the new program like any other running one, and a broken registration whose
+  instance is gone is not started.
 - **A failure says what it restored.** A failure before the registration is
   written leaves a running instance untouched. A failure after the registration
   was written restores the previous registration: its configuration is written
   back, and the failure recovery the attempt configured is not part of that
-  restore and stays in place. A failure after the restart brings the previous
-  program back into service: the restart rollback stops the instance the failed
-  update started before it restores the previous registration, and when that
-  stop cannot be proven it keeps the failed registration instead of leaving a
-  registration that names another program than the one that runs. The error
-  names the proven outcome in every case, so a failed installation never reports
-  success from the registration write alone.
+  restore and stays in place. A configuration write the platform refuses part way
+  through is read back and the previous configuration is restored before the
+  failure is reported — Windows writes the program, the account, the delayed
+  start and the description in separate calls, so the command line can already be
+  replaced when a later one fails — and the report says which of the two it
+  proved: that the previous configuration is in place again, or that the
+  registration may be partially changed together with the reason. The running
+  instance is not stopped or started on that path. A failure after the restart
+  brings the previous program back into service: the restart rollback stops the
+  instance the failed update started before it restores the previous
+  registration, and when that stop cannot be proven it keeps the failed
+  registration instead of leaving a registration that names another program than
+  the one that runs. The error names the proven outcome in every case, so a
+  failed installation never reports success from the registration write alone.
 
 macOS is unchanged: `install` there replaces the registration, so an upgrade on
 macOS stays the stop/replace/start procedure above.

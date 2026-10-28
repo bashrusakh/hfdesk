@@ -1067,6 +1067,65 @@ func TestSystemdStatusReportsAMissingExecutable(t *testing.T) {
 	})
 }
 
+// TestSystemdStatusKeepsTheRunningFactOfABrokenRegistration checks that the
+// status of a registration whose program is gone keeps the running fact of the
+// supervisor next to the broken diagnosis.
+//
+// systemd keeps the process it started, so deleting the program stops the next
+// start and not the instance. The state therefore stays broken, and the detail
+// says whether the instance still runs, so a caller that has to know whether
+// anything serves does not read "broken" as "nothing runs".
+func TestSystemdStatusKeepsTheRunningFactOfABrokenRegistration(t *testing.T) {
+	cases := []struct {
+		name string
+		// active is the state the supervisor reports.
+		active string
+		// wantRunning is the running fact of that state.
+		wantRunning bool
+	}{
+		{"the instance still runs", "active", true},
+		{"the instance does not run", "inactive", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := systemdRecordingSupervisor(t)
+			missing := filepath.Join(t.TempDir(), "bin", "hfdesk")
+			opts := systemdExistingOptions(t, missing, t.TempDir())
+			m, _, _ := systemdExistingInstallation(t, opts)
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", tc.active)
+
+			status, err := m.Status(context.Background())
+			if err != nil {
+				t.Fatalf("Status() = %v, want nil", err)
+			}
+			if status.State != StateBroken {
+				t.Errorf("the state = %q, want the diagnosis %q of the registration", status.State, StateBroken)
+			}
+			if status.Running != tc.wantRunning {
+				t.Errorf("the running fact = %v, want %v", status.Running, tc.wantRunning)
+			}
+			if !strings.Contains(status.Detail, missing) {
+				t.Errorf("the detail = %q, want it to name the missing program %q", status.Detail, missing)
+			}
+			if got := strings.Contains(status.Detail, "the instance still runs"); got != tc.wantRunning {
+				t.Errorf("the detail = %q, want the running fact %v to be described", status.Detail, tc.wantRunning)
+			}
+
+			// The running fact comes from the supervisor, so a broken
+			// registration is asked about as well.
+			shows := 0
+			for _, call := range systemdSupervisorCalls(t, logPath) {
+				if strings.HasPrefix(strings.TrimPrefix(call, "--user "), "show ") {
+					shows++
+				}
+			}
+			if shows != 1 {
+				t.Errorf("the supervisor was asked for the state %d times, want once", shows)
+			}
+		})
+	}
+}
+
 // systemdStatus registers a unit with the given arguments in a temporary
 // configuration directory and returns the status of the instance.
 //
@@ -2992,7 +3051,7 @@ func TestSystemdFailedInstallKeepsACreatedDirectoryThatHoldsData(t *testing.T) {
 	// The error of the failed supervisor call is the error the caller
 	// gets: the cleanup of the directories never replaces it.
 	t.Setenv("HFDESK_TEST_MARKER_DIR", t.TempDir())
-	wantErr := m.reloadAndEnable(context.Background(), true)
+	wantErr := m.reloadAndEnable(context.Background(), enablementPersistent)
 	if wantErr == nil {
 		t.Fatal("the fake supervisor did not fail")
 	}
@@ -3612,17 +3671,20 @@ func TestSystemdRestartVerifyWaitIsTheShutdownBudget(t *testing.T) {
 // helper returned.
 //
 // The enablement that "is-enabled" reports is HFDESK_TEST_SYSTEMCTL_ENABLED_STATE:
-// "enabled" (the default) exits with a zero status, so the unit counts as
-// enabled for boot, and every other state ("disabled", "masked",
+// "enabled" (the default) and "enabled-runtime" exit with a zero status, so the
+// unit counts as enabled for boot, and every other state ("disabled", "masked",
 // "masked-runtime") exits with a non-zero status, so a test can drive a repeat
 // installation of a unit its administrator disabled or of a masked unit that the
-// installation refuses. "masked" is a persistent mask, which the fake supervisor
-// reports while a unit file may exist; "masked-runtime" is the state of a unit
-// masked at runtime, which a test combines with an absent unit file, because the
-// mask lives in /run and leaves nothing at the unit path. "not-found" is what a
-// fresh machine reports for a unit it does not know. An "enable" that fails once
+// installation refuses. "static", "indirect", "alias" and "linked" exit with a
+// zero status as well, the way the real supervisor answers them, so a test proves
+// that the printed state and not the status decides. "masked" is a persistent
+// mask, which the fake supervisor reports while a unit file may exist;
+// "masked-runtime" is the state of a unit masked at runtime, which a test
+// combines with an absent unit file, because the mask lives in /run and leaves
+// nothing at the unit path. "not-found" is what a fresh machine reports for a
+// unit it does not know. An "enable" that fails once
 // HFDESK_TEST_SYSTEMCTL_ENABLE_FAIL is "1" drives the failure of an installation
-// that cannot enable its registration.
+// that cannot enable its registration; "enable --runtime" fails with it.
 //
 // The log path is returned. It is written even when the supervisor is asked
 // for a property only, so a test can tell a restart from a state query.
@@ -3641,9 +3703,14 @@ case "$1" in
 is-enabled)
 	state="${HFDESK_TEST_SYSTEMCTL_ENABLED_STATE:-enabled}"
 	echo "$state"
-	if [ "$state" = "enabled" ]; then
+	case "$state" in
+	enabled|enabled-runtime|static|indirect|alias|linked)
+		# The supervisor exits zero for every one of these states, and only
+		# "enabled" and "enabled-runtime" are enablements: the printed
+		# state decides what an installation keeps.
 		exit 0
-	fi
+		;;
+	esac
 	exit 1
 	;;
 enable)
@@ -4248,27 +4315,39 @@ func systemdSupervisorCallIndex(calls []string, command ...string) int {
 }
 
 // TestSystemdReinstallKeepsTheAutostartStateOfTheUnit checks that a repeat
-// installation keeps the autostart state it finds.
+// installation keeps the autostart state it finds, including its mode.
 //
 // A first installation enables the registration for boot. A repeat installation
 // must not undo the decision of an administrator: a unit that was enabled before
-// is enabled again, so the new unit file keeps starting at boot, and a unit that
-// is disabled is left alone. A masked unit is refused instead of being replaced,
-// see TestSystemdInstallRefusesAMaskedUnit. The supervisor is reloaded in every
-// case, so it picks the new unit file up, and the enablement is read before the
-// unit file is written, so the state that is kept is the state of the unit the
-// installation replaces.
+// is enabled again, a unit that was disabled is left alone, and a unit an
+// administrator enabled for this boot only ("systemctl enable --runtime") is
+// enabled at runtime again instead of being made permanent. A masked unit is
+// refused instead of being replaced, see TestSystemdInstallRefusesAMaskedUnit.
+// The "static", "indirect", "alias" and "linked" states exit with a zero status
+// of the supervisor and are not enablements either: the printed state decides,
+// not the status. The supervisor is reloaded in every case, so it picks the new
+// unit file up, and the enablement is read before the unit file is written, so
+// the state that is kept is the state of the unit the installation replaces.
 func TestSystemdReinstallKeepsTheAutostartStateOfTheUnit(t *testing.T) {
 	cases := []struct {
 		name string
 		// state is the enablement the supervisor reports for the unit
 		// that is installed already.
 		state string
-		// wantEnabled is how often the installation may enable the unit.
+		// wantEnabled is how often the installation may enable the unit
+		// persistently.
 		wantEnabled int
+		// wantRuntime is how often the installation may enable the unit
+		// for this boot only.
+		wantRuntime int
 	}{
-		{"a unit that is enabled", "enabled", 1},
-		{"a unit that is disabled", "disabled", 0},
+		{"a unit that is enabled", "enabled", 1, 0},
+		{"a unit that is enabled for this boot only", "enabled-runtime", 0, 1},
+		{"a unit that is disabled", "disabled", 0, 0},
+		{"a unit that is static", "static", 0, 0},
+		{"a unit that is indirect", "indirect", 0, 0},
+		{"a unit that is an alias", "alias", 0, 0},
+		{"a unit that is linked", "linked", 0, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -4289,7 +4368,10 @@ func TestSystemdReinstallKeepsTheAutostartStateOfTheUnit(t *testing.T) {
 
 			calls := systemdSupervisorCalls(t, logPath)
 			if got := systemdSupervisorCallsTo(calls, "enable", unitName); got != tc.wantEnabled {
-				t.Errorf("the unit was enabled %d times, want %d for a unit that was %q before:\n%s", got, tc.wantEnabled, tc.state, strings.Join(calls, "\n"))
+				t.Errorf("the unit was enabled permanently %d times, want %d for a unit that was %q before:\n%s", got, tc.wantEnabled, tc.state, strings.Join(calls, "\n"))
+			}
+			if got := systemdSupervisorCallsTo(calls, "enable", "--runtime", unitName); got != tc.wantRuntime {
+				t.Errorf("the unit was enabled at runtime %d times, want %d for a unit that was %q before:\n%s", got, tc.wantRuntime, tc.state, strings.Join(calls, "\n"))
 			}
 			if got := systemdSupervisorCallsTo(calls, "daemon-reload"); got == 0 {
 				t.Errorf("the supervisor was never reloaded:\n%s", strings.Join(calls, "\n"))
@@ -4301,6 +4383,46 @@ func TestSystemdReinstallKeepsTheAutostartStateOfTheUnit(t *testing.T) {
 			}
 			if enabledAt > reloadAt {
 				t.Errorf("the enablement was read after the supervisor was reloaded, the state of the replaced unit is not the state that was kept:\n%s", strings.Join(calls, "\n"))
+			}
+		})
+	}
+}
+
+// TestSystemdEnablementOfThePrintedState checks the mapping of the printed
+// state of "systemctl is-enabled" onto the enablement an installation keeps.
+//
+// The status of the supervisor is not the answer: "is-enabled" exits zero for
+// "static", "indirect", "alias" and "linked" as well, and a plain "enable" of
+// one of those would either fail the installation or enable a unit for a boot
+// nobody asked for. Only "enabled" and "enabled-runtime" are kept, and the mask
+// is a refusal of its own.
+func TestSystemdEnablementOfThePrintedState(t *testing.T) {
+	cases := []struct {
+		state string
+		want  enablementMode
+	}{
+		{"enabled", enablementPersistent},
+		{"enabled-runtime", enablementRuntime},
+		{"disabled", enablementNone},
+		{"masked", enablementNone},
+		{"masked-runtime", enablementNone},
+		{"static", enablementNone},
+		{"indirect", enablementNone},
+		{"alias", enablementNone},
+		{"linked", enablementNone},
+		{"not-found", enablementNone},
+		{"", enablementNone},
+		{"a state of a later release", enablementNone},
+	}
+	for _, tc := range cases {
+		t.Run(tc.state, func(t *testing.T) {
+			facts := enablementOf(tc.state)
+			if facts.mode != tc.want {
+				t.Errorf("enablementOf(%q).mode = %d, want %d", tc.state, facts.mode, tc.want)
+			}
+			wantMasked := tc.state == "masked" || tc.state == "masked-runtime"
+			if facts.masked != wantMasked {
+				t.Errorf("enablementOf(%q).masked = %v, want %v", tc.state, facts.masked, wantMasked)
 			}
 		})
 	}

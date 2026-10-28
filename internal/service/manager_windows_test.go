@@ -888,6 +888,9 @@ func TestSCMStatusFromRegistrationReportsTheStateAndTheCommandLine(t *testing.T)
 	if status.State != StateRunning {
 		t.Errorf("the state = %q, want %q", status.State, StateRunning)
 	}
+	if !status.Running {
+		t.Error("a running instance is reported as not running")
+	}
 	if status.Scope != ScopeSystem {
 		t.Errorf("the scope = %q, want %q", status.Scope, ScopeSystem)
 	}
@@ -961,6 +964,47 @@ func TestSCMStatusFromABrokenRegistrationNamesTheMissingExecutable(t *testing.T)
 	}
 	if !strings.Contains(status.Detail, missing) {
 		t.Errorf("the detail = %q, want the path of the missing executable %q", status.Detail, missing)
+	}
+	if status.Running {
+		t.Error("a stopped instance is reported as running")
+	}
+}
+
+// TestSCMStatusFromABrokenRegistrationThatRunsKeepsTheRunningFact checks that a
+// registration whose executable is gone is reported as broken while the instance
+// it started still runs.
+//
+// The service control manager keeps the process it started: deleting the program
+// stops the next start, not the instance. The state stays the diagnosis of the
+// registration, and the running fact is carried next to it, so a caller that has
+// to know whether anything serves does not read "broken" as "nothing runs".
+func TestSCMStatusFromABrokenRegistrationThatRunsKeepsTheRunningFact(t *testing.T) {
+	root := t.TempDir()
+	missing := filepath.Join(root, "gone", "hfdesk.exe")
+	opts := scmTestOptions()
+	opts.Executable = missing
+
+	facts := scmRegistrationFacts{
+		present:     true,
+		state:       svc.Running,
+		processID:   4242,
+		commandLine: scmCommandLine(opts),
+	}
+
+	status, err := scmStatusFrom(ScopeSystem, facts)
+	if err != nil {
+		t.Fatalf("scmStatusFrom() = %v, want nil", err)
+	}
+	if status.State != StateBroken {
+		t.Errorf("the state = %q, want the diagnosis %q of the registration", status.State, StateBroken)
+	}
+	if !status.Running {
+		t.Error("a registration the supervisor reports as running is reported as not running")
+	}
+	for _, want := range []string{missing, "the instance still runs"} {
+		if !strings.Contains(status.Detail, want) {
+			t.Errorf("the detail = %q, want it to mention %q", status.Detail, want)
+		}
 	}
 }
 
@@ -1077,11 +1121,13 @@ func TestSCMStatusFromKeepsTheOtherSupervisorStates(t *testing.T) {
 		name  string
 		state svc.State
 		want  State
+		// wantRunning is the running fact of the same supervisor answer.
+		wantRunning bool
 	}{
-		{"running", svc.Running, StateRunning},
-		{"start pending", svc.StartPending, StateStarting},
-		{"stop pending", svc.StopPending, StateStopping},
-		{"paused", svc.Paused, StateUnknown},
+		{"running", svc.Running, StateRunning, true},
+		{"start pending", svc.StartPending, StateStarting, true},
+		{"stop pending", svc.StopPending, StateStopping, false},
+		{"paused", svc.Paused, StateUnknown, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1105,6 +1151,9 @@ func TestSCMStatusFromKeepsTheOtherSupervisorStates(t *testing.T) {
 			}
 			if status.State != tc.want {
 				t.Errorf("the state = %q, want %q", status.State, tc.want)
+			}
+			if status.Running != tc.wantRunning {
+				t.Errorf("the running fact = %v, want %v", status.Running, tc.wantRunning)
 			}
 			if status.Detail != "" {
 				t.Errorf("the detail = %q, want none", status.Detail)
@@ -3582,6 +3631,177 @@ func TestSCMInstanceRan(t *testing.T) {
 				t.Errorf("scmInstanceRan(%v, %v) = %v, want %v", tc.present, tc.state, got, tc.want)
 			}
 		})
+	}
+}
+
+// fakeSCMConfiguration is the configuration of a registration of a test.
+//
+// It implements scmConfiguration, so the failure path of an update can be driven
+// without a registration of its own. A refused write can apply the configuration
+// first, which is what the platform leaves behind when a later call of the
+// non-atomic update fails, and a read can be refused as well. The fake has no
+// start and no stop: the failure path of an update never touches the running
+// instance, and a type that cannot do it proves that.
+type fakeSCMConfiguration struct {
+	// config is the configuration the registration holds.
+	config mgr.Config
+	// writes are the configurations the writes tried to store, in order.
+	writes []mgr.Config
+	// writeErrs are the errors of the writes, per call: a missing entry
+	// keeps the write. A refused write stores the configuration first when
+	// applyBeforeRefusing is set, so a partial update can be simulated.
+	writeErrs []error
+	// applyBeforeRefusing stores a configuration before its write refuses
+	// it.
+	applyBeforeRefusing bool
+	// readErr is the error of every read.
+	readErr error
+}
+
+// UpdateConfig records the write and returns the error of the call.
+func (f *fakeSCMConfiguration) UpdateConfig(config mgr.Config) error {
+	index := len(f.writes)
+	f.writes = append(f.writes, config)
+	var err error
+	if index < len(f.writeErrs) {
+		err = f.writeErrs[index]
+	}
+	if err == nil || f.applyBeforeRefusing {
+		f.config = config
+	}
+	return err
+}
+
+// Config returns the configuration the registration holds.
+func (f *fakeSCMConfiguration) Config() (mgr.Config, error) {
+	if f.readErr != nil {
+		return mgr.Config{}, f.readErr
+	}
+	return f.config, nil
+}
+
+// TestSCMFailedUpdateConfigRestoresThePreviousConfiguration checks the failure
+// path of a configuration write that the platform refuses.
+//
+// Service.UpdateConfig is not atomic: the command line can be replaced before a
+// later call of the same update fails. The failure path reads the registration
+// back and restores the configuration it replaced, and the report says exactly
+// what was proved: a restore that was read back, a restore that failed, and a
+// read that failed all name their outcome, and the original failure stays the
+// error the caller gets.
+func TestSCMFailedUpdateConfigRestoresThePreviousConfiguration(t *testing.T) {
+	previousConfig := mgr.Config{
+		ServiceType:      windows.SERVICE_WIN32_OWN_PROCESS,
+		StartType:        mgr.StartAutomatic,
+		ErrorControl:     mgr.ErrorNormal,
+		BinaryPathName:   `C:\old\hfdesk.exe service run --listen 127.0.0.1:8080`,
+		ServiceStartName: scmLocalServiceAccount,
+	}
+	requestedConfig := buildSCMConfig(scmTestOptions())
+	updateErr := errors.New("the service control manager refused the description")
+	restoreErr := errors.New("the service control manager refused the command line")
+
+	cases := []struct {
+		name string
+		// fake is the registration the update is written to.
+		fake *fakeSCMConfiguration
+		// want is a sentence the report has to carry.
+		want []string
+		// wantUnproven is true when the report must not claim a restore.
+		wantUnproven bool
+		// noRestoreWrite is true when the registration is written once
+		// only: a read that fails cannot be followed by a restore that
+		// would be read back anyway.
+		noRestoreWrite bool
+	}{
+		{
+			name: "the configuration is restored",
+			fake: &fakeSCMConfiguration{
+				config:              previousConfig,
+				writeErrs:           []error{updateErr},
+				applyBeforeRefusing: true,
+			},
+			want: []string{"update the registration", updateErr.Error(), "was restored"},
+		},
+		{
+			name: "the restore also fails",
+			fake: &fakeSCMConfiguration{
+				config:              previousConfig,
+				writeErrs:           []error{updateErr, restoreErr},
+				applyBeforeRefusing: true,
+			},
+			want:         []string{"update the registration", updateErr.Error(), "may be partially changed", restoreErr.Error()},
+			wantUnproven: true,
+		},
+		{
+			name: "the registration cannot be read back",
+			fake: &fakeSCMConfiguration{
+				config:              previousConfig,
+				writeErrs:           []error{updateErr},
+				applyBeforeRefusing: true,
+				readErr:             errors.New("the service control manager is gone"),
+			},
+			want:           []string{"update the registration", updateErr.Error(), "may be partially changed", "could not be read back"},
+			wantUnproven:   true,
+			noRestoreWrite: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &scmManager{scope: ScopeSystem}
+			previous := previousSCMRegistration{present: true, config: previousConfig}
+
+			err := m.updateRegistrationConfig(tc.fake, requestedConfig, previous)
+			if err == nil {
+				t.Fatal("updateRegistrationConfig() = nil, want the failure of the update")
+			}
+			if !errors.Is(err, updateErr) {
+				t.Errorf("updateRegistrationConfig() = %v, want the original failure wrapped", err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("updateRegistrationConfig() = %q, want it to mention %q", err, want)
+				}
+			}
+			if tc.wantUnproven && strings.Contains(err.Error(), "was restored") {
+				t.Errorf("updateRegistrationConfig() = %q, want no claim that the configuration was restored", err)
+			}
+
+			// The update wrote once, and the restore is the second write
+			// whenever the registration could be read back.
+			wantWrites := 2
+			if tc.noRestoreWrite {
+				wantWrites = 1
+			}
+			if len(tc.fake.writes) != wantWrites {
+				t.Fatalf("the registration was written %d times, want %d", len(tc.fake.writes), wantWrites)
+			}
+			if !scmSameRegistration(tc.fake.writes[0].BinaryPathName, requestedConfig.BinaryPathName) {
+				t.Errorf("the first write carries %q, want the requested registration", tc.fake.writes[0].BinaryPathName)
+			}
+			if tc.noRestoreWrite {
+				return
+			}
+			if !scmSameRegistration(tc.fake.writes[1].BinaryPathName, previousConfig.BinaryPathName) {
+				t.Errorf("the second write carries %q, want the previous registration", tc.fake.writes[1].BinaryPathName)
+			}
+		})
+	}
+}
+
+// TestSCMFailedUpdateConfigKeepsASuccessfulWrite checks that a configuration
+// write the platform accepts needs no restore and reports no failure.
+func TestSCMFailedUpdateConfigKeepsASuccessfulWrite(t *testing.T) {
+	previousConfig := mgr.Config{BinaryPathName: `C:\old\hfdesk.exe service run`}
+	requestedConfig := buildSCMConfig(scmTestOptions())
+	registration := &fakeSCMConfiguration{config: previousConfig}
+
+	m := &scmManager{scope: ScopeSystem}
+	if err := m.updateRegistrationConfig(registration, requestedConfig, previousSCMRegistration{present: true, config: previousConfig}); err != nil {
+		t.Fatalf("updateRegistrationConfig() = %v, want nil", err)
+	}
+	if len(registration.writes) != 1 {
+		t.Errorf("the registration was written %d times, want the update only", len(registration.writes))
 	}
 }
 

@@ -472,6 +472,55 @@ func TestServiceGateOpensAStartingServiceAfterItSettled(t *testing.T) {
 	}
 }
 
+// TestServiceGateOpensABrokenButRunningService proves that a launch offers the
+// running service when the registration is broken but the instance still runs.
+//
+// A registration whose program was deleted is reported as broken, and the
+// service control manager keeps the process it started. The launch has to offer
+// "Open HFDesk" for it: offering the start of a service that already serves
+// would send the user to a second start of the same instance.
+func TestServiceGateOpensABrokenButRunningService(t *testing.T) {
+	broken := runningServiceStatus(service.StateBroken, "127.0.0.1:18080")
+	broken.Running = true
+	broken.Detail = "the registered executable C:\\portable\\hfdesk.exe does not exist"
+
+	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+		return broken, nil
+	})
+	replaceSeam(t, &showServiceChoice, func(prompt serviceChoicePrompt) serviceChoice {
+		if prompt.State != service.StateBroken {
+			t.Errorf("the dialog asked about the state %q, want the broken registration", prompt.State)
+		}
+		if !prompt.Running {
+			t.Error("the prompt does not carry the running fact of the broken registration")
+		}
+		if got, want := serviceGateOpenLabel(prompt), "Open HFDesk"; got != want {
+			t.Errorf("the first button is %q, want %q", got, want)
+		}
+		return serviceChoiceOpen
+	})
+	var opened []string
+	replaceSeam(t, &openBrowser, func(url string) error {
+		opened = append(opened, url)
+		return nil
+	})
+	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+		t.Fatal("the gate started a service that is already running")
+		return 0, nil
+	})
+	messages := recordMessages(t)
+
+	if serviceGate() {
+		t.Fatal("the service gate let a launch with an installed service start its own server")
+	}
+	if len(opened) != 1 || opened[0] != "http://127.0.0.1:18080" {
+		t.Errorf("the gate opened %v, want the web UI of the running service", opened)
+	}
+	if len(*messages) != 0 {
+		t.Errorf("the gate showed %v, want no notice", *messages)
+	}
+}
+
 // TestServiceGateStartsAStoppingServiceAfterItSettled proves that a launch that
 // finds the service stopping waits for it to settle and only then offers the
 // start of the stopped service.
@@ -988,6 +1037,69 @@ func TestServiceHelperUpdateKeepsARunningServiceRunning(t *testing.T) {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
 		}
+	}
+}
+
+// TestServiceHelperUpdateKeepsTheRunningFactOfABrokenRegistration proves that
+// the running fact of a broken registration decides what the update expects.
+//
+// A registration whose program was deleted is reported as broken. The service
+// control manager keeps the process it started, so the registration can still
+// serve: the update of such a service has to expect a running service and must
+// not fail although the manager restarted it. A broken registration without a
+// running instance stays stopped.
+func TestServiceHelperUpdateKeepsTheRunningFactOfABrokenRegistration(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		running bool
+	}{
+		{name: "broken but running", running: true},
+		{name: "broken and stopped", running: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			replaceSeam(t, &serviceVerifyBudget, 100*time.Millisecond)
+			replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+				return `C:\portable\hfdesk.exe`, nil
+			})
+
+			broken := runningServiceStatus(service.StateBroken, "127.0.0.1:18080")
+			broken.Running = tc.running
+			manager := &fakeServiceManager{
+				statuses: []service.Status{broken, broken},
+				installResult: service.InstallOptions{
+					Executable: `C:\portable\hfdesk.exe`,
+					Listen:     broken.Listen,
+					Paths:      broken.Paths,
+				},
+			}
+			replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+				return manager, nil
+			})
+			messages := recordMessages(t)
+
+			if err := RunServiceAction(ServiceActionOptions{Action: "update", Version: "1.3.0"}); err != nil {
+				t.Fatalf("the update of the %s service failed: %v", tc.name, err)
+			}
+			if manager.starts != 0 {
+				t.Errorf("the update started the service %d times, want the service layer to decide", manager.starts)
+			}
+			if len(*messages) != 1 {
+				t.Fatalf("the helper showed %d message boxes, want the report of the update", len(*messages))
+			}
+			text := (*messages)[0].text
+			if tc.running {
+				if !strings.Contains(text, "http://127.0.0.1:18080") {
+					t.Errorf("the report %q does not name the address of the running service", text)
+				}
+				if strings.Contains(text, "stays stopped") {
+					t.Errorf("the report %q claims the running service stays stopped", text)
+				}
+				return
+			}
+			if !strings.Contains(text, "stays stopped") {
+				t.Errorf("the report %q does not say that the stopped service stays stopped", text)
+			}
+		})
 	}
 }
 
