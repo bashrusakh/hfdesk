@@ -12,8 +12,10 @@ The supervisor owns the lifecycle completely:
   shortcut.
 - The service is headless: it never opens a browser and never shows a tray
   icon.
-- The supervisor starts the instance at boot of its scope and restarts it when
-  it fails.
+- The supervisor starts the instance at boot of its scope when the registration
+  is set to do so — a first installation writes that autostart, and a repeat
+  installation keeps the autostart state it finds (see
+  [Upgrades](#upgrades)) — and restarts it when it fails.
 
 Service mode is a **separate command family**. `hfdesk` without a `service`
 subcommand behaves exactly as before: same flags, same config precedence, same
@@ -289,7 +291,7 @@ directory of the instance is the real log sink on macOS.
 
 | Command | Effect | A service that is not installed |
 |---|---|---|
-| `install` | Registers the service with the supervisor and enables it for the boot of the scope. A macOS LaunchAgent starts the instance as soon as it is registered (`RunAtLoad`); a systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is updated in place on Windows and Linux — the settings the command does not name again are kept, a running instance is restarted on the new program, and a stopped one stays stopped — and replaced on macOS (see [Upgrades](#upgrades)). | It creates the registration. |
+| `install` | Registers the service with the supervisor and enables it for the boot of the scope on a **first** installation; a **repeat** installation keeps the autostart state the registration already has — an enabled systemd unit stays enabled, a disabled or masked one is not enabled again, and a Windows registration keeps its start type and its delayed-auto-start flag. A macOS LaunchAgent starts the instance as soon as it is registered (`RunAtLoad`); a systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is updated in place on Windows and Linux — the settings the command does not name again are kept, a running instance is restarted on the new program, and a stopped one stays stopped — and replaced on macOS (see [Upgrades](#upgrades)). | It creates the registration. |
 | `uninstall` | Removes the **registration only**. | Clean success: the registration is already gone. |
 | `start` | Starts the registered service. | **Error** that says the service is not installed. |
 | `stop` | Stops the registered service. | Clean success: there is nothing running to stop. |
@@ -550,7 +552,10 @@ replaces the other.
   administrators can modify: the service runs that program as `LocalService`,
   and HFDesk never changes the permissions of a user folder. Windows shows its
   standard administrator prompt, the elevated helper installs the service,
-  starts it and verifies that it runs, and reports the result in a message box.
+  starts it and verifies that it runs — that the server on the registered
+  address answers as HFDesk, with the health document of the instance or, for a
+  protected instance, its Basic-auth challenge — and reports the result in a
+  message box.
   A declined prompt or a missing console program changes nothing and leaves the
   desktop app running.
 
@@ -752,6 +757,15 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   or `--executable`. A flag named again changes that setting, and `--cache-dir`
   without `--hub-dir` moves the hub directory with the cache root, exactly as it
   does on a first installation.
+- **The autostart state is kept.** The start at boot is a setting of the
+  registration and not of the command: a repeat installation writes the
+  autostart state the registration already has, so a reinstall with a new binary
+  never undoes a decision of an administrator. An enabled systemd unit stays
+  enabled, and a unit that is disabled or masked is not enabled again; on
+  Windows the start type and the delayed-auto-start flag are written back as
+  they are, so a manual or a disabled start stays manual or disabled and a
+  delayed automatic start stays delayed. Only a **first** installation enables
+  the registration it writes for the boot of its scope.
 - **The running state decides the restart.** An instance that runs, or is
   starting, is stopped and started again on the new program, and the
   installation succeeds only when the supervisor reports it running with the
@@ -765,11 +779,15 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   also answers on the listen address of that unit with the same readiness
   probe the Windows handler uses. A unit that systemd reports active is a
   forked process and not a server — a process that dies on a bind error is
-  reported active for a moment — so "runs" means the server answers, and a
-  probe that does not succeed within the budget is a failed update that rolls
-  back. An instance that was stopped, failed, broken or absent is **not**
-  started: `install` never starts a service that was not running, and starting
-  stays an explicit `service start`.
+  reported active for a moment — so "runs" means the instance itself answers:
+  the probe asks `/api/health` and accepts only a `200` that carries the health
+  document of HFDesk (`status` `ok` and a version) or a `401` that carries the
+  Basic-auth challenge of the instance (`Basic realm="HFDesk"`), and it sends
+  no credential, so a foreign program that happens to listen on the port is not
+  mistaken for the restarted instance. A probe that does not succeed within the
+  budget is a failed update that rolls back. An instance that was stopped,
+  failed, broken or absent is **not** started: `install` never starts a service
+  that was not running, and starting stays an explicit `service start`.
 - **A failure says what it restored.** A failure before the registration is
   written leaves a running instance untouched. A failure after the registration
   was written restores the previous registration: its configuration is written

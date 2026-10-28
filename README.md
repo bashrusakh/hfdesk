@@ -272,7 +272,10 @@ Service mode binds loopback by default (`127.0.0.1:8080`). Exposing the
 dashboard to the network needs an explicit `--listen 0.0.0.0:8080`.
 
 On Windows and Linux, `service install` over an existing registration keeps the
-settings the command does not name again and applies an update to a running
+settings the command does not name again and the autostart state the
+registration already has — an enabled systemd unit stays enabled, a disabled or
+masked one is not enabled again, and a Windows start type and delayed-auto-start
+flag are written back as they are — and applies an update to a running
 instance, which is restarted on the new program; a stopped service stays stopped.
 
 See [docs/SERVICE.md](docs/SERVICE.md) for the full reference: scopes, runtime
