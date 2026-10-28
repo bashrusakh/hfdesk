@@ -127,7 +127,7 @@ func TestSCMDisabledRunningRefusalRefusesBeforeItStopsTheInstance(t *testing.T) 
 			for _, want := range []string{
 				"is running, but its start type is disabled",
 				"Windows will not start it again after the installation stops it",
-				"set the start type to manual or automatic",
+				"Set the start type to manual or automatic",
 				`"sc config hfdesk start= demand"`,
 				"run the installation again",
 			} {
