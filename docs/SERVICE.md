@@ -800,16 +800,26 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   with a disabled start type is allowed, because the installation does not start
   it.
 - **The program is checked before anything is touched.** An installation
-  inspects the program before it writes a registration, creates a directory or
-  stops a running instance: a Windows or a Mach-O image and an ELF of another
-  class, byte order or machine are refused on Linux, and the account the
-  instance runs as must be able to read and execute the program and to traverse
-  its parent directories — the mode bits for the service account of the scope on
-  Linux, the access control lists of the program and of its parents for
-  `LocalService` on Windows. Only a definite denial refuses, and the error names
-  the account and the access it lacks; rights that cannot be read prove no
-  denial. The check never changes a permission: it reports what is missing and
-  leaves the grant to the operator.
+  checks the path and effective execute access before it writes a registration,
+  creates an instance directory or stops a running instance. Linux uses the
+  kernel access check under the identity of the instance (including directory
+  traversal and filesystem access rules); a native executable does not need a
+  read bit. When the visible `binfmt_misc` state is readable and empty, a
+  readable, short `#!` script is also checked for read access and an accessible
+  interpreter. A visibly truncated ELF header, a missing interpreter named by
+  an ELF `PT_INTERP` segment or shebang, and short plain text without a shebang
+  are refused only under that same condition; if a handler is active or its
+  state is unavailable, those formats remain unclassified.
+  Linux does not reject an ELF solely because its machine differs from
+  `runtime.GOARCH`, or reject another format merely because HFDesk cannot parse
+  it: compatible architectures and registered handlers belong to the host.
+  An unclassified format is not called verified. If effective access under the
+  instance identity itself cannot be established, preflight logs that
+  uncertainty; it does not treat it as a denial or as verified access. For a
+  running update, systemd's actual start/readiness check and the existing
+  rollback remain authoritative for runtime behavior. On Windows, the ACL
+  check for `LocalService` is unchanged. No permission is changed by the
+  installation.
 - **The running state decides the restart.** An instance that runs, or is
   starting, is stopped and started again on the new program, and the
   installation succeeds only when the supervisor reports it running with the

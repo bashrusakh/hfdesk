@@ -13,17 +13,21 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -697,7 +701,7 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	}
 	// The program is checked before anything is read or written, so a refused
 	// program creates no directory, rewrites no unit and stops no instance.
-	if err := m.preflight(opts, account); err != nil {
+	if err := m.preflight(ctx, opts, account); err != nil {
 		return opts, err
 	}
 	// The state of the replaced registration is read before the unit file
@@ -1163,10 +1167,12 @@ func trimExecStartPath(value string) string {
 	return value
 }
 
-// preflight rejects an installation the supervisor could not run: a missing
-// supervisor, an unusable bind address or an executable that the account of the
-// scope cannot run.
-func (m *systemdManager) preflight(opts InstallOptions, account *user.User) error {
+// preflight rejects an installation the supervisor demonstrably cannot run:
+// a missing supervisor, an unusable bind address, a definite access denial, or
+// a format failure that the host's visible binary-format handlers cannot
+// resolve. Unknown executable formats are left to systemd rather than rejected
+// by this partial inspection.
+func (m *systemdManager) preflight(ctx context.Context, opts InstallOptions, account *user.User) error {
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		return fmt.Errorf("service: systemctl is not available: %w", err)
 	}
@@ -1180,176 +1186,510 @@ func (m *systemdManager) preflight(opts InstallOptions, account *user.User) erro
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("service: executable %q is not a regular file", opts.Executable)
 	}
-	if info.Mode().Perm()&0o111 == 0 {
-		return fmt.Errorf("service: executable %q is not executable", opts.Executable)
-	}
-	if err := checkExecutableFormat(opts.Executable); err != nil {
+	inspection, err := inspectExecutable(opts.Executable, opts.Paths.StateDir, linuxBinfmtMiscDirectory)
+	if err != nil {
 		return err
 	}
+	if inspection.format == executableFormatUnknown {
+		log.Printf("service: executable %q has an unclassified format; the format is not being treated as verified or refused by the preflight", opts.Executable)
+	}
 
-	// A user scope unit runs as the installing user; a machine-wide one runs
-	// as the resolved account. An unreadable identity proves no denial.
-	if account == nil && m.scope == ScopeUser {
-		if current, err := user.Current(); err == nil {
-			account = current
-		}
+	accessMode := uint32(unix.X_OK)
+	if inspection.format == executableFormatScript {
+		// Linux's script handler starts the interpreter, which must be able
+		// to read the script itself. Native executables do not need this bit.
+		accessMode |= unix.R_OK
 	}
-	if account == nil {
-		return nil
-	}
-	identity, err := linuxAccessAccount(account)
+	access, err := m.executableAccess(ctx, opts.Executable, accessMode, account, "")
 	if err != nil {
-		return nil
+		return err
 	}
-	if err := checkExecutableAccess(opts.Executable, identity); err != nil {
-		return fmt.Errorf("service: executable %q is not usable by the account %q: %w", opts.Executable, account.Username, err)
+	accountName := "the current user"
+	if m.scope == ScopeSystem && account != nil {
+		accountName = account.Username
+	} else if current, err := user.Current(); err == nil {
+		accountName = current.Username
 	}
-	return nil
-}
+	switch access {
+	case executableAccessDenied:
+		reason := errExecutableNotUsable
+		if inspection.format == executableFormatScript && accessMode&unix.R_OK != 0 {
+			reason = errExecutableNotReadable
+		}
+		return fmt.Errorf("service: executable %q is not usable by the account %q: %w", opts.Executable, accountName, reason)
+	case executableAccessUnknown:
+		log.Printf("service: execute access for %q by %s is inconclusive; it is not treated as a denial or as verified", opts.Executable, accountName)
+	}
 
-// checkExecutableAccess reports whether the account can read and execute the
-// program and traverse its parents. Only a definite denial is an error: an
-// access that cannot be read proves nothing. Root needs an execute bit only.
-func checkExecutableAccess(path string, identity accessAccount) error {
-	resolved, err := resolvePath(path)
-	if err != nil {
-		return nil
-	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return nil
-	}
-	if identity.UID == 0 {
-		if info.Mode().Perm()&0o111 == 0 {
-			return errExecutableNotUsable
+	if inspection.interpreter != "" {
+		workingDirectory := ""
+		if !filepath.IsAbs(inspection.interpreter) {
+			workingDirectory = opts.Paths.StateDir
 		}
-		return nil
-	}
-	if effectivePermission(info, identity)&0o500 != 0o500 {
-		return errExecutableNotUsable
-	}
-	for _, dir := range []string{filepath.Dir(resolved), filepath.Dir(filepath.Clean(path))} {
-		ok, err := accountCanTraverse(dir, identity)
+		interpreterAccess, err := m.executableAccess(ctx, inspection.interpreter, uint32(unix.X_OK), account, workingDirectory)
 		if err != nil {
-			return nil
+			return err
 		}
-		if !ok {
-			return errExecutableNotReachable
+		switch interpreterAccess {
+		case executableAccessDenied:
+			return fmt.Errorf("service: executable %q names an interpreter the account %q cannot use: %q", opts.Executable, accountName, inspection.interpreter)
+		case executableAccessUnknown:
+			log.Printf("service: interpreter access for %q by %s is inconclusive; it is not treated as a denial or as verified", inspection.interpreter, accountName)
 		}
 	}
 	return nil
 }
 
-// errExecutableNotUsable reports a program the account cannot read and execute.
-var errExecutableNotUsable = errors.New("the account cannot read and execute it")
+type executableAccess int
 
-// errExecutableNotReachable reports an untraversable parent of the program.
-var errExecutableNotReachable = errors.New("the account cannot reach it through the parent directories")
+const (
+	executableAccessUnknown executableAccess = iota
+	executableAccessAllowed
+	executableAccessDenied
+)
 
-// checkExecutableFormat rejects a program the platform demonstrably cannot run:
-// a PE or Mach-O image and an ELF of another class, byte order or machine.
-// Scripts stay valid.
-func checkExecutableFormat(path string) error {
-	header, err := readExecutableHeader(path)
-	if err != nil {
-		// An unreadable header proves no format; the access check refuses it.
-		return nil
+var (
+	errExecutableNotUsable   = errors.New("the account cannot execute it")
+	errExecutableNotReadable = errors.New("the account cannot read the script")
+)
+
+func executableAccessFromError(err error) executableAccess {
+	switch {
+	case err == nil:
+		return executableAccessAllowed
+	case errors.Is(err, errAccessWorkingDirectoryNotReady):
+		return executableAccessUnknown
+	case errors.Is(err, unix.EACCES), errors.Is(err, unix.ENOENT), errors.Is(err, unix.ENOTDIR), errors.Is(err, unix.ELOOP):
+		return executableAccessDenied
+	default:
+		return executableAccessUnknown
 	}
-	if len(header) >= 2 && header[0] == 'M' && header[1] == 'Z' {
-		return fmt.Errorf("service: executable %q is a Windows program and cannot run on this platform", path)
-	}
-	if len(header) >= 4 {
-		switch binary.BigEndian.Uint32(header[:4]) {
-		case 0xfeedface, 0xcefaedfe, 0xfeedfacf, 0xcffaedfe, 0xcafebabe, 0xbebafeca:
-			return fmt.Errorf("service: executable %q is a Mach-O program and cannot run on this platform", path)
-		}
-	}
-	if len(header) < 4 || header[0] != 0x7f || header[1] != 'E' || header[2] != 'L' || header[3] != 'F' {
-		return nil
-	}
-	if len(header) < 20 {
-		return fmt.Errorf("service: executable %q is a truncated ELF program", path)
-	}
-	class, data := header[4], header[5]
-	order, ok := elfByteOrder(data)
-	if !ok {
-		return fmt.Errorf("service: executable %q is an ELF program with the unknown byte order %d", path, data)
-	}
-	machine := order.Uint16(header[18:20])
-	want, known := elfMachine(runtime.GOARCH)
-	if !known {
-		return nil
-	}
-	if class != want.class || data != want.data || machine != want.machine {
-		return fmt.Errorf("service: executable %q is built for another platform: ELF class %d, byte order %d, machine 0x%04X; this host is %s", path, class, data, machine, runtime.GOARCH)
-	}
-	return nil
 }
 
-func readExecutableHeader(path string) ([]byte, error) {
+type executableFormat int
+
+const (
+	executableFormatUnknown executableFormat = iota
+	executableFormatELF
+	executableFormatScript
+)
+
+type executableInspection struct {
+	format      executableFormat
+	interpreter string
+}
+
+type binfmtMiscAvailability int
+
+const (
+	binfmtMiscUnknown binfmtMiscAvailability = iota
+	binfmtMiscEmpty
+	binfmtMiscActive
+)
+
+const (
+	linuxBinfmtMiscDirectory = "/proc/sys/fs/binfmt_misc"
+	maxExecutablePrefix      = 4096
+	maxShebangLine           = 127
+)
+
+// inspectExecutable rejects only formats the available host evidence shows the
+// ordinary Linux loaders cannot handle. It deliberately does not compare ELF
+// machine identities or reject other files merely because this inspection does
+// not recognize them.
+func inspectExecutable(path, workingDirectory, binfmtDirectory string) (executableInspection, error) {
+	handlers := binfmtMiscHandlers(binfmtDirectory)
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		// In particular, an execute-only ELF is a valid input even though the
+		// installer cannot read its header.
+		return executableInspection{format: executableFormatUnknown}, nil
 	}
 	defer file.Close()
-	header := make([]byte, 20)
-	n, err := io.ReadFull(file, header)
+
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return executableInspection{format: executableFormatUnknown}, nil
+	}
+	readSize := info.Size()
+	if readSize > maxExecutablePrefix {
+		readSize = maxExecutablePrefix
+	}
+	prefix := make([]byte, int(readSize))
+	n, readErr := io.ReadFull(file, prefix)
+	if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+		return executableInspection{format: executableFormatUnknown}, nil
+	}
+	prefix = prefix[:n]
+
+	if bytes.HasPrefix(prefix, []byte{0x7f, 'E', 'L', 'F'}) {
+		if handlers != binfmtMiscEmpty {
+			return executableInspection{format: executableFormatUnknown}, nil
+		}
+		if err := checkTruncatedELFHeader(prefix, info.Size()); err != nil {
+			return executableInspection{}, fmt.Errorf("service: executable %q: %w", path, err)
+		}
+		interpreter, known, err := elfProgramInterpreter(file, prefix, info.Size())
+		if err != nil {
+			return executableInspection{}, fmt.Errorf("service: executable %q: %w", path, err)
+		}
+		if !known {
+			return executableInspection{format: executableFormatUnknown}, nil
+		}
+		if interpreter != "" && !filepath.IsAbs(interpreter) && workingDirectory == "" {
+			return executableInspection{format: executableFormatUnknown}, nil
+		}
+		return executableInspection{format: executableFormatELF, interpreter: interpreter}, nil
+	}
+
+	if bytes.HasPrefix(prefix, []byte("#!")) {
+		if handlers != binfmtMiscEmpty {
+			return executableInspection{format: executableFormatUnknown}, nil
+		}
+		interpreter, ok := linuxShebangInterpreter(prefix, info.Size())
+		if !ok {
+			return executableInspection{format: executableFormatUnknown}, nil
+		}
+		if interpreter == "" {
+			return executableInspection{}, fmt.Errorf("service: executable %q has a shebang with no interpreter", path)
+		}
+		if !filepath.IsAbs(interpreter) && workingDirectory == "" {
+			return executableInspection{format: executableFormatUnknown}, nil
+		}
+		return executableInspection{format: executableFormatScript, interpreter: interpreter}, nil
+	}
+
+	if handlers == binfmtMiscEmpty && plainTextFile(prefix, info.Size()) {
+		return executableInspection{}, fmt.Errorf("service: executable %q is plain text without a shebang and no active binfmt_misc handler is visible", path)
+	}
+	return executableInspection{format: executableFormatUnknown}, nil
+}
+
+func checkTruncatedELFHeader(prefix []byte, fileSize int64) error {
+	if len(prefix) < 16 || fileSize < 16 {
+		return errors.New("truncated ELF identification")
+	}
+	var headerSize int64
+	switch prefix[4] {
+	case 1: // ELFCLASS32
+		headerSize = 52
+	case 2: // ELFCLASS64
+		headerSize = 64
+	default:
+		return errors.New("invalid ELF class")
+	}
+	if prefix[5] != 1 && prefix[5] != 2 {
+		return errors.New("invalid ELF byte order")
+	}
+	if prefix[6] != 1 {
+		return errors.New("invalid ELF identification version")
+	}
+	if fileSize < headerSize || int64(len(prefix)) < headerSize {
+		return errors.New("truncated ELF header")
+	}
+	return nil
+}
+
+// elfProgramInterpreter reads only the ELF program-header table that the Linux
+// executable loader consumes. It does not classify the machine or emulate ELF
+// load behavior; a table it cannot interpret stays unclassified.
+func elfProgramInterpreter(file *os.File, header []byte, fileSize int64) (string, bool, error) {
+	var order binary.ByteOrder
+	var phoff uint64
+	var phentsize, phnum uint16
+	var programHeaderSize uint64
+	switch header[4] {
+	case 1: // ELFCLASS32
+		order = binary.LittleEndian
+		if header[5] == 2 {
+			order = binary.BigEndian
+		}
+		phoff = uint64(order.Uint32(header[28:32]))
+		phentsize = order.Uint16(header[42:44])
+		phnum = order.Uint16(header[44:46])
+		programHeaderSize = 32
+	case 2: // ELFCLASS64
+		order = binary.LittleEndian
+		if header[5] == 2 {
+			order = binary.BigEndian
+		}
+		phoff = order.Uint64(header[32:40])
+		phentsize = order.Uint16(header[54:56])
+		phnum = order.Uint16(header[56:58])
+		programHeaderSize = 56
+	default:
+		return "", false, nil
+	}
+	if phnum == 0xffff || phnum == 0 || uint64(phentsize) != programHeaderSize {
+		return "", false, nil
+	}
+	tableSize := uint64(phnum) * programHeaderSize
+	if fileSize < 0 || phoff > uint64(fileSize) || tableSize > uint64(fileSize)-phoff {
+		return "", true, errors.New("truncated ELF program header table")
+	}
+	table := make([]byte, int(tableSize))
+	n, err := file.ReadAt(table, int64(phoff))
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-		return nil, err
+		return "", false, nil
 	}
-	return header[:n], nil
+	if n != len(table) {
+		return "", false, nil
+	}
+
+	var interpreter string
+	for i := 0; i < int(phnum); i++ {
+		entry := table[i*int(programHeaderSize) : (i+1)*int(programHeaderSize)]
+		if order.Uint32(entry[:4]) != 3 { // PT_INTERP
+			continue
+		}
+		if interpreter != "" {
+			return "", true, errors.New("ELF has multiple interpreter segments")
+		}
+		var offset, size uint64
+		if header[4] == 1 {
+			offset = uint64(order.Uint32(entry[4:8]))
+			size = uint64(order.Uint32(entry[16:20]))
+		} else {
+			offset = order.Uint64(entry[8:16])
+			size = order.Uint64(entry[32:40])
+		}
+		if size == 0 || offset > uint64(fileSize) || size > uint64(fileSize)-offset {
+			return "", true, errors.New("truncated ELF interpreter segment")
+		}
+		if size > maxExecutablePrefix {
+			return "", false, nil
+		}
+		segment := make([]byte, int(size))
+		n, err := file.ReadAt(segment, int64(offset))
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return "", false, nil
+		}
+		if n != len(segment) {
+			return "", false, nil
+		}
+		terminator := bytes.IndexByte(segment, 0)
+		if terminator <= 0 {
+			return "", false, nil
+		}
+		interpreter = string(segment[:terminator])
+	}
+	return interpreter, true, nil
 }
 
-func elfByteOrder(data byte) (binary.ByteOrder, bool) {
-	switch data {
-	case 1:
-		return binary.LittleEndian, true
-	case 2:
-		return binary.BigEndian, true
+func linuxShebangInterpreter(prefix []byte, fileSize int64) (string, bool) {
+	line := prefix[2:]
+	if newline := bytes.IndexByte(line, '\n'); newline >= 0 {
+		if newline > maxShebangLine {
+			return "", false
+		}
+		line = line[:newline]
+	} else if fileSize-int64(2) > maxShebangLine {
+		// The kernel truncates long shebang lines. Without knowing which
+		// kernel rule applies, do not guess at the interpreter path.
+		return "", false
+	}
+	line = bytes.TrimLeft(line, " \t")
+	if nul := bytes.IndexByte(line, 0); nul >= 0 {
+		return "", false
+	}
+	if end := bytes.IndexAny(line, " \t"); end >= 0 {
+		line = line[:end]
+	}
+	return string(line), true
+}
+
+func plainTextFile(prefix []byte, fileSize int64) bool {
+	if fileSize < 0 || fileSize > maxExecutablePrefix || int64(len(prefix)) != fileSize || !utf8.Valid(prefix) {
+		return false
+	}
+	for _, r := range string(prefix) {
+		if r != '\n' && r != '\r' && r != '\t' && !unicode.IsPrint(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func binfmtMiscHandlers(directory string) binfmtMiscAvailability {
+	status, err := os.ReadFile(filepath.Join(directory, "status"))
+	if err != nil {
+		return binfmtMiscUnknown
+	}
+	switch strings.TrimSpace(string(status)) {
+	case "disabled":
+		return binfmtMiscEmpty
+	case "enabled":
 	default:
-		return nil, false
+		return binfmtMiscUnknown
 	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return binfmtMiscUnknown
+	}
+	for _, entry := range entries {
+		if entry.Name() == "register" || entry.Name() == "status" {
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(directory, entry.Name()))
+		if err != nil {
+			return binfmtMiscUnknown
+		}
+		firstLine, _, _ := bytes.Cut(contents, []byte{'\n'})
+		if string(firstLine) == "enabled" {
+			return binfmtMiscActive
+		}
+		if string(firstLine) != "disabled" {
+			return binfmtMiscUnknown
+		}
+	}
+	return binfmtMiscEmpty
 }
 
-type linuxELF struct {
-	class   byte
-	data    byte
-	machine uint16
+func linuxExecutableAccessIdentity(account *user.User) (accessAccount, error) {
+	uid, err := strconv.Atoi(account.Uid)
+	if err != nil {
+		return accessAccount{}, err
+	}
+	gid, err := strconv.Atoi(account.Gid)
+	if err != nil {
+		return accessAccount{}, err
+	}
+	groupIDs, err := account.GroupIds()
+	if err != nil {
+		return accessAccount{}, err
+	}
+	identity := accessAccount{UID: uid, GID: gid, Groups: []int{gid}}
+	seen := map[int]struct{}{gid: {}}
+	for _, groupID := range groupIDs {
+		group, err := strconv.Atoi(groupID)
+		if err != nil {
+			return accessAccount{}, err
+		}
+		if _, ok := seen[group]; ok {
+			continue
+		}
+		seen[group] = struct{}{}
+		identity.Groups = append(identity.Groups, group)
+	}
+	return identity, nil
 }
 
-// elfMachine returns the ELF identity of a Go architecture; a missing entry is
-// not compared.
-func elfMachine(arch string) (linuxELF, bool) {
-	switch arch {
-	case "386":
-		return linuxELF{class: 1, data: 1, machine: 3}, true
-	case "amd64":
-		return linuxELF{class: 2, data: 1, machine: 62}, true
-	case "arm":
-		return linuxELF{class: 1, data: 1, machine: 40}, true
-	case "arm64":
-		return linuxELF{class: 2, data: 1, machine: 183}, true
-	case "loong64":
-		return linuxELF{class: 2, data: 1, machine: 258}, true
-	case "mips":
-		return linuxELF{class: 1, data: 2, machine: 8}, true
-	case "mipsle":
-		return linuxELF{class: 1, data: 1, machine: 8}, true
-	case "mips64":
-		return linuxELF{class: 2, data: 2, machine: 8}, true
-	case "mips64le":
-		return linuxELF{class: 2, data: 1, machine: 8}, true
-	case "ppc64":
-		return linuxELF{class: 2, data: 2, machine: 21}, true
-	case "ppc64le":
-		return linuxELF{class: 2, data: 1, machine: 21}, true
-	case "riscv64":
-		return linuxELF{class: 2, data: 1, machine: 243}, true
-	case "s390x":
-		return linuxELF{class: 2, data: 2, machine: 22}, true
-	default:
-		return linuxELF{}, false
+func currentExecutableAccessIdentity() accessAccount {
+	groups, _ := unix.Getgroups()
+	identity := accessAccount{UID: unix.Geteuid(), GID: unix.Getegid(), Groups: []int{unix.Getegid()}}
+	seen := map[int]struct{}{identity.GID: {}}
+	for _, group := range groups {
+		if _, ok := seen[group]; ok {
+			continue
+		}
+		seen[group] = struct{}{}
+		identity.Groups = append(identity.Groups, group)
 	}
+	return identity
+}
+
+func sameAccessIdentity(left, right accessAccount) bool {
+	if left.UID != right.UID || left.GID != right.GID || len(left.Groups) != len(right.Groups) {
+		return false
+	}
+	groups := make(map[int]struct{}, len(left.Groups))
+	for _, group := range left.Groups {
+		groups[group] = struct{}{}
+	}
+	for _, group := range right.Groups {
+		if _, ok := groups[group]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func accessCredential(identity accessAccount) (*syscall.Credential, error) {
+	if identity.UID < 0 || identity.GID < 0 || uint64(identity.UID) > uint64(^uint32(0)) || uint64(identity.GID) > uint64(^uint32(0)) {
+		return nil, errors.New("the service identity is outside the Linux UID/GID range")
+	}
+	groups := make([]uint32, 0, len(identity.Groups))
+	seen := make(map[uint32]struct{}, len(identity.Groups))
+	for _, group := range append([]int{identity.GID}, identity.Groups...) {
+		if group < 0 || uint64(group) > uint64(^uint32(0)) {
+			return nil, errors.New("the service identity has a group outside the Linux GID range")
+		}
+		id := uint32(group)
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		groups = append(groups, id)
+	}
+	return &syscall.Credential{Uid: uint32(identity.UID), Gid: uint32(identity.GID), Groups: groups}, nil
+}
+
+func (m *systemdManager) executableAccess(ctx context.Context, path string, mode uint32, account *user.User, workingDirectory string) (executableAccess, error) {
+	if m.scope == ScopeUser {
+		return checkExecutableAccess(ctx, path, currentExecutableAccessIdentity(), mode, workingDirectory)
+	}
+	if account == nil {
+		return executableAccessUnknown, nil
+	}
+	target, err := linuxExecutableAccessIdentity(account)
+	if err != nil {
+		return executableAccessUnknown, nil
+	}
+	return checkExecutableAccess(ctx, path, target, mode, workingDirectory)
+}
+
+func checkExecutableAccess(ctx context.Context, path string, identity accessAccount, mode uint32, workingDirectory string) (executableAccess, error) {
+	if sameAccessIdentity(identity, currentExecutableAccessIdentity()) {
+		if identity.UID != 0 && accessProbeHasCapabilities() {
+			return executableAccessUnknown, nil
+		}
+		if unix.Getuid() != unix.Geteuid() || unix.Getgid() != unix.Getegid() {
+			return executableAccessUnknown, nil
+		}
+		return executableAccessFromError(faccessatExecutablePath(path, mode, workingDirectory)), nil
+	}
+	credential, err := accessCredential(identity)
+	if err != nil {
+		return executableAccessUnknown, nil
+	}
+	running, err := os.Executable()
+	if err != nil {
+		return executableAccessUnknown, nil
+	}
+	if !safeAccessProbeExecutable(running) {
+		return executableAccessUnknown, nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(probeCtx, running, internalAccessProbeCommand, path, strconv.FormatUint(uint64(mode), 10), workingDirectory)
+	cmd.Env = []string{}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
+	err = cmd.Run()
+	if ctx.Err() != nil {
+		return executableAccessUnknown, ctx.Err()
+	}
+	if err == nil {
+		return executableAccessAllowed, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		switch exitErr.ExitCode() {
+		case accessProbeDeniedCode:
+			return executableAccessDenied, nil
+		case accessProbeUnknownCode:
+			return executableAccessUnknown, nil
+		}
+	}
+	return executableAccessUnknown, nil
+}
+
+func safeAccessProbeExecutable(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0 {
+		return false
+	}
+	_, err = unix.Getxattr(path, "security.capability", nil)
+	return errors.Is(err, unix.ENODATA) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP)
 }
 
 // checkSystemPaths rejects a machine-wide installation that would adopt the

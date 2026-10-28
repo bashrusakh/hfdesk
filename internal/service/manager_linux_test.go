@@ -8,16 +8,17 @@ package service
 import (
 	"bytes"
 	"context"
+	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -27,6 +28,7 @@ import (
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/internal/server"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
+	"golang.org/x/sys/unix"
 )
 
 // systemdTestOptions returns an installation for the systemd tests. The
@@ -3647,95 +3649,256 @@ func TestSystemdRestartVerifyWaitIsTheShutdownBudget(t *testing.T) {
 	}
 }
 
-// TestSystemdCheckExecutableAccess checks the effective access of the account
-// that runs the unit: through its user, its primary group or a supplementary
-// group, and the refusal of a missing read bit, execute bit or parent traversal.
-func TestSystemdCheckExecutableAccess(t *testing.T) {
-	// The program lives directly in the temporary root, so an identity that
-	// is not the owner can traverse every parent of the machine.
-	tmpInfo, err := os.Stat("/tmp")
-	if err != nil || tmpInfo.Mode().Perm()&0o001 == 0 {
-		t.Skip("skipping: the temporary root is not traversable by another account")
+// TestSystemdCheckExecutableAccessUsesKernelPermissions checks the effective
+// kernel access result, including execute-only native files and parent search.
+func TestSystemdCheckExecutableAccessUsesKernelPermissions(t *testing.T) {
+	if accessProbeHasCapabilities() {
+		t.Skip("current-identity access is deliberately inconclusive with effective/permitted capabilities")
 	}
-	file, err := os.CreateTemp("/tmp", "hfdesk-access-")
-	if err != nil {
-		t.Skipf("skipping: a program cannot be created in the temporary root: %v", err)
-	}
-	executable := file.Name()
-	if _, err := file.WriteString("#!/bin/sh\nexit 0\n"); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Remove(executable) })
-	if err := os.Chmod(executable, 0o750); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(executable)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		t.Skipf("the file system does not report an owner: %v", info.Sys())
-	}
-	uid, gid := int(stat.Uid), int(stat.Gid)
 
+	root := t.TempDir()
+	executable := filepath.Join(root, "program")
+	if err := os.WriteFile(executable, []byte("fixture"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	identity := currentExecutableAccessIdentity()
+	readOnlyDenial := executableAccessDenied
+	if os.Geteuid() == 0 {
+		readOnlyDenial = executableAccessAllowed
+	}
 	for _, tc := range []struct {
-		name     string
-		mode     os.FileMode
-		identity accessAccount
-		want     error
+		name string
+		mode os.FileMode
+		want executableAccess
+		bits uint32
 	}{
-		{"the owner", 0o750, accessAccount{UID: uid, GID: gid + 1}, nil},
-		{"the primary group", 0o750, accessAccount{UID: uid + 1, GID: gid}, nil},
-		{"a supplementary group", 0o750, accessAccount{UID: uid + 1, GID: gid + 1, Groups: []int{gid}}, nil},
-		{"a program without the execute bit", 0o600, accessAccount{UID: uid, GID: gid}, errExecutableNotUsable},
-		{"a program without the read bit", 0o111, accessAccount{UID: uid, GID: gid}, errExecutableNotUsable},
+		{"owner execute", 0o700, executableAccessAllowed, unix.X_OK},
+		{"execute-only native access", 0o100, executableAccessAllowed, unix.X_OK},
+		{"read and execute follow the current identity", 0o100, readOnlyDenial, unix.R_OK | unix.X_OK},
+		{"no execute permission", 0o600, executableAccessDenied, unix.X_OK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := os.Chmod(executable, tc.mode); err != nil {
 				t.Fatal(err)
 			}
-			if err := checkExecutableAccess(executable, tc.identity); !errors.Is(err, tc.want) {
-				t.Errorf("checkExecutableAccess(%04o) = %v, want %v", tc.mode, err, tc.want)
+			got, err := checkExecutableAccess(context.Background(), executable, identity, tc.bits, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("checkExecutableAccess(%04o, %03o) = %v, want %v", tc.mode, tc.bits, got, tc.want)
 			}
 		})
 	}
 
-	t.Run("a parent directory without traverse", func(t *testing.T) {
-		// The program is below a directory the account cannot enter, while
-		// the installing process still reaches it: the parent is owned by
-		// the process and the account is another identity.
-		root, err := os.MkdirTemp("/tmp", "hfdesk-parent-")
-		if err != nil {
-			t.Skipf("skipping: a directory cannot be created in the temporary root: %v", err)
+	t.Run("parent without search permission", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root can bypass this DAC search denial")
 		}
-		t.Cleanup(func() { _ = os.RemoveAll(root) })
-		if err := os.Chmod(root, 0o711); err != nil {
-			t.Fatal(err)
-		}
-		parent := filepath.Join(root, "parent")
+		parent := filepath.Join(root, "blocked")
 		if err := os.Mkdir(parent, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		blocked := filepath.Join(parent, "hfdesk")
-		if err := os.WriteFile(blocked, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		blocked := filepath.Join(parent, "program")
+		if err := os.WriteFile(blocked, []byte("fixture"), 0o700); err != nil {
 			t.Fatal(err)
 		}
-
-		err = checkExecutableAccess(blocked, accessAccount{UID: uid + 1, GID: gid + 1})
-		if !errors.Is(err, errExecutableNotReachable) {
-			t.Errorf("checkExecutableAccess() = %v, want the refusal of the parent traversal", err)
+		if err := os.Chmod(parent, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := checkExecutableAccess(context.Background(), blocked, identity, unix.X_OK, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != executableAccessDenied {
+			t.Errorf("checkExecutableAccess through a non-searchable parent = %v, want denied", got)
+		}
+		if err := os.Chmod(parent, 0o700); err != nil {
+			t.Errorf("restore the temporary parent permissions for cleanup: %v", err)
 		}
 	})
+
+	t.Run("symlink to executable", func(t *testing.T) {
+		if err := os.Chmod(executable, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(root, "program-link")
+		if err := os.Symlink(executable, link); err != nil {
+			t.Fatal(err)
+		}
+		got, err := checkExecutableAccess(context.Background(), link, identity, unix.X_OK, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != executableAccessAllowed {
+			t.Errorf("checkExecutableAccess through a symlink = %v, want allowed", got)
+		}
+	})
+}
+
+func TestLinuxExecutableAccessIdentityCarriesSupplementaryGroups(t *testing.T) {
+	account, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := linuxExecutableAccessIdentity(account)
+	if err != nil {
+		t.Skipf("could not resolve account groups: %v", err)
+	}
+	uid, err := strconv.Atoi(account.Uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid, err := strconv.Atoi(account.Gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.UID != uid || identity.GID != gid {
+		t.Fatalf("identity = %+v, want uid=%d gid=%d", identity, uid, gid)
+	}
+	accountGroups, err := account.GroupIds()
+	if err != nil {
+		t.Skipf("could not resolve supplementary groups: %v", err)
+	}
+	got := make(map[int]bool, len(identity.Groups))
+	for _, group := range identity.Groups {
+		got[group] = true
+	}
+	for _, groupID := range accountGroups {
+		group, err := strconv.Atoi(groupID)
+		if err != nil {
+			t.Fatalf("parse account group %q: %v", groupID, err)
+		}
+		if !got[group] {
+			t.Errorf("identity groups %v omit account group %d", identity.Groups, group)
+		}
+	}
+	credential, err := accessCredential(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int(credential.Uid) != uid || int(credential.Gid) != gid {
+		t.Errorf("credential = %+v, want uid=%d gid=%d", credential, uid, gid)
+	}
+	for _, group := range identity.Groups {
+		found := false
+		for _, credentialGroup := range credential.Groups {
+			if int(credentialGroup) == group {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("credential groups %v omit identity group %d", credential.Groups, group)
+		}
+	}
+}
+
+func TestInternalAccessProbeReportsKernelDenialSeparatelyFromUnknown(t *testing.T) {
+	if accessProbeHasCapabilities() {
+		t.Skip("the internal helper refuses to claim access under effective/permitted capabilities")
+	}
+	if code, handled := RunInternalAccessProbe([]string{"status"}); handled || code != 0 {
+		t.Fatalf("ordinary arguments were handled as an internal probe: code=%d handled=%t", code, handled)
+	}
+
+	file := filepath.Join(t.TempDir(), "execute-only")
+	if err := os.WriteFile(file, []byte("content"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(file, 0o100); err != nil {
+		t.Fatal(err)
+	}
+	code, handled := RunInternalAccessProbe([]string{internalAccessProbeCommand, file, strconv.Itoa(unix.X_OK), ""})
+	if !handled || code != accessProbeAllowedCode {
+		t.Errorf("execute-only X_OK probe = (%d, %t), want allowed", code, handled)
+	}
+	code, handled = RunInternalAccessProbe([]string{internalAccessProbeCommand, file, strconv.Itoa(unix.R_OK | unix.X_OK), ""})
+	if !handled || code != accessProbeDeniedCode {
+		t.Errorf("execute-only R_OK|X_OK probe = (%d, %t), want definite denial", code, handled)
+	}
+	code, handled = RunInternalAccessProbe([]string{internalAccessProbeCommand, filepath.Join(t.TempDir(), "missing"), strconv.Itoa(unix.X_OK), ""})
+	if !handled || code != accessProbeDeniedCode {
+		t.Errorf("missing path probe = (%d, %t), want definite denial", code, handled)
+	}
+	code, handled = RunInternalAccessProbe([]string{internalAccessProbeCommand, file, "invalid", ""})
+	if !handled || code != accessProbeUnknownCode {
+		t.Errorf("malformed internal request = (%d, %t), want unknown", code, handled)
+	}
+}
+
+func TestSystemdExecuteOnlyNativeCandidateRunsAndInstalls(t *testing.T) {
+	current, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	native := filepath.Join(t.TempDir(), "hfdesk")
+	if err := os.WriteFile(native, contents, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(native, 0o100); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(native, "-test.run=^$").CombinedOutput(); err != nil {
+		t.Fatalf("execute-only native control did not run: %v: %s", err, out)
+	}
+
+	_ = systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	opts := systemdTempInstallOptions(t, t.TempDir())
+	opts.Executable = native
+	manager := &systemdManager{scope: ScopeUser}
+	if _, err := manager.Install(context.Background(), opts); err != nil {
+		t.Fatalf("Install() refused the execute-only native candidate: %v", err)
+	}
+
+	link := filepath.Join(t.TempDir(), "hfdesk-link")
+	if err := os.Symlink(native, link); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(link, "-test.run=^$").CombinedOutput(); err != nil {
+		t.Fatalf("execute-only native symlink did not run: %v: %s", err, out)
+	}
+	opts.Executable = link
+	effective, err := manager.Install(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Install() refused the execute-only native symlink: %v", err)
+	}
+	if effective.Executable != link {
+		t.Errorf("registered executable = %q, want preserved symlink path %q", effective.Executable, link)
+	}
+}
+
+func TestSystemdPreflightAcceptsReadableShebang(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skipf("/bin/sh is unavailable: %v", err)
+	}
+	systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	opts := systemdTempInstallOptions(t, root)
+	opts.Executable = filepath.Join(t.TempDir(), "hfdesk-script")
+	if err := os.WriteFile(opts.Executable, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command(opts.Executable).Run(); err != nil {
+		t.Fatalf("readable shebang control did not run: %v", err)
+	}
+	if err := (&systemdManager{scope: ScopeUser}).preflight(context.Background(), opts, nil); err != nil {
+		t.Fatalf("preflight refused a readable runnable script: %v", err)
+	}
 }
 
 // TestSystemdInstallRefusesAnExecutableTheAccountCannotRun checks that a refused
 // program fails the installation before the supervisor is asked to act and before
 // the unit file or a directory is written.
 func TestSystemdInstallRefusesAnExecutableTheAccountCannotRun(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("the user-scope access case needs a non-root identity")
+	}
 	logPath := systemdRecordingSupervisor(t)
 	systemdTempInstallEnvironment(t)
 	root := t.TempDir()
@@ -3778,56 +3941,479 @@ func TestSystemdInstallRefusesAnExecutableTheAccountCannotRun(t *testing.T) {
 	}
 }
 
-// TestSystemdCheckExecutableFormat checks that a program of another platform
-// is refused and a script or a matching ELF program stays valid.
-func TestSystemdCheckExecutableFormat(t *testing.T) {
-	write := func(t *testing.T, content []byte) string {
+func writeBinfmtMiscState(t *testing.T, active bool) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "status"), []byte("enabled\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if active {
+		if err := os.WriteFile(filepath.Join(dir, "custom"), []byte("enabled\ninterpreter /usr/bin/qemu\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+func elfWithMissingInterpreter(t *testing.T) ([]byte, bool) {
+	t.Helper()
+	running, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(running)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := elf.NewFile(bytes.NewReader(content))
+	if err != nil {
+		return nil, false
+	}
+	var interpreter *elf.Prog
+	for _, program := range parsed.Progs {
+		if program.Type == elf.PT_INTERP {
+			interpreter = program
+			break
+		}
+	}
+	if interpreter == nil || interpreter.Filesz < 3 || interpreter.Filesz > 4096 {
+		return nil, false
+	}
+	start := int(interpreter.Off)
+	size := int(interpreter.Filesz)
+	if start < 0 || start+size > len(content) {
+		return nil, false
+	}
+	missing := "/" + strings.Repeat("z", size-2)
+	if len(missing)+1 != size {
+		return nil, false
+	}
+	if _, err := os.Stat(missing); err == nil || !errors.Is(err, fs.ErrNotExist) {
+		return nil, false
+	}
+	segment := make([]byte, size)
+	copy(segment, missing)
+	copy(content[start:start+size], segment)
+	return content, true
+}
+
+func elfWithInterpreterPath(t *testing.T, interpreterPath string) ([]byte, string, bool) {
+	t.Helper()
+	running, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(running)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := elf.NewFile(bytes.NewReader(content))
+	if err != nil {
+		return nil, "", false
+	}
+	for _, program := range parsed.Progs {
+		if program.Type != elf.PT_INTERP || program.Filesz < 2 || program.Filesz > 4096 {
+			continue
+		}
+		if program.Off > uint64(len(content)) || program.Filesz > uint64(len(content))-program.Off {
+			return nil, "", false
+		}
+		start, size := int(program.Off), int(program.Filesz)
+		if len(interpreterPath)+1 > size {
+			return nil, "", false
+		}
+		segment := content[start : start+size]
+		terminator := bytes.IndexByte(segment, 0)
+		if terminator <= 0 {
+			return nil, "", false
+		}
+		original := string(segment[:terminator])
+		replacement := make([]byte, size)
+		copy(replacement, interpreterPath)
+		copy(content[start:start+size], replacement)
+		return content, original, true
+	}
+	return nil, "", false
+}
+
+func makeInterpreterSymlinkTree(t *testing.T, root, target string, atLexicalPath bool) {
+	t.Helper()
+	actualInside := filepath.Join(root, "actual", "inside")
+	if err := os.MkdirAll(actualInside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("actual", "inside"), filepath.Join(root, "via")); err != nil {
+		t.Fatal(err)
+	}
+	interpreter := filepath.Join(root, "actual", "runner")
+	if atLexicalPath {
+		interpreter = filepath.Join(root, "runner")
+	}
+	if err := os.Symlink(target, interpreter); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSystemdInterpreterPathsPreserveKernelSymlinkDotDotResolution(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("the direct interpreter controls run only as an unprivileged user")
+	}
+	if binfmtMiscHandlers(linuxBinfmtMiscDirectory) != binfmtMiscEmpty {
+		t.Skip("the host has active or unreadable binfmt_misc handlers; these interpreter formats are unclassified")
+	}
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skipf("/bin/sh is unavailable: %v", err)
+	}
+	systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	identity := currentExecutableAccessIdentity()
+	manager := &systemdManager{scope: ScopeUser}
+
+	validRoot := t.TempDir()
+	makeInterpreterSymlinkTree(t, validRoot, "/bin/sh", false)
+	absoluteInterpreter := validRoot + "/via/../runner"
+	absoluteScript := filepath.Join(validRoot, "absolute-script")
+	if err := os.WriteFile(absoluteScript, []byte("#!"+absoluteInterpreter+"\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(absoluteScript).CombinedOutput(); err != nil {
+		t.Fatalf("kernel rejected valid absolute shebang path %q: %v: %s", absoluteInterpreter, err, out)
+	}
+	inspection, err := inspectExecutable(absoluteScript, validRoot, linuxBinfmtMiscDirectory)
+	if err != nil || inspection.interpreter != absoluteInterpreter {
+		t.Fatalf("absolute shebang inspection = (%+v, %v), want raw path %q", inspection, err, absoluteInterpreter)
+	}
+	access, err := checkExecutableAccess(context.Background(), inspection.interpreter, identity, unix.X_OK, "")
+	if err != nil || access != executableAccessAllowed {
+		t.Errorf("kernel access for valid absolute interpreter = (%v, %v), want allowed", access, err)
+	}
+	opts := systemdTempInstallOptions(t, t.TempDir())
+	opts.Executable = absoluteScript
+	opts.Paths.StateDir = validRoot
+	if err := manager.preflight(context.Background(), opts, nil); err != nil {
+		t.Errorf("preflight refused the runnable absolute symlink/.. script: %v", err)
+	}
+
+	relativeScript := filepath.Join(validRoot, "relative-script")
+	if err := os.WriteFile(relativeScript, []byte("#!via/../runner\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(relativeScript)
+	command.Dir = validRoot
+	if out, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("kernel rejected valid relative shebang path: %v: %s", err, out)
+	}
+	inspection, err = inspectExecutable(relativeScript, validRoot, linuxBinfmtMiscDirectory)
+	if err != nil || inspection.interpreter != "via/../runner" {
+		t.Fatalf("relative shebang inspection = (%+v, %v), want raw path", inspection, err)
+	}
+	access, err = checkExecutableAccess(context.Background(), inspection.interpreter, identity, unix.X_OK, validRoot)
+	if err != nil || access != executableAccessAllowed {
+		t.Errorf("kernel access for valid relative interpreter = (%v, %v), want allowed", access, err)
+	}
+	opts.Executable = relativeScript
+	if err := manager.preflight(context.Background(), opts, nil); err != nil {
+		t.Errorf("preflight refused the runnable relative symlink/.. script: %v", err)
+	}
+
+	missingRoot := t.TempDir()
+	makeInterpreterSymlinkTree(t, missingRoot, "/bin/sh", true)
+	missingAbsolute := missingRoot + "/via/../runner"
+	missingScript := filepath.Join(missingRoot, "script")
+	if err := os.WriteFile(missingScript, []byte("#!"+missingAbsolute+"\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command(missingScript).Run(); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("kernel control for missing absolute interpreter = %v, want ENOENT", err)
+	}
+	assertSystemdInstallRefusedBeforeRestart(t, missingScript, missingRoot)
+
+	missingRelative := filepath.Join(missingRoot, "relative-script")
+	if err := os.WriteFile(missingRelative, []byte("#!via/../runner\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command = exec.Command(missingRelative)
+	command.Dir = missingRoot
+	if err := command.Run(); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("kernel control for missing relative interpreter = %v, want ENOENT", err)
+	}
+	assertSystemdInstallRefusedBeforeRestart(t, missingRelative, missingRoot)
+
+	elfPath := "via/../runner"
+	validELFRoot := t.TempDir()
+	validELF, originalInterpreter, ok := elfWithInterpreterPath(t, elfPath)
+	if !ok {
+		t.Log("the test binary has no room for a relative PT_INTERP fixture; ELF path variant not exercised")
+		return
+	}
+	makeInterpreterSymlinkTree(t, validELFRoot, originalInterpreter, false)
+	validELFCandidate := filepath.Join(validELFRoot, "candidate")
+	if err := os.WriteFile(validELFCandidate, validELF, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command = exec.Command(validELFCandidate, "-test.run=^$")
+	command.Dir = validELFRoot
+	if out, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("kernel rejected valid relative PT_INTERP %q: %v: %s", elfPath, err, out)
+	}
+	elfInspection, err := inspectExecutable(validELFCandidate, validELFRoot, linuxBinfmtMiscDirectory)
+	if err != nil || elfInspection.interpreter != elfPath {
+		t.Fatalf("PT_INTERP inspection = (%+v, %v), want raw relative path %q", elfInspection, err, elfPath)
+	}
+	access, err = checkExecutableAccess(context.Background(), elfInspection.interpreter, identity, unix.X_OK, validELFRoot)
+	if err != nil || access != executableAccessAllowed {
+		t.Errorf("kernel access for valid relative PT_INTERP = (%v, %v), want allowed", access, err)
+	}
+	opts = systemdTempInstallOptions(t, t.TempDir())
+	opts.Executable = validELFCandidate
+	opts.Paths.StateDir = validELFRoot
+	if err := manager.preflight(context.Background(), opts, nil); err != nil {
+		t.Errorf("preflight refused the runnable relative PT_INTERP: %v", err)
+	}
+
+	missingELFRoot := t.TempDir()
+	makeInterpreterSymlinkTree(t, missingELFRoot, originalInterpreter, true)
+	missingELF, _, ok := elfWithInterpreterPath(t, elfPath)
+	if !ok {
+		t.Fatal("relative PT_INTERP no longer fits the test binary")
+	}
+	missingELFCandidate := filepath.Join(missingELFRoot, "candidate")
+	if err := os.WriteFile(missingELFCandidate, missingELF, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command = exec.Command(missingELFCandidate, "-test.run=^$")
+	command.Dir = missingELFRoot
+	if err := command.Run(); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("kernel control for missing relative PT_INTERP = %v, want ENOENT", err)
+	}
+	assertSystemdInstallRefusedBeforeRestart(t, missingELFCandidate, missingELFRoot)
+}
+
+func TestSystemdInspectExecutableUsesHostEvidence(t *testing.T) {
+	emptyHandlers := writeBinfmtMiscState(t, false)
+	activeHandlers := writeBinfmtMiscState(t, true)
+	write := func(t *testing.T, name string, content []byte, mode os.FileMode) string {
 		t.Helper()
-		path := filepath.Join(t.TempDir(), "hfdesk")
-		if err := os.WriteFile(path, content, 0o755); err != nil {
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, content, mode); err != nil {
 			t.Fatal(err)
 		}
 		return path
 	}
 
-	if err := checkExecutableFormat(write(t, []byte("#!/bin/sh\nexit 0\n"))); err != nil {
-		t.Errorf("checkExecutableFormat(script) = %v, want nil", err)
+	plainText := write(t, "hfdesk", []byte("not an executable\n"), 0o700)
+	if _, err := inspectExecutable(plainText, t.TempDir(), emptyHandlers); err == nil {
+		t.Fatal("plain text with no shebang and no registered binfmt handler was not refused")
 	}
-	for _, tc := range []struct {
-		name    string
-		content []byte
-	}{
-		{"a Windows program", []byte("MZ\x90\x00")},
-		{"a Mach-O program", []byte{0xcf, 0xfa, 0xed, 0xfe}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := checkExecutableFormat(write(t, tc.content)); err == nil {
-				t.Fatalf("checkExecutableFormat(%s) = nil, want the refusal of the foreign program", tc.name)
-			}
-		})
+	inspection, err := inspectExecutable(plainText, t.TempDir(), activeHandlers)
+	if err != nil || inspection.format != executableFormatUnknown {
+		t.Fatalf("plain text with a host handler = (%+v, %v), want unclassified and allowed", inspection, err)
+	}
+	if _, err := inspectExecutable(plainText, t.TempDir(), filepath.Join(t.TempDir(), "unavailable")); err != nil {
+		t.Fatalf("plain text with unavailable handler evidence was refused: %v", err)
 	}
 
-	want, known := elfMachine(runtime.GOARCH)
-	if !known {
-		return
+	truncated := make([]byte, 20)
+	copy(truncated, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
+	truncatedPath := write(t, "truncated-elf", truncated, 0o700)
+	if _, err := inspectExecutable(truncatedPath, t.TempDir(), emptyHandlers); err == nil {
+		t.Fatal("truncated ELF header with no registered handler was not refused")
 	}
-	mismatch := make([]byte, 20)
-	copy(mismatch, []byte{0x7f, 'E', 'L', 'F'})
-	mismatch[4] = want.class
-	mismatch[5] = want.data
+	inspection, err = inspectExecutable(truncatedPath, t.TempDir(), activeHandlers)
+	if err != nil || inspection.format != executableFormatUnknown {
+		t.Fatalf("truncated ELF with a host handler = (%+v, %v), want unclassified and allowed", inspection, err)
+	}
+
+	missingInterpreter := filepath.Join(t.TempDir(), "missing-interpreter")
+	script := write(t, "script", []byte("#!"+missingInterpreter+"\nexit 0\n"), 0o700)
+	inspection, err = inspectExecutable(script, t.TempDir(), emptyHandlers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.format != executableFormatScript || inspection.interpreter != missingInterpreter {
+		t.Fatalf("script inspection = %+v, want interpreter %q", inspection, missingInterpreter)
+	}
+	access, err := checkExecutableAccess(context.Background(), inspection.interpreter, currentExecutableAccessIdentity(), unix.X_OK, "")
+	if err != nil || access != executableAccessDenied {
+		t.Errorf("missing interpreter access = (%v, %v), want definite denial", access, err)
+	}
+
+	if _, err := os.Stat("/bin/sh"); err == nil {
+		readableScript := write(t, "readable-script", []byte("#!/bin/sh\nexit 0\n"), 0o700)
+		inspection, err := inspectExecutable(readableScript, t.TempDir(), emptyHandlers)
+		if err != nil || inspection.format != executableFormatScript || inspection.interpreter != "/bin/sh" {
+			t.Fatalf("readable script inspection = (%+v, %v)", inspection, err)
+		}
+		if err := exec.Command(readableScript).Run(); err != nil {
+			t.Fatalf("the readable script control did not run: %v", err)
+		}
+	}
+
+	if dynamicELF, ok := elfWithMissingInterpreter(t); ok {
+		candidate := write(t, "missing-elf-interpreter", dynamicELF, 0o700)
+		inspection, err := inspectExecutable(candidate, t.TempDir(), emptyHandlers)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if inspection.format != executableFormatELF || inspection.interpreter == "" {
+			t.Fatalf("ELF PT_INTERP inspection = %+v, want a discovered interpreter", inspection)
+		}
+		access, err := checkExecutableAccess(context.Background(), inspection.interpreter, currentExecutableAccessIdentity(), unix.X_OK, "")
+		if err != nil || access != executableAccessDenied {
+			t.Errorf("missing PT_INTERP access = (%v, %v), want definite denial", access, err)
+		}
+	}
+
+	// A structurally complete ELF with another machine identity is not
+	// refused by a GOARCH table; the kernel/host remains the format owner.
+	running, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	elf, err := os.ReadFile(running)
+	if err != nil || len(elf) < 64 || !bytes.HasPrefix(elf, []byte{0x7f, 'E', 'L', 'F'}) {
+		t.Fatalf("read the running ELF fixture: %v", err)
+	}
 	var order binary.ByteOrder = binary.LittleEndian
-	if want.data == 2 {
+	if elf[5] == 2 {
 		order = binary.BigEndian
 	}
-	order.PutUint16(mismatch[18:20], want.machine+1)
-	if err := checkExecutableFormat(write(t, mismatch)); err == nil {
-		t.Error("checkExecutableFormat(mismatched ELF) = nil, want the refusal of the other machine")
+	machine := order.Uint16(elf[18:20])
+	if machine == ^uint16(0) {
+		machine = 0
+	} else {
+		machine++
+	}
+	order.PutUint16(elf[18:20], machine)
+	otherMachine := write(t, "other-machine-elf", elf, 0o700)
+	inspection, err = inspectExecutable(otherMachine, t.TempDir(), emptyHandlers)
+	if err != nil || inspection.format != executableFormatELF {
+		t.Errorf("structurally complete ELF with another machine = (%+v, %v), want no parser refusal", inspection, err)
 	}
 
-	if running, err := os.Executable(); err == nil {
-		if err := checkExecutableFormat(running); err != nil {
-			t.Errorf("checkExecutableFormat(%q) = %v, want nil for the running program", running, err)
+	// Other signatures stay unclassified rather than being treated as proof
+	// of an unsupported format.
+	other := write(t, "other-format", []byte("MZ\x90\x00"), 0o700)
+	inspection, err = inspectExecutable(other, t.TempDir(), emptyHandlers)
+	if err != nil || inspection.format != executableFormatUnknown {
+		t.Errorf("unrecognized format = (%+v, %v), want unclassified and allowed", inspection, err)
+	}
+}
+
+func TestSystemdInstallRefusesKnownUnusableBeforeRestart(t *testing.T) {
+	if binfmtMiscHandlers(linuxBinfmtMiscDirectory) != binfmtMiscEmpty {
+		t.Skip("the host has active or unreadable binfmt_misc handlers; these inputs are intentionally unclassified")
+	}
+
+	truncated := make([]byte, 20)
+	copy(truncated, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
+	cases := []struct {
+		name string
+		data []byte
+	}{
+		{"plain text", []byte("not an executable\n")},
+		{"truncated ELF", truncated},
+		{"missing interpreter", []byte("#!/definitely-missing-hfdesk-interpreter\nexit 0\n")},
+	}
+	if dynamicELF, ok := elfWithMissingInterpreter(t); ok {
+		cases = append(cases, struct {
+			name string
+			data []byte
+		}{"missing ELF interpreter", dynamicELF})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := filepath.Join(t.TempDir(), "hfdesk")
+			if err := os.WriteFile(candidate, tc.data, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			assertSystemdInstallRefusedBeforeRestart(t, candidate, "")
+		})
+	}
+}
+
+func assertSystemdInstallRefusedBeforeRestart(t *testing.T, candidate, workingDirectory string) {
+	t.Helper()
+	logPath := systemdRecordingSupervisor(t)
+	previous := systemdExistingOptions(t, systemdTestExecutable(t), t.TempDir())
+	if workingDirectory != "" {
+		previous.Paths.StateDir = workingDirectory
+	}
+	manager, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	if err := os.MkdirAll(previous.Paths.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateSentinel := filepath.Join(previous.Paths.StateDir, "jobs_state.json")
+	if err := os.WriteFile(stateSentinel, []byte(`{"jobs":[{"id":"keep"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", candidate)
+	if _, err := manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, candidate)); err == nil {
+		t.Fatal("Install() succeeded for a host-demonstrably unusable candidate")
+	}
+	unit, err := os.ReadFile(unitPath)
+	if err != nil || string(unit) != previousUnit {
+		t.Fatalf("the previous unit changed: read err=%v", err)
+	}
+	if content, err := os.ReadFile(stateSentinel); err != nil || string(content) != `{"jobs":[{"id":"keep"}]}` {
+		t.Errorf("the state sentinel changed: content=%q err=%v", content, err)
+	}
+	calls := systemdSupervisorCalls(t, logPath)
+	for _, command := range []string{"daemon-reload", "enable", "restart", "start"} {
+		if count := systemdSupervisorCallsTo(calls, command, unitName); count != 0 {
+			t.Errorf("preflight refusal issued %q %d times: %v", command, count, calls)
 		}
+	}
+}
+
+func TestSystemdPreflightWarnsRatherThanRejectingInconclusiveAccess(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	var logs bytes.Buffer
+	previousWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousWriter) })
+	account, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountCopy := *account
+	accountCopy.Uid = strconv.Itoa(os.Geteuid() + 1)
+	opts := systemdTempInstallOptions(t, t.TempDir())
+	opts.Scope = ScopeSystem
+	manager := &systemdManager{scope: ScopeSystem}
+
+	err = manager.preflight(context.Background(), opts, &accountCopy)
+	if err != nil {
+		t.Fatalf("preflight() = %v, want unknown access to remain unclassified", err)
+	}
+	if !strings.Contains(logs.String(), "inconclusive") || strings.Contains(logs.String(), "not usable") {
+		t.Errorf("access warning = %q, want an inconclusive warning without a denial claim", logs.String())
+	}
+	path, err := manager.unitPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("inconclusive preflight wrote the registration %q: %v", path, err)
+	}
+	if calls := systemdSupervisorCalls(t, logPath); len(calls) != 0 {
+		t.Errorf("inconclusive preflight called the supervisor: %v", calls)
+	}
+}
+
+func TestSystemdPreflightLeavesUnknownFormatUnclassified(t *testing.T) {
+	systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	root := t.TempDir()
+	opts := systemdTempInstallOptions(t, root)
+	opts.Executable = filepath.Join(t.TempDir(), "custom-format")
+	if err := os.WriteFile(opts.Executable, []byte("MZ\x90\x00"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&systemdManager{scope: ScopeUser}).preflight(context.Background(), opts, nil); err != nil {
+		t.Fatalf("preflight refused an unclassified format: %v", err)
 	}
 }
 
