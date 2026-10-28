@@ -612,7 +612,10 @@ func (m *systemdManager) grantInstanceDirs(opts InstallOptions, account *user.Us
 // A first installation enables the registration for the boot of the scope; a
 // repeat installation keeps the autostart state it finds, so a unit an
 // administrator disabled is never enabled again, and a masked unit refuses the
-// installation instead of being replaced (see reloadAndEnable).
+// installation instead of being replaced (see reloadAndEnable). The mask is
+// asked of the supervisor and not of the file system, so a runtime mask, which
+// lives in /run and leaves no file at the unit path, refuses the installation
+// as well.
 //
 // An installation that replaces a registration keeps every setting the request
 // did not name, so a reinstall with a new binary resets no bind address, paths,
@@ -698,13 +701,23 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 			return opts, err
 		}
 		previous.running = running
-		// The enablement is read before the unit file is written: a repeat
-		// installation keeps the autostart state it finds, and a masked unit
-		// is refused instead of silently unmasked.
-		enablement := m.registrationEnablement(ctx)
-		if enablement.masked {
-			return opts, m.maskedUnitRefusal()
-		}
+	}
+	// The enablement is read before the unit file is written, whether or not
+	// a unit file exists: the mask of a unit is a question for the
+	// supervisor, and a runtime mask (`systemctl mask --runtime`) lives in
+	// /run and leaves no file at the unit path, so a unit that is only
+	// masked at runtime would otherwise look like a first installation and
+	// be registered while it stays masked and cannot start.
+	//
+	// A masked unit is refused instead of silently unmasked, and a repeat
+	// installation keeps the autostart state it finds. A fresh machine is
+	// unaffected: "is-enabled" answers "not-found", which is not a mask, and
+	// a first installation enables the registration it writes anyway.
+	enablement := m.registrationEnablement(ctx)
+	if enablement.masked {
+		return opts, m.maskedUnitRefusal()
+	}
+	if existed {
 		previous.enabled = enablement.enabled
 	}
 	// The directories the installation is about to create are remembered
@@ -801,9 +814,12 @@ type registrationEnablement struct {
 	// enabled reports whether the supervisor had the unit enabled for the
 	// boot of the scope.
 	enabled bool
-	// masked reports whether the unit is masked. A masked unit is a link to
-	// /dev/null, so writing the unit file would replace the mask and silently
-	// undo the decision of an administrator.
+	// masked reports whether the unit is masked, persistently or at
+	// runtime. A persistent mask is a link to /dev/null, so writing the
+	// unit file would replace the mask and silently undo the decision of
+	// an administrator. A runtime mask lives in /run and leaves no file at
+	// the unit path, so the installation would register a unit that stays
+	// masked and cannot start.
 	masked bool
 }
 
@@ -818,6 +834,12 @@ type registrationEnablement struct {
 // masked, and a failed read is otherwise reported as not enabled; a repeat
 // installation then leaves the autostart state alone, and a supervisor that
 // cannot be reached still fails the installation at the reload.
+//
+// The mask is part of the answer for the same reason: a persistent mask is a
+// link to /dev/null at the unit path, but a runtime mask ("systemctl mask
+// --runtime") lives in /run and leaves no file there, so the masked state is
+// only visible through the supervisor. A fresh machine reports "not-found" and
+// is not masked, which is what a first installation needs.
 func (m *systemdManager) registrationEnablement(ctx context.Context) registrationEnablement {
 	out, err := m.runSystemctl(ctx, "is-enabled", unitName)
 	state := strings.TrimSpace(out)

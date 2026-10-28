@@ -291,7 +291,7 @@ directory of the instance is the real log sink on macOS.
 
 | Command | Effect | A service that is not installed |
 |---|---|---|
-| `install` | Registers the service with the supervisor and enables it for the boot of the scope on a **first** installation; a **repeat** installation keeps the autostart state the registration already has — an enabled systemd unit stays enabled, a disabled one is not enabled again, a masked unit refuses the installation, and a Windows registration keeps its start type and its delayed-auto-start flag, while a running Windows service with a disabled start type refuses the installation. A macOS LaunchAgent starts the instance as soon as it is registered (`RunAtLoad`); a systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is updated in place on Windows and Linux — the settings the command does not name again are kept, a running instance is restarted on the new program, and a stopped one stays stopped — and replaced on macOS (see [Upgrades](#upgrades)). | It creates the registration. |
+| `install` | Registers the service with the supervisor and enables it for the boot of the scope on a **first** installation; a **repeat** installation keeps the autostart state the registration already has — an enabled systemd unit stays enabled, a disabled one is not enabled again, a masked unit (persistent or `--runtime`) refuses the installation, and a Windows registration keeps its start type and its delayed-auto-start flag, while a running Windows service with a disabled start type refuses the installation. A macOS LaunchAgent starts the instance as soon as it is registered (`RunAtLoad`); a systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is updated in place on Windows and Linux — the settings the command does not name again are kept, a running instance is restarted on the new program, and a stopped one stays stopped — and replaced on macOS (see [Upgrades](#upgrades)). | It creates the registration. |
 | `uninstall` | Removes the **registration only**. | Clean success: the registration is already gone. |
 | `start` | Starts the registered service. | **Error** that says the service is not installed. |
 | `stop` | Stops the registered service. | Clean success: there is nothing running to stop. |
@@ -767,13 +767,16 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   stays delayed. Only a **first** installation enables the registration it
   writes for the boot of its scope.
 - **A state the installation cannot update is refused.** A masked systemd unit
-  is a link to `/dev/null`, and writing the unit file would replace the mask:
-  the installation refuses before the unit file is written and names
-  `systemctl unmask hfdesk.service` with the scope prefix of the command. A
-  Windows service that is running while its start type is disabled is refused
-  as well, before it is stopped: Windows will not start a disabled service
-  again, so stopping it would leave the machine without the service that ran
-  before. The error names the repair (`sc config hfdesk start= demand`, or an
+  is refused before the unit file is written, whether the mask is persistent or
+  was placed at runtime with `systemctl mask --runtime`: a persistent mask is a
+  link to `/dev/null`, and writing the unit file would replace the mask, while a
+  runtime mask lives in `/run` and leaves no file at the unit path, so the
+  installation would register a unit that stays masked and cannot start. The
+  error names `systemctl unmask hfdesk.service` with the scope prefix of the
+  command. A Windows service that is running while its start type is disabled is
+  refused as well, before it is stopped: Windows will not start a disabled
+  service again, so stopping it would leave the machine without the service that
+  ran before. The error names the repair (`sc config hfdesk start= demand`, or an
   automatic start) and asks for another installation. A stopped Windows service
   with a disabled start type is allowed, because the installation does not start
   it.

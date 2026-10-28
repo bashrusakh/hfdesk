@@ -3613,11 +3613,16 @@ func TestSystemdRestartVerifyWaitIsTheShutdownBudget(t *testing.T) {
 //
 // The enablement that "is-enabled" reports is HFDESK_TEST_SYSTEMCTL_ENABLED_STATE:
 // "enabled" (the default) exits with a zero status, so the unit counts as
-// enabled for boot, and every other state ("disabled", "masked") exits with a
-// non-zero status, so a test can drive a repeat installation of a unit its
-// administrator disabled or of a masked unit that the installation refuses. An
-// "enable" that fails once HFDESK_TEST_SYSTEMCTL_ENABLE_FAIL is "1" drives the
-// failure of an installation that cannot enable its registration.
+// enabled for boot, and every other state ("disabled", "masked",
+// "masked-runtime") exits with a non-zero status, so a test can drive a repeat
+// installation of a unit its administrator disabled or of a masked unit that the
+// installation refuses. "masked" is a persistent mask, which the fake supervisor
+// reports while a unit file may exist; "masked-runtime" is the state of a unit
+// masked at runtime, which a test combines with an absent unit file, because the
+// mask lives in /run and leaves nothing at the unit path. "not-found" is what a
+// fresh machine reports for a unit it does not know. An "enable" that fails once
+// HFDESK_TEST_SYSTEMCTL_ENABLE_FAIL is "1" drives the failure of an installation
+// that cannot enable its registration.
 //
 // The log path is returned. It is written even when the supervisor is asked
 // for a property only, so a test can tell a restart from a state query.
@@ -4189,10 +4194,16 @@ func TestSystemdRestoreOfAUnitWithoutAProgramVerifiesTheState(t *testing.T) {
 // TestSystemdFreshInstallNeverStartsTheInstance checks the documented
 // behaviour of a first installation: the registration is written and enabled,
 // and starting stays the explicit, separate command.
+//
+// A fresh machine knows no unit: "is-enabled" prints "not-found" and exits with
+// a non-zero status. The installation reads the enablement anyway, because a
+// runtime mask leaves no unit file either, and a "not-found" is not a mask: the
+// first installation proceeds and enables the registration it writes.
 func TestSystemdFreshInstallNeverStartsTheInstance(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	systemdTempInstallEnvironment(t)
 	root := t.TempDir()
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLED_STATE", "not-found")
 
 	m := &systemdManager{scope: ScopeUser}
 	if _, err := m.Install(context.Background(), systemdTempInstallOptions(t, root)); err != nil {
@@ -4210,10 +4221,16 @@ func TestSystemdFreshInstallNeverStartsTheInstance(t *testing.T) {
 		t.Errorf("a first installation started the unit %d times:\n%s", got, strings.Join(calls, "\n"))
 	}
 	// A first installation has no registration whose enablement it could
-	// keep: it enables the registration it writes, and it never asks for a
-	// state that does not exist.
-	if got := systemdSupervisorCallsTo(calls, "is-enabled", unitName); got != 0 {
-		t.Errorf("a first installation read an enablement %d times, want none:\n%s", got, strings.Join(calls, "\n"))
+	// keep, but it asks for the enablement before it writes the unit file:
+	// that is how a runtime mask, which leaves no unit file, is found. A
+	// "not-found" answer is not a mask and the installation proceeds.
+	if got := systemdSupervisorCallsTo(calls, "is-enabled", unitName); got != 1 {
+		t.Errorf("a first installation read the enablement %d times, want once:\n%s", got, strings.Join(calls, "\n"))
+	}
+	enabledAt := systemdSupervisorCallIndex(calls, "is-enabled", unitName)
+	reloadAt := systemdSupervisorCallIndex(calls, "daemon-reload")
+	if enabledAt < 0 || enabledAt > reloadAt {
+		t.Errorf("the enablement was read at %d and the supervisor was reloaded at %d, want the read before the reload:\n%s", enabledAt, reloadAt, strings.Join(calls, "\n"))
 	}
 }
 
@@ -4289,15 +4306,16 @@ func TestSystemdReinstallKeepsTheAutostartStateOfTheUnit(t *testing.T) {
 	}
 }
 
-// TestSystemdInstallRefusesAMaskedUnit checks that an installation over a masked
-// unit is refused instead of replacing the mask.
+// TestSystemdInstallRefusesAMaskedUnit checks that an installation over a
+// persistently masked unit is refused instead of replacing the mask.
 //
 // A masked unit is a symbolic link to /dev/null, and writing the unit file over
 // it would unmask the unit silently: the administrator who masked it would lose
 // that decision without noticing. The installation therefore refuses before it
 // writes the unit file and before it touches the supervisor, the unit path keeps
 // the mask, and the error names the command that unmask the unit in the scope of
-// the manager.
+// the manager. See TestSystemdInstallRefusesARuntimeMaskedUnit for a mask that
+// leaves no unit file at all.
 func TestSystemdInstallRefusesAMaskedUnit(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	root := t.TempDir()
@@ -4355,6 +4373,90 @@ func TestSystemdInstallRefusesAMaskedUnit(t *testing.T) {
 		t.Errorf("the refused installation created the directory %q (stat error: %v)", filepath.Join(root, "etc"), statErr)
 	}
 	calls := systemdSupervisorCalls(t, logPath)
+	for _, command := range [][]string{
+		{"daemon-reload"},
+		{"enable", unitName},
+		{"restart", unitName},
+		{"stop", unitName},
+	} {
+		if got := systemdSupervisorCallsTo(calls, command...); got != 0 {
+			t.Errorf("the refused installation called %q %d times:\n%s", strings.Join(command, " "), got, strings.Join(calls, "\n"))
+		}
+	}
+}
+
+// TestSystemdInstallRefusesARuntimeMaskedUnit checks that an installation over a
+// unit that is masked at runtime is refused as well.
+//
+// A runtime mask ("systemctl mask --runtime") lives in /run and leaves no file at
+// the unit path, so the installation reads the unit file of a fresh machine and
+// would register the unit while the mask stays in place: nothing is clobbered,
+// but the new registration cannot start. The mask is only visible through the
+// supervisor, which reports "masked-runtime" with a non-zero status, so the
+// enablement is read whether or not a unit file exists. The refusal happens
+// before any directory is created, before the unit file is written and before the
+// supervisor is reloaded, enabled, restarted or asked to stop anything, and the
+// error names the command that removes the mask.
+func TestSystemdInstallRefusesARuntimeMaskedUnit(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	root := t.TempDir()
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLED_STATE", "masked-runtime")
+
+	m := &systemdManager{scope: ScopeUser}
+	_, err := m.Install(context.Background(), systemdTempInstallOptions(t, root))
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of an installation over a runtime masked unit")
+	}
+	for _, want := range []string{
+		unitName,
+		"is masked",
+		"does not replace the mask",
+		"systemctl --user unmask " + unitName,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
+		}
+	}
+
+	// No unit file was created: the runtime mask left no file at the path,
+	// and the refused installation writes none. The directory of the unit
+	// file is not created either, so the refusal came before the write.
+	unitPath, pathErr := m.unitPath()
+	if pathErr != nil {
+		t.Fatalf("unitPath() = %v, want nil", pathErr)
+	}
+	if _, statErr := os.Stat(unitPath); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("the refused installation created the unit file %q (stat error: %v)", unitPath, statErr)
+	}
+	if _, statErr := os.Stat(filepath.Dir(unitPath)); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("the refused installation created the unit directory %q (stat error: %v)", filepath.Dir(unitPath), statErr)
+	}
+
+	// No directory of the instance was created either, so the refusal came
+	// before the directories were prepared.
+	if entries, readErr := os.ReadDir(root); readErr != nil {
+		t.Fatalf("read the root of the installation: %v", readErr)
+	} else if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Errorf("the refused installation created %v below %q, want no directory at all", names, root)
+	}
+
+	// The enablement is the only question the installation asked: the state
+	// of a registration that does not exist is not read, and nothing was
+	// reloaded, enabled, restarted or stopped.
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "is-enabled", unitName); got != 1 {
+		t.Errorf("the enablement was read %d times, want once before the refusal:\n%s", got, strings.Join(calls, "\n"))
+	}
+	for _, call := range calls {
+		if strings.TrimPrefix(call, "--user ") != "is-enabled "+unitName {
+			t.Errorf("the refused installation called the supervisor with %q, want only the read of the enablement:\n%s", call, strings.Join(calls, "\n"))
+		}
+	}
 	for _, command := range [][]string{
 		{"daemon-reload"},
 		{"enable", unitName},
