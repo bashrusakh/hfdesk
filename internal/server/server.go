@@ -39,6 +39,25 @@ const ShutdownPhaseTimeout = 10 * time.Second
 // sum of the budgets of its phases.
 const GracefulShutdownTimeout = 2 * ShutdownPhaseTimeout
 
+// HealthPath is the endpoint that reports the health of the instance.
+//
+// The path is published: a readiness probe of a supervised start asks it
+// before the supervisor accepts the instance, and a probe that carried a copy
+// of the path would keep asking a route this one no longer registers.
+const HealthPath = "/api/health"
+
+// BasicAuthRealm is the realm the basic authentication of the API announces to
+// a client that sends no credential.
+const BasicAuthRealm = "HFDesk"
+
+// BasicAuthChallenge is the challenge of the basic authentication: the value of
+// the WWW-Authenticate header of a refused request.
+//
+// The challenge is published as the whole header value, because a probe that
+// proves a protected instance compares the header with it as it is sent: the
+// quoting of the realm is part of the answer it accepts.
+const BasicAuthChallenge = `Basic realm="` + BasicAuthRealm + `"`
+
 // Config holds server configuration.
 type Config struct {
 	Addr        string
@@ -517,7 +536,7 @@ func (s *Server) closeJobsAfterListenError(listenErr error, timeout time.Duratio
 // registerAPIRoutes sets up all API endpoints.
 func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	// Health check
-	mux.HandleFunc("GET /api/health", s.handleHealth)
+	mux.HandleFunc("GET "+HealthPath, s.handleHealth)
 
 	// Downloads
 	mux.HandleFunc("POST /api/download", s.handleStartDownload)
@@ -673,7 +692,7 @@ func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
 		userOK := subtle.ConstantTimeCompare([]byte(user), []byte(cfg.AuthUser)) == 1
 		passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.AuthPass)) == 1
 		if !ok || !userOK || !passOK {
-			w.Header().Set("WWW-Authenticate", `Basic realm="HFDesk"`)
+			w.Header().Set("WWW-Authenticate", BasicAuthChallenge)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}

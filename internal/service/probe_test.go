@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/bashrusakh/hfdesk/internal/server"
 )
 
 // TestProbeServiceAddressMapsTheWildcardBindOntoTheLoopback checks the address
@@ -57,19 +59,19 @@ func TestProbeServiceAddressMapsTheWildcardBindOntoTheLoopback(t *testing.T) {
 func TestProbeServiceReadyAcceptsTheHealthDocumentOfTheInstance(t *testing.T) {
 	path := make(chan string, 1)
 	authorization := make(chan string, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path <- r.URL.Path
 		authorization <- r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"status":"ok","version":"1.2.3","time":"2025-01-01T00:00:00Z","endpoint":"https://huggingface.co"}`)
 	}))
-	defer server.Close()
+	defer instance.Close()
 
-	if err := probeServiceReady(server.Listener.Addr().String()); err != nil {
-		t.Fatalf("probeServiceReady(%q) = %v, want nil for the health answer of the instance", server.Listener.Addr(), err)
+	if err := probeServiceReady(instance.Listener.Addr().String()); err != nil {
+		t.Fatalf("probeServiceReady(%q) = %v, want nil for the health answer of the instance", instance.Listener.Addr(), err)
 	}
-	if got := <-path; got != "/api/health" {
-		t.Errorf("the probe asked %q, want the health endpoint of the instance", got)
+	if got := <-path; got != server.HealthPath {
+		t.Errorf("the probe asked %q, want the health endpoint %q of the instance", got, server.HealthPath)
 	}
 	if got := <-authorization; got != "" {
 		t.Errorf("the probe sent the credential %q, want no access data at all", got)
@@ -84,14 +86,14 @@ func TestProbeServiceReadyAcceptsTheHealthDocumentOfTheInstance(t *testing.T) {
 // the server on the address is the instance, and the probe needs no credential
 // to observe it.
 func TestProbeServiceReadyAcceptsTheChallengeOfTheInstance(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("WWW-Authenticate", `Basic realm="HFDesk"`)
+	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("WWW-Authenticate", server.BasicAuthChallenge)
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
-	defer server.Close()
+	defer instance.Close()
 
-	if err := probeServiceReady(server.Listener.Addr().String()); err != nil {
-		t.Fatalf("probeServiceReady(%q) = %v, want nil for the challenge of the instance", server.Listener.Addr(), err)
+	if err := probeServiceReady(instance.Listener.Addr().String()); err != nil {
+		t.Fatalf("probeServiceReady(%q) = %v, want nil for the challenge of the instance", instance.Listener.Addr(), err)
 	}
 }
 

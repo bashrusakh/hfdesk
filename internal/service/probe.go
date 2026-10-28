@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/bashrusakh/hfdesk/internal/server"
 )
 
 // The readiness probe is the part of a verified start that no supervisor can
@@ -36,7 +38,10 @@ const (
 	// instance answers it: with the health document when no basic
 	// authentication is configured, and with the challenge of the instance
 	// when one is.
-	serviceProbePath = "/api/health"
+	//
+	// The path is the one the server registers, so a probe and the route it
+	// asks cannot drift apart.
+	serviceProbePath = server.HealthPath
 
 	// serviceProbeBodyLimit bounds the body a readiness probe reads.
 	//
@@ -52,7 +57,11 @@ const (
 	// the instance sends. The probe never sends a credential, so a protected
 	// instance answers the request of the probe with this challenge, and only
 	// that answer proves that the server on the address is the instance.
-	serviceProbeAuthChallenge = `Basic realm="HFDesk"`
+	//
+	// The value is the challenge the server writes, and the probe compares the
+	// whole header with it: a challenge of another realm describes another
+	// server.
+	serviceProbeAuthChallenge = server.BasicAuthChallenge
 )
 
 // serviceReadinessProbe is the readiness probe a manager uses to verify that a

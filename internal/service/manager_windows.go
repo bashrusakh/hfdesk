@@ -104,10 +104,16 @@ const (
 	// scmVerifyTimeout bounds the wait for a restarted instance to run the
 	// registered program.
 	//
-	// The wait is the shared budget of the service layer: a restart waits
-	// for the orderly shutdown of the previous instance before the new one
-	// is started, so the new program cannot be reported earlier than that.
-	scmVerifyTimeout = ShutdownBudget
+	// The wait is sized above the readiness budget of the layer and not by
+	// the shutdown budget: the service control manager reports a started
+	// instance as running only after the instance itself waited for its HTTP
+	// server, so a verification that gave up at the readiness budget would
+	// fail a start that is still inside its own budget, and the installation
+	// would roll back an update that became ready one moment later. The
+	// margin keeps the wait clear of that edge and stays below the
+	// independent outer wait of the desktop helper (60 s), which wraps the
+	// verification of an update.
+	scmVerifyTimeout = scmReadinessTimeout + 15*time.Second
 
 	// scmVerifyPollInterval is the pause between two checks of a restarted
 	// instance.
@@ -863,10 +869,10 @@ func (m *scmManager) startAndVerify(ctx context.Context, handle *mgr.Service, ex
 // process of the attempt that just failed still runs, so the process has to
 // differ from every excluded process as well.
 //
-// The wait is bounded by the shutdown budget of the service layer and by the
-// context of the installation: an instance that does not come up within it is a
-// failed installation, not a success that is reported from the registration
-// alone.
+// The wait is bounded by the verification budget of the service layer, which
+// covers the readiness budget of the instance, and by the context of the
+// installation: an instance that does not come up within it is a failed
+// installation, not a success that is reported from the registration alone.
 func (m *scmManager) verifyRunningExecutable(ctx context.Context, handle *mgr.Service, executable string, exclude ...uint32) (scmImageCheck, error) {
 	deadline := time.Now().Add(scmVerifyTimeout)
 	detail := "the service control manager did not report the instance as running"

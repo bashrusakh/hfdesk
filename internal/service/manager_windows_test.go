@@ -3570,18 +3570,30 @@ func TestSCMSameRegistration(t *testing.T) {
 	}
 }
 
-// TestSCMVerifyWaitIsTheShutdownBudget checks that the wait for a restarted
-// instance to run the registered program covers the graceful shutdown of the
-// instance and is the shared budget of the service layer.
+// desktopVerifyBudget is the independent outer wait of the desktop service
+// helper (internal/desktop/service_helper_windows.go, serviceVerifyBudget).
 //
-// The wait is not a number of its own: a second copy of the same decision would
-// drift below the budget the server publishes for its own shutdown.
-func TestSCMVerifyWaitIsTheShutdownBudget(t *testing.T) {
-	if scmVerifyTimeout < server.GracefulShutdownTimeout {
-		t.Errorf("the verify wait of the manager = %s, want at least %s: the wait has to cover the graceful shutdown of the previous instance", scmVerifyTimeout, server.GracefulShutdownTimeout)
+// The desktop package imports this one, so this test cannot read the value back
+// without an import cycle; the number is repeated here to prove that the
+// verification of a single start still fits inside the wait that wraps an
+// update.
+const desktopVerifyBudget = 60 * time.Second
+
+// TestSCMVerifyWaitCoversTheReadinessWait checks that the wait for a restarted
+// instance to run the registered program is sized above the readiness wait of
+// the instance.
+//
+// The service control manager reports a started instance as running only after
+// the instance itself waited for its HTTP server, so a verification that gave up
+// at the readiness budget would fail a start that is still inside its own
+// budget. The wait is derived from that budget, and it stays inside the
+// independent outer wait of the desktop helper that wraps an update.
+func TestSCMVerifyWaitCoversTheReadinessWait(t *testing.T) {
+	if scmVerifyTimeout <= scmReadinessTimeout {
+		t.Errorf("the verify wait of the manager = %s, want more than the readiness budget %s: the instance reports the running state only after it waited for its HTTP server", scmVerifyTimeout, scmReadinessTimeout)
 	}
-	if scmVerifyTimeout != ShutdownBudget {
-		t.Errorf("the verify wait of the manager = %s, want the shared budget %s", scmVerifyTimeout, ShutdownBudget)
+	if scmVerifyTimeout > desktopVerifyBudget {
+		t.Errorf("the verify wait of the manager = %s, want at most the outer wait %s of the desktop service helper", scmVerifyTimeout, desktopVerifyBudget)
 	}
 	if scmVerifyPollInterval <= 0 || scmVerifyPollInterval > scmVerifyTimeout {
 		t.Errorf("the verify poll interval = %s, want a positive pause inside the wait %s", scmVerifyPollInterval, scmVerifyTimeout)
