@@ -609,40 +609,30 @@ func (m *systemdManager) grantInstanceDirs(opts InstallOptions, account *user.Us
 // registration, writes the unit file atomically, reloads the supervisor and
 // enables the unit for the boot of the scope when the installation has to.
 //
-// A first installation enables the registration for the boot of the scope: a
-// unit that is installed is a unit that starts with the machine. A repeat
-// installation keeps the autostart state it finds: a unit an administrator
-// disabled or masked is not enabled again, and a unit that was enabled before
-// stays enabled, so a reinstall with a new binary never undoes the decision of
-// the administrator.
+// A first installation enables the registration for the boot of the scope; a
+// repeat installation keeps the autostart state it finds, so a unit an
+// administrator disabled or masked is never enabled again (see reloadAndEnable).
 //
-// An installation that replaces a registration keeps every setting the
-// request did not name: the registration describes the instance that runs,
-// and a reinstall with a new binary must not reset its bind address, its
-// paths, its cache layout or its account to the defaults of the scope. The
-// executable always comes from the request.
+// An installation that replaces a registration keeps every setting the request
+// did not name, so a reinstall with a new binary resets no bind address, paths,
+// cache layout or account; the executable always comes from the request.
 //
-// A reinstalled instance that was running before is restarted and verified:
-// a registration alone does not switch the running process. An instance that
-// was stopped, and a first installation, are never started: starting is an
-// explicit, separate command.
+// A reinstalled instance that was running before is restarted and verified,
+// because a registration alone does not switch the running process. A stopped
+// instance and a first installation are never started.
 //
 // A machine-wide instance runs as the dedicated service account of the
-// platform. The account is validated before anything is created: the
-// installation never creates an account and never changes the ownership of
-// a model or a cache tree.
+// platform; the account is validated before anything is created, and the
+// installation never creates an account and never changes the ownership of a
+// model or a cache tree.
 //
-// A failure after the unit file was written rolls the unit file back, so an
-// installation never leaves a half configured unit behind. A failure after
-// the restart of a running instance restores the previous registration and
-// starts the previous instance again. A failure removes the directories the
-// installation created as well, so a failed attempt leaves the machine as it
-// was.
+// A failure after the unit file was written rolls the unit file back, and a
+// failure after the restart of a running instance restores and restarts the
+// previous registration. A failure removes the directories the installation
+// created as well, so a failed attempt leaves the machine as it was.
 //
-// The returned options are the registration as written: the merged options of
-// a reinstall, or the request of a first installation. A caller reports them
-// instead of the request, so a preserved setting is never displayed as the
-// default it was not reset to.
+// The returned options are the registration as written, so a caller reports a
+// preserved setting instead of the default it was not reset to.
 func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (InstallOptions, error) {
 	// The registration of the scope is read before anything is decided:
 	// an installation over an existing registration must merge with what
@@ -707,10 +697,8 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 			return opts, err
 		}
 		previous.running = running
-		// The enablement of the registration is read before the unit file
-		// is written: a repeat installation keeps the autostart state it
-		// finds. A first installation has no state to read, and it enables
-		// the registration it writes.
+		// The enablement is read before the unit file is written: a repeat
+		// installation keeps the autostart state it finds.
 		previous.enabled = m.registrationEnabled(ctx)
 	}
 	// The directories the installation is about to create are remembered
@@ -750,13 +738,10 @@ type previousRegistration struct {
 	// existed reports whether the scope had a registration at all.
 	existed bool
 	// running reports whether the instance ran before the installation.
-	// Only such an instance is restarted; an absent content never carries
-	// this flag.
+	// Only such an instance is restarted.
 	running bool
-	// enabled reports whether the supervisor had the unit enabled for the
-	// boot of the scope. The flag is read for a registration that existed:
-	// a first installation carries none and enables the registration it
-	// writes.
+	// enabled reports whether the supervisor had the unit enabled for boot.
+	// Only a registration that existed carries the flag.
 	enabled bool
 }
 
@@ -783,16 +768,12 @@ func registrationOptions(unit parsedUnit, scope Scope) InstallOptions {
 	return opts
 }
 
-// registrationRunning reports whether the supervisor runs the registered
-// unit.
+// registrationRunning reports whether the supervisor runs the registered unit.
 //
 // A unit the supervisor does not know does not run either: the unit file is
-// there, but the supervisor has not picked it up, which is the state an
-// installation repairs with its daemon-reload.
-//
-// Any other failure of the supervisor is reported: an installation that
-// cannot tell whether the instance runs cannot promise to bring it back, and
-// it refuses before it changes the registration.
+// there, but a daemon-reload is what makes the supervisor pick it up. Any other
+// failure is reported, because an installation that cannot tell whether the
+// instance runs cannot promise to bring it back.
 func (m *systemdManager) registrationRunning(ctx context.Context) (bool, error) {
 	out, err := m.runSystemctl(ctx, "show", unitName,
 		"--property=LoadState", "--property=ActiveState", "--property=SubState")
@@ -811,19 +792,12 @@ func (m *systemdManager) registrationRunning(ctx context.Context) (bool, error) 
 // registrationEnabled reports whether the supervisor had the unit enabled for
 // the boot of the scope.
 //
-// The answer comes from the supervisor and not from the file system: an
-// enablement is the links the supervisor keeps for the [Install] section of the
-// unit, and only the supervisor knows them. "systemctl is-enabled" exits with a
-// zero status for a unit that is enabled for boot and with a non-zero status
-// for every state that is not: a disabled unit, a masked unit and a unit the
-// supervisor does not know.
-//
-// A read that fails is reported as not enabled: "is-enabled" exits with a
-// non-zero status for every state that is not an enablement, and a supervisor
-// that cannot be asked is no evidence of an enabled unit. A repeat installation
-// then leaves the autostart state of the unit alone instead of enabling a unit
-// its administrator disabled or masked; a supervisor that cannot be reached at
-// all still fails the installation at the reload that follows.
+// The answer comes from the supervisor, not from the file system: an
+// enablement is the links the supervisor keeps for the [Install] section, and
+// only the supervisor knows them. "systemctl is-enabled" exits zero only for an
+// enabled unit, so a failed read is reported as not enabled; a repeat
+// installation then leaves the autostart state alone, and a supervisor that
+// cannot be reached still fails the installation at the reload.
 func (m *systemdManager) registrationEnabled(ctx context.Context) bool {
 	if _, err := m.runSystemctl(ctx, "is-enabled", unitName); err != nil {
 		return false
@@ -840,19 +814,13 @@ func (m *systemdManager) registrationEnabled(ctx context.Context) bool {
 // caller, so a failed installation leaves no half configured unit and no
 // empty directories behind.
 //
-// The unit is enabled for boot when the installation has to enable it: a first
-// installation enables the registration for the boot of the scope, and a repeat
-// installation keeps the autostart state it finds, so the enablement of a
-// registration an administrator decided on survives the reinstall.
+// The unit is enabled for boot only when the installation has to enable it
+// (see reloadAndEnable).
 //
-// A replaced registration that was running is restarted and verified. A
-// registration alone does not switch the process that already runs: systemd
-// keeps executing the old program until the unit is restarted. A failure of
-// that restart or of the verification restores the previous registration and
-// brings the previous instance back into service, so the machine never keeps a
-// registration it failed to put into service. The restore reports the previous
-// instance as started again only when the supervisor was observed running it:
-// the exit status of a restart is not a running instance.
+// A replaced registration that was running is restarted and verified; a failure
+// of that restart or of the verification restores the previous registration and
+// brings the previous instance back into service. The restore reports a started
+// instance only when the supervisor was observed running it.
 func (m *systemdManager) register(ctx context.Context, opts InstallOptions, account *user.User, created map[string][]string, previous previousRegistration) error {
 	// The instance runs as the service account, so the directories it owns
 	// belong to it.
@@ -871,10 +839,8 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 	if err := writeUnitFile(previous.path, unit); err != nil {
 		return err
 	}
-	// A first installation enables the registration for the boot of the
-	// scope; a repeat installation keeps the autostart state it finds. A
-	// unit an administrator disabled or masked is therefore not enabled
-	// again, and a unit that was enabled before stays enabled.
+	// A first installation enables the unit for boot; a repeat installation
+	// keeps the autostart state it finds.
 	enable := !previous.existed || previous.enabled
 	if err := m.reloadAndEnable(ctx, enable); err != nil {
 		m.rollbackUnit(ctx, previous.path, previous.content, previous.existed)
@@ -898,21 +864,15 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 // replaced and the running state it had.
 //
 // The unit file is restored and the supervisor is reloaded first, so the
-// restart below starts the previous program rather than the new one. The
-// restored file is read back before the restart: a caller is only told that
-// the previous registration was restored when the file really holds it again.
+// restart below starts the previous program, and the restored file is read back
+// before the restart: a caller is only told that the registration was restored
+// when the file really holds it again.
 //
-// A restart that the supervisor accepted is not a running instance: the
-// supervisor reports a restart of a Type=simple unit as soon as the process was
-// forked, so a unit that dies right away still ends the command with a success.
-// The running state and the readiness of the instance are therefore read back
-// before the restore is reported, and a restart that was issued but not
-// confirmed is returned as an error that says exactly that.
-//
-// The restore is best effort and never replaces the original failure: a
-// failed restore is reported with the outcome of the restore, so a caller
-// never sees an unqualified failure for a registration that was restored and
-// never a success for one that was not.
+// A restart that the supervisor accepted is not a running instance: a
+// Type=simple unit is reported restarted as soon as the process was forked, so
+// the running state and the readiness are read back, and an unconfirmed restart
+// is an error that says exactly that. The restore never replaces the original
+// failure.
 func (m *systemdManager) restorePreviousRegistration(ctx context.Context, previous previousRegistration) error {
 	// The caller may have cancelled the context, the previous registration
 	// still has to be put back into service.
@@ -927,11 +887,9 @@ func (m *systemdManager) restorePreviousRegistration(ctx context.Context, previo
 	if _, err := m.runSystemctl(cleanup, "restart", unitName); err != nil {
 		return fmt.Errorf("the registration was restored, but the restart of the previous instance was refused: %w", err)
 	}
-	// The restored registration names the program the previous instance ran.
-	// A unit whose command line cannot be read names no program, so the
-	// running state alone is verified then. The readiness probe uses the
-	// bind address of the restored unit, which is the address the restored
-	// instance serves on.
+	// The restored unit names the program the previous instance ran; a unit
+	// whose command line cannot be read names no program, so only the running
+	// state and the probe of its bind address are verified then.
 	restored := parseUnit(string(previous.content))
 	if err := m.verifyRunningExecutable(cleanup, restored.ExecStart, restored.listen()); err != nil {
 		return fmt.Errorf("the registration was restored and the restart of the previous instance was issued, but the restart was not confirmed: %w", err)
@@ -939,12 +897,9 @@ func (m *systemdManager) restorePreviousRegistration(ctx context.Context, previo
 	return nil
 }
 
-// verifyRestoredUnit checks that the unit file holds the registration an
-// installation replaced again.
-//
-// The rollback writes the file and reloads the supervisor, and both are best
-// effort: the file is read back, so the outcome of the restore is a fact and
-// not an assumption.
+// verifyRestoredUnit checks that the unit file holds the previous registration
+// again: the rollback writes and reloads best effort, so the file is read back
+// instead of assumed.
 func verifyRestoredUnit(previous previousRegistration) error {
 	content, existed, err := readUnitFile(previous.path)
 	if err != nil {
@@ -963,13 +918,8 @@ func verifyRestoredUnit(previous previousRegistration) error {
 
 // restartAndVerify restarts the unit and verifies that the supervisor runs the
 // new executable and that the instance serves on the listen address of the
-// unit.
-//
-// The restart is what switches a running instance to the new program: the
-// unit file was reloaded, but the process that is already running keeps the
-// image it was started from. The listen address comes from the unit that was
-// written, so the verification probes the address the registration names and
-// not a default of the request.
+// unit. The restart is what switches the running process, which keeps the image
+// it was started from; the listen address comes from the unit that was written.
 func (m *systemdManager) restartAndVerify(ctx context.Context, executable, listen string) error {
 	if _, err := m.runSystemctl(ctx, "restart", unitName); err != nil {
 		return fmt.Errorf("service: restart %s: %w", unitName, err)
@@ -981,12 +931,9 @@ func (m *systemdManager) restartAndVerify(ctx context.Context, executable, liste
 // instance runs the new executable.
 const restartPollInterval = 100 * time.Millisecond
 
-// restartVerifyWait returns the bounded wait for a restarted instance to run
-// the new executable.
-//
-// The wait is the shutdown budget of the service layer: a restart waits for
-// the orderly shutdown of the old instance before the new one is started, so
-// the new program cannot be reported earlier than that.
+// restartVerifyWait returns the bounded wait for a restarted instance: the
+// shutdown budget, because the new program cannot start before the old instance
+// finished its orderly shutdown.
 func (m *systemdManager) restartVerifyWait() time.Duration {
 	if m.restartWait > 0 {
 		return m.restartWait
@@ -998,32 +945,18 @@ func (m *systemdManager) restartVerifyWait() time.Duration {
 // running with the given program and the instance answers on the listen address
 // of the unit.
 //
-// The check is the effective one for this platform: it asks the supervisor for
-// the state and the ExecStart of the loaded unit. systemctl show reports the
-// configuration of the unit that was written and reloaded, not the image of the
-// process that runs it. A registration that points at the new executable
-// therefore proves nothing while the old process still runs; the installation
-// succeeds only when the supervisor reports the reloaded unit active with the
-// new program, after the restart was requested.
+// systemctl show reports the configuration of the loaded unit, not the image of
+// the process that runs it, so a registration that points at the new executable
+// proves nothing while the old process still runs. The unit is of type simple,
+// so the supervisor reports it active as soon as the process was forked, and a
+// process that dies right after is active for a moment: the readiness probe
+// therefore has to answer as well. A probe that does not answer within the wait
+// fails the verification like a state that never becomes running, so the caller
+// rolls the installation back instead of reporting an update that left no
+// server behind.
 //
-// The state of the supervisor is not a serving instance either: the unit is of
-// type simple, so the supervisor reports it active as soon as the process was
-// forked, and a process that dies right after, on a bind error for example,
-// is reported active for a moment. The readiness probe therefore has to answer
-// as well, and it asks the instance itself. A probe that does not answer within
-// the wait is a failed verification, exactly like a state that never becomes
-// running, so the caller rolls the installation back instead of reporting an
-// update that left no server behind.
-//
-// An empty executable checks the running state and the probe alone: a
-// registration whose command line names no program has no program to compare,
-// and the caller then reports the state it observed instead of a program it
-// does not know.
-//
-// The wait is bounded by the shutdown budget of the service layer and the
-// context of the installation: an instance that does not come up within it is
-// a failed installation, not a success that is reported from the registration
-// alone.
+// An empty executable checks the running state and the probe alone, and the
+// wait is bounded by the shutdown budget and the context of the installation.
 func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable, listen string) error {
 	budget := m.restartVerifyWait()
 	deadline := time.Now().Add(budget)
@@ -1046,9 +979,8 @@ func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable
 				detail = fmt.Sprintf("the supervisor reports the state %q with the program %q", show.State, path)
 			default:
 				// The supervisor reports the instance the registration
-				// names. The instance itself has to answer before the
-				// start counts: an active unit is a forked process, not
-				// a server.
+				// names; the instance itself has to answer before the
+				// start counts.
 				if probeErr := serviceReadinessProbe(listen); probeErr != nil {
 					probeFailed = true
 					if executable == "" {
@@ -1079,15 +1011,13 @@ func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable
 	}
 }
 
-// execStartPath returns the program path of the ExecStart property of the
-// supervisor.
-//
-// The supervisor reports the property as a structure:
+// execStartPath returns the program path of the ExecStart property, which the
+// supervisor reports as a structure:
 //
 //	ExecStart={ path=/usr/local/bin/hfdesk ; argv[]=/usr/local/bin/hfdesk ... }
 //
-// The "path=" field is the program the supervisor really executes. A property
-// that is absent, empty or names no path yields an empty string.
+// The "path=" field is the program that really executes; an absent or empty
+// property yields an empty string.
 func execStartPath(output string) string {
 	for _, line := range strings.Split(output, "\n") {
 		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
@@ -1198,16 +1128,10 @@ func (m *systemdManager) checkSystemPaths(opts InstallOptions) error {
 }
 
 // reloadAndEnable makes the supervisor aware of the unit file and enables the
-// unit for the boot of the scope when the installation has to.
-//
-// The reload always happens: the supervisor has to pick up the unit file the
-// installation just wrote, whether the unit was there before or not.
-//
-// The enable is the autostart of the registration: a first installation enables
-// the registration for boot, and a repeat installation keeps the autostart state
-// it finds. The caller therefore asks for the enable only when there was no
-// registration before or when the registration was enabled before, so a unit an
-// administrator disabled or masked is never enabled again by a reinstall.
+// unit for the boot of the scope when the installation has to. The reload always
+// happens; the enable is only asked for a first installation or a registration
+// that was enabled before, so a reinstall never re-enables a unit an
+// administrator disabled or masked.
 func (m *systemdManager) reloadAndEnable(ctx context.Context, enable bool) error {
 	if _, err := m.runSystemctl(ctx, "daemon-reload"); err != nil {
 		return err

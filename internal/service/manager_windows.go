@@ -32,31 +32,22 @@ import (
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
-// The Windows service mode of HFDesk is a registration in the service
-// control manager.
+// The Windows service mode of HFDesk is a registration in the service control
+// manager.
 //
-// The service control manager registers machine-wide services only, so a
-// user scope installation does not exist on this platform. The
-// registration is driven through the API of the supervisor: sc.exe,
-// PowerShell and the shell are never called, so a path with a space or a
-// quote in it cannot change the command that runs.
+// The service control manager registers machine-wide services only, so a user
+// scope installation does not exist here. The registration is driven through
+// the API of the supervisor: sc.exe, PowerShell and the shell are never called,
+// so a path with a space or a quote cannot change the command that runs.
 //
-// The manager never escalates privileges itself: an installation needs an
-// elevated shell, and so does an uninstallation that has a registration to
-// remove. The manager fails with a clear message when the process does not
-// have one.
+// The manager never escalates privileges itself: an installation and a
+// removal need an elevated shell, and the manager fails with a clear message
+// when the process has none. The existence of the registration is looked up
+// before that requirement: an ordinary shell can read it, so an absent
+// registration is a clean success in every shell.
 //
-// The existence of the registration is looked up before the elevation
-// requirement is applied: an ordinary shell can read the registration of
-// the instance, so it can tell an absent registration from a registration
-// it may not look at. A registration that is not there is a clean success
-// in every shell.
-//
-// The status of the instance is read with the rights a status needs only:
-// the right to query the state of the instance and the right to query its
-// configuration. The default descriptor of a service grants both of them
-// to the interactive users of the machine, so a normal shell reads the
-// state of a registration without an elevated shell.
+// The status reads the registration with the rights a status needs only, which
+// the default descriptor grants to the interactive users of the machine.
 const (
 	// scmDisplayName is the name the service manager shows.
 	scmDisplayName = "HFDesk"
@@ -66,17 +57,11 @@ const (
 
 	// scmLocalServiceAccount is the account the instance runs as.
 	//
-	// LocalService is the least privileged of the built-in service
-	// accounts of the operating system: it has no password, it is not a
-	// member of the administrators and it holds only the rights a
-	// service needs. The instance therefore never runs with the rights
-	// of the machine and never with the rights of the user who
-	// installed it.
-	//
-	// The account has a profile of its own, so the instance sees
-	// neither the desktop nor the files of the user who installed it.
-	// The paths of the instance are the machine-wide paths of the
-	// platform (%ProgramData%\HFDesk), never the profile of a user.
+	// LocalService is the least privileged built-in service account: no
+	// password, no membership in the administrators, only the rights a
+	// service needs. It has a profile of its own, so the instance sees
+	// neither the desktop nor the files of the user who installed it; the
+	// paths of the instance are the machine-wide paths (%ProgramData%\HFDesk).
 	scmLocalServiceAccount = `NT AUTHORITY\LocalService`
 
 	// scmRegistrationPath is the place the registration lives in. The
@@ -86,15 +71,11 @@ const (
 )
 
 const (
-	// scmStopTimeout bounds the wait for the graceful stop of the
-	// instance.
+	// scmStopTimeout bounds the wait for the graceful stop of the instance.
 	//
-	// The wait is the shared budget of the service layer: the server
-	// publishes the budget of its own orderly shutdown and the manager
-	// waits for that total plus a margin, so the manager never reports a
-	// failed stop while the instance is still saving its state. A number
-	// of its own here would be a second copy of the same decision, and
-	// the manager could drift below the budget of the server.
+	// The wait is the shared budget of the service layer, so the manager
+	// never reports a failed stop while the instance is still saving its
+	// state, and a number of its own could drift below it.
 	scmStopTimeout = ShutdownBudget
 
 	// scmStopPollInterval is the pause between two checks of the state of
@@ -104,15 +85,10 @@ const (
 	// scmVerifyTimeout bounds the wait for a restarted instance to run the
 	// registered program.
 	//
-	// The wait is sized above the readiness budget of the layer and not by
-	// the shutdown budget: the service control manager reports a started
-	// instance as running only after the instance itself waited for its HTTP
-	// server, so a verification that gave up at the readiness budget would
-	// fail a start that is still inside its own budget, and the installation
-	// would roll back an update that became ready one moment later. The
-	// margin keeps the wait clear of that edge and stays below the
-	// independent outer wait of the desktop helper (60 s), which wraps the
-	// verification of an update.
+	// The wait is sized above the readiness budget of the layer, because the
+	// service control manager reports a started instance as running only after
+	// the instance waited for its HTTP server; the margin stays below the
+	// independent outer wait of the desktop helper (60 s).
 	scmVerifyTimeout = scmReadinessTimeout + 15*time.Second
 
 	// scmVerifyPollInterval is the pause between two checks of a restarted
@@ -157,73 +133,47 @@ func newPlatformManager(scope Scope) (Manager, error) {
 
 // Install registers the instance with the service control manager.
 //
-// The installation reads the registration of the instance, validates the
-// effective options, prepares the directories of the instance, restricts the
-// access to them, checks the directories the installation reuses, writes the
-// registration and registers the event log source of the instance.
+// The installation reads the registration, validates the effective options,
+// prepares the directories, restricts the access to them, checks the
+// directories the installation reuses, writes the registration and registers
+// the event log source.
 //
 // The registration is read before anything is changed: an installation over an
 // existing registration keeps every setting the request did not name, because
-// the registration describes the instance that runs and a reinstall with a new
-// binary must not reset its bind address, its paths or its cache layout to the
-// defaults of the scope. The program of the registration always comes from the
-// request: an installation is the only way a new binary reaches the
-// registration.
+// the registration describes the instance that runs. The program always comes
+// from the request, and so does the autostart of a first installation: a
+// service an administrator switched to a manual or a delayed automatic start
+// keeps that state.
 //
-// The autostart state of the registration is kept as well: a service an
-// administrator switched to a manual or a disabled start is not turned back into
-// an automatic one by a repeat installation, and a delayed automatic start stays
-// delayed. Only a first installation is written with the automatic start.
+// The state of the instance is restricted before the registration is written,
+// so the directories the instance creates inherit the restrictive descriptor.
+// A path that existed before the installation keeps its descriptor: it belongs
+// to whoever named it, so only its descriptor is read, to check that the account
+// of the instance can work with it, and a refusal happens before the first
+// descriptor is changed. The reused directories are checked the same way.
 //
-// The state of the instance is restricted before the registration is
-// written: every directory the installation created carries the restrictive
-// descriptor, so the directories the instance creates inside them inherit
-// it and the account of the instance can work with them.
-//
-// A path of the instance that existed before the installation keeps its
-// descriptor: it belongs to whoever named it, and the installation never
-// takes a directory over from the owner it already has. The installation
-// only reads the descriptor of such a path, to check that the account of
-// the instance can work with it, and it refuses the installation before it
-// changes a single descriptor when it cannot.
-//
-// The reused directories are checked before the registration is written as
-// well: a directory the account of the instance cannot reach is a failed
-// installation and not a service that fails later with an opaque access
-// error.
-//
-// A service that is registered already is not registered a second time:
-// its registration is updated instead, so the instance keeps its identity.
+// A service that is registered already is updated instead of registered a
+// second time, so the instance keeps its identity.
 //
 // An instance that ran before the installation is restarted and verified: a
-// registration alone does not switch the running process, because the process
-// keeps the image it was started from. The installation only succeeds when the
-// instance runs the registered program in a process that is not the one it ran
-// in before. An instance that was stopped, broken or absent, and a first
-// installation, are never started: starting is an explicit, separate command.
+// registration alone does not switch the running process. The installation only
+// succeeds when the instance runs the registered program in a process that is
+// not the one it ran in before. A stopped, broken or absent instance and a
+// first installation are never started.
 //
 // The registration carries the failure recovery of the platform: the service
 // control manager restarts an instance that ends without reporting its stop,
-// and, with the non-crash switch of the recovery policy, an instance that ends
-// with an error code. An explicit stop reports the stopped state with the exit
-// code 0, so it is never turned into a restart. The switch of the policy is
-// documented to take effect at the next start of the machine: the installation
-// writes it and reports the policy it wrote, never a recovery the running
-// system did not perform yet. An installation that finds a recovery policy
-// registered already keeps it, switch included, so the settings of the
-// instance and the policy of an administrator survive a reinstall; the policy
-// of HFDesk is configured only for a registration without one.
+// and, with the non-crash switch, one that ends with an error code. The switch
+// is documented to take effect at the next start of the machine, so the
+// installation reports the policy it wrote and never a recovery the running
+// system did not perform yet. A policy that is registered already is kept.
 //
-// A failure after the registration was written restores the previous
-// registration. A failure after the restart of a running instance stops the
-// instance the failed installation started, restores the previous registration
-// and brings the previous instance back; only a verified restart is reported as
-// one, so the machine never keeps a registration that names another program than
-// the process that runs and the caller never reads a success for a start that
-// was not proven. A failed first installation removes the registration it
-// created and the directories the installation created, so a refused attempt
-// leaves the machine as it was: the directories it created are removed while
-// they are still empty, and a directory that existed before is never touched.
+// A failure after the registration was written restores the previous one; a
+// failure after the restart of a running instance stops the instance the failed
+// installation started, restores the previous registration and brings the
+// previous instance back. A failed first installation removes the registration
+// it created and the directories the installation created while they are still
+// empty; a directory that existed before is never touched.
 //
 // The returned options are the registration as written: the merged options of a
 // reinstall, or the request of a first installation.
@@ -269,15 +219,9 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) (InstallO
 		return opts, fail(err)
 	}
 	// The state of the instance is restricted before the reused
-	// directories are checked: the directories the instance creates
-	// inside its own directories inherit the restrictive descriptor, so
-	// the account of the instance can work with them.
-	//
-	// A path of the instance that existed before the installation is
-	// never rewritten: its descriptor is only read, to check that the
-	// account of the instance can work with it. The check of every such
-	// path happens before the first descriptor is changed, so a refused
-	// installation leaves every descriptor of the machine as it was.
+	// directories are checked, and a path that existed before the
+	// installation is never rewritten: the check of every such path happens
+	// before the first descriptor is changed.
 	if err := restrictInstanceState(opts, snapshot); err != nil {
 		return opts, fail(err)
 	}
@@ -309,12 +253,9 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) (InstallO
 	return opts, nil
 }
 
-// previousSCMRegistration is the registration an installation replaces.
-//
-// It is read before the installation changes anything: the merge of the request
-// needs the settings the instance runs with, a restart needs the process the
-// instance ran in, and a failed installation needs the registration it has to
-// put back.
+// previousSCMRegistration is the registration an installation replaces. It is
+// read before anything changes: the merge needs the settings the instance runs
+// with, a restart needs the process it ran in, and a failure needs it back.
 type previousSCMRegistration struct {
 	// present reports whether the instance was registered at all.
 	present bool
@@ -333,13 +274,9 @@ type previousSCMRegistration struct {
 
 // scmPreviousRegistration reads the registration the installation replaces.
 //
-// The registration is read with the rights a status needs, so an ordinary shell
-// learns whether the instance is installed and what it runs with. A registration
-// the caller may not look at is reported as the elevation requirement it is:
-// the installation needs the rights of the machine either way.
-//
 // An absent registration is not an error: it is the state a first installation
-// replaces, and a first installation starts from the request alone.
+// replaces. A registration the caller may not look at is reported as the
+// elevation requirement it is.
 func scmPreviousRegistration(scope Scope) (previousSCMRegistration, error) {
 	facts, err := scmLookupRegistration(ServiceName)
 	if err != nil {
@@ -366,18 +303,10 @@ func scmPreviousRegistration(scope Scope) (previousSCMRegistration, error) {
 // carries: the program of the command line, the bind address, the runtime paths
 // and the cache layout.
 //
-// The values come from the command line of the registration, so an installation
-// over an existing registration keeps what the instance really runs with
-// instead of what a request would default to.
-//
-// A command line that cannot be read records no setting: the options are empty
-// then, and the merge falls back to the defaults of the request. An installation
-// is the way a damaged registration is repaired, so it never fails over one.
-//
-// No field is marked explicit: a registration names the values the instance runs
-// with, and it never overrides an explicit field of the request. The account is
-// not part of the registration either: the instance runs as the built-in
-// LocalService account, which has no name of its own to record.
+// A command line that cannot be read records no setting, so the merge falls
+// back to the defaults of the request: an installation is the way a damaged
+// registration is repaired, so it never fails over one. No field is marked
+// explicit, and the account is not recorded: the instance runs as LocalService.
 func scmRegistrationOptions(commandLine string, scope Scope) InstallOptions {
 	registration, err := parseSCMCommandLine(commandLine)
 	if err != nil {
@@ -397,28 +326,19 @@ func scmRegistrationOptions(commandLine string, scope Scope) InstallOptions {
 
 // register writes the registration of the instance and puts it into service.
 //
-// The registration is created when the instance is not registered, and it is
-// updated otherwise: a second registration never exists, so the instance keeps
-// its identity and the status keeps describing one service.
-//
-// The autostart state of a registration is a setting of the machine: an update
-// writes the start type and the delayed start the registration already has, so a
-// service an administrator switched to a manual or a disabled start stays that
-// way. Only a first installation is written with the automatic start.
+// The registration is created when the instance is not registered and updated
+// otherwise: a second registration never exists, so the instance keeps its
+// identity. An update writes the start type and the delayed start the
+// registration already has, so a service an administrator switched to a manual,
+// a disabled or a delayed start stays that way; only a first installation is
+// written with the automatic start.
 //
 // The directories of the instance are already created when the function is
-// called. A failure after the registration was written restores the
-// configuration of the previous registration: the caller removes the
-// directories the installation created, so a failed installation leaves no
-// half configured service and no empty directories behind.
-//
-// A replaced registration that was running is restarted and verified. A
-// registration alone does not switch the process that already runs, so a
-// failure of that restart or of the verification stops the instance the
-// installation started, restores the configuration of the previous
-// registration, brings the previous program back into service and verifies it:
-// the machine never keeps a registration the installation failed to put into
-// service.
+// called. A failure after the registration was written restores the previous
+// configuration; the caller removes the directories the installation created. A
+// replaced registration that was running is restarted and verified, and a
+// failure of that restart stops the instance the installation started, restores
+// the previous configuration and brings the previous program back into service.
 func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts InstallOptions, previous previousSCMRegistration) error {
 	config := buildSCMConfig(opts)
 	handle, err := manager.OpenService(ServiceName)
@@ -463,12 +383,9 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 		}
 		previous.config = previousConfig
 
-		// The autostart state of the registration is a setting of the
-		// machine: an administrator may have switched the service to a
-		// manual or a disabled start, or to a delayed automatic start, and
-		// a repeat installation keeps the state it finds. Only a first
-		// installation is written with the automatic start of
-		// buildSCMConfig.
+		// An administrator may have switched the service to a manual, a
+		// disabled or a delayed start, and a repeat installation keeps the
+		// state it finds.
 		config = scmConfigWithAutostart(config, previousConfig)
 
 		if err := handle.UpdateConfig(config); err != nil {
@@ -538,31 +455,19 @@ const (
 // rollbackInstallation restores the configuration of the registration a failed
 // installation replaced.
 //
-// The failure of the installation is the error the caller gets; the outcome of
-// the restore is reported next to it, so a caller never sees an unqualified
-// failure for a configuration that was restored and never a success for one
-// that was not.
+// The failure is the error the caller gets, and the outcome of the restore is
+// reported next to it. The restore is the configuration and not the whole
+// registration: the failure recovery is left as the installation configured it.
 //
-// The restore is the configuration of the registration and not the whole
-// registration: the failure recovery is not part of it. An installation that
-// found a registration without a policy configured the policy of HFDesk, and
-// the write back leaves that policy in place. The report therefore names what
-// was restored instead of claiming a registration that is back as it was.
-//
-// The running instance is only touched when the installation had switched it: a
-// failure that happens while it still runs leaves it alone. The restart rollback
-// is the exception that keeps the two descriptions together: it stops the
-// instance the failed installation started before the previous registration is
-// written back, so the registration and the process that runs never describe
-// different programs.
-//
-// The restore runs on a context that is not cancelled by the caller: an
-// interrupted installation still has to put the machine back the way it was.
+// The running instance is only touched when the installation switched it. The
+// restart rollback stops the instance the failed installation started before
+// the previous registration is written back, so the registration and the
+// process that runs never describe different programs. The restore runs on a
+// context that the caller cannot cancel.
 func (m *scmManager) rollbackInstallation(ctx context.Context, handle *mgr.Service, previous previousSCMRegistration, mode scmRollbackMode, failure error) error {
 	if mode == scmRollbackRestart && previous.present && previous.running {
-		// The installation switched the running instance, so the rollback has
-		// to switch it back: the registration and the process that runs are
-		// described by one outcome and never by two.
+		// The installation switched the running instance, so the rollback
+		// has to switch it back.
 		return m.rollbackRestart(ctx, handle, previous, failure)
 	}
 	if err := restoreSCMRegistration(handle, previous); err != nil {
@@ -579,16 +484,10 @@ func (m *scmManager) rollbackInstallation(ctx context.Context, handle *mgr.Servi
 // scmRestartRollback is what the restart rollback of a failed installation
 // proved about the machine.
 //
-// The facts are what the rollback observed and not what it attempted: a
-// sentence composed from them never claims more than the rollback can prove.
-// They describe the configuration of the registration and the instance that
-// runs, not the whole registration: the restore writes the configuration back
-// and leaves the failure recovery as the installation configured it, so no
-// sentence reports the recovery as restored. The registration and the process
-// that runs are only described together: a rollback that cannot prove that the
-// instance of the failed installation stopped never claims that the previous
-// configuration was restored, because a registration that names one program
-// while another one runs describes the machine wrongly.
+// The facts are what was observed, not what was attempted, so no sentence
+// composed from them claims more than the rollback can prove. They describe the
+// configuration and the running instance, not the whole registration: the
+// restore leaves the failure recovery in place.
 type scmRestartRollback struct {
 	// stopped reports whether the instance the failed installation started
 	// was proven to be stopped.
@@ -612,19 +511,10 @@ type scmRestartRollback struct {
 // scmRestartRollbackSentence returns the sentence that reports the proven
 // outcome of a restart rollback next to the failure of the installation.
 //
-// The sentence is composed from the facts and from the reason of the step that
-// did not reach its goal. It is the only place the outcome of a restart
-// rollback is described, so a caller reads no sentence for a state the rollback
-// did not reach: the claim that the previous instance was started again is made
-// for a verified rollback only, and a start that could not be proven reports
-// what was proven instead.
-//
-// The sentence names what the rollback really restored: the configuration of
-// the previous registration, which is the command line and the settings the
-// registration is written with. The failure recovery of the registration is not
-// part of that configuration and the rollback does not touch it, so the
-// sentence of a completed rollback says that the failure recovery stays in
-// place instead of claiming the whole registration back.
+// It is the only place the outcome is described, so a caller reads no sentence
+// for a state the rollback did not reach: the claim that the previous instance
+// was started again is made for a verified rollback only, and the sentence of a
+// completed rollback says that the failure recovery stays in place.
 func scmRestartRollbackSentence(facts scmRestartRollback, reason string) string {
 	switch {
 	case !facts.stopped:
@@ -657,26 +547,15 @@ func scmRestartRollbackSentence(facts scmRestartRollback, reason string) string 
 // rollbackRestart stops the instance of the failed installation, restores the
 // previous registration and brings the previous instance back into service.
 //
-// The instance of the failed installation is stopped before the previous
-// registration is written back. The registration alone does not switch the
-// process that runs, so a restored registration would describe another program
-// than the running one until the instance is stopped. The stop is a clean no-op
-// for an instance that does not run, and it is bounded by the shared budget of
-// the service layer like every other stop of the manager.
+// The instance is stopped before the previous registration is written back,
+// because the restored registration would otherwise describe another program
+// than the running one. The stop is a clean no-op for an instance that does not
+// run, and it is bounded by the shared budget.
 //
 // A stop that does not reach its goal leaves the machine as the failed
-// installation left it: the registration of the failed installation is kept,
-// because its instance may still run and the two describe the same program
-// then, and the sentence says exactly that instead of claiming a rollback.
-//
-// The previous program is started again only when the restored registration
-// names it. A command line that cannot be read names no program: the rollback
-// reports the restored registration and the stopped instance instead of
-// starting an instance it cannot name.
-//
-// The restart is only reported as a success when it was verified: the image of
-// the running process was compared with the previous program, and the process
-// is none of the ones the failed attempt ran in.
+// installation left it, and the sentence says exactly that. The previous
+// program is started again only when the restored registration names it, and
+// the restart is reported as a success only when it was verified.
 func (m *scmManager) rollbackRestart(ctx context.Context, handle *mgr.Service, previous previousSCMRegistration, failure error) error {
 	// The caller may have cancelled the context, the machine still has to be
 	// put back the way it was.
@@ -734,18 +613,10 @@ func scmRunningProcessID(handle *mgr.Service) uint32 {
 // restoreSCMRegistration puts the configuration of the registration back that a
 // failed installation replaced.
 //
-// A registration of a first installation is removed: there was none before it,
-// and a failed installation leaves nothing behind.
-//
-// A replaced registration is written back with its full configuration, and the
-// configuration is read back afterwards: the read back proves the command line,
-// which is what names the program of the instance. A caller is only told that
-// the previous configuration was restored when the registration holds the
-// previous command line again.
-//
-// The failure recovery is not part of a registration configuration: the write
-// back leaves the recovery actions and the non-crash switch as the installation
-// configured them, so a policy the installation wrote stays in place.
+// A registration of a first installation is removed. A replaced registration is
+// written back and read back afterwards, which proves the command line and thus
+// the program of the instance. The write back leaves the failure recovery as
+// the installation configured it.
 func restoreSCMRegistration(handle *mgr.Service, previous previousSCMRegistration) error {
 	if !previous.present {
 		if err := handle.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
@@ -813,19 +684,12 @@ func scmSameExecutablePath(a, b string) bool {
 	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
 }
 
-// scmInstanceRan reports whether the instance of a registration ran before an
-// installation.
+// scmInstanceRan reports whether the instance ran before an installation.
 //
-// A registration that is not there does not run. An instance that reports the
-// running state runs, and so does one that is still starting: it is about to
-// report the running state, and an installation has to switch it to the new
-// program as well.
-//
-// An instance that is stopping already reached its wanted state on its own: an
-// installation leaves it alone instead of starting it again, so a service the
-// user stopped is never brought back by an installation. An instance that is
-// stopped does not run either, whatever ended it, and neither does a broken
-// registration or a paused instance the manager does not support.
+// A registration that is not there does not run, and neither does one that is
+// stopping: it already reached its wanted state, so an installation leaves it
+// alone. A running or starting instance runs: a reinstall has to switch it to
+// the new program as well.
 func scmInstanceRan(present bool, state svc.State) bool {
 	if !present {
 		return false
@@ -863,16 +727,10 @@ func (m *scmManager) startAndVerify(ctx context.Context, handle *mgr.Service, ex
 // verifyRunningExecutable waits until the instance runs the given program in a
 // process that is not one of the excluded ones.
 //
-// The check is the effective one: the service control manager reports the process
-// of the running instance, and the image of that process is compared with the
-// program. A registration that carries the program proves nothing while a
-// process of the attempt that just failed still runs, so the process has to
-// differ from every excluded process as well.
-//
-// The wait is bounded by the verification budget of the service layer, which
-// covers the readiness budget of the instance, and by the context of the
-// installation: an instance that does not come up within it is a failed
-// installation, not a success that is reported from the registration alone.
+// The service control manager reports the process of the running instance, and
+// its image is compared with the program: a registration that carries the
+// program proves nothing while a process of the failed attempt still runs. The
+// wait is bounded by the verification budget and the context.
 func (m *scmManager) verifyRunningExecutable(ctx context.Context, handle *mgr.Service, executable string, exclude ...uint32) (scmImageCheck, error) {
 	deadline := time.Now().Add(scmVerifyTimeout)
 	detail := "the service control manager did not report the instance as running"
@@ -921,20 +779,15 @@ func scmProcessExcluded(exclude []uint32, processID uint32) bool {
 	return slices.Contains(exclude, processID)
 }
 
-// scmReadRunningImage reads the image of the running process and compares it with
-// the program the registration carries.
+// scmReadRunningImage reads the image of the running process and compares it
+// with the program the registration carries.
 //
-// The first result reports whether the observation settles the question: the
-// process runs the program, or the image of the process cannot be read and the
-// evidence that is left proves what it can. The second result is the proof the
-// installation has, the third one is the reason a look did not settle the
-// question.
-//
-// The image of a process of another account can be refused to the shell of the
-// installation. The wait then accepts the evidence it has: the service control
-// manager reports the running state and the registration carries the program.
-// The caller is told that the image was not compared, so it never claims more
-// than that.
+// The first result reports whether the observation settles the question, the
+// second one is the proof the installation has, the third one the reason a look
+// did not settle it. The image of a process of another account can be refused
+// to the installation; the wait then accepts the evidence it has (the running
+// state and the program of the registration) and the caller is told that the
+// image was not compared.
 func scmReadRunningImage(handle *mgr.Service, processID uint32, executable string) (bool, scmImageCheck, string) {
 	if executable == "" {
 		// The program is unknown: there is nothing the image of the process
@@ -1048,17 +901,12 @@ const (
 )
 
 // scmRecoveryDecisionFor returns what an installation does with the failure
-// recovery of a registration, from the actions the registration carries and the
-// outcome of reading them.
+// recovery of a registration.
 //
-// A registration with at least one action keeps its policy: a repeat installation
-// keeps the settings the instance already has, and an administrator may have set a
-// policy of their own. The policy of HFDesk is configured only for a registration
-// without one.
-//
-// A read that fails is not evidence that the registration has no recovery: the
-// policy of HFDesk is configured then, because a service the machine never
-// restarts after a crash is the state the installation exists to prevent.
+// A registration with at least one action keeps its policy, because a repeat
+// installation keeps what the instance or an administrator set. The policy of
+// HFDesk is configured only for a registration without one; a read that fails
+// is not evidence of no recovery, so the policy is configured then as well.
 func scmRecoveryDecisionFor(existing []mgr.RecoveryAction, readErr error) scmRecoveryDecision {
 	if readErr != nil || len(existing) == 0 {
 		return scmRecoveryConfigure
@@ -1069,30 +917,18 @@ func scmRecoveryDecisionFor(existing []mgr.RecoveryAction, readErr error) scmRec
 // configureSCMRecovery configures the failure recovery of the registration.
 //
 // The recovery is the recovery of a failed instance and not its lifecycle: the
-// platform performs an action of the list for an instance that ended without
-// reporting its stop, and, with the non-crash switch of the registration set,
-// for an instance that reported a non-zero exit code. An explicit stop reports
-// the stopped state with the exit code 0, so the platform never turns it into a
-// restart, whatever the orderly shutdown observed on the way.
+// platform acts for an instance that ended without reporting its stop, and,
+// with the non-crash switch set, for one that reported a non-zero exit code. An
+// explicit stop reports the stopped state with exit code 0, so it is never
+// turned into a restart.
 //
-// The non-crash switch is part of the policy of HFDesk and it is set with the
-// actions: the handler of the instance reports a failed start and a failed host
-// with a non-zero exit code, and without the switch the platform would recover a
-// crashed process only and leave a service that reports its own failure stopped.
-// The switch is documented to take effect at the next start of the machine, so
-// an installation reports the policy it wrote and never a restart that the
-// running system did not perform yet.
+// The switch is part of the policy of HFDesk: the handler reports a failed
+// start and a failed host with a non-zero exit code, and without the switch the
+// platform would recover a crashed process only. The switch takes effect at the
+// next start of the machine, so the installation reports the policy it wrote.
 //
-// A registration that carries a recovery policy keeps it, and its switch is
-// kept as well: the installation only configures the policy of HFDesk when the
-// registration has none, so a reinstall neither resets the settings of the
-// instance nor the policy of an administrator. A read that fails does not skip
-// the policy of HFDesk: the installation configures it and records why.
-//
-// A recovery that cannot be configured is a failed installation: a service the
-// machine never restarts after a failure is not the instance that was asked
-// for. The actions and the switch are one policy, so a switch that cannot be
-// set fails the installation like the actions do.
+// A registration that carries a policy keeps it, switch included. A recovery
+// that cannot be configured is a failed installation.
 func configureSCMRecovery(handle *mgr.Service) error {
 	existing, err := handle.RecoveryActions()
 	if scmRecoveryDecisionFor(existing, err) == scmRecoveryKeep {
@@ -1113,20 +949,13 @@ func configureSCMRecovery(handle *mgr.Service) error {
 	return handle.SetRecoveryActionsOnNonCrashFailures(true)
 }
 
-// scmInstallDirs returns the directories an installation creates, in the
-// order it creates them.
+// scmInstallDirs returns the directories an installation creates, in the order
+// it creates them: the directory of the config file, the state directory and
+// the log directory.
 //
-// The instance owns three directories: the directory of the config file, the
-// state directory and the log directory.
-//
-// The directories the installation reuses (the cache root, the hub directory
-// and the local output directory) are not part of the list: a named data
-// directory belongs to whoever named it, and the installation never creates
-// one.
-//
-// The list holds every path once: the config file can live in the state
-// directory of the instance, and the hub directory can live in the cache
-// root.
+// A named data directory (the cache root, the hub directory, the local output
+// directory) belongs to whoever named it, so the installation never creates
+// one. Every path is listed once.
 func scmInstallDirs(opts InstallOptions) []string {
 	dirs := []string{
 		filepath.Dir(opts.Paths.ConfigFile),
@@ -1268,18 +1097,13 @@ func removeCreatedDirs(dirs []string) {
 	}
 }
 
-// Uninstall removes the registration of the instance.
-//
-// It removes the registration only: the config file, the jobs, the history,
-// the logs, the models and the cache of the instance are never touched. An
-// absent registration is a clean success.
+// Uninstall removes the registration of the instance, and only that: the config
+// file, the jobs, the history, the logs, the models and the cache are never
+// touched, and an absent registration is a clean success.
 //
 // The existence of the registration is checked before the elevation
-// requirement is applied. An ordinary shell can read the registration of
-// the instance, so it tells an absent registration from a registration it
-// may not look at: an absent registration is a clean success in every
-// shell, and the elevation requirement applies only when there is
-// something to remove.
+// requirement, so an absent registration is a clean success in every shell and
+// the requirement applies only when there is something to remove.
 func (m *scmManager) Uninstall(ctx context.Context) error {
 	state, err := scmRegistrationStateOf()
 	if err != nil {
@@ -1426,20 +1250,12 @@ func (m *scmManager) Restart(ctx context.Context) error {
 
 // Status reports the state of the registered instance.
 //
-// The registration is read with the rights a status needs only: the right
-// to query the state of the instance and the right to query its
-// configuration. The default descriptor of a service grants both of them
-// to the interactive users of the machine, so a normal shell reads the
-// state of a registration without an elevated shell.
-//
-// The description of the instance comes from the registration, so the status
-// describes the registration and not the intent of the caller. A registered
-// executable that is gone is reported as broken, so a moved or deleted
-// binary is never reported as a running service.
-//
-// The registration has no file of its own: the service control manager
-// keeps its database in the registry, so the registration path is the
-// registry key of the service.
+// The status reads the registration with the rights a status needs only, which
+// the default descriptor grants to the interactive users of the machine, so a
+// normal shell reads it without elevation. The description comes from the
+// registration, and a registered executable that is gone is reported as broken.
+// The registration has no file of its own: the path is the registry key of the
+// service.
 func (m *scmManager) Status(ctx context.Context) (Status, error) {
 	facts, err := scmLookupRegistration(ServiceName)
 	if err != nil {

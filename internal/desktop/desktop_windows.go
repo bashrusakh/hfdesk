@@ -197,20 +197,12 @@ func run(o Options, logPath string) (err error) {
 		showSubsystemWarning(subsystemWarningText)
 	}
 
-	// The Windows service is the second HFDesk of the machine, and it binds
-	// the same address. The gate reads the registration before the
-	// application is created: a launch that finds a registration asks the
-	// user what to do and ends without ever starting a server, so the two
-	// instances can never compete for the listen address.
-	//
-	// The gate runs after the logging pipeline is installed (its records
-	// are the support material of the launch) and before app.New, which is
-	// the first step that can create a server. A launch that ends here
-	// publishes no state: the published state belongs to a launch that
-	// really serves, and it is written further down.
-	//
-	// A machine without a registration continues exactly as the desktop host
-	// always did.
+	// The Windows service binds the same address, so the gate reads the
+	// registration before the application is created: a launch that finds one
+	// asks the user what to do and ends without starting a server. It runs
+	// after the logging pipeline (its records are the support material of the
+	// launch) and before app.New, the first step that can create a server. A
+	// launch that ends here publishes no state.
 	if !serviceGate() {
 		return nil
 	}

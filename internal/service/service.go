@@ -138,15 +138,9 @@ type Status struct {
 // InstallFieldSet marks the fields of an InstallOptions that a request set
 // explicitly.
 //
-// An installation that replaces an existing registration keeps every value
-// the request did not name: the registration holds the settings the instance
-// really runs with, and a reinstall must not reset them to the defaults of
-// the scope. A field that is not marked is a default of the request and only
-// applies when the existing registration has no value of its own.
-//
-// The executable is not part of the set. The program of a registration
-// always comes from the current request, because an installation is the only
-// way a new binary reaches the registration.
+// A reinstall keeps every setting the request did not name, so an unmarked
+// field only applies when the existing registration has no value of its own.
+// The executable is never part of the set: it always comes from the request.
 type InstallFieldSet struct {
 	// Listen marks a bind address the request named.
 	Listen bool
@@ -203,17 +197,12 @@ type InstallOptions struct {
 }
 
 // DefaultInstallOptions returns the options of an installation that names
-// nothing: the default listen address, the default runtime paths and the
-// default cache layout of the scope.
+// nothing: the default listen address, paths and cache layout of the scope.
 //
-// No field is marked explicit, so an installation that replaces an existing
-// registration keeps every setting of it. A caller without a command line (a
-// desktop host that installs the service it ships with) therefore asks for
-// "the defaults, nothing named" and never resets a registration it does not
-// know.
-//
-// A scope the platform does not have yields empty paths: ValidateInstallOptions
-// refuses the installation before anything is written.
+// No field is marked explicit, so a caller without a command line (the desktop
+// host) asks for "the defaults, nothing named" and never resets an existing
+// registration. A scope the platform lacks yields empty paths, which
+// ValidateInstallOptions rejects before anything is written.
 func DefaultInstallOptions(scope Scope, executable string) InstallOptions {
 	opts := InstallOptions{
 		Scope:      scope,
@@ -232,20 +221,11 @@ func DefaultInstallOptions(scope Scope, executable string) InstallOptions {
 // mergeInstallOptions returns the effective options of an installation over
 // an existing registration.
 //
-// An explicitly named field of the request wins. An unmarked field keeps the
-// value of the existing registration when that registration names one;
-// otherwise the default of the request applies, which is what makes a first
-// installation behave exactly like the request says.
-//
-// The existing options are the ones a registration is read into. A value the
-// registration does not record is empty, so an unmarked request field falls
-// back to its own default and a registration that never named a value can
-// never erase one.
-//
-// The executable always comes from the request: it is the program the
-// installation was invoked for, and the only field a reinstall is expected to
-// change. The scope comes from the request as well; the registration of the
-// other scope is a different registration and is never merged.
+// A named field of the request wins; an unmarked one keeps the value of the
+// registration when it names one and the request default otherwise, so a first
+// installation behaves exactly like the request says. The executable and the
+// scope always come from the request: the other scope is another registration
+// and is never merged.
 func mergeInstallOptions(requested, existing InstallOptions) InstallOptions {
 	merged := requested
 	if !requested.Explicit.Listen && existing.Listen != "" {
@@ -332,16 +312,10 @@ func SupportsNamedServiceAccount() bool {
 // supervisor details.
 type Manager interface {
 	// Install registers the service with the platform supervisor and
-	// returns the effective installation.
-	//
-	// The returned options are the installation as it was written: an
-	// installation that updates an existing registration reports what the
-	// instance runs with instead of what the request asked for, and a
-	// platform whose installation replaces the registration wholesale
-	// returns the request. The error is the failure of the installation: the
-	// returned options describe no effective installation then and must not
-	// be reported as one, whatever registration the failed attempt left
-	// behind.
+	// returns the installation as it was written: a reinstall reports what
+	// the instance runs with, a wholesale replacement the request. On error
+	// the returned options describe no effective installation and must not
+	// be reported as one.
 	Install(ctx context.Context, opts InstallOptions) (InstallOptions, error)
 	// Uninstall removes the registration of the service.
 	Uninstall(ctx context.Context) error
@@ -412,23 +386,16 @@ func ParseListen(addr string) (string, int, error) {
 // LocalAddress returns the address a client of the same machine reaches the
 // listener of listen with.
 //
-// A wildcard bind has no address a client can connect to: 0.0.0.0 and :: are the
-// addresses every interface of the machine answers on, and a connect() to them
-// fails with WSAEADDRNOTAVAIL on Windows and with EADDRNOTAVAIL elsewhere. Such
-// a bind is therefore replaced with the loopback address of the same family,
-// which the listener accepts like any other client. An empty host binds every
-// interface of every family as well, and is replaced with the IPv4 loopback
-// address, which a dual-stack listener accepts. Every other host is kept
-// unchanged, including the literal host name "localhost": a client resolves it to
-// the loopback interface itself.
+// A wildcard bind has no address a client can connect to: 0.0.0.0 and :: fail
+// with WSAEADDRNOTAVAIL on Windows and EADDRNOTAVAIL elsewhere. Such a bind is
+// replaced with the loopback address of the same family, which the listener
+// accepts like any other client; an empty host becomes the IPv4 loopback.
+// Every other host is kept, including "localhost".
 //
-// The port of the listen address is always kept: a client of this function has to
-// reach the instance of that address and not another one.
-//
-// The rule has one owner: the readiness probe dials the address this function
-// returns and the desktop host opens the URL of it, so the address a start is
-// verified on and the address a browser is sent to cannot differ. An address that
-// carries no host and port cannot be mapped and is an error.
+// The port is always kept, and the rule has one owner: the readiness probe
+// dials the address this function returns and the desktop host opens the URL of
+// it, so the address a start is verified on and the address a browser is sent
+// to cannot differ. An address without a host and port is an error.
 func LocalAddress(listen string) (string, error) {
 	addr := strings.TrimSpace(listen)
 	if addr == "" {

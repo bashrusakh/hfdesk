@@ -14,41 +14,29 @@ import (
 	"github.com/bashrusakh/hfdesk/internal/server"
 )
 
-// The readiness probe is the part of a verified start that no supervisor can
-// answer: a supervisor reports that the process of the unit or of the
-// registration was started, and a process is not a serving instance. The probe
-// therefore asks the instance itself, and a start that was reported by the
-// supervisor counts only when the HTTP server of the instance answers.
+// The readiness probe answers what no supervisor can: a supervisor reports a
+// started process, not a serving instance, so a start counts only when the HTTP
+// server of the instance answers.
 //
 // The probe is platform neutral: it asks the bind address of the instance with
-// the request of a client, so every platform verifies a restart with the same
-// check. The request of a bounded HTTP client is the whole check: a client whose
-// timeout expires, and one whose connection is refused, both report the address
-// as not serving.
+// the request of a bounded HTTP client, so every platform verifies a restart
+// with the same check.
 
 const (
 	// serviceProbeTimeout bounds a single readiness probe.
 	//
 	// The probe talks to an instance of the same machine, so the bound is
-	// short: a server that neither accepts the connection nor answers the
-	// request within it is not ready. The caller probes again within its own
-	// budget, so the bound of one probe never becomes the bound of a start.
+	// short; the caller probes again within its own budget.
 	serviceProbeTimeout = 2 * time.Second
 
-	// serviceProbePath is the endpoint a readiness probe asks. Every
-	// instance answers it: with the health document when no basic
-	// authentication is configured, and with the challenge of the instance
-	// when one is.
-	//
-	// The path is the one the server registers, so a probe and the route it
-	// asks cannot drift apart.
+	// serviceProbePath is the endpoint a readiness probe asks. Every instance
+	// answers it, with the health document or with the auth challenge; the
+	// value is the path the server registers, so the two cannot drift apart.
 	serviceProbePath = server.HealthPath
 
-	// serviceProbeBodyLimit bounds the body a readiness probe reads.
-	//
-	// The health document of the instance is a few hundred bytes. The bound
-	// keeps a foreign program on the address from answering with a stream the
-	// probe would read for the whole timeout of the probe.
+	// serviceProbeBodyLimit bounds the body a readiness probe reads: the
+	// health document is a few hundred bytes, and the bound keeps a foreign
+	// program from streaming until the timeout of the probe.
 	serviceProbeBodyLimit = 64 * 1024
 
 	// serviceProbeHealthStatus is the status a healthy instance reports.
@@ -56,48 +44,32 @@ const (
 
 	// serviceProbeAuthChallenge is the challenge the basic authentication of
 	// the instance sends. The probe never sends a credential, so a protected
-	// instance answers the request of the probe with this challenge, and only
-	// that answer proves that the server on the address is the instance.
-	//
-	// The value is the challenge the server writes, and the probe compares the
-	// whole header with it: a challenge of another realm describes another
-	// server.
+	// instance answers with this challenge, and only that answer proves that
+	// the server on the address is the instance; the whole header is compared,
+	// because a challenge of another realm describes another server.
 	serviceProbeAuthChallenge = server.BasicAuthChallenge
 )
 
 // serviceReadinessProbe is the readiness probe a manager uses to verify that a
-// started instance really serves.
+// started instance really serves: the Windows handler probes the address of its
+// own start and the systemd manager the address of a restarted unit.
 //
-// The handler of a Windows instance probes the address of its own start, and the
-// systemd manager probes the address of a restarted unit, so both platforms
-// verify a start with the same check.
-//
-// The variable is the seam of the test: a test that drives the lifecycle of a
-// manager with a fake supervisor forks no instance, so no server of the
-// instance answers on the registered address. Such a test replaces the probe
-// for its own run and restores it afterwards, and the verification of the
-// manager is observed without a server of its own.
-//
-// The production value is the real probe, so a manager always asks the
-// instance itself.
+// The variable is the seam of the test: a test that drives a lifecycle with a
+// fake supervisor replaces the probe, because no server of the instance answers
+// then.
 var serviceReadinessProbe = probeServiceReady
 
 // probeServiceReady reports whether the address answers as the HFDesk server.
 //
-// The probe proves the instance and not merely an HTTP server: a program that
-// happens to listen on the port of the instance is not the instance that was
-// asked for. The answer of the health endpoint therefore has to show which
-// server answered: a 200 has to carry the health document of HFDesk, with the
-// healthy status and the version of the instance, and a 401 has to carry the
-// exact challenge of the basic authentication of the instance, which is the
-// answer a protected instance sends to a request without a credential. The
-// probe never sends one: the readiness of an instance is no place for the access
-// data of its config file.
+// The probe proves the instance and not merely an HTTP server: a 200 has to
+// carry the health document with the healthy status and the version of the
+// instance, and a 401 the exact challenge of its basic authentication, which is
+// the answer a protected instance sends to a request without a credential. The
+// probe never sends one: readiness is no place for the access data of the
+// config file.
 //
-// Every other answer is a failure. A 200 with a body of another shape, a 401
-// without the challenge of HFDesk and every other status describe a server that
-// does not answer as HFDesk, and a start that was reported by the supervisor
-// counts only when this probe accepted the instance itself.
+// Every other answer is a failure, and a start counts only when this probe
+// accepted the instance itself.
 func probeServiceReady(listen string) error {
 	addr := probeServiceAddress(listen)
 
@@ -122,15 +94,13 @@ func probeServiceReady(listen string) error {
 		}
 		return nil
 	case http.StatusUnauthorized:
-		// The instance protects its API with the basic authentication of its
-		// config file. A request without a credential is refused with the
-		// challenge of the instance, and that challenge is the evidence that
-		// the server on the address is HFDesk.
+		// The instance protects its API with basic authentication. A request
+		// without a credential is refused with the challenge of the instance,
+		// which is the evidence that the server on the address is HFDesk.
 		if challenge := resp.Header.Get("WWW-Authenticate"); challenge != serviceProbeAuthChallenge {
 			return serviceNotAnswering(addr, fmt.Errorf("the health endpoint answered %s with the challenge %q instead of the challenge of the instance", resp.Status, challenge))
 		}
-		// The refusal carries no document of interest: the body is drained
-		// within the bound, so the connection is not left half read.
+		// The refusal carries no document of interest: drain the body.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, serviceProbeBodyLimit))
 		return nil
 	default:
@@ -138,13 +108,9 @@ func probeServiceReady(listen string) error {
 	}
 }
 
-// serviceHealth is the part of the health document of the instance a readiness
-// probe checks: the healthy status and the version the instance reports.
-//
-// The endpoint answers more than that (the time and the endpoint of the
-// instance), and a document that carries those fields as well is the document
-// of HFDesk. Only the two fields every instance answers are required, so the
-// probe never refuses an instance over a field it does not depend on.
+// serviceHealth is the part of the health document a readiness probe checks:
+// the healthy status and the version. Only those two fields are required, so
+// the probe never refuses an instance over a field it does not depend on.
 type serviceHealth struct {
 	// Status is the state of the instance: "ok" for an instance that serves.
 	Status string `json:"status"`
@@ -152,13 +118,9 @@ type serviceHealth struct {
 	Version string `json:"version"`
 }
 
-// readServiceHealth reads the health document of a 200 answer.
-//
-// The body is read within serviceProbeBodyLimit, so a foreign program that
-// answers with a stream ends the read instead of holding the probe. A body that
-// does not decode as the document of the endpoint is a failure: the caller turns
-// it into the failure of the probe, and the instance is not accepted over a body
-// it never wrote.
+// readServiceHealth reads the health document of a 200 answer within
+// serviceProbeBodyLimit, so a foreign program that streams ends the read. A
+// body that does not decode is a failure, not a document the instance wrote.
 func readServiceHealth(body io.Reader) (serviceHealth, error) {
 	var health serviceHealth
 	if err := json.NewDecoder(io.LimitReader(body, serviceProbeBodyLimit)).Decode(&health); err != nil {
@@ -168,22 +130,16 @@ func readServiceHealth(body io.Reader) (serviceHealth, error) {
 }
 
 // serviceNotAnswering reports that the address answered, but not as the HFDesk
-// server.
-//
-// The address is part of the failure: the probe of a start has to say which
-// address was asked, because the caller reports it next to the start that was
-// not proven.
+// server. The address is part of the failure, because a caller reports it next
+// to the start that was not proven.
 func serviceNotAnswering(addr string, reason error) error {
 	return fmt.Errorf("%s does not answer as the HFDesk server: %w", addr, reason)
 }
 
-// probeServiceAddress maps the bind address of the instance onto the address
-// the readiness probe asks.
-//
-// The mapping is owned by LocalAddress, so the probe asks the same address the
-// desktop host opens in the browser of the user. An address that cannot be
-// mapped is used unchanged: the request then reports the error of the address
-// itself.
+// probeServiceAddress maps the bind address onto the address the probe asks,
+// using LocalAddress so the probe and the desktop browser share one rule. An
+// address that cannot be mapped is used unchanged, and the request reports its
+// own error.
 func probeServiceAddress(listen string) string {
 	addr, err := LocalAddress(listen)
 	if err != nil {

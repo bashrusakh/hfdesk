@@ -37,21 +37,13 @@ const serviceActionBudget = 2 * time.Minute
 // serviceVerifyBudget bounds the wait for the state an action expects.
 //
 // The service control manager reports a started instance as pending first, so
-// the state of an action is read until it settles.
+// the state is read until it settles. The wait wraps a wait of the instance
+// itself, which probes its HTTP server for up to its readiness budget after the
+// manager started the process: a budget of the inner size alone would declare a
+// legitimate start failed just before it becomes ready. It is therefore twice
+// the 30 s readiness budget of the service layer (scmReadinessTimeout).
 //
-// The wait wraps a wait of the instance itself: a service that starts probes its
-// HTTP server for up to its own readiness budget before it reports the running
-// state, and that clock starts only when the service control manager has started
-// the process, which is after this one. A budget of the inner size alone would
-// declare a legitimate start failed at the moment the instance is about to
-// become ready, and a failed first installation would then remove a registration
-// that is about to serve. The budget is therefore twice the 30 s readiness
-// budget of the service layer (scmReadinessTimeout), which leaves the whole
-// inner budget as the margin of the outer wait.
-//
-// It is a variable so a test can shorten the wait: an action whose expectation
-// never holds has to fail, and a test must not wait for the whole budget to
-// prove that.
+// It is a variable so a test can shorten the wait.
 var serviceVerifyBudget = 60 * time.Second
 
 // serviceVerifyInterval is the pause between two reads of the state of the
@@ -62,13 +54,10 @@ const serviceVerifyInterval = 200 * time.Millisecond
 // installation wrote.
 //
 // The removal runs on a context that the end of the action cannot cancel: the
-// budget of the action may already be spent by the start that failed, and a
-// registration that is left behind because that budget ended is exactly the
-// state the removal exists to prevent. The removal may also have to stop an
-// instance that the failed start left behind, so its budget covers the shutdown
-// budget of the service layer and the removal of the registration itself. It is
-// still bounded, so a service control manager that does not answer cannot keep
-// the failure report from the user.
+// action budget may already be spent by the start that failed, and the removal
+// may also have to stop an instance the failed start left behind. It is still
+// bounded, so a service control manager that does not answer cannot keep the
+// failure report from the user.
 const serviceRemovalBudget = service.ShutdownBudget + 5*time.Second
 
 // newServiceManager returns the manager of the Windows service control manager
@@ -90,19 +79,15 @@ var waitForProcess = waitForProcessExit
 // The helper is the desktop executable started with administrator rights and
 // the hidden --service-action flag. It never starts a server, a tray icon or a
 // WebView2 window: it drives the service control manager and reports the
-// outcome of the action in a native message box, because a GUI process has no
-// console to report it to.
+// outcome in a native message box, because a GUI process has no console.
 //
 // The action waits for the desktop host that launched it before it starts or
 // restarts the service: the desktop stops its own server through the graceful
 // path and ends, and only then may the service bind the address. A wait that
-// times out is a failure of the action, so the service never starts next to a
-// desktop that still serves.
+// times out is a failure of the action.
 //
 // The helper installs no logging pipeline: the rotating log file belongs to the
-// launch that runs the desktop host, and a second writer breaks its rotation. The
-// message box is the surface of the helper, and it reports every result,
-// including a success.
+// launch that runs the desktop host, and a second writer breaks its rotation.
 func RunServiceAction(o ServiceActionOptions) error {
 	action, err := parseServiceAction(o.Action)
 	if err != nil {
@@ -133,26 +118,18 @@ func RunServiceAction(o ServiceActionOptions) error {
 // runs.
 //
 // The registration is the default installation of the service layer, made for
-// the console program next to the helper: the desktop host downloads and copies
-// nothing, so the service runs the program of the folder the helper was started
-// from. No field of the installation is named, so an installation over an
-// existing registration keeps every setting the instance already runs with.
-//
+// the console program next to the helper: no field is named, so an installation
+// over an existing registration keeps every setting the instance runs with.
 // The installation never starts an instance itself, so the start is a separate
-// step of the same action. A service that was installed but cannot be started is
-// reported as a failure of the installation instead of leaving the user with a
-// registered instance that serves nothing.
+// step; a service that cannot be started is reported as a failure of the
+// installation instead of leaving a registered instance that serves nothing.
 //
-// A failed first installation must not trap the user either: the service gate
-// of the desktop app finds every registration and ends the launch, so a
-// registration that serves nothing keeps the desktop app from starting its own
-// server. The state of the machine is therefore read before the installation:
-// when it reports no service, the registration is the result of this action and
-// is removed again when the start or its verification fails. Only that
-// registration is removed. A registration that existed before the action, and a
-// state that could not be read, are never touched: their settings and their data
-// belong to an instance this action did not create, so the failure report names
-// how to remove the registration instead.
+// A failed first installation must not trap the user: the service gate ends
+// every later launch, so a registration that serves nothing keeps the desktop
+// app from starting its own server. The state of the machine is therefore read
+// before the installation, and only a registration this action wrote is removed
+// again when the start or its verification fails. A registration that existed
+// before and a state that could not be read are never touched.
 func installWindowsService(action serviceAction, version string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceActionBudget)
 	defer cancel()
@@ -220,24 +197,17 @@ func installWindowsService(action serviceAction, version string) error {
 // removeFailedInstallation removes the registration of a failed installation and
 // reports what is left on the machine.
 //
-// freshInstall reports whether the registration was written by this action: the
-// state before the action was read successfully and reported no service. Only
-// that registration is removed, and the removal removes the registration only:
-// the data directory of the service, if the installation created one, stays
-// where it is.
+// freshInstall reports whether the registration was written by this action, and
+// only that registration is removed, and only the registration: the data
+// directory stays where it is.
 //
-// A destructive step is taken only on a state that was observed. The failure that
-// brought the caller here is a start, and a start that reported a failure may
-// still have left an instance that runs or is coming up. The state is therefore
-// read again, and the registration is removed only when that read reports a
-// settled state that does not serve. A running or still starting instance is
-// never torn down, and a state that cannot be read is not evidence of a stopped
-// service: both are reported as a registration that stays.
+// A destructive step is taken only on a state that was observed: the state is
+// read again, and the registration is removed only when it reports a settled
+// state that does not serve. A running or still starting instance is never torn
+// down, and a state that cannot be read is not evidence of a stopped service.
 //
-// The removal runs on a context of its own that is never cancelled with the
-// action, so a budget that the failed start spent cannot keep the registration
-// behind. A failed removal is reported with the failure that caused it: the
-// registration is still there, and the user has to know that.
+// The removal runs on a context that is never cancelled with the action, so a
+// spent action budget cannot keep the registration behind.
 func removeFailedInstallation(ctx context.Context, manager service.Manager, freshInstall bool) (serviceInstallAftermath, error) {
 	if !freshInstall {
 		desktopLog.Info("the registration of the service is left in place: it was not written by this installation")
@@ -270,16 +240,14 @@ func removeFailedInstallation(ctx context.Context, manager service.Manager, fres
 // updateWindowsService re-registers the service from the folder of the helper
 // and keeps the running state it had.
 //
-// The state before the update decides the expectation: a service that was
-// running has to run afterwards, and a service that was not running has to be
-// stopped afterwards. The update never starts a stopped service, so a service
-// that is running after an update of a stopped one is a failure of the action
-// and is reported as such.
+// A service that was running has to run afterwards, and one that was not
+// running has to be stopped afterwards. The update never starts a stopped
+// service, so a running service after an update of a stopped one is a failure
+// of the action.
 //
-// The update only re-points an existing registration. A machine without one is
-// a failure of the action: an update that registered a stopped service would
-// leave the user with an instance that serves nothing, and the installation is
-// the action that starts what it registers.
+// The update only re-points an existing registration: a machine without one is
+// a failure, because an update that registered a stopped service would leave an
+// instance that serves nothing.
 func updateWindowsService(action serviceAction, version string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceActionBudget)
 	defer cancel()
@@ -369,12 +337,10 @@ func startWindowsService(action serviceAction) error {
 }
 
 // serviceInstallation returns the installation options and the manager of an
-// installation or an update.
-//
-// The options are the defaults of the service layer for the console program in
-// the folder of the helper: the desktop host names no value of its own, so an
-// installation over an existing registration keeps the settings the instance
-// already runs with.
+// installation or an update: the defaults of the service layer for the console
+// program in the folder of the helper. The desktop host names no value of its
+// own, so an installation over an existing registration keeps the settings the
+// instance already runs with.
 func serviceInstallation() (service.InstallOptions, service.Manager, error) {
 	executable, err := desktopExecutable()
 	if err != nil {
@@ -456,12 +422,8 @@ func waitForProcessExit(pid int, budget time.Duration) error {
 	}
 }
 
-// serviceProgram returns the program the registration of the service runs.
-//
-// The installation reports the registration as written, which is what an
-// installation over an existing registration reports: the merged registration.
-// A manager that reports no program is not a reason to report an empty one, so
-// the request is the fallback.
+// serviceProgram returns the program the registration of the service runs: the
+// effective registration, or the request when the manager reports no program.
 func serviceProgram(installed, requested service.InstallOptions) string {
 	if installed.Executable != "" {
 		return installed.Executable
@@ -482,12 +444,8 @@ func serviceWebAddress(status service.Status) string {
 }
 
 // reportServiceFailure records the failure of a service action and reports it to
-// the user.
-//
-// The helper is a GUI process: a failure that is only recorded leaves the user
-// with a helper that vanished. The box carries the underlying error, so the user
-// can see what the service control manager refused, and the program of the
-// action, so a failure of the service account names what it could not use.
+// the user: a GUI helper that only records a failure vanishes without telling
+// the user. The box carries the underlying error and the program of the action.
 func reportServiceFailure(action serviceAction, err error, program string) {
 	if err == nil {
 		return

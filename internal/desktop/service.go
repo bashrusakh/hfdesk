@@ -27,10 +27,9 @@ const elevationDeclined = "the request for administrator rights was declined"
 
 // serviceAction is one action of the elevated service helper.
 //
-// The helper is the same desktop executable, started with administrator
-// rights and with the hidden --service-action flag. It never starts a server,
-// a tray icon or a window: it drives the service control manager and reports
-// the outcome in a native message box.
+// The helper is the same desktop executable, started with administrator rights
+// and with the hidden --service-action flag; it drives the service control
+// manager and reports the outcome in a native message box.
 type serviceAction string
 
 const (
@@ -48,12 +47,9 @@ const (
 // serviceInstallAftermath describes what a failed installation left on the
 // machine.
 //
-// A failed first installation must not leave the user with a registration that
-// serves nothing: the service gate finds it on the next launch and the desktop
-// app never starts its own server again. The registration that the action wrote
-// itself is therefore removed again, and only that one: a registration that was
-// there before the action carries the settings and the data of an instance this
-// installation did not create, so it is never removed.
+// A failed first installation must not leave a registration that serves
+// nothing, because the service gate would end every later launch. Only the
+// registration this action wrote itself is therefore removed again.
 type serviceInstallAftermath int
 
 const (
@@ -95,11 +91,9 @@ type ServiceActionOptions struct {
 	Action string
 
 	// WaitPID is the process the helper waits for before it starts or
-	// restarts the service. The desktop host passes its own process id, so
+	// restarts the service: the desktop host passes its own process id, so
 	// the service never starts while the desktop still holds the listen
-	// address. Zero means that there is nothing to wait for, which is the
-	// case for an action the service gate launches: the gate ends before it
-	// ever creates a server.
+	// address. Zero means there is nothing to wait for.
 	WaitPID int
 
 	// Version is the build version of the desktop host that launched the
@@ -140,11 +134,9 @@ const (
 	serviceChoiceUpdate
 )
 
-// serviceChoicePrompt describes the choice the service gate asks the user.
-//
-// The prompt carries the facts of the registration, so the dialog, its text
-// and its buttons are derived from one value: the question, the answer and
-// the action that follows it cannot drift apart.
+// serviceChoicePrompt describes the choice the service gate asks the user. The
+// dialog, its text and its buttons are derived from one value, so the question,
+// the answer and the action that follows it cannot drift apart.
 type serviceChoicePrompt struct {
 	// State is the state the service control manager reports.
 	State service.State
@@ -181,18 +173,14 @@ func serviceStateSettled(state service.State) bool {
 
 // serviceURL returns the browser URL of a service that listens on addr.
 //
-// The registration carries the address the service really binds. A wildcard
-// address has no address a browser can open, so the address is taken from
+// A wildcard address has no address a browser can open, so it is taken from
 // service.LocalAddress: the loopback interface of the same family, which is the
-// address the readiness probe verifies the service on. The name "localhost" and
-// every concrete host are kept: a browser resolves localhost to the loopback
-// interface itself, and the operator of the machine may have a reason to name
-// it.
+// address the readiness probe verifies the service on. Every other host is
+// kept, including "localhost".
 //
-// An address that cannot be read as a host and a port is an error: the caller
-// reports it instead of opening a URL it invented. A registration without any
-// address is an error as well, because LocalAddress would name the default
-// address of a service that is not this one.
+// An address that cannot be read as a host and a port, and a registration
+// without any address, are errors: the caller reports them instead of opening a
+// URL it invented.
 func serviceURL(addr string) (string, error) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
@@ -215,47 +203,31 @@ const (
 	executableSuffix = ".exe"
 )
 
-// findSiblingExecutable locates the console program that sits next to a
-// desktop binary: the folder of the desktop program and the program itself,
-// which names the pair the release ships.
-//
-// It is a package level variable so the tests can drive a folder that has no
-// console program: the folder of the running test executable is the folder of
-// the test binary, and it cannot hold the program of a release.
+// findSiblingExecutable locates the console program that sits next to a desktop
+// binary. It is a package level variable so the tests can drive a folder that
+// has no console program.
 var findSiblingExecutable = findConsoleExecutable
 
 // findConsoleExecutable returns the path of the console program of HFDesk in
 // dir.
 //
 // HFDesk stays portable: the desktop never downloads, copies or replaces a
-// binary. The release ships the console program next to the desktop program,
-// so the installation registers the program of the very folder the desktop
-// runs from, and an update re-registers the program of the folder the helper
+// binary, so the installation registers the program of the folder the desktop
 // runs from.
 //
-// The program paired with the desktop program is required when the name of the
-// desktop program carries a version: a release ships
+// A version-stamped desktop program requires its pair: a release ships
 // hfdesk_windows_amd64_1.3.0.exe next to hfdesk-desktop_windows_amd64_1.3.0.exe,
-// and unpacking a new release next to the old one leaves two version-stamped
-// pairs in the same folder. The pair of the program that asks is the one the
-// user meant, so its exact name is looked up first. A version-stamped desktop
-// program has no other candidate: copying only
-// hfdesk-desktop_windows_amd64_1.4.0.exe next to an old hfdesk.exe would
-// register the old console program while the success text names 1.4.0, so a
-// missing pair is an error that names the expected file and the folder. With
-// this rule the paired console program always belongs to the same release as the
-// desktop program, and the version the success text names is the version of the
-// program the registration runs.
+// and unpacking a new release next to an old one leaves two pairs in the same
+// folder. The pair of the program that asks is the one the user meant, so
+// copying only the new desktop program next to an old console program would
+// register the old program while the success text names the new version; a
+// missing pair is therefore an error that names the expected file and folder.
 //
 // A desktop program without a version stamp names no release, so the existing
-// fallbacks stay: the plain name hfdesk.exe is taken next, and a folder with
-// exactly one hfdesk*.exe is accepted as well. Zero and several candidates
-// without a pair are an error that names the folder: registering one of several
-// programs would register a program the user did not choose.
-//
-// The desktop program is never a candidate, whatever its name carries: it is
-// the program that asks for the console program, and registering it would
-// start a second desktop host as the service.
+// fallbacks stay: hfdesk.exe next, then a folder with exactly one hfdesk*.exe.
+// Zero and several candidates without a pair are an error. The desktop program
+// is never a candidate: registering it would start a second desktop host as the
+// service.
 func findConsoleExecutable(dir, desktop string) (string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -314,13 +286,8 @@ func findConsoleExecutable(dir, desktop string) (string, error) {
 
 // pairedConsoleExecutableName returns the name of the console program the
 // release ships next to desktop, or an empty string when the program carries no
-// pair.
-//
-// The two programs of a release differ only by the prefix of their names, so the
-// pair is derived from the name of the desktop program: the leading
-// hfdesk-desktop prefix is replaced with hfdesk, and the rest of the name (the
-// version stamp and the suffix) is kept. A desktop program that does not carry
-// the prefix names no pair, so nothing is preferred for it.
+// pair: the leading hfdesk-desktop prefix is replaced with hfdesk and the rest
+// of the name (version stamp and suffix) is kept.
 func pairedConsoleExecutableName(desktop string) string {
 	base := filepath.Base(desktop)
 	if !strings.HasPrefix(strings.ToLower(base), desktopExecutableName) {
@@ -332,14 +299,11 @@ func pairedConsoleExecutableName(desktop string) string {
 // desktopVersionStamp returns the version segment of the name of a desktop
 // program, and whether the name carries one.
 //
-// The release names both programs with the same version stamp:
-// hfdesk-desktop_windows_amd64_1.4.0.exe sits next to
-// hfdesk_windows_amd64_1.4.0.exe, and the local build hfdesk-desktop.exe carries
-// no stamp at all. The stamp is the first segment of the rest of the name that
-// reads as a release version, so a name that only carries the platform
-// (hfdesk-desktop_windows_amd64.exe) is a name without a version. A name
-// without the desktop prefix names no release of HFDesk, so it carries no
-// stamp either.
+// Both programs of a release carry the same stamp
+// (hfdesk-desktop_windows_amd64_1.4.0.exe), while the local build
+// hfdesk-desktop.exe carries none. The stamp is the first segment of the rest of
+// the name that reads as a release version, so a name that only carries the
+// platform is a name without a version.
 func desktopVersionStamp(desktop string) (string, bool) {
 	base := filepath.Base(desktop)
 	if !strings.HasPrefix(strings.ToLower(base), desktopExecutableName) {
@@ -359,9 +323,7 @@ func desktopVersionStamp(desktop string) (string, bool) {
 //
 // A version is numeric parts joined by dots, at least two of them, with an
 // optional pre-release or build suffix: the platform name amd64 and a build
-// number such as 2024 are not read as one, because they name no release, and
-// treating them as a version would refuse the fallbacks for a program that has
-// no release of its own.
+// number such as 2024 are not read as one, so the fallbacks stay available.
 func isVersionSegment(segment string) bool {
 	segment = strings.TrimPrefix(strings.ToLower(segment), "v")
 	if index := strings.IndexAny(segment, "-+"); index >= 0 {

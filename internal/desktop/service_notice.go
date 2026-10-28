@@ -13,12 +13,8 @@ import (
 
 // errServiceRemovalSkipped reports that the registration of a failed
 // installation was left in place because the service may still be running,
-// starting or stopping, or because its state could not be read.
-//
-// The registration of a first installation is only removed once the instance is
-// provably settled and not running: a running instance serves, and a pending one
-// may still reach the running state. Removing either would end an instance that
-// is coming up instead of cleaning up an attempt that failed.
+// starting or stopping, or because its state could not be read. A registration
+// is only removed once the instance is provably settled and not running.
 var errServiceRemovalSkipped = errors.New(
 	"the registration was not removed: the service may still be running, starting or stopping, or its state cannot be read")
 
@@ -84,16 +80,11 @@ func serviceFailureCaption(action serviceAction) string {
 // installServiceText returns the text of the confirmation that registers the
 // Windows service.
 //
-// The confirmation states the four facts the user has to know before a
-// machine-wide registration is written: the service starts at boot and keeps
-// running after the window closes, the registration needs administrator
-// rights, nothing is downloaded or copied, and the desktop and the service
-// keep separate data. The last one is the surprising one: the settings, jobs
-// and models of the desktop app are not the data of the service.
-//
-// dataDir is the state directory of the service, so the text names the
-// directory the service will really own instead of repeating a path from the
-// documentation.
+// The confirmation states the four facts the user has to know: the service
+// starts at boot and keeps running after the window closes, the registration
+// needs administrator rights, nothing is downloaded or copied, and the desktop
+// and the service keep separate data (the surprising one). dataDir is the state
+// directory of the service, so the text names the directory it will really own.
 func installServiceText(dataDir string) string {
 	text := "This registers HFDesk as a Windows service.\n\n" +
 		"The service starts at boot and keeps running after this window closes.\n" +
@@ -123,9 +114,8 @@ func serviceGateInstruction(prompt serviceChoicePrompt) string {
 // gate.
 //
 // The content names what the running service serves, what an update does and
-// that the service keeps its own data. It is the same text for the task dialog
-// and for the message box fallback, so the two can never tell the user
-// different things.
+// that the service keeps its own data. The task dialog and the message box
+// fallback share it, so the two cannot tell the user different things.
 func serviceGateContent(prompt serviceChoicePrompt) string {
 	var text string
 	if serviceStateRunning(prompt.State) && prompt.URL != "" {
@@ -154,10 +144,9 @@ func serviceGateText(prompt serviceChoicePrompt) string {
 // serviceGatePendingText returns the text of the notice of a launch that found
 // the service while it was starting or stopping.
 //
-// The notice is not the choice dialog: a pending state is not a state to decide
-// on, so the launch offers neither Open nor Start for it. It names the
-// transition it observed and that the launch changed nothing, so the user knows
-// that the state of the service is not the result of this launch.
+// A pending state is not a state to decide on, so the launch offers neither
+// Open nor Start. The notice names the transition and that the launch changed
+// nothing.
 func serviceGatePendingText(state service.State) string {
 	transition := "starting"
 	if state == service.StateStopping {
@@ -171,12 +160,10 @@ func serviceGatePendingText(state service.State) string {
 // serviceGateUnreadableText returns the text of the notice of a launch that
 // could not read the registration of the Windows service.
 //
-// The launch cannot tell a machine without a service from a machine whose
-// service is installed, so it decides on neither: a service that is installed
-// may be running, and it binds the address the desktop server would bind. The
-// notice says what that means for this launch, that a service may be installed
-// and running, that this launch started no server, and how to read the state and
-// to try again.
+// The launch cannot tell a machine without a service from one whose service is
+// installed, so it decides on neither: the notice says that a service may be
+// installed and running, that this launch started no server, and how to read
+// the state and to try again.
 func serviceGateUnreadableText(err error) string {
 	text := "HFDesk could not read the state of the Windows service.\n\n"
 	if err != nil {
@@ -323,12 +310,9 @@ func serviceNotInstalledText(action serviceAction) string {
 		there + " Install it from the tray of the desktop app first."
 }
 
-// The commands that a failure report of a service action ends with.
-//
-// A report is the result, the cause and one next action, so each command is
-// written once here instead of being repeated by every report: a report either
-// leaves the user with a state to read or with a registration to keep or remove,
-// never with both.
+// The commands that a failure report of a service action ends with: a report is
+// the result, the cause and one next action, so each command is written once
+// here instead of being repeated by every report.
 const (
 	// serviceStatusCommandText is the next action of a report that cannot
 	// say which state the action left: the state of the service has to be
@@ -341,24 +325,17 @@ const (
 	serviceUninstallCommandText = `If you do not want to keep the registration, remove it from an elevated shell with "hfdesk service uninstall".`
 )
 
-// serviceActionFailureText returns the report of a failed service action.
+// serviceActionFailureText returns the report of a failed service action: the
+// action that failed, the error of the service control manager and the one next
+// action of the state the attempt left.
 //
-// The report is the action that failed, the error the service control manager
-// returned, and the one next action of the state the attempt left. It never
-// claims that a registration was restored: a failure can happen after the
-// registration was written, so an installation report names a registration that
-// may remain instead of one that exists, and a report of an update or a start
-// points at the state instead of asserting one.
-//
-// An installation report carries the folder of its program as well: a
-// machine-wide service runs under an own account, so a program in a folder only
-// the installing user can read is the common reason a first installation fails.
-// An update and a start report leave that out: they describe a registration that
-// already ran.
-//
-// An installation that wrote a registration and could not start it does not end
-// here: the registration may have been removed again, and
-// serviceInstallFailureText reports that outcome instead.
+// It never claims that a registration was restored: a failure can happen after
+// the registration was written, so an installation report names a registration
+// that may remain. An installation report carries the folder of its program as
+// well, because a machine-wide service runs under its own account and a program
+// only the installing user can read is the common reason a first installation
+// fails. An installation that wrote a registration and could not start it is
+// reported by serviceInstallFailureText instead.
 func serviceActionFailureText(action serviceAction, err error, program string) string {
 	detail := ""
 	if err != nil {
@@ -384,19 +361,12 @@ func serviceActionFailureText(action serviceAction, err error, program string) s
 // serviceInstallFailureText returns the report of an installation that wrote the
 // registration and did not start it.
 //
-// The report is the result, the error of the failed start, and the outcome of the
-// attempt in the words of what the registration may do next: a registration that
-// this action wrote is removed again, so the user starts the desktop app normally
-// again; a registration that was there before the action, one whose state before
-// the action could not be read, one whose removal was skipped because its
-// instance may still run, and one whose removal failed all stay, so the user
-// decides whether to keep them. The outcome of a removal that failed names its
-// reason.
-//
-// The folder of the program is part of the outcomes where the registration stays:
-// a start that failed there may have failed because the account of the service
-// cannot read the program, and the registration that remains is the one the next
-// attempt uses.
+// The outcome is stated in what the registration may do next: a registration
+// this action wrote is removed again, so the user starts the desktop app
+// normally again; a registration that was there before, one whose state could
+// not be read, one whose removal was skipped and one whose removal failed all
+// stay, so the user decides whether to keep them. The folder of the program is
+// part of the outcomes where the registration stays.
 func serviceInstallFailureText(err error, program string, aftermath serviceInstallAftermath, removalErr error) string {
 	detail := ""
 	if err != nil {

@@ -21,15 +21,10 @@ import (
 // serviceStatusTimeout bounds the read of the service registration at the
 // startup of the desktop host.
 //
-// The lookup is a local read of the service control manager, so the budget
-// only covers a machine that is busy or a service control manager that does
-// not answer. A service that is starting or stopping is read again within the
-// same budget until it settled. The launch waits for it before it decides
-// whether it starts a server, so the wait has to be bounded.
-//
-// It is a variable so the tests can shorten the wait: a service whose state
-// never settles has to end the launch, and a test must not wait for the whole
-// budget to prove that.
+// The lookup is a local read of the service control manager, so the budget only
+// covers a busy machine or one that does not answer, and a service that is
+// starting or stopping is read again until it settled. It is a variable so the
+// tests can shorten the wait.
 var serviceStatusTimeout = 10 * time.Second
 
 // serviceGatePollInterval is the pause between two reads of the service state
@@ -67,29 +62,19 @@ func lookupServiceStatus(ctx context.Context) (service.Status, error) {
 
 // serviceGate decides whether this launch starts its own server.
 //
-// The Windows service is a second HFDesk on the same machine, and it binds the
-// same address. A launch that finds a registration therefore never starts a
-// server of its own: it asks the user what to do and ends, so the two
-// instances can never compete for the address.
+// The Windows service is a second HFDesk on the same machine and binds the same
+// address, so a launch that finds a registration never starts a server of its
+// own: it asks the user what to do and ends.
 //
-// The gate runs before the application is created. It reports false when the
-// launch has to end, and the caller returns before it starts a server, opens a
-// tray icon or publishes a state file. The gate reports true only when the
+// The gate runs before the application is created and reports true only when the
 // machine has no registration, which is the launch the desktop host had before
-// the service existed.
+// the service existed. A registration that cannot be read is not a machine
+// without one: the gate starts no server and reports the failure with a notice
+// that names the way to read the state and to try again.
 //
-// A registration that cannot be read is not a machine without one: an installed
-// service may be running and bind the address this launch would bind. The gate
-// therefore starts no server, publishes no state and reports the failure with a
-// notice that names the way to read the state of the service and to try again.
-// Starting the desktop server on a guess would serve the address next to an
-// instance that the machine starts on its own.
-//
-// A service that is starting or stopping is not a state to decide on: it is
-// neither a running nor a stopped service, so the gate waits for it to settle
-// before it asks the user. A service that did not settle within the budget is
-// reported with a notice and ends the launch as well: no answer of the dialog
-// could be right for a service in the middle of a transition.
+// A service that is starting or stopping is not a state to decide on, so the
+// gate waits for it to settle first; one that did not settle within the budget
+// is reported with a notice and ends the launch as well.
 func serviceGate() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceStatusTimeout)
 	defer cancel()
@@ -161,16 +146,10 @@ func serviceGate() bool {
 // serviceGateStatus reads the registration of the service and waits for a
 // pending state to settle.
 //
-// The service control manager reports a started or a stopped instance as
-// pending first, so the first read of a launch can observe a transition that is
-// over a moment later. A stopping instance is read as "not running" by the
-// decision of the gate, and deciding on it would offer the start of a service
-// that is still on its way down. The state is therefore read again until it
-// settled, and a state that did not settle within the budget is returned with
-// errServiceGatePending so the caller reports it instead of deciding on it.
-//
-// A registration that cannot be read is returned as it is: a service control
-// manager that does not answer has no state to wait for.
+// The service control manager reports a started or a stopped instance as pending
+// first, and deciding on a stopping instance would offer the start of a service
+// that is still on its way down. A state that did not settle within the budget
+// is returned with errServiceGatePending.
 func serviceGateStatus(ctx context.Context) (service.Status, error) {
 	for {
 		status, err := serviceStatus(ctx)
@@ -209,26 +188,13 @@ var serviceInstallRunning atomic.Bool
 //
 // The action asks the user to confirm the installation before anything is
 // changed, because the registration is a machine-wide change that survives the
-// desktop app: the service starts at boot and keeps running after the window
-// closes, and its data is not the data of the desktop.
-//
-// The console program of the service is verified before the user is asked: the
-// helper re-registers the service from its own folder, and a folder without the
-// program would be reported only after the user answered the elevation prompt
-// and the desktop had already begun to quit. The missing program is therefore
-// reported instead of a confirmation that cannot lead to a working
-// installation.
+// desktop app. The console program is verified before the user is asked, so a
+// folder without it is reported instead of after the elevation prompt.
 //
 // The helper is launched elevated; it waits for this process before it starts
-// the service, so the desktop can stop its own server through the graceful
-// path first. The action reports true when the host has to quit, which is the
-// case after a successful launch and never after a failure: a refused request
-// for administrator rights leaves the running desktop untouched.
-//
-// A click that arrives while an installation action is still running reports
-// false without a second confirmation and without a second prompt for
-// administrator rights: only one elevated helper is ever launched, and the tray
-// item works again as soon as an action ended without a hand-over.
+// the service, so the desktop can stop its own server first. The action reports
+// true when the host has to quit, which is the case after a successful launch
+// and never after a failure.
 func installServiceFromTray() bool {
 	if !serviceInstallRunning.CompareAndSwap(false, true) {
 		desktopLog.Info("an installation action is already running: this click on the tray item is ignored")
@@ -278,16 +244,10 @@ func installServiceFromTray() bool {
 
 // serviceDataDir returns the data directory the service owns.
 //
-// An existing registration decides: an installation merges with it, so the
-// service keeps the state directory it already runs with. A machine without a
-// registration gets the default directory of the scope, which is the directory
-// the installation will create.
-//
-// The directory is a fact of the service layer: the machine-wide instance keeps
-// its state under the machine-wide directories of the platform, never in the
-// profile of the user who installs it. The confirmation names the directory, so
-// the user learns where the data of the service lives instead of reading a path
-// from the documentation that the installation does not use.
+// An existing registration decides, because an installation merges with it; a
+// machine without a registration gets the default state directory of the scope.
+// It is a machine-wide directory, never the profile of the user who installs
+// it, so the confirmation names the directory the service will really own.
 func serviceDataDir() string {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceStatusTimeout)
 	defer cancel()
