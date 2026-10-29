@@ -113,6 +113,30 @@ func TestParseRunArgsAcceptsTheEqualsForm(t *testing.T) {
 	}
 }
 
+func TestParseRunArgsUsesTheLastSingleDashAndEqualsValue(t *testing.T) {
+	configFile, stateDir, logDir, _, _, _ := runArgsPaths(t)
+
+	got, err := ParseRunArgs([]string{
+		"-config", "/old/config.json",
+		"--config=" + configFile,
+		"-state-dir=" + stateDir,
+		"--state-dir", "/old/state",
+		"--state-dir=" + stateDir,
+		"-log-dir", logDir,
+		"-listen=127.0.0.1:9091",
+		"--listen", "127.0.0.1:9092",
+	})
+	if err != nil {
+		t.Fatalf("ParseRunArgs() = %v, want nil", err)
+	}
+	if got.Paths.ConfigFile != configFile || got.Paths.StateDir != stateDir || got.Paths.LogDir != logDir {
+		t.Errorf("parsed paths = %+v, want the last accepted values", got.Paths)
+	}
+	if got.Listen != "127.0.0.1:9092" {
+		t.Errorf("Listen = %q, want the last accepted value", got.Listen)
+	}
+}
+
 func TestParseRunArgsAcceptsTheFlagsWithoutTheCommandTokens(t *testing.T) {
 	configFile, stateDir, logDir, cacheDir, hubDir, localDir := runArgsPaths(t)
 

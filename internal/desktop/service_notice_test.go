@@ -367,139 +367,47 @@ func TestServiceActionFailureTextNamesTheFolderOfTheProgram(t *testing.T) {
 // create, could not read or could not remove stays and is named with the elevated
 // command, without ever claiming that the service does not run.
 func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing.T) {
-	reason := errors.New("the service did not start")
-	const (
-		program = `C:\portable\hfdesk.exe`
-		result  = "registered the service but could not start it"
-	)
-
-	removed := serviceInstallFailureText(reason, program, serviceInstallCleanup{aftermath: serviceInstallRemoved})
-	for _, want := range []string{
-		result,
-		reason.Error(),
-		"not installed as a Windows service",
-		"start the desktop app normally again",
-	} {
+	reason := errors.New("the health endpoint reports another version")
+	const program = `C:\portable\hfdesk.exe`
+	removed := serviceInstallStartFailureText(reason, program, &service.InstallStartError{Cause: reason, RegistrationRemoved: true})
+	for _, want := range []string{reason.Error(), "registration created by this attempt was removed", "start the desktop app normally again"} {
 		if !strings.Contains(removed, want) {
-			t.Errorf("the report of the removed registration %q does not mention %q", removed, want)
+			t.Errorf("the removed-install report %q does not mention %q", removed, want)
 		}
 	}
-	// A registration that was removed again is no program folder the user has
-	// to check, and no registration to remove: the report stays with the
-	// desktop app the user starts again.
-	for _, unwanted := range []string{"hfdesk service uninstall", `NT AUTHORITY\LocalService`, program} {
+	for _, unwanted := range []string{"hfdesk service uninstall", program, `NT AUTHORITY\LocalService`} {
 		if strings.Contains(removed, unwanted) {
-			t.Errorf("the report of the removed registration %q names %q, want neither a removal nor a folder of a registration that is gone", removed, unwanted)
+			t.Errorf("the removed-install report %q names %q although nothing remains to inspect", removed, unwanted)
 		}
 	}
 
-	kept := serviceInstallFailureText(reason, program, serviceInstallCleanup{aftermath: serviceInstallKept})
-	for _, want := range []string{
-		result,
-		reason.Error(),
-		"left in place",
-		"not created by this installation",
-		"The start could not be confirmed",
-		"may be running, starting or stopped",
-		`"hfdesk service uninstall"`,
-		"elevated shell",
-		program,
-		`NT AUTHORITY\LocalService`,
-	} {
+	cleanupErr := errors.New("the service process identity changed")
+	cleanup := &service.InstallStartError{Cause: reason, CleanupError: cleanupErr}
+	kept := serviceInstallStartFailureText(cleanup, program, cleanup)
+	for _, want := range []string{reason.Error(), cleanupErr.Error(), "registration was kept", "could not be proven", "hfdesk service status", program} {
 		if !strings.Contains(kept, want) {
-			t.Errorf("the report of the kept registration %q does not mention %q", kept, want)
+			t.Errorf("the kept-install report %q does not mention %q", kept, want)
 		}
 	}
-	if strings.Contains(kept, "it does not run") {
-		t.Errorf("the report of the kept registration %q claims that the service stopped although its state was not read", kept)
+	if strings.Contains(kept, "the service does not run") {
+		t.Errorf("the kept-install report %q claims more than the cleanup established", kept)
 	}
 
-	removalErr := errors.New("the registration is marked for deletion")
-	failed := serviceInstallFailureText(reason, program, serviceInstallCleanup{
-		aftermath:  serviceInstallRemovalFailed,
-		read:       true,
-		status:     service.Status{State: service.StateStopped},
-		removalErr: removalErr,
-	})
-	for _, want := range []string{
-		result,
-		reason.Error(),
-		"could not be removed again",
-		removalErr.Error(),
-		`"hfdesk service uninstall"`,
-		"elevated shell",
-		program,
-		`NT AUTHORITY\LocalService`,
-	} {
-		if !strings.Contains(failed, want) {
-			t.Errorf("the report of the failed removal %q does not mention %q", failed, want)
+	removeErr := errors.New("SCM denied deletion")
+	stoppedButKept := &service.InstallStartError{
+		Cause:             reason,
+		RegistrationOwned: true,
+		ProcessStopped:    true,
+		CleanupError:      removeErr,
+	}
+	removeText := serviceInstallStartFailureText(stoppedButKept, program, stoppedButKept)
+	for _, want := range []string{removeErr.Error(), "process was proven stopped", "could not be removed"} {
+		if !strings.Contains(removeText, want) {
+			t.Errorf("the stopped-but-kept report %q does not mention %q", removeText, want)
 		}
 	}
-
-	// A removal that was skipped because the state could not be read says so
-	// and never claims that the service stopped.
-	unreadable := serviceInstallFailureText(reason, program, serviceInstallCleanup{
-		aftermath:  serviceInstallKept,
-		read:       true,
-		statusErr:  errors.New("the service control manager did not answer"),
-		removalErr: errServiceRemovalSkipped,
-	})
-	for _, want := range []string{
-		result,
-		reason.Error(),
-		"not removed",
-		"state of the service could not be read",
-		"The start could not be confirmed",
-		"may be running, starting or stopped",
-		"stays in place",
-		`"hfdesk service uninstall"`,
-		"elevated shell",
-		program,
-		`NT AUTHORITY\LocalService`,
-	} {
-		if !strings.Contains(unreadable, want) {
-			t.Errorf("the report of the unreadable state %q does not mention %q", unreadable, want)
-		}
-	}
-	if strings.Contains(unreadable, "it does not run") {
-		t.Errorf("the report of the unreadable state %q claims that the service stopped", unreadable)
-	}
-
-	// A removal that was skipped because the instance is still stopping says
-	// what is known and does not claim that the service stopped either.
-	pending := serviceInstallFailureText(reason, program, serviceInstallCleanup{
-		aftermath:  serviceInstallKept,
-		read:       true,
-		status:     service.Status{State: service.StateStopping},
-		removalErr: errServiceRemovalSkipped,
-	})
-	for _, want := range []string{"not removed", "still stopping", "The start could not be confirmed", "stays in place"} {
-		if !strings.Contains(pending, want) {
-			t.Errorf("the report of the pending state %q does not mention %q", pending, want)
-		}
-	}
-	if strings.Contains(pending, "it does not run") {
-		t.Errorf("the report of the pending state %q claims that the service stopped", pending)
-	}
-
-	// The outcome of the installation is the whole state of the service, so
-	// no report of it asks the user to read a state it just described, and no
-	// report of it repeats the separate data of the desktop app.
-	for _, outcome := range []struct {
-		name string
-		text string
-	}{
-		{"removed", removed},
-		{"kept", kept},
-		{"failed", failed},
-		{"unreadable", unreadable},
-		{"pending", pending},
-	} {
-		for _, unwanted := range []string{"hfdesk service status", "were not touched"} {
-			if strings.Contains(outcome.text, unwanted) {
-				t.Errorf("the report of the %s registration %q names %q, want the outcome and one action", outcome.name, outcome.text, unwanted)
-			}
-		}
+	if strings.Contains(removeText, "ownership could not be proven") {
+		t.Errorf("the stopped-but-kept report %q misstates registration ownership", removeText)
 	}
 }
 

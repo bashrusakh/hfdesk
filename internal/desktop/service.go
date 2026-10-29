@@ -44,42 +44,6 @@ const (
 	serviceActionStart serviceAction = "start"
 )
 
-// serviceInstallAftermath describes what a failed installation left on the
-// machine.
-//
-// A failed first installation must not leave a registration that serves
-// nothing, because the service gate would end every later launch. Only the
-// registration this action wrote itself is therefore removed again.
-type serviceInstallAftermath int
-
-const (
-	// serviceInstallRemoved means that the registration the failed
-	// installation wrote was removed again, so HFDesk is not installed as a
-	// Windows service.
-	serviceInstallRemoved serviceInstallAftermath = iota
-	// serviceInstallKept means that the registration was left in place: it
-	// existed before the action, or the state before the action could not be
-	// read.
-	serviceInstallKept
-	// serviceInstallRemovalFailed means that the registration the failed
-	// installation wrote could not be removed again.
-	serviceInstallRemovalFailed
-)
-
-// String returns the aftermath for a log record.
-func (a serviceInstallAftermath) String() string {
-	switch a {
-	case serviceInstallRemoved:
-		return "removed"
-	case serviceInstallKept:
-		return "kept"
-	case serviceInstallRemovalFailed:
-		return "removal-failed"
-	default:
-		return "unknown"
-	}
-}
-
 // ServiceActionOptions describes one invocation of the elevated helper.
 //
 // The flags are private to the desktop executable: they are not part of the

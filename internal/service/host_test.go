@@ -708,6 +708,34 @@ func TestBuildConfigKeepsTheRegistrationWithoutAConfigFileValue(t *testing.T) {
 	}
 }
 
+func TestBuildConfigKeepsInheritedCacheEnvironmentWhenRegistrationOmitsIt(t *testing.T) {
+	model := serviceInstance(t, map[string]string{})
+	t.Setenv("HF_HOME", "/operator/cache-root")
+	t.Setenv("HF_HUB_CACHE", "/operator/hub-cache")
+	t.Cleanup(runtimepaths.Reset)
+
+	requested := DefaultInstallOptions(ScopeUser, "/opt/hfdesk")
+	existing := InstallOptions{Scope: ScopeUser, Listen: "127.0.0.1:19090", Paths: model}
+	effective := mergeInstallOptions(requested, existing, true)
+	if effective.CacheDir != "" || effective.HubDir != "" {
+		t.Fatalf("effective registration destinations = %q/%q, want absence", effective.CacheDir, effective.HubDir)
+	}
+	if _, err := buildConfig(RunOptions{
+		Paths:    effective.Paths,
+		Listen:   effective.Listen,
+		CacheDir: effective.CacheDir,
+		HubDir:   effective.HubDir,
+	}, "127.0.0.1", 8080); err != nil {
+		t.Fatalf("buildConfig() = %v, want nil", err)
+	}
+	if got := os.Getenv("HF_HOME"); got != "/operator/cache-root" {
+		t.Errorf("HF_HOME = %q, want the inherited value", got)
+	}
+	if got := os.Getenv("HF_HUB_CACHE"); got != "/operator/hub-cache" {
+		t.Errorf("HF_HUB_CACHE = %q, want the inherited value", got)
+	}
+}
+
 // TestBuildConfigDerivesTheHubDir checks the hub rule of an instance.
 //
 // A config file that defines the cache root owns the whole cache layout, so

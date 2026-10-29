@@ -19,6 +19,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,6 +29,7 @@ import (
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/internal/server"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
+	"github.com/godbus/dbus/v5"
 	"golang.org/x/sys/unix"
 )
 
@@ -483,6 +485,85 @@ func TestSystemdParseUnitRecoversTheRegistration(t *testing.T) {
 	}
 }
 
+func TestSplitSystemdWordsDecodesDocumentedCEscapes(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want []string
+	}{
+		{name: "bell", line: `\a`, want: []string{"\a"}},
+		{name: "backspace", line: `\b`, want: []string{"\b"}},
+		{name: "form-feed", line: `\f`, want: []string{"\f"}},
+		{name: "newline", line: `\n`, want: []string{"\n"}},
+		{name: "carriage-return", line: `\r`, want: []string{"\r"}},
+		{name: "tab", line: `\t`, want: []string{"\t"}},
+		{name: "vertical-tab", line: `\v`, want: []string{"\v"}},
+		{name: "slash", line: `a\\b`, want: []string{`a\b`}},
+		{name: "double-quote", line: `"a\"b"`, want: []string{`a"b`}},
+		{name: "single-quote", line: `\'a\'`, want: []string{"'a'"}},
+		{name: "systemd-space", line: `a\sb`, want: []string{"a b"}},
+		{name: "hex-space", line: `a\x20b`, want: []string{"a b"}},
+		{name: "octal-space", line: `a\040b`, want: []string{"a b"}},
+		{name: "unicode16-space", line: `a\u0020b`, want: []string{"a b"}},
+		{name: "unicode32-space", line: `a\U00000020b`, want: []string{"a b"}},
+		{name: "literal-percent", line: `a%%b`, want: []string{"a%b"}},
+		{name: "single-quoted", line: `'a b'`, want: []string{"a b"}},
+		{name: "empty-words", line: `"" ''`, want: []string{"", ""}},
+		{name: "unknown-escape-is-literal", line: `a\qb`, want: []string{`a\qb`}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := splitSystemdWords(test.line); !reflect.DeepEqual(got, test.want) {
+				t.Errorf("splitSystemdWords(%q) = %#v, want %#v", test.line, got, test.want)
+			}
+		})
+	}
+}
+
+func TestSystemdParseAndReplaceContinuedExecStart(t *testing.T) {
+	content := `[Unit]
+Description=HFDesk
+
+[Service]
+ExecStart=/bin/true \
+# ignored comment in continued value
+  service run -config=/srv/config\x20one/hfdesk.json -state-dir=/srv/state -log-dir=/srv/log --cache-dir=
+WorkingDirectory=/operator/cwd
+Environment=HF_HOME=/operator/home
+Restart=on-failure
+`
+	unit := parseUnit(content)
+	wantArgs := []string{
+		"/bin/true", "service", "run", "-config=/srv/config one/hfdesk.json",
+		"-state-dir=/srv/state", "-log-dir=/srv/log", "--cache-dir=",
+	}
+	if unit.ExecStartRaw != wantArgs[0] || !slices.Equal(append([]string{unit.ExecStartRaw}, unit.ExecArgsRaw...), wantArgs) {
+		t.Fatalf("continued ExecStart = %q %#v, want %#v", unit.ExecStartRaw, unit.ExecArgsRaw, wantArgs)
+	}
+	loaded := systemdLoadedConfig{loaded: true, execPath: wantArgs[0], execArgs: wantArgs}
+	if err := loadedMatchesUnit(loaded, unit); err != nil {
+		t.Fatalf("loadedMatchesUnit() rejected the native parsed vector: %v", err)
+	}
+
+	updated, err := updateSystemdServiceDirectives(content, map[string]systemdDirectiveChange{
+		"ExecStart": {value: `"/bin/echo" service run --config=/new`},
+	})
+	if err != nil {
+		t.Fatalf("updateSystemdServiceDirectives() = %v", err)
+	}
+	if strings.Contains(updated, "ignored comment in continued value") || strings.Contains(updated, "-state-dir=/srv/state") {
+		t.Errorf("replacing ExecStart left part of its old continuation behind:\n%s", updated)
+	}
+	for _, kept := range []string{"WorkingDirectory=/operator/cwd", "Environment=HF_HOME=/operator/home", "Restart=on-failure"} {
+		if !strings.Contains(updated, kept) {
+			t.Errorf("continued command replacement lost unrelated directive %q:\n%s", kept, updated)
+		}
+	}
+	if got := parseUnit(updated).ExecStart; got != "/bin/echo" {
+		t.Errorf("updated executable = %q, want /bin/echo", got)
+	}
+}
+
 // TestSystemdAnalyzeVerify checks the rendered unit with the verifier of the
 // supervisor itself: a unit that the supervisor cannot parse is not a unit.
 //
@@ -501,9 +582,13 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 	root := t.TempDir()
 	opts := systemdTestOptions(t, ScopeUser)
 	opts.Executable = executable
+	stateDir := filepath.Join(root, `state with spaces\and%literal"quoted`)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	opts.Paths = runtimepaths.Paths{
 		ConfigFile: filepath.Join(root, "hfdesk.json"),
-		StateDir:   root,
+		StateDir:   stateDir,
 		LogDir:     filepath.Join(root, "logs"),
 	}
 	if err := os.MkdirAll(opts.Paths.LogDir, 0o700); err != nil {
@@ -515,17 +600,332 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 		t.Fatalf("renderUnit() = %v, want nil", err)
 	}
 	path := filepath.Join(root, unitName)
-	if err := os.WriteFile(path, []byte(unit), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, analyze, "verify", path)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("systemd-analyze verify %s = %v\n%s\nthe unit:\n%s", path, err, stderr.String(), unit)
+	t.Setenv("SYSTEMD_LOG_LEVEL", "debug")
+	verify := func(stage, content string) string {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.CommandContext(ctx, analyze, "verify", "--man=no", "--generators=no", path)
+		cmd.Env = os.Environ()
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("systemd-analyze verify (%s) %s = %v\n%s\n%s\nthe unit:\n%s", stage, path, err, stdout.String(), stderr.String(), content)
+		}
+		for _, line := range strings.Split(stdout.String(), "\n") {
+			if i := strings.Index(line, "WorkingDirectory:"); i >= 0 {
+				selected := strings.TrimSpace(line[i+len("WorkingDirectory:"):])
+				if _, err := os.Stat(selected); err != nil {
+					t.Errorf("native selected WorkingDirectory %q is not an existing requested directory: %v", selected, err)
+				}
+				return selected
+			}
+		}
+		t.Fatalf("systemd-analyze verify (%s) reported no selected WorkingDirectory\n%s\n%s", stage, stdout.String(), stderr.String())
+		return ""
+	}
+	if got := parseUnit(unit).WorkingDirectory; got != stateDir {
+		t.Errorf("first-install WorkingDirectory = %q, want literal path %q", got, stateDir)
+	}
+	if got := verify("first install", unit); got != stateDir {
+		t.Errorf("native first-install WorkingDirectory = %q, want requested path %q", got, stateDir)
+	}
+	control := "[Service]\nExecStart=/bin/true\nWorkingDirectory=" + strings.ReplaceAll(stateDir, "%", "%%") + "\n"
+	if got := verify("raw native-value control", control); got != stateDir {
+		t.Fatalf("native raw-value control selected %q, want %q", got, stateDir)
+	}
+
+	explicitStateDir := filepath.Join(root, `updated state with spaces\and%literal"quoted`)
+	if err := os.MkdirAll(explicitStateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	updated := opts
+	updated.Paths.StateDir = explicitStateDir
+	updated.Explicit.StateDir = true
+	unit, err = updateUnit(unit, updated, nil)
+	if err != nil {
+		t.Fatalf("updateUnit() = %v, want nil", err)
+	}
+	if got := parseUnit(unit).WorkingDirectory; got != explicitStateDir {
+		t.Errorf("explicit StateDir update WorkingDirectory = %q, want literal path %q", got, explicitStateDir)
+	}
+	if got := verify("explicit StateDir update", unit); got != explicitStateDir {
+		t.Errorf("native explicit-update WorkingDirectory = %q, want requested path %q", got, explicitStateDir)
+	}
+
+	adminWorkingDirectory := "WorkingDirectory=%h"
+	workingDirectoryValue, err := systemdWorkingDirectoryValue(explicitStateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousWorkingDirectory := "WorkingDirectory=" + workingDirectoryValue
+	if !strings.Contains(unit, previousWorkingDirectory) {
+		t.Fatalf("explicit update lost its WorkingDirectory directive:\n%s", unit)
+	}
+	unit = strings.Replace(unit, previousWorkingDirectory, adminWorkingDirectory, 1)
+	execOnly := updated
+	execOnly.Executable = "/bin/true"
+	execOnly.Explicit.StateDir = false
+	unit, err = updateUnit(unit, execOnly, nil)
+	if err != nil {
+		t.Fatalf("executable-only updateUnit() = %v, want nil", err)
+	}
+	if !strings.Contains(unit, adminWorkingDirectory) {
+		t.Fatalf("executable-only update changed the administrator's WorkingDirectory source:\n%s", unit)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := verify("executable-only update preserving admin WorkingDirectory", unit); got != home {
+		t.Errorf("native executable-only WorkingDirectory = %q, want the native %%h path %q", got, home)
+	}
+
+	trailingStateDir := filepath.Join(root, "state with trailing backslash\\")
+	if err := os.MkdirAll(trailingStateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	trailingOpts := opts
+	trailingOpts.Paths.StateDir = trailingStateDir
+	trailingUnit, err := renderUnit(trailingOpts, nil)
+	if err != nil {
+		t.Fatalf("renderUnit() for terminal backslash = %v", err)
+	}
+	if got := verify("first install with terminal backslash", trailingUnit); got != trailingStateDir {
+		t.Errorf("native terminal-backslash WorkingDirectory = %q, want %q", got, trailingStateDir)
+	}
+	updatedTrailingStateDir := filepath.Join(root, "updated state with trailing backslash\\")
+	if err := os.MkdirAll(updatedTrailingStateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	trailingOpts.Paths.StateDir = updatedTrailingStateDir
+	trailingOpts.Explicit.StateDir = true
+	trailingUnit, err = updateUnit(trailingUnit, trailingOpts, nil)
+	if err != nil {
+		t.Fatalf("updateUnit() for terminal backslash = %v", err)
+	}
+	if got := verify("explicit StateDir update with terminal backslash", trailingUnit); got != updatedTrailingStateDir {
+		t.Errorf("native updated terminal-backslash WorkingDirectory = %q, want %q", got, updatedTrailingStateDir)
+	}
+
+	pairedBackslashes := filepath.Join(root, "state with paired trailing backslashes\\\\")
+	if err := os.MkdirAll(pairedBackslashes, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pairedOpts := opts
+	pairedOpts.Paths.StateDir = pairedBackslashes
+	pairedUnit, err := renderUnit(pairedOpts, nil)
+	if err != nil {
+		t.Fatalf("renderUnit() for paired terminal backslashes = %v", err)
+	}
+	if got := verify("first install with paired terminal backslashes", pairedUnit); got != pairedBackslashes {
+		t.Errorf("native paired-backslash WorkingDirectory = %q, want %q", got, pairedBackslashes)
+	}
+}
+
+func TestSystemdWorkingDirectoryRejectsUnrepresentableTrailingSpace(t *testing.T) {
+	opts := systemdTestOptions(t, ScopeUser)
+	opts.Paths.StateDir = filepath.Join(t.TempDir(), "state ")
+	if err := validateUnitPaths(opts, false); err == nil || !strings.Contains(err.Error(), "trailing spaces are stripped") {
+		t.Fatalf("first-install validateUnitPaths() = %v, want refusal of an unrepresentable WorkingDirectory", err)
+	}
+	if err := validateUnitPaths(opts, true); err != nil {
+		t.Fatalf("executable-only validation rejected the inherited app state path: %v", err)
+	}
+	if _, err := renderUnit(opts, nil); err == nil || !strings.Contains(err.Error(), "trailing spaces are stripped") {
+		t.Fatalf("renderUnit() = %v, want refusal of an unrepresentable WorkingDirectory", err)
+	}
+	opts.Explicit.StateDir = true
+	if err := validateUnitPaths(opts, true); err == nil || !strings.Contains(err.Error(), "trailing spaces are stripped") {
+		t.Fatalf("explicit StateDir validation = %v, want refusal of an unrepresentable WorkingDirectory", err)
+	}
+	unit := "[Service]\nExecStart=/bin/true service run --config /srv/config.json --state-dir /srv/state --log-dir /srv/log\nWorkingDirectory=/srv/state\n"
+	if _, err := updateUnit(unit, opts, nil); err == nil || !strings.Contains(err.Error(), "trailing spaces are stripped") {
+		t.Fatalf("updateUnit() = %v, want refusal of an unrepresentable WorkingDirectory", err)
+	}
+}
+
+func TestSystemdRunFlagEditorFollowsFlagSetSemantics(t *testing.T) {
+	source := "/bin/true service run -config=/srv/config.json --state-dir /srv/state -log-dir=/srv/logs -listen=127.0.0.1:18080 --listen 127.0.0.1:18081 --cache-dir=/srv/cache --"
+	words := splitSystemdWordTokens(source)
+	updated := replaceSystemdRunFlag(words, "listen", "127.0.0.1:19222", true)
+	updatedSource := make([]string, len(updated))
+	for i, word := range updated {
+		updatedSource[i] = word.source
+	}
+	gotSource := strings.Join(updatedSource, " ")
+	wantSource := "/bin/true service run -config=/srv/config.json --state-dir /srv/state -log-dir=/srv/logs --listen 127.0.0.1:19222 --cache-dir=/srv/cache --"
+	if gotSource != wantSource {
+		t.Fatalf("source update = %q, want %q", gotSource, wantSource)
+	}
+	before, err := ParseRunArgs(parseUnit("[Service]\nExecStart=" + source).ExecArgs)
+	if err != nil {
+		t.Fatalf("baseline ParseRunArgs() = %v", err)
+	}
+	after, err := ParseRunArgs(parseUnit("[Service]\nExecStart=" + gotSource).ExecArgs)
+	if err != nil {
+		t.Fatalf("updated ParseRunArgs() = %v", err)
+	}
+	before.Listen = after.Listen
+	if after.Listen != "127.0.0.1:19222" || !reflect.DeepEqual(after, before) {
+		t.Errorf("updated parsed options = %+v, want only Listen changed from %+v", after, before)
+	}
+}
+
+func TestSystemdRunFlagEditorTreatsOptionValueAsDistinctFromTerminator(t *testing.T) {
+	source := "/bin/true service run --config -- --state-dir /srv/state --log-dir /srv/log --"
+	words := splitSystemdWordTokens(source)
+	layout := scanSystemdRunArgs(words, true)
+	if layout.terminator != len(words)-1 {
+		t.Fatalf("terminator index = %d, want final standalone -- at %d", layout.terminator, len(words)-1)
+	}
+	if len(layout.options) != 3 || layout.options[0].name != "config" || words[layout.options[0].end-1].value != "--" {
+		t.Fatalf("option layout = %+v, want config to consume the first -- as its value", layout)
+	}
+	updated := replaceSystemdRunFlag(words, "listen", "127.0.0.1:19222", true)
+	var sourceWords []string
+	for _, word := range updated {
+		sourceWords = append(sourceWords, word.source)
+	}
+	got := strings.Join(sourceWords, " ")
+	want := "/bin/true service run --config -- --state-dir /srv/state --log-dir /srv/log --listen 127.0.0.1:19222 --"
+	if got != want {
+		t.Fatalf("updated source = %q, want %q", got, want)
+	}
+	_, err := ParseRunArgs(parseUnit("[Service]\nExecStart=" + got).ExecArgs)
+	if err == nil || !strings.Contains(err.Error(), "absolute path") || strings.Contains(err.Error(), "unexpected argument") {
+		t.Fatalf("ParseRunArgs() error = %v, want the consumed -- value to fail path validation, not terminate parsing", err)
+	}
+}
+
+func TestSystemdInstallInsertsExplicitOptionBeforeTerminator(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	root := t.TempDir()
+	config := filepath.Join(root, "config.json")
+	state := filepath.Join(root, "state")
+	logs := filepath.Join(root, "logs")
+	content := "[Service]\nExecStart=/bin/true service run --config " + config + " --state-dir " + state + " --log-dir " + logs + " --\nWorkingDirectory=" + root + "\n[Install]\nWantedBy=default.target\n"
+	baseline, err := ParseRunArgs(parseUnit(content).ExecArgs)
+	if err != nil {
+		t.Fatalf("baseline ParseRunArgs() = %v", err)
+	}
+
+	manager := &systemdManager{scope: ScopeUser}
+	path, err := manager.unitPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setSystemdTestPropertyReader(t, manager)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+
+	requested := DefaultInstallOptions(ScopeUser, "/bin/true")
+	requested.Listen = "127.0.0.1:19222"
+	requested.Explicit.Listen = true
+	installed, err := manager.Install(context.Background(), requested)
+	if err != nil {
+		t.Fatalf("Install() = %v", err)
+	}
+	stored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedArgs := parseUnit(string(stored)).ExecArgs
+	parsed, err := ParseRunArgs(updatedArgs)
+	if err != nil {
+		t.Fatalf("successful Install() wrote an invalid ParseRunArgs vector: %v\n%s", err, stored)
+	}
+	baseline.Listen = requested.Listen
+	if !reflect.DeepEqual(parsed, baseline) || installed.Listen != requested.Listen {
+		t.Errorf("installed options = %+v / returned listen %q, want %+v", parsed, installed.Listen, baseline)
+	}
+	if !strings.Contains(string(stored), "--log-dir "+logs+" --listen 127.0.0.1:19222 --\n") {
+		t.Errorf("explicit flag was not inserted before the true terminator:\n%s", stored)
+	}
+	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 0 {
+		t.Errorf("stopped service was restarted %d times", got)
+	}
+}
+
+func TestSystemdExecutableUpdatePreservesInheritedStatePathAndIndependentWorkingDirectory(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	root := t.TempDir()
+	state := filepath.Join(root, "state ")
+	config := filepath.Join(root, "config.json")
+	logs := filepath.Join(root, "logs")
+	workingDirectory := filepath.Join(root, "native-working-directory")
+	for _, dir := range []string{state, filepath.Dir(config), logs, workingDirectory} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dataPath := filepath.Join(state, "jobs_state.json")
+	data := []byte(`{"jobs":[{"id":"preserved-state"}]}`)
+	if err := os.WriteFile(dataPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	content := "[Service]\nExecStart=/bin/true service run --config \"" + config + "\" --state-dir \"" + state + "\" --log-dir \"" + logs + "\"\n" +
+		"WorkingDirectory=" + workingDirectory + "\nRestart=on-failure\n[Install]\nWantedBy=default.target\n"
+	baseline, err := ParseRunArgs(parseUnit(content).ExecArgs)
+	if err != nil || baseline.Paths.StateDir != state {
+		t.Fatalf("baseline app argv = %+v, %v; want trailing-space state %q", baseline, err, state)
+	}
+	if _, err := os.Stat(filepath.Join(root, "state")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("trimmed state-path decoy exists before update: %v", err)
+	}
+
+	manager := &systemdManager{scope: ScopeUser}
+	unitPath, err := manager.unitPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setSystemdTestPropertyReader(t, manager)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+
+	installed, err := manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, "/bin/echo"))
+	if err != nil {
+		t.Fatalf("executable-only Install() rejected the inherited state path: %v", err)
+	}
+	if installed.Paths.StateDir != state {
+		t.Fatalf("Install() state dir = %q, want the unchanged app path %q", installed.Paths.StateDir, state)
+	}
+	stored, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := parseUnit(string(stored))
+	parsed, err := ParseRunArgs(updated.ExecArgs)
+	if err != nil || parsed.Paths.StateDir != state {
+		t.Fatalf("updated app argv = %+v, %v; want unchanged state %q", parsed, err, state)
+	}
+	if updated.WorkingDirectory != workingDirectory || !strings.Contains(string(stored), "WorkingDirectory="+workingDirectory+"\n") {
+		t.Fatalf("executable-only update changed independent WorkingDirectory %q:\n%s", workingDirectory, stored)
+	}
+	if after, err := os.ReadFile(dataPath); err != nil || !bytes.Equal(after, data) {
+		t.Errorf("state data changed: %q, %v", after, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "state")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("update created the trimmed state-path decoy: %v", err)
+	}
+	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 0 {
+		t.Errorf("stopped unit was restarted %d times", got)
 	}
 }
 
@@ -2889,9 +3289,21 @@ func systemdFakeSupervisor(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
 	script := `#!/bin/sh
+if [ "$1" = "--user" ]; then
+	shift
+fi
 if [ -n "$HFDESK_TEST_MARKER_DIR" ]; then
 	mkdir -p "$HFDESK_TEST_MARKER_DIR" || exit 1
 	: > "$HFDESK_TEST_MARKER_DIR/marker" || exit 1
+fi
+if [ "$1" = "show" ]; then
+	unit="${XDG_CONFIG_HOME}/systemd/user/hfdesk.service"
+	if [ ! -e "$unit" ]; then
+			echo "LoadState=not-found"
+			exit 0
+		fi
+		echo "LoadState=loaded"
+		exit 0
 fi
 if [ "$HFDESK_TEST_SUPERVISOR" = "ok" ]; then
 	exit 0
@@ -3067,8 +3479,11 @@ func TestSystemdFailedInstallKeepsACreatedDirectoryThatHoldsData(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want the failure of the supervisor")
 	}
-	if err.Error() != wantErr.Error() {
-		t.Errorf("Install() = %q, want %q", err, wantErr)
+	if !strings.Contains(err.Error(), wantErr.Error()) {
+		t.Errorf("Install() = %q, want the original failure %q", err, wantErr)
+	}
+	if !strings.Contains(err.Error(), "the previous unit file or captured loaded settings could not be restored or verified") {
+		t.Errorf("Install() = %q, want the unconfirmed rollback outcome", err)
 	}
 
 	// The state directory holds the marker, so it is kept, and so are the
@@ -3486,7 +3901,7 @@ func TestMergeInstallOptionsKeepsTheRegistration(t *testing.T) {
 	requested := installOptionsForMerge("/default", "/new/bin/hfdesk")
 	existing := installOptionsForMerge("/registered", "/old/bin/hfdesk")
 
-	merged := mergeInstallOptions(requested, existing)
+	merged := mergeInstallOptions(requested, existing, true)
 
 	if merged.Executable != requested.Executable {
 		t.Errorf("the executable is %q, want the one of the request %q", merged.Executable, requested.Executable)
@@ -3514,7 +3929,7 @@ func TestMergeInstallOptionsHonoursTheExplicitFields(t *testing.T) {
 	}
 	existing := installOptionsForMerge("/registered", "/old/bin/hfdesk")
 
-	merged := mergeInstallOptions(requested, existing)
+	merged := mergeInstallOptions(requested, existing, true)
 
 	if !reflect.DeepEqual(merged, requested) {
 		t.Errorf("mergeInstallOptions() =\n%+v\nwant the request\n%+v", merged, requested)
@@ -3527,7 +3942,7 @@ func TestMergeInstallOptionsHonoursTheExplicitFields(t *testing.T) {
 func TestMergeInstallOptionsUsesTheDefaultsOnAFirstInstall(t *testing.T) {
 	requested := installOptionsForMerge("/default", "/new/bin/hfdesk")
 
-	merged := mergeInstallOptions(requested, InstallOptions{})
+	merged := mergeInstallOptions(requested, InstallOptions{}, false)
 
 	if !reflect.DeepEqual(merged, requested) {
 		t.Errorf("mergeInstallOptions() =\n%+v\nwant the request\n%+v", merged, requested)
@@ -3543,7 +3958,7 @@ func TestMergeInstallOptionsResolvesEachFieldOnItsOwn(t *testing.T) {
 	requested.Explicit.CacheDir = true
 	existing := installOptionsForMerge("/registered", "/old/bin/hfdesk")
 
-	merged := mergeInstallOptions(requested, existing)
+	merged := mergeInstallOptions(requested, existing, true)
 
 	if merged.CacheDir != requested.CacheDir {
 		t.Errorf("the cache root is %q, want the named one %q", merged.CacheDir, requested.CacheDir)
@@ -3575,6 +3990,199 @@ func TestSystemdRegistrationOptionsRecoversTheRegistration(t *testing.T) {
 	want.Executable = opts.Executable
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("registrationOptions() =\n%+v\nwant\n%+v", got, want)
+	}
+}
+
+func TestSystemdRegistrationOptionsUsesAcceptedFlagSyntaxAndLastValue(t *testing.T) {
+	unit := `[Service]
+ExecStart=/opt/hfdesk/hfdesk service run -config=/old/hfdesk.json --config=/new/hfdesk.json -state-dir /old/state --state-dir=/new/state -log-dir=/new/logs -listen=127.0.0.1:8181 --listen 127.0.0.1:9191 -cache-dir=/old/cache --cache-dir=/new/cache -hub-dir=/old/hub --hub-dir=/new/hub -local-dir=/old/models --local-dir=/new/models
+`
+	got := registrationOptions(parseUnit(unit), ScopeUser)
+	want := InstallOptions{
+		Scope:      ScopeUser,
+		Executable: "/opt/hfdesk/hfdesk",
+		Listen:     "127.0.0.1:9191",
+		Paths: runtimepaths.Paths{
+			ConfigFile: "/new/hfdesk.json",
+			StateDir:   "/new/state",
+			LogDir:     "/new/logs",
+		},
+		CacheDir: "/new/cache",
+		HubDir:   "/new/hub",
+		LocalDir: "/new/models",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("registrationOptions() =\n%+v\nwant\n%+v", got, want)
+	}
+}
+
+func TestLoadedConfigDecodesTypedExecStartArguments(t *testing.T) {
+	wantArgs := []string{
+		"/srv/HF Desk/bin/hfdesk", "service", "run", "--config",
+		"/srv/HF Desk/config with spaces.json", "--empty", "", "--literal", "quote\" and \\ slash $HOME",
+	}
+	properties := map[string]dbus.Variant{
+		"ExecStartEx": dbus.MakeVariant([]systemdExecStartExEntry{{
+			Path:  wantArgs[0],
+			Argv:  wantArgs,
+			Flags: []string{"full-privileges"},
+		}}),
+		"WorkingDirectory": dbus.MakeVariant("/srv/HF Desk/state"),
+		"User":             dbus.MakeVariant("hfdesk"),
+		"Group":            dbus.MakeVariant("hfdesk"),
+		"Environment": dbus.MakeVariant([]string{
+			`HF_HOME=/srv/HF Desk/cache`, `HF_HUB_CACHE=/srv/HF Desk/hub`, `HF_LABEL=quoted "value"`,
+		}),
+		"EnvironmentFiles": dbus.MakeVariant([]systemdEnvironmentFile{{Path: "/etc/hfdesk/cache file.env", IgnoreErrors: true}}),
+	}
+	got, err := loadedConfigFromProperties(properties)
+	if err != nil {
+		t.Fatalf("loadedConfigFromProperties() = %v", err)
+	}
+	if !got.loaded || got.execPath != wantArgs[0] || !slices.Equal(got.execArgs, wantArgs) || !slices.Equal(got.execFlags, []string{"full-privileges"}) {
+		t.Errorf("loaded ExecStart = %+v, want the typed argv and flags", got)
+	}
+	if got.workingDirectory != "/srv/HF Desk/state" || got.user != "hfdesk" || got.group != "hfdesk" {
+		t.Errorf("loaded launch identity = %+v, want the typed values", got)
+	}
+	if !slices.Equal(got.environment, []string{`HF_HOME=/srv/HF Desk/cache`, `HF_HUB_CACHE=/srv/HF Desk/hub`, `HF_LABEL=quoted "value"`}) {
+		t.Errorf("loaded Environment = %q, want each typed variable intact", got.environment)
+	}
+	if !slices.Equal(got.environmentFiles, []systemdEnvironmentFile{{Path: "/etc/hfdesk/cache file.env", IgnoreErrors: true}}) {
+		t.Errorf("loaded EnvironmentFiles = %+v, want the typed path and ignore flag", got.environmentFiles)
+	}
+}
+
+func TestLoadedConfigDecodesLegacyTypedExecStart(t *testing.T) {
+	want := []string{"/opt/HF Desk/hfdesk", "--config", "/etc/HF Desk/hfdesk.json"}
+	properties := map[string]dbus.Variant{
+		"ExecStart":        dbus.MakeVariant([]systemdExecStartEntry{{Path: want[0], Argv: want}}),
+		"WorkingDirectory": dbus.MakeVariant(""),
+		"User":             dbus.MakeVariant(""),
+		"Group":            dbus.MakeVariant(""),
+		"Environment":      dbus.MakeVariant([]string{}),
+		"EnvironmentFiles": dbus.MakeVariant([]systemdEnvironmentFile{}),
+	}
+	got, err := loadedConfigFromProperties(properties)
+	if err != nil {
+		t.Fatalf("loadedConfigFromProperties() = %v", err)
+	}
+	if got.execPath != want[0] || !slices.Equal(got.execArgs, want) || got.ignoreErrors {
+		t.Errorf("legacy loaded ExecStart = %+v, want the lossless typed argv", got)
+	}
+}
+
+func TestLoadedConfigRejectsUnavailableTypedProperties(t *testing.T) {
+	properties := map[string]dbus.Variant{
+		"WorkingDirectory": dbus.MakeVariant(""),
+		"User":             dbus.MakeVariant(""),
+		"Group":            dbus.MakeVariant(""),
+		"Environment":      dbus.MakeVariant([]string{}),
+		"EnvironmentFiles": dbus.MakeVariant([]systemdEnvironmentFile{}),
+	}
+	if _, err := loadedConfigFromProperties(properties); err == nil || !strings.Contains(err.Error(), "ExecStart") {
+		t.Fatalf("loadedConfigFromProperties() error = %v, want missing typed ExecStart error", err)
+	}
+}
+
+func TestLoadedConfigRejectsWrongExecStartSignatureForEmptyArray(t *testing.T) {
+	properties := systemdTypedProperties("", []string{}, []string{}, "", "", "", []systemdEnvironmentFile{})
+	properties["ExecStartEx"] = dbus.MakeVariant([]systemdExecStartEntry{})
+	if _, err := loadedConfigFromProperties(properties); err == nil || !strings.Contains(err.Error(), `ExecStartEx with signature "a(sasbttttuii)"`) {
+		t.Fatalf("loadedConfigFromProperties() error = %v, want wrong ExecStartEx signature", err)
+	}
+}
+
+func TestDBusPropertiesFromCallPreservesTypedValues(t *testing.T) {
+	raw := map[string]dbus.Variant{
+		"ExecStartEx": dbus.MakeVariant([]systemdExecStartExEntry{{
+			Path: "/bin/true", Argv: []string{"/bin/true", ""}, Flags: []string{},
+		}}),
+		"EnvironmentFiles": dbus.MakeVariant([]systemdEnvironmentFile{{Path: "/etc/hfdesk.env", IgnoreErrors: true}}),
+		"WorkingDirectory": dbus.MakeVariant("/srv/hfdesk"),
+		"User":             dbus.MakeVariant(""),
+		"Group":            dbus.MakeVariant(""),
+		"Environment":      dbus.MakeVariant([]string{}),
+	}
+	call := &dbus.Call{Body: []interface{}{raw}}
+	if raw["ExecStartEx"].Signature().String() != "a(sasasttttuii)" || raw["EnvironmentFiles"].Signature().String() != "a(sb)" {
+		t.Fatalf("fixture signatures changed: ExecStartEx=%s EnvironmentFiles=%s", raw["ExecStartEx"].Signature(), raw["EnvironmentFiles"].Signature())
+	}
+	properties, err := dbusPropertiesFromCall(call)
+	if err != nil {
+		t.Fatalf("dbusPropertiesFromCall() = %v", err)
+	}
+	if properties["ExecStartEx"].Signature().String() != "a(sasasttttuii)" || properties["EnvironmentFiles"].Signature().String() != "a(sb)" {
+		t.Errorf("production extraction changed signatures: ExecStartEx=%s EnvironmentFiles=%s", properties["ExecStartEx"].Signature(), properties["EnvironmentFiles"].Signature())
+	}
+	if _, err := loadedConfigFromProperties(properties); err != nil {
+		t.Errorf("loadedConfigFromProperties(raw) = %v, want a valid typed projection", err)
+	}
+}
+
+func TestSessionBusAddressUsesCurrentContextWithoutMutatingEnvironment(t *testing.T) {
+	runtimeDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "")
+	busPath := filepath.Join(runtimeDir, "bus")
+	if err := os.WriteFile(busPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := "unix:path=" + dbus.EscapeBusAddressValue(busPath)
+	if got := sessionBusAddress(); got != want {
+		t.Errorf("sessionBusAddress() = %q, want discovered runtime bus %q", got, want)
+	}
+	if got := os.Getenv("DBUS_SESSION_BUS_ADDRESS"); got != "" {
+		t.Errorf("session discovery mutated DBUS_SESSION_BUS_ADDRESS to %q", got)
+	}
+	if err := os.Remove(busPath); err != nil {
+		t.Fatal(err)
+	}
+	const discovered = "unix:abstract=/tmp/hfdesk-test-session"
+	if err := os.WriteFile(filepath.Join(runtimeDir, "dbus-session"), []byte("DBUS_SESSION_BUS_ADDRESS="+discovered+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := sessionBusAddress(); got != discovered {
+		t.Errorf("sessionBusAddress() = %q, want dbus-session-file address %q", got, discovered)
+	}
+	const explicit = "unix:abstract=/tmp/hfdesk-explicit-session"
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", explicit)
+	if got := sessionBusAddress(); got != explicit {
+		t.Errorf("sessionBusAddress() = %q, want explicit address %q", got, explicit)
+	}
+}
+
+func TestSystemdStatusUsesAcceptedRegistrationFlagSyntax(t *testing.T) {
+	systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	manager := &systemdManager{scope: ScopeUser}
+	path, err := manager.unitPath()
+	if err != nil {
+		t.Fatalf("unitPath() = %v", err)
+	}
+	root := t.TempDir()
+	unit := fmt.Sprintf(`[Service]
+ExecStart=/bin/true service run -config=%s --config=%s -state-dir=%s --state-dir=%s -log-dir=%s -listen=127.0.0.1:8181 --listen=127.0.0.1:9191 -cache-dir=%s --cache-dir=%s -hub-dir=%s --hub-dir=%s -local-dir=%s --local-dir=%s
+`, filepath.Join(root, "old.json"), filepath.Join(root, "current.json"), filepath.Join(root, "old-state"), filepath.Join(root, "state"), filepath.Join(root, "logs"), filepath.Join(root, "old-cache"), filepath.Join(root, "cache"), filepath.Join(root, "old-hub"), filepath.Join(root, "hub"), filepath.Join(root, "old-models"), filepath.Join(root, "models"))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create the unit directory: %v", err)
+	}
+	for _, name := range []string{path, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
+		if err := os.WriteFile(name, []byte(unit), 0o644); err != nil {
+			t.Fatalf("write the unit file %q: %v", name, err)
+		}
+	}
+	status, err := manager.Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status() = %v", err)
+	}
+	wantPaths := runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "current.json"),
+		StateDir:   filepath.Join(root, "state"),
+		LogDir:     filepath.Join(root, "logs"),
+	}
+	if status.Executable != "/bin/true" || status.Listen != "127.0.0.1:9191" || status.Paths != wantPaths || status.CacheDir != filepath.Join(root, "cache") {
+		t.Errorf("Status() = %+v, want the last accepted values in the registered command", status)
 	}
 }
 
@@ -3855,6 +4463,7 @@ func TestSystemdExecuteOnlyNativeCandidateRunsAndInstalls(t *testing.T) {
 	if _, err := manager.Install(context.Background(), opts); err != nil {
 		t.Fatalf("Install() refused the execute-only native candidate: %v", err)
 	}
+	setSystemdTestPropertyReader(t, manager)
 
 	link := filepath.Join(t.TempDir(), "hfdesk-link")
 	if err := os.Symlink(native, link); err != nil {
@@ -4456,13 +5065,16 @@ func TestSystemdVerifyRunningExecutableChecksTheExpectedVersion(t *testing.T) {
 }
 
 // systemdRecordingSupervisor replaces systemctl with a fake supervisor that
-// records every call and answers the state query of an installation.
+// records every call and keeps the unit file on disk separate from a
+// supervisor-loaded copy. Typed D-Bus properties come from the Go test fake,
+// not the lossy display string printed by systemctl.
 //
-// The reported state is HFDESK_TEST_SYSTEMCTL_ACTIVE, and the program of its
-// ExecStart property is HFDESK_TEST_SYSTEMCTL_EXECUTABLE. A restart fails once
-// when HFDESK_TEST_SYSTEMCTL_RESTART_FAIL_ONCE is "1", so a test can drive the
-// failure of the first restart while the restore of the previous registration
-// still succeeds.
+// A successful daemon-reload copies the on-disk unit into the loaded copy; a
+// configured reload failure leaves that copy unchanged. `show` reports the
+// lifecycle state, while the loaded configuration is read from the typed Go
+// fake and active state is controlled separately by HFDESK_TEST_SYSTEMCTL_ACTIVE.
+// A restart fails once when HFDESK_TEST_SYSTEMCTL_RESTART_FAIL_ONCE is "1", so
+// a test can drive a failed update and a successful restore.
 //
 // A restart reports the state it leaves behind: when
 // HFDESK_TEST_SYSTEMCTL_RESTARTED names a marker file, the supervisor creates it
@@ -4470,10 +5082,8 @@ func TestSystemdVerifyRunningExecutableChecksTheExpectedVersion(t *testing.T) {
 // from then on. A restart returns as soon as the unit was forked, so a test can
 // drive a restart that is accepted while the unit is dead. When
 // HFDESK_TEST_SYSTEMCTL_RESTART_COUNT names a file, the number of restarts is
-// written to it; the program of the ExecStart property is then reported as
-// HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_RESTART from the second restart on, so a
-// test can drive a restart of an update and a restart of a restore that bring
-// different programs into service.
+// written to it for a test readiness probe to distinguish the failed update
+// from a later recovery start.
 //
 // The readiness probe is replaced for the run of the test: the fake supervisor
 // forks no instance, so no server of the instance answers on the registered
@@ -4523,6 +5133,29 @@ is-enabled)
 	esac
 	exit 1
 	;;
+daemon-reload)
+	count=0
+	if [ -n "$HFDESK_TEST_SYSTEMCTL_RELOAD_COUNT" ] && [ -e "$HFDESK_TEST_SYSTEMCTL_RELOAD_COUNT" ]; then
+		count=$(cat "$HFDESK_TEST_SYSTEMCTL_RELOAD_COUNT")
+	fi
+	count=$((count + 1))
+	if [ -n "$HFDESK_TEST_SYSTEMCTL_RELOAD_COUNT" ]; then
+		printf '%s' "$count" > "$HFDESK_TEST_SYSTEMCTL_RELOAD_COUNT" || exit 1
+	fi
+	if [ "$HFDESK_TEST_SYSTEMCTL_DAEMON_RELOAD_FAIL_AT" = "$count" ]; then
+		echo "the fake supervisor refuses daemon-reload $count" >&2
+		exit 1
+	fi
+	unit="${XDG_CONFIG_HOME}/systemd/user/hfdesk.service"
+	if [ -n "$HFDESK_TEST_SYSTEMCTL_LOADED_UNIT" ]; then
+		if [ -e "$unit" ]; then
+			cp "$unit" "$HFDESK_TEST_SYSTEMCTL_LOADED_UNIT" || exit 1
+		else
+			rm -f "$HFDESK_TEST_SYSTEMCTL_LOADED_UNIT" || exit 1
+		fi
+	fi
+	exit 0
+	;;
 enable)
 	if [ "$HFDESK_TEST_SYSTEMCTL_ENABLE_FAIL" = "1" ]; then
 		echo "the fake supervisor refuses the enable" >&2
@@ -4542,15 +5175,36 @@ show)
 	if [ "$active" = "activating" ]; then
 		sub=start-pre
 	fi
+	unit="${XDG_CONFIG_HOME}/systemd/user/hfdesk.service"
+	if [ -n "$HFDESK_TEST_SYSTEMCTL_LOADED_UNIT" ]; then
+		if [ ! -e "$HFDESK_TEST_SYSTEMCTL_LOADED_UNIT" ] && [ -z "$HFDESK_TEST_SYSTEMCTL_EXECUTABLE" ]; then
+			echo "LoadState=not-found"
+			echo "ActiveState=inactive"
+			echo "SubState=dead"
+			exit 0
+		fi
+		if [ -e "$HFDESK_TEST_SYSTEMCTL_LOADED_UNIT" ]; then
+			unit="$HFDESK_TEST_SYSTEMCTL_LOADED_UNIT"
+		fi
+	fi
+	if [ ! -e "$unit" ] && [ -z "$HFDESK_TEST_SYSTEMCTL_EXECUTABLE" ]; then
+		echo "LoadState=not-found"
+		echo "ActiveState=inactive"
+		echo "SubState=dead"
+		exit 0
+	fi
 	echo "LoadState=loaded"
 	echo "ActiveState=$active"
 	echo "SubState=$sub"
-	exe="$HFDESK_TEST_SYSTEMCTL_EXECUTABLE"
-	if [ -n "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT" ] && [ -n "$HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_RESTART" ] && [ -e "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT" ] && [ "$(cat "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT")" -ge 2 ]; then
-		exe="$HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_RESTART"
+	executable="$HFDESK_TEST_SYSTEMCTL_EXECUTABLE"
+	if [ -n "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT" ] && [ -e "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT" ]; then
+		restart_count=$(cat "$HFDESK_TEST_SYSTEMCTL_RESTART_COUNT")
+		if [ "$restart_count" = "2" ] && [ -n "$HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_SECOND_RESTART" ]; then
+			executable="$HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_SECOND_RESTART"
+		fi
 	fi
-	if [ -n "$exe" ]; then
-		echo "ExecStart={ path=$exe ; argv[]=$exe service run ; ignore_errors=no }"
+	if [ -n "$executable" ]; then
+		printf 'ExecStart={ path=%s }\n' "$executable"
 	fi
 	exit 0
 	;;
@@ -4581,6 +5235,8 @@ exit 0
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_LOG", logPath)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT", filepath.Join(dir, "loaded-unit"))
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_RELOAD_COUNT", filepath.Join(dir, "reload-count"))
 	// The fake supervisor forks no instance, so the readiness probe of the
 	// service layer is replaced for the run of the test. A test that drives
 	// the probe installs its own after this helper returned.
@@ -4625,7 +5281,9 @@ func systemdSupervisorCallsTo(calls []string, command ...string) int {
 func systemdExistingInstallation(t *testing.T, opts InstallOptions) (*systemdManager, string, string) {
 	t.Helper()
 	systemdTempInstallEnvironment(t)
+	loadedPath := os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")
 	m := &systemdManager{scope: ScopeUser}
+	setSystemdTestPropertyReader(t, m)
 	path, err := m.unitPath()
 	if err != nil {
 		t.Fatalf("unitPath() = %v, want nil", err)
@@ -4640,7 +5298,116 @@ func systemdExistingInstallation(t *testing.T, opts InstallOptions) (*systemdMan
 	if err := os.WriteFile(path, []byte(unit), 0o644); err != nil {
 		t.Fatalf("write the unit file: %v", err)
 	}
+	if err := os.WriteFile(loadedPath, []byte(unit), 0o644); err != nil {
+		t.Fatalf("write the loaded unit: %v", err)
+	}
 	return m, path, unit
+}
+
+func setSystemdTestPropertyReader(t *testing.T, manager *systemdManager) {
+	t.Helper()
+	loadedPath := os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")
+	manager.readServiceProperties = func(_ context.Context, name string) (map[string]dbus.Variant, error) {
+		if name != unitName {
+			return nil, fmt.Errorf("unexpected unit %q", name)
+		}
+		content, err := os.ReadFile(loadedPath)
+		if err != nil {
+			return nil, err
+		}
+		return systemdTestPropertiesFromUnit(string(content)), nil
+	}
+}
+
+func systemdTestPropertiesFromUnit(content string) map[string]dbus.Variant {
+	unit := parseUnit(content)
+	var commands []systemdExecStartExEntry
+	if unit.ExecStartRaw != "" {
+		argv := append([]string{unit.ExecStartRaw}, unit.ExecArgsRaw...)
+		commands = append(commands, systemdExecStartExEntry{Path: unit.ExecStartRaw, Argv: argv})
+	}
+	var environment []string
+	var environmentFiles []systemdEnvironmentFile
+	section := ""
+	for _, logical := range systemdLogicalLines(content) {
+		trimmed := strings.TrimSpace(logical.text)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			section = strings.ToLower(strings.TrimSpace(trimmed[1 : len(trimmed)-1]))
+			continue
+		}
+		if section != "service" {
+			continue
+		}
+		key, value, ok := strings.Cut(trimmed, "=")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "Environment":
+			environment = append(environment, splitSystemdWords(value)...)
+		case "EnvironmentFile":
+			for _, entry := range splitSystemdWords(value) {
+				file := systemdEnvironmentFile{}
+				if strings.HasPrefix(entry, "-") {
+					file.IgnoreErrors = true
+					entry = strings.TrimPrefix(entry, "-")
+				}
+				file.Path = entry
+				environmentFiles = append(environmentFiles, file)
+			}
+		}
+	}
+	return map[string]dbus.Variant{
+		"ExecStartEx":      dbus.MakeVariant(commands),
+		"WorkingDirectory": dbus.MakeVariant(unit.WorkingDirectory),
+		"User":             dbus.MakeVariant(unit.User),
+		"Group":            dbus.MakeVariant(unit.Group),
+		"Environment":      dbus.MakeVariant(environment),
+		"EnvironmentFiles": dbus.MakeVariant(environmentFiles),
+	}
+}
+
+func systemdTypedProperties(execPath string, argv, environment []string, workingDirectory, userName, groupName string, environmentFiles []systemdEnvironmentFile) map[string]dbus.Variant {
+	return map[string]dbus.Variant{
+		"ExecStartEx": dbus.MakeVariant([]systemdExecStartExEntry{{
+			Path:  execPath,
+			Argv:  slices.Clone(argv),
+			Flags: []string{},
+		}}),
+		"WorkingDirectory": dbus.MakeVariant(workingDirectory),
+		"User":             dbus.MakeVariant(userName),
+		"Group":            dbus.MakeVariant(groupName),
+		"Environment":      dbus.MakeVariant(slices.Clone(environment)),
+		"EnvironmentFiles": dbus.MakeVariant(slices.Clone(environmentFiles)),
+	}
+}
+
+func setSystemdTypedPropertySequence(t *testing.T, manager *systemdManager, properties ...map[string]dbus.Variant) {
+	t.Helper()
+	if len(properties) == 0 {
+		t.Fatal("a typed manager sequence must include at least one state")
+	}
+	reloadCountPath := os.Getenv("HFDESK_TEST_SYSTEMCTL_RELOAD_COUNT")
+	manager.readServiceProperties = func(_ context.Context, name string) (map[string]dbus.Variant, error) {
+		if name != unitName {
+			return nil, fmt.Errorf("unexpected unit %q", name)
+		}
+		index := 0
+		content, err := os.ReadFile(reloadCountPath)
+		if err == nil {
+			count, parseErr := strconv.Atoi(strings.TrimSpace(string(content)))
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			index = count
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
+		if index >= len(properties) {
+			index = len(properties) - 1
+		}
+		return properties[index], nil
+	}
 }
 
 // systemdExistingOptions returns a user scope registration whose settings all
@@ -4762,6 +5529,534 @@ func TestSystemdReinstallOfAStoppedUnitDoesNotStartIt(t *testing.T) {
 	}
 }
 
+func TestSystemdReinstallPreservesUnrelatedUnitSettings(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	previousUnit = strings.Replace(previousUnit,
+		"WorkingDirectory="+previous.Paths.StateDir,
+		"WorkingDirectory=/operator/launch-dir", 1)
+	previousUnit = strings.Replace(previousUnit,
+		"Environment=HOME=",
+		"Environment=HF_HUB_CACHE=/operator/hub\nEnvironmentFile=-/etc/hfdesk/service.env\nEnvironment=HOME=", 1)
+	previousUnit = strings.Replace(previousUnit,
+		"Restart=on-failure",
+		"Restart=always", 1)
+	previousUnit = strings.Replace(previousUnit,
+		"TimeoutStopSec=",
+		"ExecStartPre=/usr/bin/test -d /operator/data\nTimeoutStopSec=", 1)
+	for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
+		if err := os.WriteFile(name, []byte(previousUnit), 0o644); err != nil {
+			t.Fatalf("write the customized unit %q: %v", name, err)
+		}
+	}
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+
+	if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
+		t.Fatalf("Install() = %v, want nil", err)
+	}
+	content, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("read the updated unit: %v", err)
+	}
+	for _, setting := range []string{
+		"WorkingDirectory=/operator/launch-dir",
+		"Environment=HF_HUB_CACHE=/operator/hub",
+		"EnvironmentFile=-/etc/hfdesk/service.env",
+		"Restart=always",
+		"ExecStartPre=/usr/bin/test -d /operator/data",
+	} {
+		if !strings.Contains(string(content), setting) {
+			t.Errorf("the updated unit lost %q:\n%s", setting, content)
+		}
+	}
+	if got := parseUnit(string(content)).ExecStart; got != newExecutable {
+		t.Errorf("the updated executable = %q, want %q", got, newExecutable)
+	}
+	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 0 {
+		t.Errorf("the stopped unit was restarted %d times", got)
+	}
+}
+
+func TestSystemdUpdateOfStoredButUnloadedUnitStaysStopped(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	loadedPath := os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")
+	if err := os.Remove(loadedPath); err != nil {
+		t.Fatalf("mark the stored unit as not loaded: %v", err)
+	}
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+
+	effective, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+	if err != nil {
+		t.Fatalf("Install() = %v, want an update of the stored unit", err)
+	}
+	want := previous
+	want.Executable = newExecutable
+	if !reflect.DeepEqual(effective, want) {
+		t.Errorf("Install() = %+v, want the previous stored options with the new executable %+v", effective, want)
+	}
+	content, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("read the updated unit: %v", err)
+	}
+	if got := parseUnit(string(content)).ExecStart; got != newExecutable {
+		t.Errorf("stored executable = %q, want %q", got, newExecutable)
+	}
+	if string(content) == previousUnit {
+		t.Fatal("the stored unit did not change to the requested executable")
+	}
+	if _, err := os.Stat(loadedPath); err != nil {
+		t.Errorf("daemon-reload did not load the updated stored unit: %v", err)
+	}
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "start", unitName) + systemdSupervisorCallsTo(calls, "restart", unitName); got != 0 {
+		t.Errorf("the stored but stopped instance was started %d times:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
+func TestSystemdStoredUnloadedUpdateKeepsHexEscapedConfigPath(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	root := t.TempDir()
+	config := filepath.Join(root, "config one", "hfdesk.json")
+	if err := os.MkdirAll(filepath.Dir(config), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config, []byte(`{"connections":3}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateDir, logDir := filepath.Join(root, "state"), filepath.Join(root, "logs")
+	content := fmt.Sprintf("[Service]\nExecStart=/bin/true service run -config=%s -state-dir=%s -log-dir=%s --cache-dir=\n[Install]\nWantedBy=default.target\n", strings.ReplaceAll(config, " ", `\x20`), stateDir, logDir)
+	manager := &systemdManager{scope: ScopeUser}
+	setSystemdTestPropertyReader(t, manager)
+	path, err := manager.unitPath()
+	if err != nil {
+		t.Fatalf("unitPath() = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	installed, err := manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, "/bin/true"))
+	if err != nil {
+		t.Fatalf("Install() = %v, want a stopped stored-unit update", err)
+	}
+	if installed.Paths.ConfigFile != config {
+		t.Errorf("Install() changed the unnamed config path: got %q, want %q", installed.Paths.ConfigFile, config)
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parseUnit(string(updated)).paths().ConfigFile; got != config {
+		t.Errorf("updated unit config path = %q, want %q", got, config)
+	}
+	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 0 {
+		t.Errorf("stored but unloaded unit was restarted %d times", got)
+	}
+}
+
+func TestSystemdUpdatePreservesEscapedDollarArguments(t *testing.T) {
+	systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+	m, unitPath, _ := systemdExistingInstallation(t, previous)
+	requested := DefaultInstallOptions(ScopeUser, newExecutable)
+	requested.Paths.ConfigFile = filepath.Join(root, "new$desk", "hfdesk.json")
+	requested.Explicit.Config = true
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+
+	effective, err := m.Install(context.Background(), requested)
+	if err != nil {
+		t.Fatalf("Install() = %v, want the escaped-dollar update", err)
+	}
+	if effective.Executable != newExecutable || effective.Paths.ConfigFile != requested.Paths.ConfigFile {
+		t.Errorf("effective options = %+v, want the literal dollar paths", effective)
+	}
+	content, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "new$$desk") {
+		t.Errorf("the updated unit did not escape literal dollar signs:\n%s", content)
+	}
+	parsed := parseUnit(string(content))
+	if parsed.ExecStart != newExecutable || parsed.flagValue("--config") != requested.Paths.ConfigFile {
+		t.Errorf("the parsed registration = %+v, want the literal dollar config path", parsed)
+	}
+}
+
+type systemdLosslessUpdateFixture struct {
+	logPath       string
+	manager       *systemdManager
+	unitPath      string
+	previousUnit  string
+	previous      InstallOptions
+	updated       InstallOptions
+	oldProperties map[string]dbus.Variant
+	newProperties map[string]dbus.Variant
+}
+
+func newSystemdLosslessUpdateFixture(t *testing.T) systemdLosslessUpdateFixture {
+	t.Helper()
+	logPath := systemdRecordingSupervisor(t)
+	root := filepath.Join(t.TempDir(), `root with "spaces"`)
+	makeExecutable := func(name string) string {
+		path := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	oldExecutable := makeExecutable(filepath.Join(`bin old "quoted"`, "hfdesk"))
+	newExecutable := makeExecutable(filepath.Join(`bin new "quoted"`, "hfdesk"))
+	previous := systemdExistingOptions(t, oldExecutable, root)
+	previous.Paths.ConfigFile = filepath.Join(root, `config "quoted" with spaces`, "hfdesk.json")
+	previous.Paths.StateDir = filepath.Join(root, `state "quoted" with spaces`)
+	previous.Paths.LogDir = filepath.Join(root, `logs "quoted" with spaces`)
+	previous.CacheDir = filepath.Join(root, `cache "quoted" with spaces`)
+	previous.HubDir = filepath.Join(previous.CacheDir, `hub "quoted"`)
+	previous.LocalDir = ""
+	manager, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+
+	command := "ExecStart=" + systemdExecStart(previous)
+	withEmptyArgument := command + ` --local-dir ""`
+	previousUnit = strings.Replace(previousUnit, command, withEmptyArgument, 1)
+	environmentLine := `Environment=HFDSK_TEST_LABEL="value with spaces and \"quotes\""`
+	previousUnit = strings.Replace(previousUnit, "Environment=HOME=", environmentLine+"\nEnvironment=HOME=", 1)
+	previousUnit = strings.Replace(previousUnit, "\n\n[Install]", "\nEnvironmentFile=-/etc/hfdesk/service.env\n\n[Install]", 1)
+	loadedPath := os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")
+	for _, path := range []string{unitPath, loadedPath} {
+		if err := os.WriteFile(path, []byte(previousUnit), 0o644); err != nil {
+			t.Fatalf("write the independently-authored unit %q: %v", path, err)
+		}
+	}
+
+	home, err := unitHomeDir(previous)
+	if err != nil {
+		t.Fatalf("unitHomeDir() = %v", err)
+	}
+	environment := []string{`HFDSK_TEST_LABEL=value with spaces and "quotes"`, "HOME=" + home}
+	environmentFiles := []systemdEnvironmentFile{{Path: "/etc/hfdesk/service.env", IgnoreErrors: true}}
+	oldArgv := append([]string{oldExecutable}, RunArgs(previous)...)
+	oldArgv = append(oldArgv, "--local-dir", "")
+	updated := previous
+	updated.Executable = newExecutable
+	newArgv := append([]string{newExecutable}, RunArgs(updated)...)
+	newArgv = append(newArgv, "--local-dir", "")
+	return systemdLosslessUpdateFixture{
+		logPath:       logPath,
+		manager:       manager,
+		unitPath:      unitPath,
+		previousUnit:  previousUnit,
+		previous:      previous,
+		updated:       updated,
+		oldProperties: systemdTypedProperties(oldExecutable, oldArgv, environment, previous.Paths.StateDir, "", "", environmentFiles),
+		newProperties: systemdTypedProperties(newExecutable, newArgv, environment, previous.Paths.StateDir, "", "", environmentFiles),
+	}
+}
+
+type systemdDynamicPathFixture struct {
+	logPath            string
+	manager            *systemdManager
+	unitPath           string
+	loadedPath         string
+	root               string
+	sourceUnit         string
+	configSource       string
+	stateSource        string
+	cacheSource        string
+	hubSource          string
+	localSource        string
+	logDir             string
+	listen             string
+	managerState       string
+	managerWorkingDir  string
+	newExecutable      string
+	explicitConfig     string
+	oldProperties      map[string]dbus.Variant
+	newProperties      map[string]dbus.Variant
+	explicitProperties map[string]dbus.Variant
+}
+
+func newSystemdDynamicPathFixture(t *testing.T) systemdDynamicPathFixture {
+	t.Helper()
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	configSource := filepath.Join(root, "${HF_CONFIG}", "hfdesk.json")
+	actualConfig := filepath.Join(root, "config with spaces", "hfdesk.json")
+	if err := os.MkdirAll(filepath.Dir(actualConfig), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(actualConfig, []byte(`{"connections":3}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	actualCache := filepath.Join(root, "cache with spaces")
+	logDir := filepath.Join(root, "%n", "logs")
+	managerLogDir := filepath.Join(root, unitName, "logs")
+	managerHome := filepath.Join(root, "manager home")
+	managerWorkingDir, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("read the user home for the %%h fixture: %v", err)
+	}
+	managerState := filepath.Join(managerWorkingDir, "state with spaces")
+	listen := "127.0.0.1:19090"
+	stateSource := `%h/state with spaces`
+	cacheSource := `${HF_CACHE}`
+	hubSource := `${HF_HUB}`
+	localSource := `${HF_LOCAL}`
+	previous := systemdExistingOptions(t, "/bin/true", root)
+	manager, unitPath, _ := systemdExistingInstallation(t, previous)
+	sourceUnit := "[Unit]\nDescription=HFDesk\n\n[Service]\n" +
+		"ExecStart=/bin/true service run --config \"" + configSource + "\"" +
+		" --state-dir=\"" + stateSource + "\" --log-dir=" + logDir +
+		" --listen=" + listen + " --cache-dir=" + cacheSource +
+		" --hub-dir=" + hubSource + " --local-dir=" + localSource + "\n" +
+		"WorkingDirectory=%h\n" +
+		"Environment=HF_CONFIG=\"config with spaces\"\n" +
+		"Environment=HF_CACHE=\"" + actualCache + "\"\n" +
+		"Environment=HF_HUB=\"" + filepath.Join(root, "hub with spaces") + "\"\n" +
+		"Environment=HF_LOCAL=\"" + filepath.Join(root, "models with spaces") + "\"\n" +
+		"Environment=HOME=\"" + managerHome + "\"\n" +
+		"Restart=on-failure\n\n[Install]\nWantedBy=default.target\n"
+	loadedPath := os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")
+	for _, path := range []string{unitPath, loadedPath} {
+		if err := os.WriteFile(path, []byte(sourceUnit), 0o644); err != nil {
+			t.Fatalf("write the dynamic source fixture %q: %v", path, err)
+		}
+	}
+	newExecutable := systemdTestExecutable(t)
+	explicitConfig := filepath.Join(root, "explicit config", "hfdesk.json")
+	environment := []string{
+		"HF_CONFIG=config with spaces",
+		"HF_CACHE=" + actualCache,
+		"HF_HUB=" + filepath.Join(root, "hub with spaces"),
+		"HF_LOCAL=" + filepath.Join(root, "models with spaces"),
+		"HOME=" + managerHome,
+	}
+	environmentFiles := []systemdEnvironmentFile{}
+	oldArgv := []string{
+		"/bin/true", "service", "run", "--config", configSource,
+		"--state-dir=" + managerState, "--log-dir=" + managerLogDir,
+		"--listen=" + listen, "--cache-dir=" + cacheSource,
+		"--hub-dir=" + hubSource, "--local-dir=" + localSource,
+	}
+	newArgv := slices.Clone(oldArgv)
+	newArgv[0] = newExecutable
+	explicitArgv := []string{
+		newExecutable, "service", "run", "--config", explicitConfig,
+		"--state-dir=" + managerState, "--log-dir=" + managerLogDir,
+		"--listen=" + listen, "--cache-dir=" + cacheSource,
+		"--hub-dir=" + hubSource, "--local-dir=" + localSource,
+	}
+	return systemdDynamicPathFixture{
+		logPath:            logPath,
+		manager:            manager,
+		unitPath:           unitPath,
+		loadedPath:         loadedPath,
+		root:               root,
+		sourceUnit:         sourceUnit,
+		configSource:       configSource,
+		stateSource:        stateSource,
+		cacheSource:        cacheSource,
+		hubSource:          hubSource,
+		localSource:        localSource,
+		logDir:             logDir,
+		listen:             listen,
+		managerState:       managerState,
+		managerWorkingDir:  managerWorkingDir,
+		newExecutable:      newExecutable,
+		explicitConfig:     explicitConfig,
+		oldProperties:      systemdTypedProperties("/bin/true", oldArgv, environment, managerWorkingDir, "", "", environmentFiles),
+		newProperties:      systemdTypedProperties(newExecutable, newArgv, environment, managerWorkingDir, "", "", environmentFiles),
+		explicitProperties: systemdTypedProperties(newExecutable, explicitArgv, environment, managerWorkingDir, "", "", environmentFiles),
+	}
+}
+
+func TestSystemdUpdatePreservesDynamicNativeOperands(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		unloaded bool
+		explicit bool
+	}{
+		{name: "loaded executable-only"},
+		{name: "stored but unloaded executable-only", unloaded: true},
+		{name: "loaded explicit config only", explicit: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newSystemdDynamicPathFixture(t)
+			properties := fixture.newProperties
+			if test.explicit {
+				properties = fixture.explicitProperties
+			}
+			setSystemdTypedPropertySequence(t, fixture.manager, fixture.oldProperties, properties)
+			if test.unloaded {
+				if err := os.Remove(fixture.loadedPath); err != nil {
+					t.Fatalf("mark the stored unit as not loaded: %v", err)
+				}
+			}
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+
+			requested := DefaultInstallOptions(ScopeUser, fixture.newExecutable)
+			if test.explicit {
+				requested.Paths.ConfigFile = fixture.explicitConfig
+				requested.Explicit.Config = true
+			}
+			installed, err := fixture.manager.Install(context.Background(), requested)
+			if err != nil {
+				t.Fatalf("Install() = %v, want the native dynamic operands to survive", err)
+			}
+			wantConfig := fixture.configSource
+			if test.explicit {
+				wantConfig = fixture.explicitConfig
+			}
+			if installed.Executable != fixture.newExecutable || installed.Paths.ConfigFile != wantConfig || installed.Paths.StateDir != fixture.stateSource || installed.Paths.LogDir != fixture.logDir || installed.CacheDir != fixture.cacheSource || installed.HubDir != fixture.hubSource || installed.LocalDir != fixture.localSource {
+				t.Errorf("Install() = %+v, want executable %q and source-preserved config/state/cache operands", installed, fixture.newExecutable)
+			}
+			updated, err := os.ReadFile(fixture.unitPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := string(updated)
+			for _, preserved := range []string{
+				"--state-dir=\"" + fixture.stateSource + "\"",
+				"--log-dir=" + fixture.logDir,
+				"--cache-dir=" + fixture.cacheSource,
+				"--hub-dir=" + fixture.hubSource,
+				"--local-dir=" + fixture.localSource,
+				"WorkingDirectory=%h",
+				"Environment=HF_CONFIG=\"config with spaces\"",
+				"Environment=HF_CACHE=\"" + filepath.Join(fixture.root, "cache with spaces") + "\"",
+				"Environment=HF_HUB=\"" + filepath.Join(fixture.root, "hub with spaces") + "\"",
+				"Environment=HF_LOCAL=\"" + filepath.Join(fixture.root, "models with spaces") + "\"",
+			} {
+				if !strings.Contains(text, preserved) {
+					t.Errorf("updated source lost unresupplied native operand/setting %q:\n%s", preserved, text)
+				}
+			}
+			if !test.explicit && !strings.Contains(text, "--config \""+fixture.configSource+"\"") {
+				t.Errorf("unmarked config expression was re-encoded or replaced:\n%s", text)
+			}
+			if test.explicit {
+				if strings.Contains(text, fixture.configSource) || !strings.Contains(text, systemdQuoteCommand(fixture.explicitConfig)) {
+					t.Errorf("explicit config resupply did not affect only the config operand:\n%s", text)
+				}
+			}
+			for _, unresolved := range []string{"${HF_CONFIG}", "${HF_CACHE}", "${HF_HUB}", "${HF_LOCAL}", "%h", "%n"} {
+				if _, err := os.Stat(filepath.Join(fixture.root, unresolved)); !errors.Is(err, fs.ErrNotExist) {
+					t.Errorf("update created a directory for unresolved expression %q: %v", unresolved, err)
+				}
+			}
+			if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, fixture.logPath), "restart", unitName); got != 0 {
+				t.Errorf("stopped/unloaded registration was restarted %d times", got)
+			}
+		})
+	}
+}
+
+func TestSystemdDynamicLoadedMismatchRollsBackSource(t *testing.T) {
+	fixture := newSystemdDynamicPathFixture(t)
+	changedState := filepath.Join(fixture.root, "different manager state")
+	changedArgv := []string{
+		fixture.newExecutable, "service", "run", "--config", fixture.configSource,
+		"--state-dir=" + changedState,
+		"--log-dir=" + filepath.Join(fixture.root, unitName, "logs"),
+		"--listen=" + fixture.listen, "--cache-dir=" + fixture.cacheSource,
+		"--hub-dir=" + fixture.hubSource, "--local-dir=" + fixture.localSource,
+	}
+	changed := systemdTypedProperties(fixture.newExecutable, changedArgv, []string{
+		"HF_CONFIG=config with spaces",
+		"HF_CACHE=" + filepath.Join(fixture.root, "cache with spaces"),
+		"HF_HUB=" + filepath.Join(fixture.root, "hub with spaces"),
+		"HF_LOCAL=" + filepath.Join(fixture.root, "models with spaces"),
+		"HOME=" + filepath.Join(fixture.root, "manager home"),
+	}, fixture.managerWorkingDir, "", "", []systemdEnvironmentFile{})
+	setSystemdTypedPropertySequence(t, fixture.manager, fixture.oldProperties, changed, fixture.oldProperties)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+
+	_, err := fixture.manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, fixture.newExecutable))
+	if err == nil || !strings.Contains(err.Error(), "typed --state-dir argument changed across the update") {
+		t.Fatalf("Install() error = %v, want rejection of the changed manager-loaded dynamic path", err)
+	}
+	content, readErr := os.ReadFile(fixture.unitPath)
+	if readErr != nil || string(content) != fixture.sourceUnit {
+		t.Errorf("restored source (error %v) =\n%s\nwant original dynamic source\n%s", readErr, content, fixture.sourceUnit)
+	}
+	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, fixture.logPath), "restart", unitName); got != 0 {
+		t.Errorf("stopped unit was restarted %d times during rollback", got)
+	}
+}
+
+func TestSystemdUpdateUsesTypedArgvForSpacesQuotesEmptyArgsAndEnvironment(t *testing.T) {
+	fixture := newSystemdLosslessUpdateFixture(t)
+	setSystemdTypedPropertySequence(t, fixture.manager, fixture.oldProperties, fixture.newProperties)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+
+	effective, err := fixture.manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, fixture.updated.Executable))
+	if err != nil {
+		t.Fatalf("Install() = %v, want a full update with typed argv", err)
+	}
+	if !reflect.DeepEqual(effective, fixture.updated) {
+		t.Errorf("Install() = %+v, want %+v", effective, fixture.updated)
+	}
+	content, err := os.ReadFile(fixture.unitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered := parseUnit(string(content))
+	if registered.ExecStart != fixture.updated.Executable || registered.flagValue("--config") != fixture.previous.Paths.ConfigFile {
+		t.Errorf("updated registration = %+v; config path with spaces/quotes was not preserved", registered)
+	}
+	for _, preserved := range []string{
+		`Environment=HFDSK_TEST_LABEL="value with spaces and \"quotes\""`,
+		"EnvironmentFile=-/etc/hfdesk/service.env",
+	} {
+		if !strings.Contains(string(content), preserved) {
+			t.Errorf("updated unit lost preserved setting %q:\n%s", preserved, content)
+		}
+	}
+	if calls := systemdSupervisorCalls(t, fixture.logPath); systemdSupervisorCallsTo(calls, "restart", unitName) != 0 {
+		t.Errorf("the stopped unit was restarted:\n%s", strings.Join(calls, "\n"))
+	}
+}
+
+func TestSystemdRollbackUsesTypedArgvForSpacesQuotesEmptyArgsAndEnvironment(t *testing.T) {
+	fixture := newSystemdLosslessUpdateFixture(t)
+	setSystemdTypedPropertySequence(t, fixture.manager, fixture.oldProperties, fixture.newProperties, fixture.oldProperties)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", fixture.previous.Executable)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_RESTART_FAIL_ONCE", "1")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_RESTART_MARKER", filepath.Join(t.TempDir(), "restart"))
+
+	_, err := fixture.manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, fixture.updated.Executable))
+	if err == nil || !strings.Contains(err.Error(), "the previous registration was restored") {
+		t.Fatalf("Install() = %v, want the failed restart and verified typed rollback", err)
+	}
+	content, readErr := os.ReadFile(fixture.unitPath)
+	if readErr != nil || string(content) != fixture.previousUnit {
+		t.Errorf("restored unit (error %v) =\n%s\nwant\n%s", readErr, content, fixture.previousUnit)
+	}
+	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, fixture.logPath), "restart", unitName); got != 2 {
+		t.Errorf("restart count = %d, want the failed update restart and one verified restore", got)
+	}
+}
+
 // TestSystemdFailedRestartRestoresThePreviousRegistration checks that a
 // restart the supervisor refuses neither leaves the new registration behind
 // nor keeps the instance down: the previous unit file is written back, the
@@ -4813,12 +6108,112 @@ func TestSystemdFailedRestartRestoresThePreviousRegistration(t *testing.T) {
 	}
 }
 
-// TestSystemdUnverifiedRestartRestoresThePreviousRegistration checks that a
-// restart which does not put the new executable into service is a failed
-// installation: a registration alone never reports success, the previous unit
-// file is restored and the previous instance is started again, which is
-// verified before it is reported.
-func TestSystemdUnverifiedRestartRestoresThePreviousRegistration(t *testing.T) {
+func TestSystemdRollbackReloadFailureDoesNotRestartOrClaimRecovery(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	executable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, executable, root)
+	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	previousUnit = strings.Replace(previousUnit,
+		"Environment=HOME=",
+		"Environment=HF_HUB_CACHE=/registered/hub\nEnvironmentFile=-/etc/hfdesk/service.env\nEnvironment=HOME=", 1)
+	for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
+		if err := os.WriteFile(name, []byte(previousUnit), 0o644); err != nil {
+			t.Fatalf("write the previous unit %q: %v", name, err)
+		}
+	}
+	oldProperties := systemdTestPropertiesFromUnit(previousUnit)
+	oldConfig, err := loadedConfigFromProperties(oldProperties)
+	if err != nil {
+		t.Fatalf("decode the previous typed manager properties: %v", err)
+	}
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_DAEMON_RELOAD_FAIL_AT", "2")
+
+	requested := DefaultInstallOptions(ScopeUser, executable)
+	requested.Paths.ConfigFile = filepath.Join(root, "new-config", "hfdesk.json")
+	requested.Explicit.Config = true
+	updated := previous
+	updated.Paths.ConfigFile = requested.Paths.ConfigFile
+	updatedArgv := append([]string{executable}, RunArgs(updated)...)
+	updatedEnvironment := slices.Clone(oldConfig.environment)
+	for i, value := range updatedEnvironment {
+		if strings.HasPrefix(value, "HF_HUB_CACHE=") {
+			updatedEnvironment[i] = "HF_HUB_CACHE=/operator/new-hub"
+		}
+	}
+	updatedProperties := systemdTypedProperties(executable, updatedArgv, updatedEnvironment, oldConfig.workingDirectory, oldConfig.user, oldConfig.group, oldConfig.environmentFiles)
+	setSystemdTypedPropertySequence(t, m, oldProperties, updatedProperties)
+	_, err = m.Install(context.Background(), requested)
+	if err == nil {
+		t.Fatal("Install() = nil, want the typed environment mismatch and unconfirmed rollback")
+	}
+	for _, want := range []string{"did not preserve the loaded environment", "reload the restored unit"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Install() = %q, want the original/rollback failure %q", err, want)
+		}
+	}
+	for _, unsupported := range []string{"captured loaded command/launch settings were restored", "previous instance was started again"} {
+		if strings.Contains(err.Error(), unsupported) {
+			t.Errorf("Install() = %q, must not claim %q", err, unsupported)
+		}
+	}
+
+	disk, readErr := os.ReadFile(unitPath)
+	if readErr != nil || string(disk) != previousUnit {
+		t.Errorf("stored unit after rollback (error %v) =\n%s\nwant\n%s", readErr, disk, previousUnit)
+	}
+	loadedBytes, readErr := os.ReadFile(os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT"))
+	if readErr != nil {
+		t.Fatalf("read the supervisor-loaded unit: %v", readErr)
+	}
+	loaded := parseUnit(string(loadedBytes))
+	if loaded.ExecStart != executable || loaded.listen() != previous.Listen || loaded.flagValue("--config") == previous.Paths.ConfigFile {
+		t.Errorf("the supervisor-loaded command/environment do not distinguish the failed update: %+v", loaded)
+	}
+	loadedConfig, err := loadedConfigFromProperties(updatedProperties)
+	if err != nil {
+		t.Fatalf("decode the still-loaded typed manager properties: %v", err)
+	}
+	if loadedConfig.execPath != executable || runArgValue(loadedConfig.execArgs[1:], "--listen") != previous.Listen || runArgValue(loadedConfig.execArgs[1:], "--config") == previous.Paths.ConfigFile || slices.Equal(loadedConfig.environment, oldConfig.environment) {
+		t.Errorf("typed loaded state = %+v, want same executable/listen but changed config and environment", loadedConfig)
+	}
+
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 0 {
+		t.Errorf("the instance was restarted %d times, want no restart while the typed loaded state is unconfirmed:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
+func TestSystemdUpdateWithUnavailableTypedPropertiesRefusesBeforeMutation(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	m.readServiceProperties = func(context.Context, string) (map[string]dbus.Variant, error) {
+		return nil, errors.New("fake typed property read failed")
+	}
+
+	_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+	if err == nil || !strings.Contains(err.Error(), "fake typed property read failed") {
+		t.Fatalf("Install() = %v, want the typed-read failure", err)
+	}
+	content, readErr := os.ReadFile(unitPath)
+	if readErr != nil || string(content) != previousUnit {
+		t.Errorf("unit file changed without typed loaded settings (error %v):\n%s", readErr, content)
+	}
+	if calls := systemdSupervisorCalls(t, logPath); systemdSupervisorCallsTo(calls, "daemon-reload") != 0 {
+		t.Errorf("the refused update touched systemd after the typed read failed: %v", calls)
+	}
+}
+
+// TestSystemdReinstallRefusesAShadowedLoadedCommand checks that a registration
+// whose effective loaded command differs from its unit file is not updated by
+// silently changing only the base file. The fake keeps the same executable and
+// listen address but gives the loaded command a different config and environment.
+func TestSystemdReinstallRefusesAShadowedLoadedCommand(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	root := t.TempDir()
 	oldExecutable := systemdTestExecutable(t)
@@ -4826,24 +6221,42 @@ func TestSystemdUnverifiedRestartRestoresThePreviousRegistration(t *testing.T) {
 	previous := systemdExistingOptions(t, oldExecutable, root)
 
 	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
-	// The supervisor keeps reporting the old program: the restart
-	// succeeds, but the instance never runs the new executable.
+	overrideConfig := filepath.Join(root, "administrator", "hfdesk.json")
+	loadedUnit := strings.Replace(previousUnit,
+		"--config "+previous.Paths.ConfigFile,
+		"--config "+overrideConfig, 1)
+	if loadedUnit == previousUnit {
+		t.Fatal("the generated command did not contain the config path to override")
+	}
+	loadedUnit = strings.Replace(loadedUnit, "\n\n[Install]", "\nEnvironment=HF_HUB_CACHE=/operator/hub\n\n[Install]", 1)
+	loadedPath := os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")
+	if err := os.WriteFile(loadedPath, []byte(loadedUnit), 0o644); err != nil {
+		t.Fatalf("write the simulated loaded unit: %v", err)
+	}
+	loadedArgv := append([]string{oldExecutable}, RunArgs(previous)...)
+	for i, arg := range loadedArgv {
+		if arg == previous.Paths.ConfigFile {
+			loadedArgv[i] = overrideConfig
+			break
+		}
+	}
+	home, err := unitHomeDir(previous)
+	if err != nil {
+		t.Fatalf("unitHomeDir() = %v", err)
+	}
+	loadedEnvironment := []string{"HF_HUB_CACHE=/operator/hub", "HOME=" + home}
+	loadedProperties := systemdTypedProperties(oldExecutable, loadedArgv, loadedEnvironment, previous.Paths.StateDir, "", "", nil)
+	m.readServiceProperties = func(context.Context, string) (map[string]dbus.Variant, error) {
+		return loadedProperties, nil
+	}
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
-	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", oldExecutable)
-	m.restartWait = 250 * time.Millisecond
 
-	_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+	_, err = m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
 	if err == nil {
-		t.Fatal("Install() = nil, want the failed verification of the new executable")
+		t.Fatal("Install() = nil, want refusal of the shadowed loaded command")
 	}
-	if !strings.Contains(err.Error(), "does not run") {
-		t.Errorf("Install() = %q, want an error that names the executable the instance does not run", err)
-	}
-	if !strings.Contains(err.Error(), "the previous registration was restored") {
-		t.Errorf("Install() = %q, want an error that reports the restored registration", err)
-	}
-	if !strings.Contains(err.Error(), "the previous instance was started again") {
-		t.Errorf("Install() = %q, want the verified restart of the previous instance", err)
+	if !strings.Contains(err.Error(), "differs from its unit file") {
+		t.Errorf("Install() = %q, want an error that identifies the loaded command mismatch", err)
 	}
 
 	content, readErr := os.ReadFile(unitPath)
@@ -4851,12 +6264,27 @@ func TestSystemdUnverifiedRestartRestoresThePreviousRegistration(t *testing.T) {
 		t.Fatalf("read the unit file: %v", readErr)
 	}
 	if string(content) != previousUnit {
-		t.Errorf("the unit file was not restored:\n%s\nwant\n%s", content, previousUnit)
+		t.Errorf("the base unit changed despite the override refusal:\n%s\nwant\n%s", content, previousUnit)
+	}
+	loaded, readErr := os.ReadFile(loadedPath)
+	if readErr != nil || string(loaded) != loadedUnit {
+		t.Errorf("the simulated loaded unit changed after refusal (error %v):\n%s\nwant\n%s", readErr, loaded, loadedUnit)
+	}
+	registered := parseUnit(string(loaded))
+	if registered.ExecStart != oldExecutable || registered.listen() != previous.Listen || registered.flagValue("--config") != overrideConfig || registered.Environment["HF_HUB_CACHE"] != "/operator/hub" {
+		t.Errorf("the loaded override does not retain its distinct config/environment: %+v", registered)
+	}
+	typed, err := loadedConfigFromProperties(loadedProperties)
+	if err != nil {
+		t.Fatalf("decode the typed override: %v", err)
+	}
+	if typed.execPath != oldExecutable || runArgValue(typed.execArgs[1:], "--listen") != previous.Listen || runArgValue(typed.execArgs[1:], "--config") != overrideConfig || !slices.Equal(typed.environment, loadedEnvironment) {
+		t.Errorf("typed loaded override = %+v, want same executable/listen with distinct config/environment", typed)
 	}
 
 	calls := systemdSupervisorCalls(t, logPath)
-	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 2 {
-		t.Errorf("the unit was restarted %d times, want the failed restart and the restore:\n%s", got, strings.Join(calls, "\n"))
+	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 0 {
+		t.Errorf("the refused update restarted the unit %d times:\n%s", got, strings.Join(calls, "\n"))
 	}
 }
 
@@ -4881,7 +6309,6 @@ func TestSystemdActiveUnitThatDoesNotServeIsAFailedUpdate(t *testing.T) {
 	// restore brings the previous program back.
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
-	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_RESTART", oldExecutable)
 	m.restartWait = 250 * time.Millisecond
 
 	// The instance of the new registration does not answer: the probe fails
@@ -4889,6 +6316,7 @@ func TestSystemdActiveUnitThatDoesNotServeIsAFailedUpdate(t *testing.T) {
 	// the restored registration answers.
 	restartCount := filepath.Join(t.TempDir(), "restarts")
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_RESTART_COUNT", restartCount)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_SECOND_RESTART", oldExecutable)
 	serviceReadinessProbe = func(listen string) error {
 		count := 0
 		if content, err := os.ReadFile(restartCount); err == nil {
@@ -5026,7 +6454,12 @@ func TestSystemdRestoreThatIsNotConfirmedIsNotReportedAsStartedAgain(t *testing.
 func TestSystemdRestoreOfAUnitWithoutAProgramVerifiesTheState(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	root := t.TempDir()
-	path := filepath.Join(root, "etc", "systemd", "user", unitName)
+	systemdTempInstallEnvironment(t)
+	m := &systemdManager{scope: ScopeUser}
+	path, err := m.unitPath()
+	if err != nil {
+		t.Fatalf("unitPath() = %v", err)
+	}
 	// A registration whose command line cannot be read: the section holds
 	// no ExecStart, so the restored registration names no program.
 	content := []byte("[Unit]\nDescription=HFDesk\n\n[Service]\nWorkingDirectory=" + root + "\n")
@@ -5036,10 +6469,19 @@ func TestSystemdRestoreOfAUnitWithoutAProgramVerifiesTheState(t *testing.T) {
 	if err := os.WriteFile(path, content, 0o644); err != nil {
 		t.Fatalf("write the unit file: %v", err)
 	}
+	if err := os.WriteFile(os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT"), content, 0o644); err != nil {
+		t.Fatalf("write the loaded unit: %v", err)
+	}
+	m.readServiceProperties = func(context.Context, string) (map[string]dbus.Variant, error) {
+		return systemdTypedProperties("", []string{}, []string{}, root, "", "", []systemdEnvironmentFile{}), nil
+	}
 
-	m := &systemdManager{scope: ScopeUser}
 	m.restartWait = 250 * time.Millisecond
-	previous := previousRegistration{path: path, content: content, existed: true, running: true}
+	loaded, err := m.registrationUnitConfig(context.Background())
+	if err != nil {
+		t.Fatalf("registrationUnitConfig() = %v", err)
+	}
+	previous := previousRegistration{path: path, content: content, existed: true, running: true, loaded: loaded, loadedKnown: true}
 
 	// A supervisor that reports the unit active is enough: the restore
 	// reports a started instance without comparing a program.
@@ -5051,7 +6493,7 @@ func TestSystemdRestoreOfAUnitWithoutAProgramVerifiesTheState(t *testing.T) {
 	// The state is verified and not assumed: a unit the supervisor does not
 	// report active is a restore that was not confirmed.
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
-	err := m.restorePreviousRegistration(context.Background(), previous)
+	err = m.restorePreviousRegistration(context.Background(), previous)
 	if err == nil {
 		t.Fatal("restorePreviousRegistration() = nil, want the unconfirmed state of the restored unit")
 	}

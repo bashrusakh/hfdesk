@@ -13,11 +13,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"runtime"
+	"reflect"
 	"slices"
-	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -27,7 +25,6 @@ import (
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
 
-	"github.com/bashrusakh/hfdesk/internal/pe"
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
@@ -186,30 +183,64 @@ func newPlatformManager(scope Scope) (Manager, error) {
 // reinstall, or the request of a first installation. Created reports whether this
 // call wrote the registration.
 func (m *scmManager) Install(ctx context.Context, opts InstallOptions) (InstallOptions, error) {
+	installed, _, err := m.install(ctx, opts, false)
+	return installed, err
+}
+
+// InstallAndStart is the desktop helper's first-install path. It only creates
+// an absent registration and keeps the creation handle through start,
+// readiness/version verification and any failure cleanup.
+func (m *scmManager) InstallAndStart(ctx context.Context, opts InstallOptions) (InstallStartResult, error) {
+	installed, status, err := m.install(ctx, opts, true)
+	if err != nil {
+		return InstallStartResult{}, err
+	}
+	return InstallStartResult{Installation: installed, Status: status}, nil
+}
+
+func (m *scmManager) install(ctx context.Context, opts InstallOptions, startFirst bool) (InstallOptions, Status, error) {
 	// The registration is read before a directory is created: the merge of
 	// the request needs the settings the instance runs with, and only an
 	// instance that ran before is restarted.
 	previous, err := scmPreviousRegistration(opts.Scope)
 	if err != nil {
-		return opts, err
+		return opts, Status{}, err
+	}
+	if startFirst && previous.present {
+		return opts, Status{}, fmt.Errorf("service: %s is already registered; the first-install action will not change or start it", ServiceName)
 	}
 	if previous.present {
-		opts = mergeInstallOptions(opts, previous.options)
+		opts = mergeInstallOptions(opts, previous.options, previous.present)
 	}
 
 	if err := ValidateInstallOptions(opts); err != nil {
-		return opts, err
+		return opts, Status{}, err
+	}
+	// Candidate structure and host execution support are read before any
+	// directory preparation, registration write or stop of a running service.
+	if err := preflightExecutableImage(opts.Executable); err != nil {
+		return opts, Status{}, err
 	}
 	// The elevation requirement is checked before a directory is created:
 	// a permission error of the machine-wide directories is a much less
 	// readable answer than the real reason.
 	if err := requireElevated("an installation"); err != nil {
-		return opts, err
+		return opts, Status{}, err
+	}
+	var pathAccess scmPathAccess
+	pathAccess, err = scmOpenPathAccess(previous.processID)
+	if err != nil {
+		log.Printf("service: the effective access token of the running %s could not be obtained (%v): access preflight is inconclusive", ServiceName, err)
+		pathAccess = nil
+	}
+	if pathAccess != nil {
+		defer pathAccess.Close()
 	}
 	// The program is checked before the first write, so a refused program leaves
-	// the instance unchanged. A check that cannot read the rights refuses none.
-	if err := preflightExecutableAccess(opts.Executable); err != nil {
-		return opts, err
+	// the instance unchanged. Only AccessCheck with the running LocalService
+	// token can establish a denial; an unavailable token remains inconclusive.
+	if err := preflightExecutableAccess(opts.Executable, pathAccess); err != nil {
+		return opts, Status{}, err
 	}
 	// The paths the installation is about to create are remembered before
 	// they are created, so the installation knows which of them it owns.
@@ -229,22 +260,22 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) (InstallO
 		// The preparation may have created some of the directories
 		// before it failed: they are removed again, so a failed attempt
 		// leaves the machine as it was.
-		return opts, fail(err)
+		return opts, Status{}, fail(err)
 	}
 	// The state of the instance is restricted before the reused
 	// directories are checked, and a path that existed before the
 	// installation is never rewritten: the check of every such path happens
 	// before the first descriptor is changed.
-	if err := restrictInstanceState(opts, snapshot); err != nil {
-		return opts, fail(err)
+	if err := restrictInstanceState(opts, snapshot, pathAccess); err != nil {
+		return opts, Status{}, fail(err)
 	}
-	if err := m.preflight(opts); err != nil {
-		return opts, fail(err)
+	if err := m.preflight(opts, pathAccess); err != nil {
+		return opts, Status{}, fail(err)
 	}
 
 	manager, err := mgr.Connect()
 	if err != nil {
-		return opts, fail(fmt.Errorf("service: connect to the service control manager: %w", err))
+		return opts, Status{}, fail(fmt.Errorf("service: connect to the service control manager: %w", err))
 	}
 	defer manager.Disconnect()
 
@@ -252,12 +283,21 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) (InstallO
 	// the previous registration, so the caller never keeps a registration
 	// the installation failed to put into service; only a registration this
 	// call wrote may be removed after a failed start.
-	created, versionVerified, err := m.register(ctx, manager, opts, previous)
+	registered, err := m.register(ctx, manager, opts, previous, startFirst)
 	if err != nil {
-		return opts, fail(err)
+		if startFirst {
+			var startFailure *InstallStartError
+			if !errors.As(err, &startFailure) || !startFailure.RegistrationRemoved {
+				// The first-install path may have left an owned or concurrently
+				// changed registration in place. Keep its directories rather than
+				// deleting paths that registration may already use.
+				return opts, Status{}, err
+			}
+		}
+		return opts, Status{}, fail(err)
 	}
-	opts.Created = created
-	opts.VersionVerified = versionVerified
+	opts.Created = registered.created
+	opts.VersionVerified = registered.versionVerified
 
 	// The event log source carries the diagnostics of the instance. A
 	// source that cannot be registered is not a failed installation: the
@@ -267,7 +307,7 @@ func (m *scmManager) Install(ctx context.Context, opts InstallOptions) (InstallO
 		log.Printf("service: the event log source of %s was not registered: %v", ServiceName, err)
 		logEvent(eventLogWarning, fmt.Sprintf("hfdesk: the event log source of %s was not registered: %v", ServiceName, err))
 	}
-	return opts, nil
+	return opts, registered.status, nil
 }
 
 // previousSCMRegistration is the registration an installation replaces. It is
@@ -345,10 +385,9 @@ func scmRegistrationOptions(commandLine string, scope Scope) InstallOptions {
 //
 // The registration is created when the instance is not registered and updated
 // otherwise: a second registration never exists, so the instance keeps its
-// identity. An update writes the start type and the delayed start the
-// registration already has, so a service an administrator switched to a manual,
-// a disabled or a delayed start stays that way; only a first installation is
-// written with the automatic start.
+// identity. An update changes the command line while retaining the readable SCM
+// settings it does not own, including start type and delayed start; only a first
+// installation is written with the automatic start.
 //
 // The directories of the instance are already created when the function is
 // called. A failure after the registration was written restores the previous
@@ -360,36 +399,52 @@ func scmRegistrationOptions(commandLine string, scope Scope) InstallOptions {
 // installation started, restores the previous configuration and brings the
 // previous program back into service.
 //
-// The results report who created the registration and whether the version matched.
-func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts InstallOptions, previous previousSCMRegistration) (bool, bool, error) {
+// The result reports who created the registration, whether the version matched
+// and the state verified while the creation handle was still owned.
+type scmRegisterResult struct {
+	created         bool
+	versionVerified bool
+	status          Status
+}
+
+func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts InstallOptions, previous previousSCMRegistration, startFirst bool) (scmRegisterResult, error) {
+	result := scmRegisterResult{}
 	config := buildSCMConfig(opts)
 	handle, err := manager.OpenService(ServiceName)
 	created := false
 	switch {
 	case err == nil:
+		if startFirst && !previous.present {
+			// A registration appeared after the read-only lookup. It is not
+			// the service this first-install action created, so it is neither
+			// updated, started, stopped nor removed here.
+			_ = handle.Close()
+			return result, fmt.Errorf("service: %s appeared during the first installation; no existing registration was changed", ServiceName)
+		}
 		// The service is registered already: the registration is updated
 		// instead of a second one being created.
 	case errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST):
 		handle, err = manager.CreateService(ServiceName, opts.Executable, config, RunArgs(opts)...)
 		if err != nil {
-			return false, false, fmt.Errorf("service: register %s: %w", ServiceName, err)
+			return result, fmt.Errorf("service: register %s: %w", ServiceName, err)
 		}
 		created = true
 		// A first installation replaces nothing: a failed one removes the
 		// registration it created instead of restoring one.
 		previous = previousSCMRegistration{}
 	default:
-		return false, false, fmt.Errorf("service: open the registration of %s: %w", ServiceName, err)
+		return result, fmt.Errorf("service: open the registration of %s: %w", ServiceName, err)
 	}
 	defer handle.Close()
 	target := scmServiceRecoveryTarget{manager: m, handle: handle}
+	result.created = created
 
 	if !created {
 		// The configuration of the registration is read before it is
 		// changed, so a failure after the write can put it back as it was.
 		previousConfig, err := handle.Config()
 		if err != nil {
-			return false, false, fmt.Errorf("service: read the registration of %s: %w", ServiceName, err)
+			return result, fmt.Errorf("service: read the registration of %s: %w", ServiceName, err)
 		}
 		if !previous.present {
 			// The registration appeared between the read-only lookup and
@@ -398,7 +453,7 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 			// restarted.
 			status, err := handle.Query()
 			if err != nil {
-				return false, false, scmRefused("an installation", fmt.Errorf("service: query the state of %s: %w", ServiceName, err))
+				return result, scmRefused("an installation", fmt.Errorf("service: query the state of %s: %w", ServiceName, err))
 			}
 			previous.present = true
 			previous.running = scmInstanceRan(true, status.State)
@@ -412,16 +467,16 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 		// refuses before it writes the registration, so the instance keeps
 		// running.
 		if err := scmDisabledRunningRefusal(previous.present, previous.running, previousConfig.StartType); err != nil {
-			return false, false, err
+			return result, err
 		}
 
-		// An administrator may have switched the service to a manual, a
-		// disabled or a delayed start, and a repeat installation keeps the
-		// state it finds.
-		config = scmConfigWithAutostart(config, previousConfig)
+		// An administrator may have changed native settings such as start
+		// type, dependencies or display metadata. Keep those while replacing
+		// only the command line and the fixed HFDesk identity.
+		config = scmConfigForUpdate(config, previousConfig)
 
 		if err := m.updateRegistrationConfig(handle, config, previous); err != nil {
-			return false, false, err
+			return result, err
 		}
 		log.Printf("service: %s is installed already, the registration was updated", ServiceName)
 		logEvent(eventLogInfo, fmt.Sprintf("hfdesk: the registration of %s was updated", ServiceName))
@@ -432,14 +487,35 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 	// policy that is registered already is kept, so a reinstall never resets
 	// what the instance or an administrator decided.
 	if err := configureSCMRecovery(handle); err != nil {
-		return created, false, m.rollbackInstallation(ctx, target, previous, scmRollbackRegistration,
+		return result, m.rollbackInstallation(ctx, target, previous, scmRollbackRegistration,
 			fmt.Errorf("service: configure the failure recovery of %s: %w", ServiceName, err))
 	}
 
 	if !previous.running {
-		// A first installation and an instance that was not running stay
-		// stopped: starting is an explicit, separate command.
-		return created, false, nil
+		if !startFirst {
+			// The ordinary install command and an update of a stopped
+			// instance preserve the stopped state.
+			return result, nil
+		}
+		if !created {
+			return result, errors.New("service: the first-install action did not create its registration")
+		}
+		ownedConfig, err := handle.Config()
+		if err != nil {
+			cause := fmt.Errorf("service: read the newly created registration before its first start: %w", err)
+			return result, &InstallStartError{Cause: cause, CleanupError: errors.New("the registration configuration could not be proven unchanged; it was not started or removed")}
+		}
+		if !scmSameOwnedConfig(ownedConfig, config) {
+			cause := errors.New("service: the newly created registration changed before its first start")
+			return result, &InstallStartError{Cause: cause, CleanupError: errors.New("the changed registration was not started, stopped or removed")}
+		}
+		verified, status, err := m.startFirstRegistration(ctx, target, opts, ownedConfig)
+		if err != nil {
+			return result, err
+		}
+		result.versionVerified = verified
+		result.status = status
+		return result, nil
 	}
 
 	// The instance ran before the installation, so it has to run the new
@@ -450,25 +526,203 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 		// Only an undelivered control proves the instance keeps running; an
 		// accepted or unreadable stop may still put it down, so the rollback
 		// settles it instead of leaving the machine without its instance.
-		return created, false, m.rollbackInstallation(ctx, target, previous, scmStopRollbackMode(outcome),
+		return result, m.rollbackInstallation(ctx, target, previous, scmStopRollbackMode(outcome),
 			fmt.Errorf("service: stop the running instance of %s: %w", ServiceName, err))
 	}
 	check, versionVerified, err := m.startAndVerifyVersion(ctx, handle, opts.Executable, opts.Listen, opts.ExpectedVersion, previous.processID)
 	if err != nil {
-		return created, false, m.rollbackInstallation(ctx, target, previous, scmRollbackRestart,
+		return result, m.rollbackInstallation(ctx, target, previous, scmRollbackRestart,
 			fmt.Errorf("service: the installation did not put the new executable into service: %w", err))
 	}
 	if check != scmImageVerified {
 		// The handle of the running process was refused, so the image of the
 		// process could not be read. The instance runs and the registration
-		// carries the program; the installation reports exactly that and
-		// never claims that the image was compared.
+		// carries the program; the installation reports exactly that. The
+		// independent health-version result, when present, remains its own
+		// fact and is not erased by the image-read result.
 		message := fmt.Sprintf("hfdesk: %s runs the registered program %s, the image of the process was not readable from the shell of the installation", ServiceName, opts.Executable)
 		log.Printf("service: %s", message)
 		logEvent(eventLogWarning, message)
-		versionVerified = false
 	}
-	return created, versionVerified, nil
+	status, finalState, err := scmStatusFromTarget(target)
+	if err != nil {
+		return result, m.rollbackInstallation(ctx, target, previous, scmRollbackRestart,
+			fmt.Errorf("service: the state of the restarted instance cannot be confirmed: %w", err))
+	}
+	if finalState.State != svc.Running || finalState.ProcessId == previous.processID {
+		return result, m.rollbackInstallation(ctx, target, previous, scmRollbackRestart,
+			fmt.Errorf("service: the restarted instance did not remain in a new running process (state %v, process %d)", finalState.State, finalState.ProcessId))
+	}
+	result.versionVerified = versionVerified
+	result.status = status
+	return result, nil
+}
+
+type scmFirstInstallTarget interface {
+	scmRunningImageTarget
+	scmServiceControl
+	Start() error
+	Config() (mgr.Config, error)
+	Delete() error
+}
+
+func (m *scmManager) startFirstRegistration(ctx context.Context, target scmFirstInstallTarget, opts InstallOptions, ownedConfig mgr.Config) (bool, Status, error) {
+	if !scmFirstInstallRegistrationStillOwned(target, ownedConfig) {
+		cause := errors.New("service: the newly created registration changed before its first start")
+		return false, Status{}, &InstallStartError{Cause: cause, CleanupError: errors.New("the changed registration was not started, stopped or removed")}
+	}
+	startErr := target.Start()
+	startedHere := startErr == nil
+	if errors.Is(startErr, windows.ERROR_SERVICE_ALREADY_RUNNING) {
+		// A concurrent start is not this action's process. It may still be
+		// checked for success, but cleanup must not stop it on failure.
+		startErr = nil
+	}
+	if startErr != nil {
+		failure := scmRefused("a start", fmt.Errorf("service: start %s: %w", ServiceName, startErr))
+		return false, Status{}, m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, 0, failure)
+	}
+
+	verification, err := m.verifyRunningExecutableVersionUsing(ctx, target,
+		opts.Executable, opts.Listen, opts.ExpectedVersion, true)
+	if err != nil {
+		processID := verification.processID
+		if !startedHere {
+			processID = 0
+		}
+		failure := fmt.Errorf("service: the first installation did not put the new executable into service: %w", err)
+		return false, Status{}, m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, processID, failure)
+	}
+	if verification.imageCheck != scmImageVerified {
+		message := fmt.Sprintf("hfdesk: %s is running its registered program %s, but the process image could not be read from the installation shell", ServiceName, opts.Executable)
+		log.Printf("service: %s", message)
+		logEvent(eventLogWarning, message)
+	}
+
+	if !scmFirstInstallRegistrationStillOwned(target, ownedConfig) {
+		failure := errors.New("service: the first-install registration changed after readiness verification")
+		return false, Status{}, m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, verification.processID, failure)
+	}
+	status, finalState, err := scmStatusFromTarget(target)
+	if err != nil {
+		failure := fmt.Errorf("service: the state of the first installed instance cannot be confirmed: %w", err)
+		processID := verification.processID
+		if !startedHere {
+			processID = 0
+		}
+		return false, Status{}, m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, processID, failure)
+	}
+	if !scmFirstInstallRegistrationStillOwned(target, ownedConfig) {
+		failure := errors.New("service: the first-install registration changed while its final state was read")
+		return false, Status{}, m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, verification.processID, failure)
+	}
+	if !status.Running || finalState.State != svc.Running || finalState.ProcessId != verification.processID {
+		failure := fmt.Errorf("service: the first installed process did not remain in service (state %v, process %d, running %t)", finalState.State, finalState.ProcessId, status.Running)
+		processID := verification.processID
+		if !startedHere {
+			processID = 0
+		}
+		return false, Status{}, m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, processID, failure)
+	}
+	return verification.versionVerified, status, nil
+}
+
+type scmOwnedFirstInstallControl struct {
+	target    scmFirstInstallTarget
+	config    mgr.Config
+	processID uint32
+}
+
+func (c scmOwnedFirstInstallControl) Query() (svc.Status, error) { return c.target.Query() }
+
+func (c scmOwnedFirstInstallControl) Control(cmd svc.Cmd) (svc.Status, error) {
+	if !scmFirstInstallRegistrationStillOwned(c.target, c.config) {
+		return svc.Status{}, errors.New("the registration changed during first-install cleanup")
+	}
+	status, err := c.target.Query()
+	if err != nil {
+		return status, err
+	}
+	if status.State != svc.Stopped && (c.processID == 0 || status.ProcessId != c.processID) {
+		return status, errors.New("the running process is not the process started by this first installation")
+	}
+	return c.target.Control(cmd)
+}
+
+func scmFirstInstallRegistrationStillOwned(target scmFirstInstallTarget, expected mgr.Config) bool {
+	current, err := target.Config()
+	return err == nil && scmSameOwnedConfig(current, expected)
+}
+
+func scmSameOwnedConfig(current, expected mgr.Config) bool {
+	if !scmSameRegistration(current.BinaryPathName, expected.BinaryPathName) {
+		return false
+	}
+	// x/sys returns Dependencies as a non-nil empty slice when the SCM has
+	// no entries, while a freshly built configuration leaves it nil. They are
+	// the same registration state, not a concurrent configuration change.
+	if !slices.Equal(current.Dependencies, expected.Dependencies) {
+		return false
+	}
+	current.BinaryPathName = expected.BinaryPathName
+	current.Dependencies = expected.Dependencies
+	return reflect.DeepEqual(current, expected)
+}
+
+func (m *scmManager) cleanupFailedFirstRegistration(ctx context.Context, target scmFirstInstallTarget, ownedConfig mgr.Config, processID uint32, cause error) error {
+	cleanup := context.WithoutCancel(ctx)
+	keep := func(owned, stopped bool, err error) error {
+		return &InstallStartError{
+			Cause:             cause,
+			RegistrationOwned: owned,
+			ProcessStopped:    stopped,
+			CleanupError:      err,
+		}
+	}
+	if !scmFirstInstallRegistrationStillOwned(target, ownedConfig) {
+		return keep(false, false, errors.New("the registration no longer matches the configuration created by this installation"))
+	}
+	status, err := target.Query()
+	if err != nil {
+		return keep(true, false, fmt.Errorf("the state of the created registration cannot be read: %w", err))
+	}
+	if status.State != svc.Stopped {
+		if processID == 0 || status.ProcessId != processID {
+			return keep(true, false, fmt.Errorf("the running process %d was not proven to be the process started by this installation", status.ProcessId))
+		}
+		if _, err := m.stopService(cleanup, scmOwnedFirstInstallControl{target: target, config: ownedConfig, processID: processID}); err != nil {
+			return keep(true, false, fmt.Errorf("the process started by this installation was not proven stopped: %w", err))
+		}
+	}
+	if !scmFirstInstallRegistrationStillOwned(target, ownedConfig) {
+		return keep(false, true, errors.New("the registration changed before it could be removed"))
+	}
+	if err := target.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+		return keep(true, true, fmt.Errorf("the stopped registration created by this installation could not be removed: %w", err))
+	}
+	return &InstallStartError{Cause: cause, RegistrationRemoved: true, RegistrationOwned: true, ProcessStopped: true}
+}
+
+func scmStatusFromTarget(target interface {
+	Query() (svc.Status, error)
+	Config() (mgr.Config, error)
+}) (Status, svc.Status, error) {
+	status, err := target.Query()
+	if err != nil {
+		return Status{}, svc.Status{}, err
+	}
+	config, err := target.Config()
+	if err != nil {
+		return Status{}, svc.Status{}, err
+	}
+	result, err := scmStatusFrom(ScopeSystem, scmRegistrationFacts{
+		present:     true,
+		state:       status.State,
+		exitCode:    status.Win32ExitCode,
+		processID:   status.ProcessId,
+		commandLine: config.BinaryPathName,
+	})
+	return result, status, err
 }
 
 // scmRollbackMode tells a rollback how much of the previous installation to put
@@ -759,19 +1013,27 @@ type scmServiceRecoveryTarget struct {
 	handle  *mgr.Service
 }
 
-func (t scmServiceRecoveryTarget) Query() (svc.Status, error) { return t.handle.Query() }
+func (t scmServiceRecoveryTarget) Query() (svc.Status, error) { return scmQueryStatus(t.handle) }
+
+func (t scmServiceRecoveryTarget) ReadRunningImage(processID uint32, executable string) (bool, scmImageCheck, string) {
+	return scmReadRunningImage(t.handle, processID, executable)
+}
+
+func (t scmServiceRecoveryTarget) Start() error { return scmStartService(t.handle) }
 
 func (t scmServiceRecoveryTarget) Control(cmd svc.Cmd) (svc.Status, error) {
-	return t.handle.Control(cmd)
+	return scmControlService(t.handle, cmd)
 }
 
 func (t scmServiceRecoveryTarget) UpdateConfig(config mgr.Config) error {
 	return t.handle.UpdateConfig(config)
 }
 
-func (t scmServiceRecoveryTarget) Config() (mgr.Config, error) { return t.handle.Config() }
+func (t scmServiceRecoveryTarget) Config() (mgr.Config, error) {
+	return scmQueryServiceConfig(t.handle)
+}
 
-func (t scmServiceRecoveryTarget) Delete() error { return t.handle.Delete() }
+func (t scmServiceRecoveryTarget) Delete() error { return scmDeleteService(t.handle) }
 
 func (t scmServiceRecoveryTarget) StartAndVerify(ctx context.Context, executable string, exclude ...uint32) (scmImageCheck, error) {
 	return t.manager.startAndVerify(ctx, t.handle, executable, exclude...)
@@ -1016,13 +1278,37 @@ func (m *scmManager) verifyRunningExecutable(ctx context.Context, handle *mgr.Se
 // variable is the seam of the test: a test verifies without a registration of
 // the service control manager.
 var scmQueryStatus = (*mgr.Service).Query
+var scmQueryServiceConfig = (*mgr.Service).Config
+var scmStartService = func(service *mgr.Service) error { return service.Start() }
+var scmControlService = (*mgr.Service).Control
+var scmDeleteService = (*mgr.Service).Delete
+var scmQueryProcessImageName = queryProcessImageName
+var scmQueryServiceCommandLine = queryServiceCommandLine
+
+type scmRunningImageTarget interface {
+	Query() (svc.Status, error)
+	ReadRunningImage(processID uint32, executable string) (bool, scmImageCheck, string)
+}
+
+type scmStartVerification struct {
+	imageCheck      scmImageCheck
+	versionVerified bool
+	processID       uint32
+}
 
 // verifyRunningExecutableVersion also waits for the expected version.
 func (m *scmManager) verifyRunningExecutableVersion(ctx context.Context, handle *mgr.Service, executable, listen, expectedVersion string, exclude ...uint32) (scmImageCheck, bool, error) {
+	result, err := m.verifyRunningExecutableVersionUsing(ctx,
+		scmServiceRecoveryTarget{manager: m, handle: handle}, executable, listen, expectedVersion, false, exclude...)
+	return result.imageCheck, result.versionVerified, err
+}
+
+func (m *scmManager) verifyRunningExecutableVersionUsing(ctx context.Context, target scmRunningImageTarget, executable, listen, expectedVersion string, requireReadiness bool, exclude ...uint32) (scmStartVerification, error) {
 	deadline := time.Now().Add(scmVerifyBudget)
 	detail := "the service control manager did not report the instance as running"
+	var lastProcessID uint32
 	for {
-		status, err := scmQueryStatus(handle)
+		status, err := target.Query()
 		switch {
 		case err != nil:
 			detail = fmt.Sprintf("the state of %s cannot be read: %v", ServiceName, err)
@@ -1035,17 +1321,25 @@ func (m *scmManager) verifyRunningExecutableVersion(ctx context.Context, handle 
 			// registration is not in service yet.
 			detail = fmt.Sprintf("the process %d that ran before the attempt still runs", status.ProcessId)
 		default:
-			settled, check, reason := scmReadRunningImage(handle, status.ProcessId, executable)
+			lastProcessID = status.ProcessId
+			settled, check, reason := target.ReadRunningImage(status.ProcessId, executable)
 			if settled {
-				if check != scmImageVerified || expectedVersion == "" {
-					return check, false, nil
+				if expectedVersion == "" && !requireReadiness {
+					return scmStartVerification{imageCheck: check, processID: status.ProcessId}, nil
 				}
 				verified, probeErr := serviceInstallProbe(listen, expectedVersion)
 				if probeErr == nil {
-					return check, verified, nil
+					return scmStartVerification{imageCheck: check, versionVerified: verified, processID: status.ProcessId}, nil
 				}
 				if errors.Is(probeErr, errServiceVersionMismatch) {
-					return check, false, fmt.Errorf("the instance does not run the expected version: %w", probeErr)
+					return scmStartVerification{imageCheck: check, processID: status.ProcessId}, fmt.Errorf("the instance does not run the expected version: %w", probeErr)
+				}
+				if check != scmImageVerified && !requireReadiness {
+					// The image access was inconclusive. Keep the existing
+					// readiness outcome, but do not claim a version that the
+					// health endpoint did not expose. A mismatching version
+					// above remains a definite failure.
+					return scmStartVerification{imageCheck: check, processID: status.ProcessId}, nil
 				}
 				detail = fmt.Sprintf("the instance does not answer on %s: %v", probeAddressOrListen(listen), probeErr)
 			} else {
@@ -1055,11 +1349,11 @@ func (m *scmManager) verifyRunningExecutableVersion(ctx context.Context, handle 
 			}
 		}
 		if !time.Now().Before(deadline) {
-			return scmImageUnverified, false, fmt.Errorf("the instance does not run %q within %s: %s", executable, scmVerifyBudget, detail)
+			return scmStartVerification{imageCheck: scmImageUnverified, processID: lastProcessID}, fmt.Errorf("the instance does not run %q within %s: %s", executable, scmVerifyBudget, detail)
 		}
 		select {
 		case <-ctx.Done():
-			return scmImageUnverified, false, ctx.Err()
+			return scmStartVerification{imageCheck: scmImageUnverified, processID: lastProcessID}, ctx.Err()
 		case <-time.After(scmVerifyPollInterval):
 		}
 	}
@@ -1102,7 +1396,7 @@ func scmReadRunningImage(handle *mgr.Service, processID uint32, executable strin
 		// state alone.
 		return true, scmImageUnverified, ""
 	}
-	image, err := queryProcessImageName(processID)
+	image, err := scmQueryProcessImageName(processID)
 	switch {
 	case err == nil:
 		if scmSameExecutablePath(image, executable) {
@@ -1130,7 +1424,7 @@ func scmReadRunningImage(handle *mgr.Service, processID uint32, executable strin
 // configuration the installation wrote, so the answer describes the registration
 // that is really there.
 func scmRegistrationPointsAt(handle *mgr.Service, executable string) (bool, error) {
-	commandLine, err := queryServiceCommandLine(handle.Handle)
+	commandLine, err := scmQueryServiceCommandLine(handle.Handle)
 	if err != nil {
 		return false, err
 	}
@@ -1200,25 +1494,69 @@ const scmRecoveryResetPeriod uint32 = 24 * 60 * 60
 type scmRecoveryDecision int
 
 const (
-	// scmRecoveryConfigure writes the recovery policy of HFDesk: the
-	// registration has none.
+	// scmRecoveryConfigure writes the HFDesk policy after a successful read
+	// proved that the registration has no recovery actions.
 	scmRecoveryConfigure scmRecoveryDecision = iota
 	// scmRecoveryKeep keeps the recovery policy the registration carries.
 	scmRecoveryKeep
+	// scmRecoveryUnreadable refuses to infer absence from a failed read.
+	scmRecoveryUnreadable
 )
 
 // scmRecoveryDecisionFor returns what an installation does with the failure
 // recovery of a registration.
 //
-// A registration with at least one action keeps its policy, because a repeat
-// installation keeps what the instance or an administrator set. The policy of
-// HFDesk is configured only for a registration without one; a read that fails
-// is not evidence of no recovery, so the policy is configured then as well.
+// A registration with at least one action keeps that action list. Only a
+// successful read of an empty list authorizes default-action setup; an
+// unreadable list is not absence. The non-crash flag is adjudicated separately.
 func scmRecoveryDecisionFor(existing []mgr.RecoveryAction, readErr error) scmRecoveryDecision {
-	if readErr != nil || len(existing) == 0 {
+	if readErr != nil {
+		return scmRecoveryUnreadable
+	}
+	if len(existing) == 0 {
 		return scmRecoveryConfigure
 	}
 	return scmRecoveryKeep
+}
+
+type scmRecoverySettings struct {
+	actions       []mgr.RecoveryAction
+	resetPeriod   uint32
+	nonCrash      bool
+	command       string
+	rebootMessage string
+}
+
+type scmRecoveryConfig interface {
+	RecoveryActions() ([]mgr.RecoveryAction, error)
+	ResetPeriod() (uint32, error)
+	RecoveryActionsOnNonCrashFailures() (bool, error)
+	RecoveryCommand() (string, error)
+	RebootMessage() (string, error)
+	SetActions([]mgr.RecoveryAction, uint32, string, string) error
+	SetNonCrashFailures(bool) error
+}
+
+type scmServiceRecoveryConfig struct{ handle *mgr.Service }
+
+func (c scmServiceRecoveryConfig) RecoveryActions() ([]mgr.RecoveryAction, error) {
+	return c.handle.RecoveryActions()
+}
+func (c scmServiceRecoveryConfig) ResetPeriod() (uint32, error) { return c.handle.ResetPeriod() }
+func (c scmServiceRecoveryConfig) RecoveryActionsOnNonCrashFailures() (bool, error) {
+	return c.handle.RecoveryActionsOnNonCrashFailures()
+}
+func (c scmServiceRecoveryConfig) RecoveryCommand() (string, error) {
+	return c.handle.RecoveryCommand()
+}
+func (c scmServiceRecoveryConfig) RebootMessage() (string, error) {
+	return c.handle.RebootMessage()
+}
+func (c scmServiceRecoveryConfig) SetActions(actions []mgr.RecoveryAction, reset uint32, command, reboot string) error {
+	return scmSetRecoveryActions(c.handle, actions, reset, command, reboot)
+}
+func (c scmServiceRecoveryConfig) SetNonCrashFailures(enabled bool) error {
+	return c.handle.SetRecoveryActionsOnNonCrashFailures(enabled)
 }
 
 // configureSCMRecovery configures the failure recovery of the registration.
@@ -1234,26 +1572,171 @@ func scmRecoveryDecisionFor(existing []mgr.RecoveryAction, readErr error) scmRec
 // platform would recover a crashed process only. The switch takes effect at the
 // next start of the machine, so the installation reports the policy it wrote.
 //
-// A registration that carries a policy keeps it, switch included. A recovery
-// that cannot be configured is a failed installation.
+// Existing nonempty actions are preserved. The non-crash flag is read
+// separately and enabled when needed so handler-reported failures receive the
+// required recovery; a user-requested clean stop still reports exit code zero.
+// A successful read that proves no actions causes the required default policy
+// to be configured, preserving the readable recovery command and reboot
+// message. A failed read is not treated as absence.
 func configureSCMRecovery(handle *mgr.Service) error {
-	existing, err := handle.RecoveryActions()
-	if scmRecoveryDecisionFor(existing, err) == scmRecoveryKeep {
-		log.Printf("service: %s keeps the failure recovery of its registration", ServiceName)
+	return configureSCMRecoveryWith(scmServiceRecoveryConfig{handle: handle})
+}
+
+func configureSCMRecoveryWith(config scmRecoveryConfig) error {
+	existing, err := config.RecoveryActions()
+	decision := scmRecoveryDecisionFor(existing, err)
+	switch decision {
+	case scmRecoveryUnreadable:
+		return fmt.Errorf("service: read the failure recovery actions of %s: %w", ServiceName, err)
+	case scmRecoveryKeep:
+		nonCrash, err := config.RecoveryActionsOnNonCrashFailures()
+		if err != nil {
+			return fmt.Errorf("service: read the non-crash recovery flag of %s: %w", ServiceName, err)
+		}
+		if nonCrash {
+			log.Printf("service: %s keeps its existing failure actions and non-crash recovery flag", ServiceName)
+			return nil
+		}
+		if err := config.SetNonCrashFailures(true); err != nil {
+			failure := fmt.Errorf("service: enable recovery for non-crash failures of %s: %w", ServiceName, err)
+			if restoreErr := scmRestoreNonCrashFlag(config, existing, false); restoreErr != nil {
+				return fmt.Errorf("%w (the previous recovery actions and non-crash flag could not be restored or verified: %v)", failure, restoreErr)
+			}
+			return fmt.Errorf("%w (the previous recovery actions and non-crash flag were restored and verified)", failure)
+		}
+		log.Printf("service: %s keeps its existing recovery actions and enables the required non-crash failure flag", ServiceName)
 		return nil
 	}
+
+	previous := scmRecoverySettings{actions: existing}
+	if previous.resetPeriod, err = config.ResetPeriod(); err != nil {
+		return fmt.Errorf("service: read the failure recovery reset period of %s: %w", ServiceName, err)
+	}
+	if previous.nonCrash, err = config.RecoveryActionsOnNonCrashFailures(); err != nil {
+		return fmt.Errorf("service: read the non-crash recovery flag of %s: %w", ServiceName, err)
+	}
+	if previous.command, err = config.RecoveryCommand(); err != nil {
+		return fmt.Errorf("service: read the recovery command of %s: %w", ServiceName, err)
+	}
+	if previous.rebootMessage, err = config.RebootMessage(); err != nil {
+		return fmt.Errorf("service: read the recovery reboot message of %s: %w", ServiceName, err)
+	}
+
+	if err := config.SetActions(scmRecoveryActions(), scmRecoveryResetPeriod, previous.command, previous.rebootMessage); err != nil {
+		failure := fmt.Errorf("service: configure the failure recovery actions of %s: %w", ServiceName, err)
+		return scmRestoreRecoveryAfterFailure(config, previous, failure, false)
+	}
+	if !previous.nonCrash {
+		if err := config.SetNonCrashFailures(true); err != nil {
+			failure := fmt.Errorf("service: enable recovery for non-crash failures of %s: %w", ServiceName, err)
+			return scmRestoreRecoveryAfterFailure(config, previous, failure, true)
+		}
+	}
+	log.Printf("service: the registration of %s had no recovery actions; the required HFDesk crash/error policy was configured", ServiceName)
+	return nil
+}
+
+func scmRestoreNonCrashFlag(config scmRecoveryConfig, expectedActions []mgr.RecoveryAction, previous bool) error {
+	if err := config.SetNonCrashFailures(previous); err != nil {
+		return fmt.Errorf("write the previous non-crash recovery flag: %w", err)
+	}
+	actions, err := config.RecoveryActions()
 	if err != nil {
-		log.Printf("service: the failure recovery of %s cannot be read (%v), the recovery policy of HFDesk is configured", ServiceName, err)
+		return fmt.Errorf("read the recovery actions after restoring the flag: %w", err)
+	}
+	nonCrash, err := config.RecoveryActionsOnNonCrashFailures()
+	if err != nil {
+		return fmt.Errorf("read the non-crash flag after restoring it: %w", err)
+	}
+	if !slices.Equal(actions, expectedActions) || nonCrash != previous {
+		return errors.New("read-back does not match the previous recovery actions and non-crash flag")
+	}
+	return nil
+}
+
+func scmRestoreRecoveryAfterFailure(config scmRecoveryConfig, previous scmRecoverySettings, failure error, restoreFlag bool) error {
+	if err := scmRestoreRecoverySettings(config, previous, restoreFlag); err != nil {
+		return fmt.Errorf("%w (the previous empty recovery policy could not be restored or verified: %v)", failure, err)
+	}
+	return fmt.Errorf("%w (the previous empty recovery policy was restored and verified)", failure)
+}
+
+func scmRestoreRecoverySettings(config scmRecoveryConfig, previous scmRecoverySettings, restoreFlag bool) error {
+	var restoreErrs []error
+	if err := config.SetActions(previous.actions, previous.resetPeriod, previous.command, previous.rebootMessage); err != nil {
+		restoreErrs = append(restoreErrs, fmt.Errorf("write the previous recovery actions: %w", err))
+	}
+	if restoreFlag {
+		if err := config.SetNonCrashFailures(previous.nonCrash); err != nil {
+			restoreErrs = append(restoreErrs, fmt.Errorf("write the previous non-crash recovery flag: %w", err))
+		}
+	}
+	if len(restoreErrs) > 0 {
+		return errors.Join(restoreErrs...)
+	}
+	actions, err := config.RecoveryActions()
+	if err != nil {
+		return fmt.Errorf("read the restored recovery actions: %w", err)
+	}
+	resetPeriod, err := config.ResetPeriod()
+	if err != nil {
+		return fmt.Errorf("read the restored recovery reset period: %w", err)
+	}
+	nonCrash, err := config.RecoveryActionsOnNonCrashFailures()
+	if err != nil {
+		return fmt.Errorf("read the restored non-crash recovery flag: %w", err)
+	}
+	command, err := config.RecoveryCommand()
+	if err != nil {
+		return fmt.Errorf("read the restored recovery command: %w", err)
+	}
+	reboot, err := config.RebootMessage()
+	if err != nil {
+		return fmt.Errorf("read the restored recovery reboot message: %w", err)
+	}
+	if len(actions) != 0 || resetPeriod != previous.resetPeriod || nonCrash != previous.nonCrash || command != previous.command || reboot != previous.rebootMessage {
+		return errors.New("read-back does not match the previous empty recovery policy")
+	}
+	return nil
+}
+
+func scmSetRecoveryActions(handle *mgr.Service, actions []mgr.RecoveryAction, resetPeriod uint32, command, reboot string) error {
+	var commandPtr, rebootPtr *uint16
+	var err error
+	if command != "" {
+		commandPtr, err = windows.UTF16PtrFromString(command)
+		if err != nil {
+			return err
+		}
+	}
+	if reboot != "" {
+		rebootPtr, err = windows.UTF16PtrFromString(reboot)
+		if err != nil {
+			return err
+		}
+	}
+	native := make([]windows.SC_ACTION, len(actions))
+	for i, action := range actions {
+		native[i] = windows.SC_ACTION{
+			Type:  uint32(action.Type),
+			Delay: uint32(action.Delay / time.Millisecond),
+		}
+	}
+	policy := windows.SERVICE_FAILURE_ACTIONS{
+		ResetPeriod:  resetPeriod,
+		RebootMsg:    rebootPtr,
+		Command:      commandPtr,
+		ActionsCount: uint32(len(native)),
+	}
+	if len(native) > 0 {
+		policy.Actions = &native[0]
 	} else {
-		log.Printf("service: the registration of %s has no failure recovery, the recovery policy of HFDesk is configured", ServiceName)
+		// The SCM API accepts a non-nil buffer with a zero count to clear
+		// actions, matching mgr.ResetRecoveryActions while retaining the
+		// previous reset period and ancillary fields.
+		policy.Actions = &windows.SC_ACTION{}
 	}
-	if err := handle.SetRecoveryActions(scmRecoveryActions(), scmRecoveryResetPeriod); err != nil {
-		return err
-	}
-	// The switch takes effect at the next start of the machine, which is
-	// documented by the platform: an installation never reports more than
-	// the policy it wrote.
-	return handle.SetRecoveryActionsOnNonCrashFailures(true)
+	return windows.ChangeServiceConfig2(handle.Handle, windows.SERVICE_CONFIG_FAILURE_ACTIONS, (*byte)(unsafe.Pointer(&policy)))
 }
 
 // scmInstallDirs returns the directories an installation creates, in the order
@@ -2073,15 +2556,14 @@ func (m *scmManager) stopService(ctx context.Context, handle scmServiceControl) 
 	}
 }
 
-// preflight rejects an installation the service control manager could not
-// run: an unusable executable, an executable that is not a Windows program of
-// the architecture of this process, an invalid bind address or a directory the
-// account of the instance cannot reach.
+// preflight rejects an installation with an unusable executable, a PE machine
+// the host is known not to support, an invalid bind address or a directory the
+// account of the instance is proven unable to use.
 //
 // The preflight runs before the registration is written, so a rejected
 // installation never leaves a service behind that fails later with an
 // opaque access error.
-func (m *scmManager) preflight(opts InstallOptions) error {
+func (m *scmManager) preflight(opts InstallOptions, pathAccess ...scmPathAccess) error {
 	if !filepath.IsAbs(opts.Executable) {
 		return fmt.Errorf("service: executable %q must be an absolute path", opts.Executable)
 	}
@@ -2092,65 +2574,10 @@ func (m *scmManager) preflight(opts InstallOptions) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("service: executable %q is not a regular file", opts.Executable)
 	}
-	if err := preflightExecutableImage(opts.Executable); err != nil {
-		return err
-	}
 	if _, _, err := ParseListen(opts.Listen); err != nil {
 		return err
 	}
-	return preflightDataPaths(opts)
-}
-
-// preflightExecutableImage rejects an executable the service control manager
-// of this machine could not run.
-//
-// The platform starts the registered image itself, so the header of the file is
-// the only place the installation can learn what it is about to register: a
-// truncated download, a file that is not a program at all and a binary of
-// another architecture are refused here, before the registration is written
-// and before a running instance is stopped.
-//
-// An architecture this installation does not compare is still required to name
-// a PE image: only the architectures HFDesk ships have a comparison.
-func preflightExecutableImage(executable string) error {
-	return preflightExecutableImageFor(executable, runtime.GOARCH)
-}
-
-// preflightExecutableImageFor is preflightExecutableImage for the named
-// architecture of the process.
-//
-// The architecture is a parameter so the comparison can be checked without a
-// machine of every architecture of the platform.
-func preflightExecutableImageFor(executable, arch string) error {
-	machine, err := pe.Machine(executable)
-	if err != nil {
-		return fmt.Errorf("service: executable %q is not a Windows executable: %w", executable, err)
-	}
-	want, known := scmProcessMachine(arch)
-	if !known {
-		return nil
-	}
-	if machine != want {
-		return fmt.Errorf("service: executable %q is built for another architecture: the image is machine 0x%04X and this process is %s (0x%04X)", executable, machine, arch, want)
-	}
-	return nil
-}
-
-// scmProcessMachine returns the machine type of an image that runs on the given
-// architecture of the process.
-//
-// The machine types are the ones HFDesk ships a program for. An architecture
-// without a value is not compared by the installation: the program is then
-// only required to be a PE image.
-func scmProcessMachine(arch string) (machine uint16, known bool) {
-	switch arch {
-	case "amd64":
-		return pe.MachineAMD64, true
-	case "arm64":
-		return pe.MachineARM64, true
-	default:
-		return 0, false
-	}
+	return preflightDataPaths(opts, pathAccess...)
 }
 
 // scmExecutableAccess is what the access check of the registered program proved.
@@ -2167,40 +2594,27 @@ var scmCheckExecutableAccess = scmExecutableAccessOf
 // preflightExecutableAccess refuses a program the account cannot read and
 // execute, and a parent it cannot traverse. An unreadable descriptor is not a
 // denial: the installation reports that it could not check.
-func preflightExecutableAccess(executable string) error {
-	access, reason := scmCheckExecutableAccess(executable)
+func preflightExecutableAccess(executable string, pathAccess ...scmPathAccess) error {
+	var effective scmPathAccess
+	if len(pathAccess) != 0 {
+		effective = pathAccess[0]
+	}
+	access, reason := scmCheckExecutableAccess(executable, effective)
 	switch access {
 	case scmExecutableAccessDenied:
-		return fmt.Errorf("service: executable %q is not usable by the account the instance runs as (%s): %s: grant the account read and execute access to the program and traverse access to the directories above it, or choose a program the account can use", executable, scmServiceIdentityName, reason)
+		return fmt.Errorf("service: executable %q is not usable by the account the instance runs as (%s): %s: grant the account read and execute access to the program, or choose a program the account can use", executable, scmServiceIdentityName, reason)
 	case scmExecutableAccessInconclusive:
-		log.Printf("service: the access rights of the executable %q cannot be read (%s): the installation cannot tell whether %s can execute it", executable, reason, scmServiceIdentityName)
+		log.Printf("service: effective access to executable %q for %s is inconclusive (%s)", executable, scmServiceIdentityName, reason)
 	}
 	return nil
 }
 
-func scmExecutableAccessOf(executable string) (scmExecutableAccess, string) {
-	identity := scmServiceIdentity()
+func scmExecutableAccessOf(executable string, access scmPathAccess) (scmExecutableAccess, string) {
 	resolved, err := scmResolvePath(executable)
 	if err != nil {
 		return scmExecutableAccessInconclusive, fmt.Sprintf("the real location of the program cannot be read: %v", err)
 	}
-	sddl, err := scmReadServiceAccess(resolved)
-	if err != nil {
-		return scmExecutableAccessInconclusive, fmt.Sprintf("the access control list of the program cannot be read: %v", err)
-	}
-	if err := sddlGrantsExecutable(sddl, identity); err != nil {
-		return scmExecutableAccessDenied, err.Error()
-	}
-	for _, dir := range scmParentDirs(resolved) {
-		sddl, err := scmReadServiceAccess(dir)
-		if err != nil {
-			return scmExecutableAccessInconclusive, fmt.Sprintf("the access control list of %q cannot be read: %v", dir, err)
-		}
-		if err := sddlGrantsTraverse(sddl, identity); err != nil {
-			return scmExecutableAccessDenied, fmt.Sprintf("%q: %v", dir, err)
-		}
-	}
-	return scmExecutableAccessAllowed, ""
+	return scmCheckPathAccess(resolved, windows.GENERIC_READ|windows.GENERIC_EXECUTE, access)
 }
 
 // scmParentDirs returns the directories above a path, the immediate parent first.
@@ -2218,228 +2632,9 @@ func scmParentDirs(path string) []string {
 }
 
 const (
-	scmAccessRead uint32 = 1 << iota
-	scmAccessExecute
-)
-
-func sddlGrantsExecutable(sddl string, identity scmIdentitySIDs) error {
-	return sddlGrantsAccess(sddl, identity, scmAccessRead|scmAccessExecute, sddlMaskExecutableRights)
-}
-
-func sddlGrantsTraverse(sddl string, identity scmIdentitySIDs) error {
-	return sddlGrantsAccess(sddl, identity, scmAccessExecute, sddlMaskExecuteRights)
-}
-
-func sddlGrantsAccess(sddl string, identity scmIdentitySIDs, needed uint32, mask func(uint32) uint32) error {
-	if strings.Contains(strings.ToUpper(sddl), "NO_ACCESS_CONTROL") {
-		// A NULL DACL grants every account full access.
-		return nil
-	}
-	var (
-		allowed bool
-		granted uint32
-	)
-	for _, ace := range parseSDDLAces(sddl) {
-		if ace.inheritOnly() {
-			continue
-		}
-		if !ace.coversIdentity(identity) {
-			continue
-		}
-		switch ace.kind {
-		case "D", "OD":
-			denied := mask(ace.rights) & needed
-			if denied == 0 {
-				continue
-			}
-			return fmt.Errorf("the access control list denies the account %s the %s%s", scmServiceIdentityName, sddlAccessName(denied), identity.note())
-		case "A", "OA":
-			allowed = true
-			granted |= mask(ace.rights)
-		}
-	}
-	switch {
-	case !allowed:
-		return fmt.Errorf("the access control list grants the account %s no access%s", scmServiceIdentityName, identity.note())
-	case granted&needed != needed:
-		return fmt.Errorf("the access control list grants the account %s no %s%s", scmServiceIdentityName, sddlAccessName(needed&^granted), identity.note())
-	}
-	return nil
-}
-
-func sddlMaskExecutableRights(mask uint32) uint32 {
-	if mask&windows.GENERIC_ALL != 0 {
-		return scmAccessRead | scmAccessExecute
-	}
-	var rights uint32
-	if mask&(windows.GENERIC_READ|windows.FILE_READ_DATA) != 0 {
-		rights |= scmAccessRead
-	}
-	if mask&(windows.GENERIC_EXECUTE|windows.FILE_EXECUTE) != 0 {
-		rights |= scmAccessExecute
-	}
-	return rights
-}
-
-func sddlMaskExecuteRights(mask uint32) uint32 {
-	if mask&(windows.GENERIC_ALL|windows.GENERIC_EXECUTE|windows.FILE_EXECUTE) != 0 {
-		return scmAccessExecute
-	}
-	return 0
-}
-
-func sddlAccessName(rights uint32) string {
-	switch {
-	case rights&scmAccessRead != 0 && rights&scmAccessExecute != 0:
-		return "read and execute access"
-	case rights&scmAccessRead != 0:
-		return "read access"
-	case rights&scmAccessExecute != 0:
-		return "execute access"
-	default:
-		return "access"
-	}
-}
-
-// The service identity of the instance is the account the registration runs
-// the program as: LocalService (S-1-5-19). The access control list of a
-// directory the installation reuses has to grant that account the access
-// the instance needs, otherwise the instance fails later with an opaque
-// access error.
-//
-// The membership of the account is the one the documentation of the
-// platform grants to it, and it is the only source of it. The built-in
-// service accounts of the platform are local authenticated users, so the
-// token of a service logon of the account carries the account itself,
-// everybody and the authenticated users.
-//
-// The Interactive Users group (S-1-5-4) is deliberately not part of it: it
-// is the group of an interactive logon, and the instance never runs an
-// interactive logon. A descriptor that grants the access to the interactive
-// users only is a descriptor the instance can never use, and the
-// installation has to refuse it.
-//
-// The membership is never read from a token of the account: the local
-// security authority of a machine does not accept the logon of the account
-// on every machine, and a check of a path has to answer the same way on
-// every machine. The message of a refusal says that the check was made
-// against the documented membership and not against the groups of a token,
-// so the operator knows what the answer is based on.
-const (
-	// scmServiceIdentitySID is the SID of the account the instance runs
-	// as: LocalService (S-1-5-19).
-	scmServiceIdentitySID = "S-1-5-19"
-
-	// scmServiceIdentityName is the name of the account the instance runs
-	// as. The name is part of the message of a failed installation, so
-	// the user knows which account needs the access.
+	scmServiceIdentitySID  = "S-1-5-19"
 	scmServiceIdentityName = `NT AUTHORITY\LocalService`
-
-	// scmEveryoneSID is the SID of the Everyone group. Every token of
-	// the platform carries it, so an access control list that grants the
-	// access to everybody grants it to the account of the instance as
-	// well.
-	scmEveryoneSID = "S-1-1-0"
-
-	// scmAuthenticatedUsersSID is the SID of the Authenticated Users
-	// group. The documentation of the platform treats the built-in
-	// service accounts as local authenticated users, so the token of a
-	// service logon of the account carries this group as well.
-	scmAuthenticatedUsersSID = "S-1-5-11"
-
-	// scmInteractiveUsersSID is the SID of the Interactive Users group.
-	// It is the group of an interactive logon: the instance runs a
-	// service logon and is never an interactive user, so the group never
-	// covers the account of the instance.
-	scmInteractiveUsersSID = "S-1-5-4"
 )
-
-// scmIdentitySIDs is the set of security identifiers that cover the account
-// the instance runs as.
-//
-// The set is the documented membership of the account: the account itself,
-// everybody and the authenticated users. The Interactive Users group is
-// deliberately not part of it.
-//
-// An access control list that grants the access to one of them grants it to
-// the account of the instance as well.
-type scmIdentitySIDs struct {
-	// sids holds the SIDs of the set in their canonical form.
-	sids map[string]bool
-}
-
-// covers reports whether a SID covers the account of the instance.
-func (i scmIdentitySIDs) covers(sid string) bool {
-	return i.sids[scmNormalizeSID(sid)]
-}
-
-// note returns the note that tells the caller that the check was made
-// against the documented membership of the account and not against the
-// groups of a token of it.
-//
-// The note is never empty: the membership of the account is the documented
-// one, so the user has to know that the groups of the account were not read
-// from a token of it.
-func (i scmIdentitySIDs) note() string {
-	return fmt.Sprintf(
-		": the check was made against the membership the documentation of the platform grants to the account %s: the account itself, everybody and the authenticated users, and not against the groups of a token of the account",
-		scmServiceIdentityName,
-	)
-}
-
-// scmNormalizeSID returns the canonical form of a SID.
-//
-// The trustees of an access control entry and the SIDs of the membership of
-// the account are both written in the canonical form, but a descriptor that
-// was written by hand can carry another case and spaces around the SID.
-func scmNormalizeSID(sid string) string {
-	return strings.ToUpper(strings.TrimSpace(sid))
-}
-
-// scmDocumentedIdentitySIDs returns the membership the documentation of the
-// platform grants to the account of the instance.
-//
-// The documentation of Microsoft treats the built-in service accounts as
-// local authenticated users: LocalService and NetworkService belong to the
-// same class as the Authenticated Users group, and the default security
-// descriptors of the system grant that class its rights. The token of such a
-// logon therefore carries the account itself, everybody and the authenticated
-// users.
-//
-// The Interactive Users group is deliberately not part of the set: it is the
-// group of an interactive logon, and the account of the instance runs a
-// service logon.
-//
-// The documentation the membership is taken from:
-//
-//   - "Well-known security identifiers in Windows" (Microsoft Learn):
-//     S-1-5-19 is LocalService, S-1-5-11 is Authenticated Users and
-//     S-1-5-4 is Interactive Users.
-//   - "Service Account Security and Access Rights" (Microsoft Learn):
-//     LocalService and NetworkService are members of the Authenticated
-//     Users group.
-//
-// The set is the only source of the membership: the local security authority
-// of a machine does not accept the logon of the account on every machine,
-// and a check of a path has to answer the same way on every machine. The
-// note of the set tells the operator that the check was made against the
-// documentation of the platform and not against the groups of a token of
-// the account.
-func scmDocumentedIdentitySIDs() scmIdentitySIDs {
-	return scmIdentitySIDs{
-		sids: map[string]bool{
-			scmNormalizeSID(scmServiceIdentitySID):    true,
-			scmNormalizeSID(scmEveryoneSID):           true,
-			scmNormalizeSID(scmAuthenticatedUsersSID): true,
-		},
-	}
-}
-
-// scmServiceIdentity is the membership of the account the instance runs as.
-//
-// The membership is read once per process: it is a property of the account
-// and not of the path that is checked.
-var scmServiceIdentity = sync.OnceValue(scmDocumentedIdentitySIDs)
 
 // preflightDataPaths checks the directories an installation reuses: the
 // cache root, the hub directory and the local output directory.
@@ -2479,7 +2674,11 @@ var scmServiceIdentity = sync.OnceValue(scmDocumentedIdentitySIDs)
 // The installation never creates a directory the user named: it belongs to
 // whoever named it, and the installation only reads the access control list
 // of the ancestor it judges.
-func preflightDataPaths(opts InstallOptions) error {
+func preflightDataPaths(opts InstallOptions, pathAccess ...scmPathAccess) error {
+	var access scmPathAccess
+	if len(pathAccess) != 0 {
+		access = pathAccess[0]
+	}
 	for _, dir := range []struct {
 		name string
 		path string
@@ -2518,7 +2717,7 @@ func preflightDataPaths(opts InstallOptions) error {
 		// not exist yet is checked through its nearest existing ancestor.
 		// The check reads the access control list of the real location of
 		// the directory.
-		if err := preflightDataPath(dir.name, dir.path); err != nil {
+		if err := preflightDataPath(dir.name, dir.path, access); err != nil {
 			return err
 		}
 	}
@@ -2620,7 +2819,11 @@ func scmSplitExistingPath(path string) (string, []string, error) {
 // The installation never creates a directory the user named: it belongs to
 // whoever named it, and the installation only reads the access control list
 // of the path it checks.
-func preflightDataPath(name, path string) error {
+func preflightDataPath(name, path string, pathAccess ...scmPathAccess) error {
+	var access scmPathAccess
+	if len(pathAccess) != 0 {
+		access = pathAccess[0]
+	}
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("service: %s %q must be an absolute path", name, path)
 	}
@@ -2631,7 +2834,7 @@ func preflightDataPath(name, path string) error {
 		if !info.IsDir() {
 			return fmt.Errorf("service: %s %q is not a directory: the instance needs a directory there", name, path)
 		}
-		return checkServiceAccess(name, path)
+		return checkServiceAccess(name, path, access)
 	case !errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("service: %s %q is not usable: %w", name, path, err)
 	}
@@ -2645,7 +2848,7 @@ func preflightDataPath(name, path string) error {
 	// access rights of it belong to whoever named it, and an installation
 	// that created one would take a tree of models over without being
 	// asked to.
-	return checkServiceCreateAccess(name, path)
+	return checkServiceCreateAccess(name, path, access)
 }
 
 // checkServiceCreateAccess checks that the account of the instance can
@@ -2661,30 +2864,33 @@ func preflightDataPath(name, path string) error {
 // never creates the directory the user named and never applies a descriptor
 // to a path it reuses.
 //
-// The directories above the ancestor are not judged: the account of the
-// instance traverses them with the privilege that lets a service account
-// bypass the traverse check, so a directory the account reaches is never
-// refused here for a traverse right it does not need. The check of the
-// manager is a preflight of the permissions of a path and not a simulation
-// of the access check of the operating system.
-func checkServiceCreateAccess(label, path string) error {
+// The path and its parents are checked with the effective token of the running
+// LocalService instance. Windows' AccessCheck applies DACL order; the parent
+// traverse check is skipped only when that token reports the normally-enabled
+// SeChangeNotifyPrivilege.
+func checkServiceCreateAccess(label, path string, pathAccess ...scmPathAccess) error {
+	var access scmPathAccess
+	if len(pathAccess) != 0 {
+		access = pathAccess[0]
+	}
 	ancestor, err := scmNearestExistingDir(path)
 	if err != nil {
 		return fmt.Errorf("service: the %s %q does not exist and the nearest existing ancestor of it cannot be read: %w: the installation cannot tell whether the account %s can create the directory", label, path, err, scmServiceIdentityName)
 	}
-	sddl, err := scmReadServiceAccess(ancestor)
-	if err != nil {
-		return fmt.Errorf("service: the %s %q does not exist and the access rights of its nearest existing ancestor %q cannot be read: %w: the installation cannot tell whether the account %s can create the directory", label, path, ancestor, err, scmServiceIdentityName)
-	}
-	if err := sddlGrantsIdentity(sddl, scmServiceIdentity()); err != nil {
+	decision, reason := scmCheckPathAccess(ancestor, windows.GENERIC_READ|windows.GENERIC_WRITE, access)
+	switch decision {
+	case scmExecutableAccessDenied:
 		// The message names the directory, the account and the access
 		// that is missing: the user has to grant the access to the
 		// ancestor, and the name of the ancestor is what makes the
 		// guidance actionable.
 		return fmt.Errorf(
-			"service: the %s %q does not exist and the account %s cannot create it: %w: the nearest existing ancestor %q has to grant the account read and write access: the installation never creates a directory the user named, the instance creates it when it runs, as the account the instance runs as: grant the account read and write access to the ancestor directory, or install the instance without this path",
-			label, path, scmServiceIdentityName, err, ancestor,
+			"service: the %s %q does not exist and the account %s cannot create it: %s: the nearest existing ancestor %q has to grant the account read and write access: the installation never creates a directory the user named, the instance creates it when it runs, as the account the instance runs as: grant the account read and write access to the ancestor directory, or install the instance without this path",
+			label, path, scmServiceIdentityName, reason, ancestor,
 		)
+	}
+	if decision == scmExecutableAccessInconclusive {
+		log.Printf("service: effective access to the nearest existing ancestor %q for %s is inconclusive (%s)", ancestor, scmServiceIdentityName, reason)
 	}
 	return nil
 }
@@ -2726,402 +2932,24 @@ func scmNearestExistingDir(path string) (string, error) {
 	}
 }
 
-// checkServiceAccess reads the access control list of a path and checks
-// that the account of the instance can work with it.
+// checkServiceAccess uses Windows AccessCheck with the effective service token
+// to decide whether the account can work with a path.
 //
 // The access control list is only read: the descriptor of the instance is
 // never applied to a path the installation reuses.
-func checkServiceAccess(label, path string) error {
-	sddl, err := scmReadServiceAccess(path)
-	if err != nil {
-		return fmt.Errorf("service: the access rights of the %s %q cannot be read: %w: the installation cannot tell whether the account %s can use the path", label, path, err, scmServiceIdentityName)
+func checkServiceAccess(label, path string, pathAccess ...scmPathAccess) error {
+	var access scmPathAccess
+	if len(pathAccess) != 0 {
+		access = pathAccess[0]
 	}
-	if err := sddlGrantsIdentity(sddl, scmServiceIdentity()); err != nil {
-		return fmt.Errorf("service: the %s %q is not usable by the account the instance runs as (%s): %w: grant the account read and write access to the path, or install the instance without this path", label, path, scmServiceIdentityName, err)
-	}
-	return nil
-}
-
-// scmReadServiceAccess reads the access control list of a path and returns
-// it in its SDDL form.
-//
-// The list that decides the access is the one of the real location of the
-// path: the platform follows the links of a path before it uses it, so a
-// directory that is reached through a link is used by the rights of its
-// target and not by the rights of the link itself. A path whose real
-// location cannot be read is judged by the path as it was written.
-func scmReadServiceAccess(path string) (string, error) {
-	resolved, err := scmResolvePath(path)
-	if err != nil {
-		resolved = path
-	}
-	// The owner and the group are read next to the access control list:
-	// the conversion of a descriptor into its SDDL form needs the whole
-	// descriptor, and reading them needs no right beyond the one the
-	// access control list needs.
-	sd, err := windows.GetNamedSecurityInfo(
-		resolved,
-		windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION,
-	)
-	if err != nil {
-		return "", err
-	}
-	sddl := sd.String()
-	if sddl == "" {
-		return "", errors.New("the access control list is empty")
-	}
-	return sddl, nil
-}
-
-// sddlGrantsIdentity reports whether the access control list of an SDDL
-// string grants the account of the instance the access it needs.
-//
-// The check is a permission preflight, not a simulation of the access check
-// of the operating system: it reads the access control list of the path
-// itself, it does not resolve the inheritance of a parent directory or the
-// privileges of a token.
-//
-// The trustees that cover the account are the ones of the documented
-// membership of the account. The Interactive Users group is never one of
-// them: the instance runs a service logon and is never an interactive user,
-// so a descriptor that grants the access to the interactive users only is
-// refused.
-//
-// A denied entry wins over an allowed one, but only when it denies a right
-// the instance needs: a directory that denies the change of its access
-// control list, or the change of its owner, is a directory the instance can
-// still read and write, and it is not refused because of it.
-//
-// An inherit only entry applies to the children of the object and never to
-// the object itself: it grants the account nothing on the directory the
-// check is made for, and it denies it nothing either.
-func sddlGrantsIdentity(sddl string, identity scmIdentitySIDs) error {
-	var (
-		allowed bool
-		read    bool
-		write   bool
-	)
-	for _, ace := range parseSDDLAces(sddl) {
-		if ace.inheritOnly() {
-			// The entry is about the children of the directory, not
-			// about the directory itself.
-			continue
-		}
-		if !ace.coversIdentity(identity) {
-			continue
-		}
-		switch ace.kind {
-		case "D", "OD":
-			// The entry takes the access away only when it denies a
-			// right the instance needs.
-			denied := scmMaskRights(ace.rights) & scmNeededRights
-			if denied == 0 {
-				continue
-			}
-			return fmt.Errorf("the access control list denies the account %s the %s%s", scmServiceIdentityName, scmRightName(denied), identity.note())
-		case "A", "OA":
-			allowed = true
-			rights := scmMaskRights(ace.rights)
-			read = read || rights&scmRightRead != 0
-			write = write || rights&scmRightWrite != 0
-		}
-	}
-	switch {
-	case !allowed:
-		return fmt.Errorf("the access control list grants the account %s no access%s", scmServiceIdentityName, identity.note())
-	case !read:
-		return fmt.Errorf("the access control list grants the account %s no read access%s", scmServiceIdentityName, identity.note())
-	case !write:
-		return fmt.Errorf("the access control list grants the account %s no write access%s", scmServiceIdentityName, identity.note())
+	decision, reason := scmCheckPathAccess(path, windows.GENERIC_READ|windows.GENERIC_WRITE, access)
+	switch decision {
+	case scmExecutableAccessDenied:
+		return fmt.Errorf("service: the %s %q is not usable by the account the instance runs as (%s): %s: grant the account read and write access to the path, or install the instance without this path", label, path, scmServiceIdentityName, reason)
+	case scmExecutableAccessInconclusive:
+		log.Printf("service: effective access to %s %q for %s is inconclusive (%s)", label, path, scmServiceIdentityName, reason)
 	}
 	return nil
-}
-
-// sddlACE is one access control entry of an SDDL string.
-type sddlACE struct {
-	// kind is the type of the entry: "A" for an allowed entry and "D"
-	// for a denied one.
-	kind string
-	// flags holds the inheritance flags of the entry.
-	flags string
-	// rights is the access mask the entry grants or denies.
-	rights uint32
-	// trustee is the SID the entry applies to.
-	trustee string
-}
-
-// inheritOnly reports whether the entry applies to the children of the
-// object and never to the object itself.
-//
-// The inherit only flag ("IO") is one of the two letter codes of the flags
-// field of an entry. The field is a concatenation of such codes, so the
-// codes are read one after the other: a search for the text of the code
-// would read the letters of two neighbouring codes as the inherit only
-// flag.
-func (ace sddlACE) inheritOnly() bool {
-	flags := strings.ToUpper(ace.flags)
-	for i := 0; i+2 <= len(flags); i += 2 {
-		if flags[i:i+2] == "IO" {
-			return true
-		}
-	}
-	return false
-}
-
-// coversIdentity reports whether the entry applies to the account of the
-// instance or to one of the groups it belongs to.
-//
-// The trustees of an SDDL string are raw SIDs. The aliases of the platform
-// are accepted as well, so a descriptor that was written by hand is read
-// the same way.
-//
-// The membership of the account decides: an alias is only another way to
-// write a SID, and the SID is one of the ones of the effective membership of
-// the account or it is not one of them.
-func (ace sddlACE) coversIdentity(identity scmIdentitySIDs) bool {
-	trustee := strings.ToUpper(strings.TrimSpace(ace.trustee))
-	if sid, ok := sddlTrusteeAliases[trustee]; ok {
-		trustee = sid
-	}
-	return identity.covers(trustee)
-}
-
-// sddlTrusteeAliases maps the aliases of a trustee of an SDDL access
-// control entry onto the SID they stand for.
-//
-// The map resolves the aliases of the platform, it does not grant any
-// access: a resolved trustee covers the account of the instance only when
-// the effective membership of the account carries it. The alias of the
-// Interactive Users (IU) therefore never covers the account of the
-// instance, which runs a service logon.
-var sddlTrusteeAliases = map[string]string{
-	"WD": "S-1-1-0",      // Everyone
-	"BU": "S-1-5-32-545", // Users
-	"AU": "S-1-5-11",     // Authenticated Users
-	"IU": "S-1-5-4",      // Interactive Users
-	"LS": "S-1-5-19",     // LocalService
-}
-
-// The rights the instance needs on a directory it works with.
-//
-// The instance reads the directory, it creates entries in it, and it reads
-// and writes the files in it: it needs the read access and the write access
-// of the directory and of its files.
-//
-// A right the instance does not need is not one of them. The right to
-// change the access control list of the directory, the right to change its
-// owner and the rights of the configuration of the platform are none of
-// them: a denied entry that carries one of them takes nothing the instance
-// needs away.
-const (
-	// scmRightRead is the right to read the directory and the files in
-	// it.
-	scmRightRead uint32 = 1 << iota
-	// scmRightWrite is the right to create entries in the directory and
-	// to write the files in it.
-	scmRightWrite
-)
-
-// scmNeededRights is the mask of the rights the instance needs.
-//
-// The mask is the intersection a denied entry is measured against: an entry
-// that denies one of these rights takes a right the instance needs away.
-const scmNeededRights = scmRightRead | scmRightWrite
-
-// The individual rights of a file and of a directory the instance needs.
-//
-// The instance reads a directory, it creates entries in it and it reads and
-// writes the files in it. The rights are the ones of a directory, and the
-// rights of a file carry the same values: the right to list the entries of
-// the directory is FILE_READ_DATA, the right to walk through it is
-// FILE_EXECUTE, the right to create a file in it is FILE_WRITE_DATA and the
-// right to create a directory in it is FILE_APPEND_DATA.
-//
-// The right to delete an entry of the directory is the one the platform does
-// not export, so it is written down here.
-const (
-	// scmFileDeleteChild is the right to delete an entry of a directory
-	// (FILE_DELETE_CHILD). The platform does not export the constant.
-	scmFileDeleteChild uint32 = 0x00000040
-
-	// scmFileReadRights is the mask of the individual rights the instance
-	// needs to read a directory and the files in it: the right to list
-	// the entries of the directory (FILE_LIST_DIRECTORY, the same value
-	// as FILE_READ_DATA), the right to read the extended attributes of
-	// the entries, the right to walk through the directory
-	// (FILE_TRAVERSE, the same value as FILE_EXECUTE) and the right to
-	// read their attributes.
-	scmFileReadRights uint32 = windows.FILE_READ_DATA |
-		windows.FILE_READ_EA |
-		windows.FILE_EXECUTE |
-		windows.FILE_READ_ATTRIBUTES
-
-	// scmFileWriteRights is the mask of the individual rights the
-	// instance needs to create entries in a directory and to write the
-	// files in it: the right to create a file in it (FILE_ADD_FILE, the
-	// same value as FILE_WRITE_DATA), the right to create a directory in
-	// it (FILE_ADD_SUBDIRECTORY, the same value as FILE_APPEND_DATA),
-	// the right to write the extended attributes of the entries, the
-	// right to delete an entry of it and the right to write their
-	// attributes.
-	scmFileWriteRights uint32 = windows.FILE_WRITE_DATA |
-		windows.FILE_APPEND_DATA |
-		windows.FILE_WRITE_EA |
-		scmFileDeleteChild |
-		windows.FILE_WRITE_ATTRIBUTES
-)
-
-// scmMaskRights returns the rights of the check that an access mask
-// carries.
-//
-// The mask is read by its individual bits: the rights of the check are the
-// rights of a directory and of a file, and an entry that carries one of
-// them carries the right it stands for. An entry that carries a single one
-// of them denies that one, so a denial of the right to create a file in a
-// directory is a denial of the write access the instance needs.
-//
-// The generic rights are the same rights in another form: the manager of the
-// platform expands them into the file rights of the object before it checks
-// the access, so they carry the rights they stand for. The full control
-// carries every right of the check. The right to execute an object is none
-// of the rights of the check.
-//
-// A right the instance does not need is not one of them: the right to delete
-// the object, the right to read its descriptor, the right to change its
-// access control list, the right to change its owner and the right to
-// synchronize with it are none of them, so an entry that carries one of them
-// takes nothing the instance needs away.
-//
-// The mapping is the same for an allowed and for a denied entry: a right
-// that an entry does not carry is not a right it grants and not a right it
-// denies.
-func scmMaskRights(mask uint32) uint32 {
-	if mask&windows.GENERIC_ALL != 0 {
-		return scmRightRead | scmRightWrite
-	}
-	var rights uint32
-	if mask&windows.GENERIC_READ != 0 {
-		rights |= scmRightRead
-	}
-	if mask&windows.GENERIC_WRITE != 0 {
-		rights |= scmRightWrite
-	}
-	if mask&scmFileReadRights != 0 {
-		rights |= scmRightRead
-	}
-	if mask&scmFileWriteRights != 0 {
-		rights |= scmRightWrite
-	}
-	return rights
-}
-
-// scmRightName names the rights of the check a mask carries.
-//
-// The name is the one the messages of the manager use: the read access and
-// the write access are the access the instance needs on a path.
-func scmRightName(rights uint32) string {
-	switch {
-	case rights&scmRightRead != 0 && rights&scmRightWrite != 0:
-		return "read and write access"
-	case rights&scmRightRead != 0:
-		return "read access"
-	default:
-		return "write access"
-	}
-}
-
-// parseSDDLAces returns the access control entries of an SDDL string.
-//
-// The entries are the parenthesized groups of the string. The parts around
-// them (the header of the descriptor, the owner and the group) carry no
-// entry.
-func parseSDDLAces(sddl string) []sddlACE {
-	var aces []sddlACE
-	for i := 0; i < len(sddl); {
-		open := strings.IndexByte(sddl[i:], '(')
-		if open < 0 {
-			break
-		}
-		i += open + 1
-		end := strings.IndexByte(sddl[i:], ')')
-		if end < 0 {
-			break
-		}
-		body := sddl[i : i+end]
-		i += end + 1
-		if ace, ok := parseSDDLACE(body); ok {
-			aces = append(aces, ace)
-		}
-	}
-	return aces
-}
-
-// parseSDDLACE reads one access control entry of an SDDL string.
-//
-// The entry has the shape (type;flags;rights;object-type;inheritance;trustee).
-// The trustee is the last field of the entry, the rights the third one and
-// the flags the second one.
-func parseSDDLACE(body string) (sddlACE, bool) {
-	fields := strings.Split(body, ";")
-	if len(fields) < 2 {
-		return sddlACE{}, false
-	}
-	ace := sddlACE{
-		kind:    strings.ToUpper(strings.TrimSpace(fields[0])),
-		flags:   strings.ToUpper(strings.TrimSpace(fields[1])),
-		trustee: strings.TrimSpace(fields[len(fields)-1]),
-	}
-	if len(fields) >= 3 {
-		ace.rights = parseSDDLRights(fields[2])
-	}
-	return ace, true
-}
-
-// parseSDDLRights reads the rights field of an access control entry.
-//
-// The field holds an access mask as a hexadecimal number or as one of the
-// aliases of the platform. A field that cannot be read grants nothing.
-func parseSDDLRights(field string) uint32 {
-	field = strings.TrimSpace(field)
-	if field == "" {
-		return 0
-	}
-	if mask, ok := sddlRights[strings.ToUpper(field)]; ok {
-		return mask
-	}
-	text := strings.TrimPrefix(strings.TrimPrefix(field, "0x"), "0X")
-	mask, err := strconv.ParseUint(text, 16, 32)
-	if err != nil {
-		return 0
-	}
-	return uint32(mask)
-}
-
-// scmFileAllAccess is the access mask of the alias "FA" of the rights field
-// of an SDDL entry: the standard rights of a file plus every right on the
-// data of the file. The platform does not export the constant.
-const scmFileAllAccess uint32 = 0x001F01FF
-
-// sddlRights maps the aliases of the rights field of an SDDL access control
-// entry onto the access mask they stand for.
-//
-// The aliases are the ones the platform reads and writes: the generic
-// rights (GA, GR, GW, GX), the standard rights (RC, SD, WD, WO) and the
-// file rights (FA, FR, FW, FX).
-var sddlRights = map[string]uint32{
-	"GA": windows.GENERIC_ALL,
-	"GR": windows.GENERIC_READ,
-	"GW": windows.GENERIC_WRITE,
-	"GX": windows.GENERIC_EXECUTE,
-	"RC": windows.READ_CONTROL,
-	"SD": windows.DELETE,
-	"WD": windows.WRITE_DAC,
-	"WO": windows.WRITE_OWNER,
-	"FA": scmFileAllAccess,
-	"FR": windows.FILE_GENERIC_READ,
-	"FW": windows.FILE_GENERIC_WRITE,
-	"FX": windows.FILE_GENERIC_EXECUTE,
 }
 
 // requireElevated rejects a machine-wide operation that needs an elevated
@@ -3210,20 +3038,15 @@ func buildSCMConfig(opts InstallOptions) mgr.Config {
 	}
 }
 
-// scmConfigWithAutostart returns the configuration an update of a registration
-// writes: the configuration of the installation with the autostart state the
-// registration already has.
-//
-// A repeat installation keeps the autostart state it finds. An administrator
-// may have switched the service to a manual or a disabled start, so it does not
-// start at boot, or to a delayed automatic start; a reinstall with a new binary
-// is not the place to undo that decision. The two fields are the whole autostart
-// state of a registration: the update of the configuration writes both of them,
-// so they are kept together.
-func scmConfigWithAutostart(config, previous mgr.Config) mgr.Config {
-	config.StartType = previous.StartType
-	config.DelayedAutoStart = previous.DelayedAutoStart
-	return config
+// scmConfigForUpdate changes the program while retaining the other readable
+// SCM settings. The service identity is fixed by the project contract and the
+// SCM API does not return Password, so neither field is copied from a prior
+// registration.
+func scmConfigForUpdate(config, previous mgr.Config) mgr.Config {
+	previous.BinaryPathName = config.BinaryPathName
+	previous.ServiceStartName = scmLocalServiceAccount
+	previous.Password = ""
+	return previous
 }
 
 // scmCommandLine renders the command line the registration carries: the
@@ -3273,12 +3096,7 @@ func (r scmRegistration) cacheDir() string {
 
 // flagValue returns the value of a flag of the argument vector.
 func (r scmRegistration) flagValue(flag string) string {
-	for i, arg := range r.args {
-		if arg == flag && i+1 < len(r.args) {
-			return r.args[i+1]
-		}
-	}
-	return ""
+	return runArgValue(r.args, flag)
 }
 
 // parseSCMCommandLine reads the executable and the arguments out of the
@@ -3382,7 +3200,11 @@ func registerEventSource() error {
 // never re-ACLed: they can hold gigabytes of data that the user may reuse
 // from an interactive run, and a recursive change of the access rights
 // would take the data away from the user who owns it.
-func restrictInstanceState(opts InstallOptions, snapshot scmInstallSnapshot) error {
+func restrictInstanceState(opts InstallOptions, snapshot scmInstallSnapshot, pathAccess ...scmPathAccess) error {
+	var access scmPathAccess
+	if len(pathAccess) != 0 {
+		access = pathAccess[0]
+	}
 	paths := instanceStatePaths(opts, snapshot)
 	// The paths that existed before the installation are checked first:
 	// the account of the instance has to be able to work with them
@@ -3391,7 +3213,7 @@ func restrictInstanceState(opts InstallOptions, snapshot scmInstallSnapshot) err
 		if path.created {
 			continue
 		}
-		if err := checkServiceAccess(path.name, path.path); err != nil {
+		if err := checkServiceAccess(path.name, path.path, access); err != nil {
 			return err
 		}
 	}

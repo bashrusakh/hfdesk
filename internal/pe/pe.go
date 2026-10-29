@@ -11,14 +11,15 @@
 // the desktop host therefore read the subsystem out of the PE header of the
 // file they are given.
 //
-// The machine type of the image is read as well: a service installation
-// registers a program for the architecture of the machine it runs on, and a
-// binary of another architecture has to be refused before a running instance
-// is touched.
+// The machine type of the image is read as well. This package reports the
+// field; the Windows service manager asks the host operating system whether it
+// supports that machine type, rather than inferring support from the installer
+// process architecture.
 //
 // The package only reads: it never runs a program and it never writes
-// anything. It works on every platform, so a build check runs on the machine
-// that built the artifact and the desktop host can read its own executable.
+// anything. It works on every platform, so callers can inspect PE structure
+// without treating a field extraction as proof that the Windows loader accepts
+// the image.
 package pe
 
 import (
@@ -51,7 +52,13 @@ const (
 	dosHeaderOffsetField = 0x3C
 	// peSignatureSize is the size of the PE signature and of the COFF
 	// header that follows it.
-	peSignatureSize = 24
+	peSignatureSize              = 24
+	coffOptionalHeaderSizeOffset = 16
+	coffCharacteristicsOffset    = 18
+	coffSectionCountOffset       = 2
+	coffExecutableImage          = 0x0002
+	coffDLL                      = 0x2000
+	coffSectionHeaderSize        = 40
 	// peSignatureOffset is the offset of the "PE\0\0" signature inside
 	// the PE header.
 	peSignatureOffset = 0
@@ -66,7 +73,10 @@ const (
 	optionalHeaderOffset = 24
 	// optionalHeaderMagicSize is the size of the magic field of the
 	// optional header.
-	optionalHeaderMagicSize = 2
+	optionalHeaderMagicSize        = 2
+	optionalHeader32Size           = 224
+	optionalHeader64Size           = 240
+	optionalHeaderEntryPointOffset = 16
 	// subsystemOffset is the offset of the subsystem field inside the
 	// optional header.
 	//
@@ -152,6 +162,95 @@ func Machine(path string) (uint16, error) {
 	defer file.Close()
 
 	return MachineOf(file)
+}
+
+// ExecutableMachine returns the machine type of a structurally usable Windows
+// executable at path. Unlike Machine, it checks the mandatory executable
+// headers and section table before returning the COFF field.
+//
+// This is a bounded structural check, not a recreation of the Windows loader:
+// it rejects missing or truncated mandatory headers and section data, but does
+// not claim that arbitrary PE semantics are loadable.
+func ExecutableMachine(path string) (uint16, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer file.Close()
+
+	return ExecutableMachineOf(file)
+}
+
+// ExecutableMachineOf reads the machine type after checking the required
+// Windows executable structure. MachineOf remains the field-extraction API for
+// callers that need only the COFF value.
+func ExecutableMachineOf(r io.ReaderAt) (uint16, error) {
+	peOffset, header, err := readPEHeader(r)
+	if err != nil {
+		return 0, err
+	}
+
+	coffOffset := peSignatureOffset + 4
+	sectionCount := binary.LittleEndian.Uint16(header[coffOffset+coffSectionCountOffset:])
+	optionalSize := binary.LittleEndian.Uint16(header[coffOffset+coffOptionalHeaderSizeOffset:])
+	characteristics := binary.LittleEndian.Uint16(header[coffOffset+coffCharacteristicsOffset:])
+	if sectionCount == 0 {
+		return 0, errors.New("the file is not a usable PE executable: it has no sections")
+	}
+	if characteristics&coffExecutableImage == 0 || characteristics&coffDLL != 0 {
+		return 0, errors.New("the file is not a usable PE executable: the COFF header does not describe an executable image")
+	}
+
+	optionalOffset := peOffset + optionalHeaderOffset
+	magicBytes := make([]byte, optionalHeaderMagicSize)
+	if err := readAt(r, optionalOffset, magicBytes); err != nil {
+		return 0, fmt.Errorf("read the optional header: %w", err)
+	}
+	magic := binary.LittleEndian.Uint16(magicBytes)
+	minimumOptionalSize := uint16(0)
+	switch magic {
+	case magicPE32:
+		minimumOptionalSize = optionalHeader32Size
+	case magicPE32Plus:
+		minimumOptionalSize = optionalHeader64Size
+	default:
+		return 0, fmt.Errorf("the file is not a usable PE executable: the optional header has the unknown magic 0x%04X", magic)
+	}
+	if optionalSize < minimumOptionalSize {
+		return 0, fmt.Errorf("the file is not a usable PE executable: the optional header is %d bytes, shorter than the required %d", optionalSize, minimumOptionalSize)
+	}
+
+	entryPoint := make([]byte, 4)
+	if err := readAt(r, optionalOffset+optionalHeaderEntryPointOffset, entryPoint); err != nil {
+		return 0, fmt.Errorf("read the optional header entry point: %w", err)
+	}
+	if binary.LittleEndian.Uint32(entryPoint) == 0 {
+		return 0, errors.New("the file is not a usable PE executable: the optional header has no entry point")
+	}
+
+	sectionTableOffset := optionalOffset + int64(optionalSize)
+	sectionTableSize := int64(sectionCount) * coffSectionHeaderSize
+	sections := make([]byte, int(sectionTableSize))
+	if err := readAt(r, sectionTableOffset, sections); err != nil {
+		return 0, fmt.Errorf("read the section table: %w", err)
+	}
+	for i := 0; i < int(sectionCount); i++ {
+		section := sections[i*coffSectionHeaderSize : (i+1)*coffSectionHeaderSize]
+		rawSize := binary.LittleEndian.Uint32(section[16:20])
+		rawOffset := binary.LittleEndian.Uint32(section[20:24])
+		if rawSize == 0 {
+			continue
+		}
+		if rawOffset == 0 {
+			return 0, fmt.Errorf("the file is not a usable PE executable: section %d has data at offset zero", i)
+		}
+		lastByte := make([]byte, 1)
+		if err := readAt(r, int64(rawOffset)+int64(rawSize)-1, lastByte); err != nil {
+			return 0, fmt.Errorf("read section %d data: %w", i, err)
+		}
+	}
+
+	return binary.LittleEndian.Uint16(header[machineOffset : machineOffset+machineSize]), nil
 }
 
 // MachineOf reads the machine type out of the headers of a PE image.

@@ -505,23 +505,19 @@ same service at the same time.
 - The installation configures the **failure recovery** of the registration
   only when the registration has none: three automatic restarts, after 5 s,
   30 s and 60 s, with the failure count reset after one day without a failure.
-  A policy that is already registered — for example one an administrator set —
-  is kept, including its switch for non-crash failures. An instance that ends
-  without reporting its stop, and an instance that reports a stopped state with
-  a non-zero exit code, are therefore restarted by the platform: the
-  installation enables the recovery of a non-crash failure together with those
-  actions, so a failure the instance reports itself does not leave the service
-  stopped. The platform repeats the **last** action — the restart after 60 s —
-  for every further failure until the failure count is reset after a day
-  without a failure, so a program that cannot come up is retried once a minute
-  and never in a tight loop. An explicit user stop reports a clean stop with
-  the exit code 0, so it is not a failure and never triggers a restart. The
-  non-crash switch is documented by Microsoft to take effect at the next start
-  of Windows: the installation writes it and reports the policy it wrote, and
-  a machine that is already running applies it after the next boot. A policy
-  that cannot be read is not taken for an absent one: the installation
-  configures the HFDesk policy then. A recovery policy that cannot be
-  configured fails the installation, which rolls the registration back.
+  A registration with a nonempty action list keeps those actions. The
+  installation enables its readable non-crash flag when false, because this
+  service reports failed starts and hosts with a nonzero exit code. An explicit
+  user stop reports zero and is not a recovery signal. The non-crash flag takes
+  effect at the next start of Windows; a running machine applies a newly written
+  value after its next boot. If a successful read finds no actions, setup writes
+  the default restart schedule and one-day reset period, preserves the readable
+  recovery command and reboot message, and enables non-crash recovery. A failed
+  policy read is not absence and causes no recovery-policy write. If setup fails,
+  the previous policy is restored and read back where possible; an unverified
+  restore is reported rather than claimed. The platform repeats the last action
+  (restart after 60 s) until the failure count resets, so a program that cannot
+  come up is retried once a minute and never in a tight loop.
 - The service identity is `LocalService`, a least-privilege Windows service
   account, not `LocalSystem`. It is **not configurable**: the built-in account
   has no name of its own and needs no credential, so a Windows instance
@@ -566,23 +562,27 @@ replaces the other.
   message box. A desktop release also passes the version of that release as the
   expected version, and its report names a version only when the started
   instance reported it; a local desktop build names no release and claims none.
+  PE candidates are checked for complete mandatory executable headers and
+  sections without running them; Windows host and guest-machine support, not
+  the helper's process architecture, decides known architecture incompatibility.
+  If Windows cannot answer that support query, the candidate is not rejected on
+  that basis alone. When updating a running service, access preflight uses its
+  actual LocalService token and Windows `AccessCheck`; if that token cannot be
+  obtained, access remains unknown rather than being inferred from a partial
+  SDDL model.
   A declined prompt or a missing console program changes nothing and leaves the
   desktop app running.
 
-  An installation that registered the service and then failed to start it, or
-  failed to verify the start, does not leave the user with a registration that
-  serves nothing: the installation reports whether it **created** the
-  registration, and only a registration it created is removed again — and only
-  when the state read after the failure is settled and does not serve. The
-  removal takes the registration only, the data stays where it is, and the
-  report says that the desktop app can be started normally again. Every other
-  case keeps its registration and names `hfdesk service uninstall` from an
-  elevated shell instead: a registration that existed before the attempt or
-  appeared between the read-only lookup of the manager and its write, and a
-  service that is running, starting or stopping at that read. A state that
-  cannot be read is not a stopped service: the report says that the start could
-  not be confirmed and that the service may be running, starting or stopped,
-  instead of claiming that it does not run.
+  A first install starts and verifies the service through the same SCM handle
+  that created its registration. A mismatching health version or failed
+  readiness check stops and removes that registration only after the service
+  process and unchanged command line are still proven to belong to this attempt;
+  the service-owned data is never removed. If the process or registration has
+  changed, or its state cannot be read, the helper does not reopen the name and
+  risk stopping or deleting another installation: it keeps the registration and
+  reports that cleanup could not be proven. A proven cleanup says that the
+  desktop app can be started normally again. A registration already present at
+  the first-install boundary is left untouched and reported as a conflict.
 - **No second server.** Once the helper is started, the desktop app stops its
   own server through the graceful shutdown and ends. The helper starts the
   service only after that process has exited, so the desktop app and the service
@@ -773,6 +773,20 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   or `--executable`. A flag named again changes that setting, and `--cache-dir`
   without `--hub-dir` moves the hub directory with the cache root, exactly as it
   does on a first installation.
+- **Native settings are kept too.** On Linux, an update changes the unit command
+  and changes the working directory or service identity only when the matching
+  install flag is named. Other unit directives, including environment settings
+  and environment files, stay in place. If systemd's loaded command differs from
+  the unit file (for example because an override owns it), the update is refused
+  rather than editing an administrator-owned drop-in or claiming that a
+  shadowed base-file edit took effect. On Windows, the readable SCM settings
+  that HFDesk does not own are written back with the new command line. The
+  Windows identity remains the fixed `LocalService` account, and an SCM password
+  is never copied.
+- Linux compares the loaded command through systemd's typed D-Bus argv
+  properties. It does not infer argument boundaries from `systemctl show`'s
+  joined display. If the loaded properties cannot be read, an existing update
+  stops before changing the unit.
 - **The autostart state is kept.** The start at boot is a setting of the
   registration and not of the command: a repeat installation writes the
   autostart state the registration already has, so a reinstall with a new binary
@@ -817,9 +831,11 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   instance identity itself cannot be established, preflight logs that
   uncertainty; it does not treat it as a denial or as verified access. For a
   running update, systemd's actual start/readiness check and the existing
-  rollback remain authoritative for runtime behavior. On Windows, the ACL
-  check for `LocalService` is unchanged. No permission is changed by the
-  installation.
+  rollback remain authoritative for runtime behavior. On Windows, a running
+  service update uses its actual `LocalService` process token for native
+  `AccessCheck`, including its enabled traverse-bypass privilege. If that token
+  cannot be obtained, access remains inconclusive rather than being inferred
+  from a partial group model. No permission is changed by the installation.
 - **The running state decides the restart.** An instance that runs, or is
   starting, is stopped and started again on the new program, and the
   installation succeeds only when the supervisor reports it running with the
@@ -827,7 +843,8 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   Windows the image of the running process is compared with the registered
   program; the read of the image can be refused for a process of another
   account, and the installation then reports the running state with the
-  registered program and records that the image was not compared. On Linux no
+  registered program and records that the image was not compared. A health
+  version remains a separate fact from process-image identity. On Linux no
   process image is read: the installation asks systemd for the state and the
   `ExecStart` of the loaded unit, and it waits until the restarted instance
   also answers on the listen address of that unit with the same readiness
@@ -846,13 +863,17 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   fail a healthy instance. When the build version of the new program is known,
   the installation compares it too: an installation run from the registered
   binary knows its own build version, the desktop host passes the version of the
-  release it installs, and a mismatch fails the update at once because the
-  version of a running instance does not change — while `--executable`, a local
-  `dev` build and an instance behind Basic auth prove readiness without a
-  version. A probe that does not succeed within the budget is a failed update
-  that rolls back. An instance that was stopped, failed, or absent is **not**
-  started: `install` never starts a service that was not running, and starting
-  stays an explicit `service start`. A registration that is `broken` follows the
+  release it installs, and an observed mismatch fails because the version of a
+  running instance does not change. That mismatch remains a failure when Windows
+  cannot read the process image. If both the image and a health version are
+  unavailable, the update makes no version claim; an unknown check is not treated
+  as a mismatching version. A Basic-auth challenge proves readiness without a
+  version, and a local `dev` build asks readiness without a release expectation.
+  A first desktop install must pass the service-owned readiness check before it
+  reports success. An instance that was stopped, failed, or absent is **not**
+  started by the CLI: `hfdesk service install` never starts a service that was
+  not running, and starting stays an explicit `service start`. A registration
+  that is `broken` follows the
   running fact and not the state: an instance the supervisor still runs is
   restarted on the new program like any other running one, and a broken
   registration whose instance is gone is not started.
@@ -867,10 +888,14 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   replaced when a later one fails — and the report says which of the two it
   proved: that the previous configuration is in place again, or that the
   registration may be partially changed together with the reason. The running
-  instance is not stopped or started on that path. A failure after the restart
-  brings the previous program back into service: the restart rollback stops the
-  instance the failed update started before it restores the previous
-  registration, and when that stop cannot be proven it keeps the failed
+  instance is not stopped or started on that path. On Linux, a restart rollback
+  starts the previous program only after the previous unit file is read back, a
+  daemon reload succeeds and systemd reports the previous command, environment,
+  environment files and launch identity again. If any of those checks fails, no
+  recovery restart is issued and the error retains the installation failure
+  while describing the unconfirmed rollback. On Windows, the restart rollback
+  stops the instance the failed update started before it restores the previous
+  configuration, and when that stop cannot be proven it keeps the failed
   registration instead of leaving a registration that names another program than
   the one that runs. The error names the proven outcome in every case, so a
   failed installation never reports success from the registration write alone.

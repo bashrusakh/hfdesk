@@ -258,14 +258,16 @@ func DefaultInstallOptions(scope Scope, executable string) InstallOptions {
 }
 
 // mergeInstallOptions returns the effective options of an installation over
-// an existing registration.
+// an existing registration. existingPresent distinguishes the absence of an
+// optional value in a real registration from the zero value of a first install.
 //
-// A named field of the request wins; an unmarked one keeps the value of the
-// registration when it names one and the request default otherwise, so a first
-// installation behaves exactly like the request says. The executable and the
-// scope always come from the request: the other scope is another registration
-// and is never merged.
-func mergeInstallOptions(requested, existing InstallOptions) InstallOptions {
+// A named field of the request wins. An unmarked required field keeps the
+// registration value when it has one and the request default otherwise;
+// optional destinations keep the registration's absence as well as its value.
+// A first installation has no registration to merge, so it uses the request.
+// The executable and scope always come from the request: another scope is a
+// different registration and is never merged.
+func mergeInstallOptions(requested, existing InstallOptions, existingPresent bool) InstallOptions {
 	merged := requested
 	if !requested.Explicit.Listen && existing.Listen != "" {
 		merged.Listen = existing.Listen
@@ -279,13 +281,16 @@ func mergeInstallOptions(requested, existing InstallOptions) InstallOptions {
 	if !requested.Explicit.LogDir && existing.Paths.LogDir != "" {
 		merged.Paths.LogDir = existing.Paths.LogDir
 	}
-	if !requested.Explicit.CacheDir && existing.CacheDir != "" {
+	if existingPresent && !requested.Explicit.CacheDir {
+		// An absent optional destination is meaningful: the host then
+		// follows its config/environment/default precedence. Do not replace
+		// that absence with a default carried by the reinstall request.
 		merged.CacheDir = existing.CacheDir
 	}
-	if !requested.Explicit.HubDir && existing.HubDir != "" {
+	if existingPresent && !requested.Explicit.HubDir {
 		merged.HubDir = existing.HubDir
 	}
-	if !requested.Explicit.LocalDir && existing.LocalDir != "" {
+	if existingPresent && !requested.Explicit.LocalDir {
 		merged.LocalDir = existing.LocalDir
 	}
 	if !requested.Explicit.ServiceUser && existing.ServiceUser != "" {
@@ -366,6 +371,73 @@ type Manager interface {
 	Restart(ctx context.Context) error
 	// Status reports the state of the registered service.
 	Status(ctx context.Context) (Status, error)
+}
+
+// InstallStartResult is the registration and settled state of a new
+// installation that the desktop helper starts as part of its install action.
+type InstallStartResult struct {
+	Installation InstallOptions
+	Status       Status
+}
+
+// InstallStartError reports a first-install start failure and what its
+// ownership-scoped cleanup established.
+type InstallStartError struct {
+	Cause               error
+	RegistrationRemoved bool
+	RegistrationOwned   bool
+	ProcessStopped      bool
+	CleanupError        error
+}
+
+func (e *InstallStartError) Error() string {
+	if e == nil {
+		return "service: first-install start failed"
+	}
+	message := "service: first-install start failed"
+	if e.Cause != nil {
+		message = e.Cause.Error()
+	}
+	switch {
+	case e.RegistrationRemoved:
+		return message + " (the failed instance was settled and its registration was removed)"
+	case e.CleanupError != nil:
+		if e.ProcessStopped && !e.RegistrationOwned {
+			return fmt.Sprintf("%s (the failed process was stopped, but the registration changed and was kept: %v)", message, e.CleanupError)
+		}
+		if e.RegistrationOwned && e.ProcessStopped {
+			return fmt.Sprintf("%s (the failed process was proven stopped, but its registration could not be removed: %v)", message, e.CleanupError)
+		}
+		if e.RegistrationOwned {
+			return fmt.Sprintf("%s (the registration was kept because its process was not proven stopped: %v)", message, e.CleanupError)
+		}
+		return fmt.Sprintf("%s (the registration was kept because ownership could not be proven: %v)", message, e.CleanupError)
+	default:
+		return message + " (the registration was kept because ownership and process state were not proven)"
+	}
+}
+
+func (e *InstallStartError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+type installStarter interface {
+	InstallAndStart(context.Context, InstallOptions) (InstallStartResult, error)
+}
+
+// InstallAndStart asks a platform manager that supports an ownership-preserving
+// first install to create, start and verify the new registration as one action.
+// The ordinary Install method keeps its existing stopped-first-install
+// semantics for command-line callers.
+func InstallAndStart(ctx context.Context, manager Manager, opts InstallOptions) (InstallStartResult, error) {
+	starter, ok := manager.(installStarter)
+	if !ok {
+		return InstallStartResult{}, errors.New("service: this platform manager does not support an ownership-preserving first install")
+	}
+	return starter.InstallAndStart(ctx, opts)
 }
 
 // New returns the manager of the platform supervisor for the given scope.

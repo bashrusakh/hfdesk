@@ -17,6 +17,12 @@ const (
 	// testPeHeaderOffset is the offset of the PE header in the
 	// synthesized image.
 	testPeHeaderOffset = 0x80
+	// testSectionHeaderSize is the size of one section header.
+	testSectionHeaderSize = 40
+	// testSectionRawOffset is the aligned location of the synthesized section.
+	testSectionRawOffset = 0x200
+	// testSectionRawSize is the size of the synthesized section data.
+	testSectionRawSize = 0x200
 	// testOptionalHeaderSize32 is the size of the optional header of a
 	// PE32 image.
 	testOptionalHeaderSize32 = 224
@@ -298,6 +304,49 @@ func TestMachineReadsTheArchitectureOfAnUnknownOptionalHeader(t *testing.T) {
 	}
 }
 
+func TestExecutableMachineRejectsTheCOFFOnlyStub(t *testing.T) {
+	image := buildPEImageWithMachine(SubsystemWindowsCUI, magicPE32Plus, testOptionalHeaderSize64, MachineAMD64)
+	stub := image[:testPeHeaderOffset+peSignatureSize]
+
+	if _, err := ExecutableMachineOf(bytes.NewReader(stub)); err == nil {
+		t.Fatal("ExecutableMachineOf accepted a COFF-only stub without an optional header or section table")
+	}
+	// Field extraction intentionally remains a separate, weaker contract.
+	if machine, err := MachineOf(bytes.NewReader(stub)); err != nil || machine != MachineAMD64 {
+		t.Errorf("MachineOf(COFF-only stub) = 0x%04X, %v, want the extracted machine 0x%04X", machine, err, MachineAMD64)
+	}
+}
+
+func TestExecutableMachineRequiresCompleteOptionalAndSectionHeaders(t *testing.T) {
+	image := buildPEImageWithMachine(SubsystemWindowsCUI, magicPE32Plus, testOptionalHeaderSize64, MachineAMD64)
+	cases := []struct {
+		name  string
+		image []byte
+	}{
+		{"truncated optional header", image[:testPeHeaderOffset+optionalHeaderOffset+testOptionalHeaderSize64-1]},
+		{"truncated section table", image[:testPeHeaderOffset+optionalHeaderOffset+testOptionalHeaderSize64+testSectionHeaderSize-1]},
+		{"truncated section data", image[:testSectionRawOffset+testSectionRawSize-1]},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ExecutableMachineOf(bytes.NewReader(tc.image)); err == nil {
+				t.Fatalf("ExecutableMachineOf accepted %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestExecutableMachineReadsStructurallyCompleteImage(t *testing.T) {
+	image := buildPEImageWithMachine(SubsystemWindowsCUI, magicPE32Plus, testOptionalHeaderSize64, MachineAMD64)
+	machine, err := ExecutableMachineOf(bytes.NewReader(image))
+	if err != nil {
+		t.Fatalf("ExecutableMachineOf: %v", err)
+	}
+	if machine != MachineAMD64 {
+		t.Errorf("machine = 0x%04X, want 0x%04X", machine, MachineAMD64)
+	}
+}
+
 // buildPEImage builds a PE image with the given subsystem and optional
 // header.
 //
@@ -307,18 +356,29 @@ func TestMachineReadsTheArchitectureOfAnUnknownOptionalHeader(t *testing.T) {
 // be read.
 func buildPEImage(subsystem int, magic uint16, optionalHeaderSize int) []byte {
 	optional := testPeHeaderOffset + optionalHeaderOffset
-	image := make([]byte, optional+optionalHeaderSize)
+	sectionTable := optional + optionalHeaderSize
+	image := make([]byte, testSectionRawOffset+testSectionRawSize)
 
 	copy(image[dosSignatureOffset:], []byte("MZ"))
 	binary.LittleEndian.PutUint32(image[dosHeaderOffsetField:], uint32(testPeHeaderOffset))
 
 	copy(image[testPeHeaderOffset+peSignatureOffset:], []byte("PE\x00\x00"))
-	// The COFF header follows the PE signature. Its size of the optional
-	// header sits at the offset 16 of the COFF header.
+	// The COFF header carries one executable section and the optional
+	// header size.
+	binary.LittleEndian.PutUint16(image[testPeHeaderOffset+4+coffSectionCountOffset:], 1)
 	binary.LittleEndian.PutUint16(image[testPeHeaderOffset+4+16:], uint16(optionalHeaderSize))
+	binary.LittleEndian.PutUint16(image[testPeHeaderOffset+4+coffCharacteristicsOffset:], coffExecutableImage)
 
 	binary.LittleEndian.PutUint16(image[optional:], magic)
+	binary.LittleEndian.PutUint32(image[optional+optionalHeaderEntryPointOffset:], 0x1000)
+	binary.LittleEndian.PutUint32(image[optional+56:], 0x2000)
+	binary.LittleEndian.PutUint32(image[optional+60:], uint32(testSectionRawOffset))
 	binary.LittleEndian.PutUint16(image[optional+subsystemOffset:], uint16(subsystem))
+	copy(image[sectionTable:], []byte(".text"))
+	binary.LittleEndian.PutUint32(image[sectionTable+8:], testSectionRawSize)
+	binary.LittleEndian.PutUint32(image[sectionTable+12:], 0x1000)
+	binary.LittleEndian.PutUint32(image[sectionTable+16:], testSectionRawSize)
+	binary.LittleEndian.PutUint32(image[sectionTable+20:], testSectionRawOffset)
 
 	return image
 }

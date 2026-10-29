@@ -11,12 +11,16 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -139,16 +143,11 @@ func TestSCMDisabledRunningRefusalRefusesBeforeItStopsTheInstance(t *testing.T) 
 	}
 }
 
-// TestSCMConfigWithAutostartKeepsTheStateOfTheRegistration checks that a repeat
-// installation writes the autostart state the registration already has.
-//
-// The start type of a registration is a setting of the machine: an
-// administrator may have switched the service to a manual or a disabled start,
-// so it does not start at boot, or to a delayed automatic start. A reinstall
-// with a new binary is not the place to undo that decision, so the update of the
-// configuration carries the state of the registration and not the automatic
-// start a first installation uses.
-func TestSCMConfigWithAutostartKeepsTheStateOfTheRegistration(t *testing.T) {
+// TestSCMConfigForUpdatePreservesTheReadableRegistrationSettings checks that
+// an update changes the command line but keeps the other readable SCM settings,
+// including start type and delayed start. The fixed service identity and blank
+// password remain the project policy.
+func TestSCMConfigForUpdatePreservesTheReadableRegistrationSettings(t *testing.T) {
 	config := buildSCMConfig(scmTestOptions())
 	cases := []struct {
 		name     string
@@ -161,26 +160,67 @@ func TestSCMConfigWithAutostartKeepsTheStateOfTheRegistration(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := scmConfigWithAutostart(config, tc.previous)
-			if got.StartType != tc.previous.StartType {
-				t.Errorf("StartType = %d, want the start type %d of the registration", got.StartType, tc.previous.StartType)
-			}
-			if got.DelayedAutoStart != tc.previous.DelayedAutoStart {
-				t.Errorf("DelayedAutoStart = %v, want %v of the registration", got.DelayedAutoStart, tc.previous.DelayedAutoStart)
-			}
-			// The autostart state is the only part of the configuration the
-			// repeat installation keeps: the rest is the registration the
-			// installation writes.
-			if got.BinaryPathName != config.BinaryPathName {
-				t.Errorf("BinaryPathName = %q, want the command line %q of the installation", got.BinaryPathName, config.BinaryPathName)
-			}
-			if got.ServiceStartName != config.ServiceStartName {
-				t.Errorf("ServiceStartName = %q, want %q", got.ServiceStartName, config.ServiceStartName)
-			}
-			if got.ErrorControl != config.ErrorControl || got.ServiceType != config.ServiceType {
-				t.Errorf("the configuration = %+v, want the service type and error control of the installation", got)
+			previous := tc.previous
+			previous.ServiceType = windows.SERVICE_WIN32_OWN_PROCESS
+			previous.ErrorControl = mgr.ErrorSevere
+			previous.BinaryPathName = `C:\old\hfdesk.exe service run`
+			previous.LoadOrderGroup = "HFDeskGroup"
+			previous.TagId = 17
+			previous.Dependencies = []string{"LanmanWorkstation", "Tcpip"}
+			previous.ServiceStartName = scmLocalServiceAccount
+			previous.Password = secretSentinel
+			previous.DisplayName = "Operator label"
+			previous.Description = "Operator description"
+			previous.SidType = 2
+
+			got := scmConfigForUpdate(config, previous)
+			want := previous
+			want.BinaryPathName = config.BinaryPathName
+			want.ServiceStartName = scmLocalServiceAccount
+			want.Password = ""
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("scmConfigForUpdate() =\n%+v\nwant preserved configuration\n%+v", got, want)
 			}
 		})
+	}
+}
+
+func TestSCMStatusUsesAcceptedFlagSyntaxAndLastValue(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("Executable() = %v", err)
+	}
+	root := t.TempDir()
+	configFile := filepath.Join(root, "new", "hfdesk.json")
+	stateDir := filepath.Join(root, "new", "state")
+	logDir := filepath.Join(root, "new", "logs")
+	cacheDir := filepath.Join(root, "new", "cache")
+	hubDir := filepath.Join(root, "new", "hub")
+	localDir := filepath.Join(root, "new", "models")
+	args := []string{
+		"-config=C:\\old\\hfdesk.json", "--config", configFile,
+		"-state-dir", `C:\old\state`, "--state-dir=" + stateDir,
+		"-log-dir=" + logDir,
+		"-listen=127.0.0.1:8181", "--listen", "127.0.0.1:9191",
+		"-cache-dir=C:\\old\\cache", "--cache-dir=" + cacheDir,
+		"-hub-dir=C:\\old\\hub", "--hub-dir=" + hubDir,
+		"-local-dir=C:\\old\\models", "--local-dir=" + localDir,
+	}
+	commandLine := syscall.EscapeArg(executable)
+	for _, arg := range args {
+		commandLine += " " + syscall.EscapeArg(arg)
+	}
+	facts := scmRegistrationFacts{
+		present:     true,
+		state:       svc.Running,
+		commandLine: commandLine,
+	}
+	status, err := scmStatusFrom(ScopeSystem, facts)
+	if err != nil {
+		t.Fatalf("scmStatusFrom() = %v", err)
+	}
+	if status.Executable != executable || status.Listen != "127.0.0.1:9191" || status.Paths != (runtimepaths.Paths{ConfigFile: configFile, StateDir: stateDir, LogDir: logDir}) || status.CacheDir != cacheDir {
+		t.Errorf("status = %+v, want the last values of the registered command", status)
 	}
 }
 
@@ -1704,375 +1744,6 @@ func TestSCMBrokenRegistration(t *testing.T) {
 	}
 }
 
-// TestSDDLGrantsIdentity checks the access control list of a path against
-// the account the instance runs as.
-//
-// The access control lists are the SDDL strings the platform writes: the
-// trustees appear as raw SIDs and not as aliases.
-//
-// The set of the trustees that cover the account is the documented
-// membership: the account itself, everybody and the authenticated users.
-// The membership of the account is checked by
-// TestSDDLGrantsIdentityWithTheMembershipOfTheAccount.
-func TestSDDLGrantsIdentity(t *testing.T) {
-	identity := scmDocumentedIdentitySIDs()
-	cases := []struct {
-		name    string
-		sddl    string
-		wantErr bool
-	}{
-		{"the account itself", "D:P(A;;FA;;;S-1-5-19)", false},
-		{"the alias of the account", "D:P(A;;FA;;;LS)", false},
-		{"everyone", "D:P(A;;FA;;;S-1-1-0)", false},
-		{"the alias of everyone", "D:P(A;;FA;;;WD)", false},
-		{"the interactive users group", "D:P(A;;FA;;;S-1-5-4)", true},
-		{"the alias of the interactive users group", "D:P(A;;FA;;;IU)", true},
-		{"the users group", "D:P(A;;FA;;;S-1-5-32-545)", true},
-		{"the authenticated users group", "D:P(A;;FA;;;S-1-5-11)", false},
-		{"the alias of the authenticated users group", "D:P(A;;FA;;;AU)", false},
-		{"an unrelated account", "D:P(A;;FA;;;S-1-5-18)", true},
-		{"an unrelated group", "D:P(A;;FA;;;S-1-5-32-544)", true},
-		{"a denied entry next to an allowed one", "D:P(D;;GA;;;S-1-5-19)(A;;FA;;;S-1-1-0)", true},
-		{"a denied entry for everybody", "D:P(D;;GA;;;S-1-1-0)(A;;FA;;;S-1-5-19)", true},
-		{"a denied entry that denies the write access", "D:P(D;;FW;;;S-1-5-19)(A;;FR;;;S-1-1-0)", true},
-		{"a denied entry that denies the read access", "D:P(D;;FR;;;S-1-5-19)(A;;FW;;;S-1-1-0)", true},
-		{"a denied entry that denies the change of the access control list", "D:P(D;;WD;;;S-1-5-19)(A;;FA;;;S-1-1-0)", false},
-		{"a denied entry that denies the change of the owner", "D:P(D;;WO;;;S-1-5-19)(A;;FA;;;S-1-1-0)", false},
-		{"read only rights", "D:P(A;;FR;;;S-1-5-19)", true},
-		{"write only rights", "D:P(A;;FW;;;S-1-5-19)", true},
-		{"the generic rights", "D:P(A;;0xC0000000;;;S-1-5-19)", false},
-		{"the file rights", "D:P(A;;0x0013019F;;;S-1-5-19)", false},
-		{"an empty list", "D:P", true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := sddlGrantsIdentity(tc.sddl, identity)
-			if tc.wantErr && err == nil {
-				t.Errorf("sddlGrantsIdentity(%q) = nil, want an error", tc.sddl)
-			}
-			if !tc.wantErr && err != nil {
-				t.Errorf("sddlGrantsIdentity(%q) = %v, want nil", tc.sddl, err)
-			}
-		})
-	}
-}
-
-// TestSDDLGrantsIdentityIgnoresADenialOfARightTheInstanceDoesNotNeed checks
-// that a denied entry refuses the path only when it denies a right the
-// instance needs.
-//
-// The instance reads the directory, it creates entries in it and it reads and
-// writes the files in it. The right to change the access control list of the
-// directory, the right to change its owner and the rights of the
-// configuration of the platform are none of them, so a denied entry that
-// carries one of them denies the instance nothing it needs.
-func TestSDDLGrantsIdentityIgnoresADenialOfARightTheInstanceDoesNotNeed(t *testing.T) {
-	identity := scmDocumentedIdentitySIDs()
-
-	// A denied entry that denies the change of the access control list of
-	// the directory: the directory is still usable by the instance.
-	if err := sddlGrantsIdentity("D:P(D;;WD;;;S-1-5-19)(A;;FA;;;S-1-1-0)", identity); err != nil {
-		t.Errorf("sddlGrantsIdentity() = %v, want nil: a denial of the change of the access control list takes nothing the instance needs away", err)
-	}
-
-	// The same for the change of the owner of the directory.
-	if err := sddlGrantsIdentity("D:P(D;;WO;;;S-1-5-19)(A;;FA;;;S-1-1-0)", identity); err != nil {
-		t.Errorf("sddlGrantsIdentity() = %v, want nil: a denial of the change of the owner takes nothing the instance needs away", err)
-	}
-
-	// A denial of the write access is a denial the instance needs: it has
-	// to create entries in the directory.
-	err := sddlGrantsIdentity("D:P(D;;FW;;;S-1-5-19)(A;;FA;;;S-1-1-0)", identity)
-	if err == nil {
-		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of a denied write access")
-	}
-	if !strings.Contains(err.Error(), "write access") {
-		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the denied right", err)
-	}
-
-	// A denial of the read access is a denial the instance needs: it has
-	// to read the directory and the files in it.
-	err = sddlGrantsIdentity("D:P(D;;FR;;;S-1-5-19)(A;;FA;;;S-1-1-0)", identity)
-	if err == nil {
-		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of a denied read access")
-	}
-	if !strings.Contains(err.Error(), "read access") {
-		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the denied right", err)
-	}
-}
-
-// TestSDDLGrantsIdentityRefusesADenialOfAnIndividualFileRight checks that a
-// denied entry that carries a single file right the instance needs is
-// refused.
-//
-// The instance creates the files of the cache in the directory it works
-// with, so the right to create a file in it (FILE_ADD_FILE) is a right the
-// instance needs. A descriptor that denies that right to the account of the
-// instance and grants the full control to everybody else denies the write
-// access the instance needs, and the installation has to refuse it.
-//
-// The denial is measured against the individual rights of the entry: the
-// aggregate masks alone carry nothing here, and the denial would be ignored.
-func TestSDDLGrantsIdentityRefusesADenialOfAnIndividualFileRight(t *testing.T) {
-	identity := scmDocumentedIdentitySIDs()
-
-	err := sddlGrantsIdentity("D:P(D;;0x00000002;;;LS)(A;;FA;;;WD)", identity)
-	if err == nil {
-		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of a denied FILE_ADD_FILE")
-	}
-	if !strings.Contains(err.Error(), "write access") {
-		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the denied right", err)
-	}
-}
-
-// TestSDDLGrantsIdentityGrantsAnIndividualFileRight checks that an allowed
-// entry that carries a single file right grants that right and not the
-// other one.
-//
-// The right to create a file in a directory (FILE_ADD_FILE) is the write
-// access of the check, and it is not the read access: a directory that
-// grants it alone is a directory the account of the instance can write in
-// and cannot read.
-func TestSDDLGrantsIdentityGrantsAnIndividualFileRight(t *testing.T) {
-	identity := scmDocumentedIdentitySIDs()
-
-	// The mapping itself: the right to create a file is the write
-	// access and not the read access.
-	if got := scmMaskRights(windows.FILE_WRITE_DATA); got != scmRightWrite {
-		t.Errorf("scmMaskRights(FILE_ADD_FILE) = %#08x, want the write access and not the read access", got)
-	}
-
-	// The entry alone grants the write access and not the read access,
-	// so the directory is refused for the missing read access.
-	err := sddlGrantsIdentity("D:P(A;;0x00000002;;;LS)", identity)
-	if err == nil {
-		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of a directory without the read access")
-	}
-	if !strings.Contains(err.Error(), "read access") {
-		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the missing read access", err)
-	}
-	if strings.Contains(err.Error(), "write access") {
-		t.Errorf("sddlGrantsIdentity() = %v, want the write access to be granted", err)
-	}
-
-	// The same entry next to an entry that grants the read access: the
-	// directory is usable by the account of the instance.
-	if err := sddlGrantsIdentity("D:P(A;;0x00000002;;;LS)(A;;0x00000001;;;LS)", identity); err != nil {
-		t.Errorf("sddlGrantsIdentity() = %v, want nil for a directory the account of the instance can read and write", err)
-	}
-}
-
-// TestSCMMaskRightsMapsTheIndividualFileRights checks that the rights of an
-// access control entry are read by their individual bits.
-//
-// The instance needs the rights of a directory: it reads the entries of it
-// and the files in it, and it creates entries in it and writes the files in
-// it. An entry that carries a single one of them carries that right, so an
-// entry that denies a single one of them denies it.
-//
-// The rights the instance does not need are not rights of the check: the
-// right to delete the object, the right to read its descriptor, the right to
-// change its access control list, the right to change its owner, the right
-// to synchronize with it and the right to execute it are none of them.
-//
-// The generic rights and the aggregate masks carry the same rights as the
-// individual bits they stand for.
-func TestSCMMaskRightsMapsTheIndividualFileRights(t *testing.T) {
-	cases := []struct {
-		name string
-		mask uint32
-		want uint32
-	}{
-		{"the right to list the directory", windows.FILE_LIST_DIRECTORY, scmRightRead},
-		{"the right to read the extended attributes", windows.FILE_READ_EA, scmRightRead},
-		{"the right to walk through the directory", windows.FILE_TRAVERSE, scmRightRead},
-		{"the right to read the attributes", windows.FILE_READ_ATTRIBUTES, scmRightRead},
-		{"the right to create a file", windows.FILE_WRITE_DATA, scmRightWrite},
-		{"the right to create a directory", windows.FILE_APPEND_DATA, scmRightWrite},
-		{"the right to write the extended attributes", windows.FILE_WRITE_EA, scmRightWrite},
-		{"the right to delete a child", scmFileDeleteChild, scmRightWrite},
-		{"the right to write the attributes", windows.FILE_WRITE_ATTRIBUTES, scmRightWrite},
-		{"the right to delete the object", windows.DELETE, 0},
-		{"the right to read the descriptor", windows.READ_CONTROL, 0},
-		{"the right to change the access control list", windows.WRITE_DAC, 0},
-		{"the right to change the owner", windows.WRITE_OWNER, 0},
-		{"the right to synchronize", windows.SYNCHRONIZE, 0},
-		{"the right to execute", windows.GENERIC_EXECUTE, 0},
-		{"the generic read", windows.GENERIC_READ, scmRightRead},
-		{"the generic write", windows.GENERIC_WRITE, scmRightWrite},
-		{"the generic all", windows.GENERIC_ALL, scmRightRead | scmRightWrite},
-		{"the aggregate read", windows.FILE_GENERIC_READ, scmRightRead},
-		{"the aggregate write", windows.FILE_GENERIC_WRITE, scmRightWrite},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := scmMaskRights(tc.mask); got != tc.want {
-				t.Errorf("scmMaskRights(%#08x) = %#08x, want %#08x", tc.mask, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestSDDLGrantsIdentityWithTheMembershipOfTheAccount checks the access
-// control list of a path against the membership of the account the instance
-// runs as.
-//
-// The membership is the documented one: the account itself, everybody and
-// the authenticated users. A group the membership carries covers the account
-// and a group it does not carry does not.
-//
-// The test never skips: the membership of the account is the documented one
-// on every machine.
-func TestSDDLGrantsIdentityWithTheMembershipOfTheAccount(t *testing.T) {
-	identity := scmServiceIdentity()
-
-	// The membership the check is made against: it carries the account
-	// itself and everybody, and it never carries the interactive users,
-	// because the instance runs a service logon.
-	if !identity.covers(scmServiceIdentitySID) {
-		t.Fatalf("the membership %v does not carry the account %s", identity.sids, scmServiceIdentitySID)
-	}
-	if !identity.covers(scmEveryoneSID) {
-		t.Fatalf("the membership %v does not carry everybody", identity.sids)
-	}
-	if identity.covers(scmInteractiveUsersSID) {
-		t.Fatalf("the membership %v carries the interactive users, want a membership without them", identity.sids)
-	}
-
-	// The account itself.
-	if err := sddlGrantsIdentity("D:P(A;;FA;;;S-1-5-19)", identity); err != nil {
-		t.Errorf("sddlGrantsIdentity() = %v, want nil for the account itself", err)
-	}
-	// Everybody.
-	if err := sddlGrantsIdentity("D:P(A;;FA;;;S-1-1-0)", identity); err != nil {
-		t.Errorf("sddlGrantsIdentity() = %v, want nil for everybody", err)
-	}
-	// The interactive users: the instance runs a service logon and is
-	// never an interactive user.
-	if err := sddlGrantsIdentity("D:P(A;;FA;;;S-1-5-4)", identity); err == nil {
-		t.Error("sddlGrantsIdentity() = nil, want the refusal of the interactive users")
-	}
-	// A group the account does not carry.
-	uncarried := scmTestUncarriedSID(t, identity)
-	if err := sddlGrantsIdentity("D:P(A;;FA;;;"+uncarried+")", identity); err == nil {
-		t.Errorf("sddlGrantsIdentity() = nil, want the refusal of the group %s", uncarried)
-	}
-	// Every group of the membership covers the account.
-	for group := range identity.sids {
-		if err := sddlGrantsIdentity("D:P(A;;FA;;;"+group+")", identity); err != nil {
-			t.Errorf("sddlGrantsIdentity() = %v, want nil for the group %s the account carries", err, group)
-		}
-	}
-}
-
-// TestSDDLInheritOnlyDoesNotGrantTheIdentityAccess checks that an access
-// control entry that applies to the children of the object grants the
-// account of the instance nothing on the object itself.
-//
-// An inherit only entry ("IO") is about the children of the directory: the
-// directory itself is not covered by it, so a directory whose only entry for
-// the account of the instance is an inherit only one is a directory the
-// instance can never use.
-func TestSDDLInheritOnlyDoesNotGrantTheIdentityAccess(t *testing.T) {
-	identity := scmDocumentedIdentitySIDs()
-
-	// The entry is about the children of the directory: it grants the
-	// account nothing on the directory itself.
-	err := sddlGrantsIdentity("D:P(A;OICIIO;FA;;;LS)", identity)
-	if err == nil {
-		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of an inherit only entry")
-	}
-	if !strings.Contains(err.Error(), scmServiceIdentityName) {
-		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the account of the instance", err)
-	}
-
-	// The same entry without the inherit only flag applies to the
-	// directory itself and grants the account the access.
-	if err := sddlGrantsIdentity("D:P(A;OICI;FA;;;LS)", identity); err != nil {
-		t.Errorf("sddlGrantsIdentity() = %v, want nil for an entry that applies to the directory itself", err)
-	}
-
-	// An inherit only entry does not deny the account either: the
-	// directory is refused because nothing grants it, and not because
-	// something denies it.
-	err = sddlGrantsIdentity("D:P(D;OICIIO;GA;;;LS)", identity)
-	if err == nil {
-		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of a directory that grants the account nothing")
-	}
-	if !strings.Contains(err.Error(), "no access") {
-		t.Errorf("sddlGrantsIdentity() = %v, want the refusal of the missing access and not a denial", err)
-	}
-	if strings.Contains(err.Error(), "denies") {
-		t.Errorf("sddlGrantsIdentity() = %v, want no denial: an inherit only entry denies the account nothing", err)
-	}
-}
-
-// TestSCMIdentitySIDsOfTheAccount checks the membership of the account the
-// instance runs as.
-//
-// The membership is the documented one: the account itself is in it,
-// everybody is in it, and the interactive users are never in it, because the
-// instance runs a service logon.
-//
-// The test never skips: the membership of the account is the documented one
-// on every machine.
-func TestSCMIdentitySIDsOfTheAccount(t *testing.T) {
-	identity := scmServiceIdentity()
-
-	if !identity.covers(scmServiceIdentitySID) {
-		t.Errorf("the membership %v does not carry the account %s", identity.sids, scmServiceIdentitySID)
-	}
-	if !identity.covers(scmEveryoneSID) {
-		t.Errorf("the membership %v does not carry everybody", identity.sids)
-	}
-	if identity.covers(scmInteractiveUsersSID) {
-		t.Errorf("the membership %v carries the interactive users, want a membership without them", identity.sids)
-	}
-}
-
-// TestSddlGrantsIdentityNamesTheDocumentedMembership checks that a check
-// that was made against the documented membership says so.
-//
-// The membership of the account is the documented one and not the one of a
-// token of it, so the user has to know that the groups of the account were
-// not read from a token of the account.
-func TestSddlGrantsIdentityNamesTheDocumentedMembership(t *testing.T) {
-	identity := scmDocumentedIdentitySIDs()
-
-	err := sddlGrantsIdentity("D:P(A;;FA;;;S-1-5-32-544)", identity)
-	if err == nil {
-		t.Fatal("sddlGrantsIdentity() = nil, want the refusal of a group outside the documented membership")
-	}
-	if !strings.Contains(err.Error(), "documentation of the platform") {
-		t.Errorf("sddlGrantsIdentity() = %v, want an error that names the documented membership", err)
-	}
-	if !strings.Contains(err.Error(), "not against the groups of a token") {
-		t.Errorf("sddlGrantsIdentity() = %v, want an error that says the check was not made against a token of the account", err)
-	}
-}
-
-// scmTestUncarriedSID returns a SID the account of the instance does not
-// carry.
-//
-// The candidates are the groups of the machine that the account of the
-// instance is not a member of.
-func scmTestUncarriedSID(t *testing.T, identity scmIdentitySIDs) string {
-	t.Helper()
-	for _, candidate := range []string{
-		"S-1-5-32-544", // Administrators
-		"S-1-5-18",     // LocalSystem
-		"S-1-5-20",     // NetworkService
-		"S-1-5-32-546", // Guests
-		"S-1-5-4",      // Interactive Users
-	} {
-		if !identity.covers(candidate) {
-			return candidate
-		}
-	}
-	t.Fatalf("the membership %v carries every candidate group", identity.sids)
-	return ""
-}
-
 // scmTestNamesPath reports whether a message of the manager names a path.
 //
 // The messages of the manager quote the path they talk about, so the
@@ -2226,14 +1897,9 @@ func TestPreflightDataPathsAcceptAMissingNamedDirectory(t *testing.T) {
 	for _, named := range scmTestNamedDirs() {
 		t.Run(named.name, func(t *testing.T) {
 			root := t.TempDir()
-			// The nearest existing ancestor of the directory grants the
-			// account of the instance the access it needs to create the
-			// directory there.
-			scmTestSetDACL(t, root, scmTestAllowInstanceIdentityDACL(t))
-
 			opts, path := scmTestOptionsWithNamedDir(root, named)
-
-			if err := preflightDataPaths(opts); err != nil {
+			access := scmTestPathAccessFor(t, path, true)
+			if err := preflightDataPaths(opts, access); err != nil {
 				t.Errorf("preflightDataPaths() = %v, want nil for a directory the account of the instance can create", err)
 			}
 			// The installation created nothing: the instance creates the
@@ -2261,14 +1927,10 @@ func TestPreflightDataPathsRefuseAMissingNamedDirectory(t *testing.T) {
 	for _, named := range scmTestNamedDirs() {
 		t.Run(named.name, func(t *testing.T) {
 			root := t.TempDir()
-			// The nearest existing ancestor of the directory does not
-			// grant the account of the instance the access it needs to
-			// create the directory there.
-			scmTestSetDACL(t, root, scmTestDenyInstanceIdentityDACL(t))
-
 			opts, path := scmTestOptionsWithNamedDir(root, named)
+			access := scmTestPathAccessFor(t, path, false)
 
-			err := preflightDataPaths(opts)
+			err := preflightDataPaths(opts, access)
 			if err == nil {
 				t.Fatalf("preflightDataPaths() = nil, want the refusal of %s", named.name)
 			}
@@ -2312,13 +1974,9 @@ func TestPreflightDataPathJudgesTheNearestExistingAncestor(t *testing.T) {
 	if err := os.Mkdir(ancestor, 0o750); err != nil {
 		t.Fatalf("Mkdir() = %v, want nil", err)
 	}
-	scmTestSetDACL(t, ancestor, scmTestAllowInstanceIdentityDACL(t))
-	// The root of the test does not grant the account of the instance the
-	// access: the check has to judge the ancestor and not the root.
-	scmTestSetDACL(t, root, scmTestDenyInstanceIdentityDACL(t))
-
 	path := filepath.Join(ancestor, "b", "cache")
-	if err := preflightDataPath("cache dir", path); err != nil {
+	access := scmTestPathAccessFor(t, path, true)
+	if err := preflightDataPath("cache dir", path, access); err != nil {
 		t.Errorf("preflightDataPath(%q) = %v, want nil for a directory the account of the instance can create in its nearest existing ancestor", path, err)
 	}
 	// The installation created nothing.
@@ -2345,9 +2003,6 @@ func TestSCMPreflightDataPathsAcceptADirectoryInsideTheStateRoot(t *testing.T) {
 	if err := os.MkdirAll(stateDir, 0o750); err != nil {
 		t.Fatalf("MkdirAll() = %v, want nil", err)
 	}
-	// The state root belongs to the account of the instance.
-	scmTestSetDACL(t, stateDir, scmTestAllowInstanceIdentityDACL(t))
-
 	opts := scmTestOptions()
 	opts.Paths = runtimepaths.Paths{
 		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
@@ -2358,8 +2013,12 @@ func TestSCMPreflightDataPathsAcceptADirectoryInsideTheStateRoot(t *testing.T) {
 	opts.HubDir = filepath.Join(stateDir, "cache", "hub")
 	opts.LocalDir = ""
 
-	if err := preflightDataPaths(opts); err != nil {
+	access := &scmTestPathAccess{}
+	if err := preflightDataPaths(opts, access); err != nil {
 		t.Errorf("preflightDataPaths() = %v, want nil for a directory inside the state root", err)
+	}
+	if len(access.calls) != 0 {
+		t.Errorf("preflightDataPaths() checked %v, want the absent state-root default to remain exempt", access.calls)
 	}
 	// The directory was not created: the instance creates it when it runs.
 	if _, err := os.Stat(opts.CacheDir); !errors.Is(err, fs.ErrNotExist) {
@@ -2383,16 +2042,12 @@ func TestSCMPreflightDataPathsRefuseAnExistingDirectoryInsideTheStateRoot(t *tes
 	if err := os.MkdirAll(stateDir, 0o750); err != nil {
 		t.Fatalf("MkdirAll() = %v, want nil", err)
 	}
-	// The state root belongs to the account of the instance.
-	scmTestSetDACL(t, stateDir, scmTestAllowInstanceIdentityDACL(t))
-
 	// The cache exists already and the account of the instance cannot
 	// work with it.
 	cacheDir := filepath.Join(stateDir, "cache")
 	if err := os.Mkdir(cacheDir, 0o750); err != nil {
 		t.Fatalf("Mkdir() = %v, want nil", err)
 	}
-	scmTestSetDACL(t, cacheDir, scmTestDenyInstanceIdentityDACL(t))
 
 	opts := scmTestOptions()
 	opts.Paths = runtimepaths.Paths{
@@ -2404,7 +2059,7 @@ func TestSCMPreflightDataPathsRefuseAnExistingDirectoryInsideTheStateRoot(t *tes
 	opts.HubDir = ""
 	opts.LocalDir = ""
 
-	err := preflightDataPaths(opts)
+	err := preflightDataPaths(opts, scmTestPathAccessFor(t, cacheDir, false))
 	if err == nil {
 		t.Fatalf("preflightDataPaths() = nil, want the refusal of an existing directory inside the state root")
 	}
@@ -2426,7 +2081,6 @@ func TestSCMPreflightDataPathsCheckAnExistingDirectoryOutsideTheStateRoot(t *tes
 	if err := os.MkdirAll(stateDir, 0o750); err != nil {
 		t.Fatalf("MkdirAll() = %v, want nil", err)
 	}
-	scmTestSetDACL(t, stateDir, scmTestAllowInstanceIdentityDACL(t))
 
 	// A directory outside of the state root the account of the instance
 	// can work with.
@@ -2434,7 +2088,6 @@ func TestSCMPreflightDataPathsCheckAnExistingDirectoryOutsideTheStateRoot(t *tes
 	if err := os.Mkdir(usable, 0o750); err != nil {
 		t.Fatalf("Mkdir() = %v, want nil", err)
 	}
-	scmTestSetDACL(t, usable, scmTestAllowInstanceIdentityDACL(t))
 
 	// A directory outside of the state root the account of the instance
 	// cannot work with.
@@ -2442,7 +2095,6 @@ func TestSCMPreflightDataPathsCheckAnExistingDirectoryOutsideTheStateRoot(t *tes
 	if err := os.Mkdir(unusable, 0o750); err != nil {
 		t.Fatalf("Mkdir() = %v, want nil", err)
 	}
-	scmTestSetDACL(t, unusable, scmTestDenyInstanceIdentityDACL(t))
 
 	opts := scmTestOptions()
 	opts.Paths = runtimepaths.Paths{
@@ -2456,13 +2108,13 @@ func TestSCMPreflightDataPathsCheckAnExistingDirectoryOutsideTheStateRoot(t *tes
 	// The directory the account of the instance can work with is
 	// accepted.
 	opts.CacheDir = usable
-	if err := preflightDataPaths(opts); err != nil {
+	if err := preflightDataPaths(opts, scmTestPathAccessFor(t, usable, true)); err != nil {
 		t.Errorf("preflightDataPaths() = %v, want nil for a directory the account of the instance can work with", err)
 	}
 
 	// The directory it cannot work with is refused.
 	opts.CacheDir = unusable
-	err := preflightDataPaths(opts)
+	err := preflightDataPaths(opts, scmTestPathAccessFor(t, unusable, false))
 	if err == nil {
 		t.Fatalf("preflightDataPaths() = nil, want the refusal of a directory the account of the instance cannot work with")
 	}
@@ -2490,7 +2142,6 @@ func TestSCMPreflightDataPathsRefuseALinkThatLeavesTheStateRoot(t *testing.T) {
 	if err := os.MkdirAll(stateDir, 0o750); err != nil {
 		t.Fatalf("MkdirAll() = %v, want nil", err)
 	}
-	scmTestSetDACL(t, stateDir, scmTestAllowInstanceIdentityDACL(t))
 
 	// A directory outside of the state root that the account of the
 	// instance cannot use.
@@ -2498,7 +2149,6 @@ func TestSCMPreflightDataPathsRefuseALinkThatLeavesTheStateRoot(t *testing.T) {
 	if err := os.Mkdir(outside, 0o750); err != nil {
 		t.Fatalf("Mkdir() = %v, want nil", err)
 	}
-	scmTestSetDACL(t, outside, scmTestDenyInstanceIdentityDACL(t))
 
 	// A link inside the state root that points at it.
 	link := filepath.Join(stateDir, "cache")
@@ -2526,7 +2176,7 @@ func TestSCMPreflightDataPathsRefuseALinkThatLeavesTheStateRoot(t *testing.T) {
 	opts.HubDir = ""
 	opts.LocalDir = ""
 
-	err = preflightDataPaths(opts)
+	err = preflightDataPaths(opts, scmTestPathAccessFor(t, link, false))
 	if err == nil {
 		t.Fatalf("preflightDataPaths() = nil, want the refusal of a link that leaves the state root")
 	}
@@ -2555,13 +2205,8 @@ func TestPreflightDataPathRefusesAPathTheIdentityCannotReach(t *testing.T) {
 	if err := os.Mkdir(parent, 0o700); err != nil {
 		t.Fatalf("Mkdir() = %v, want nil", err)
 	}
-	// The directory grants the machine and its administrators the access,
-	// not the account the instance runs as: the account of the instance
-	// could not create the directory there either.
-	scmTestSetDACL(t, parent, fmt.Sprintf("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;%s)", scmTestCurrentUserSID(t)))
-
 	path := filepath.Join(parent, "cache")
-	err := preflightDataPath("cache dir", path)
+	err := preflightDataPath("cache dir", path, scmTestPathAccessFor(t, path, false))
 	if err == nil {
 		t.Fatalf("preflightDataPath(%q) = nil, want an error", path)
 	}
@@ -2597,75 +2242,29 @@ func TestPreflightDataPathRefusesAPathTheIdentityCannotReach(t *testing.T) {
 	}
 }
 
-// TestPreflightDataPathRefusesADirectoryThatGrantsOnlyTheInteractiveUsers
-// checks that a directory the instance can never use is refused.
-//
-// The instance runs a service logon and is never an interactive user, so a
-// descriptor that grants the access to the interactive users of the machine
-// only grants the access to the users of an interactive session. The
-// preflight has to refuse the directory instead of accepting it.
-func TestPreflightDataPathRefusesADirectoryThatGrantsOnlyTheInteractiveUsers(t *testing.T) {
+// TestPreflightDataPathDoesNotInferLocalServiceAccessWithoutItsToken keeps an
+// incomplete identity model from becoming a denial oracle.
+func TestPreflightDataPathDoesNotInferLocalServiceAccessWithoutItsToken(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "cache")
 	if err := os.Mkdir(path, 0o700); err != nil {
 		t.Fatalf("Mkdir() = %v, want nil", err)
 	}
-	// The directory grants the access to the interactive users of the
-	// machine, to the machine itself and to the account of the test: the
-	// test has to keep the access to the directory it restricted.
-	scmTestSetDACL(t, path, fmt.Sprintf(
-		"D:P(A;OICI;FA;;;%s)(A;OICI;FA;;;SY)(A;OICI;FA;;;%s)",
-		scmInteractiveUsersSID, scmTestCurrentUserSID(t)))
-
 	err := preflightDataPath("cache dir", path)
-	if err == nil {
-		t.Fatalf("preflightDataPath(%q) = nil, want the refusal of a directory that grants the access to the interactive users only", path)
-	}
-	if !scmTestNamesPath(err.Error(), path) {
-		t.Errorf("preflightDataPath(%q) = %v, want an error that names the path", path, err)
-	}
-	if !strings.Contains(err.Error(), scmServiceIdentityName) {
-		t.Errorf("preflightDataPath(%q) = %v, want an error that names the account of the instance", path, err)
-	}
-	if !strings.Contains(err.Error(), "grant the account") {
-		t.Errorf("preflightDataPath(%q) = %v, want an error that tells the user what to do", path, err)
+	if err != nil {
+		t.Fatalf("preflightDataPath(%q) = %v, want inconclusive success without an actual LocalService token", path, err)
 	}
 }
 
-// TestPreflightDataPathRefusesADirectoryThatGrantsOnlyTheChildren checks
-// that a directory whose only entry for the account of the instance applies
-// to its children is refused.
-//
-// An inherit only entry is about the children of the directory: the
-// directory itself is not covered by it. A directory the account of the
-// instance can only reach through its children is a directory the instance
-// can never use, and the preflight has to refuse it.
-func TestPreflightDataPathRefusesADirectoryThatGrantsOnlyTheChildren(t *testing.T) {
+func TestPreflightDataPathLeavesDescriptorReadFailureInconclusive(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "cache")
 	if err := os.Mkdir(path, 0o700); err != nil {
 		t.Fatalf("Mkdir() = %v, want nil", err)
 	}
-	// The directory grants the account of the instance the access to its
-	// children only, and the account of the test the access to the
-	// directory itself: the test has to keep the access to the directory
-	// it restricted.
-	scmTestSetDACL(t, path, fmt.Sprintf(
-		"D:P(A;OICIIO;FA;;;%s)(A;;FA;;;%s)",
-		scmServiceIdentitySID, scmTestCurrentUserSID(t)))
-
-	err := preflightDataPath("cache dir", path)
-	if err == nil {
-		t.Fatalf("preflightDataPath(%q) = nil, want the refusal of a directory that grants the account the access to its children only", path)
-	}
-	if !scmTestNamesPath(err.Error(), path) {
-		t.Errorf("preflightDataPath(%q) = %v, want an error that names the path", path, err)
-	}
-	if !strings.Contains(err.Error(), scmServiceIdentityName) {
-		t.Errorf("preflightDataPath(%q) = %v, want an error that names the account of the instance", path, err)
-	}
-	if !strings.Contains(err.Error(), "grant the account") {
-		t.Errorf("preflightDataPath(%q) = %v, want an error that tells the user what to do", path, err)
+	access := &scmTestPathAccess{errors: map[string]error{path: errors.New("descriptor unavailable")}}
+	if err := preflightDataPath("cache dir", path, access); err != nil {
+		t.Fatalf("preflightDataPath(%q) = %v, want unknown AccessCheck evidence to remain inconclusive", path, err)
 	}
 }
 
@@ -2688,7 +2287,7 @@ func TestSCMPreflightExecutableAccess(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			scmCheckExecutableAccess = func(string) (scmExecutableAccess, string) {
+			scmCheckExecutableAccess = func(string, scmPathAccess) (scmExecutableAccess, string) {
 				return tc.access, tc.reason
 			}
 			err := preflightExecutableAccess(executable)
@@ -2710,34 +2309,163 @@ func TestSCMPreflightExecutableAccess(t *testing.T) {
 	}
 }
 
-// TestSDDLGrantsExecutable checks the read and execute access of a program and
-// the traverse access of a parent directory.
-func TestSDDLGrantsExecutable(t *testing.T) {
-	identity := scmDocumentedIdentitySIDs()
+type scmTestPathAccess struct {
+	results      map[string]bool
+	errors       map[string]error
+	defaultSet   bool
+	defaultAllow bool
+	privilege    bool
+	privilegeErr error
+	calls        []struct {
+		path    string
+		desired uint32
+	}
+}
+
+func (a *scmTestPathAccess) Check(path string, desired uint32) (bool, error) {
+	a.calls = append(a.calls, struct {
+		path    string
+		desired uint32
+	}{path, desired})
+	if err := a.errors[path]; err != nil {
+		return false, err
+	}
+	result, ok := a.results[path]
+	if !ok {
+		if a.defaultSet {
+			return a.defaultAllow, nil
+		}
+		return false, fmt.Errorf("no test AccessCheck result for %q", path)
+	}
+	return result, nil
+}
+
+func (a *scmTestPathAccess) HasEnabledPrivilege(name string) (bool, error) {
+	if name != scmChangeNotifyPrivilege {
+		return false, fmt.Errorf("unexpected privilege query %q", name)
+	}
+	return a.privilege, a.privilegeErr
+}
+
+func (*scmTestPathAccess) Close() {}
+
+func scmTestPathAccessFor(t *testing.T, path string, allowed bool) *scmTestPathAccess {
+	t.Helper()
+	checked := path
+	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+		var nearestErr error
+		checked, nearestErr = scmNearestExistingDir(path)
+		if nearestErr != nil {
+			t.Fatalf("find the AccessCheck target for %q: %v", path, nearestErr)
+		}
+	}
+	resolved, err := scmResolvePath(checked)
+	if err != nil {
+		t.Fatalf("resolve the AccessCheck target for %q: %v", path, err)
+	}
+	return &scmTestPathAccess{
+		results:      map[string]bool{resolved: allowed},
+		defaultSet:   true,
+		defaultAllow: true,
+		privilege:    true,
+	}
+}
+
+func scmTestImpersonationToken(t *testing.T) windows.Token {
+	t.Helper()
+	var token windows.Token
+	if err := windows.DuplicateTokenEx(windows.GetCurrentProcessToken(), windows.TOKEN_QUERY,
+		nil, windows.SecurityImpersonation, windows.TokenImpersonation, &token); err != nil {
+		t.Skipf("cannot duplicate the test token for AccessCheck: %v", err)
+	}
+	t.Cleanup(func() { _ = token.Close() })
+	return token
+}
+
+func TestSCMAccessCheckMapsGenericRightsAndHonorsDACLOrder(t *testing.T) {
+	token := scmTestImpersonationToken(t)
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil || user.User.Sid == nil {
+		t.Skipf("the current token SID is unavailable: %v", err)
+	}
+	sid := user.User.Sid.String()
 	for _, tc := range []struct {
-		name     string
-		sddl     string
-		exec     bool
-		traverse bool
+		name    string
+		sddl    string
+		allowed bool
 	}{
-		{"full control", "D:P(A;;FA;;;LS)", true, true},
-		{"the generic read and execute", "D:P(A;;GR;;;LS)(A;;GX;;;LS)", true, true},
-		{"the read and execute rights", "D:P(A;;FR;;;LS)(A;;FX;;;LS)", true, true},
-		{"the generic execute", "D:P(A;;GX;;;LS)", false, true},
-		{"execute only", "D:P(A;;FX;;;LS)", false, true},
-		{"read only", "D:P(A;;FR;;;LS)", false, false},
-		{"a denied execute next to full control", "D:P(D;;FX;;;LS)(A;;FA;;;LS)", false, false},
-		{"an inherit only entry", "D:P(A;OICIIO;FA;;;LS)", false, false},
-		{"a null DACL", "D:NO_ACCESS_CONTROL", true, true},
+		{"earlier complete explicit allow wins before inherited deny", fmt.Sprintf("D:P(A;;FR;;;%s)(A;;FX;;;%s)(D;ID;FA;;;WD)", sid, sid), true},
+		{"earlier deny blocks later allow", fmt.Sprintf("D:P(D;;FR;;;WD)(A;;FA;;;%s)", sid), false},
+		{"inherit-only allow does not apply to this object", fmt.Sprintf("D:P(A;OICIIO;FA;;;%s)", sid), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := sddlGrantsExecutable(tc.sddl, identity); (err != nil) == tc.exec {
-				t.Errorf("sddlGrantsExecutable(%q) = %v, want a refusal = %t", tc.sddl, err, !tc.exec)
+			sd, err := windows.SecurityDescriptorFromString(tc.sddl)
+			if err != nil {
+				t.Fatalf("SecurityDescriptorFromString() = %v", err)
 			}
-			if err := sddlGrantsTraverse(tc.sddl, identity); (err != nil) == tc.traverse {
-				t.Errorf("sddlGrantsTraverse(%q) = %v, want a refusal = %t", tc.sddl, err, !tc.traverse)
+			allowed, err := scmAccessCheckDescriptor(token, sd, windows.GENERIC_READ|windows.GENERIC_EXECUTE)
+			if err != nil {
+				t.Fatalf("AccessCheck = %v", err)
+			}
+			if allowed != tc.allowed {
+				t.Errorf("AccessCheck(%q) = %v, want %v", tc.sddl, allowed, tc.allowed)
 			}
 		})
+	}
+}
+
+func TestSCMPathAccessHonorsTraversePrivilegeAndUnknownEvidence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "parent", "hfdesk.exe")
+	parent := filepath.Dir(path)
+	withPrivilege := &scmTestPathAccess{
+		results:   map[string]bool{path: true, parent: false},
+		privilege: true,
+	}
+	decision, _ := scmCheckPathAccess(path, windows.GENERIC_READ|windows.GENERIC_EXECUTE, withPrivilege)
+	if decision != scmExecutableAccessAllowed {
+		t.Fatalf("a denied parent traverse ACE overrode enabled SeChangeNotifyPrivilege: decision %v", decision)
+	}
+	if len(withPrivilege.calls) != 1 || withPrivilege.calls[0].path != path {
+		t.Errorf("AccessCheck calls = %+v, want only the executable object when traverse bypass is enabled", withPrivilege.calls)
+	}
+
+	withoutPrivilege := &scmTestPathAccess{
+		results: map[string]bool{path: true, parent: false},
+	}
+	decision, _ = scmCheckPathAccess(path, windows.GENERIC_READ|windows.GENERIC_EXECUTE, withoutPrivilege)
+	if decision != scmExecutableAccessDenied {
+		t.Errorf("a real parent traverse denial without the bypass privilege = %v, want denied", decision)
+	}
+
+	decision, _ = scmCheckPathAccess(path, windows.GENERIC_READ|windows.GENERIC_EXECUTE, nil)
+	if decision != scmExecutableAccessInconclusive {
+		t.Errorf("missing token evidence = %v, want inconclusive", decision)
+	}
+	unknown := &scmTestPathAccess{errors: map[string]error{path: errors.New("descriptor unavailable")}}
+	decision, _ = scmCheckPathAccess(path, windows.GENERIC_READ|windows.GENERIC_EXECUTE, unknown)
+	if decision != scmExecutableAccessInconclusive {
+		t.Errorf("unavailable descriptor evidence = %v, want inconclusive", decision)
+	}
+	privilegeUnknown := &scmTestPathAccess{
+		results:      map[string]bool{path: true},
+		privilegeErr: errors.New("token privileges unavailable"),
+	}
+	decision, _ = scmCheckPathAccess(path, windows.GENERIC_READ|windows.GENERIC_EXECUTE, privilegeUnknown)
+	if decision != scmExecutableAccessInconclusive {
+		t.Errorf("unavailable traverse-privilege evidence = %v, want inconclusive", decision)
+	}
+}
+
+func TestSCMDataDirectoryPreflightUsesTheSameAccessCheckOwner(t *testing.T) {
+	dir := t.TempDir()
+	denied := &scmTestPathAccess{results: map[string]bool{dir: false}, privilege: true}
+	err := preflightDataPath("cache dir", dir, denied)
+	if err == nil || !strings.Contains(err.Error(), "Windows AccessCheck denied") {
+		t.Fatalf("preflightDataPath() = %v, want the actual AccessCheck denial", err)
+	}
+	unknown := preflightDataPath("cache dir", dir)
+	if unknown != nil {
+		t.Fatalf("preflightDataPath() without a service token = %v, want inconclusive success", unknown)
 	}
 }
 
@@ -2777,81 +2505,62 @@ func TestPreflightExecutableImageRefusesATruncatedProgram(t *testing.T) {
 	}
 }
 
-// TestPreflightExecutableImageRefusesAProgramOfAnotherArchitecture proves
-// that an installation refuses a program that was built for another
-// architecture than the process that installs it, and that a process
-// architecture without a comparison only requires a PE image.
-func TestPreflightExecutableImageComparesTheMachineOfTheProcess(t *testing.T) {
+// TestPreflightExecutableImageUsesTheHostSupportResult proves that candidate
+// acceptance follows Windows host support rather than the architecture of the
+// installer process.
+func TestPreflightExecutableImageUsesTheHostSupportResult(t *testing.T) {
 	cases := []struct {
 		name    string
-		arch    string
 		machine uint16
+		support scmExecutableSupport
 		wantErr bool
 	}{
-		{"AMD64 image for an AMD64 process", "amd64", pe.MachineAMD64, false},
-		{"ARM64 image for an AMD64 process", "amd64", pe.MachineARM64, true},
-		{"ARM64 image for an ARM64 process", "arm64", pe.MachineARM64, false},
-		{"AMD64 image for an ARM64 process", "arm64", pe.MachineAMD64, true},
-		// The installation has no comparison for this architecture of
-		// the process: the file is still required to be a PE image.
-		{"ARM64 image for a 386 process", "386", pe.MachineARM64, false},
+		{"host-supported native image", pe.MachineAMD64, scmExecutableSupported, false},
+		{"host-supported emulated image", pe.MachineARM64, scmExecutableSupported, false},
+		{"known unsupported image", pe.MachineI386, scmExecutableUnsupported, true},
+		{"unknown host support is not incompatibility", pe.MachineARM64, scmExecutableSupportUnknown, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			path := scmTestExecutable(t, scmTestPEImage(tc.machine))
 
-			err := preflightExecutableImageFor(path, tc.arch)
+			err := preflightExecutableImageWithSupport(path, func(uint16) scmExecutableSupport {
+				return tc.support
+			})
 			if !tc.wantErr {
 				if err != nil {
-					t.Fatalf("preflightExecutableImageFor(%q, %q) = %v, want nil", path, tc.arch, err)
+					t.Fatalf("preflightExecutableImageWithSupport(%q) = %v, want nil", path, err)
 				}
 				return
 			}
 			if err == nil {
-				t.Fatalf("preflightExecutableImageFor(%q, %q) = nil, want the refusal of the architecture 0x%04X", path, tc.arch, tc.machine)
+				t.Fatalf("preflightExecutableImageWithSupport(%q) = nil, want the refusal of machine 0x%04X", path, tc.machine)
 			}
 			if !scmTestNamesPath(err.Error(), path) {
-				t.Errorf("preflightExecutableImageFor(%q, %q) = %v, want an error that names the file", path, tc.arch, err)
+				t.Errorf("preflightExecutableImageWithSupport(%q) = %v, want an error that names the file", path, err)
 			}
-			if !strings.Contains(err.Error(), "another architecture") {
-				t.Errorf("preflightExecutableImageFor(%q, %q) = %v, want an error that says the program is built for another architecture", path, tc.arch, err)
+			if !strings.Contains(err.Error(), "reports this host cannot execute") {
+				t.Errorf("preflightExecutableImageWithSupport(%q) = %v, want a known host incompatibility", path, err)
 			}
 		})
 	}
 }
 
-// TestPreflightExecutableImageRequiresAPEImageForAnArchitectureWithoutAComparison
-// proves that the architecture without a comparison is no way around the check
-// of the file: a file that is not a program is refused as well.
-func TestPreflightExecutableImageRequiresAPEImageForAnArchitectureWithoutAComparison(t *testing.T) {
-	path := scmTestExecutable(t, []byte(strings.Repeat("this is not a Windows program\n", 8)))
-
-	if err := preflightExecutableImageFor(path, "386"); err == nil {
-		t.Fatal("preflightExecutableImageFor accepted a file that is not a Windows program")
+func TestPreflightExecutableImageAcceptsTheActualWindowsTestExecutable(t *testing.T) {
+	path, err := os.Executable()
+	if err != nil {
+		t.Fatalf("Executable() = %v", err)
+	}
+	if err := preflightExecutableImage(path); err != nil {
+		t.Fatalf("preflightExecutableImage(%q) = %v, want the actual running test image to pass", path, err)
 	}
 }
 
-// TestSCMProcessMachineNamesTheArchitecturesOfTheImages proves that only the
-// architectures HFDesk ships have a machine type the installation compares.
-func TestSCMProcessMachineNamesTheArchitecturesOfTheImages(t *testing.T) {
-	cases := map[string]struct {
-		machine uint16
-		known   bool
-	}{
-		"amd64": {pe.MachineAMD64, true},
-		"arm64": {pe.MachineARM64, true},
-		"386":   {0, false},
-		"wasm":  {0, false},
-		"":      {0, false},
-	}
-	for arch, want := range cases {
-		machine, known := scmProcessMachine(arch)
-		if known != want.known {
-			t.Errorf("scmProcessMachine(%q) known = %v, want %v", arch, known, want.known)
-		}
-		if machine != want.machine {
-			t.Errorf("scmProcessMachine(%q) machine = 0x%04X, want 0x%04X", arch, machine, want.machine)
-		}
+func TestPreflightExecutableImageRequiresACompletePEExecutable(t *testing.T) {
+	path := scmTestExecutable(t, []byte(strings.Repeat("this is not a Windows program\n", 8)))
+
+	if err := preflightExecutableImageWithSupport(path, nil); err == nil {
+		t.Fatal("preflightExecutableImageWithSupport accepted a file that is not a Windows program")
 	}
 }
 
@@ -3012,6 +2721,33 @@ func scmTestDACL(t *testing.T, path string) string {
 	return permissions[index:]
 }
 
+// sddlACE and its parser are test-only descriptor-inspection helpers. They do
+// not classify access; production uses the Windows AccessCheck API.
+type sddlACE struct{ trustee string }
+
+func parseSDDLAces(sddl string) []sddlACE {
+	var aces []sddlACE
+	for i := 0; i < len(sddl); {
+		open := strings.IndexByte(sddl[i:], '(')
+		if open < 0 {
+			break
+		}
+		i += open + 1
+		end := strings.IndexByte(sddl[i:], ')')
+		if end < 0 {
+			break
+		}
+		fields := strings.Split(sddl[i:i+end], ";")
+		if len(fields) >= 6 {
+			if trustee := strings.TrimSpace(fields[len(fields)-1]); trustee != "" {
+				aces = append(aces, sddlACE{trustee: trustee})
+			}
+		}
+		i += end + 1
+	}
+	return aces
+}
+
 // scmTestTrustees returns the trustees of the access control list of a path.
 //
 // The trustees are returned as SIDs: the aliases of the platform are
@@ -3133,9 +2869,9 @@ func TestSCMInstanceStateKeepsTheDescriptorOfADirectoryThatExistedBefore(t *test
 	}
 }
 
-// TestSCMInstanceStateRefusesADirectoryTheIdentityCannotUse checks that a
-// directory that existed before the installation and that the account of the
-// instance cannot use is refused, and that no descriptor was changed.
+// TestSCMInstanceStateRefusesADirectoryTheIdentityCannotUse checks that an
+// established AccessCheck denial for an existing state directory is refused,
+// and that no descriptor was changed.
 //
 // The refusal happens before the first descriptor is changed, so the
 // directories the installation created keep the descriptor they inherited.
@@ -3146,13 +2882,13 @@ func TestSCMInstanceStateRefusesADirectoryTheIdentityCannotUse(t *testing.T) {
 	root := t.TempDir()
 	opts := scmTestInstallOptions(t, root)
 
-	// The state directory existed before the installation and grants the
-	// access to the machine and to its administrators only.
+	// The state directory existed before the installation. Access denial is
+	// injected through the native-query seam, without changing its ACL.
 	stateDir := opts.Paths.StateDir
 	if err := os.MkdirAll(stateDir, 0o750); err != nil {
 		t.Fatalf("MkdirAll(%q) = %v, want nil", stateDir, err)
 	}
-	scmTestSetDACL(t, stateDir, scmTestDenyInstanceIdentityDACL(t))
+	// The path access result is injected below; no ACL is changed by this test.
 
 	snapshot := newSCMInstallSnapshot(opts)
 	if err := PrepareDirs(opts); err != nil {
@@ -3167,7 +2903,7 @@ func TestSCMInstanceStateRefusesADirectoryTheIdentityCannotUse(t *testing.T) {
 		before[path] = scmTestDACL(t, path)
 	}
 
-	err := restrictInstanceState(opts, snapshot)
+	err := restrictInstanceState(opts, snapshot, scmTestPathAccessFor(t, stateDir, false))
 	if err == nil {
 		t.Fatal("restrictInstanceState() = nil, want the refusal of the state directory")
 	}
@@ -3308,30 +3044,47 @@ func scmTestSetDACL(t *testing.T, path, sddl string) {
 	}
 }
 
-// The layout of the PE image the tests synthesize.
+// The layout of the structurally complete PE image the tests synthesize.
 const (
 	// scmTestDosHeaderSize is the size of the DOS header, the part of an
 	// image the offset of the PE header is read from.
 	scmTestDosHeaderSize = 64
 	// scmTestPeHeaderOffset is the offset of the PE header in the
 	// synthesized image.
-	scmTestPeHeaderOffset = 0x80
-	// scmTestPeHeaderSize is the size of the PE signature and of the COFF
-	// header that follows it.
-	scmTestPeHeaderSize = 24
+	scmTestPeHeaderOffset       = 0x80
+	scmTestOptionalHeaderSize   = 240
+	scmTestOptionalHeader32Size = 224
+	scmTestSectionHeaderSize    = 40
+	scmTestSectionRawOffset     = 0x200
+	scmTestSectionRawSize       = 0x200
 )
 
-// scmTestPEImage builds a PE image of the given machine type.
-//
-// Only the fields the installation reads are filled in: the DOS header, the PE
-// signature and the machine type of the COFF header. The rest of the image is
-// zero, which is enough for the machine type to be read.
+// scmTestPEImage builds a structurally complete PE image with one section.
+// It exercises header validation, not actual Windows loadability.
 func scmTestPEImage(machine uint16) []byte {
-	image := make([]byte, scmTestPeHeaderOffset+scmTestPeHeaderSize)
+	image := make([]byte, scmTestSectionRawOffset+scmTestSectionRawSize)
+	optionalSize := scmTestOptionalHeaderSize
+	magic := uint16(0x020B)
+	if machine == pe.MachineI386 {
+		optionalSize = scmTestOptionalHeader32Size
+		magic = 0x010B
+	}
 	copy(image[0:], []byte("MZ"))
 	binary.LittleEndian.PutUint32(image[0x3C:], scmTestPeHeaderOffset)
 	copy(image[scmTestPeHeaderOffset:], []byte("PE\x00\x00"))
 	binary.LittleEndian.PutUint16(image[scmTestPeHeaderOffset+4:], machine)
+	binary.LittleEndian.PutUint16(image[scmTestPeHeaderOffset+4+2:], 1)
+	binary.LittleEndian.PutUint16(image[scmTestPeHeaderOffset+4+16:], uint16(optionalSize))
+	binary.LittleEndian.PutUint16(image[scmTestPeHeaderOffset+4+18:], 0x0002)
+	optional := scmTestPeHeaderOffset + 24
+	binary.LittleEndian.PutUint16(image[optional:], magic)
+	binary.LittleEndian.PutUint32(image[optional+16:], 0x1000)
+	section := optional + optionalSize
+	copy(image[section:], []byte(".text"))
+	binary.LittleEndian.PutUint32(image[section+8:], scmTestSectionRawSize)
+	binary.LittleEndian.PutUint32(image[section+12:], 0x1000)
+	binary.LittleEndian.PutUint32(image[section+16:], scmTestSectionRawSize)
+	binary.LittleEndian.PutUint32(image[section+20:], scmTestSectionRawOffset)
 	return image
 }
 
@@ -3362,7 +3115,7 @@ func scmTestInstallOptions(t *testing.T, root string) InstallOptions {
 	// The ACL of the system program is not the subject of the tests that
 	// install it: the access check has tests of its own.
 	previousAccess := scmCheckExecutableAccess
-	scmCheckExecutableAccess = func(string) (scmExecutableAccess, string) {
+	scmCheckExecutableAccess = func(string, scmPathAccess) (scmExecutableAccess, string) {
 		return scmExecutableAccessAllowed, ""
 	}
 	t.Cleanup(func() { scmCheckExecutableAccess = previousAccess })
@@ -3381,23 +3134,9 @@ func scmTestInstallOptions(t *testing.T, root string) InstallOptions {
 	}
 }
 
-// scmTestDenyInstanceIdentityDACL returns a descriptor that grants the
-// machine, its administrators and the account of the test the access, and
-// the account of the instance none.
-//
-// A directory with this descriptor is refused by the preflight: the account
-// the instance runs as cannot work with it.
-func scmTestDenyInstanceIdentityDACL(t *testing.T) string {
-	t.Helper()
-	return fmt.Sprintf("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;%s)", scmTestCurrentUserSID(t))
-}
-
-// scmTestAllowInstanceIdentityDACL returns a descriptor that grants the
-// machine, its administrators, the account of the instance and the account
-// of the test the access.
-//
-// A directory with this descriptor passes the preflight: the account the
-// instance runs as can work with it.
+// scmTestAllowInstanceIdentityDACL returns a descriptor used by tests that
+// inspect state-directory ACL changes. It does not substitute for the
+// effective-token AccessCheck used by installation preflight.
 func scmTestAllowInstanceIdentityDACL(t *testing.T) string {
 	t.Helper()
 	return fmt.Sprintf("%s(A;OICI;FA;;;%s)", scmStateSDDL(), scmTestCurrentUserSID(t))
@@ -3455,18 +3194,21 @@ func scmTestOwnerAndMode(t *testing.T, path string) (string, os.FileMode) {
 	return owner.String(), info.Mode().Perm()
 }
 
-// scmTestRefuseLocalDir turns the local directory of an installation into a
-// directory the account of the instance cannot reach.
+// scmTestRefuseLocalDir injects an established AccessCheck denial without
+// mutating the ACL of the local directory.
 //
-// The preflight refuses the installation when it reaches the local
-// directory, so the installation fails after the directories of the instance
-// were created: the point a failed installation has to clean up.
+// The installation fails after creating its own directories, exercising that
+// cleanup boundary before any live SCM operation.
 func scmTestRefuseLocalDir(t *testing.T, opts InstallOptions) {
 	t.Helper()
 	if err := os.MkdirAll(opts.LocalDir, 0o700); err != nil {
 		t.Fatalf("MkdirAll(%q) = %v, want nil", opts.LocalDir, err)
 	}
-	scmTestSetDACL(t, opts.LocalDir, scmTestDenyInstanceIdentityDACL(t))
+	previous := scmOpenPathAccess
+	scmOpenPathAccess = func(uint32) (scmPathAccess, error) {
+		return scmTestPathAccessFor(t, opts.LocalDir, false), nil
+	}
+	t.Cleanup(func() { scmOpenPathAccess = previous })
 }
 
 // TestSCMCreatedDirOrder checks the order of the directories a failed
@@ -3863,7 +3605,7 @@ func TestSCMReinstallKeepsTheRegistrationOfTheInstance(t *testing.T) {
 		HubDir:   filepath.Join("C:\\ProgramData", "HFDesk", "cache", "hub"),
 	}
 
-	merged := mergeInstallOptions(requested, existing)
+	merged := mergeInstallOptions(requested, existing, true)
 
 	if merged.Executable != requested.Executable {
 		t.Errorf("the executable = %q, want the one of the request %q", merged.Executable, requested.Executable)
@@ -3909,7 +3651,7 @@ func TestSCMReinstallHonoursTheExplicitFields(t *testing.T) {
 		LocalDir: filepath.Join("C:\\Named", "models"),
 	}
 
-	merged := mergeInstallOptions(requested, existing)
+	merged := mergeInstallOptions(requested, existing, true)
 	if !reflect.DeepEqual(merged, requested) {
 		t.Errorf("mergeInstallOptions() =\n%+v\nwant the request\n%+v", merged, requested)
 	}
@@ -3948,15 +3690,9 @@ func TestSCMRecoveryActionsRestartTheFailedInstance(t *testing.T) {
 	}
 }
 
-// TestSCMRecoveryDecisionKeepsARegisteredPolicy checks what an installation does
-// with the failure recovery of a registration: the policy of HFDesk is configured
-// only when the registration has none, and a policy that is registered already is
-// kept, because a repeat installation keeps the settings of the instance and an
-// administrator may have set a policy of their own.
-//
-// A read that fails does not skip the required policy: a service without recovery
-// is the state the installation exists to prevent, so the policy of HFDesk is
-// configured then.
+// TestSCMRecoveryDecisionKeepsARegisteredPolicy checks that only a successful
+// read of an empty action list authorizes default recovery setup. A failed read
+// is not evidence that the registration lacks recovery.
 func TestSCMRecoveryDecisionKeepsARegisteredPolicy(t *testing.T) {
 	administrator := []mgr.RecoveryAction{
 		{Type: mgr.ServiceRestart, Delay: 10 * time.Second},
@@ -3976,8 +3712,8 @@ func TestSCMRecoveryDecisionKeepsARegisteredPolicy(t *testing.T) {
 		{"the policy of HFDesk is registered already", scmRecoveryActions(), nil, scmRecoveryKeep},
 		{"a policy of an administrator", administrator, nil, scmRecoveryKeep},
 		{"an explicitly registered policy of no action", []mgr.RecoveryAction{{Type: mgr.NoAction}}, nil, scmRecoveryKeep},
-		{"a read that fails", nil, readFailure, scmRecoveryConfigure},
-		{"a read that fails although actions were returned", administrator, readFailure, scmRecoveryConfigure},
+		{"a read that fails", nil, readFailure, scmRecoveryUnreadable},
+		{"a read that fails although actions were returned", administrator, readFailure, scmRecoveryUnreadable},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -3986,6 +3722,230 @@ func TestSCMRecoveryDecisionKeepsARegisteredPolicy(t *testing.T) {
 					test.existing, test.readErr, got, test.want)
 			}
 		})
+	}
+}
+
+type scmTestRecoveryConfig struct {
+	actions         []mgr.RecoveryAction
+	resetPeriod     uint32
+	nonCrash        bool
+	command         string
+	rebootMessage   string
+	actionsReadErr  error
+	resetReadErr    error
+	nonCrashReadErr error
+	commandReadErr  error
+	rebootReadErr   error
+	actionWriteErrs []error
+	flagWriteErrs   []error
+	actionWrites    []scmRecoverySettings
+	flagWrites      []bool
+}
+
+func (c *scmTestRecoveryConfig) RecoveryActions() ([]mgr.RecoveryAction, error) {
+	return slices.Clone(c.actions), c.actionsReadErr
+}
+func (c *scmTestRecoveryConfig) ResetPeriod() (uint32, error) {
+	return c.resetPeriod, c.resetReadErr
+}
+func (c *scmTestRecoveryConfig) RecoveryActionsOnNonCrashFailures() (bool, error) {
+	return c.nonCrash, c.nonCrashReadErr
+}
+func (c *scmTestRecoveryConfig) RecoveryCommand() (string, error) {
+	return c.command, c.commandReadErr
+}
+func (c *scmTestRecoveryConfig) RebootMessage() (string, error) {
+	return c.rebootMessage, c.rebootReadErr
+}
+func (c *scmTestRecoveryConfig) SetActions(actions []mgr.RecoveryAction, reset uint32, command, reboot string) error {
+	c.actionWrites = append(c.actionWrites, scmRecoverySettings{
+		actions: slices.Clone(actions), resetPeriod: reset, command: command, rebootMessage: reboot,
+	})
+	var err error
+	if len(c.actionWriteErrs) > 0 {
+		err = c.actionWriteErrs[0]
+		c.actionWriteErrs = c.actionWriteErrs[1:]
+	}
+	if err == nil {
+		c.actions, c.resetPeriod, c.command, c.rebootMessage = slices.Clone(actions), reset, command, reboot
+	}
+	return err
+}
+func (c *scmTestRecoveryConfig) SetNonCrashFailures(enabled bool) error {
+	c.flagWrites = append(c.flagWrites, enabled)
+	var err error
+	if len(c.flagWriteErrs) > 0 {
+		err = c.flagWriteErrs[0]
+		c.flagWriteErrs = c.flagWriteErrs[1:]
+	}
+	if err == nil {
+		c.nonCrash = enabled
+	}
+	return err
+}
+
+func TestSCMConfigureRecoveryUsesOnlyEstablishedMissingPolicy(t *testing.T) {
+	custom := []mgr.RecoveryAction{{Type: mgr.ServiceRestart, Delay: 12 * time.Second}}
+	t.Run("preserves existing actions and non-crash flag", func(t *testing.T) {
+		config := &scmTestRecoveryConfig{
+			actions: custom, resetPeriod: 17, nonCrash: true,
+			command: "custom recovery command", rebootMessage: "custom reboot message",
+		}
+		if err := configureSCMRecoveryWith(config); err != nil {
+			t.Fatalf("configureSCMRecoveryWith() = %v, want existing policy preserved", err)
+		}
+		if len(config.actionWrites) != 0 || len(config.flagWrites) != 0 {
+			t.Errorf("the existing policy received writes: actions=%v flags=%v", config.actionWrites, config.flagWrites)
+		}
+	})
+	t.Run("enables error recovery without replacing custom actions", func(t *testing.T) {
+		config := &scmTestRecoveryConfig{actions: custom, resetPeriod: 17, nonCrash: false}
+		if err := configureSCMRecoveryWith(config); err != nil {
+			t.Fatalf("configureSCMRecoveryWith() = %v, want only the required flag correction", err)
+		}
+		if !slices.Equal(config.actions, custom) || !config.nonCrash {
+			t.Errorf("the custom recovery policy is %+v, want its actions preserved and error recovery enabled", config)
+		}
+		if len(config.actionWrites) != 0 || !slices.Equal(config.flagWrites, []bool{true}) {
+			t.Errorf("writes are actions=%v flags=%v, want only the non-crash flag correction", config.actionWrites, config.flagWrites)
+		}
+	})
+	t.Run("sets required defaults after successful empty read", func(t *testing.T) {
+		config := &scmTestRecoveryConfig{
+			resetPeriod: 17, command: "custom recovery command", rebootMessage: "custom reboot message",
+		}
+		if err := configureSCMRecoveryWith(config); err != nil {
+			t.Fatalf("configureSCMRecoveryWith() = %v, want defaults configured", err)
+		}
+		if !slices.Equal(config.actions, scmRecoveryActions()) || config.resetPeriod != scmRecoveryResetPeriod || !config.nonCrash {
+			t.Errorf("configured recovery = %+v, want defaults and non-crash failure recovery", config)
+		}
+		if config.command != "custom recovery command" || config.rebootMessage != "custom reboot message" {
+			t.Errorf("the ancillary recovery settings changed: %+v", config)
+		}
+		if len(config.flagWrites) != 1 || !config.flagWrites[0] {
+			t.Errorf("non-crash flag writes = %v, want one enable after a successful read of false", config.flagWrites)
+		}
+	})
+	t.Run("does not rewrite an already-enabled non-crash flag", func(t *testing.T) {
+		config := &scmTestRecoveryConfig{nonCrash: true}
+		if err := configureSCMRecoveryWith(config); err != nil {
+			t.Fatalf("configureSCMRecoveryWith() = %v, want defaults configured", err)
+		}
+		if len(config.flagWrites) != 0 {
+			t.Errorf("non-crash flag writes = %v, want none", config.flagWrites)
+		}
+	})
+}
+
+func TestSCMConfigureRecoveryDoesNotWriteAfterUnreadableEvidence(t *testing.T) {
+	readErr := errors.New("the recovery policy could not be read")
+	cases := []struct {
+		name   string
+		config *scmTestRecoveryConfig
+	}{
+		{"actions", &scmTestRecoveryConfig{actionsReadErr: readErr}},
+		{"reset period", &scmTestRecoveryConfig{resetReadErr: readErr}},
+		{"non-crash flag on an empty action list", &scmTestRecoveryConfig{nonCrashReadErr: readErr}},
+		{"non-crash flag on existing actions", &scmTestRecoveryConfig{actions: []mgr.RecoveryAction{{Type: mgr.ServiceRestart}}, nonCrashReadErr: readErr}},
+		{"recovery command", &scmTestRecoveryConfig{commandReadErr: readErr}},
+		{"reboot message", &scmTestRecoveryConfig{rebootReadErr: readErr}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := configureSCMRecoveryWith(tc.config)
+			if err == nil {
+				t.Fatal("configureSCMRecoveryWith() = nil, want the unreadable policy error")
+			}
+			if len(tc.config.actionWrites) != 0 || len(tc.config.flagWrites) != 0 {
+				t.Errorf("the unreadable policy caused writes: actions=%v flags=%v", tc.config.actionWrites, tc.config.flagWrites)
+			}
+		})
+	}
+}
+
+func TestSCMConfigureRecoveryRestoresOnlyTheNonCrashFlagForCustomActions(t *testing.T) {
+	setupErr := errors.New("the SCM refused the non-crash flag")
+	actions := []mgr.RecoveryAction{{Type: mgr.ServiceRestart, Delay: 19 * time.Second}}
+	config := &scmTestRecoveryConfig{
+		actions:       slices.Clone(actions),
+		nonCrash:      false,
+		flagWriteErrs: []error{setupErr, nil},
+	}
+	err := configureSCMRecoveryWith(config)
+	if err == nil || !errors.Is(err, setupErr) {
+		t.Fatalf("configureSCMRecoveryWith() = %v, want the flag write error", err)
+	}
+	if !slices.Equal(config.actions, actions) || config.nonCrash {
+		t.Errorf("the previous custom policy is %+v, want its actions and false flag restored", config)
+	}
+	if len(config.actionWrites) != 0 || !slices.Equal(config.flagWrites, []bool{true, false}) {
+		t.Errorf("writes are actions=%v flags=%v, want only enable then restore the flag", config.actionWrites, config.flagWrites)
+	}
+}
+
+func TestSCMConfigureRecoveryRestoresAfterActionWriteFailure(t *testing.T) {
+	writeErr := errors.New("the SCM refused failure actions")
+	config := &scmTestRecoveryConfig{
+		resetPeriod:     23,
+		command:         "custom command",
+		rebootMessage:   "custom message",
+		actionWriteErrs: []error{writeErr, nil},
+	}
+	err := configureSCMRecoveryWith(config)
+	if err == nil || !errors.Is(err, writeErr) {
+		t.Fatalf("configureSCMRecoveryWith() = %v, want the action-write error", err)
+	}
+	if !strings.Contains(err.Error(), "previous empty recovery policy was restored and verified") {
+		t.Errorf("error = %v, want verified recovery restoration", err)
+	}
+	if len(config.actionWrites) != 2 || len(config.actionWrites[1].actions) != 0 || config.actionWrites[1].resetPeriod != 23 {
+		t.Errorf("action writes = %+v, want the default write and restoration of the prior empty policy", config.actionWrites)
+	}
+	if len(config.flagWrites) != 0 {
+		t.Errorf("non-crash flag writes = %v, want none after the action write failed", config.flagWrites)
+	}
+}
+
+func TestSCMConfigureRecoveryRestoresThePriorPolicyWhenSetupFails(t *testing.T) {
+	flagErr := errors.New("the SCM refused the non-crash flag")
+	config := &scmTestRecoveryConfig{
+		resetPeriod:   19,
+		command:       "custom command",
+		rebootMessage: "custom message",
+		flagWriteErrs: []error{flagErr, nil},
+	}
+	err := configureSCMRecoveryWith(config)
+	if err == nil || !errors.Is(err, flagErr) {
+		t.Fatalf("configureSCMRecoveryWith() = %v, want the original flag error", err)
+	}
+	if !strings.Contains(err.Error(), "previous empty recovery policy was restored and verified") {
+		t.Errorf("error = %v, want the verified recovery restore outcome", err)
+	}
+	if len(config.actionWrites) != 2 || len(config.actionWrites[1].actions) != 0 || config.actionWrites[1].resetPeriod != 19 {
+		t.Errorf("action writes = %+v, want defaults followed by the original empty policy and reset period", config.actionWrites)
+	}
+	if config.nonCrash || len(config.flagWrites) != 2 || config.flagWrites[0] != true || config.flagWrites[1] != false {
+		t.Errorf("non-crash state/writes = %v/%v, want the original false value restored", config.nonCrash, config.flagWrites)
+	}
+}
+
+func TestSCMConfigureRecoveryReportsAnUnverifiedRestoreWithoutLosingTheCause(t *testing.T) {
+	setupErr := errors.New("the SCM refused the non-crash flag")
+	restoreErr := errors.New("the SCM refused the recovery reset")
+	config := &scmTestRecoveryConfig{
+		flagWriteErrs:   []error{setupErr, nil},
+		actionWriteErrs: []error{nil, restoreErr},
+	}
+	err := configureSCMRecoveryWith(config)
+	if err == nil || !errors.Is(err, setupErr) {
+		t.Fatalf("configureSCMRecoveryWith() = %v, want the setup error preserved", err)
+	}
+	if !strings.Contains(err.Error(), "could not be restored or verified") || strings.Contains(err.Error(), "was restored and verified") {
+		t.Errorf("error = %v, want an unverified recovery restore", err)
+	}
+	if !strings.Contains(err.Error(), restoreErr.Error()) {
+		t.Errorf("error = %v, want the restore failure reason", err)
 	}
 }
 
@@ -4309,6 +4269,298 @@ func TestSCMVerifyWaitCoversTheReadinessWait(t *testing.T) {
 	}
 	if scmVerifyPollInterval <= 0 || scmVerifyPollInterval > scmVerifyTimeout {
 		t.Errorf("the verify poll interval = %s, want a positive pause inside the wait %s", scmVerifyPollInterval, scmVerifyTimeout)
+	}
+}
+
+type scmTestFirstInstallTarget struct {
+	status      svc.Status
+	config      mgr.Config
+	imageCheck  scmImageCheck
+	imageReason string
+	onImageRead func()
+	startErr    error
+	controlErr  error
+	starts      int
+	controls    int
+	deletes     int
+}
+
+func replaceSCMTestSeam[T any](t *testing.T, seam *T, value T) {
+	t.Helper()
+	previous := *seam
+	*seam = value
+	t.Cleanup(func() { *seam = previous })
+}
+
+func (t *scmTestFirstInstallTarget) Query() (svc.Status, error) { return t.status, nil }
+
+func (t *scmTestFirstInstallTarget) ReadRunningImage(uint32, string) (bool, scmImageCheck, string) {
+	if t.onImageRead != nil {
+		t.onImageRead()
+	}
+	return true, t.imageCheck, t.imageReason
+}
+
+func (t *scmTestFirstInstallTarget) Start() error {
+	t.starts++
+	return t.startErr
+}
+
+func (t *scmTestFirstInstallTarget) Control(cmd svc.Cmd) (svc.Status, error) {
+	t.controls++
+	if t.controlErr != nil {
+		return t.status, t.controlErr
+	}
+	t.status = svc.Status{State: svc.Stopped}
+	return t.status, nil
+}
+
+func (t *scmTestFirstInstallTarget) Config() (mgr.Config, error) { return t.config, nil }
+
+func (t *scmTestFirstInstallTarget) Delete() error {
+	t.deletes++
+	return nil
+}
+
+func scmTestHealthEndpoint(t *testing.T, version string, challenge bool) string {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for the real health probe: %v", err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != serviceProbePath {
+			http.NotFound(w, r)
+			return
+		}
+		if challenge {
+			w.Header().Set("WWW-Authenticate", serviceProbeAuthChallenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`, version)
+	}))
+	server.Listener = listener
+	server.Start()
+	t.Cleanup(server.Close)
+	return strings.TrimPrefix(server.URL, "http://")
+}
+
+func scmTestFirstInstallOptions(t *testing.T, listen, expectedVersion string) InstallOptions {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("read the actual Windows test executable: %v", err)
+	}
+	root := t.TempDir()
+	return InstallOptions{
+		Scope:           ScopeSystem,
+		Executable:      executable,
+		Listen:          listen,
+		ExpectedVersion: expectedVersion,
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+			StateDir:   filepath.Join(root, "state"),
+			LogDir:     filepath.Join(root, "logs"),
+		},
+	}
+}
+
+// TestSCMFirstInstallUsesTheRealImageAccessAndHealthProbePaths drives the
+// production first-start adapter with nonmutating SCM API seams and a real
+// local HTTP health endpoint. It verifies that an access-denied image lookup
+// does not suppress an observable version mismatch.
+func TestSCMFirstInstallUsesTheRealImageAccessAndHealthProbePaths(t *testing.T) {
+	cases := []struct {
+		name       string
+		health     string
+		expected   string
+		challenge  bool
+		wantErr    bool
+		wantVerify bool
+	}{
+		{"matching release", "1.4.0", "1.4.0", false, false, true},
+		{"observable mismatch", "1.3.0", "1.4.0", false, true, false},
+		{"authentication challenge", "", "1.4.0", true, false, false},
+		{"dev build", "1.3.0", "dev", false, false, false},
+		{"unversioned build", "1.3.0", "", false, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			listen := scmTestHealthEndpoint(t, tc.health, tc.challenge)
+			opts := scmTestFirstInstallOptions(t, listen, tc.expected)
+			commandLine := scmCommandLine(opts)
+			expectedConfig := buildSCMConfig(opts)
+			scmConfig := expectedConfig
+			// mgr.Service.Config decodes an empty dependency MULTI_SZ to an
+			// initialized zero-length slice.
+			scmConfig.Dependencies = []string{}
+			var controls, deletes, starts int
+			handle := &mgr.Service{Handle: windows.Handle(123)}
+			wrongHandle := false
+			checkHandle := func(got *mgr.Service) {
+				if got != handle {
+					wrongHandle = true
+				}
+			}
+			state := svc.Running
+			replaceSCMTestSeam(t, &scmQueryStatus, func(got *mgr.Service) (svc.Status, error) {
+				checkHandle(got)
+				return svc.Status{State: state, ProcessId: 8142}, nil
+			})
+			replaceSCMTestSeam(t, &scmQueryServiceConfig, func(got *mgr.Service) (mgr.Config, error) {
+				checkHandle(got)
+				return scmConfig, nil
+			})
+			replaceSCMTestSeam(t, &scmStartService, func(got *mgr.Service) error {
+				checkHandle(got)
+				starts++
+				return nil
+			})
+			replaceSCMTestSeam(t, &scmQueryProcessImageName, func(uint32) (string, error) {
+				return "", windows.ERROR_ACCESS_DENIED
+			})
+			replaceSCMTestSeam(t, &scmQueryServiceCommandLine, func(got windows.Handle) (string, error) {
+				if got != handle.Handle {
+					wrongHandle = true
+				}
+				return commandLine, nil
+			})
+			replaceSCMTestSeam(t, &scmControlService, func(got *mgr.Service, _ svc.Cmd) (svc.Status, error) {
+				checkHandle(got)
+				controls++
+				state = svc.Stopped
+				return svc.Status{State: state}, nil
+			})
+			replaceSCMTestSeam(t, &scmDeleteService, func(got *mgr.Service) error {
+				checkHandle(got)
+				deletes++
+				return nil
+			})
+
+			target := scmServiceRecoveryTarget{manager: &scmManager{scope: ScopeSystem}, handle: handle}
+			verified, status, err := (&scmManager{scope: ScopeSystem}).startFirstRegistration(
+				context.Background(), target, opts, expectedConfig)
+			if wrongHandle {
+				t.Error("the first-start verification or cleanup did not use the creation handle")
+			}
+			if tc.wantErr {
+				var startErr *InstallStartError
+				if !errors.As(err, &startErr) || !errors.Is(err, errServiceVersionMismatch) || !startErr.RegistrationRemoved {
+					t.Fatalf("startFirstRegistration() error = %v, want the observed mismatch and owned cleanup", err)
+				}
+				if controls != 1 || deletes != 1 {
+					t.Errorf("mismatch cleanup controls=%d deletes=%d, want one stop and removal on the same handle", controls, deletes)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("startFirstRegistration() = %v, want success", err)
+			}
+			if starts != 1 || controls != 0 || deletes != 0 {
+				t.Errorf("successful first launch starts=%d controls=%d deletes=%d", starts, controls, deletes)
+			}
+			if status.State != StateRunning || !status.Running || verified != tc.wantVerify {
+				t.Errorf("status=%+v versionVerified=%v, want running and verified=%v", status, verified, tc.wantVerify)
+			}
+		})
+	}
+}
+
+func TestSCMSameOwnedConfigNormalizesEmptyDependencyRepresentation(t *testing.T) {
+	expected := buildSCMConfig(scmTestOptions())
+	current := expected
+	current.Dependencies = []string{}
+	if !scmSameOwnedConfig(current, expected) {
+		t.Fatal("an empty SCM dependency list differed from the nil creation value")
+	}
+
+	current.Dependencies = []string{"Tcpip"}
+	if scmSameOwnedConfig(current, expected) {
+		t.Error("a changed dependency list was accepted as the owned registration")
+	}
+
+	current = expected
+	current.DisplayName = "changed registration"
+	if scmSameOwnedConfig(current, expected) {
+		t.Error("a changed display name was accepted as the owned registration")
+	}
+}
+
+func TestSCMRunningUpdateRejectsAnObservableMismatchWithoutImageProof(t *testing.T) {
+	listen := scmTestHealthEndpoint(t, "1.3.0", false)
+	opts := scmTestFirstInstallOptions(t, listen, "1.4.0")
+	commandLine := scmCommandLine(opts)
+	replaceSCMTestSeam(t, &scmQueryStatus, func(*mgr.Service) (svc.Status, error) {
+		return svc.Status{State: svc.Running, ProcessId: 8142}, nil
+	})
+	replaceSCMTestSeam(t, &scmQueryProcessImageName, func(uint32) (string, error) {
+		return "", windows.ERROR_ACCESS_DENIED
+	})
+	replaceSCMTestSeam(t, &scmQueryServiceCommandLine, func(windows.Handle) (string, error) {
+		return commandLine, nil
+	})
+
+	check, verified, err := (&scmManager{scope: ScopeSystem}).verifyRunningExecutableVersion(
+		context.Background(), &mgr.Service{}, opts.Executable, listen, opts.ExpectedVersion)
+	if err == nil || !errors.Is(err, errServiceVersionMismatch) {
+		t.Fatalf("verifyRunningExecutableVersion() = %v, want the actual health-version mismatch", err)
+	}
+	if check != scmImageUnverified || verified {
+		t.Errorf("verification = image %v, version %v, want an inconclusive image and failed version check", check, verified)
+	}
+}
+
+func TestSCMFirstInstallCleanupDoesNotTouchAChangedRegistrationOrProcess(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("read the actual Windows test executable: %v", err)
+	}
+	other, err := os.Executable()
+	if err != nil {
+		t.Fatalf("read the actual Windows test executable: %v", err)
+	}
+	listen := scmTestHealthEndpoint(t, "1.3.0", false)
+	cases := []struct {
+		name   string
+		change func(*scmTestFirstInstallTarget, string)
+	}{
+		{"registration command changed", func(target *scmTestFirstInstallTarget, _ string) {
+			target.onImageRead = func() {
+				opts := scmTestFirstInstallOptions(t, listen, "1.4.0")
+				opts.Executable = other + ".other"
+				target.config.BinaryPathName = scmCommandLine(opts)
+			}
+		}},
+		{"registration start setting changed", func(target *scmTestFirstInstallTarget, _ string) {
+			target.onImageRead = func() { target.config.StartType = mgr.StartManual }
+		}},
+		{"process changed", func(target *scmTestFirstInstallTarget, _ string) {
+			target.onImageRead = func() { target.status.ProcessId = 9917 }
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := scmTestFirstInstallOptions(t, listen, "1.4.0")
+			opts.Executable = executable
+			commandLine := scmCommandLine(opts)
+			target := &scmTestFirstInstallTarget{
+				status:     svc.Status{State: svc.Running, ProcessId: 8142},
+				config:     mgr.Config{BinaryPathName: commandLine},
+				imageCheck: scmImageUnverified,
+			}
+			tc.change(target, commandLine)
+			_, _, err := (&scmManager{scope: ScopeSystem}).startFirstRegistration(
+				context.Background(), target, opts, mgr.Config{BinaryPathName: commandLine})
+			var startErr *InstallStartError
+			if !errors.As(err, &startErr) || startErr.RegistrationRemoved || startErr.CleanupError == nil {
+				t.Fatalf("startFirstRegistration() error = %v, want unproven ownership and a kept registration", err)
+			}
+			if target.controls != 0 || target.deletes != 0 {
+				t.Errorf("cleanup controlled %d times and deleted %d registrations after ownership changed", target.controls, target.deletes)
+			}
+		})
 	}
 }
 

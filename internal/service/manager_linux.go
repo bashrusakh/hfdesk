@@ -14,10 +14,12 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -27,6 +29,7 @@ import (
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
+	"github.com/godbus/dbus/v5"
 	"golang.org/x/sys/unix"
 )
 
@@ -79,6 +82,9 @@ const (
 // layer.
 type systemdManager struct {
 	scope Scope
+	// readServiceProperties supplies typed manager data in tests. Production
+	// reads the same properties through a private D-Bus connection.
+	readServiceProperties func(context.Context, string) (map[string]dbus.Variant, error)
 	// restartWait overrides the bounded wait for a restarted instance to
 	// run the new executable. It is zero in production, where the wait is
 	// the shutdown budget of the service layer; a test drives the failure
@@ -449,6 +455,41 @@ func instanceDirs(opts InstallOptions) []instanceDir {
 	return unique
 }
 
+func systemdInstanceDirs(opts InstallOptions, dynamic map[string]bool) []instanceDir {
+	dirs := instanceDirs(opts)
+	filtered := make([]instanceDir, 0, len(dirs))
+	for _, dir := range dirs {
+		if dir.name == "config dir" && dynamic["config"] ||
+			dir.name == "state dir" && dynamic["state-dir"] ||
+			dir.name == "log dir" && dynamic["log-dir"] {
+			continue
+		}
+		filtered = append(filtered, dir)
+	}
+	return filtered
+}
+
+func prepareSystemdInstanceDirs(opts InstallOptions, dirs []instanceDir, dynamic map[string]bool) error {
+	if !dynamic["config"] && !dynamic["state-dir"] && !dynamic["log-dir"] {
+		return PrepareDirs(opts)
+	}
+	for _, dir := range dirs {
+		if dir.path == "" || dir.path == "." {
+			return fmt.Errorf("service: %s path is required", dir.name)
+		}
+		if !filepath.IsAbs(dir.path) {
+			return fmt.Errorf("service: %s path %q must be an absolute path", dir.name, dir.path)
+		}
+		if isRootDir(dir.path) {
+			return fmt.Errorf("service: %s path %q is the filesystem root and must not be tightened", dir.name, dir.path)
+		}
+		if err := ensureDir(dir.path, dirMode); err != nil {
+			return fmt.Errorf("service: %s %q: %w", dir.name, dir.path, err)
+		}
+	}
+	return nil
+}
+
 // createdDirs returns the directories that do not exist yet on the way to
 // the path, from the top down.
 //
@@ -492,9 +533,13 @@ func createdDirs(path string) []string {
 // the first directory of the instance that needed it is the one that created
 // it.
 func createdDirOrder(opts InstallOptions, created map[string][]string) []string {
+	return createdDirOrderForDirs(instanceDirs(opts), created)
+}
+
+func createdDirOrderForDirs(dirs []instanceDir, created map[string][]string) []string {
 	var order []string
 	seen := make(map[string]bool, len(created))
-	for _, dir := range instanceDirs(opts) {
+	for _, dir := range dirs {
 		for _, path := range created[dir.path] {
 			if seen[path] {
 				continue
@@ -564,6 +609,10 @@ func machineDir(path string) bool {
 // directory of the instance. It is read before the directories are created,
 // so the installation knows which of them it owns.
 func (m *systemdManager) grantInstanceDirs(opts InstallOptions, account *user.User, created map[string][]string) error {
+	return m.grantInstanceDirsForDirs(opts, account, created, instanceDirs(opts))
+}
+
+func (m *systemdManager) grantInstanceDirsForDirs(opts InstallOptions, account *user.User, created map[string][]string, dirs []instanceDir) error {
 	if m.scope != ScopeSystem || account == nil {
 		return nil
 	}
@@ -575,7 +624,6 @@ func (m *systemdManager) grantInstanceDirs(opts InstallOptions, account *user.Us
 	if err != nil {
 		return fmt.Errorf("service: the group id of the service account %q is not a number: %w", account.Username, err)
 	}
-	dirs := instanceDirs(opts)
 	// The directories are checked before the first of them is granted, so
 	// a refused installation leaves every ownership as it was.
 	for _, dir := range dirs {
@@ -638,14 +686,15 @@ func (m *systemdManager) grantInstanceDirs(opts InstallOptions, account *user.Us
 // installation never creates an account and never changes the ownership of a
 // model or a cache tree.
 //
-// A failure after the unit file was written rolls the unit file back, and a
-// failure after the restart of a running instance restores and restarts the
-// previous registration. A failure removes the directories the installation
-// created as well, so a failed attempt leaves the machine as it was.
+// A failure after the unit file was written restores the previous unit and
+// verifies the loaded configuration; a failed running restart only restarts
+// the previous instance after that verification. A failure also removes
+// installation-created directories when they are still empty.
 //
 // The returned options are the registration as written, so a caller reports a
 // preserved setting instead of the default it was not reset to.
 func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (InstallOptions, error) {
+	requested := opts
 	// The registration of the scope is read before anything is decided:
 	// an installation over an existing registration must merge with what
 	// the instance really runs with, and it must know whether the instance
@@ -658,11 +707,16 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	if err != nil {
 		return InstallOptions{}, err
 	}
+	sourceUnit := parsedUnit{}
+	dynamicFields := map[string]bool{}
 	if existed {
-		opts = mergeInstallOptions(opts, registrationOptions(parseUnit(string(content)), opts.Scope))
+		sourceUnit = parseUnit(string(content))
+		opts = mergeInstallOptions(opts, registrationOptions(sourceUnit, opts.Scope), true)
+		dynamicFields = systemdDynamicInstallFields(sourceUnit, requested)
 	}
 
-	if err := ValidateInstallOptions(opts); err != nil {
+	validationOpts := systemdValidationOptions(opts, dynamicFields)
+	if err := ValidateInstallOptions(validationOpts); err != nil {
 		return opts, err
 	}
 	// A path with a control character would end up in the unit file
@@ -670,7 +724,7 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	// directive the installation never wrote. The check runs before the
 	// root requirement, before any directory is created and before the
 	// unit file is written: a refused installation leaves nothing behind.
-	if err := validateUnitPaths(opts); err != nil {
+	if err := validateUnitPaths(validationOpts, existed); err != nil {
 		return opts, err
 	}
 	// A machine-wide instance must not adopt the state of the user who
@@ -678,6 +732,7 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	// requirement, before any directory is created and before the unit
 	// file is written: a refused installation leaves nothing behind, and
 	// every platform reports the same reason for the same command line.
+	filesystemOpts := systemdFilesystemOptions(opts, dynamicFields)
 	if err := m.checkSystemPaths(opts); err != nil {
 		return opts, err
 	}
@@ -690,7 +745,7 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	if err != nil {
 		return opts, err
 	}
-	if err := m.checkServiceAccountAccess(opts, account); err != nil {
+	if err := m.checkServiceAccountAccess(filesystemOpts, account); err != nil {
 		return opts, err
 	}
 	// The root requirement is checked before any directory is created: a
@@ -701,13 +756,17 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	}
 	// The program is checked before anything is read or written, so a refused
 	// program creates no directory, rewrites no unit and stops no instance.
-	if err := m.preflight(ctx, opts, account); err != nil {
+	preflightOpts := validationOpts
+	if existed && dynamicFields["state-dir"] {
+		preflightOpts.Paths.StateDir = ""
+	}
+	if err := m.preflight(ctx, preflightOpts, account); err != nil {
 		return opts, err
 	}
 	// The state of the replaced registration is read before the unit file
 	// is written: only a running instance is restarted, a stopped one has
 	// to stay stopped.
-	previous := previousRegistration{path: path, content: content, existed: existed}
+	previous := previousRegistration{path: path, content: content, existed: existed, dynamicFields: dynamicFields}
 	if existed {
 		running, err := m.registrationRunning(ctx)
 		if err != nil {
@@ -734,6 +793,20 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	}
 	if existed {
 		previous.enablement = enablement.mode
+		loaded, err := m.registrationUnitConfig(ctx)
+		if err != nil {
+			return opts, fmt.Errorf("service: the loaded configuration of %s could not be read, the registration was not changed: %w", unitName, err)
+		}
+		previous.loaded = loaded
+		previous.loadedKnown = true
+		if !loaded.loaded && previous.running {
+			return opts, errors.New("service: systemd reported a running unit without a loaded configuration; the registration was not changed")
+		}
+		if loaded.loaded {
+			if err := loadedMatchesUnit(loaded, parseUnit(string(content))); err != nil {
+				return opts, fmt.Errorf("service: the loaded command of %s differs from its unit file; an override may own the effective command, refusing to update it: %w", unitName, err)
+			}
+		}
 	}
 	// The directories the installation is about to create are remembered
 	// before they are created, so the account is given the ownership of
@@ -742,15 +815,16 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	//
 	// The list is also what a failed installation removes again, so a
 	// failed installation leaves the machine as it was.
-	created := make(map[string][]string, 3)
-	for _, dir := range instanceDirs(opts) {
+	instanceDirectories := systemdInstanceDirs(opts, dynamicFields)
+	created := make(map[string][]string, len(instanceDirectories))
+	for _, dir := range instanceDirectories {
 		created[dir.path] = createdDirs(dir.path)
 	}
-	if err := PrepareDirs(opts); err != nil {
+	if err := prepareSystemdInstanceDirs(opts, instanceDirectories, dynamicFields); err != nil {
 		// The preparation may have created some of the directories
 		// before it failed: they are removed again, so a failed attempt
 		// leaves the machine as it was.
-		removeCreatedDirs(createdDirOrder(opts, created))
+		removeCreatedDirs(createdDirOrderForDirs(instanceDirectories, created))
 		return opts, err
 	}
 	// The installation owns the directories it created from here on: a
@@ -758,7 +832,7 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	// the directories of the instance behind.
 	verified, err := m.register(ctx, opts, account, created, previous)
 	if err != nil {
-		removeCreatedDirs(createdDirOrder(opts, created))
+		removeCreatedDirs(createdDirOrderForDirs(instanceDirectories, created))
 		return opts, err
 	}
 	opts.VersionVerified = verified
@@ -780,6 +854,38 @@ type previousRegistration struct {
 	// registration, in its mode. Only a registration that existed carries
 	// it.
 	enablement enablementMode
+	// loaded is the effective command and launch configuration reported by
+	// systemd before the update. The file on disk alone cannot prove what the
+	// supervisor has loaded.
+	loaded systemdLoadedConfig
+	// loadedKnown reports that loaded was read successfully for an existing
+	// registration. A first installation expects no loaded registration.
+	loadedKnown bool
+	// dynamicFields are untouched ExecStart options whose source uses systemd
+	// specifiers or environment references. Their source text is preserved
+	// while available manager-reported values are compared with the snapshot.
+	dynamicFields map[string]bool
+}
+
+// systemdLoadedConfig is the effective command and the launch properties
+// systemd reports for a unit. Dynamic process state is intentionally omitted:
+// it is verified separately from the loaded registration.
+type systemdLoadedConfig struct {
+	loaded           bool
+	execPath         string
+	execArgs         []string
+	execFlags        []string
+	ignoreErrors     bool
+	workingDirectory string
+	user             string
+	group            string
+	environment      []string
+	environmentFiles []systemdEnvironmentFile
+}
+
+type systemdEnvironmentFile struct {
+	Path         string
+	IgnoreErrors bool
 }
 
 // registrationOptions returns the installation options a unit registers.
@@ -824,6 +930,463 @@ func (m *systemdManager) registrationRunning(ctx context.Context) (bool, error) 
 	// A starting instance already runs: it is about to reach the running
 	// state, and a reinstall has to switch it to the new program as well.
 	return runningState(state), nil
+}
+
+// registrationUnitConfig reads systemd's typed D-Bus properties. systemctl's
+// ExecStart display joins argv elements with spaces, so it cannot prove their
+// boundaries when a path or argument itself contains whitespace. These are the
+// manager's parsed settings before runtime environment expansion, not the
+// process argv or an atomic snapshot with service state.
+func (m *systemdManager) registrationUnitConfig(ctx context.Context) (systemdLoadedConfig, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := m.runSystemctl(ctx, "show", unitName,
+		"--property=LoadState")
+	if err != nil {
+		return systemdLoadedConfig{}, err
+	}
+	show := parseSystemdShow(out)
+	if show.LoadState == "not-found" {
+		return systemdLoadedConfig{}, nil
+	}
+	if show.LoadState != "loaded" {
+		return systemdLoadedConfig{}, fmt.Errorf("systemd reported LoadState=%q", show.LoadState)
+	}
+	properties, err := m.loadedServiceProperties(ctx, unitName)
+	if err != nil {
+		return systemdLoadedConfig{}, err
+	}
+	return loadedConfigFromProperties(properties)
+}
+
+func (m *systemdManager) loadedServiceProperties(ctx context.Context, name string) (map[string]dbus.Variant, error) {
+	if m.readServiceProperties != nil {
+		return m.readServiceProperties(ctx, name)
+	}
+	conn, err := m.systemdDBusConnection(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("service: connect to the %s systemd manager: %w", m.scope, err)
+	}
+	defer conn.Close()
+
+	manager := conn.Object("org.freedesktop.systemd1", "/org/freedesktop/systemd1")
+	var objectPath dbus.ObjectPath
+	if err := manager.CallWithContext(ctx, "org.freedesktop.systemd1.Manager.GetUnit", dbus.FlagNoAutoStart, name).Store(&objectPath); err != nil {
+		return nil, fmt.Errorf("service: read the loaded object path of %s: %w", name, err)
+	}
+	if !objectPath.IsValid() {
+		return nil, fmt.Errorf("service: systemd returned an invalid object path for %s", name)
+	}
+	unit := conn.Object("org.freedesktop.systemd1", objectPath)
+	call := unit.CallWithContext(ctx, "org.freedesktop.DBus.Properties.GetAll", dbus.FlagNoAutoStart, "org.freedesktop.systemd1.Service")
+	properties, err := dbusPropertiesFromCall(call)
+	if err != nil {
+		return nil, fmt.Errorf("service: read the loaded properties of %s: %w", name, err)
+	}
+	return properties, nil
+}
+
+func dbusPropertiesFromCall(call *dbus.Call) (map[string]dbus.Variant, error) {
+	if call == nil {
+		return nil, errors.New("systemd returned no D-Bus property reply")
+	}
+	if call.Err != nil {
+		return nil, call.Err
+	}
+	if len(call.Body) != 1 {
+		return nil, fmt.Errorf("systemd returned %d D-Bus property values, want one dictionary", len(call.Body))
+	}
+	properties, ok := call.Body[0].(map[string]dbus.Variant)
+	if !ok {
+		return nil, fmt.Errorf("systemd returned D-Bus property body %T, want map[string]dbus.Variant", call.Body[0])
+	}
+	return properties, nil
+}
+
+func (m *systemdManager) systemdDBusConnection(ctx context.Context) (*dbus.Conn, error) {
+	switch m.scope {
+	case ScopeSystem:
+		if os.Geteuid() == 0 {
+			conn, privateErr := connectSystemdPrivate(ctx, "/run/systemd/private")
+			if privateErr == nil {
+				return conn, nil
+			}
+			conn, busErr := dbus.ConnectSystemBus(dbus.WithContext(ctx))
+			if busErr == nil {
+				return conn, nil
+			}
+			return nil, fmt.Errorf("manager-private socket: %v; system bus: %w", privateErr, busErr)
+		}
+		return dbus.ConnectSystemBus(dbus.WithContext(ctx))
+
+	case ScopeUser:
+		if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
+			conn, privateErr := connectSystemdPrivate(ctx, filepath.Join(runtimeDir, "systemd", "private"))
+			if privateErr == nil {
+				return conn, nil
+			}
+			if address := sessionBusAddress(); address != "" {
+				conn, busErr := dbus.Connect(address, dbus.WithContext(ctx))
+				if busErr == nil {
+					return conn, nil
+				}
+				return nil, fmt.Errorf("manager-private socket: %v; session bus: %w", privateErr, busErr)
+			}
+			return nil, privateErr
+		}
+		if address := sessionBusAddress(); address != "" {
+			return dbus.Connect(address, dbus.WithContext(ctx))
+		}
+		return nil, errors.New("no user manager transport is available from XDG_RUNTIME_DIR or the session bus environment")
+
+	default:
+		return nil, fmt.Errorf("unknown systemd scope %q", m.scope)
+	}
+}
+
+func connectSystemdPrivate(ctx context.Context, socketPath string) (*dbus.Conn, error) {
+	stream, err := (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+	if err != nil {
+		return nil, err
+	}
+	closeStream := func() { _ = stream.Close() }
+	if err := checkSystemdPrivatePeer(stream); err != nil {
+		closeStream()
+		return nil, err
+	}
+	conn, err := dbus.NewConn(stream, dbus.WithContext(ctx))
+	if err != nil {
+		closeStream()
+		return nil, err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := stream.SetDeadline(deadline); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+	}
+	if err := conn.Auth([]dbus.Auth{dbus.AuthExternal(strconv.Itoa(os.Geteuid()))}); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := stream.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func checkSystemdPrivatePeer(stream net.Conn) error {
+	unixConn, ok := stream.(*net.UnixConn)
+	if !ok {
+		return errors.New("systemd manager-private transport is not a Unix socket")
+	}
+	rawConn, err := unixConn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var peer *unix.Ucred
+	var peerErr error
+	if err := rawConn.Control(func(fd uintptr) {
+		peer, peerErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	}); err != nil {
+		return err
+	}
+	if peerErr != nil {
+		return peerErr
+	}
+	if peer.Uid != 0 && peer.Uid != uint32(os.Geteuid()) {
+		return fmt.Errorf("systemd manager-private peer uid %d does not match the current user", peer.Uid)
+	}
+	return nil
+}
+
+func sessionBusAddress() string {
+	if address := os.Getenv("DBUS_SESSION_BUS_ADDRESS"); address != "" && address != "autolaunch:" {
+		return address
+	}
+	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
+	if runtimeDir == "" {
+		currentUser, err := user.Current()
+		if err != nil {
+			return ""
+		}
+		runtimeDir = filepath.Join("/run/user", currentUser.Uid)
+	}
+	busPath := filepath.Join(runtimeDir, "bus")
+	if _, err := os.Stat(busPath); err == nil {
+		return "unix:path=" + dbus.EscapeBusAddressValue(busPath)
+	}
+	content, err := os.ReadFile(filepath.Join(runtimeDir, "dbus-session"))
+	if err != nil {
+		return ""
+	}
+	const prefix = "DBUS_SESSION_BUS_ADDRESS="
+	address := strings.TrimRight(strings.TrimPrefix(string(content), prefix), "\r\n")
+	if !strings.HasPrefix(string(content), prefix) {
+		return ""
+	}
+	return address
+}
+
+// loadedMatchesUnit rejects an update when a drop-in or another loaded source
+// already makes the effective command differ from the unit file being edited.
+func loadedMatchesUnit(loaded systemdLoadedConfig, unit parsedUnit) error {
+	var expected []string
+	if unit.ExecStartRaw != "" {
+		expected = append([]string{unit.ExecStartRaw}, unit.ExecArgsRaw...)
+	}
+	if !loaded.loaded || len(loaded.execArgs) != len(expected) || loaded.ignoreErrors || len(loaded.execFlags) != 0 {
+		return errors.New("the effective ExecStart is not the command in the unit file")
+	}
+	if !unit.ExecStartDynamic && loaded.execPath != unit.ExecStartRaw {
+		return errors.New("the effective executable is not the command in the unit file")
+	}
+	for i, arg := range expected {
+		if i == 0 && unit.ExecStartDynamic || i > 0 && i-1 < len(unit.ExecArgsDynamic) && unit.ExecArgsDynamic[i-1] {
+			continue
+		}
+		if loaded.execArgs[i] != arg {
+			return errors.New("the effective ExecStart is not the command in the unit file")
+		}
+	}
+	return nil
+}
+
+func systemdInstallFlagExplicit(opts InstallOptions, flag string) bool {
+	switch flag {
+	case "config":
+		return opts.Explicit.Config
+	case "state-dir":
+		return opts.Explicit.StateDir
+	case "log-dir":
+		return opts.Explicit.LogDir
+	case "listen":
+		return opts.Explicit.Listen
+	case "cache-dir":
+		return opts.Explicit.CacheDir
+	case "hub-dir":
+		return opts.Explicit.HubDir
+	case "local-dir":
+		return opts.Explicit.LocalDir
+	default:
+		return false
+	}
+}
+
+func systemdDynamicInstallFields(unit parsedUnit, opts InstallOptions) map[string]bool {
+	dynamic := make(map[string]bool)
+	for flag, unresolved := range unit.DynamicRunArgs {
+		if unresolved && !systemdInstallFlagExplicit(opts, flag) {
+			dynamic[flag] = true
+		}
+	}
+	if unit.WorkingDirectoryDynamic && !opts.Explicit.StateDir {
+		if _, hasStateArg := unit.DynamicRunArgs["state-dir"]; !hasStateArg {
+			dynamic["state-dir"] = true
+		}
+	}
+	return dynamic
+}
+
+func systemdValidationOptions(opts InstallOptions, dynamic map[string]bool) InstallOptions {
+	defaults := DefaultInstallOptions(opts.Scope, opts.Executable)
+	if dynamic["config"] {
+		opts.Paths.ConfigFile = defaults.Paths.ConfigFile
+	}
+	if dynamic["state-dir"] {
+		opts.Paths.StateDir = defaults.Paths.StateDir
+	}
+	if dynamic["log-dir"] {
+		opts.Paths.LogDir = defaults.Paths.LogDir
+	}
+	if dynamic["listen"] {
+		opts.Listen = defaults.Listen
+	}
+	if dynamic["cache-dir"] {
+		opts.CacheDir = ""
+	}
+	if dynamic["hub-dir"] {
+		opts.HubDir = ""
+	}
+	if dynamic["local-dir"] {
+		opts.LocalDir = ""
+	}
+	return opts
+}
+
+func systemdFilesystemOptions(opts InstallOptions, dynamic map[string]bool) InstallOptions {
+	if dynamic["config"] {
+		opts.Paths.ConfigFile = ""
+	}
+	if dynamic["state-dir"] {
+		opts.Paths.StateDir = ""
+	}
+	if dynamic["log-dir"] {
+		opts.Paths.LogDir = ""
+	}
+	if dynamic["cache-dir"] {
+		opts.CacheDir = ""
+	}
+	if dynamic["hub-dir"] {
+		opts.HubDir = ""
+	}
+	if dynamic["local-dir"] {
+		opts.LocalDir = ""
+	}
+	return opts
+}
+
+// verifyUpdatedUnit checks the command and preserved launch settings after
+// daemon-reload and before a running instance can be restarted.
+func (m *systemdManager) verifyUpdatedUnit(ctx context.Context, opts InstallOptions, account *user.User, previous previousRegistration, unitContent string) error {
+	loaded, err := m.registrationUnitConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("service: read the loaded configuration after daemon-reload: %w", err)
+	}
+	updatedUnit := parseUnit(unitContent)
+	if err := loadedMatchesUnit(loaded, updatedUnit); err != nil {
+		return errors.New("service: systemd did not load the requested executable and arguments; an override may own the effective command")
+	}
+	if !previous.loadedKnown || !previous.loaded.loaded {
+		return nil
+	}
+	for flag, dynamic := range updatedUnit.DynamicRunArgs {
+		if !dynamic || systemdInstallFlagExplicit(opts, flag) {
+			continue
+		}
+		before := runArgValue(previous.loaded.execArgs[1:], "--"+flag)
+		after := runArgValue(loaded.execArgs[1:], "--"+flag)
+		if before != after {
+			return fmt.Errorf("service: systemd's typed --%s argument changed across the update", flag)
+		}
+	}
+	if !slices.Equal(loaded.environment, previous.loaded.environment) || !slices.Equal(loaded.environmentFiles, previous.loaded.environmentFiles) {
+		return errors.New("service: systemd did not preserve the loaded environment and environment files")
+	}
+	if !opts.Explicit.StateDir && loaded.workingDirectory != previous.loaded.workingDirectory {
+		return errors.New("service: systemd did not preserve the loaded working directory")
+	}
+	if !opts.Explicit.ServiceUser && (loaded.user != previous.loaded.user || loaded.group != previous.loaded.group) {
+		return errors.New("service: systemd did not preserve the loaded service identity")
+	}
+	if opts.Explicit.StateDir && loaded.workingDirectory != opts.Paths.StateDir {
+		return errors.New("service: systemd did not load the requested working directory")
+	}
+	if opts.Explicit.ServiceUser {
+		identity, err := unitIdentity(opts, account)
+		if err != nil {
+			return err
+		}
+		identityUnit := parseUnit("[Service]\n" + identity)
+		if loaded.user != identityUnit.User || loaded.group != identityUnit.Group {
+			return errors.New("service: systemd did not load the requested service identity")
+		}
+	}
+	return nil
+}
+
+func sameSystemdLoadedConfig(a, b systemdLoadedConfig) bool {
+	return a.loaded == b.loaded && a.execPath == b.execPath && slices.Equal(a.execArgs, b.execArgs) &&
+		slices.Equal(a.execFlags, b.execFlags) && a.ignoreErrors == b.ignoreErrors &&
+		a.workingDirectory == b.workingDirectory && a.user == b.user && a.group == b.group &&
+		slices.Equal(a.environment, b.environment) && slices.Equal(a.environmentFiles, b.environmentFiles)
+}
+
+type systemdExecStartEntry struct {
+	Path                    string
+	Argv                    []string
+	IgnoreErrors            bool
+	StartTimestamp          uint64
+	ExitTimestamp           uint64
+	StartTimestampMonotonic uint64
+	ExitTimestampMonotonic  uint64
+	PID                     uint32
+	Code                    int32
+	Status                  int32
+}
+
+type systemdExecStartExEntry struct {
+	Path                    string
+	Argv                    []string
+	Flags                   []string
+	StartTimestamp          uint64
+	ExitTimestamp           uint64
+	StartTimestampMonotonic uint64
+	ExitTimestampMonotonic  uint64
+	PID                     uint32
+	Code                    int32
+	Status                  int32
+}
+
+func loadedConfigFromProperties(properties map[string]dbus.Variant) (systemdLoadedConfig, error) {
+	loaded := systemdLoadedConfig{loaded: true}
+	if err := storeDBusProperty(properties, "WorkingDirectory", "s", &loaded.workingDirectory); err != nil {
+		return systemdLoadedConfig{}, err
+	}
+	if err := storeDBusProperty(properties, "User", "s", &loaded.user); err != nil {
+		return systemdLoadedConfig{}, err
+	}
+	if err := storeDBusProperty(properties, "Group", "s", &loaded.group); err != nil {
+		return systemdLoadedConfig{}, err
+	}
+	if err := storeDBusProperty(properties, "Environment", "as", &loaded.environment); err != nil {
+		return systemdLoadedConfig{}, err
+	}
+	if err := storeDBusProperty(properties, "EnvironmentFiles", "a(sb)", &loaded.environmentFiles); err != nil {
+		return systemdLoadedConfig{}, err
+	}
+
+	if command, ok := properties["ExecStartEx"]; ok {
+		if signature := command.Signature().String(); signature != "a(sasasttttuii)" {
+			return systemdLoadedConfig{}, fmt.Errorf("systemd returned ExecStartEx with signature %q", signature)
+		}
+		var commands []systemdExecStartExEntry
+		if err := dbus.Store([]interface{}{command.Value()}, &commands); err != nil {
+			return systemdLoadedConfig{}, fmt.Errorf("decode ExecStartEx: %w", err)
+		}
+		if len(commands) > 1 {
+			return systemdLoadedConfig{}, errors.New("systemd reports multiple ExecStart commands")
+		}
+		if len(commands) == 1 {
+			loaded.execPath = commands[0].Path
+			loaded.execArgs = commands[0].Argv
+			loaded.execFlags = commands[0].Flags
+		}
+	} else if command, ok := properties["ExecStart"]; ok {
+		if signature := command.Signature().String(); signature != "a(sasbttttuii)" {
+			return systemdLoadedConfig{}, fmt.Errorf("systemd returned ExecStart with signature %q", signature)
+		}
+		var commands []systemdExecStartEntry
+		if err := dbus.Store([]interface{}{command.Value()}, &commands); err != nil {
+			return systemdLoadedConfig{}, fmt.Errorf("decode ExecStart: %w", err)
+		}
+		if len(commands) > 1 {
+			return systemdLoadedConfig{}, errors.New("systemd reports multiple ExecStart commands")
+		}
+		if len(commands) == 1 {
+			loaded.execPath = commands[0].Path
+			loaded.execArgs = commands[0].Argv
+			loaded.ignoreErrors = commands[0].IgnoreErrors
+		}
+	} else {
+		return systemdLoadedConfig{}, errors.New("systemd did not return ExecStart or ExecStartEx")
+	}
+	return loaded, nil
+}
+
+func storeDBusProperty(properties map[string]dbus.Variant, name, signature string, destination interface{}) error {
+	property, ok := properties[name]
+	if !ok {
+		return fmt.Errorf("systemd did not return property %s", name)
+	}
+	if got := property.Signature().String(); got != signature {
+		return fmt.Errorf("systemd property %s has signature %q, want %q", name, got, signature)
+	}
+	if err := dbus.Store([]interface{}{property.Value()}, destination); err != nil {
+		return fmt.Errorf("decode systemd property %s: %w", name, err)
+	}
+	return nil
 }
 
 // registrationEnablement is what the supervisor reports about the enablement of
@@ -936,11 +1499,17 @@ func (m *systemdManager) maskedUnitRefusal() error {
 func (m *systemdManager) register(ctx context.Context, opts InstallOptions, account *user.User, created map[string][]string, previous previousRegistration) (bool, error) {
 	// The instance runs as the service account, so the directories it owns
 	// belong to it.
-	if err := m.grantInstanceDirs(opts, account, created); err != nil {
+	if err := m.grantInstanceDirsForDirs(opts, account, created, systemdInstanceDirs(opts, previous.dynamicFields)); err != nil {
 		return false, err
 	}
 
-	unit, err := renderUnit(opts, account)
+	var unit string
+	var err error
+	if previous.existed {
+		unit, err = updateUnit(string(previous.content), opts, account)
+	} else {
+		unit, err = renderUnit(opts, account)
+	}
 	if err != nil {
 		return false, err
 	}
@@ -955,8 +1524,12 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 		enable = previous.enablement
 	}
 	if err := m.reloadAndEnable(ctx, enable); err != nil {
-		m.rollbackUnit(ctx, previous.path, previous.content, previous.existed)
-		return false, err
+		return false, m.reportUnitRollback(ctx, previous, err)
+	}
+	if previous.existed {
+		if err := m.verifyUpdatedUnit(ctx, opts, account, previous, unit); err != nil {
+			return false, m.reportUnitRollback(ctx, previous, err)
+		}
 	}
 	if !previous.running {
 		// A first installation and a stopped instance stay stopped:
@@ -976,10 +1549,9 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 // restorePreviousRegistration restores the registration an installation
 // replaced and the running state it had.
 //
-// The unit file is restored and the supervisor is reloaded first, so the
-// restart below starts the previous program, and the restored file is read back
-// before the restart: a caller is only told that the registration was restored
-// when the file really holds it again.
+// The unit file is restored and read back, then the supervisor is reloaded and
+// its loaded command and launch properties are compared with the pre-update
+// snapshot. The restart below is issued only after both states are confirmed.
 //
 // A restart that the supervisor accepted is not a running instance: a
 // Type=simple unit is reported restarted as soon as the process was forked, so
@@ -990,8 +1562,7 @@ func (m *systemdManager) restorePreviousRegistration(ctx context.Context, previo
 	// The caller may have cancelled the context, the previous registration
 	// still has to be put back into service.
 	cleanup := context.WithoutCancel(ctx)
-	m.rollbackUnit(cleanup, previous.path, previous.content, previous.existed)
-	if err := verifyRestoredUnit(previous); err != nil {
+	if err := m.rollbackUnit(cleanup, previous); err != nil {
 		return err
 	}
 	if !previous.running {
@@ -1010,9 +1581,23 @@ func (m *systemdManager) restorePreviousRegistration(ctx context.Context, previo
 	return nil
 }
 
+// reportUnitRollback preserves the failure that triggered a rollback and names
+// only the outcome the storage and loaded-configuration checks proved.
+func (m *systemdManager) reportUnitRollback(ctx context.Context, previous previousRegistration, failure error) error {
+	if err := m.rollbackUnit(context.WithoutCancel(ctx), previous); err != nil {
+		return fmt.Errorf("%w (the previous unit file or captured loaded settings could not be restored or verified: %v)", failure, err)
+	}
+	if previous.existed {
+		if !previous.loaded.loaded {
+			return fmt.Errorf("%w (the previous unit file and command were restored and loaded; no instance was restarted)", failure)
+		}
+		return fmt.Errorf("%w (the previous unit file and captured loaded command/launch settings were restored)", failure)
+	}
+	return fmt.Errorf("%w (the failed registration was removed from disk and the supervisor)", failure)
+}
+
 // verifyRestoredUnit checks that the unit file holds the previous registration
-// again: the rollback writes and reloads best effort, so the file is read back
-// instead of assumed.
+// again before systemd is asked to reload it.
 func verifyRestoredUnit(previous previousRegistration) error {
 	content, existed, err := readUnitFile(previous.path)
 	if err != nil {
@@ -1085,7 +1670,7 @@ func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable
 		} else {
 			show := parseSystemdShow(out)
 			path := execStartPath(out)
-			programMatches := show.State == StateRunning && (executable == "" || path == executable)
+			programMatches := show.State == StateRunning && (executable == "" || path == systemdLoadedExecutablePath(executable))
 			switch {
 			case !programMatches && executable == "":
 				detail = fmt.Sprintf("the supervisor reports the state %q", show.State)
@@ -1777,23 +2362,52 @@ func (m *systemdManager) reloadAndEnable(ctx context.Context, mode enablementMod
 	return nil
 }
 
-// rollbackUnit restores the registration of a failed installation: the
-// previous unit file is written back, or the unit file of the failed
-// installation is removed when there was none. The supervisor is reloaded
-// afterwards, so it never keeps a stale unit.
-//
-// The rollback is best effort: the original failure of the installation is
-// the error the caller gets.
-func (m *systemdManager) rollbackUnit(ctx context.Context, path string, previous []byte, existed bool) {
+// rollbackUnit restores the registration of a failed installation and checks
+// both the file on disk and the captured command/launch properties systemd
+// reported before the update. A successful file write or daemon-reload command
+// alone does not prove those loaded properties returned to their prior values.
+func (m *systemdManager) rollbackUnit(ctx context.Context, previous previousRegistration) error {
 	// The caller may have cancelled the context, the rollback still has to
 	// clean the registration up.
 	cleanup := context.WithoutCancel(ctx)
-	if existed {
-		_ = writeUnitFile(path, string(previous))
+	if previous.existed {
+		if err := writeUnitFile(previous.path, string(previous.content)); err != nil {
+			return fmt.Errorf("write the previous unit file back: %w", err)
+		}
 	} else {
-		_ = os.Remove(path)
+		if err := os.Remove(previous.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("remove the failed unit file: %w", err)
+		}
 	}
-	_, _ = m.runSystemctl(cleanup, "daemon-reload")
+	if err := verifyRestoredUnit(previous); err != nil {
+		return err
+	}
+	if _, err := m.runSystemctl(cleanup, "daemon-reload"); err != nil {
+		return fmt.Errorf("reload the restored unit: %w", err)
+	}
+	loaded, err := m.registrationUnitConfig(cleanup)
+	if err != nil {
+		return fmt.Errorf("read the restored loaded configuration: %w", err)
+	}
+	if previous.existed {
+		if !previous.loadedKnown {
+			return errors.New("the previous loaded configuration was not captured before the update")
+		}
+		if previous.loaded.loaded && !sameSystemdLoadedConfig(loaded, previous.loaded) {
+			return errors.New("the supervisor did not load the previous command and captured launch settings")
+		}
+		if !previous.loaded.loaded {
+			if !loaded.loaded {
+				return errors.New("the restored unit remains unknown to systemd")
+			}
+			if err := loadedMatchesUnit(loaded, parseUnit(string(previous.content))); err != nil {
+				return fmt.Errorf("the restored unit file is present but its command did not load: %w", err)
+			}
+		}
+	} else if loaded.loaded {
+		return errors.New("the failed unit is still loaded after its file was removed")
+	}
+	return nil
 }
 
 // Uninstall removes the registration of the service.
@@ -2188,7 +2802,7 @@ func writeUnitFile(path, content string) error {
 const unitTemplate = `# HFDesk service unit.
 #
 # Generated by the hfdesk service install command; a later installation
-# overwrites this file.
+# updates its command while preserving other unit settings.
 #
 # The unit holds no access data: an instance reads its own settings from its
 # config file, which only the owner of the instance can read. The unit
@@ -2235,15 +2849,13 @@ func renderUnit(opts InstallOptions, account *user.User) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	identity, err := unitIdentity(opts, account)
+	workingDirectory, err := systemdWorkingDirectoryValue(opts.Paths.StateDir)
 	if err != nil {
 		return "", err
 	}
-
-	words := make([]string, 0, len(RunArgs(opts))+1)
-	words = append(words, systemdQuoteCommandAlways(opts.Executable))
-	for _, arg := range RunArgs(opts) {
-		words = append(words, systemdQuoteCommand(arg))
+	identity, err := unitIdentity(opts, account)
+	if err != nil {
+		return "", err
 	}
 
 	target := "default.target"
@@ -2253,41 +2865,347 @@ func renderUnit(opts InstallOptions, account *user.User) (string, error) {
 
 	return fmt.Sprintf(unitTemplate,
 		identity,
-		strings.Join(words, " "),
-		systemdQuote(opts.Paths.StateDir),
+		systemdExecStart(opts),
+		workingDirectory,
 		systemdStopTimeout(),
 		systemdQuote("HOME="+home),
 		target,
 	), nil
 }
 
-// validateUnitPaths rejects an installation whose paths carry a control
-// character.
+func systemdExecStart(opts InstallOptions) string {
+	words := make([]string, 0, len(RunArgs(opts))+1)
+	words = append(words, systemdQuoteCommandAlways(opts.Executable))
+	for _, arg := range RunArgs(opts) {
+		words = append(words, systemdQuoteCommand(arg))
+	}
+	return strings.Join(words, " ")
+}
+
+func systemdLoadedExecutablePath(executable string) string {
+	words := splitSystemdWords(systemdQuoteCommandAlways(executable))
+	if len(words) == 0 {
+		return executable
+	}
+	return words[0]
+}
+
+type systemdDirectiveChange struct {
+	value  string
+	remove bool
+}
+
+// updateUnit changes only native directives that carry options explicitly
+// named by an update. Every other line, including directives HFDesk does not
+// interpret, stays intact.
+func updateUnit(content string, opts InstallOptions, account *user.User) (string, error) {
+	execStart, err := updateSystemdExecStartSource(content, opts)
+	if err != nil {
+		return "", err
+	}
+	changes := map[string]systemdDirectiveChange{
+		"ExecStart": {value: execStart},
+	}
+	if opts.Explicit.StateDir {
+		workingDirectory, err := systemdWorkingDirectoryValue(opts.Paths.StateDir)
+		if err != nil {
+			return "", err
+		}
+		changes["WorkingDirectory"] = systemdDirectiveChange{value: workingDirectory}
+	}
+	if opts.Explicit.ServiceUser {
+		identity, err := unitIdentity(opts, account)
+		if err != nil {
+			return "", err
+		}
+		changes["User"] = systemdDirectiveChange{value: systemdQuote(opts.ServiceUser)}
+		changes["Group"] = systemdDirectiveChange{remove: true}
+		for _, line := range strings.Split(identity, "\n") {
+			key, value, ok := strings.Cut(line, "=")
+			if ok {
+				changes[key] = systemdDirectiveChange{value: value}
+			}
+		}
+	}
+	return updateSystemdServiceDirectives(content, changes)
+}
+
+func updateSystemdExecStartSource(content string, opts InstallOptions) (string, error) {
+	section := ""
+	for _, line := range systemdLogicalLines(content) {
+		trimmed := strings.TrimSpace(line.text)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			section = strings.ToLower(strings.TrimSpace(trimmed[1 : len(trimmed)-1]))
+			continue
+		}
+		if section != "service" {
+			continue
+		}
+		key, value, ok := strings.Cut(trimmed, "=")
+		if !ok || strings.TrimSpace(key) != "ExecStart" {
+			continue
+		}
+		tokens := splitSystemdWordTokens(strings.TrimSpace(value))
+		if len(tokens) == 0 {
+			return systemdExecStart(opts), nil
+		}
+		tokens[0] = systemdSourceWord(systemdCommandPrefix(tokens[0].source) + systemdQuoteCommandAlways(opts.Executable))
+		for _, option := range []struct {
+			name     string
+			value    string
+			explicit bool
+			present  bool
+		}{
+			{"config", opts.Paths.ConfigFile, opts.Explicit.Config, opts.Paths.ConfigFile != ""},
+			{"state-dir", opts.Paths.StateDir, opts.Explicit.StateDir, opts.Paths.StateDir != ""},
+			{"log-dir", opts.Paths.LogDir, opts.Explicit.LogDir, opts.Paths.LogDir != ""},
+			{"listen", listenArg(opts.Listen), opts.Explicit.Listen, listenArg(opts.Listen) != ""},
+			{"cache-dir", opts.CacheDir, opts.Explicit.CacheDir, opts.CacheDir != ""},
+			{"hub-dir", opts.HubDir, opts.Explicit.HubDir, opts.HubDir != ""},
+			{"local-dir", opts.LocalDir, opts.Explicit.LocalDir, opts.LocalDir != ""},
+		} {
+			if !option.explicit {
+				continue
+			}
+			tokens = replaceSystemdRunFlag(tokens, option.name, option.value, option.present)
+		}
+		words := make([]string, len(tokens))
+		for i, token := range tokens {
+			words[i] = token.source
+		}
+		return strings.Join(words, " "), nil
+	}
+	return systemdExecStart(opts), nil
+}
+
+func systemdSourceWord(source string) systemdWord {
+	if words := splitSystemdWordTokens(source); len(words) == 1 {
+		return words[0]
+	}
+	return systemdWord{source: source, value: source}
+}
+
+func systemdCommandPrefix(source string) string {
+	for i := 0; i < len(source); i++ {
+		if strings.ContainsRune("-@:+!", rune(source[i])) {
+			continue
+		}
+		return source[:i]
+	}
+	return source
+}
+
+func replaceSystemdRunFlag(words []systemdWord, name, value string, present bool) []systemdWord {
+	layout := scanSystemdRunArgs(words, true)
+	occurrences := make(map[int]int)
+	insertAt := layout.insertionPoint
+	for _, option := range layout.options {
+		if option.name == name {
+			occurrences[option.start] = option.end
+			insertAt = option.start
+		}
+	}
+	var updated []systemdWord
+	for i := 0; i < len(words); {
+		if i == insertAt && present {
+			updated = append(updated, systemdSourceWord("--"+name), systemdSourceWord(systemdQuoteCommand(value)))
+		}
+		if occurrence, ok := occurrences[i]; ok {
+			i = occurrence
+			continue
+		}
+		updated = append(updated, words[i])
+		i++
+	}
+	if insertAt == len(words) && present {
+		updated = append(updated, systemdSourceWord("--"+name), systemdSourceWord(systemdQuoteCommand(value)))
+	}
+	return updated
+}
+
+type systemdRunOption struct {
+	name       string
+	start, end int
+	dynamic    bool
+}
+
+type systemdRunArgLayout struct {
+	options        []systemdRunOption
+	terminator     int
+	insertionPoint int
+}
+
+// scanSystemdRunArgs follows the option/value consumption used by Go's
+// flag.FlagSet: a separate option consumes its next word even when it is "--".
+func scanSystemdRunArgs(words []systemdWord, executableIncluded bool) systemdRunArgLayout {
+	start := 0
+	if executableIncluded && len(words) > 0 {
+		start = 1
+	}
+	if len(words) >= start+2 && words[start].value == "service" && words[start+1].value == "run" {
+		start += 2
+	} else if len(words) > start && words[start].value == "run" {
+		start++
+	}
+
+	layout := systemdRunArgLayout{terminator: -1, insertionPoint: len(words)}
+	for i := start; i < len(words); {
+		if words[i].value == "--" {
+			layout.terminator = i
+			layout.insertionPoint = i
+			return layout
+		}
+		name, hasInlineValue, ok := parseSystemdRunOption(words[i].value)
+		if !ok {
+			layout.insertionPoint = i
+			return layout
+		}
+		end := i + 1
+		dynamic := words[i].dynamic
+		if !hasInlineValue {
+			if end == len(words) {
+				layout.options = append(layout.options, systemdRunOption{name: name, start: i, end: end, dynamic: dynamic})
+				return layout
+			}
+			dynamic = words[end].dynamic
+			end++
+		}
+		layout.options = append(layout.options, systemdRunOption{name: name, start: i, end: end, dynamic: dynamic})
+		i = end
+	}
+	return layout
+}
+
+func parseSystemdRunOption(word string) (name string, hasInlineValue, ok bool) {
+	if len(word) < 2 || word[0] != '-' {
+		return "", false, false
+	}
+	nameStart := 1
+	if word[1] == '-' {
+		if len(word) == 2 {
+			return "", false, false
+		}
+		nameStart = 2
+	}
+	if word[nameStart] == '-' || word[nameStart] == '=' {
+		return "", false, false
+	}
+	name, _, hasInlineValue = strings.Cut(word[nameStart:], "=")
+	if !systemdRunFlag(name) {
+		return "", false, false
+	}
+	return name, hasInlineValue, true
+}
+
+func updateSystemdServiceDirectives(content string, changes map[string]systemdDirectiveChange) (string, error) {
+	lines := strings.Split(content, "\n")
+	logicalLines := systemdLogicalLines(content)
+	section := ""
+	serviceHeader := -1
+	counts := make(map[string]int, len(changes))
+	for _, line := range logicalLines {
+		trimmed := strings.TrimSpace(line.text)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			section = strings.ToLower(strings.TrimSpace(trimmed[1 : len(trimmed)-1]))
+			if section == "service" && serviceHeader < 0 {
+				serviceHeader = line.start
+			}
+			continue
+		}
+		if section != "service" || trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+			continue
+		}
+		key, _, ok := strings.Cut(trimmed, "=")
+		key = strings.TrimSpace(key)
+		if _, changing := changes[key]; ok && changing {
+			counts[key]++
+		}
+	}
+	if serviceHeader < 0 {
+		return "", errors.New("service: the existing unit has no [Service] section to update")
+	}
+	if counts["ExecStart"] > 1 {
+		return "", errors.New("service: the existing unit has multiple ExecStart directives; refusing to replace an ambiguous command")
+	}
+
+	ordered := []string{"ExecStart", "WorkingDirectory", "User", "Group"}
+	var updated []string
+	section = ""
+	appendOriginal := func(line systemdLogicalLine) {
+		updated = append(updated, lines[line.start:line.end+1]...)
+	}
+	for _, line := range logicalLines {
+		trimmed := strings.TrimSpace(line.text)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			section = strings.ToLower(strings.TrimSpace(trimmed[1 : len(trimmed)-1]))
+			appendOriginal(line)
+			if line.start == serviceHeader {
+				for _, key := range ordered {
+					change, changing := changes[key]
+					if changing && !change.remove && counts[key] == 0 {
+						updated = append(updated, key+"="+change.value)
+					}
+				}
+			}
+			continue
+		}
+		if section == "service" {
+			key, _, ok := strings.Cut(trimmed, "=")
+			key = strings.TrimSpace(key)
+			if change, changing := changes[key]; ok && changing {
+				if change.remove {
+					continue
+				}
+				updated = append(updated, replaceUnitDirective(lines[line.start], key, change.value))
+				continue
+			}
+		}
+		appendOriginal(line)
+	}
+	return strings.Join(updated, "\n"), nil
+}
+
+func replaceUnitDirective(line, key, value string) string {
+	ending := ""
+	if strings.HasSuffix(line, "\r") {
+		ending = "\r"
+		line = strings.TrimSuffix(line, "\r")
+	}
+	indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+	return indent + key + "=" + value + ending
+}
+
+// validateUnitPaths checks paths whose source bytes the operation will emit
+// into the unit. A first install writes every option; an update writes the
+// executable and only the explicitly named path operands.
 //
-// A unit file is a line based file: a control character in a path would end
-// up in it literally, and a newline would end the directive it is written in
-// and start another one the installation never wrote.
-//
-// The check covers every path that ends up in the unit: the executable, the
-// paths of the instance and the directories the user named.
-func validateUnitPaths(opts InstallOptions) error {
+// Unit-file controls can split newly written directives. An emitted
+// WorkingDirectory is also checked using its native value rules; an inherited
+// app state path is not that directive.
+func validateUnitPaths(opts InstallOptions, existing bool) error {
 	for _, p := range []struct {
-		name string
-		path string
+		name     string
+		path     string
+		explicit bool
 	}{
-		{"executable", opts.Executable},
-		{"config file", opts.Paths.ConfigFile},
-		{"state dir", opts.Paths.StateDir},
-		{"log dir", opts.Paths.LogDir},
-		{"cache dir", opts.CacheDir},
-		{"hub dir", opts.HubDir},
-		{"local dir", opts.LocalDir},
+		{"executable", opts.Executable, true},
+		{"config file", opts.Paths.ConfigFile, opts.Explicit.Config},
+		{"state dir", opts.Paths.StateDir, opts.Explicit.StateDir},
+		{"log dir", opts.Paths.LogDir, opts.Explicit.LogDir},
+		{"cache dir", opts.CacheDir, opts.Explicit.CacheDir},
+		{"hub dir", opts.HubDir, opts.Explicit.HubDir},
+		{"local dir", opts.LocalDir, opts.Explicit.LocalDir},
 	} {
-		if p.path == "" {
+		if p.path == "" || existing && !p.explicit {
 			continue
 		}
 		if r, ok := controlCharacter(p.path); ok {
 			return fmt.Errorf("service: the %s %q contains the control character %q: a path of an installation must not contain a control character", p.name, p.path, r)
+		}
+	}
+	if !existing || opts.Explicit.StateDir {
+		if _, err := systemdWorkingDirectoryValue(opts.Paths.StateDir); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -2399,6 +3317,44 @@ func systemdQuote(value string) string {
 	return systemdQuoteAlways(value)
 }
 
+// systemdWorkingDirectoryValue leaves path bytes intact; unlike ExecStart,
+// WorkingDirectory does not perform C-style unescaping. Only literal percent
+// signs need escaping from native systemd specifier expansion. A final odd
+// backslash gets a separator space so it cannot continue the unit-file line.
+func systemdWorkingDirectoryValue(value string) (string, error) {
+	if strings.HasSuffix(value, " ") {
+		return "", fmt.Errorf("service: the state dir %q cannot be represented by systemd WorkingDirectory because trailing spaces are stripped", value)
+	}
+	value = strings.ReplaceAll(value, "%", "%%")
+	backslashes := 0
+	for i := len(value) - 1; i >= 0 && value[i] == '\\'; i-- {
+		backslashes++
+	}
+	if backslashes%2 != 0 {
+		// Keep an odd final backslash from continuing the unit-file line.
+		value += " "
+	}
+	return value, nil
+}
+
+func parseSystemdWorkingDirectory(value string) (string, bool) {
+	var b strings.Builder
+	dynamic := false
+	for i := 0; i < len(value); {
+		if value[i] == '%' && i+1 < len(value) {
+			if value[i+1] == '%' {
+				b.WriteByte('%')
+				i += 2
+				continue
+			}
+			dynamic = true
+		}
+		b.WriteByte(value[i])
+		i++
+	}
+	return b.String(), dynamic
+}
+
 // systemdQuoteAlways renders one value of a unit file in the C style
 // quoting of systemd, no matter what the value contains.
 func systemdQuoteAlways(value string) string {
@@ -2476,13 +3432,28 @@ func systemdQuoteCommandAlways(value string) string {
 type parsedUnit struct {
 	// ExecStart is the executable of the unit.
 	ExecStart string
+	// ExecStartRaw and ExecArgsRaw retain the systemd-parsed, pre-environment-
+	// expansion values reported by D-Bus. The resolved fields below are for
+	// interpreting the options the running process receives.
+	ExecStartRaw string
+	ExecArgsRaw  []string
+	// Dynamic marks source words that systemd expands as specifiers or
+	// environment references. Those source expressions are kept separate from
+	// the manager's typed loaded values.
+	ExecStartDynamic bool
+	ExecArgsDynamic  []bool
+	DynamicRunArgs   map[string]bool
 	// ExecArgs are the arguments of the executable.
 	ExecArgs []string
 	// WorkingDirectory is the working directory of the unit.
-	WorkingDirectory string
+	WorkingDirectory        string
+	WorkingDirectoryDynamic bool
 	// User is the account a machine-wide unit runs as. A user scope unit
 	// names no account, so the value is empty there.
 	User string
+	// Group is the primary or explicitly configured group of a system-scope
+	// unit. It is kept unchanged unless the request names another service user.
+	Group string
 	// Environment holds the environment variables of the unit.
 	Environment map[string]string
 }
@@ -2510,12 +3481,7 @@ func (u parsedUnit) paths() runtimepaths.Paths {
 
 // flagValue returns the value of a flag of the argument vector of the unit.
 func (u parsedUnit) flagValue(flag string) string {
-	for i := 0; i+1 < len(u.ExecArgs); i++ {
-		if u.ExecArgs[i] == flag {
-			return u.ExecArgs[i+1]
-		}
-	}
-	return ""
+	return runArgValue(u.ExecArgs, flag)
 }
 
 // parseUnit reads the registration facts of a unit file.
@@ -2526,7 +3492,8 @@ func (u parsedUnit) flagValue(flag string) string {
 func parseUnit(content string) parsedUnit {
 	unit := parsedUnit{Environment: map[string]string{}}
 	section := ""
-	for _, line := range strings.Split(content, "\n") {
+	for _, logical := range systemdLogicalLines(content) {
+		line := logical.text
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
 			continue
@@ -2544,19 +3511,34 @@ func parseUnit(content string) parsedUnit {
 		}
 		switch strings.TrimSpace(key) {
 		case "ExecStart":
-			words := resolveSystemdDollars(splitSystemdWords(value))
-			if len(words) == 0 {
+			tokens := splitSystemdWordTokens(value)
+			rawWords := make([]string, len(tokens))
+			for i, token := range tokens {
+				rawWords[i] = token.value
+			}
+			if len(rawWords) == 0 {
 				continue
 			}
+			words := resolveSystemdDollars(slices.Clone(rawWords))
+			unit.ExecStartRaw = rawWords[0]
+			unit.ExecArgsRaw = append([]string(nil), rawWords[1:]...)
+			unit.ExecStartDynamic = tokens[0].dynamic
+			unit.ExecArgsDynamic = make([]bool, len(tokens)-1)
+			for i := 1; i < len(tokens); i++ {
+				unit.ExecArgsDynamic[i-1] = tokens[i].dynamic
+			}
+			unit.DynamicRunArgs = dynamicRunArgValues(tokens[1:])
 			unit.ExecStart = words[0]
 			unit.ExecArgs = words[1:]
 		case "WorkingDirectory":
-			if words := splitSystemdWords(value); len(words) > 0 {
-				unit.WorkingDirectory = words[0]
-			}
+			unit.WorkingDirectory, unit.WorkingDirectoryDynamic = parseSystemdWorkingDirectory(value)
 		case "User":
-			if words := splitSystemdWords(value); len(words) > 0 {
-				unit.User = words[0]
+			if words := splitSystemdWordTokens(value); len(words) > 0 {
+				unit.User = words[0].value
+			}
+		case "Group":
+			if words := splitSystemdWordTokens(value); len(words) > 0 {
+				unit.Group = words[0].value
 			}
 		case "Environment":
 			for _, word := range splitSystemdWords(value) {
@@ -2568,79 +3550,259 @@ func parseUnit(content string) parsedUnit {
 			}
 		}
 	}
+	if unit.WorkingDirectoryDynamic {
+		if _, hasStateArg := unit.DynamicRunArgs["state-dir"]; !hasStateArg {
+			if unit.DynamicRunArgs == nil {
+				unit.DynamicRunArgs = make(map[string]bool)
+			}
+			unit.DynamicRunArgs["state-dir"] = true
+		}
+	}
 	return unit
 }
 
-// splitSystemdWords splits a command line of a unit file into its words.
-// It understands the quoting of the supervisor: single quotes, double quotes
-// and backslash escapes.
+type systemdLogicalLine struct {
+	text       string
+	start, end int
+}
+
+// systemdLogicalLines joins the physical lines systemd continues before it
+// parses assignments. start/end retain the original span so an updated
+// directive can replace its whole continued value without leaving orphaned
+// physical lines behind.
+func systemdLogicalLines(content string) []systemdLogicalLine {
+	physical := strings.Split(content, "\n")
+	logical := make([]systemdLogicalLine, 0, len(physical))
+	for start := 0; start < len(physical); {
+		line := strings.TrimSuffix(physical[start], "\r")
+		end := start
+		for hasSystemdLineContinuation(line) {
+			line = line[:len(line)-1] + " "
+			next := end + 1
+			for next < len(physical) && isSystemdCommentLine(physical[next]) {
+				next++
+			}
+			if next >= len(physical) {
+				end = len(physical) - 1
+				break
+			}
+			line += strings.TrimSuffix(physical[next], "\r")
+			end = next
+		}
+		logical = append(logical, systemdLogicalLine{text: line, start: start, end: end})
+		start = end + 1
+	}
+	return logical
+}
+
+func isSystemdCommentLine(line string) bool {
+	trimmed := strings.TrimLeft(line, " \t\r\n")
+	return strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";")
+}
+
+func hasSystemdLineContinuation(line string) bool {
+	backslashes := 0
+	for i := len(line) - 1; i >= 0 && line[i] == '\\'; i-- {
+		backslashes++
+	}
+	return backslashes%2 == 1
+}
+
+type systemdWord struct {
+	source  string
+	value   string
+	dynamic bool
+}
+
+// splitSystemdWords implements systemd's ExecStart word boundary: whitespace
+// separates unquoted words, quotes group a word, and C escapes are decoded
+// without re-splitting the escaped result. Unknown escapes remain literal, as
+// systemd's relaxed syntax path does after warning.
 func splitSystemdWords(line string) []string {
+	tokens := splitSystemdWordTokens(line)
+	words := make([]string, len(tokens))
+	for i, token := range tokens {
+		words[i] = token.value
+	}
+	return words
+}
+
+func splitSystemdWordTokens(line string) []systemdWord {
 	var (
-		words []string
-		word  strings.Builder
-		has   bool
+		words     []systemdWord
+		word      strings.Builder
+		expansion strings.Builder
+		start     = -1
+		quote     byte
 	)
-	flush := func() {
-		if !has {
+	flush := func(end int) {
+		if start < 0 {
 			return
 		}
-		words = append(words, word.String())
+		words = append(words, systemdWord{
+			source:  line[start:end],
+			value:   word.String(),
+			dynamic: hasSystemdExpansion(expansion.String()),
+		})
 		word.Reset()
-		has = false
+		expansion.Reset()
+		start = -1
 	}
-	for i := 0; i < len(line); i++ {
-		switch c := line[i]; {
-		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
-			flush()
-		case c == '\'':
-			has = true
-			end := strings.IndexByte(line[i+1:], '\'')
-			if end < 0 {
-				word.WriteString(line[i+1:])
-				i = len(line)
-				continue
+	for i := 0; i < len(line); {
+		c := line[i]
+		if c == '\\' {
+			if start < 0 {
+				start = i
 			}
-			word.WriteString(line[i+1 : i+1+end])
-			i = i + 1 + end
-		case c == '"':
-			has = true
-			for i++; i < len(line); i++ {
-				if line[i] == '\\' && i+1 < len(line) {
-					word.WriteString(unescapeSystemdChar(line[i+1]))
-					i++
-					continue
-				}
-				if line[i] == '%' && i+1 < len(line) && line[i+1] == '%' {
-					word.WriteByte('%')
-					i++
-					continue
-				}
-				if line[i] == '"' {
-					break
-				}
-				word.WriteByte(line[i])
-			}
-		case c == '\\':
-			has = true
-			if i+1 < len(line) {
-				word.WriteString(unescapeSystemdChar(line[i+1]))
-				i++
-			}
-		case c == '%':
-			has = true
-			if i+1 < len(line) && line[i+1] == '%' {
-				word.WriteByte('%')
-				i++
-				continue
+			value, next := unescapeSystemdSequence(line, i)
+			word.WriteString(value)
+			expansion.WriteString(value)
+			i = next
+			continue
+		}
+		if c == '%' && i+1 < len(line) && line[i+1] == '%' {
+			if start < 0 {
+				start = i
 			}
 			word.WriteByte('%')
+			expansion.WriteString("%%")
+			i += 2
+			continue
+		}
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+			} else {
+				word.WriteByte(c)
+				expansion.WriteByte(c)
+			}
+			i++
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			if start < 0 {
+				start = i
+			}
+			quote = c
+		case ' ', '\t', '\n', '\r':
+			flush(i)
 		default:
-			has = true
+			if start < 0 {
+				start = i
+			}
 			word.WriteByte(c)
+			expansion.WriteByte(c)
+		}
+		i++
+	}
+	flush(len(line))
+	return words
+}
+
+func hasSystemdExpansion(value string) bool {
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '$':
+			if i+1 < len(value) && value[i+1] == '$' {
+				i++
+				continue
+			}
+			if i+1 < len(value) && (value[i+1] == '{' || isSystemdVariableNameStart(value[i+1])) {
+				return true
+			}
+		case '%':
+			if i+1 < len(value) && value[i+1] == '%' {
+				i++
+				continue
+			}
+			if i+1 < len(value) {
+				return true
+			}
 		}
 	}
-	flush()
-	return words
+	return false
+}
+
+func isSystemdVariableNameStart(c byte) bool {
+	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+func dynamicRunArgValues(args []systemdWord) map[string]bool {
+	values := make(map[string]bool)
+	for _, option := range scanSystemdRunArgs(args, false).options {
+		values[option.name] = option.dynamic
+	}
+	return values
+}
+
+func systemdRunFlag(name string) bool {
+	switch name {
+	case "config", "state-dir", "log-dir", "listen", "cache-dir", "hub-dir", "local-dir":
+		return true
+	default:
+		return false
+	}
+}
+
+func unescapeSystemdSequence(line string, slash int) (string, int) {
+	if slash+1 >= len(line) {
+		return "\\", slash + 1
+	}
+	code := line[slash+1]
+	switch code {
+	case 'a':
+		return "\a", slash + 2
+	case 'b':
+		return "\b", slash + 2
+	case 'f':
+		return "\f", slash + 2
+	case 'n':
+		return "\n", slash + 2
+	case 'r':
+		return "\r", slash + 2
+	case 't':
+		return "\t", slash + 2
+	case 'v':
+		return "\v", slash + 2
+	case '\\':
+		return "\\", slash + 2
+	case '"':
+		return `"`, slash + 2
+	case '\'':
+		return "'", slash + 2
+	case 's':
+		return " ", slash + 2
+	case 'x':
+		if slash+4 <= len(line) {
+			value, err := strconv.ParseUint(line[slash+2:slash+4], 16, 8)
+			if err == nil && value != 0 {
+				return string([]byte{byte(value)}), slash + 4
+			}
+		}
+	case 'u':
+		if slash+6 <= len(line) {
+			value, err := strconv.ParseUint(line[slash+2:slash+6], 16, 16)
+			if err == nil && value != 0 && utf8.ValidRune(rune(value)) {
+				return string(rune(value)), slash + 6
+			}
+		}
+	case 'U':
+		if slash+10 <= len(line) {
+			value, err := strconv.ParseUint(line[slash+2:slash+10], 16, 32)
+			if err == nil && value != 0 && utf8.ValidRune(rune(value)) {
+				return string(rune(value)), slash + 10
+			}
+		}
+	default:
+		if code >= '0' && code <= '7' && slash+4 <= len(line) {
+			value, err := strconv.ParseUint(line[slash+1:slash+4], 8, 8)
+			if err == nil && value != 0 {
+				return string([]byte{byte(value)}), slash + 4
+			}
+		}
+	}
+	return line[slash : slash+2], slash + 2
 }
 
 // resolveSystemdDollars resolves the escaped dollar signs of the words of a
@@ -2661,23 +3823,6 @@ func resolveSystemdDollars(words []string) []string {
 		words[i] = strings.ReplaceAll(word, "$$", "$")
 	}
 	return words
-}
-
-// unescapeSystemdChar returns the character an escape sequence of a unit
-// file stands for.
-func unescapeSystemdChar(c byte) string {
-	switch c {
-	case 'n':
-		return "\n"
-	case 't':
-		return "\t"
-	case 'r':
-		return "\r"
-	case 's':
-		return " "
-	default:
-		return string(c)
-	}
 }
 
 // systemdShow holds the properties of the unit the supervisor reported.
