@@ -20,6 +20,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -774,9 +775,11 @@ type scmTestRecoveryTarget struct {
 	// config is the configuration the registration holds.
 	config mgr.Config
 	// writes are the configurations written back, in order.
-	writes []mgr.Config
+	writes    []mgr.Config
+	writeErrs []error
 	// deletes is the number of removals.
-	deletes int
+	deletes   int
+	deleteErr error
 	// starts is the number of starts of the previous program.
 	starts int
 	// started is the program the rollback started.
@@ -788,8 +791,15 @@ type scmTestRecoveryTarget struct {
 // UpdateConfig records the configuration written back.
 func (t *scmTestRecoveryTarget) UpdateConfig(config mgr.Config) error {
 	t.writes = append(t.writes, config)
-	t.config = config
-	return nil
+	var err error
+	if len(t.writeErrs) > 0 {
+		err = t.writeErrs[0]
+		t.writeErrs = t.writeErrs[1:]
+	}
+	if err == nil {
+		t.config = config
+	}
+	return err
 }
 
 // Config returns the configuration the registration holds.
@@ -798,7 +808,7 @@ func (t *scmTestRecoveryTarget) Config() (mgr.Config, error) { return t.config, 
 // Delete records the removal of the registration.
 func (t *scmTestRecoveryTarget) Delete() error {
 	t.deletes++
-	return nil
+	return t.deleteErr
 }
 
 // StartAndVerify records the start of the previous program.
@@ -874,32 +884,35 @@ func TestSCMRollbackSettlesTheStopItInherits(t *testing.T) {
 	shortenSCMStopBudget(t, 10*time.Millisecond)
 	readErr := errors.New("the service control manager did not answer")
 	cases := []struct {
-		name        string
-		mode        scmRollbackMode
-		controlErr  error
-		queryErr    error
-		queryErrs   []error
-		state       svc.State
-		settle      bool
-		wantOutcome scmStopOutcome
-		wantWrites  int
-		wantStarts  int
-		wantReports []string
+		name         string
+		mode         scmRollbackMode
+		controlErr   error
+		queryErr     error
+		queryErrs    []error
+		state        svc.State
+		settle       bool
+		wantOutcome  scmStopOutcome
+		wantWrites   int
+		wantStarts   int
+		wantDirsSafe bool
+		wantReports  []string
 	}{
 		{
-			name:        "a control that was never delivered",
-			controlErr:  errors.New("the service control manager refused the stop"),
-			wantOutcome: scmStopNotDelivered,
-			wantWrites:  1,
-			wantReports: []string{"the configuration of the previous registration was restored", "the instance still runs", "no instance was started"},
+			name:         "a control that was never delivered",
+			controlErr:   errors.New("the service control manager refused the stop"),
+			wantOutcome:  scmStopNotDelivered,
+			wantWrites:   1,
+			wantDirsSafe: true,
+			wantReports:  []string{"the configuration of the previous registration was restored", "the instance still runs", "no instance was started"},
 		},
 		{
-			name:        "the previous instance then stops",
-			settle:      true,
-			wantOutcome: scmStopUnsettled,
-			wantWrites:  1,
-			wantStarts:  1,
-			wantReports: []string{"the previous instance was proven stopped", scmRollbackSuccessClaim},
+			name:         "the previous instance then stops",
+			settle:       true,
+			wantOutcome:  scmStopUnsettled,
+			wantWrites:   1,
+			wantStarts:   1,
+			wantDirsSafe: true,
+			wantReports:  []string{"the previous instance was proven stopped", scmRollbackSuccessClaim},
 		},
 		{
 			name:        "a stop that stays pending",
@@ -907,35 +920,39 @@ func TestSCMRollbackSettlesTheStopItInherits(t *testing.T) {
 			wantReports: []string{"was not proven to be stopped", "no instance was started", "hfdesk service status", "did not stop within"},
 		},
 		{
-			name:        "a state that cannot be read",
-			queryErr:    readErr,
-			wantOutcome: scmStopNotDelivered,
-			wantWrites:  1,
-			wantReports: []string{"the configuration of the previous registration was restored", "the running state of the instance could not be confirmed", "no instance was started", "hfdesk service status", "did not answer"},
+			name:         "a state that cannot be read",
+			queryErr:     readErr,
+			wantOutcome:  scmStopNotDelivered,
+			wantWrites:   1,
+			wantDirsSafe: true,
+			wantReports:  []string{"the configuration of the previous registration was restored", "the running state of the instance could not be confirmed", "no instance was started", "hfdesk service status", "did not answer"},
 		},
 		{
-			name:        "a state that cannot be read first and then reads as running",
-			queryErrs:   []error{readErr},
-			wantOutcome: scmStopNotDelivered,
-			wantWrites:  1,
-			wantReports: []string{"the configuration of the previous registration was restored", "the instance still runs", "no instance was started"},
+			name:         "a state that cannot be read first and then reads as running",
+			queryErrs:    []error{readErr},
+			wantOutcome:  scmStopNotDelivered,
+			wantWrites:   1,
+			wantDirsSafe: true,
+			wantReports:  []string{"the configuration of the previous registration was restored", "the instance still runs", "no instance was started"},
 		},
 		{
-			name:        "a state that cannot be read first and then reads as stopped",
-			queryErrs:   []error{readErr},
-			state:       svc.Stopped,
-			wantOutcome: scmStopNotDelivered,
-			wantWrites:  1,
-			wantStarts:  1,
-			wantReports: []string{"the previous instance was proven stopped", "the configuration of the previous registration was restored", scmRollbackSuccessClaim},
+			name:         "a state that cannot be read first and then reads as stopped",
+			queryErrs:    []error{readErr},
+			state:        svc.Stopped,
+			wantOutcome:  scmStopNotDelivered,
+			wantWrites:   1,
+			wantStarts:   1,
+			wantDirsSafe: true,
+			wantReports:  []string{"the previous instance was proven stopped", "the configuration of the previous registration was restored", scmRollbackSuccessClaim},
 		},
 		{
-			name:        "a state that cannot be read first and then stays stopping",
-			queryErrs:   []error{readErr},
-			state:       svc.StopPending,
-			wantOutcome: scmStopNotDelivered,
-			wantWrites:  1,
-			wantReports: []string{"the configuration of the previous registration was restored", "the running state of the instance could not be confirmed", "no instance was started", "hfdesk service status"},
+			name:         "a state that cannot be read first and then stays stopping",
+			queryErrs:    []error{readErr},
+			state:        svc.StopPending,
+			wantOutcome:  scmStopNotDelivered,
+			wantWrites:   1,
+			wantDirsSafe: true,
+			wantReports:  []string{"the configuration of the previous registration was restored", "the running state of the instance could not be confirmed", "no instance was started", "hfdesk service status"},
 		},
 		{
 			name:        "the instance of a failed start",
@@ -977,9 +994,12 @@ func TestSCMRollbackSettlesTheStopItInherits(t *testing.T) {
 				target.queryAfterControlErr = nil
 			}
 			controlsBeforeRollback := target.controls
-			rollbackErr := manager.rollbackInstallation(context.Background(), target, previous, mode, failure)
+			dirsSafe, rollbackErr := manager.rollbackInstallation(context.Background(), target, previous, mode, failure)
 			if rollbackErr == nil || !errors.Is(rollbackErr, failure) {
 				t.Fatalf("rollbackInstallation() = %v, want the original failure wrapped", rollbackErr)
+			}
+			if dirsSafe != tc.wantDirsSafe {
+				t.Errorf("rollbackInstallation() directory cleanup safe = %v, want %v", dirsSafe, tc.wantDirsSafe)
 			}
 			if outcome == scmStopNotDelivered && target.controls != controlsBeforeRollback {
 				t.Errorf("the rollback delivered %d stop controls after a stop that was never delivered, want none", target.controls-controlsBeforeRollback)
@@ -1019,9 +1039,12 @@ func TestSCMRollbackOfAFailureOutsideTheInstanceRestoresTheRegistration(t *testi
 	previous := scmTestRunningPrevious()
 	failure := errors.New("the failure recovery could not be configured")
 
-	err := (&scmManager{scope: ScopeSystem}).rollbackInstallation(context.Background(), target, previous, scmRollbackRegistration, failure)
+	dirsSafe, err := (&scmManager{scope: ScopeSystem}).rollbackInstallation(context.Background(), target, previous, scmRollbackRegistration, failure)
 	if err == nil || !errors.Is(err, failure) {
 		t.Fatalf("rollbackInstallation() = %v, want the original failure wrapped", err)
+	}
+	if !dirsSafe {
+		t.Error("rollbackInstallation() says directory cleanup is unsafe after a verified configuration restore")
 	}
 	if len(target.writes) != 1 || target.starts != 0 || target.controls != 0 || target.deletes != 0 {
 		t.Errorf("the rollback wrote %d configurations, started %d instances, delivered %d controls and removed %d registrations, want one write and no other change",
@@ -1031,6 +1054,48 @@ func TestSCMRollbackOfAFailureOutsideTheInstanceRestoresTheRegistration(t *testi
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the report %q does not mention %q", err, want)
 		}
+	}
+}
+
+func TestSCMDirectoryCleanupUsesProvenRegistrationOutcome(t *testing.T) {
+	failure := errors.New("the install step failed")
+	deleteErr := errors.New("the SCM refused deletion")
+	writeErr := errors.New("the SCM refused restoration")
+	cases := []struct {
+		name     string
+		prev     previousSCMRegistration
+		target   *scmTestRecoveryTarget
+		wantSafe bool
+	}{
+		{"new registration deleted", previousSCMRegistration{}, &scmTestRecoveryTarget{}, true},
+		{"new registration deletion unconfirmed", previousSCMRegistration{}, &scmTestRecoveryTarget{deleteErr: deleteErr}, false},
+		{"prior config restored", scmTestRunningPrevious(), &scmTestRecoveryTarget{}, true},
+		{"prior config restoration failed", scmTestRunningPrevious(), &scmTestRecoveryTarget{writeErrs: []error{writeErr}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			safe, err := (&scmManager{scope: ScopeSystem}).rollbackInstallation(
+				context.Background(), tc.target, tc.prev, scmRollbackRegistration, failure)
+			if err == nil || !errors.Is(err, failure) {
+				t.Fatalf("rollbackInstallation() = %v, want original failure wrapped", err)
+			}
+			if safe != tc.wantSafe {
+				t.Errorf("rollbackInstallation() cleanup-safe = %v, want %v", safe, tc.wantSafe)
+			}
+		})
+	}
+
+	dir := filepath.Join(t.TempDir(), "created-state")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("Mkdir(%q) = %v", dir, err)
+	}
+	cleanupCreatedSCMInstallDirs([]string{dir}, scmRegisterResult{createdDirsSafeToRemove: false})
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("an unproven registration outcome removed %q: %v", dir, err)
+	}
+	cleanupCreatedSCMInstallDirs([]string{dir}, scmRegisterResult{createdDirsSafeToRemove: true})
+	if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a proven-safe cleanup left %q in place: %v", dir, err)
 	}
 }
 
@@ -3563,19 +3628,41 @@ func TestSCMRegistrationOptionsRecoversTheRegistration(t *testing.T) {
 	}
 }
 
-// TestSCMRegistrationOptionsOfADamagedRegistrationNameNothing checks that a
-// registration that carries no readable command line records no setting.
+// TestSCMRegistrationOptionsOfAnUnreadableCommandLineNameNothing checks that a
+// registration without a readable command line records no setting.
 //
 // An installation is the way a damaged registration is repaired, so the
 // recovery never fails: the options are empty, and the merge falls back to the
 // defaults of the request.
-func TestSCMRegistrationOptionsOfADamagedRegistrationNameNothing(t *testing.T) {
+func TestSCMRegistrationOptionsOfAnUnreadableCommandLineNameNothing(t *testing.T) {
 	for _, commandLine := range []string{"", "   "} {
 		got := scmRegistrationOptions(commandLine, ScopeSystem)
 		want := InstallOptions{Scope: ScopeSystem}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("scmRegistrationOptions(%q) =\n%+v\nwant\n%+v", commandLine, got, want)
 		}
+	}
+}
+
+func TestSCMRegistrationOptionsDefaultsListenForAParseableBrokenRegistration(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing", "hfdesk.exe")
+	commandLine := syscall.EscapeArg(missing)
+
+	options := scmRegistrationOptions(commandLine, ScopeSystem)
+	if options.Executable != missing || options.Listen != DefaultListen {
+		t.Fatalf("scmRegistrationOptions() = %+v, want the readable program and parser-default listen %q", options, DefaultListen)
+	}
+
+	status, err := scmStatusFrom(ScopeSystem, scmRegistrationFacts{
+		present:     true,
+		state:       svc.Stopped,
+		commandLine: commandLine,
+	})
+	if err != nil {
+		t.Fatalf("scmStatusFrom() = %v, want a readable broken registration", err)
+	}
+	if status.State != StateBroken || status.Listen != DefaultListen {
+		t.Errorf("status = %+v, want broken with parser-default listen %q", status, DefaultListen)
 	}
 }
 
@@ -3785,31 +3872,45 @@ func (c *scmTestRecoveryConfig) SetNonCrashFailures(enabled bool) error {
 }
 
 func TestSCMConfigureRecoveryUsesOnlyEstablishedMissingPolicy(t *testing.T) {
-	custom := []mgr.RecoveryAction{{Type: mgr.ServiceRestart, Delay: 12 * time.Second}}
-	t.Run("preserves existing actions and non-crash flag", func(t *testing.T) {
-		config := &scmTestRecoveryConfig{
-			actions: custom, resetPeriod: 17, nonCrash: true,
-			command: "custom recovery command", rebootMessage: "custom reboot message",
+	customPolicies := []struct {
+		name    string
+		actions []mgr.RecoveryAction
+	}{
+		{"intentional no-action", []mgr.RecoveryAction{{Type: mgr.NoAction}}},
+		{"custom restart", []mgr.RecoveryAction{{Type: mgr.ServiceRestart, Delay: 12 * time.Second}}},
+		{"computer reboot", []mgr.RecoveryAction{{Type: mgr.ComputerReboot, Delay: 13 * time.Second}}},
+		{"run command", []mgr.RecoveryAction{{Type: mgr.RunCommand, Delay: 14 * time.Second}}},
+		{"mixed ordered actions", []mgr.RecoveryAction{
+			{Type: mgr.NoAction},
+			{Type: mgr.ServiceRestart, Delay: 15 * time.Second},
+			{Type: mgr.ComputerReboot, Delay: 16 * time.Second},
+			{Type: mgr.RunCommand, Delay: 17 * time.Second},
+		}},
+	}
+	for _, policy := range customPolicies {
+		for _, nonCrash := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/non-crash-%t", policy.name, nonCrash), func(t *testing.T) {
+				custom := slices.Clone(policy.actions)
+				config := &scmTestRecoveryConfig{
+					actions: custom, resetPeriod: 17, nonCrash: nonCrash,
+					command: "custom recovery command", rebootMessage: "custom reboot message",
+				}
+				if err := configureSCMRecoveryWith(config); err != nil {
+					t.Fatalf("configureSCMRecoveryWith() = %v, want the custom policy preserved", err)
+				}
+				if !slices.Equal(config.actions, custom) || config.nonCrash != nonCrash {
+					t.Errorf("the custom policy became actions=%v nonCrash=%v, want actions=%v nonCrash=%v",
+						config.actions, config.nonCrash, custom, nonCrash)
+				}
+				if len(config.actionWrites) != 0 || len(config.flagWrites) != 0 {
+					t.Errorf("the custom policy received writes: actions=%v flags=%v", config.actionWrites, config.flagWrites)
+				}
+				if config.command != "custom recovery command" || config.rebootMessage != "custom reboot message" {
+					t.Errorf("the custom ancillary recovery settings changed: %+v", config)
+				}
+			})
 		}
-		if err := configureSCMRecoveryWith(config); err != nil {
-			t.Fatalf("configureSCMRecoveryWith() = %v, want existing policy preserved", err)
-		}
-		if len(config.actionWrites) != 0 || len(config.flagWrites) != 0 {
-			t.Errorf("the existing policy received writes: actions=%v flags=%v", config.actionWrites, config.flagWrites)
-		}
-	})
-	t.Run("enables error recovery without replacing custom actions", func(t *testing.T) {
-		config := &scmTestRecoveryConfig{actions: custom, resetPeriod: 17, nonCrash: false}
-		if err := configureSCMRecoveryWith(config); err != nil {
-			t.Fatalf("configureSCMRecoveryWith() = %v, want only the required flag correction", err)
-		}
-		if !slices.Equal(config.actions, custom) || !config.nonCrash {
-			t.Errorf("the custom recovery policy is %+v, want its actions preserved and error recovery enabled", config)
-		}
-		if len(config.actionWrites) != 0 || !slices.Equal(config.flagWrites, []bool{true}) {
-			t.Errorf("writes are actions=%v flags=%v, want only the non-crash flag correction", config.actionWrites, config.flagWrites)
-		}
-	})
+	}
 	t.Run("sets required defaults after successful empty read", func(t *testing.T) {
 		config := &scmTestRecoveryConfig{
 			resetPeriod: 17, command: "custom recovery command", rebootMessage: "custom reboot message",
@@ -3847,7 +3948,6 @@ func TestSCMConfigureRecoveryDoesNotWriteAfterUnreadableEvidence(t *testing.T) {
 		{"actions", &scmTestRecoveryConfig{actionsReadErr: readErr}},
 		{"reset period", &scmTestRecoveryConfig{resetReadErr: readErr}},
 		{"non-crash flag on an empty action list", &scmTestRecoveryConfig{nonCrashReadErr: readErr}},
-		{"non-crash flag on existing actions", &scmTestRecoveryConfig{actions: []mgr.RecoveryAction{{Type: mgr.ServiceRestart}}, nonCrashReadErr: readErr}},
 		{"recovery command", &scmTestRecoveryConfig{commandReadErr: readErr}},
 		{"reboot message", &scmTestRecoveryConfig{rebootReadErr: readErr}},
 	}
@@ -3857,31 +3957,26 @@ func TestSCMConfigureRecoveryDoesNotWriteAfterUnreadableEvidence(t *testing.T) {
 			if err == nil {
 				t.Fatal("configureSCMRecoveryWith() = nil, want the unreadable policy error")
 			}
+			if !errors.Is(err, readErr) {
+				t.Errorf("configureSCMRecoveryWith() = %v, want the original read error", err)
+			}
 			if len(tc.config.actionWrites) != 0 || len(tc.config.flagWrites) != 0 {
 				t.Errorf("the unreadable policy caused writes: actions=%v flags=%v", tc.config.actionWrites, tc.config.flagWrites)
 			}
 		})
 	}
-}
-
-func TestSCMConfigureRecoveryRestoresOnlyTheNonCrashFlagForCustomActions(t *testing.T) {
-	setupErr := errors.New("the SCM refused the non-crash flag")
-	actions := []mgr.RecoveryAction{{Type: mgr.ServiceRestart, Delay: 19 * time.Second}}
-	config := &scmTestRecoveryConfig{
-		actions:       slices.Clone(actions),
-		nonCrash:      false,
-		flagWriteErrs: []error{setupErr, nil},
-	}
-	err := configureSCMRecoveryWith(config)
-	if err == nil || !errors.Is(err, setupErr) {
-		t.Fatalf("configureSCMRecoveryWith() = %v, want the flag write error", err)
-	}
-	if !slices.Equal(config.actions, actions) || config.nonCrash {
-		t.Errorf("the previous custom policy is %+v, want its actions and false flag restored", config)
-	}
-	if len(config.actionWrites) != 0 || !slices.Equal(config.flagWrites, []bool{true, false}) {
-		t.Errorf("writes are actions=%v flags=%v, want only enable then restore the flag", config.actionWrites, config.flagWrites)
-	}
+	t.Run("an unreadable custom flag is preserved without writes", func(t *testing.T) {
+		custom := []mgr.RecoveryAction{{Type: mgr.ComputerReboot, Delay: 5 * time.Second}}
+		config := &scmTestRecoveryConfig{
+			actions: custom, nonCrash: false, nonCrashReadErr: readErr,
+		}
+		if err := configureSCMRecoveryWith(config); err != nil {
+			t.Fatalf("configureSCMRecoveryWith() = %v, want the custom policy untouched", err)
+		}
+		if !slices.Equal(config.actions, custom) || config.nonCrash || len(config.actionWrites) != 0 || len(config.flagWrites) != 0 {
+			t.Errorf("the unreadable custom policy changed: %+v", config)
+		}
+	})
 }
 
 func TestSCMConfigureRecoveryRestoresAfterActionWriteFailure(t *testing.T) {
@@ -4104,6 +4199,8 @@ func TestSCMFailedUpdateConfigRestoresThePreviousConfiguration(t *testing.T) {
 		want []string
 		// wantUnproven is true when the report must not claim a restore.
 		wantUnproven bool
+		// wantDirsSafe follows the actual restore/read-back result.
+		wantDirsSafe bool
 	}{
 		{
 			name: "the configuration is restored",
@@ -4112,7 +4209,8 @@ func TestSCMFailedUpdateConfigRestoresThePreviousConfiguration(t *testing.T) {
 				writeErrs:           []error{updateErr},
 				applyBeforeRefusing: true,
 			},
-			want: []string{"update the registration", updateErr.Error(), "was restored"},
+			want:         []string{"update the registration", updateErr.Error(), "was restored"},
+			wantDirsSafe: true,
 		},
 		{
 			name: "the restore also fails",
@@ -4147,7 +4245,8 @@ func TestSCMFailedUpdateConfigRestoresThePreviousConfiguration(t *testing.T) {
 				applyBeforeRefusing: true,
 				partialReadErr:      readErr,
 			},
-			want: []string{"update the registration", updateErr.Error(), "was restored"},
+			want:         []string{"update the registration", updateErr.Error(), "was restored"},
+			wantDirsSafe: true,
 		},
 	}
 	for _, tc := range cases {
@@ -4155,9 +4254,12 @@ func TestSCMFailedUpdateConfigRestoresThePreviousConfiguration(t *testing.T) {
 			m := &scmManager{scope: ScopeSystem}
 			previous := previousSCMRegistration{present: true, config: previousConfig}
 
-			err := m.updateRegistrationConfig(tc.fake, requestedConfig, previous)
+			dirsSafe, err := m.updateRegistrationConfig(tc.fake, requestedConfig, previous)
 			if err == nil {
 				t.Fatal("updateRegistrationConfig() = nil, want the failure of the update")
+			}
+			if dirsSafe != tc.wantDirsSafe {
+				t.Errorf("updateRegistrationConfig() directory cleanup safe = %v, want %v", dirsSafe, tc.wantDirsSafe)
 			}
 			if !errors.Is(err, updateErr) {
 				t.Errorf("updateRegistrationConfig() = %v, want the original failure wrapped", err)
@@ -4194,8 +4296,12 @@ func TestSCMFailedUpdateConfigKeepsASuccessfulWrite(t *testing.T) {
 	registration := &fakeSCMConfiguration{config: previousConfig}
 
 	m := &scmManager{scope: ScopeSystem}
-	if err := m.updateRegistrationConfig(registration, requestedConfig, previousSCMRegistration{present: true, config: previousConfig}); err != nil {
+	dirsSafe, err := m.updateRegistrationConfig(registration, requestedConfig, previousSCMRegistration{present: true, config: previousConfig})
+	if err != nil {
 		t.Fatalf("updateRegistrationConfig() = %v, want nil", err)
+	}
+	if dirsSafe {
+		t.Error("a successful update says newly created directories are safe to remove")
 	}
 	if len(registration.writes) != 1 {
 		t.Errorf("the registration was written %d times, want the update only", len(registration.writes))
@@ -4347,6 +4453,41 @@ func scmTestHealthEndpoint(t *testing.T, version string, challenge bool) string 
 	return strings.TrimPrefix(server.URL, "http://")
 }
 
+func scmTestProbeResponse(t *testing.T, status int, body, challenge string) (string, *atomic.Int32) {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for the readiness response: %v", err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		if challenge != "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = fmt.Fprint(w, body)
+	}))
+	server.Listener = listener
+	server.Start()
+	t.Cleanup(server.Close)
+	return strings.TrimPrefix(server.URL, "http://"), &requests
+}
+
+func scmTestClosedProbeAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for the closed readiness address: %v", err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close the readiness listener: %v", err)
+	}
+	return address
+}
+
 func scmTestFirstInstallOptions(t *testing.T, listen, expectedVersion string) InstallOptions {
 	t.Helper()
 	executable, err := os.Executable()
@@ -4365,6 +4506,25 @@ func scmTestFirstInstallOptions(t *testing.T, listen, expectedVersion string) In
 			LogDir:     filepath.Join(root, "logs"),
 		},
 	}
+}
+
+func scmTestRunningVerificationTarget(t *testing.T, opts InstallOptions, imageReadable bool) (*mgr.Service, *int) {
+	t.Helper()
+	handle, starts := &mgr.Service{Handle: windows.Handle(123)}, 0
+	replaceSCMTestSeam(t, &scmStartService, func(*mgr.Service) error { starts++; return nil })
+	replaceSCMTestSeam(t, &scmQueryStatus, func(*mgr.Service) (svc.Status, error) {
+		return svc.Status{State: svc.Running, ProcessId: 8142}, nil
+	})
+	replaceSCMTestSeam(t, &scmQueryProcessImageName, func(uint32) (string, error) {
+		if imageReadable {
+			return opts.Executable, nil
+		}
+		return "", windows.ERROR_ACCESS_DENIED
+	})
+	replaceSCMTestSeam(t, &scmQueryServiceCommandLine, func(windows.Handle) (string, error) {
+		return scmCommandLine(opts), nil
+	})
+	return handle, &starts
 }
 
 // TestSCMFirstInstallUsesTheRealImageAccessAndHealthProbePaths drives the
@@ -4491,24 +4651,125 @@ func TestSCMSameOwnedConfigNormalizesEmptyDependencyRepresentation(t *testing.T)
 func TestSCMRunningUpdateRejectsAnObservableMismatchWithoutImageProof(t *testing.T) {
 	listen := scmTestHealthEndpoint(t, "1.3.0", false)
 	opts := scmTestFirstInstallOptions(t, listen, "1.4.0")
-	commandLine := scmCommandLine(opts)
-	replaceSCMTestSeam(t, &scmQueryStatus, func(*mgr.Service) (svc.Status, error) {
-		return svc.Status{State: svc.Running, ProcessId: 8142}, nil
-	})
-	replaceSCMTestSeam(t, &scmQueryProcessImageName, func(uint32) (string, error) {
-		return "", windows.ERROR_ACCESS_DENIED
-	})
-	replaceSCMTestSeam(t, &scmQueryServiceCommandLine, func(windows.Handle) (string, error) {
-		return commandLine, nil
-	})
+	handle, _ := scmTestRunningVerificationTarget(t, opts, false)
 
 	check, verified, err := (&scmManager{scope: ScopeSystem}).verifyRunningExecutableVersion(
-		context.Background(), &mgr.Service{}, opts.Executable, listen, opts.ExpectedVersion)
+		context.Background(), handle, opts.Executable, listen, opts.ExpectedVersion)
 	if err == nil || !errors.Is(err, errServiceVersionMismatch) {
 		t.Fatalf("verifyRunningExecutableVersion() = %v, want the actual health-version mismatch", err)
 	}
 	if check != scmImageUnverified || verified {
 		t.Errorf("verification = image %v, version %v, want an inconclusive image and failed version check", check, verified)
+	}
+}
+
+func TestSCMRollbackStartVerificationRemainsImageOnly(t *testing.T) {
+	opts := scmTestOptions()
+	probed := false
+	replaceSCMTestSeam(t, &scmStartService, func(*mgr.Service) error { return nil })
+	replaceSCMTestSeam(t, &scmQueryStatus, func(*mgr.Service) (svc.Status, error) {
+		return svc.Status{State: svc.Running, ProcessId: 8142}, nil
+	})
+	replaceSCMTestSeam(t, &scmQueryProcessImageName, func(uint32) (string, error) {
+		return opts.Executable, nil
+	})
+	replaceSCMTestSeam(t, &serviceInstallProbe, func(string, string) (bool, error) {
+		probed = true
+		return false, errors.New("readiness is not part of rollback image proof")
+	})
+
+	image, err := (&scmManager{scope: ScopeSystem}).startAndVerify(
+		context.Background(), &mgr.Service{}, opts.Executable)
+	if err != nil || image != scmImageVerified {
+		t.Fatalf("startAndVerify() = %v, %v, want only the verified restored image", image, err)
+	}
+	if probed {
+		t.Error("rollback image verification unexpectedly required HTTP readiness")
+	}
+}
+
+func TestSCMRunningUpdateKeepsReadinessSeparateFromImageAndVersionProof(t *testing.T) {
+	cases := []struct {
+		name       string
+		health     string
+		expected   string
+		challenge  bool
+		wantVerify bool
+	}{
+		{"matching release", "1.4.0", "1.4.0", false, true},
+		{"auth challenge", "", "1.4.0", true, false},
+		{"dev build", "dev", "dev", false, false},
+		{"unknown expected version", "1.4.0", "", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			listen := scmTestHealthEndpoint(t, tc.health, tc.challenge)
+			opts := scmTestFirstInstallOptions(t, listen, tc.expected)
+			handle, starts := scmTestRunningVerificationTarget(t, opts, false)
+
+			image, verified, err := (&scmManager{scope: ScopeSystem}).startAndVerifyVersion(
+				context.Background(), handle, opts.Executable, listen, tc.expected)
+			if err != nil {
+				t.Fatalf("startAndVerifyVersion() = %v, want readiness success", err)
+			}
+			if *starts != 1 || image != scmImageUnverified || verified != tc.wantVerify {
+				t.Errorf("start=%d image=%v versionVerified=%v, want one start, inaccessible image and versionVerified=%v",
+					*starts, image, verified, tc.wantVerify)
+			}
+		})
+	}
+}
+
+func TestSCMRunningUpdateDoesNotHideReadinessFailuresBehindAnUnreadableImage(t *testing.T) {
+	cases := []struct {
+		name          string
+		imageReadable bool
+		listen        func(*testing.T) (string, *atomic.Int32)
+		wantDetail    string
+	}{
+		{"connection refused", false, func(t *testing.T) (string, *atomic.Int32) {
+			return scmTestClosedProbeAddress(t), nil
+		}, "connect"},
+		{"HTTP 500", false, func(t *testing.T) (string, *atomic.Int32) {
+			return scmTestProbeResponse(t, http.StatusInternalServerError, `{"error":"foreign"}`, "")
+		}, "500"},
+		{"foreign health document", false, func(t *testing.T) (string, *atomic.Int32) {
+			return scmTestProbeResponse(t, http.StatusOK, `{"status":"not-hfdesk","version":"1.4.0"}`, "")
+		}, `"not-hfdesk"`},
+		{"HTTP 500 with image proof", true, func(t *testing.T) (string, *atomic.Int32) {
+			return scmTestProbeResponse(t, http.StatusInternalServerError, `{"error":"foreign"}`, "")
+		}, "500"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			listen, requests := tc.listen(t)
+			opts := scmTestFirstInstallOptions(t, listen, "1.4.0")
+			replaceSCMTestSeam(t, &scmVerifyBudget, 250*time.Millisecond)
+			handle, _ := scmTestRunningVerificationTarget(t, opts, tc.imageReadable)
+
+			started := time.Now()
+			image, verified, err := (&scmManager{scope: ScopeSystem}).startAndVerifyVersion(
+				context.Background(), handle, opts.Executable, listen, opts.ExpectedVersion)
+			if err == nil || errors.Is(err, errServiceVersionMismatch) {
+				t.Fatalf("startAndVerifyVersion() = %v, want the bounded readiness failure", err)
+			}
+			if !strings.Contains(err.Error(), "within") || !strings.Contains(err.Error(), tc.wantDetail) {
+				t.Errorf("startAndVerifyVersion() = %v, want bounded failure mentioning %q", err, tc.wantDetail)
+			}
+			if time.Since(started) < 100*time.Millisecond {
+				t.Errorf("readiness failed after %s, want the bounded retry path", time.Since(started))
+			}
+			wantImage := scmImageUnverified
+			if tc.imageReadable {
+				wantImage = scmImageVerified
+			}
+			if image != wantImage || verified {
+				t.Errorf("image=%v versionVerified=%v, want independent image=%v and no version claim", image, verified, wantImage)
+			}
+			if requests != nil && requests.Load() < 2 {
+				t.Errorf("readiness probe requests = %d, want retries within the original verification budget", requests.Load())
+			}
+		})
 	}
 }
 

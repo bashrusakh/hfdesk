@@ -250,6 +250,125 @@ func resolveServiceAccount(opts InstallOptions) (*user.User, error) {
 	return account, nil
 }
 
+// systemdAccessIdentityForInstall uses the generated identity for a new unit
+// and loaded native properties for an existing unit. An absent or unloaded
+// manager projection is not replaced with a guess from the unit source.
+func systemdAccessIdentityForInstall(scope Scope, requested InstallOptions, existing bool, loaded systemdLoadedConfig, loadedKnown bool, account *user.User) (string, *accessAccount) {
+	if scope == ScopeUser {
+		current, err := user.Current()
+		if err != nil {
+			return "the current user", nil
+		}
+		identity := currentExecutableAccessIdentity()
+		return current.Username, &identity
+	}
+
+	var userName, groupName string
+	var supplementary []string
+	if !existing {
+		if account == nil {
+			return "the service account", nil
+		}
+		userName = account.Username
+		groupName = account.Gid
+	} else {
+		if !loadedKnown || !loaded.loaded || !loaded.supplementaryGroupsKnown {
+			return "the native service identity", nil
+		}
+		supplementary = loaded.supplementaryGroups
+		if requested.Explicit.ServiceUser {
+			if account == nil {
+				return "the requested service account", nil
+			}
+			userName = account.Username
+			groupName = account.Gid
+		} else {
+			userName, groupName = loaded.user, loaded.group
+		}
+	}
+	if userName == "" {
+		return "the native service identity", nil
+	}
+	identityAccount, err := systemdAccountByName(userName)
+	if err != nil {
+		return userName, nil
+	}
+	identity, err := linuxSystemdAccessIdentity(identityAccount, groupName, supplementary)
+	if err != nil {
+		return userName, nil
+	}
+	return identityAccount.Username, &identity
+}
+
+func systemdAccountByName(name string) (*user.User, error) {
+	if _, err := strconv.Atoi(name); err == nil {
+		return user.LookupId(name)
+	}
+	return user.Lookup(name)
+}
+
+func linuxSystemdAccessIdentity(account *user.User, groupName string, supplementary []string) (accessAccount, error) {
+	uid, err := strconv.Atoi(account.Uid)
+	if err != nil {
+		return accessAccount{}, err
+	}
+	primaryGID, err := strconv.Atoi(account.Gid)
+	if err != nil {
+		return accessAccount{}, err
+	}
+	if groupName != "" {
+		primaryGID, err = systemdGroupID(groupName)
+		if err != nil {
+			return accessAccount{}, err
+		}
+	}
+	groupAccount := *account
+	groupAccount.Gid = strconv.Itoa(primaryGID)
+	groupIDs, err := groupAccount.GroupIds()
+	if err != nil {
+		return accessAccount{}, err
+	}
+	identity := accessAccount{UID: uid, GID: primaryGID}
+	seen := map[int]struct{}{primaryGID: {}}
+	addGroup := func(id string) error {
+		group, err := systemdGroupID(id)
+		if err != nil {
+			return err
+		}
+		if _, ok := seen[group]; !ok {
+			seen[group] = struct{}{}
+			identity.Groups = append(identity.Groups, group)
+		}
+		return nil
+	}
+	identity.Groups = append(identity.Groups, primaryGID)
+	for _, id := range groupIDs {
+		if err := addGroup(id); err != nil {
+			return accessAccount{}, err
+		}
+	}
+	for _, name := range supplementary {
+		if err := addGroup(name); err != nil {
+			return accessAccount{}, err
+		}
+	}
+	return identity, nil
+}
+
+func systemdGroupID(name string) (int, error) {
+	if id, err := strconv.Atoi(name); err == nil {
+		if id < 0 {
+			return 0, fmt.Errorf("negative group id %q", name)
+		}
+		return id, nil
+	}
+	group, err := user.LookupGroup(name)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(group.Gid)
+}
+
 // serviceAccount resolves the account of the manager scope.
 //
 // A user scope instance runs as the user of the session: it needs no
@@ -290,6 +409,21 @@ func (m *systemdManager) checkServiceAccountAccess(opts InstallOptions, account 
 	if m.scope != ScopeSystem || account == nil {
 		return nil
 	}
+	identity, err := linuxAccessAccount(account)
+	if err != nil {
+		return err
+	}
+	return m.checkServiceAccountAccessWithIdentity(opts, account.Username, &identity)
+}
+
+func (m *systemdManager) checkServiceAccountAccessWithIdentity(opts InstallOptions, accountName string, identity *accessAccount) error {
+	if m.scope != ScopeSystem {
+		return nil
+	}
+	if identity == nil {
+		log.Printf("service: custom-directory write access is inconclusive because the effective systemd identity is not established; no denial is inferred")
+		return nil
+	}
 	defaultCache, defaultHub := DefaultCacheDirs(m.scope, opts.Paths)
 	for _, dir := range []struct {
 		kind string
@@ -318,7 +452,7 @@ func (m *systemdManager) checkServiceAccountAccess(opts InstallOptions, account 
 		if pathMissingInsideRealDir(opts.Paths.StateDir, dir.path) {
 			continue
 		}
-		if err := checkDirWritableByAccount(dir.path, account); err != nil {
+		if err := checkDirWritableByIdentity(dir.path, *identity); err != nil {
 			if !errors.Is(err, errNotWritable) {
 				return fmt.Errorf("service: the %s directory %q of the machine-wide instance is not usable: %w", dir.kind, dir.path, err)
 			}
@@ -329,7 +463,7 @@ func (m *systemdManager) checkServiceAccountAccess(opts InstallOptions, account 
 			// owns the directory, or the directory itself is given to
 			// the account.
 			return fmt.Errorf("service: the service account %q cannot write to the %s directory %q: grant it access and install again (for example add the account to the group that owns the directory, or give the directory itself to the account with %q; for a directory that holds a lot of data, granting group access is preferable to changing the owner)",
-				account.Username, dir.kind, dir.path, "chown "+account.Username+" "+dir.path)
+				accountName, dir.kind, dir.path, "chown "+accountName+" "+dir.path)
 		}
 	}
 	return nil
@@ -352,6 +486,10 @@ func checkDirWritableByAccount(path string, account *user.User) error {
 	if err != nil {
 		return err
 	}
+	return checkDirWritableByIdentity(path, identity)
+}
+
+func checkDirWritableByIdentity(path string, identity accessAccount) error {
 	ok, err := accountCanUseDir(path, identity)
 	if err != nil {
 		return err
@@ -745,7 +883,18 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	if err != nil {
 		return opts, err
 	}
-	if err := m.checkServiceAccountAccess(filesystemOpts, account); err != nil {
+	var preflightLoaded systemdLoadedConfig
+	preflightLoadedKnown := false
+	preflightLoadedAttempted := false
+	if existed && m.scope == ScopeSystem && os.Geteuid() == 0 {
+		preflightLoadedAttempted = true
+		if loaded, readErr := m.registrationUnitConfig(ctx); readErr == nil {
+			preflightLoaded = loaded
+			preflightLoadedKnown = true
+		}
+	}
+	accountName, identity := systemdAccessIdentityForInstall(opts.Scope, requested, existed, preflightLoaded, preflightLoadedKnown, account)
+	if err := m.checkServiceAccountAccessWithIdentity(filesystemOpts, accountName, identity); err != nil {
 		return opts, err
 	}
 	// The root requirement is checked before any directory is created: a
@@ -754,13 +903,20 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	if err := m.requireRoot("an installation"); err != nil {
 		return opts, err
 	}
+	if existed && !preflightLoadedAttempted {
+		if loaded, readErr := m.registrationUnitConfig(ctx); readErr == nil {
+			preflightLoaded = loaded
+			preflightLoadedKnown = true
+		}
+	}
 	// The program is checked before anything is read or written, so a refused
 	// program creates no directory, rewrites no unit and stops no instance.
 	preflightOpts := validationOpts
 	if existed && dynamicFields["state-dir"] {
 		preflightOpts.Paths.StateDir = ""
 	}
-	if err := m.preflight(ctx, preflightOpts, account); err != nil {
+	workingDirectory := systemdWorkingDirectoryForPreflight(preflightOpts, existed, preflightLoaded, preflightLoadedKnown)
+	if err := m.preflightWithContext(ctx, preflightOpts, accountName, identity, workingDirectory); err != nil {
 		return opts, err
 	}
 	// The state of the replaced registration is read before the unit file
@@ -871,16 +1027,18 @@ type previousRegistration struct {
 // systemd reports for a unit. Dynamic process state is intentionally omitted:
 // it is verified separately from the loaded registration.
 type systemdLoadedConfig struct {
-	loaded           bool
-	execPath         string
-	execArgs         []string
-	execFlags        []string
-	ignoreErrors     bool
-	workingDirectory string
-	user             string
-	group            string
-	environment      []string
-	environmentFiles []systemdEnvironmentFile
+	loaded                   bool
+	execPath                 string
+	execArgs                 []string
+	execFlags                []string
+	ignoreErrors             bool
+	workingDirectory         string
+	user                     string
+	group                    string
+	supplementaryGroups      []string
+	supplementaryGroupsKnown bool
+	environment              []string
+	environmentFiles         []systemdEnvironmentFile
 }
 
 type systemdEnvironmentFile struct {
@@ -1264,6 +1422,9 @@ func (m *systemdManager) verifyUpdatedUnit(ctx context.Context, opts InstallOpti
 	if !slices.Equal(loaded.environment, previous.loaded.environment) || !slices.Equal(loaded.environmentFiles, previous.loaded.environmentFiles) {
 		return errors.New("service: systemd did not preserve the loaded environment and environment files")
 	}
+	if previous.loaded.supplementaryGroupsKnown && loaded.supplementaryGroupsKnown && !slices.Equal(loaded.supplementaryGroups, previous.loaded.supplementaryGroups) {
+		return errors.New("service: systemd did not preserve the loaded supplementary groups")
+	}
 	if !opts.Explicit.StateDir && loaded.workingDirectory != previous.loaded.workingDirectory {
 		return errors.New("service: systemd did not preserve the loaded working directory")
 	}
@@ -1290,6 +1451,7 @@ func sameSystemdLoadedConfig(a, b systemdLoadedConfig) bool {
 	return a.loaded == b.loaded && a.execPath == b.execPath && slices.Equal(a.execArgs, b.execArgs) &&
 		slices.Equal(a.execFlags, b.execFlags) && a.ignoreErrors == b.ignoreErrors &&
 		a.workingDirectory == b.workingDirectory && a.user == b.user && a.group == b.group &&
+		a.supplementaryGroupsKnown == b.supplementaryGroupsKnown && slices.Equal(a.supplementaryGroups, b.supplementaryGroups) &&
 		slices.Equal(a.environment, b.environment) && slices.Equal(a.environmentFiles, b.environmentFiles)
 }
 
@@ -1329,6 +1491,15 @@ func loadedConfigFromProperties(properties map[string]dbus.Variant) (systemdLoad
 	}
 	if err := storeDBusProperty(properties, "Group", "s", &loaded.group); err != nil {
 		return systemdLoadedConfig{}, err
+	}
+	if property, ok := properties["SupplementaryGroups"]; ok {
+		if signature := property.Signature().String(); signature != "as" {
+			return systemdLoadedConfig{}, fmt.Errorf("systemd property SupplementaryGroups has signature %q, want %q", signature, "as")
+		}
+		if err := dbus.Store([]interface{}{property.Value()}, &loaded.supplementaryGroups); err != nil {
+			return systemdLoadedConfig{}, fmt.Errorf("decode systemd property SupplementaryGroups: %w", err)
+		}
+		loaded.supplementaryGroupsKnown = true
 	}
 	if err := storeDBusProperty(properties, "Environment", "as", &loaded.environment); err != nil {
 		return systemdLoadedConfig{}, err
@@ -1536,7 +1707,8 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 		// starting is an explicit, separate command.
 		return false, nil
 	}
-	verified, err := m.restartAndVerify(ctx, opts.Executable, parseUnit(unit).listen(), opts.ExpectedVersion)
+	updatedUnit := parseUnit(unit)
+	verified, err := m.restartAndVerify(ctx, opts.Executable, updatedUnit.listen(), opts.ExpectedVersion, updatedUnit.DynamicRunArgs["listen"])
 	if err != nil {
 		if restoreErr := m.restorePreviousRegistration(ctx, previous); restoreErr != nil {
 			return false, fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration could not be put back into service: %v)", err, restoreErr)
@@ -1575,7 +1747,7 @@ func (m *systemdManager) restorePreviousRegistration(ctx context.Context, previo
 	// whose command line cannot be read names no program, so only the running
 	// state and the probe of its bind address are verified then.
 	restored := parseUnit(string(previous.content))
-	if _, err := m.verifyRunningExecutable(cleanup, restored.ExecStart, restored.listen(), ""); err != nil {
+	if _, err := m.verifyRunningExecutableWithListenSource(cleanup, restored.ExecStart, restored.listen(), "", restored.DynamicRunArgs["listen"]); err != nil {
 		return fmt.Errorf("the registration was restored and the restart of the previous instance was issued, but the restart was not confirmed: %w", err)
 	}
 	return nil
@@ -1615,14 +1787,67 @@ func verifyRestoredUnit(previous previousRegistration) error {
 }
 
 // restartAndVerify restarts the unit and verifies that the supervisor runs the
-// new executable and that the instance serves on the listen address of the
-// unit. The restart is what switches the running process, which keeps the image
-// it was started from; the listen address comes from the unit that was written.
-func (m *systemdManager) restartAndVerify(ctx context.Context, executable, listen, expectedVersion string) (bool, error) {
+// new executable and that the instance serves on the registered listen address.
+// A static address comes from the unit source; a dynamic address comes from the
+// effective run arguments of the restarted process.
+func (m *systemdManager) restartAndVerify(ctx context.Context, executable, listen, expectedVersion string, dynamicListen bool) (bool, error) {
 	if _, err := m.runSystemctl(ctx, "restart", unitName); err != nil {
 		return false, fmt.Errorf("service: restart %s: %w", unitName, err)
 	}
-	return m.verifyRunningExecutable(ctx, executable, listen, expectedVersion)
+	return m.verifyRunningExecutableWithListenSource(ctx, executable, listen, expectedVersion, dynamicListen)
+}
+
+func (m *systemdManager) runtimeRunOptions(ctx context.Context) (RunOptions, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	properties, err := m.loadedServiceProperties(ctx, unitName)
+	if err != nil {
+		return RunOptions{}, fmt.Errorf("read the active service process from systemd: %w", err)
+	}
+	mainPID, err := systemdMainPIDFromProperties(properties)
+	if err != nil {
+		return RunOptions{}, err
+	}
+	commandLine, err := os.ReadFile(filepath.Join("/proc", strconv.FormatUint(uint64(mainPID), 10), "cmdline"))
+	if err != nil {
+		return RunOptions{}, fmt.Errorf("read the actual service process argv: %w", err)
+	}
+	if len(commandLine) == 0 {
+		return RunOptions{}, errors.New("the running service process exposed an empty argv")
+	}
+	argv := strings.Split(strings.TrimSuffix(string(commandLine), "\x00"), "\x00")
+	if len(argv) < 2 || argv[0] == "" {
+		return RunOptions{}, errors.New("the running service process did not expose usable argv")
+	}
+	if options, err := ParseRunArgs(argv[1:]); err == nil {
+		return options, nil
+	}
+	// A shebang executable may put its script path before the service command.
+	// Reuse the host parser rather than interpreting an environment expression.
+	for i := 1; i+1 < len(argv); i++ {
+		if argv[i] == "service" && argv[i+1] == "run" {
+			return ParseRunArgs(argv[i:])
+		}
+	}
+	return RunOptions{}, errors.New("the running process argv did not expose HFDesk service run options")
+}
+
+func systemdMainPIDFromProperties(properties map[string]dbus.Variant) (uint32, error) {
+	property, ok := properties["MainPID"]
+	if !ok {
+		return 0, errors.New("systemd did not report the running service MainPID")
+	}
+	if signature := property.Signature().String(); signature != "u" {
+		return 0, fmt.Errorf("systemd property MainPID has signature %q, want %q", signature, "u")
+	}
+	var pid uint32
+	if err := dbus.Store([]interface{}{property.Value()}, &pid); err != nil {
+		return 0, fmt.Errorf("decode systemd property MainPID: %w", err)
+	}
+	if pid == 0 {
+		return 0, errors.New("systemd reported no running service MainPID")
+	}
+	return pid, nil
 }
 
 // restartPollInterval is the interval between two checks whether a restarted
@@ -1657,10 +1882,18 @@ func (m *systemdManager) restartVerifyWait() time.Duration {
 // wait is bounded by the shutdown budget and the context of the installation.
 // The result reports whether a known expected version was compared and seen.
 func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable, listen, expectedVersion string) (bool, error) {
+	return m.verifyRunningExecutableWithListenSource(ctx, executable, listen, expectedVersion, false)
+}
+
+func (m *systemdManager) verifyRunningExecutableWithListenSource(ctx context.Context, executable, listen, expectedVersion string, dynamicListen bool) (bool, error) {
 	budget := m.restartVerifyWait()
 	deadline := time.Now().Add(budget)
-	address := probeServiceAddress(listen)
+	address := ""
+	if !dynamicListen {
+		address = probeServiceAddress(listen)
+	}
 	detail := "the supervisor did not report a state"
+	var runtimeListenErr error
 	for {
 		probeFailed := false
 		out, err := m.runSystemctl(ctx, "show", unitName,
@@ -1679,9 +1912,23 @@ func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable
 			default:
 				// The supervisor reports the instance the registration
 				// names; the instance itself has to answer before the
-				// start counts. A version mismatch ends the wait at once:
-				// the version of a running instance does not change.
-				verified, probeErr := serviceInstallProbe(listen, expectedVersion)
+				// start counts. A dynamic listen expression is not the
+				// process argv: ask the running MainPID and use the host
+				// parser on that argv instead of probing the source text.
+				effectiveListen := listen
+				if dynamicListen {
+					runOptions, listenErr := m.runtimeRunOptions(ctx)
+					if listenErr != nil {
+						runtimeListenErr = listenErr
+						probeFailed = true
+						detail = fmt.Sprintf("the effective runtime listen address is not observable: %v", listenErr)
+						break
+					}
+					runtimeListenErr = nil
+					effectiveListen = runOptions.Listen
+					address = probeServiceAddress(effectiveListen)
+				}
+				verified, probeErr := serviceInstallProbe(effectiveListen, expectedVersion)
 				if probeErr != nil {
 					if errors.Is(probeErr, errServiceVersionMismatch) {
 						return false, fmt.Errorf("the restarted %s does not run the expected version: %w", unitName, probeErr)
@@ -1698,6 +1945,9 @@ func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable
 			}
 		}
 		if !time.Now().Before(deadline) {
+			if dynamicListen && runtimeListenErr != nil {
+				return false, fmt.Errorf("the restarted %s runtime listen address was not observable within %s: %w", unitName, budget, runtimeListenErr)
+			}
 			switch {
 			case probeFailed:
 				return false, fmt.Errorf("the restarted %s does not answer on %s within %s: %s", unitName, address, budget, detail)
@@ -1758,6 +2008,42 @@ func trimExecStartPath(value string) string {
 // resolve. Unknown executable formats are left to systemd rather than rejected
 // by this partial inspection.
 func (m *systemdManager) preflight(ctx context.Context, opts InstallOptions, account *user.User) error {
+	var (
+		accountName string
+		identity    *accessAccount
+	)
+	if m.scope == ScopeUser {
+		if current, err := user.Current(); err == nil {
+			accountName = current.Username
+		}
+		current := currentExecutableAccessIdentity()
+		identity = &current
+	} else if account != nil {
+		accountName = account.Username
+		if current, err := linuxExecutableAccessIdentity(account); err == nil {
+			identity = &current
+		}
+	}
+	return m.preflightWithContext(ctx, opts, accountName, identity, opts.Paths.StateDir)
+}
+
+func systemdWorkingDirectoryForPreflight(opts InstallOptions, existing bool, loaded systemdLoadedConfig, loadedKnown bool) string {
+	if !existing {
+		return opts.Paths.StateDir
+	}
+	// An update that changes WorkingDirectory can be shadowed by native
+	// drop-ins. Until the resulting manager value is loaded, its effective
+	// cwd is not established for this preflight.
+	if opts.Explicit.StateDir || !loadedKnown || !loaded.loaded {
+		return ""
+	}
+	if filepath.IsAbs(loaded.workingDirectory) {
+		return loaded.workingDirectory
+	}
+	return ""
+}
+
+func (m *systemdManager) preflightWithContext(ctx context.Context, opts InstallOptions, accountName string, identity *accessAccount, workingDirectory string) error {
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		return fmt.Errorf("service: systemctl is not available: %w", err)
 	}
@@ -1771,7 +2057,7 @@ func (m *systemdManager) preflight(ctx context.Context, opts InstallOptions, acc
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("service: executable %q is not a regular file", opts.Executable)
 	}
-	inspection, err := inspectExecutable(opts.Executable, opts.Paths.StateDir, linuxBinfmtMiscDirectory)
+	inspection, err := inspectExecutable(opts.Executable, workingDirectory, linuxBinfmtMiscDirectory)
 	if err != nil {
 		return err
 	}
@@ -1785,15 +2071,15 @@ func (m *systemdManager) preflight(ctx context.Context, opts InstallOptions, acc
 		// to read the script itself. Native executables do not need this bit.
 		accessMode |= unix.R_OK
 	}
-	access, err := m.executableAccess(ctx, opts.Executable, accessMode, account, "")
-	if err != nil {
-		return err
+	access := executableAccessUnknown
+	if identity != nil {
+		access, err = checkExecutableAccess(ctx, opts.Executable, *identity, accessMode, workingDirectory)
+		if err != nil {
+			return err
+		}
 	}
-	accountName := "the current user"
-	if m.scope == ScopeSystem && account != nil {
-		accountName = account.Username
-	} else if current, err := user.Current(); err == nil {
-		accountName = current.Username
+	if accountName == "" {
+		accountName = "the native service identity"
 	}
 	switch access {
 	case executableAccessDenied:
@@ -1807,13 +2093,16 @@ func (m *systemdManager) preflight(ctx context.Context, opts InstallOptions, acc
 	}
 
 	if inspection.interpreter != "" {
-		workingDirectory := ""
+		interpreterWorkingDirectory := ""
 		if !filepath.IsAbs(inspection.interpreter) {
-			workingDirectory = opts.Paths.StateDir
+			interpreterWorkingDirectory = workingDirectory
 		}
-		interpreterAccess, err := m.executableAccess(ctx, inspection.interpreter, uint32(unix.X_OK), account, workingDirectory)
-		if err != nil {
-			return err
+		interpreterAccess := executableAccessUnknown
+		if identity != nil && (filepath.IsAbs(inspection.interpreter) || interpreterWorkingDirectory != "") {
+			interpreterAccess, err = checkExecutableAccess(ctx, inspection.interpreter, *identity, uint32(unix.X_OK), interpreterWorkingDirectory)
+			if err != nil {
+				return err
+			}
 		}
 		switch interpreterAccess {
 		case executableAccessDenied:
@@ -3450,9 +3739,7 @@ type parsedUnit struct {
 	WorkingDirectoryDynamic bool
 	// User is the account a machine-wide unit runs as. A user scope unit
 	// names no account, so the value is empty there.
-	User string
-	// Group is the primary or explicitly configured group of a system-scope
-	// unit. It is kept unchanged unless the request names another service user.
+	User  string
 	Group string
 	// Environment holds the environment variables of the unit.
 	Environment map[string]string

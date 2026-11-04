@@ -1559,8 +1559,7 @@ func TestServiceHelperInstallNamesTheEffectiveProgram(t *testing.T) {
 		return console, nil
 	})
 	manager := &fakeServiceManager{
-		statuses:   []service.Status{runningServiceStatus(service.StateStopped, "127.0.0.1:18080")},
-		installErr: errors.New("the service control manager refused the registration"),
+		installStartErr: errors.New("the service control manager refused the registration"),
 	}
 	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
 		return manager, nil
