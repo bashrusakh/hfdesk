@@ -2327,7 +2327,11 @@ func TestPreflightDataPathLeavesDescriptorReadFailureInconclusive(t *testing.T) 
 	if err := os.Mkdir(path, 0o700); err != nil {
 		t.Fatalf("Mkdir() = %v, want nil", err)
 	}
-	access := &scmTestPathAccess{errors: map[string]error{path: errors.New("descriptor unavailable")}}
+	resolved, err := scmResolvePath(path)
+	if err != nil {
+		t.Fatalf("resolve directory %q: %v", path, err)
+	}
+	access := &scmTestPathAccess{errors: map[string]error{resolved: errors.New("descriptor unavailable")}}
 	if err := preflightDataPath("cache dir", path, access); err != nil {
 		t.Fatalf("preflightDataPath(%q) = %v, want unknown AccessCheck evidence to remain inconclusive", path, err)
 	}
@@ -2365,7 +2369,10 @@ func TestSCMPreflightExecutableAccess(t *testing.T) {
 			if err == nil {
 				t.Fatal("preflightExecutableAccess() = nil, want the refusal of the program")
 			}
-			for _, want := range []string{executable, scmServiceIdentityName, tc.reason, "read and execute"} {
+			if !scmTestNamesPath(err.Error(), executable) {
+				t.Errorf("preflightExecutableAccess() = %v, want the refused executable path %q", err, executable)
+			}
+			for _, want := range []string{scmServiceIdentityName, tc.reason, "read and execute"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("preflightExecutableAccess() = %v, want %q in the refusal", err, want)
 				}
@@ -2448,20 +2455,39 @@ func scmTestPathAccessFor(t *testing.T, path string, allowed bool) *scmTestPathA
 
 func scmTestImpersonationToken(t *testing.T) windows.Token {
 	t.Helper()
+	var primary windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY|windows.TOKEN_DUPLICATE, &primary); err != nil {
+		t.Fatalf("OpenProcessToken() = %v", err)
+	}
+	t.Cleanup(func() { _ = primary.Close() })
 	var token windows.Token
-	if err := windows.DuplicateTokenEx(windows.GetCurrentProcessToken(), windows.TOKEN_QUERY,
+	if err := windows.DuplicateTokenEx(primary, windows.TOKEN_QUERY,
 		nil, windows.SecurityImpersonation, windows.TokenImpersonation, &token); err != nil {
-		t.Skipf("cannot duplicate the test token for AccessCheck: %v", err)
+		t.Fatalf("DuplicateTokenEx() = %v", err)
 	}
 	t.Cleanup(func() { _ = token.Close() })
 	return token
 }
 
+func scmTestCreateDirectorySymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		if errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD) || errors.Is(err, windows.ERROR_ACCESS_DENIED) ||
+			errors.Is(err, windows.ERROR_NOT_SUPPORTED) || errors.Is(err, windows.ERROR_INVALID_FUNCTION) {
+			t.Skipf("directory reparse points are unavailable: %v", err)
+		}
+		t.Fatalf("Symlink(%q, %q): %v", target, link, err)
+	}
+}
+
 func TestSCMAccessCheckMapsGenericRightsAndHonorsDACLOrder(t *testing.T) {
 	token := scmTestImpersonationToken(t)
-	user, err := windows.GetCurrentProcessToken().GetTokenUser()
-	if err != nil || user.User.Sid == nil {
-		t.Skipf("the current token SID is unavailable: %v", err)
+	user, err := token.GetTokenUser()
+	if err != nil {
+		t.Fatalf("GetTokenUser() = %v", err)
+	}
+	if user.User.Sid == nil {
+		t.Fatal("GetTokenUser() returned no user SID")
 	}
 	sid := user.User.Sid.String()
 	for _, tc := range []struct {
@@ -2491,9 +2517,12 @@ func TestSCMAccessCheckMapsGenericRightsAndHonorsDACLOrder(t *testing.T) {
 
 func TestSCMPathRouteUsesNativeAccessCheckForSourceDenials(t *testing.T) {
 	token := scmTestImpersonationToken(t)
-	user, err := windows.GetCurrentProcessToken().GetTokenUser()
-	if err != nil || user.User.Sid == nil {
-		t.Skipf("the current token SID is unavailable: %v", err)
+	user, err := token.GetTokenUser()
+	if err != nil {
+		t.Fatalf("GetTokenUser() = %v", err)
+	}
+	if user.User.Sid == nil {
+		t.Fatal("GetTokenUser() returned no user SID")
 	}
 	root := t.TempDir()
 	restricted := filepath.Join(root, "restricted")
@@ -2505,13 +2534,9 @@ func TestSCMPathRouteUsesNativeAccessCheckForSourceDenials(t *testing.T) {
 		}
 	}
 	firstLink := filepath.Join(restricted, "junction")
-	if err := os.Symlink(intermediate, firstLink); err != nil {
-		t.Skipf("directory reparse points are unavailable: %v", err)
-	}
+	scmTestCreateDirectorySymlink(t, intermediate, firstLink)
 	secondLink := filepath.Join(intermediate, "nested")
-	if err := os.Symlink(target, secondLink); err != nil {
-		t.Skipf("nested directory reparse points are unavailable: %v", err)
-	}
+	scmTestCreateDirectorySymlink(t, target, secondLink)
 	sourcePath := filepath.Join(firstLink, "nested", "hfdesk.exe")
 	targetFile := filepath.Join(target, "hfdesk.exe")
 	if err := os.WriteFile(targetFile, []byte("test image"), 0o600); err != nil {
@@ -2524,6 +2549,14 @@ func TestSCMPathRouteUsesNativeAccessCheckForSourceDenials(t *testing.T) {
 	if !strings.EqualFold(filepath.Clean(resolved), filepath.Clean(targetFile)) {
 		t.Fatalf("resolved path = %q, want nested reparse target %q", resolved, targetFile)
 	}
+	resolvedRestricted, err := scmResolvePath(restricted)
+	if err != nil {
+		t.Fatalf("resolve source ancestor %q: %v", restricted, err)
+	}
+	resolvedIntermediate, err := scmResolvePath(firstLink)
+	if err != nil {
+		t.Fatalf("resolve first reparse target %q: %v", firstLink, err)
+	}
 
 	sid := user.User.Sid.String()
 	allowed, err := windows.SecurityDescriptorFromString(fmt.Sprintf("D:P(A;;FA;;;%s)", sid))
@@ -2532,11 +2565,11 @@ func TestSCMPathRouteUsesNativeAccessCheckForSourceDenials(t *testing.T) {
 	}
 	deniedTraverse, err := windows.SecurityDescriptorFromString(fmt.Sprintf("D:P(D;;FX;;;%s)(A;;FA;;;WD)", sid))
 	if err != nil {
-		t.Fatalf("build the source ancestor descriptor: %v", err)
+		t.Fatalf("build the traversal-denial descriptor: %v", err)
 	}
 	descriptors := map[string]*windows.SECURITY_DESCRIPTOR{
-		strings.ToUpper(filepath.Clean(resolved)):   allowed,
-		strings.ToUpper(filepath.Clean(restricted)): deniedTraverse,
+		strings.ToUpper(filepath.Clean(resolved)):           allowed,
+		strings.ToUpper(filepath.Clean(resolvedRestricted)): deniedTraverse,
 	}
 	// The zero-value privilege flag forces the no-bypass route through AccessCheck.
 	access := &scmTestPathAccess{
@@ -2549,24 +2582,24 @@ func TestSCMPathRouteUsesNativeAccessCheckForSourceDenials(t *testing.T) {
 		},
 	}
 	decision, reason := scmCheckPathAccess(sourcePath, windows.GENERIC_READ|windows.GENERIC_EXECUTE, access)
-	if decision != scmExecutableAccessDenied || !strings.Contains(reason, restricted) {
+	if decision != scmExecutableAccessDenied || !scmTestNamesPath(reason, restricted) {
 		t.Fatalf("native AccessCheck with an allowed target and denied source ancestor = %v, %q; want source traversal denied", decision, reason)
 	}
 
-	descriptors[strings.ToUpper(filepath.Clean(restricted))] = allowed
-	descriptors[strings.ToUpper(filepath.Clean(intermediate))] = deniedTraverse
+	descriptors[strings.ToUpper(filepath.Clean(resolvedRestricted))] = allowed
+	descriptors[strings.ToUpper(filepath.Clean(resolvedIntermediate))] = deniedTraverse
 	decision, reason = scmCheckPathAccess(sourcePath, windows.GENERIC_READ|windows.GENERIC_EXECUTE, access)
-	if decision != scmExecutableAccessDenied || !strings.Contains(reason, intermediate) {
+	if decision != scmExecutableAccessDenied || !scmTestNamesPath(reason, intermediate) {
 		t.Fatalf("native AccessCheck with a denied nested reparse target = %v, %q; want the intermediate route denial", decision, reason)
 	}
 
-	descriptors[strings.ToUpper(filepath.Clean(intermediate))] = allowed
+	descriptors[strings.ToUpper(filepath.Clean(resolvedIntermediate))] = allowed
 	decision, reason = scmCheckPathAccess(sourcePath, windows.GENERIC_READ|windows.GENERIC_EXECUTE, access)
 	if decision != scmExecutableAccessAllowed {
 		t.Fatalf("native AccessCheck over the complete nested route = %v, %q; want allowed", decision, reason)
 	}
 
-	access.errors = map[string]error{intermediate: errors.New("nested route descriptor unavailable")}
+	access.errors = map[string]error{resolvedIntermediate: errors.New("nested route descriptor unavailable")}
 	decision, _ = scmCheckPathAccess(sourcePath, windows.GENERIC_READ|windows.GENERIC_EXECUTE, access)
 	if decision != scmExecutableAccessInconclusive {
 		t.Errorf("native route with an unavailable nested descriptor = %v, want inconclusive", decision)
@@ -2583,20 +2616,28 @@ func TestSCMPathAccessHonorsTraversePrivilegeAndUnknownEvidence(t *testing.T) {
 	if err := os.WriteFile(path, []byte("test image"), 0o600); err != nil {
 		t.Fatalf("WriteFile(%q): %v", path, err)
 	}
+	resolved, err := scmResolvePath(path)
+	if err != nil {
+		t.Fatalf("resolve executable %q: %v", path, err)
+	}
+	resolvedParent, err := scmResolvePath(parent)
+	if err != nil {
+		t.Fatalf("resolve parent %q: %v", parent, err)
+	}
 	withPrivilege := &scmTestPathAccess{
-		results:   map[string]bool{path: true, parent: false},
+		results:   map[string]bool{resolved: true, resolvedParent: false},
 		privilege: true,
 	}
 	decision, _ := scmCheckPathAccess(path, windows.GENERIC_READ|windows.GENERIC_EXECUTE, withPrivilege)
 	if decision != scmExecutableAccessAllowed {
 		t.Fatalf("a denied parent traverse ACE overrode enabled SeChangeNotifyPrivilege: decision %v", decision)
 	}
-	if len(withPrivilege.calls) != 1 || withPrivilege.calls[0].path != path {
+	if len(withPrivilege.calls) != 1 || !strings.EqualFold(filepath.Clean(withPrivilege.calls[0].path), filepath.Clean(resolved)) {
 		t.Errorf("AccessCheck calls = %+v, want only the executable object when traverse bypass is enabled", withPrivilege.calls)
 	}
 
 	withoutPrivilege := &scmTestPathAccess{
-		results: map[string]bool{path: true, parent: false},
+		results: map[string]bool{resolved: true, resolvedParent: false},
 	}
 	decision, _ = scmCheckPathAccess(path, windows.GENERIC_READ|windows.GENERIC_EXECUTE, withoutPrivilege)
 	if decision != scmExecutableAccessDenied {
@@ -2607,13 +2648,13 @@ func TestSCMPathAccessHonorsTraversePrivilegeAndUnknownEvidence(t *testing.T) {
 	if decision != scmExecutableAccessInconclusive {
 		t.Errorf("missing token evidence = %v, want inconclusive", decision)
 	}
-	unknown := &scmTestPathAccess{errors: map[string]error{path: errors.New("descriptor unavailable")}}
+	unknown := &scmTestPathAccess{errors: map[string]error{resolved: errors.New("descriptor unavailable")}}
 	decision, _ = scmCheckPathAccess(path, windows.GENERIC_READ|windows.GENERIC_EXECUTE, unknown)
 	if decision != scmExecutableAccessInconclusive {
 		t.Errorf("unavailable descriptor evidence = %v, want inconclusive", decision)
 	}
 	privilegeUnknown := &scmTestPathAccess{
-		results:      map[string]bool{path: true},
+		results:      map[string]bool{resolved: true},
 		privilegeErr: errors.New("token privileges unavailable"),
 	}
 	decision, _ = scmCheckPathAccess(path, windows.GENERIC_READ|windows.GENERIC_EXECUTE, privilegeUnknown)
@@ -2639,14 +2680,14 @@ func TestSCMPathAccessChecksTraversalOfAWorkingDirectory(t *testing.T) {
 		},
 	}
 	decision, reason := scmCheckPathAccess(dir, windows.GENERIC_READ|windows.GENERIC_WRITE, access)
-	if decision != scmExecutableAccessDenied || !strings.Contains(reason, resolved) {
+	if decision != scmExecutableAccessDenied || !scmTestNamesPath(reason, resolved) {
 		t.Fatalf("a working directory without traverse access = %v, %q; want the actual directory denial", decision, reason)
 	}
 }
 
 func TestSCMDataDirectoryPreflightUsesTheSameAccessCheckOwner(t *testing.T) {
 	dir := t.TempDir()
-	denied := &scmTestPathAccess{results: map[string]bool{dir: false}, privilege: true}
+	denied := scmTestPathAccessFor(t, dir, false)
 	err := preflightDataPath("cache dir", dir, denied)
 	if err == nil || !strings.Contains(err.Error(), "Windows AccessCheck denied") {
 		t.Fatalf("preflightDataPath() = %v, want the actual AccessCheck denial", err)
@@ -3417,16 +3458,18 @@ func scmTestOwnerAndMode(t *testing.T, path string) (string, os.FileMode) {
 //
 // The installation fails after creating its own directories, exercising that
 // cleanup boundary before any live SCM operation.
-func scmTestRefuseLocalDir(t *testing.T, opts InstallOptions) {
+func scmTestRefuseLocalDir(t *testing.T, opts InstallOptions) *scmTestPathAccess {
 	t.Helper()
 	if err := os.MkdirAll(opts.LocalDir, 0o700); err != nil {
 		t.Fatalf("MkdirAll(%q) = %v, want nil", opts.LocalDir, err)
 	}
+	access := scmTestPathAccessFor(t, opts.LocalDir, false)
 	previous := scmOpenPathAccess
 	scmOpenPathAccess = func(uint32) (scmPathAccess, error) {
-		return scmTestPathAccessFor(t, opts.LocalDir, false), nil
+		return access, nil
 	}
 	t.Cleanup(func() { scmOpenPathAccess = previous })
+	return access
 }
 
 // TestSCMCreatedDirOrder checks the order of the directories a failed
@@ -3623,10 +3666,10 @@ func TestSCMFailedInstallReportsTheOriginalError(t *testing.T) {
 	}
 	root := t.TempDir()
 	opts := scmTestInstallOptions(t, root)
-	scmTestRefuseLocalDir(t, opts)
+	access := scmTestRefuseLocalDir(t, opts)
 
 	// The refusal of the preflight is the error the caller gets.
-	want := preflightDataPath("local dir", opts.LocalDir)
+	want := preflightDataPath("local dir", opts.LocalDir, access)
 	if want == nil {
 		t.Fatal("the local directory is usable by the account of the instance, the test cannot fail the installation")
 	}

@@ -360,7 +360,7 @@ func scmRegistrationOptions(commandLine string, scope Scope) InstallOptions {
 	registration, err := parseSCMCommandLine(commandLine)
 	if err != nil {
 		log.Printf("service: the command line of the registration of %s cannot be read (%v), the request applies", ServiceName, err)
-		registration = scmRegistration{}
+		return InstallOptions{Scope: scope}
 	}
 	return InstallOptions{
 		Scope:      scope,

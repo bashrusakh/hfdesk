@@ -93,6 +93,6 @@ func scmPEInspectionUnavailable(err error) bool {
 	}
 	var pathErr *os.PathError
 	var linkErr *os.LinkError
-	return os.IsPermission(err) || errors.Is(err, windows.ERROR_ACCESS_DENIED) ||
+	return errors.Is(err, fs.ErrPermission) || os.IsPermission(err) || errors.Is(err, windows.ERROR_ACCESS_DENIED) ||
 		errors.As(err, &pathErr) || errors.As(err, &linkErr)
 }
