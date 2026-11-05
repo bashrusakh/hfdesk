@@ -445,9 +445,18 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 		// changed, so a failure after the write can put it back as it was.
 		previousConfig, err := handle.Config()
 		if err != nil {
+			if !previous.present {
+				// A registration appeared after the read-only lookup. Its
+				// command line is unknown, so these paths are not safe to
+				// remove even though this attempt has not written yet.
+				result.createdDirsSafeToRemove = false
+			}
 			return result, fmt.Errorf("service: read the registration of %s: %w", ServiceName, err)
 		}
 		if !previous.present {
+			// Keep paths until this newly observed registration is either
+			// restored by a verified rollback or left untouched on success.
+			result.createdDirsSafeToRemove = false
 			// The registration appeared between the read-only lookup and
 			// this handle: it is the registration the installation
 			// replaces, and its state decides whether it has to be
@@ -2567,9 +2576,11 @@ func (m *scmManager) preflight(opts InstallOptions, pathAccess ...scmPathAccess)
 	}
 	info, err := os.Stat(opts.Executable)
 	if err != nil {
-		return fmt.Errorf("service: executable %q is not usable: %w", opts.Executable, err)
-	}
-	if !info.Mode().IsRegular() {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("service: executable %q is not usable: %w", opts.Executable, err)
+		}
+		log.Printf("service: executable metadata for %q cannot be inspected (%v); the installer did not classify the executable as invalid", opts.Executable, err)
+	} else if !info.Mode().IsRegular() {
 		return fmt.Errorf("service: executable %q is not a regular file", opts.Executable)
 	}
 	if _, _, err := ParseListen(opts.Listen); err != nil {
@@ -2608,11 +2619,7 @@ func preflightExecutableAccess(executable string, pathAccess ...scmPathAccess) e
 }
 
 func scmExecutableAccessOf(executable string, access scmPathAccess) (scmExecutableAccess, string) {
-	resolved, err := scmResolvePath(executable)
-	if err != nil {
-		return scmExecutableAccessInconclusive, fmt.Sprintf("the real location of the program cannot be read: %v", err)
-	}
-	return scmCheckPathAccess(resolved, windows.GENERIC_READ|windows.GENERIC_EXECUTE, access)
+	return scmCheckPathAccess(executable, windows.GENERIC_READ|windows.GENERIC_EXECUTE, access)
 }
 
 // scmParentDirs returns the directories above a path, the immediate parent first.
@@ -2834,7 +2841,8 @@ func preflightDataPath(name, path string, pathAccess ...scmPathAccess) error {
 		}
 		return checkServiceAccess(name, path, access)
 	case !errors.Is(err, fs.ErrNotExist):
-		return fmt.Errorf("service: %s %q is not usable: %w", name, path, err)
+		log.Printf("service: metadata for %s %q cannot be inspected (%v); path usability is inconclusive", name, path, err)
+		return nil
 	}
 
 	// The directory does not exist yet. The instance creates it when it
@@ -2863,19 +2871,23 @@ func preflightDataPath(name, path string, pathAccess ...scmPathAccess) error {
 // to a path it reuses.
 //
 // The path and its parents are checked with the effective token of the running
-// LocalService instance. Windows' AccessCheck applies DACL order; the parent
-// traverse check is skipped only when that token reports the normally-enabled
-// SeChangeNotifyPrivilege.
+// LocalService instance, including the original and every observed
+// reparse-resolved segment. Windows' AccessCheck applies DACL order; traversal
+// checks are skipped only when that token reports SeChangeNotifyPrivilege enabled.
 func checkServiceCreateAccess(label, path string, pathAccess ...scmPathAccess) error {
 	var access scmPathAccess
 	if len(pathAccess) != 0 {
 		access = pathAccess[0]
 	}
-	ancestor, err := scmNearestExistingDir(path)
+	sourceAncestor, ancestor, err := scmNearestExistingDirRoute(path)
 	if err != nil {
-		return fmt.Errorf("service: the %s %q does not exist and the nearest existing ancestor of it cannot be read: %w: the installation cannot tell whether the account %s can create the directory", label, path, err, scmServiceIdentityName)
+		if errors.Is(err, errSCMNotDirectory) {
+			return fmt.Errorf("service: the %s %q cannot be created because its nearest existing ancestor is not a directory: %w", label, path, err)
+		}
+		log.Printf("service: access to the nearest existing ancestor of %q for %s is inconclusive (%v)", path, scmServiceIdentityName, err)
+		return nil
 	}
-	decision, reason := scmCheckPathAccess(ancestor, windows.GENERIC_READ|windows.GENERIC_WRITE, access)
+	decision, reason := scmCheckPathAccessFrom(sourceAncestor, ancestor, windows.GENERIC_READ|windows.GENERIC_WRITE, access)
 	switch decision {
 	case scmExecutableAccessDenied:
 		// The message names the directory, the account and the access
@@ -2915,7 +2927,7 @@ func scmNearestExistingDir(path string) (string, error) {
 		info, err := os.Stat(current)
 		if err == nil {
 			if !info.IsDir() {
-				return "", fmt.Errorf("%q is not a directory", current)
+				return "", fmt.Errorf("%q is not a directory: %w", current, errSCMNotDirectory)
 			}
 			return current, nil
 		}
@@ -2928,6 +2940,20 @@ func scmNearestExistingDir(path string) (string, error) {
 		}
 		current = parent
 	}
+}
+
+var errSCMNotDirectory = errors.New("not a directory")
+
+func scmNearestExistingDirRoute(path string) (sourceAncestor, resolvedAncestor string, err error) {
+	resolvedAncestor, err = scmNearestExistingDir(path)
+	if err != nil {
+		return "", "", err
+	}
+	sourceAncestor, _, err = scmSplitExistingPath(path)
+	if err != nil {
+		return "", "", err
+	}
+	return sourceAncestor, resolvedAncestor, nil
 }
 
 // checkServiceAccess uses Windows AccessCheck with the effective service token

@@ -8,6 +8,9 @@ package service
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -232,12 +235,19 @@ func scmCheckPathAccess(path string, desiredAccess uint32, access scmPathAccess)
 	if err != nil {
 		return scmExecutableAccessInconclusive, fmt.Sprintf("the real location of %q cannot be read: %v", path, err)
 	}
-	allowed, err := access.Check(resolved, desiredAccess)
+	return scmCheckPathAccessFrom(path, resolved, desiredAccess, access)
+}
+
+func scmCheckPathAccessFrom(sourcePath, resolvedPath string, desiredAccess uint32, access scmPathAccess) (scmExecutableAccess, string) {
+	if access == nil {
+		return scmExecutableAccessInconclusive, "the running service token is unavailable"
+	}
+	allowed, err := access.Check(resolvedPath, desiredAccess)
 	if err != nil {
-		return scmExecutableAccessInconclusive, fmt.Sprintf("AccessCheck for %q could not be completed: %v", resolved, err)
+		return scmExecutableAccessInconclusive, fmt.Sprintf("AccessCheck for %q could not be completed: %v", resolvedPath, err)
 	}
 	if !allowed {
-		return scmExecutableAccessDenied, fmt.Sprintf("Windows AccessCheck denied the requested access to %q", resolved)
+		return scmExecutableAccessDenied, fmt.Sprintf("Windows AccessCheck denied the requested access to %q", resolvedPath)
 	}
 	bypass, err := access.HasEnabledPrivilege(scmChangeNotifyPrivilege)
 	if err != nil {
@@ -246,14 +256,106 @@ func scmCheckPathAccess(path string, desiredAccess uint32, access scmPathAccess)
 	if bypass {
 		return scmExecutableAccessAllowed, ""
 	}
-	for _, dir := range scmParentDirs(resolved) {
+	directories, routeErr := scmPathTraversalDirectories(sourcePath, resolvedPath)
+	var inspectionErr error = routeErr
+	for _, dir := range directories {
 		allowed, err := access.Check(dir, windows.FILE_TRAVERSE)
 		if err != nil {
-			return scmExecutableAccessInconclusive, fmt.Sprintf("AccessCheck for traversal of %q could not be completed: %v", dir, err)
+			if inspectionErr == nil {
+				inspectionErr = fmt.Errorf("AccessCheck for traversal of %q could not be completed: %w", dir, err)
+			}
+			continue
 		}
 		if !allowed {
 			return scmExecutableAccessDenied, fmt.Sprintf("Windows AccessCheck denied traversal of %q", dir)
 		}
 	}
+	if inspectionErr != nil {
+		return scmExecutableAccessInconclusive, fmt.Sprintf("the complete traversal route from %q to %q could not be checked: %v", sourcePath, resolvedPath, inspectionErr)
+	}
 	return scmExecutableAccessAllowed, ""
+}
+
+func scmPathTraversalDirectories(sourcePath, resolvedPath string) ([]string, error) {
+	var directories []string
+	seen := make(map[string]bool)
+	add := func(path string) {
+		cleaned := filepath.Clean(path)
+		key := strings.ToUpper(cleaned)
+		if cleaned != "" && !seen[key] {
+			seen[key] = true
+			directories = append(directories, cleaned)
+		}
+	}
+	for _, dir := range scmParentDirs(sourcePath) {
+		add(dir)
+	}
+
+	// Resolve each source prefix, not just the final path: a nested reparse
+	// point adds a target-side segment that is absent from either endpoint.
+	prefixes := scmPathPrefixes(sourcePath)
+	var inspectionErr error
+	for i, prefix := range prefixes {
+		info, err := os.Stat(prefix)
+		if err != nil {
+			inspectionErr = fmt.Errorf("inspect route component %q: %w", prefix, err)
+			break
+		}
+		if !info.IsDir() {
+			if i < len(prefixes)-1 {
+				inspectionErr = fmt.Errorf("route component %q is not a directory", prefix)
+				break
+			}
+			continue
+		}
+		add(prefix)
+		resolvedPrefix, err := scmResolvePath(prefix)
+		if err != nil {
+			inspectionErr = fmt.Errorf("resolve route component %q: %w", prefix, err)
+			break
+		}
+		add(resolvedPrefix)
+	}
+	for _, dir := range scmParentDirs(resolvedPath) {
+		add(dir)
+	}
+	info, err := os.Stat(resolvedPath)
+	if err != nil {
+		if inspectionErr == nil {
+			inspectionErr = fmt.Errorf("inspect resolved route endpoint %q: %w", resolvedPath, err)
+		}
+	}
+	if err == nil && info.IsDir() {
+		add(resolvedPath)
+	}
+	return directories, inspectionErr
+}
+
+func scmPathPrefixes(path string) []string {
+	cleaned := filepath.Clean(path)
+	separator := string(filepath.Separator)
+	volume := filepath.VolumeName(cleaned)
+	rest := strings.TrimPrefix(cleaned, volume)
+	root := ""
+	if filepath.IsAbs(cleaned) {
+		root = separator
+		if volume != "" {
+			root = volume + separator
+		}
+	}
+	prefixes := make([]string, 0, 1+strings.Count(rest, separator))
+	if root != "" {
+		prefixes = append(prefixes, root)
+	}
+	for _, component := range strings.Split(strings.Trim(rest, separator), separator) {
+		if component == "" {
+			continue
+		}
+		if len(prefixes) == 0 {
+			prefixes = append(prefixes, component)
+		} else {
+			prefixes = append(prefixes, filepath.Join(prefixes[len(prefixes)-1], component))
+		}
+	}
+	return prefixes
 }

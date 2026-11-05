@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -105,6 +107,10 @@ func probeServiceReady(listen string) error {
 // empty expectation and an authentication challenge carry no version.
 func probeServiceReadyForVersion(listen, expectedVersion string) (bool, error) {
 	addr := probeServiceAddress(listen)
+	probeURL, err := serviceProbeURL(listen)
+	if err != nil {
+		return false, fmt.Errorf("build the readiness URL for %s: %w", addr, err)
+	}
 	expectedVersion = strings.TrimSpace(expectedVersion)
 	if expectedVersion == serviceProbeDevVersion {
 		expectedVersion = ""
@@ -121,7 +127,7 @@ func probeServiceReadyForVersion(listen, expectedVersion string) (bool, error) {
 			return http.ErrUseLastResponse
 		},
 	}
-	resp, err := client.Get("http://" + addr + serviceProbePath)
+	resp, err := client.Get(probeURL.String())
 	if err != nil {
 		return false, err
 	}
@@ -159,6 +165,19 @@ func probeServiceReadyForVersion(listen, expectedVersion string) (bool, error) {
 	default:
 		return false, serviceNotAnswering(addr, fmt.Errorf("the health endpoint answered with the status %s", resp.Status))
 	}
+}
+
+func serviceProbeURL(listen string) (*url.URL, error) {
+	address := probeServiceAddress(listen)
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	return &url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(host, port),
+		Path:   serviceProbePath,
+	}, nil
 }
 
 // serviceHealth is the part of the health document a readiness probe checks:

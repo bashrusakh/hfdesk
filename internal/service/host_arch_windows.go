@@ -6,8 +6,12 @@
 package service
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log"
+	"os"
 	"syscall"
 	"unsafe"
 
@@ -59,8 +63,16 @@ func preflightExecutableImage(executable string) error {
 }
 
 func preflightExecutableImageWithSupport(executable string, support func(uint16) scmExecutableSupport) error {
-	machine, err := pe.ExecutableMachine(executable)
+	return preflightExecutableImageUsing(executable, pe.ExecutableMachine, support)
+}
+
+func preflightExecutableImageUsing(executable string, readMachine func(string) (uint16, error), support func(uint16) scmExecutableSupport) error {
+	machine, err := readMachine(executable)
 	if err != nil {
+		if scmPEInspectionUnavailable(err) {
+			log.Printf("service: PE structure inspection of %q is inconclusive (%v); the installer did not classify the executable as invalid", executable, err)
+			return nil
+		}
 		return fmt.Errorf("service: executable %q is not a Windows executable: %w", executable, err)
 	}
 	if support == nil {
@@ -73,4 +85,14 @@ func preflightExecutableImageWithSupport(executable string, support func(uint16)
 		log.Printf("service: Windows execution support for PE machine 0x%04X of %q cannot be determined; the installer did not infer incompatibility", machine, executable)
 	}
 	return nil
+}
+
+func scmPEInspectionUnavailable(err error) bool {
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return false
+	}
+	var pathErr *os.PathError
+	var linkErr *os.LinkError
+	return os.IsPermission(err) || errors.Is(err, windows.ERROR_ACCESS_DENIED) ||
+		errors.As(err, &pathErr) || errors.As(err, &linkErr)
 }

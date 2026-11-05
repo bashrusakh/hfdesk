@@ -28,7 +28,9 @@ const (
 	testOptionalHeaderSize32 = 224
 	// testOptionalHeaderSize64 is the size of the optional header of a
 	// PE32+ image.
-	testOptionalHeaderSize64 = 240
+	testOptionalHeaderSize64      = 240
+	testOptionalHeaderFixedSize32 = 96
+	testOptionalHeaderFixedSize64 = 112
 )
 
 // TestSubsystemReadsThePE32OptionalHeader proves that the subsystem is read
@@ -336,6 +338,58 @@ func TestExecutableMachineRequiresCompleteOptionalAndSectionHeaders(t *testing.T
 	}
 }
 
+func TestExecutableMachineAcceptsOptionalHeadersWithFewerDeclaredDirectories(t *testing.T) {
+	cases := []struct {
+		name    string
+		magic   uint16
+		size    int
+		machine uint16
+	}{
+		{"PE32 with no directories", magicPE32, testOptionalHeaderFixedSize32, MachineI386},
+		{"PE32 with one directory", magicPE32, testOptionalHeaderFixedSize32 + dataDirectoryEntrySize, MachineI386},
+		{"PE32+ with no directories", magicPE32Plus, testOptionalHeaderFixedSize64, MachineAMD64},
+		{"PE32+ with one directory", magicPE32Plus, testOptionalHeaderFixedSize64 + dataDirectoryEntrySize, MachineAMD64},
+		{"PE32+ with all current directories", magicPE32Plus, testOptionalHeaderSize64, MachineAMD64},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			image := buildPEImageWithMachine(SubsystemWindowsCUI, tc.magic, tc.size, tc.machine)
+			got, err := ExecutableMachineOf(bytes.NewReader(image))
+			if err != nil {
+				t.Fatalf("ExecutableMachineOf: %v", err)
+			}
+			if got != tc.machine {
+				t.Errorf("machine = 0x%04X, want 0x%04X", got, tc.machine)
+			}
+		})
+	}
+}
+
+func TestExecutableMachineRejectsTruncatedOrOutOfBoundsDataDirectories(t *testing.T) {
+	cases := []struct {
+		name  string
+		magic uint16
+		size  int
+		count uint32
+	}{
+		{"PE32 missing the directory count", magicPE32, testOptionalHeaderFixedSize32 - 1, 0},
+		{"PE32+ missing the directory count", magicPE32Plus, testOptionalHeaderFixedSize64 - 1, 0},
+		{"PE32 count exceeds its declared optional header", magicPE32, testOptionalHeaderFixedSize32, 1},
+		{"PE32+ count exceeds its declared optional header", magicPE32Plus, testOptionalHeaderFixedSize64, 1},
+		{"directory is cut short by SizeOfOptionalHeader", magicPE32Plus, testOptionalHeaderFixedSize64 + dataDirectoryEntrySize - 1, 1},
+		{"count exceeds available directory entries", magicPE32Plus, testOptionalHeaderFixedSize64 + dataDirectoryEntrySize, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			image := buildPEImageWithMachine(SubsystemWindowsCUI, tc.magic, tc.size, MachineAMD64)
+			setNumberOfRvaAndSizes(image, tc.magic, tc.count)
+			if _, err := ExecutableMachineOf(bytes.NewReader(image)); err == nil {
+				t.Fatal("ExecutableMachineOf accepted an optional-header directory count outside its declared bounds")
+			}
+		})
+	}
+}
+
 func TestExecutableMachineReadsStructurallyCompleteImage(t *testing.T) {
 	image := buildPEImageWithMachine(SubsystemWindowsCUI, magicPE32Plus, testOptionalHeaderSize64, MachineAMD64)
 	machine, err := ExecutableMachineOf(bytes.NewReader(image))
@@ -347,13 +401,8 @@ func TestExecutableMachineReadsStructurallyCompleteImage(t *testing.T) {
 	}
 }
 
-// buildPEImage builds a PE image with the given subsystem and optional
-// header.
-//
-// Only the fields the parser reads are filled in: the DOS header, the PE
-// signature, the COFF header and the magic and the subsystem of the optional
-// header. The rest of the image is zero, which is enough for the headers to
-// be read.
+// buildPEImage builds a coherent small PE32/PE32+ image with one code section
+// and a directory count that matches the optional-header size.
 func buildPEImage(subsystem int, magic uint16, optionalHeaderSize int) []byte {
 	optional := testPeHeaderOffset + optionalHeaderOffset
 	sectionTable := optional + optionalHeaderSize
@@ -367,20 +416,66 @@ func buildPEImage(subsystem int, magic uint16, optionalHeaderSize int) []byte {
 	// header size.
 	binary.LittleEndian.PutUint16(image[testPeHeaderOffset+4+coffSectionCountOffset:], 1)
 	binary.LittleEndian.PutUint16(image[testPeHeaderOffset+4+16:], uint16(optionalHeaderSize))
-	binary.LittleEndian.PutUint16(image[testPeHeaderOffset+4+coffCharacteristicsOffset:], coffExecutableImage)
+	characteristics := uint16(coffExecutableImage)
+	if magic == magicPE32 {
+		characteristics |= 0x0100 // IMAGE_FILE_32BIT_MACHINE
+	}
+	binary.LittleEndian.PutUint16(image[testPeHeaderOffset+4+coffCharacteristicsOffset:], characteristics)
 
 	binary.LittleEndian.PutUint16(image[optional:], magic)
+	binary.LittleEndian.PutUint32(image[optional+4:], testSectionRawSize)
 	binary.LittleEndian.PutUint32(image[optional+optionalHeaderEntryPointOffset:], 0x1000)
+	binary.LittleEndian.PutUint32(image[optional+20:], 0x1000) // BaseOfCode
+	if magic == magicPE32 {
+		binary.LittleEndian.PutUint32(image[optional+24:], 0) // no data section
+		binary.LittleEndian.PutUint32(image[optional+28:], 0x00400000)
+		binary.LittleEndian.PutUint32(image[optional+72:], 0x00100000) // Stack reserve
+		binary.LittleEndian.PutUint32(image[optional+76:], 0x1000)     // Stack commit
+		binary.LittleEndian.PutUint32(image[optional+80:], 0x00100000) // Heap reserve
+		binary.LittleEndian.PutUint32(image[optional+84:], 0x1000)     // Heap commit
+	} else {
+		binary.LittleEndian.PutUint64(image[optional+24:], 0x0000000140000000)
+		binary.LittleEndian.PutUint64(image[optional+72:], 0x00100000) // Stack reserve
+		binary.LittleEndian.PutUint64(image[optional+80:], 0x1000)     // Stack commit
+		binary.LittleEndian.PutUint64(image[optional+88:], 0x00100000) // Heap reserve
+		binary.LittleEndian.PutUint64(image[optional+96:], 0x1000)     // Heap commit
+	}
+	binary.LittleEndian.PutUint32(image[optional+32:], 0x1000) // Section alignment
+	binary.LittleEndian.PutUint32(image[optional+36:], 0x200)  // File alignment
+	binary.LittleEndian.PutUint16(image[optional+40:], 6)      // Major OS version
+	binary.LittleEndian.PutUint16(image[optional+48:], 6)      // Major subsystem version
 	binary.LittleEndian.PutUint32(image[optional+56:], 0x2000)
 	binary.LittleEndian.PutUint32(image[optional+60:], uint32(testSectionRawOffset))
 	binary.LittleEndian.PutUint16(image[optional+subsystemOffset:], uint16(subsystem))
+	setNumberOfRvaAndSizes(image, magic, uint32(testDirectoryCount(optionalHeaderSize, magic)))
 	copy(image[sectionTable:], []byte(".text"))
 	binary.LittleEndian.PutUint32(image[sectionTable+8:], testSectionRawSize)
 	binary.LittleEndian.PutUint32(image[sectionTable+12:], 0x1000)
 	binary.LittleEndian.PutUint32(image[sectionTable+16:], testSectionRawSize)
 	binary.LittleEndian.PutUint32(image[sectionTable+20:], testSectionRawOffset)
+	binary.LittleEndian.PutUint32(image[sectionTable+36:], 0x60000020) // code, execute, read
+	image[testSectionRawOffset] = 0xC3
 
 	return image
+}
+
+func testDirectoryCount(optionalHeaderSize int, magic uint16) int {
+	fixedSize := testOptionalHeaderFixedSize32
+	if magic == magicPE32Plus {
+		fixedSize = testOptionalHeaderFixedSize64
+	}
+	if optionalHeaderSize <= fixedSize {
+		return 0
+	}
+	return (optionalHeaderSize - fixedSize) / dataDirectoryEntrySize
+}
+
+func setNumberOfRvaAndSizes(image []byte, magic uint16, count uint32) {
+	offset := testPeHeaderOffset + optionalHeaderOffset + optionalHeader32DirectoryCount
+	if magic == magicPE32Plus {
+		offset = testPeHeaderOffset + optionalHeaderOffset + optionalHeader64DirectoryCount
+	}
+	binary.LittleEndian.PutUint32(image[offset:], count)
 }
 
 // buildPEImageWithMachine builds a PE image with the given subsystem, optional

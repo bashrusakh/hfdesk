@@ -74,8 +74,12 @@ const (
 	// optionalHeaderMagicSize is the size of the magic field of the
 	// optional header.
 	optionalHeaderMagicSize        = 2
-	optionalHeader32Size           = 224
-	optionalHeader64Size           = 240
+	optionalHeader32FixedSize      = 96
+	optionalHeader64FixedSize      = 112
+	optionalHeader32DirectoryCount = 92
+	optionalHeader64DirectoryCount = 108
+	numberOfRvaAndSizesSize        = 4
+	dataDirectoryEntrySize         = 8
 	optionalHeaderEntryPointOffset = 16
 	// subsystemOffset is the offset of the subsystem field inside the
 	// optional header.
@@ -208,16 +212,28 @@ func ExecutableMachineOf(r io.ReaderAt) (uint16, error) {
 	}
 	magic := binary.LittleEndian.Uint16(magicBytes)
 	minimumOptionalSize := uint16(0)
+	directoryCountOffset := int64(0)
 	switch magic {
 	case magicPE32:
-		minimumOptionalSize = optionalHeader32Size
+		minimumOptionalSize = optionalHeader32FixedSize
+		directoryCountOffset = optionalHeader32DirectoryCount
 	case magicPE32Plus:
-		minimumOptionalSize = optionalHeader64Size
+		minimumOptionalSize = optionalHeader64FixedSize
+		directoryCountOffset = optionalHeader64DirectoryCount
 	default:
 		return 0, fmt.Errorf("the file is not a usable PE executable: the optional header has the unknown magic 0x%04X", magic)
 	}
 	if optionalSize < minimumOptionalSize {
 		return 0, fmt.Errorf("the file is not a usable PE executable: the optional header is %d bytes, shorter than the required %d", optionalSize, minimumOptionalSize)
+	}
+	directoryCountBytes := make([]byte, numberOfRvaAndSizesSize)
+	if err := readAt(r, optionalOffset+directoryCountOffset, directoryCountBytes); err != nil {
+		return 0, fmt.Errorf("read the optional header data-directory count: %w", err)
+	}
+	directoryCount := binary.LittleEndian.Uint32(directoryCountBytes)
+	availableDirectoryBytes := uint64(optionalSize - minimumOptionalSize)
+	if uint64(directoryCount)*dataDirectoryEntrySize > availableDirectoryBytes {
+		return 0, fmt.Errorf("the file is not a usable PE executable: NumberOfRvaAndSizes declares %d entries outside the %d-byte optional-header data-directory area", directoryCount, availableDirectoryBytes)
 	}
 
 	entryPoint := make([]byte, 4)

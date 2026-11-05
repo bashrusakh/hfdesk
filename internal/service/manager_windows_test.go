@@ -2375,13 +2375,15 @@ func TestSCMPreflightExecutableAccess(t *testing.T) {
 }
 
 type scmTestPathAccess struct {
-	results      map[string]bool
-	errors       map[string]error
-	defaultSet   bool
-	defaultAllow bool
-	privilege    bool
-	privilegeErr error
-	calls        []struct {
+	results          map[string]bool
+	resultsByDesired map[string]map[uint32]bool
+	errors           map[string]error
+	check            func(string, uint32) (bool, error)
+	defaultSet       bool
+	defaultAllow     bool
+	privilege        bool
+	privilegeErr     error
+	calls            []struct {
 		path    string
 		desired uint32
 	}
@@ -2394,6 +2396,14 @@ func (a *scmTestPathAccess) Check(path string, desired uint32) (bool, error) {
 	}{path, desired})
 	if err := a.errors[path]; err != nil {
 		return false, err
+	}
+	if a.check != nil {
+		return a.check(path, desired)
+	}
+	if byDesired, ok := a.resultsByDesired[path]; ok {
+		if result, ok := byDesired[desired]; ok {
+			return result, nil
+		}
 	}
 	result, ok := a.results[path]
 	if !ok {
@@ -2479,9 +2489,100 @@ func TestSCMAccessCheckMapsGenericRightsAndHonorsDACLOrder(t *testing.T) {
 	}
 }
 
+func TestSCMPathRouteUsesNativeAccessCheckForSourceDenials(t *testing.T) {
+	token := scmTestImpersonationToken(t)
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil || user.User.Sid == nil {
+		t.Skipf("the current token SID is unavailable: %v", err)
+	}
+	root := t.TempDir()
+	restricted := filepath.Join(root, "restricted")
+	intermediate := filepath.Join(root, "intermediate")
+	target := filepath.Join(root, "target")
+	for _, dir := range []string{restricted, intermediate, target} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatalf("Mkdir(%q): %v", dir, err)
+		}
+	}
+	firstLink := filepath.Join(restricted, "junction")
+	if err := os.Symlink(intermediate, firstLink); err != nil {
+		t.Skipf("directory reparse points are unavailable: %v", err)
+	}
+	secondLink := filepath.Join(intermediate, "nested")
+	if err := os.Symlink(target, secondLink); err != nil {
+		t.Skipf("nested directory reparse points are unavailable: %v", err)
+	}
+	sourcePath := filepath.Join(firstLink, "nested", "hfdesk.exe")
+	targetFile := filepath.Join(target, "hfdesk.exe")
+	if err := os.WriteFile(targetFile, []byte("test image"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q): %v", targetFile, err)
+	}
+	resolved, err := scmResolvePath(sourcePath)
+	if err != nil {
+		t.Fatalf("resolve nested route %q: %v", sourcePath, err)
+	}
+	if !strings.EqualFold(filepath.Clean(resolved), filepath.Clean(targetFile)) {
+		t.Fatalf("resolved path = %q, want nested reparse target %q", resolved, targetFile)
+	}
+
+	sid := user.User.Sid.String()
+	allowed, err := windows.SecurityDescriptorFromString(fmt.Sprintf("D:P(A;;FA;;;%s)", sid))
+	if err != nil {
+		t.Fatalf("build the target descriptor: %v", err)
+	}
+	deniedTraverse, err := windows.SecurityDescriptorFromString(fmt.Sprintf("D:P(D;;FX;;;%s)(A;;FA;;;WD)", sid))
+	if err != nil {
+		t.Fatalf("build the source ancestor descriptor: %v", err)
+	}
+	descriptors := map[string]*windows.SECURITY_DESCRIPTOR{
+		strings.ToUpper(filepath.Clean(resolved)):   allowed,
+		strings.ToUpper(filepath.Clean(restricted)): deniedTraverse,
+	}
+	// The zero-value privilege flag forces the no-bypass route through AccessCheck.
+	access := &scmTestPathAccess{
+		check: func(path string, desired uint32) (bool, error) {
+			descriptor := descriptors[strings.ToUpper(filepath.Clean(path))]
+			if descriptor == nil {
+				descriptor = allowed
+			}
+			return scmAccessCheckDescriptor(token, descriptor, desired)
+		},
+	}
+	decision, reason := scmCheckPathAccess(sourcePath, windows.GENERIC_READ|windows.GENERIC_EXECUTE, access)
+	if decision != scmExecutableAccessDenied || !strings.Contains(reason, restricted) {
+		t.Fatalf("native AccessCheck with an allowed target and denied source ancestor = %v, %q; want source traversal denied", decision, reason)
+	}
+
+	descriptors[strings.ToUpper(filepath.Clean(restricted))] = allowed
+	descriptors[strings.ToUpper(filepath.Clean(intermediate))] = deniedTraverse
+	decision, reason = scmCheckPathAccess(sourcePath, windows.GENERIC_READ|windows.GENERIC_EXECUTE, access)
+	if decision != scmExecutableAccessDenied || !strings.Contains(reason, intermediate) {
+		t.Fatalf("native AccessCheck with a denied nested reparse target = %v, %q; want the intermediate route denial", decision, reason)
+	}
+
+	descriptors[strings.ToUpper(filepath.Clean(intermediate))] = allowed
+	decision, reason = scmCheckPathAccess(sourcePath, windows.GENERIC_READ|windows.GENERIC_EXECUTE, access)
+	if decision != scmExecutableAccessAllowed {
+		t.Fatalf("native AccessCheck over the complete nested route = %v, %q; want allowed", decision, reason)
+	}
+
+	access.errors = map[string]error{intermediate: errors.New("nested route descriptor unavailable")}
+	decision, _ = scmCheckPathAccess(sourcePath, windows.GENERIC_READ|windows.GENERIC_EXECUTE, access)
+	if decision != scmExecutableAccessInconclusive {
+		t.Errorf("native route with an unavailable nested descriptor = %v, want inconclusive", decision)
+	}
+}
+
 func TestSCMPathAccessHonorsTraversePrivilegeAndUnknownEvidence(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "parent", "hfdesk.exe")
-	parent := filepath.Dir(path)
+	root := t.TempDir()
+	parent := filepath.Join(root, "parent")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatalf("Mkdir(%q): %v", parent, err)
+	}
+	path := filepath.Join(parent, "hfdesk.exe")
+	if err := os.WriteFile(path, []byte("test image"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q): %v", path, err)
+	}
 	withPrivilege := &scmTestPathAccess{
 		results:   map[string]bool{path: true, parent: false},
 		privilege: true,
@@ -2518,6 +2619,28 @@ func TestSCMPathAccessHonorsTraversePrivilegeAndUnknownEvidence(t *testing.T) {
 	decision, _ = scmCheckPathAccess(path, windows.GENERIC_READ|windows.GENERIC_EXECUTE, privilegeUnknown)
 	if decision != scmExecutableAccessInconclusive {
 		t.Errorf("unavailable traverse-privilege evidence = %v, want inconclusive", decision)
+	}
+}
+
+func TestSCMPathAccessChecksTraversalOfAWorkingDirectory(t *testing.T) {
+	dir := t.TempDir()
+	resolved, err := scmResolvePath(dir)
+	if err != nil {
+		t.Fatalf("resolve directory %q: %v", dir, err)
+	}
+	access := &scmTestPathAccess{
+		defaultSet:   true,
+		defaultAllow: true,
+		resultsByDesired: map[string]map[uint32]bool{
+			resolved: {
+				windows.GENERIC_READ | windows.GENERIC_WRITE: true,
+				windows.FILE_TRAVERSE:                        false,
+			},
+		},
+	}
+	decision, reason := scmCheckPathAccess(dir, windows.GENERIC_READ|windows.GENERIC_WRITE, access)
+	if decision != scmExecutableAccessDenied || !strings.Contains(reason, resolved) {
+		t.Fatalf("a working directory without traverse access = %v, %q; want the actual directory denial", decision, reason)
 	}
 }
 
@@ -2626,6 +2749,36 @@ func TestPreflightExecutableImageRequiresACompletePEExecutable(t *testing.T) {
 
 	if err := preflightExecutableImageWithSupport(path, nil); err == nil {
 		t.Fatal("preflightExecutableImageWithSupport accepted a file that is not a Windows program")
+	}
+}
+
+func TestPreflightExecutableImageSeparatesInspectionAccessFromDamage(t *testing.T) {
+	for _, readErr := range []error{windows.ERROR_ACCESS_DENIED, fmt.Errorf("read optional header: %w", fs.ErrPermission)} {
+		supportQueried := false
+		err := preflightExecutableImageUsing(`C:\Restricted\hfdesk.exe`,
+			func(string) (uint16, error) { return 0, readErr },
+			func(uint16) scmExecutableSupport {
+				supportQueried = true
+				return scmExecutableUnsupported
+			})
+		if err != nil {
+			t.Errorf("preflightExecutableImageUsing(access error) = %v, want inconclusive success", err)
+		}
+		if supportQueried {
+			t.Error("host support was queried without a machine field")
+		}
+	}
+
+	structureErr := errors.New("truncated optional header")
+	err := preflightExecutableImageUsing(`C:\Restricted\hfdesk.exe`,
+		func(string) (uint16, error) { return 0, structureErr }, nil)
+	if err == nil || !errors.Is(err, structureErr) || !strings.Contains(err.Error(), "not a Windows executable") {
+		t.Errorf("preflightExecutableImageUsing(structural error) = %v, want the invalid-image refusal", err)
+	}
+
+	missing := filepath.Join(t.TempDir(), "missing.exe")
+	if err := preflightExecutableImage(missing); err == nil || !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("preflightExecutableImage(%q) = %v, want the demonstrably missing candidate refused", missing, err)
 	}
 }
 
@@ -4825,8 +4978,9 @@ func TestSCMFirstInstallCleanupDoesNotTouchAChangedRegistrationOrProcess(t *test
 	}
 }
 
-// TestSCMVerifyRunningExecutableKeepsTheProbeCause checks that the failure of
-// the readiness probe reaches the timeout error.
+// TestSCMVerifyRunningExecutableKeepsIndependentImageAndProbeEvidence checks
+// that readiness failure reaches the timeout while a verified process image
+// remains a separate fact.
 //
 // The service control manager reports the instance as running with the image of
 // the test process, so the probe is the only step that fails. The error has to
@@ -4866,8 +5020,8 @@ func TestSCMVerifyRunningExecutableKeepsTheProbeCause(t *testing.T) {
 	if !probed {
 		t.Fatalf("verifyRunningExecutableVersion() = %q before the readiness probe was asked", err)
 	}
-	if check != scmImageUnverified || verified {
-		t.Errorf("verifyRunningExecutableVersion() = %d, %t, want %d, false", check, verified, scmImageUnverified)
+	if check != scmImageVerified || verified {
+		t.Errorf("verifyRunningExecutableVersion() = %d, %t, want verified image evidence and no version claim", check, verified)
 	}
 	for _, want := range []string{listen, probeErr.Error()} {
 		if !strings.Contains(err.Error(), want) {

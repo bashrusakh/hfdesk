@@ -4,6 +4,8 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -50,6 +52,45 @@ func TestProbeServiceAddressMapsTheWildcardBindOntoTheLoopback(t *testing.T) {
 				t.Errorf("probeServiceAddress(%q) = %q, want %q", tc.listen, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestProbeServiceReadySerializesAnIPv6ZoneWithoutDialingTheNetwork(t *testing.T) {
+	const listen = "[fe80::1%eth0]:8080"
+	probeURL, err := serviceProbeURL(listen)
+	if err != nil {
+		t.Fatalf("serviceProbeURL(%q) = %v", listen, err)
+	}
+	parsed, err := url.Parse(probeURL.String())
+	if err != nil {
+		t.Fatalf("parse serialized probe URL %q: %v", probeURL, err)
+	}
+	if !strings.Contains(probeURL.String(), "%25eth0]:8080") {
+		t.Fatalf("probe URL = %q, want the RFC 6874 encoded zone", probeURL)
+	}
+	if got := parsed.Port(); got != "8080" || parsed.Path != server.HealthPath {
+		t.Fatalf("probe URL = %q, want port 8080 and health path %q", probeURL, server.HealthPath)
+	}
+
+	dialErr := errors.New("test intercepted the socket dial")
+	var dialedAddress string
+	previous := serviceProbeTransport
+	transport := previous.Clone()
+	transport.DialContext = func(_ context.Context, _, address string) (net.Conn, error) {
+		dialedAddress = address
+		return nil, dialErr
+	}
+	serviceProbeTransport = transport
+	t.Cleanup(func() {
+		serviceProbeTransport = previous
+		transport.CloseIdleConnections()
+	})
+
+	if err := probeServiceReady(listen); !errors.Is(err, dialErr) {
+		t.Fatalf("probeServiceReady(%q) = %v, want the intercepted dial error (not a URL parse failure)", listen, err)
+	}
+	if want := net.JoinHostPort("fe80::1%eth0", "8080"); dialedAddress != want {
+		t.Errorf("the probe dialed %q, want decoded host and zone %q", dialedAddress, want)
 	}
 }
 
