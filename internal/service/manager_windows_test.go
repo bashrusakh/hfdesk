@@ -2469,6 +2469,27 @@ func scmTestImpersonationToken(t *testing.T) windows.Token {
 	return token
 }
 
+// AccessCheck requires valid owner and group SIDs in the descriptor, not only
+// the DACL that determines the result.
+func scmTestAccessCheckDescriptor(t *testing.T, ownerSID, dacl string) *windows.SECURITY_DESCRIPTOR {
+	t.Helper()
+	sddl := fmt.Sprintf("O:%sG:%s%s", ownerSID, ownerSID, dacl)
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		t.Fatalf("SecurityDescriptorFromString(%q) = %v", sddl, err)
+	}
+	if !sd.IsValid() {
+		t.Fatalf("SecurityDescriptorFromString(%q) returned an invalid descriptor", sddl)
+	}
+	if owner, _, err := sd.Owner(); err != nil || owner == nil {
+		t.Fatalf("security descriptor owner = %v, %v; want a valid SID", owner, err)
+	}
+	if group, _, err := sd.Group(); err != nil || group == nil {
+		t.Fatalf("security descriptor group = %v, %v; want a valid SID", group, err)
+	}
+	return sd
+}
+
 func scmTestCreateDirectorySymlink(t *testing.T, target, link string) {
 	t.Helper()
 	if err := os.Symlink(target, link); err != nil {
@@ -2492,24 +2513,21 @@ func TestSCMAccessCheckMapsGenericRightsAndHonorsDACLOrder(t *testing.T) {
 	sid := user.User.Sid.String()
 	for _, tc := range []struct {
 		name    string
-		sddl    string
+		dacl    string
 		allowed bool
 	}{
 		{"earlier complete explicit allow wins before inherited deny", fmt.Sprintf("D:P(A;;FR;;;%s)(A;;FX;;;%s)(D;ID;FA;;;WD)", sid, sid), true},
-		{"earlier deny blocks later allow", fmt.Sprintf("D:P(D;;FR;;;WD)(A;;FA;;;%s)", sid), false},
-		{"inherit-only allow does not apply to this object", fmt.Sprintf("D:P(A;OICIIO;FA;;;%s)", sid), false},
+		{"earlier deny blocks later allow", "D:P(D;;FR;;;WD)(A;;FA;;;" + sid + ")", false},
+		{"inherit-only allow does not apply to this object", "D:P(A;OICIIO;FA;;;" + sid + ")", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			sd, err := windows.SecurityDescriptorFromString(tc.sddl)
-			if err != nil {
-				t.Fatalf("SecurityDescriptorFromString() = %v", err)
-			}
+			sd := scmTestAccessCheckDescriptor(t, sid, tc.dacl)
 			allowed, err := scmAccessCheckDescriptor(token, sd, windows.GENERIC_READ|windows.GENERIC_EXECUTE)
 			if err != nil {
 				t.Fatalf("AccessCheck = %v", err)
 			}
 			if allowed != tc.allowed {
-				t.Errorf("AccessCheck(%q) = %v, want %v", tc.sddl, allowed, tc.allowed)
+				t.Errorf("AccessCheck(%q) = %v, want %v", tc.dacl, allowed, tc.allowed)
 			}
 		})
 	}
@@ -2546,8 +2564,12 @@ func TestSCMPathRouteUsesNativeAccessCheckForSourceDenials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve nested route %q: %v", sourcePath, err)
 	}
-	if !strings.EqualFold(filepath.Clean(resolved), filepath.Clean(targetFile)) {
-		t.Fatalf("resolved path = %q, want nested reparse target %q", resolved, targetFile)
+	resolvedTarget, err := scmResolvePath(targetFile)
+	if err != nil {
+		t.Fatalf("resolve nested target %q: %v", targetFile, err)
+	}
+	if !strings.EqualFold(filepath.Clean(resolved), filepath.Clean(resolvedTarget)) {
+		t.Fatalf("resolved route = %q, resolved target = %q; want the nested route to name that target", resolved, resolvedTarget)
 	}
 	resolvedRestricted, err := scmResolvePath(restricted)
 	if err != nil {
@@ -2559,14 +2581,8 @@ func TestSCMPathRouteUsesNativeAccessCheckForSourceDenials(t *testing.T) {
 	}
 
 	sid := user.User.Sid.String()
-	allowed, err := windows.SecurityDescriptorFromString(fmt.Sprintf("D:P(A;;FA;;;%s)", sid))
-	if err != nil {
-		t.Fatalf("build the target descriptor: %v", err)
-	}
-	deniedTraverse, err := windows.SecurityDescriptorFromString(fmt.Sprintf("D:P(D;;FX;;;%s)(A;;FA;;;WD)", sid))
-	if err != nil {
-		t.Fatalf("build the traversal-denial descriptor: %v", err)
-	}
+	allowed := scmTestAccessCheckDescriptor(t, sid, fmt.Sprintf("D:P(A;;FA;;;%s)", sid))
+	deniedTraverse := scmTestAccessCheckDescriptor(t, sid, fmt.Sprintf("D:P(D;;FX;;;%s)(A;;FA;;;WD)", sid))
 	descriptors := map[string]*windows.SECURITY_DESCRIPTOR{
 		strings.ToUpper(filepath.Clean(resolved)):           allowed,
 		strings.ToUpper(filepath.Clean(resolvedRestricted)): deniedTraverse,

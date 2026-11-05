@@ -3137,6 +3137,9 @@ func parseSCMCommandLine(commandLine string) (scmRegistration, error) {
 	if len(parts) == 0 {
 		return registration, errors.New("service: the registration carries no command line")
 	}
+	if strings.TrimSpace(parts[0]) == "" {
+		return registration, errors.New("service: the registration carries no executable")
+	}
 	registration.executable = parts[0]
 	registration.args = parts[1:]
 	return registration, nil
