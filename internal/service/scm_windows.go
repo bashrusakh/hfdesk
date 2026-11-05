@@ -9,11 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"golang.org/x/sys/windows/svc"
@@ -67,9 +63,31 @@ const (
 
 	// scmReadinessInterval is the pause between two readiness probes.
 	scmReadinessInterval = 100 * time.Millisecond
+)
 
-	// scmProbeTimeout bounds a single readiness probe.
-	scmProbeTimeout = 2 * time.Second
+const (
+	// scmExitCodeOK is the exit code of an instance that ended the way it
+	// was asked to end.
+	//
+	// The code is the value the handler returns: the library of the platform
+	// derives the exit code of the instance from that return value alone,
+	// and a zero return reaches the service control manager as NO_ERROR. A
+	// stop the user requested is a clean end, whatever the orderly shutdown
+	// observed on the way, and the platform must never turn it into a
+	// recovery.
+	scmExitCodeOK uint32 = 0
+
+	// scmExitCodeFailure is the exit code of an instance that failed.
+	//
+	// The platform performs the recovery actions of a registration for an
+	// instance that ends without reporting its stop, and, with the non-crash
+	// switch of the registration set, for an instance whose exit code is
+	// non-zero. That exit code is the value the handler returns: it is
+	// derived from the return value alone, so the failed paths of the
+	// handler end with this code as their return, and the failure reaches
+	// the service control manager even when the reported status carries no
+	// exit code at all.
+	scmExitCodeFailure uint32 = 1
 )
 
 // runAsWindowsService runs HFDesk as the process of a registered service.
@@ -144,6 +162,28 @@ func newSCMHandler(opts RunOptions) *scmHandler {
 // reports the states of the instance on the changes channel, it reacts to
 // the control requests of the manager on the request channel and it returns
 // the exit code of the instance.
+//
+// The registration of the instance carries the failure recovery of the
+// platform, and the recovery for a non-crash failure keys on the exit code the
+// instance reports. The exit code of the instance is the value the handler
+// returns: the library of the platform derives it from that return value and
+// ignores the exit code field of the reported status. The two ends of the
+// instance therefore never share a code:
+//
+//   - a stop the manager requested is a clean end. The instance reports the
+//     stopped state and returns 0, so the service control manager reads
+//     NO_ERROR, even when the orderly shutdown observed an error: the error is
+//     logged to the event log, and a service the user stopped is never turned
+//     into a recovery, because the platform would restart what the user asked
+//     to go away;
+//   - a start that failed, and a host that failed, are failures. The instance
+//     reports the stopped state and returns 1, so the failure reaches the
+//     service control manager as the exit code of the instance, and the
+//     recovery of the platform restarts it. An orderly shutdown that does not
+//     finish in time is not one of them: the instance was asked to stop, and
+//     the logged error is the evidence of how cleanly it did;
+//   - an instance the platform kills reports no status at all, and the
+//     platform applies the recovery actions to it.
 func (h *scmHandler) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
 	// The instance does not run yet: the manager waits for the report of
 	// the running state before it hands the instance over to the machine.
@@ -152,8 +192,11 @@ func (h *scmHandler) Execute(args []string, r <-chan svc.ChangeRequest, changes 
 	opts, err := h.resolveOptions(args)
 	if err != nil {
 		logEvent(eventLogError, fmt.Sprintf("hfdesk: the service could not be started: %v", err))
-		changes <- svc.Status{State: svc.Stopped}
-		return false, 1
+		// The exit code below is the returned one: the library of the
+		// platform derives it from the return value alone, and the field of
+		// the status is informational to it.
+		changes <- svc.Status{State: svc.Stopped, Win32ExitCode: scmExitCodeFailure}
+		return false, scmExitCodeFailure
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -183,15 +226,17 @@ func (h *scmHandler) Execute(args []string, r <-chan svc.ChangeRequest, changes 
 			// that failed already.
 			logEvent(eventLogError, fmt.Sprintf("hfdesk: the instance did not stop cleanly: %v", shutdownErr))
 		}
-		changes <- svc.Status{State: svc.Stopped}
-		return false, 1
+		// The start failed, so the instance ends as a failure: the
+		// recovery of the platform restarts it instead of leaving a
+		// service that does not serve. The code is the returned one; the
+		// field of the status is informational.
+		changes <- svc.Status{State: svc.Stopped, Win32ExitCode: scmExitCodeFailure}
+		return false, scmExitCodeFailure
 	}
 	if stopRequested {
 		// The manager asked the instance to stop while it was starting.
-		if err := h.stopInstance(cancel, host, changes); err != nil {
-			return false, 1
-		}
-		return false, 0
+		h.stopInstance(cancel, host, changes)
+		return false, scmExitCodeOK
 	}
 
 	logEvent(eventLogInfo, fmt.Sprintf("hfdesk: the service is running on %s", opts.Listen))
@@ -203,10 +248,8 @@ func (h *scmHandler) Execute(args []string, r <-chan svc.ChangeRequest, changes 
 			if !ok {
 				// The dispatcher closed the channel: the instance is
 				// asked to stop.
-				if err := h.stopInstance(cancel, host, changes); err != nil {
-					return false, 1
-				}
-				return false, 0
+				h.stopInstance(cancel, host, changes)
+				return false, scmExitCodeOK
 			}
 			switch request.Cmd {
 			case svc.Interrogate:
@@ -214,22 +257,23 @@ func (h *scmHandler) Execute(args []string, r <-chan svc.ChangeRequest, changes 
 				// is reported again and the instance keeps running.
 				changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 			case svc.Stop, svc.Shutdown:
-				if err := h.stopInstance(cancel, host, changes); err != nil {
-					return false, 1
-				}
-				return false, 0
+				h.stopInstance(cancel, host, changes)
+				return false, scmExitCodeOK
 			}
 		case <-host.done:
 			// The host ended on its own: the instance does not run any
 			// more.
 			if err := host.err; err != nil {
 				logEvent(eventLogError, fmt.Sprintf("hfdesk: the service failed: %v", err))
-				changes <- svc.Status{State: svc.Stopped}
-				return false, 1
+				// Both codes of this pair are the returned ones: the
+				// library of the platform derives the exit code from the
+				// return value and not from the field of the status.
+				changes <- svc.Status{State: svc.Stopped, Win32ExitCode: scmExitCodeFailure}
+				return false, scmExitCodeFailure
 			}
 			logEvent(eventLogInfo, "hfdesk: the service stopped on its own")
-			changes <- svc.Status{State: svc.Stopped}
-			return false, 0
+			changes <- svc.Status{State: svc.Stopped, Win32ExitCode: scmExitCodeOK}
+			return false, scmExitCodeOK
 		}
 	}
 }
@@ -283,16 +327,26 @@ func (h *scmHost) ended() bool {
 // its connections and closes the job manager. Only when that is done the
 // instance is reported as stopped, so the service control manager never
 // kills a process that is still busy.
-func (h *scmHandler) stopInstance(cancel context.CancelFunc, host *scmHost, changes chan<- svc.Status) error {
+//
+// The stop is the end the manager asked for, so the handler returns the exit
+// code 0 whatever the orderly shutdown observed, and the service control
+// manager reads that return value as the code of the instance. A shutdown that
+// does not finish in time, or that reports the error of the server, is written
+// to the event log and never reported as a failure of the instance: the
+// registration of the instance carries the recovery of the platform for a
+// non-crash failure, and a non-zero code here would restart a service the user
+// asked to stop.
+func (h *scmHandler) stopInstance(cancel context.CancelFunc, host *scmHost, changes chan<- svc.Status) {
 	changes <- svc.Status{State: svc.StopPending}
 	logEvent(eventLogInfo, "hfdesk: the service is stopping")
-	err := h.waitForShutdown(cancel, host)
-	if err != nil {
+	if err := h.waitForShutdown(cancel, host); err != nil {
 		logEvent(eventLogError, fmt.Sprintf("hfdesk: the service did not stop cleanly: %v", err))
 	}
 	logEvent(eventLogInfo, "hfdesk: the service is stopped")
-	changes <- svc.Status{State: svc.Stopped}
-	return err
+	// The stopped state carries the code as information only: the exit code
+	// of the instance is the one the caller returns, and the library of the
+	// platform reads it from there.
+	changes <- svc.Status{State: svc.Stopped, Win32ExitCode: scmExitCodeOK}
 }
 
 // waitForShutdown cancels the application context and waits for the
@@ -396,7 +450,7 @@ func (h *scmHandler) waitForReady(ctx context.Context, listen string, host *scmH
 	}
 	deadline := time.Now().Add(timeout)
 	for {
-		if err := probeServiceReady(listen); err == nil {
+		if err := serviceReadinessProbe(listen); err == nil {
 			return false, nil
 		}
 		select {
@@ -431,67 +485,6 @@ func (h *scmHandler) waitForReady(ctx context.Context, listen string, host *scmH
 			return false, fmt.Errorf("the HTTP server did not answer on %s within %s", listen, timeout)
 		}
 	}
-}
-
-// probeServiceReady reports whether the HTTP server of the instance
-// answers.
-//
-// Any HTTP status is accepted: the point of the probe is that an HTTP
-// server listens on the address and answers, not that it answers with a
-// particular code. A server that answers with the status of the basic
-// authentication of the instance is a server that answers.
-func probeServiceReady(listen string) error {
-	addr := scmProbeAddress(listen)
-	conn, err := net.DialTimeout("tcp", addr, scmProbeTimeout)
-	if err != nil {
-		return err
-	}
-	_ = conn.Close()
-
-	client := &http.Client{Timeout: scmProbeTimeout}
-	resp, err := client.Get("http://" + addr + "/api/health")
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return nil
-}
-
-// scmProbeAddress maps the bind address of the instance onto the address
-// the readiness probe dials.
-//
-// A wildcard bind has no address a client can connect to: 0.0.0.0 and :: are
-// the addresses every interface of the machine answers on, and a connect()
-// to them fails with WSAEADDRNOTAVAIL. The probe therefore dials the
-// loopback address of the same family, which a wildcard listener accepts
-// like any other client. Every other host is used unchanged.
-//
-// The port of the bind address is always kept: the probe has to reach the
-// server of the instance and not another one.
-func scmProbeAddress(listen string) string {
-	addr := strings.TrimSpace(listen)
-	if addr == "" {
-		addr = DefaultListen
-	}
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		// An address that carries no port cannot be mapped: it is used
-		// unchanged, so the probe reports the error of the dial itself.
-		return addr
-	}
-	switch host {
-	case "0.0.0.0":
-		host = "127.0.0.1"
-	case "::":
-		host = "::1"
-	case "":
-		// An empty host binds every interface of every family. The
-		// probe uses the loopback address of the IPv4 family, which a
-		// dual-stack listener accepts.
-		host = "127.0.0.1"
-	}
-	return net.JoinHostPort(host, port)
 }
 
 // eventLogLevel is the kind of a message of the Windows Event Log.

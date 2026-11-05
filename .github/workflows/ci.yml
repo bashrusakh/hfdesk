@@ -125,7 +125,7 @@ jobs:
         run: |
           go run ./cmd/hfdesk/genico.go
           rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk/resource_windows_amd64.syso
-          rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk-desktop/resource_windows_amd64.syso
+          rsrc -ico cmd/hfdesk/hfdesk.ico -manifest cmd/hfdesk-desktop/hfdesk.manifest -o cmd/hfdesk-desktop/resource_windows_amd64.syso
           go build -ldflags "-s -w -X main.Version=$env:VERSION" -o hfdesk_windows_amd64_ci.exe ./cmd/hfdesk
           go build -ldflags "-s -w -X main.Version=$env:VERSION -H=windowsgui" -o hfdesk-desktop_windows_amd64_ci.exe ./cmd/hfdesk-desktop
 

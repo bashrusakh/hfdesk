@@ -104,12 +104,17 @@ jobs:
       # Every package needs its own resource file: the linker picks up the
       # .syso file of the package it builds, so the desktop host cannot
       # borrow the resource of the console host.
+      #
+      # The desktop resource also carries the application manifest: it
+      # declares the version 6 of the common controls, which the choice
+      # dialog of the service gate needs, and it keeps the process at the
+      # rights of the user who starts it.
       - name: Generate Windows icon resources (Windows only)
         if: ${{ matrix.os == 'windows' }}
         run: |
           go run ./cmd/hfdesk/genico.go
           rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk/resource_windows_amd64.syso
-          rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk-desktop/resource_windows_amd64.syso
+          rsrc -ico cmd/hfdesk/hfdesk.ico -manifest cmd/hfdesk-desktop/hfdesk.manifest -o cmd/hfdesk-desktop/resource_windows_amd64.syso
 
       - name: Build binary
         env:

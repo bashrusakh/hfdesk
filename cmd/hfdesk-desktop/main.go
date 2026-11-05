@@ -18,6 +18,17 @@
 // opens a console window next to the notification area icon. The host reads
 // the PE header of its own executable at startup and tells the user how to
 // rebuild the binary when it was built wrong. It keeps running either way.
+//
+// The binary is also the elevated helper of the Windows service: the desktop
+// host starts the very same executable with the hidden flags
+//
+//	--service-action install|update|start
+//	--wait-pid N
+//
+// and the helper performs the action, reports it in a native message box and
+// ends without a server, a tray icon or a window. The flags are private to the
+// desktop executable: they are not part of the options of the hfdesk command,
+// and they are not documented in its usage.
 package main
 
 import (
@@ -41,22 +52,46 @@ func main() {
 	}
 }
 
-// run performs the desktop startup: it parses the shared flags and hands the
-// startup over to the desktop host.
+// run performs the startup of the process.
 //
-// The flags are the flags of the hfdesk command, so both hosts accept the
-// same options and read the same configuration file.
+// The command is first read as the elevated helper of the Windows service: a
+// launch that carries the hidden service flags performs the action and ends
+// before anything of the desktop host exists. Every other command starts the
+// desktop host.
 //
-// The flags are parsed with ContinueOnError: the default of the flag package
-// prints the error and the usage to standard error and ends the process, and
-// a GUI subsystem program has no console, so the user would see a process
-// that vanished without an explanation. The problem is reported to the user
-// in a native message box instead, and the process ends with a non-zero exit
-// code.
-//
-// The exit code of the process is returned: zero for a host that started and
-// that ended without a failure.
+// The exit code of the process is returned: zero for a process that ended
+// without a failure.
 func run() int {
+	// The helper runs first and on a flag set of its own: the service flags
+	// are private to the desktop executable, so they are neither part of the
+	// shared options of the server host nor part of its usage text.
+	//
+	// A command that the helper flag set does not accept is the command of
+	// the desktop host, and the flag set below reports its problems. A helper
+	// command is therefore recognized by its action flag and never by the
+	// absence of a host flag.
+	var helper desktop.ServiceActionOptions
+	var helperAction string
+	helperFlags := flag.NewFlagSet("hfdesk-desktop-service", flag.ContinueOnError)
+	helperFlags.SetOutput(io.Discard)
+	helperFlags.StringVar(&helperAction, "service-action", "",
+		"install, update or start the HFDesk service")
+	helperFlags.IntVar(&helper.WaitPID, "wait-pid", 0,
+		"wait for this process to exit before the service starts")
+	if err := helperFlags.Parse(os.Args[1:]); err == nil && helperAction != "" {
+		helper.Action = helperAction
+		helper.Version = Version
+		if err := desktop.RunServiceAction(helper); err != nil {
+			// The helper reports its outcome to the user itself, in a native
+			// message box: the exit code only tells the launcher what
+			// happened. A GUI process has no console, so the line is written
+			// for a command line that started the helper by hand.
+			fmt.Fprintf(os.Stderr, "hfdesk-desktop: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
 	var opts app.Options
 
 	// The usage is collected on its own: the desktop host shows the

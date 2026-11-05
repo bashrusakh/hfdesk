@@ -41,6 +41,8 @@ type RunOptions struct {
 	// It is the fallback: the local-dir of the config file of the instance
 	// wins over it. Empty means the Hugging Face cache layout is used.
 	LocalDir string
+	// Version is the build version of the running program.
+	Version string
 }
 
 // Run starts HFDesk in service mode and blocks until ctx is cancelled or the
@@ -92,6 +94,15 @@ func Run(ctx context.Context, opts RunOptions) error {
 	cfg, err := buildConfig(opts, host, port)
 	if err != nil {
 		return err
+	}
+
+	// A platform handler that re-parses the argument vector carries no version.
+	version := opts.Version
+	if version == "" {
+		version = buildVersion
+	}
+	if version != "" {
+		server.Version = version
 	}
 
 	// The server owns the graceful shutdown path (quiesce, HTTP drain, job

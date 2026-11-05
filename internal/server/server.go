@@ -39,6 +39,25 @@ const ShutdownPhaseTimeout = 10 * time.Second
 // sum of the budgets of its phases.
 const GracefulShutdownTimeout = 2 * ShutdownPhaseTimeout
 
+// HealthPath is the endpoint that reports the health of the instance.
+//
+// The path is published: a readiness probe of a supervised start asks it
+// before the supervisor accepts the instance, and a probe that carried a copy
+// of the path would keep asking a route this one no longer registers.
+const HealthPath = "/api/health"
+
+// BasicAuthRealm is the realm the basic authentication of the API announces to
+// a client that sends no credential.
+const BasicAuthRealm = "HFDesk"
+
+// BasicAuthChallenge is the challenge of the basic authentication: the value of
+// the WWW-Authenticate header of a refused request.
+//
+// The challenge is published as the whole header value, because a probe that
+// proves a protected instance compares the header with it as it is sent: the
+// quoting of the realm is part of the answer it accepts.
+const BasicAuthChallenge = `Basic realm="` + BasicAuthRealm + `"`
+
 // Config holds server configuration.
 type Config struct {
 	Addr        string
@@ -277,10 +296,13 @@ func (s *Server) BoundAddr() net.Addr {
 
 // BrowserURL returns a browser-safe URL for the running server.
 //
-// A wildcard bind (0.0.0.0, :: or an empty host) yields the loopback
-// address 127.0.0.1 instead of the wildcard address, because a browser
-// cannot open the wildcard address. Any other host is used as bound. The
-// effective port is always included.
+// A wildcard bind has no address a browser can open, so it yields the loopback
+// address of its family instead: an unspecified IPv4 address and an empty host
+// yield 127.0.0.1, an unspecified IPv6 address yields ::1. The family is the one
+// of the configured address, because the listener of an IPv4 wildcard is a
+// dual-stack socket that reports the IPv6 wildcard on some platforms: the
+// operator asked for the IPv4 wildcard and not for the family the socket chose.
+// Any other host is used as bound. The effective port is always included.
 func (s *Server) BrowserURL() string {
 	host, port := s.boundHostPort()
 	return browserURLFor(host, port)
@@ -309,12 +331,33 @@ func (s *Server) setBoundAddr(addr net.Addr) {
 // boundHostPort returns the host and the effective port of the running
 // server. Before the server is bound it falls back to the configured
 // address and port.
+//
+// A wildcard bind is reported with the spelling of the configuration. The
+// listener of an IPv4 wildcard is a dual-stack socket that reports the IPv6
+// wildcard on some platforms, and the loopback address a browser can open
+// follows the family the operator asked for and not the one the socket chose. A
+// concrete bound host is never replaced, and a configuration that names no
+// wildcard leaves the bound spelling in place.
 func (s *Server) boundHostPort() (string, int) {
-	if addr := s.BoundAddr(); addr != nil {
-		return splitAddrHostPort(addr)
-	}
 	cfg := s.snapshotConfig()
+	if addr := s.BoundAddr(); addr != nil {
+		host, port := splitAddrHostPort(addr)
+		if isWildcardHost(host) && isWildcardHost(cfg.Addr) {
+			host = cfg.Addr
+		}
+		return host, port
+	}
 	return cfg.Addr, cfg.Port
+}
+
+// isWildcardHost reports whether a bind host is the address of every interface:
+// an empty host, or an unspecified IP address of either family.
+func isWildcardHost(host string) bool {
+	if host == "" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsUnspecified()
 }
 
 // browserURLFor builds the browser-safe URL for a bind host and an effective
@@ -324,13 +367,27 @@ func browserURLFor(host string, port int) string {
 }
 
 // browserHost maps a bind host to a host a browser can open. A wildcard or
-// empty bind host becomes the loopback address; every other host is kept.
+// empty bind host has no address a browser can open, so it becomes the loopback
+// address of the same family: an unspecified IPv4 address and an empty host
+// become 127.0.0.1, an unspecified IPv6 address becomes ::1. Every other host is
+// kept: a browser resolves the name localhost to the loopback interface itself.
+//
+// The caller resolves a wildcard bind from the configuration first (see
+// boundHostPort), so the family of the loopback address is the family the
+// operator asked for. The mapping itself is the rule service.LocalAddress applies
+// to a registered listen address, so a start that is verified on an address and a
+// browser that is sent to it never disagree. The server package cannot import the
+// service package, so the rule is spelled here as well: a change to the mapping of
+// either copy has to change the other one.
 func browserHost(host string) string {
 	if host == "" {
 		return "127.0.0.1"
 	}
 	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
-		return "127.0.0.1"
+		if ip.To4() != nil {
+			return "127.0.0.1"
+		}
+		return "::1"
 	}
 	return host
 }
@@ -517,7 +574,7 @@ func (s *Server) closeJobsAfterListenError(listenErr error, timeout time.Duratio
 // registerAPIRoutes sets up all API endpoints.
 func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	// Health check
-	mux.HandleFunc("GET /api/health", s.handleHealth)
+	mux.HandleFunc("GET "+HealthPath, s.handleHealth)
 
 	// Downloads
 	mux.HandleFunc("POST /api/download", s.handleStartDownload)
@@ -673,7 +730,7 @@ func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
 		userOK := subtle.ConstantTimeCompare([]byte(user), []byte(cfg.AuthUser)) == 1
 		passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.AuthPass)) == 1
 		if !ok || !userOK || !passOK {
-			w.Header().Set("WWW-Authenticate", `Basic realm="HFDesk"`)
+			w.Header().Set("WWW-Authenticate", BasicAuthChallenge)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}

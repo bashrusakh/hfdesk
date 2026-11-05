@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 )
@@ -46,6 +47,64 @@ func RunArgsHelp() []struct{ Name, Usage string } {
 // this parser: it is rejected as an unknown flag and its value never
 // reaches an error message.
 func ParseRunArgs(args []string) (RunOptions, error) {
+	opts, err := parseRunArgsValues(args)
+	if err != nil {
+		return RunOptions{}, err
+	}
+
+	// An instance is only started with a complete path model. A missing
+	// flag means a broken registration, not a default.
+	for _, required := range []struct {
+		flag  string
+		value string
+	}{
+		{"--config", opts.Paths.ConfigFile},
+		{"--state-dir", opts.Paths.StateDir},
+		{"--log-dir", opts.Paths.LogDir},
+	} {
+		if required.value == "" {
+			return RunOptions{}, fmt.Errorf("service: missing required flag %s", required.flag)
+		}
+	}
+
+	// A supervised process must not resolve a path against the working
+	// directory of the supervisor, so every path of the vector is
+	// absolute. The optional directories may stay unset, but a set one is
+	// absolute as well.
+	for _, p := range []struct {
+		flag  string
+		value string
+	}{
+		{"--config", opts.Paths.ConfigFile},
+		{"--state-dir", opts.Paths.StateDir},
+		{"--log-dir", opts.Paths.LogDir},
+		{"--cache-dir", opts.CacheDir},
+		{"--hub-dir", opts.HubDir},
+		{"--local-dir", opts.LocalDir},
+	} {
+		if p.value == "" {
+			continue
+		}
+		if !filepath.IsAbs(p.value) {
+			return RunOptions{}, fmt.Errorf("service: %s %q must be an absolute path", p.flag, p.value)
+		}
+	}
+
+	// The bind address is validated exactly as at install time: an empty
+	// host and an out-of-range port are rejected the same way.
+	if _, _, err := ParseListen(opts.Listen); err != nil {
+		return RunOptions{}, err
+	}
+	opts.Listen = listenArg(opts.Listen)
+	return opts, nil
+}
+
+// parseRunArgsValues is the one parser for the flag syntax accepted by the
+// headless host. Registration readers use its values too, so status and a
+// reinstall do not reinterpret an argument vector differently from Run.
+// Values parsed before a malformed or unknown flag remain available to the
+// tolerant registration readers.
+func parseRunArgsValues(args []string) (RunOptions, error) {
 	fs := flag.NewFlagSet("service run", flag.ContinueOnError)
 	// The parser reports its own errors. A usage dump of the flag set is
 	// noise for a CLI and useless for a service handler that has no
@@ -70,62 +129,12 @@ func ParseRunArgs(args []string) (RunOptions, error) {
 	fs.StringVar(&hubDir, "hub-dir", "", "absolute path of the Hugging Face hub cache directory")
 	fs.StringVar(&localDir, "local-dir", "", "absolute path of the flat output directory")
 
-	if err := fs.Parse(stripRunCommand(args)); err != nil {
-		return RunOptions{}, fmt.Errorf("service: parse run arguments: %w", err)
-	}
+	err := fs.Parse(stripRunCommand(args))
 	// Everything the parser does not know is a mistake: a positional
 	// argument would otherwise be dropped silently. Its value is not
 	// repeated in the error: a bare word is the shape a credential takes
 	// when it is handed over without a flag.
-	if rest := fs.Args(); len(rest) > 0 {
-		return RunOptions{}, fmt.Errorf("service: parse run arguments: unexpected argument, the vector carries flags only")
-	}
-
-	// An instance is only started with a complete path model. A missing
-	// flag means a broken registration, not a default.
-	for _, required := range []struct {
-		flag  string
-		value string
-	}{
-		{"--config", configFile},
-		{"--state-dir", stateDir},
-		{"--log-dir", logDir},
-	} {
-		if required.value == "" {
-			return RunOptions{}, fmt.Errorf("service: missing required flag %s", required.flag)
-		}
-	}
-
-	// A supervised process must not resolve a path against the working
-	// directory of the supervisor, so every path of the vector is
-	// absolute. The optional directories may stay unset, but a set one is
-	// absolute as well.
-	for _, p := range []struct {
-		flag  string
-		value string
-	}{
-		{"--config", configFile},
-		{"--state-dir", stateDir},
-		{"--log-dir", logDir},
-		{"--cache-dir", cacheDir},
-		{"--hub-dir", hubDir},
-		{"--local-dir", localDir},
-	} {
-		if p.value == "" {
-			continue
-		}
-		if !filepath.IsAbs(p.value) {
-			return RunOptions{}, fmt.Errorf("service: %s %q must be an absolute path", p.flag, p.value)
-		}
-	}
-
-	// The bind address is validated exactly as at install time: an empty
-	// host and an out-of-range port are rejected the same way.
-	if _, _, err := ParseListen(listen); err != nil {
-		return RunOptions{}, err
-	}
-
-	return RunOptions{
+	opts := RunOptions{
 		Paths: runtimepaths.Paths{
 			ConfigFile: configFile,
 			StateDir:   stateDir,
@@ -133,11 +142,48 @@ func ParseRunArgs(args []string) (RunOptions, error) {
 		},
 		// The address keeps the canonical shape the argument vector
 		// carries, so a parsed instance and a registered one agree.
-		Listen:   listenArg(listen),
+		Listen:   listen,
 		CacheDir: cacheDir,
 		HubDir:   hubDir,
 		LocalDir: localDir,
-	}, nil
+	}
+	if err != nil {
+		return opts, fmt.Errorf("service: parse run arguments: %w", err)
+	}
+	if rest := fs.Args(); len(rest) > 0 {
+		return opts, fmt.Errorf("service: parse run arguments: unexpected argument, the vector carries flags only")
+	}
+	return opts, nil
+}
+
+// runArgValue returns one registered flag from an argument vector using the
+// same parser as ParseRunArgs. It is intentionally tolerant of other missing
+// required values because status must still describe a damaged registration.
+func runArgValue(args []string, flag string) string {
+	opts := parseRunArgValues(args)
+	switch strings.TrimLeft(flag, "-") {
+	case "config":
+		return opts.Paths.ConfigFile
+	case "state-dir":
+		return opts.Paths.StateDir
+	case "log-dir":
+		return opts.Paths.LogDir
+	case "listen":
+		return opts.Listen
+	case "cache-dir":
+		return opts.CacheDir
+	case "hub-dir":
+		return opts.HubDir
+	case "local-dir":
+		return opts.LocalDir
+	default:
+		return ""
+	}
+}
+
+func parseRunArgValues(args []string) RunOptions {
+	opts, _ := parseRunArgsValues(args)
+	return opts
 }
 
 // stripRunCommand removes the leading command tokens of the invocation, so

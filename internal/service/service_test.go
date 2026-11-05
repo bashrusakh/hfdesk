@@ -99,19 +99,64 @@ func TestRunArgsUsesDefaultListenWhenUnset(t *testing.T) {
 	}
 }
 
+func TestMergeInstallOptionsPreservesUnsetRegistrationDestinations(t *testing.T) {
+	requested := fullInstallOptions(t)
+	existing := fullInstallOptions(t)
+	existing.CacheDir = ""
+	existing.HubDir = ""
+	existing.LocalDir = ""
+
+	got := mergeInstallOptions(requested, existing, true)
+	if got.CacheDir != "" || got.HubDir != "" || got.LocalDir != "" {
+		t.Errorf("unset destinations = %q/%q/%q, want absence from the registration", got.CacheDir, got.HubDir, got.LocalDir)
+	}
+	if got.Paths != existing.Paths || got.Listen != existing.Listen {
+		t.Errorf("merge changed the other registered settings: %+v", got)
+	}
+}
+
+func TestMergeInstallOptionsKeepsAnAbsentHubForAnExistingCache(t *testing.T) {
+	requested := fullInstallOptions(t)
+	existing := fullInstallOptions(t)
+	existing.CacheDir = "/registered/custom-cache"
+	existing.HubDir = ""
+
+	got := mergeInstallOptions(requested, existing, true)
+	if got.CacheDir != existing.CacheDir || got.HubDir != "" {
+		t.Errorf("merged cache layout = %q/%q, want custom cache with no registered hub", got.CacheDir, got.HubDir)
+	}
+}
+
+func TestMergeInstallOptionsUsesDerivedHubForAnExplicitCacheOnlyRequest(t *testing.T) {
+	requested := fullInstallOptions(t)
+	requested.CacheDir = "/new/cache"
+	requested.HubDir = filepath.Join(requested.CacheDir, "hub")
+	requested.Explicit.CacheDir = true
+	requested.Explicit.HubDir = true
+	existing := fullInstallOptions(t)
+	existing.CacheDir = "/old/cache"
+	existing.HubDir = "/separate/old-hub"
+
+	got := mergeInstallOptions(requested, existing, true)
+	if got.CacheDir != requested.CacheDir || got.HubDir != filepath.Join(requested.CacheDir, "hub") {
+		t.Errorf("cache-only request merged to %q/%q, want %q/%q", got.CacheDir, got.HubDir, requested.CacheDir, filepath.Join(requested.CacheDir, "hub"))
+	}
+}
+
 // installOptionStringFields are the string fields of InstallOptions.
 //
-// Every one of them carries the scope, a path, the bind address or the
-// account of an instance. The type carries no credential field at all, so a
-// registration can never carry one.
+// Every one of them carries the scope, a path, the bind address, the account
+// or the build version of an instance. The type carries no credential field at
+// all, so a registration can never carry one.
 var installOptionStringFields = map[string]bool{
-	"Scope":       true,
-	"Executable":  true,
-	"Listen":      true,
-	"CacheDir":    true,
-	"HubDir":      true,
-	"LocalDir":    true,
-	"ServiceUser": true,
+	"Scope":           true,
+	"Executable":      true,
+	"Listen":          true,
+	"CacheDir":        true,
+	"HubDir":          true,
+	"LocalDir":        true,
+	"ServiceUser":     true,
+	"ExpectedVersion": true,
 }
 
 // TestInstallOptionsCarryNoCredentialField checks that the options of an
@@ -534,6 +579,32 @@ func TestDefaultServiceUserIsStable(t *testing.T) {
 		if got := DefaultServiceUser(); got != first {
 			t.Fatalf("DefaultServiceUser() = %q, want the stable value %q", got, first)
 		}
+	}
+}
+
+func TestSCMExecutableSupportUsesHostNativeAndGuestCapabilities(t *testing.T) {
+	queryErr := errors.New("the host support API is unavailable")
+	cases := []struct {
+		name      string
+		candidate uint16
+		native    uint16
+		query     func(uint16) (bool, error)
+		want      scmExecutableSupport
+	}{
+		{"native image is supported without a guest query", 0xAA64, 0xAA64, nil, scmExecutableSupported},
+		{"supported emulated guest is accepted", 0x8664, 0xAA64, func(uint16) (bool, error) { return true, nil }, scmExecutableSupported},
+		{"known unsupported guest is refused", 0xAA64, 0x8664, func(uint16) (bool, error) { return false, nil }, scmExecutableUnsupported},
+		{"unavailable guest query remains unknown", 0x8664, 0xAA64, func(uint16) (bool, error) { return false, queryErr }, scmExecutableSupportUnknown},
+		{"unknown native machine remains unknown", 0x8664, 0, func(uint16) (bool, error) { return true, nil }, scmExecutableSupportUnknown},
+		{"unknown candidate remains unknown", 0, 0xAA64, func(uint16) (bool, error) { return false, nil }, scmExecutableSupportUnknown},
+		{"missing guest query remains unknown", 0x8664, 0xAA64, nil, scmExecutableSupportUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scmExecutableSupportForHost(tc.candidate, tc.native, tc.query); got != tc.want {
+				t.Errorf("scmExecutableSupportForHost(0x%04X, 0x%04X) = %v, want %v", tc.candidate, tc.native, got, tc.want)
+			}
+		})
 	}
 }
 
