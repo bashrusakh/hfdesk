@@ -138,6 +138,25 @@ var newServiceManager = service.New
 // the same machine could see.
 var holdServiceMutation = service.HoldDesktopSingleton
 
+// serviceStatusNextAction is the next action of a refusal that changed
+// nothing: the command that reads the current state of the instance. The
+// subcommand belongs to this very command family, so the refusal names a
+// real command and never a guessed one.
+const serviceStatusNextAction = `; run "hfdesk service status" to read the current state of the service`
+
+// holdRefusalNextAction returns the next action that follows a mutation
+// refused because the per-session desktop singleton could not be held — the
+// same action the desktop helper notice appends to its report of this
+// refusal. A cause that already names its own step (another Windows identity
+// owns the object, and that refusal says to end that process) keeps only
+// that step: a report carries one next action, never two.
+func holdRefusalNextAction(err error) string {
+	if errors.Is(err, service.ErrSingletonAccessDenied) {
+		return ""
+	}
+	return serviceStatusNextAction
+}
+
 // beginServiceMutationHold takes the hold that keeps a relaunch of the
 // desktop app out of the window of a mutation that starts or restarts the
 // service, or refuses the command before it changes anything.
@@ -150,10 +169,10 @@ var holdServiceMutation = service.HoldDesktopSingleton
 func beginServiceMutationHold() (release func(), err error) {
 	holdRelease, err := holdServiceMutation("")
 	if err != nil {
-		return nil, fmt.Errorf("the per-session desktop singleton must be held before a service mutation and could not be held, so nothing was changed: %w", err)
+		return nil, fmt.Errorf("the per-session desktop singleton must be held before a service mutation and could not be held, so nothing was changed: %w%s", err, holdRefusalNextAction(err))
 	}
 	if holdRelease == nil {
-		return nil, errors.New("the per-session desktop singleton hold returned no release, so nothing was changed")
+		return nil, errors.New("the per-session desktop singleton hold returned no release, so nothing was changed" + holdRefusalNextAction(nil))
 	}
 	return holdRelease, nil
 }

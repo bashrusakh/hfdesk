@@ -410,7 +410,7 @@ type scmRegisterResult struct {
 func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts InstallOptions, previous previousSCMRegistration, startFirst bool) (scmRegisterResult, error) {
 	result := scmRegisterResult{createdDirsSafeToRemove: true}
 	config := buildSCMConfig(opts)
-	handle, err := manager.OpenService(ServiceName)
+	handle, err := scmOpenService(manager, ServiceName)
 	created := false
 	switch {
 	case err == nil:
@@ -449,7 +449,7 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 	if !created {
 		// The configuration of the registration is read before it is
 		// changed, so a failure after the write can put it back as it was.
-		previousConfig, err := handle.Config()
+		previousConfig, err := scmQueryServiceConfig(handle)
 		if err != nil {
 			if !previous.present {
 				// A registration appeared after the read-only lookup. Its
@@ -467,7 +467,7 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 			// this handle: it is the registration the installation
 			// replaces, and its state decides whether it has to be
 			// restarted.
-			status, err := handle.Query()
+			status, err := scmQueryStatus(handle)
 			if err != nil {
 				return result, scmRefused("an installation", fmt.Errorf("service: query the state of %s: %w", ServiceName, err))
 			}
@@ -485,10 +485,14 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 		// recovery policy is configured and before the instance is
 		// stopped, so nothing of the machine is touched.
 		if err := scmServiceAccountRefusal(previousConfig.ServiceStartName); err != nil {
-			// This refusal happens before any write of this attempt:
-			// no registration was written, so the directories this
-			// attempt created are safe to remove again.
-			result.createdDirsSafeToRemove = true
+			// This refusal happens before any write of this attempt: no
+			// registration was written, so the cleanup decision stays the
+			// one the code above already made — the directories this
+			// attempt created are safe to remove again for a registration
+			// it knew, while a registration that appeared between the
+			// read-only lookup and the open may reference them and keeps
+			// the keep-paths decision of its case. The neighbouring
+			// disabled-start refusal does not touch the decision either.
 			return result, err
 		}
 
@@ -1292,9 +1296,10 @@ func scmDisabledRunningRefusal(present, running bool, startType uint32) error {
 // registration is written, before the recovery policy is configured and
 // before the instance is stopped — and names the command that restores the
 // supported identity. A registration that runs as the supported identity is
-// never refused: the update keeps its account exactly as it does today, and
-// a first installation is unaffected — it registers the supported identity
-// itself and never reaches this check.
+// never refused, whatever spelling the operating system reports it under
+// (see scmSupportedServiceAccount): the update keeps its account exactly as
+// it does today, and a first installation is unaffected — it registers the
+// supported identity itself and never reaches this check.
 func scmServiceAccountRefusal(account string) error {
 	if scmSupportedServiceAccount(account) {
 		return nil
@@ -1316,12 +1321,46 @@ func scmServiceAccountRefusal(account string) error {
 //
 // The service control manager stores the name the registration was created
 // with and resolves it case-insensitively; it also accepts the well-known
-// security identifier of the account, so both spellings of the same identity
-// keep updating and nothing else does.
+// security identifier of the account. What a read reports back is the form
+// the operating system produced — on a localized system the built-in account
+// carries the localized name the account database spells it with — so a name
+// literal is not the identity. The two known spellings are fast paths, and
+// any other spelling is resolved to its security identifier and compared
+// with the well-known identifier of the supported identity: every spelling
+// of LocalService is accepted and no other account is. An account the
+// machine cannot resolve is not confirmed as the supported identity and
+// keeps the refusal.
 func scmSupportedServiceAccount(account string) bool {
 	account = strings.TrimSpace(account)
-	return strings.EqualFold(account, scmLocalServiceAccount) ||
-		strings.EqualFold(account, scmLocalServiceAccountSID)
+	if strings.EqualFold(account, scmLocalServiceAccount) ||
+		strings.EqualFold(account, scmLocalServiceAccountSID) {
+		return true
+	}
+	if account == "" {
+		// An empty start name is how the service control manager reports
+		// the built-in LocalSystem account, not the supported identity.
+		return false
+	}
+	sid, err := scmAccountSecurityIdentifier(account)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(sid, scmLocalServiceAccountSID)
+}
+
+// scmAccountSecurityIdentifier resolves an account name of the local
+// machine to the string form of its security identifier.
+//
+// The variable is the seam of the tests: the spelling and localization of
+// account names belong to the operating system a test happens to run on,
+// and a test drives the identity comparison without depending on the
+// language of that machine.
+var scmAccountSecurityIdentifier = func(account string) (string, error) {
+	sid, _, _, err := windows.LookupSID("", account)
+	if err != nil {
+		return "", err
+	}
+	return sid.String(), nil
 }
 
 // scmImageCheck is how much of the running instance an installation could prove.
@@ -1382,6 +1421,12 @@ func (m *scmManager) verifyRunningExecutable(ctx context.Context, handle *mgr.Se
 // the service control manager.
 var scmQueryStatus = (*mgr.Service).Query
 var scmQueryServiceConfig = (*mgr.Service).Config
+
+// scmOpenService opens the registration for the write path of an
+// installation. The variable is the seam of the test: a test drives the
+// update path without a registration of its own on the machine, which a
+// shell without elevation cannot create.
+var scmOpenService = (*mgr.Mgr).OpenService
 var scmStartService = func(service *mgr.Service) error { return service.Start() }
 var scmControlService = (*mgr.Service).Control
 var scmDeleteService = (*mgr.Service).Delete

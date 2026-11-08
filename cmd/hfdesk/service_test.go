@@ -3143,7 +3143,7 @@ func TestServiceMutationRefusesWhenTheSingletonCannotBeHeld(t *testing.T) {
 			if code != serviceFailureExitCode {
 				t.Fatalf("the refused command must exit with %d, got %d:\n%s", serviceFailureExitCode, code, stderr.String())
 			}
-			for _, want := range []string{"nothing was changed", reason.Error()} {
+			for _, want := range []string{"nothing was changed", reason.Error(), `run "hfdesk service status"`} {
 				if !strings.Contains(stderr.String(), want) {
 					t.Errorf("the error does not mention %q:\n%s", want, stderr.String())
 				}
@@ -3153,6 +3153,51 @@ func TestServiceMutationRefusesWhenTheSingletonCannotBeHeld(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestServiceMutationHoldRefusalCarriesOneNextAction proves the message
+// discipline of the refusal from its two remaining sides: a cause that
+// already names its own step (the access-denied hold of another Windows
+// identity) keeps only that step, and a hold that returns no release names
+// the command that reads the state of the instance. A report never carries
+// both commands, the rule the desktop helper notice follows.
+func TestServiceMutationHoldRefusalCarriesOneNextAction(t *testing.T) {
+	accessDenied := fmt.Errorf(
+		"the desktop singleton exists but this Windows identity cannot access it: another HFDesk process under a different Windows account created it; end that process and try again%w",
+		service.ErrSingletonAccessDenied)
+
+	t.Run("a cause that names its own step keeps only that step", func(t *testing.T) {
+		useFakeManager(t, fakeManager{status: service.Status{State: service.StateStopped}})
+		refuseSingletonHold(t, accessDenied)
+
+		var stdout, stderr bytes.Buffer
+		if code := runServiceCommand([]string{"start"}, &stdout, &stderr); code != serviceFailureExitCode {
+			t.Fatalf("the refused command must exit with %d, got %d:\n%s", serviceFailureExitCode, code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "end that process and try again") {
+			t.Errorf("the refusal does not carry the cause of the hold:\n%s", stderr.String())
+		}
+		if strings.Contains(stderr.String(), "hfdesk service status") {
+			t.Errorf("the refusal carries a second next action next to the step of its cause:\n%s", stderr.String())
+		}
+	})
+
+	t.Run("a hold without a release names the status command", func(t *testing.T) {
+		useFakeManager(t, fakeManager{status: service.Status{State: service.StateStopped}})
+		previous := holdServiceMutation
+		holdServiceMutation = func(string) (func(), error) { return nil, nil }
+		t.Cleanup(func() { holdServiceMutation = previous })
+
+		var stdout, stderr bytes.Buffer
+		if code := runServiceCommand([]string{"start"}, &stdout, &stderr); code != serviceFailureExitCode {
+			t.Fatalf("the refused command must exit with %d, got %d:\n%s", serviceFailureExitCode, code, stderr.String())
+		}
+		for _, want := range []string{"returned no release", "nothing was changed", `run "hfdesk service status"`} {
+			if !strings.Contains(stderr.String(), want) {
+				t.Errorf("the refusal does not mention %q:\n%s", want, stderr.String())
+			}
+		}
+	})
 }
 
 // TestServiceReadAndStopPathsNeverHoldTheSingleton proves the preserved side

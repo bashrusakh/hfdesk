@@ -206,6 +206,152 @@ func TestSCMServiceAccountRefusalRefusesOnlyAChangedIdentity(t *testing.T) {
 	}
 }
 
+// TestSCMSupportedServiceAccountComparesIdentitiesNotNameLiterals checks
+// both sides of the supported-identity comparison behind the refusal.
+//
+// The service control manager reports the account in whatever form the
+// operating system produced: on a localized system the built-in account
+// carries a name no English literal matches. A registration that runs as the
+// supported identity is therefore never refused, whatever spelling the
+// machine resolves it under, while a name the machine cannot confirm as
+// LocalService keeps the refusal exactly as before. The known literal
+// spellings stay fast paths: they are accepted without any lookup.
+func TestSCMSupportedServiceAccountComparesIdentitiesNotNameLiterals(t *testing.T) {
+	var resolved []string
+	replaceSCMTestSeam(t, &scmAccountSecurityIdentifier, func(account string) (string, error) {
+		resolved = append(resolved, account)
+		switch account {
+		case `NT AUTORITÄT\LOKALER DIENST`:
+			// The localized name the account database spells the
+			// supported identity with on a German system.
+			return scmLocalServiceAccountSID, nil
+		case `CONTOSO\svc-other`:
+			return "S-1-5-21-1111111111-2222222222-3333333333-1001", nil
+		default:
+			return "", errors.New("the account name does not exist on this machine")
+		}
+	})
+
+	t.Run("the localized spelling of the supported identity is never refused", func(t *testing.T) {
+		if err := scmServiceAccountRefusal(`NT AUTORITÄT\LOKALER DIENST`); err != nil {
+			t.Errorf("scmServiceAccountRefusal of the supported identity = %v, want nil: a localized name is the same identity", err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name    string
+		account string
+		shown   string
+	}{
+		{"a resolvable foreign account", `CONTOSO\svc-other`, `CONTOSO\svc-other`},
+		{"an unresolvable name", `HFDESK-TEST\unknown`, `HFDESK-TEST\unknown`},
+		{"the built-in LocalSystem account", "LocalSystem", "LocalSystem"},
+		{"an empty start name", "", "LocalSystem"},
+	} {
+		t.Run("refused "+tc.name, func(t *testing.T) {
+			err := scmServiceAccountRefusal(tc.account)
+			if err == nil {
+				t.Fatalf("scmServiceAccountRefusal(%q) = nil, want the refusal of the update", tc.account)
+			}
+			if !errors.Is(err, ErrServiceAccountMismatch) {
+				t.Errorf("the refusal %v is not classified as ErrServiceAccountMismatch", err)
+			}
+			if want := fmt.Sprintf("runs as \"%s\"", tc.shown); !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal %q does not mention %q", err, want)
+			}
+		})
+	}
+
+	t.Run("the literal spellings are accepted without a lookup", func(t *testing.T) {
+		resolved = nil
+		for _, account := range []string{
+			scmLocalServiceAccount,
+			`nt authority\localservice`,
+			scmLocalServiceAccountSID,
+			"s-1-5-19",
+			" " + scmLocalServiceAccountSID + " ",
+		} {
+			if err := scmServiceAccountRefusal(account); err != nil {
+				t.Errorf("scmServiceAccountRefusal(%q) = %v, want nil: an update keeps this identity", account, err)
+			}
+		}
+		if len(resolved) != 0 {
+			t.Errorf("the known literal spellings were resolved %d times, want the fast path: %v", len(resolved), resolved)
+		}
+	})
+
+	t.Run("an empty start name is refused without a lookup", func(t *testing.T) {
+		resolved = nil
+		if err := scmServiceAccountRefusal(""); err == nil {
+			t.Fatal("scmServiceAccountRefusal(\"\") = nil, want the refusal: an empty start name is the LocalSystem account")
+		}
+		if len(resolved) != 0 {
+			t.Errorf("the empty start name was resolved %d times, want no lookup: %v", len(resolved), resolved)
+		}
+	})
+}
+
+// TestSCMServiceAccountRefusalKeepsTheCleanupDecisionOfItsInterleave checks
+// both sides of the cleanup decision at the refusal call site of register.
+//
+// The refusal happens before any write of this attempt. For a registration
+// that already existed when the attempt looked it up, the directories the
+// attempt created are its own and stay safe to remove. A registration that
+// appeared between the read-only lookup and the open may reference those
+// very directories, so the refusal keeps the keep-paths decision of that
+// interleave instead of overriding it.
+func TestSCMServiceAccountRefusalKeepsTheCleanupDecisionOfItsInterleave(t *testing.T) {
+	replaceSCMTestSeam(t, &scmOpenService, func(*mgr.Mgr, string) (*mgr.Service, error) {
+		return new(mgr.Service), nil
+	})
+	replaceSCMTestSeam(t, &scmQueryServiceConfig, func(*mgr.Service) (mgr.Config, error) {
+		return mgr.Config{
+			ServiceType:      windows.SERVICE_WIN32_OWN_PROCESS,
+			StartType:        mgr.StartAutomatic,
+			ErrorControl:     mgr.ErrorNormal,
+			BinaryPathName:   `C:\other\hfdesk.exe service run`,
+			ServiceStartName: `CONTOSO\svc-other`,
+		}, nil
+	})
+	replaceSCMTestSeam(t, &scmQueryStatus, func(*mgr.Service) (svc.Status, error) {
+		return svc.Status{State: svc.Stopped}, nil
+	})
+
+	for _, tc := range []struct {
+		name     string
+		previous previousSCMRegistration
+		appeared bool
+		wantSafe string
+	}{
+		{
+			name:     "the registration was known before the attempt",
+			previous: previousSCMRegistration{present: true},
+			appeared: false,
+			wantSafe: "the directories this attempt created are its own: no registration write happened",
+		},
+		{
+			name:     "a registration appeared during the attempt",
+			previous: previousSCMRegistration{},
+			appeared: true,
+			wantSafe: "the appeared registration may reference the directories this attempt created",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &scmManager{}
+			result, err := m.register(context.Background(), nil, scmTestOptions(), tc.previous, false)
+			if !errors.Is(err, ErrServiceAccountMismatch) {
+				t.Fatalf("register() = %v, want the refusal over the account of the registration", err)
+			}
+			if result.created {
+				t.Error("the refusal reported a created registration: it returns before any write")
+			}
+			if got, want := result.createdDirsSafeToRemove, !tc.appeared; got != want {
+				t.Errorf("createdDirsSafeToRemove = %v, want %v: %s", got, want, tc.wantSafe)
+			}
+		})
+	}
+}
+
 // TestSCMConfigForUpdatePreservesTheReadableRegistrationSettings checks that
 // an update changes the command line but keeps the other readable SCM settings,
 // including start type and delayed start. The fixed service identity and blank
