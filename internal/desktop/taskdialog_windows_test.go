@@ -400,3 +400,78 @@ func buttonLabels(buttons []serviceGateButton) []string {
 	}
 	return labels
 }
+
+// TestServiceGateMessageBoxFallbackMapsYesNoCancel proves the mapping of the
+// message box fallback of the service gate: which box each answer opens and
+// which action every answer performs.
+//
+// A positively confirmed stopped service is asked in two boxes — the first
+// one picks the desktop mode, a service action or no action, and only a No
+// opens the second one that names the service actions — while every other
+// state keeps its single box and the mapping it had. The desktop answer is
+// the one that continues the launch and never the start action, so the box
+// that offers it can never select the start of the service.
+//
+// The real message box blocks a process without an interactive window station,
+// so the seam is replaced with the scripted answers and records the text of
+// every box it is asked to show.
+func TestServiceGateMessageBoxFallbackMapsYesNoCancel(t *testing.T) {
+	stopped := serviceChoicePrompt{State: service.StateStopped}
+	running := serviceChoicePrompt{State: service.StateRunning}
+	failed := serviceChoicePrompt{State: service.StateFailed}
+
+	for _, tc := range []struct {
+		name    string
+		prompt  serviceChoicePrompt
+		answers []int32
+		want    serviceChoice
+	}{
+		{name: "stopped yes continues in desktop mode", prompt: stopped,
+			answers: []int32{messageBoxYes}, want: serviceChoiceDesktop},
+		{name: "stopped no asks for the service action", prompt: stopped,
+			answers: []int32{messageBoxNo, messageBoxYes}, want: serviceChoiceStart},
+		{name: "stopped no then no updates", prompt: stopped,
+			answers: []int32{messageBoxNo, messageBoxNo}, want: serviceChoiceUpdate},
+		{name: "stopped cancel changes nothing", prompt: stopped,
+			answers: []int32{messageBoxCancel}, want: serviceChoiceCancel},
+		{name: "running yes opens", prompt: running,
+			answers: []int32{messageBoxYes}, want: serviceChoiceOpen},
+		{name: "running no updates", prompt: running,
+			answers: []int32{messageBoxNo}, want: serviceChoiceUpdate},
+		{name: "failed yes starts", prompt: failed,
+			answers: []int32{messageBoxYes}, want: serviceChoiceStart},
+		{name: "cancel changes nothing", prompt: running,
+			answers: []int32{messageBoxCancel}, want: serviceChoiceCancel},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var asked []string
+			replaceSeam(t, &showGateMessageBox, func(text string, _ uint32) int32 {
+				if len(asked) >= len(tc.answers) {
+					t.Errorf("the fallback asked box %d, only %d answers scripted", len(asked)+1, len(tc.answers))
+					return messageBoxCancel
+				}
+				asked = append(asked, text)
+				return tc.answers[len(asked)-1]
+			})
+
+			if choice := messageBoxChoice(tc.prompt); choice != tc.want {
+				t.Errorf("the fallback answer %v performs %v, want %v", tc.answers, choice, tc.want)
+			}
+
+			if len(asked) != len(tc.answers) {
+				t.Fatalf("the fallback asked %d boxes, want %d: texts %q", len(asked), len(tc.answers), asked)
+			}
+			for i, text := range asked {
+				// Only the stopped service gets a second box, and it is
+				// the box that names the service actions.
+				want := serviceGateChooseText(tc.prompt)
+				if servicePromptStopped(tc.prompt) && i > 0 {
+					want = serviceGateServiceActionChooseText(tc.prompt)
+				}
+				if text != want {
+					t.Errorf("box %d text = %q, want %q", i+1, text, want)
+				}
+			}
+		})
+	}
+}

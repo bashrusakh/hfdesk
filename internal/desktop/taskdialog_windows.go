@@ -399,7 +399,14 @@ func messageBoxServiceActionChoice(prompt serviceChoicePrompt) serviceChoice {
 // reports the id of the answer. A text or a caption that cannot be converted
 // reports the Cancel id: without a readable question the box asks for no
 // action.
-func showGateMessageBox(text string, defaultButton uint32) int32 {
+//
+// It is a package level variable so the tests can answer the fallback: the
+// real message box blocks a process without an interactive window station.
+var showGateMessageBox = showNativeGateMessageBox
+
+// showNativeGateMessageBox shows one box of the fallback of the service gate
+// in a native message box.
+func showNativeGateMessageBox(text string, defaultButton uint32) int32 {
 	textPtr, err := windows.UTF16PtrFromString(text)
 	if err != nil {
 		return messageBoxCancel
