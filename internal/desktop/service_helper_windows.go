@@ -109,26 +109,36 @@ func RunServiceAction(o ServiceActionOptions) error {
 		// Authorization is settled: only the singleton outlives it, through
 		// the service mutation, and is released before the final notice.
 		handover.releaseAuthorizationHandles()
-	} else if (action == serviceActionUpdate || action == serviceActionStart) &&
-		strings.TrimSpace(o.InstanceMutex) != "" {
-		// The gate that asked for this action ended without a handover —
-		// nothing waits for a desktop exit — but the mutation still needs
-		// the singleton: it takes the service out of the positively
-		// stopped state that gate decided on, and a relaunch in that
-		// window could bind the address the instance needs. The hold
-		// starts before any mutation and ends with the action: the
-		// reporter paths release it before the final notice, and the
-		// deferred close covers every other return.
-		mutex, holdErr := holdDesktopSingleton(o.InstanceMutex)
+	} else if action == serviceActionUpdate || action == serviceActionStart {
+		// Every mutation that starts or restarts the service holds the
+		// per-session desktop singleton, whether the gate handed this
+		// launch's object over or a command line was typed by hand: the
+		// mutation takes the service out of a positively confirmed
+		// stopped state, and a relaunch in that window could bind the
+		// address the restarted instance needs. An empty name computes
+		// the object of this session itself. The hold starts before any
+		// mutation and ends with the action: the reporter paths release
+		// it before the final notice, and the deferred close covers every
+		// other return. A hold that cannot be established refuses the
+		// action before anything is touched.
+		release, holdErr := holdServiceSingleton(o.InstanceMutex)
 		if holdErr != nil {
-			(&serviceActionReporter{action: action}).failure(holdErr, "")
+			(&serviceActionReporter{action: action}).singletonHoldRefused(holdErr)
 			return holdErr
 		}
-		handover = &helperHandover{mutex: mutex}
+		handover = &helperHandover{hold: release}
 		defer handover.close()
 	}
 	return runServiceAction(action, o.Version, &serviceActionReporter{action: action, handover: handover})
 }
+
+// holdServiceSingleton holds the per-session desktop singleton for a service
+// action that has no desktop handover wait.
+//
+// It is a package level variable so the tests can drive the refusal of an
+// action that cannot hold the window: a hold that fails must refuse before
+// the mutation, not run it unprotected.
+var holdServiceSingleton = service.HoldDesktopSingleton
 
 // preflightServiceProgram checks the console program of this folder with the
 // image preflight the installation runs, before the ready signal; the
@@ -155,10 +165,15 @@ func validateServiceHandoverOptions(action serviceAction, o ServiceActionOptions
 		if action == serviceActionInstall {
 			return errors.New("desktop: service installation requires a graceful desktop handover")
 		}
+		// An update or a start without any handover argument is accepted:
+		// the helper computes the desktop singleton of its own session
+		// and holds it through the mutation itself (see RunServiceAction),
+		// so a hand-typed command line holds the same window the gate
+		// hands over, and it still waits for no desktop exit.
 		return nil
 	}
-	// An update or a start carries the singleton identity alone: it holds
-	// the desktop singleton through its mutation without waiting for a
+	// An update or a start may carry the singleton identity alone: it holds
+	// that desktop singleton through its mutation without waiting for a
 	// desktop exit, because the gate that asked for it already ended. Every
 	// other combination still needs the complete install handover below.
 	if (action == serviceActionUpdate || action == serviceActionStart) && o.WaitPID == 0 &&
@@ -490,6 +505,22 @@ func (r *serviceActionReporter) handoverFailure(err error) {
 	showMessage(serviceFailureCaption(r.action),
 		"HFDesk could not confirm the desktop handover. No service action was performed.\n\n"+err.Error(),
 		windows.MB_ICONERROR)
+}
+
+// singletonHoldRefused reports a mutation that refused before it changed
+// anything because the desktop singleton could not be held.
+//
+// The refusal happens before the first change: no hold means no mutation, so
+// the report states that no service action was performed and names the cause
+// of the failed hold.
+func (r *serviceActionReporter) singletonHoldRefused(err error) {
+	if err == nil {
+		return
+	}
+	desktopLog.Error("the service action refused without holding the desktop singleton",
+		"action", string(r.action), "error", err)
+	r.message(serviceFailureCaption(r.action),
+		serviceSingletonHoldRefusedText(r.action, err), windows.MB_ICONERROR)
 }
 
 func (r *serviceActionReporter) firstInstallStartFailure(err error, cleanup *service.InstallStartError, program string) {

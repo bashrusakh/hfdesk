@@ -130,6 +130,34 @@ func isServiceUsageError(err error) bool {
 // without touching the system of the test run.
 var newServiceManager = service.New
 
+// holdServiceMutation holds the per-session desktop singleton around one
+// service mutation that starts or restarts the service.
+//
+// The variable is the seam of the tests: a test observes the hold without
+// creating the object of its own session, which another package's tests of
+// the same machine could see.
+var holdServiceMutation = service.HoldDesktopSingleton
+
+// beginServiceMutationHold takes the hold that keeps a relaunch of the
+// desktop app out of the window of a mutation that starts or restarts the
+// service, or refuses the command before it changes anything.
+//
+// The hold is taken before the first change and released when the command
+// ends, so the whole mutation — including a rollback and the restart of a
+// running instance — runs with the singleton held. A hold that cannot be
+// established fails closed: the command refuses with the reason instead of
+// moving a service a relaunch could then bind.
+func beginServiceMutationHold() (release func(), err error) {
+	holdRelease, err := holdServiceMutation("")
+	if err != nil {
+		return nil, fmt.Errorf("the per-session desktop singleton must be held before a service mutation and could not be held, so nothing was changed: %w", err)
+	}
+	if holdRelease == nil {
+		return nil, errors.New("the per-session desktop singleton hold returned no release, so nothing was changed")
+	}
+	return holdRelease, nil
+}
+
 // versionLikeSegment matches a "digit.digit" segment of a file name.
 //
 // The heuristic is deliberately simple: a release artifact carries its
@@ -675,6 +703,11 @@ func newInstallFlagSet(flags *installFlags) *flag.FlagSet {
 // never starts the instance itself: the supervisor may start a registration
 // that asks for it (a LaunchAgent with RunAtLoad starts it), so the summary
 // reports the state that was reached instead of a fixed claim.
+//
+// An installation over an existing registration can stop and restart a
+// running instance, so the desktop singleton of this session is held across
+// the whole write and released when the command ends; a hold that cannot be
+// established refuses the command before the registration is touched.
 func serviceInstall(args []string, stdout io.Writer) error {
 	flags := installFlags{}
 	fs := newInstallFlagSet(&flags)
@@ -736,6 +769,15 @@ func serviceInstall(args []string, stdout io.Writer) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// The registration write may stop and restart a running instance, so
+	// the desktop singleton of this session is held across the whole
+	// mutation and released when the command ends.
+	holdRelease, err := beginServiceMutationHold()
+	if err != nil {
+		return err
+	}
+	defer holdRelease()
 
 	effective, err := mgr.Install(ctx, opts)
 	if err != nil {
@@ -1115,6 +1157,11 @@ func newLifecycleManager(name string, args []string, stdout io.Writer, summary s
 }
 
 // serviceStart starts the registered service.
+//
+// The start takes the service out of a stopped state a launch may have
+// decided on, so the desktop singleton of this session is held across the
+// start and released when the command ends; a hold that cannot be
+// established refuses the command before the service is touched.
 func serviceStart(args []string, stdout io.Writer) error {
 	mgr, _, err := newLifecycleManager("hfdesk service start", args, stdout,
 		"Start the registered service.")
@@ -1124,6 +1171,12 @@ func serviceStart(args []string, stdout io.Writer) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	holdRelease, err := beginServiceMutationHold()
+	if err != nil {
+		return err
+	}
+	defer holdRelease()
 
 	if err := mgr.Start(ctx); err != nil {
 		return err
@@ -1153,6 +1206,11 @@ func serviceStop(args []string, stdout io.Writer) error {
 }
 
 // serviceRestart stops and starts the registered service.
+//
+// The restart moves the service through the stopped state in one command, so
+// the desktop singleton of this session is held across the whole restart and
+// released when the command ends; a hold that cannot be established refuses
+// the command before the service is touched.
 func serviceRestart(args []string, stdout io.Writer) error {
 	mgr, _, err := newLifecycleManager("hfdesk service restart", args, stdout,
 		"Stop and start the registered service.")
@@ -1162,6 +1220,12 @@ func serviceRestart(args []string, stdout io.Writer) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	holdRelease, err := beginServiceMutationHold()
+	if err != nil {
+		return err
+	}
+	defer holdRelease()
 
 	if err := mgr.Restart(ctx); err != nil {
 		return err

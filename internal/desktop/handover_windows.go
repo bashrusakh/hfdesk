@@ -286,6 +286,11 @@ type helperHandover struct {
 	ready   windows.Handle
 	success windows.Handle
 	mutex   windows.Handle
+	// hold releases the singleton of the service layer for an action that
+	// has no desktop handover wait: the gate's update and start, and a
+	// hand-typed helper command line. It outlives the authorization
+	// handles, through the service mutation, and ends with releaseSingleton.
+	hold    func()
 	release sync.Once
 }
 
@@ -336,49 +341,6 @@ func openDesktopSingleton(name string) (windows.Handle, error) {
 	return handle, nil
 }
 
-// holdDesktopSingleton holds the per-session desktop singleton for a service
-// mutation the desktop did not hand over with a wait.
-//
-// The gate-launched update stops and restarts a running instance after the
-// desktop host that asked for it has already ended, so the named object would
-// die with that process: a launch in the stopped window would find a
-// positively confirmed stopped service and could bind the address the
-// restarted instance needs. The helper therefore creates the object when the
-// desktop that owned it is gone and opens the very object when that desktop is
-// still alive — the object acquireInstanceLock creates, with the same
-// descriptor, so a launch during the window reports the running instance
-// instead of starting a second server. The returned handle is the hold: the
-// operating system keeps the object until the last handle closes, and
-// releaseSingleton drops it before the final notice.
-func holdDesktopSingleton(name string) (windows.Handle, error) {
-	if strings.TrimSpace(name) == "" {
-		return 0, errors.New("desktop: no desktop singleton name was given to hold")
-	}
-	namePtr, err := windows.UTF16PtrFromString(name)
-	if err != nil {
-		return 0, fmt.Errorf("desktop: encode the desktop singleton name: %w", err)
-	}
-	attrs, descriptor, err := restrictedObjectSecurity(windows.MUTEX_ALL_ACCESS, windows.READ_CONTROL)
-	if err != nil {
-		return 0, fmt.Errorf("desktop: secure the desktop singleton %q: %w", name, err)
-	}
-	handle, err := windows.CreateMutex(attrs, false, namePtr)
-	runtime.KeepAlive(descriptor)
-	if handle == 0 {
-		if err == nil {
-			err = errors.New("the operating system returned no handle")
-		}
-		return 0, fmt.Errorf("desktop: hold the desktop singleton %q during the service mutation: %w", name, err)
-	}
-	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
-		_ = windows.CloseHandle(handle)
-		return 0, fmt.Errorf("desktop: hold the desktop singleton %q during the service mutation: %w", name, err)
-	}
-	// ERROR_ALREADY_EXISTS still returns a live handle to the existing
-	// object, and that handle is exactly the hold this path needs.
-	return handle, nil
-}
-
 func openNamedEvent(name string, access uint32) (windows.Handle, error) {
 	namePtr, err := windows.UTF16PtrFromString(name)
 	if err != nil {
@@ -419,6 +381,10 @@ func (h *helperHandover) releaseSingleton() {
 		if h.mutex != 0 {
 			_ = windows.CloseHandle(h.mutex)
 			h.mutex = 0
+		}
+		if h.hold != nil {
+			h.hold()
+			h.hold = nil
 		}
 	})
 }

@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/internal/service"
@@ -2306,13 +2307,267 @@ func TestServiceHelperFailsWhenTheSingletonCannotBeHeld(t *testing.T) {
 			if caption := serviceFailureCaption(tc.action); (*messages)[0].caption != caption {
 				t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 			}
-			for _, want := range []string{tc.result, "hfdesk service status"} {
+			for _, want := range []string{tc.result, "No service action was performed", "hfdesk service status"} {
 				if !strings.Contains((*messages)[0].text, want) {
 					t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
 				}
 			}
 		})
 	}
+}
+
+// TestServiceHelperComputesTheSingletonWhenTheFlagIsAbsent proves the
+// hand-typed helper command line holds the same window as the gate's handover:
+// an update or a start without --instance-mutex computes the object of its own
+// session, holds it through the mutation and releases it before the final
+// notice — the defect of a mutation that ran unprotected when the caller
+// passed no flag.
+func TestServiceHelperComputesTheSingletonWhenTheFlagIsAbsent(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		action       serviceAction
+		statuses     []service.Status
+		needsConsole bool
+		caption      string
+	}{
+		{"update", serviceActionUpdate, []service.Status{
+			runningServiceStatus(service.StateStopped, "127.0.0.1:18080"),
+			runningServiceStatus(service.StateStopped, "127.0.0.1:18080"),
+		}, true, serviceUpdatedCaption},
+		{"start", serviceActionStart, []service.Status{
+			runningServiceStatus(service.StateStopped, "127.0.0.1:18080"),
+			runningServiceStatus(service.StateRunning, "127.0.0.1:18080"),
+		}, false, serviceStartedCaption},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := requireFreeSingleton(t)
+			if tc.needsConsole {
+				replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+					return `C:\portable\hfdesk.exe`, nil
+				})
+			}
+			manager := &singletonObservingManager{fakeServiceManager: &fakeServiceManager{
+				statuses: tc.statuses,
+			}}
+			replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+				return manager, nil
+			})
+			messages, existedAtNotice := recordMessagesWithSingletonProbe(t)
+
+			if err := RunServiceAction(ServiceActionOptions{Action: string(tc.action)}); err != nil {
+				t.Fatalf("the %s without a singleton argument failed: %v", tc.action, err)
+			}
+			if len(manager.existedDuringMutation) != 1 || !manager.existedDuringMutation[0] {
+				t.Fatalf("the singleton existed during the mutation = %v, want [true] for the computed name %q: a launch in that window would start a second server",
+					manager.existedDuringMutation, name)
+			}
+			if len(*existedAtNotice) != 1 || (*existedAtNotice)[0] {
+				t.Fatalf("the singleton existed when the final notice was shown = %v, want [false]: the hold must end before the notice",
+					*existedAtNotice)
+			}
+			requireSingletonReleased(t)
+			if len(*messages) != 1 || (*messages)[0].caption != tc.caption {
+				t.Fatalf("the helper showed %v, want the report %q", *messages, tc.caption)
+			}
+		})
+	}
+}
+
+// TestServiceHelperRefusesWhenTheSingletonCannotBeEstablished proves the
+// refusal of an action whose hold cannot even be established — the name of
+// the object cannot be computed: nothing is touched, and the report states
+// that no service action was performed and names the cause.
+func TestServiceHelperRefusesWhenTheSingletonCannotBeEstablished(t *testing.T) {
+	for _, tc := range []struct {
+		action serviceAction
+		result string
+	}{
+		{serviceActionUpdate, "could not update"},
+		{serviceActionStart, "could not start"},
+	} {
+		t.Run(string(tc.action), func(t *testing.T) {
+			replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+				t.Fatal("the action touched the service although the singleton could not be established")
+				return nil, nil
+			})
+			replaceSeam(t, &holdServiceSingleton, func(string) (func(), error) {
+				return nil, errors.New("the per-session desktop singleton cannot be named: the session of the process cannot be read")
+			})
+			messages := recordMessages(t)
+
+			err := RunServiceAction(ServiceActionOptions{Action: string(tc.action)})
+			if err == nil {
+				t.Fatal("the action ran although the singleton could not be established")
+			}
+			if len(*messages) != 1 {
+				t.Fatalf("the helper showed %d message boxes, want the refusal of the action", len(*messages))
+			}
+			for _, want := range []string{
+				tc.result, "No service action was performed", "cannot be named", "hfdesk service status",
+			} {
+				if !strings.Contains((*messages)[0].text, want) {
+					t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+				}
+			}
+		})
+	}
+}
+
+// TestServiceHelperRefusesAnIdentityThatCannotAccessTheSingleton proves the
+// refusal of an object another Windows identity owns: a hand-typed update
+// computes the real per-session name, meets an object this identity cannot
+// access and refuses before the mutation. The report names the identity
+// problem and its own step, and carries no second command.
+func TestServiceHelperRefusesAnIdentityThatCannotAccessTheSingleton(t *testing.T) {
+	name := requireFreeSingleton(t)
+	createDeniedDesktopSingleton(t, name)
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		t.Fatal("the action touched the service although this identity cannot hold the singleton")
+		return nil, nil
+	})
+	messages := recordMessages(t)
+
+	err := RunServiceAction(ServiceActionOptions{Action: "update"})
+	if err == nil {
+		t.Fatal("the update ran although this identity cannot access the singleton")
+	}
+	if !errors.Is(err, service.ErrSingletonAccessDenied) {
+		t.Errorf("the refusal %v is not classified as an access denial of the singleton", err)
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the helper showed %d message boxes, want the refusal of the action", len(*messages))
+	}
+	text := (*messages)[0].text
+	for _, want := range []string{"No service action was performed", "end that process and try again"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the report %q does not mention %q", text, want)
+		}
+	}
+	if strings.Contains(text, "hfdesk service status") {
+		t.Errorf("the report %q carries a second next action next to the step of the identity refusal", text)
+	}
+}
+
+// TestServiceHoldBehavesLikeTheDesktopInstanceLock proves the alignment the
+// hold depends on: the service layer's hold and the desktop host's own
+// instance lock are the same object, created with the same descriptor — the
+// user with full mutex access, the administrators and the system with read
+// control — so a same-identity relaunch during a hold takes the established
+// "already running" path instead of failing on an object it cannot open.
+func TestServiceHoldBehavesLikeTheDesktopInstanceLock(t *testing.T) {
+	name := requireFreeSingleton(t)
+
+	release, err := service.HoldDesktopSingleton(name)
+	if err != nil {
+		t.Fatalf("hold the singleton through the service layer: %v", err)
+	}
+
+	lock, err := acquireInstanceLock()
+	if err != nil {
+		release()
+		t.Fatalf("acquire the desktop singleton during the hold: %v", err)
+	}
+	if !lock.Exists() {
+		lock.Release()
+		release()
+		t.Fatalf("the service hold on %q and the desktop instance lock are not the same object", name)
+	}
+
+	// The descriptor of the object the hold created: the desktop host's
+	// relaunch opens it with MUTEX_ALL_ACCESS, so this identity's full
+	// access and the read-only administrative principals are the contract
+	// both creators have to write.
+	security, err := windows.GetSecurityInfo(lock.handle, windows.SE_KERNEL_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		lock.Release()
+		release()
+		t.Fatalf("read singleton DACL: %v", err)
+	}
+	acl, _, err := security.DACL()
+	if err != nil || acl == nil || acl.AceCount != 3 {
+		lock.Release()
+		release()
+		t.Errorf("singleton ACL = %v, err=%v; want user, Administrators, and SYSTEM", acl, err)
+	} else {
+		entries := securityEntries(t, acl)
+		user, userErr := currentUserSID()
+		if userErr != nil {
+			lock.Release()
+			release()
+			t.Fatalf("read the initiating user's SID: %v", userErr)
+		}
+		admin, adminErr := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+		if adminErr != nil {
+			lock.Release()
+			release()
+			t.Fatalf("build the Administrators SID: %v", adminErr)
+		}
+		system, systemErr := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+		if systemErr != nil {
+			lock.Release()
+			release()
+			t.Fatalf("build the SYSTEM SID: %v", systemErr)
+		}
+		want := map[string]windows.ACCESS_MASK{
+			user:            windows.ACCESS_MASK(windows.MUTEX_ALL_ACCESS),
+			admin.String():  windows.ACCESS_MASK(windows.READ_CONTROL),
+			system.String(): windows.ACCESS_MASK(windows.READ_CONTROL),
+		}
+		if len(entries) != len(want) {
+			t.Errorf("singleton DACL entries = %v, want %v", entries, want)
+		}
+		for sid, rights := range want {
+			if entries[sid] != rights {
+				t.Errorf("singleton DACL grants %#x to %s, want %#x", entries[sid], sid, rights)
+			}
+		}
+	}
+	lock.Release()
+	release()
+
+	probe, err := acquireInstanceLock()
+	if err != nil {
+		t.Fatalf("probe the singleton after the hold ended: %v", err)
+	}
+	if probe.Exists() {
+		probe.Release()
+		t.Fatal("the singleton survived the end of the hold: a later launch would be refused as already running")
+	}
+	probe.Release()
+}
+
+// createDeniedDesktopSingleton creates the per-session singleton under a
+// descriptor that grants it to SYSTEM only: this identity then meets it the
+// way a relaunch meets an object another Windows account created. The
+// fixture handle is closed when the test ends, and the object dies with its
+// last handle.
+func createDeniedDesktopSingleton(t *testing.T, name string) {
+	t.Helper()
+	descriptor, err := windows.SecurityDescriptorFromString(
+		fmt.Sprintf("D:P(A;;0x%08X;;;SY)", uint32(windows.MUTEX_ALL_ACCESS)))
+	if err != nil {
+		t.Fatalf("build the denying descriptor: %v", err)
+	}
+	attrs := &windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: descriptor,
+	}
+	namePtr, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		t.Fatalf("encode the singleton name: %v", err)
+	}
+	handle, err := windows.CreateMutex(attrs, false, namePtr)
+	if handle == 0 {
+		if err == nil {
+			err = errors.New("the operating system returned no handle")
+		}
+		t.Fatalf("create the denying fixture object: %v", err)
+	}
+	if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		_ = windows.CloseHandle(handle)
+		t.Fatal("the fixture object already exists: the test would deny a real singleton")
+	}
+	t.Cleanup(func() { _ = windows.CloseHandle(handle) })
 }
 
 // TestServiceHelperUpdateRejectsAVanishedRegistration proves a stopped-service

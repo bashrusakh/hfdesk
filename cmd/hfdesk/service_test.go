@@ -68,12 +68,20 @@ func (m fakeManager) Status(context.Context) (service.Status, error) {
 //
 // The command family never touches the system of the test run: the manager
 // of the platform is the fake one, so a lifecycle command can be driven
-// through every answer of a supervisor.
+// through every answer of a supervisor. The desktop singleton hold is
+// neutralized with it: the tests of this package observe the hold through
+// their own recorder, and the real object belongs to the desktop package's
+// tests on the same machine — two test packages creating it in parallel
+// would make both results depend on timing.
 func useFakeManager(t *testing.T, mgr service.Manager) {
 	t.Helper()
 	previous := newServiceManager
 	newServiceManager = func(service.Scope) (service.Manager, error) { return mgr, nil }
 	t.Cleanup(func() { newServiceManager = previous })
+
+	previousHold := holdServiceMutation
+	holdServiceMutation = func(string) (func(), error) { return func() {}, nil }
+	t.Cleanup(func() { holdServiceMutation = previousHold })
 }
 
 // platformFactsByName holds the facts of the platforms of the service
@@ -2954,5 +2962,213 @@ func TestServiceInstallSummaryReportsTheEffectiveRegistration(t *testing.T) {
 		if got := summaryField(stdout.String(), field.name); got != field.want {
 			t.Errorf("the summary reports %s %q, want the effective %q", field.name, got, field.want)
 		}
+	}
+}
+
+// recordedHold observes one production hold: it counts the acquisitions and
+// the releases and remembers whether the hold is currently held.
+type recordedHold struct {
+	held     bool
+	acquired int
+	released int
+}
+
+// useRecordedHold points the singleton hold of the command family at a
+// recorder for the duration of the test: the test observes when the hold is
+// taken and when it ends without creating the real object of its session,
+// which the desktop package's tests of the same machine own.
+func useRecordedHold(t *testing.T) *recordedHold {
+	t.Helper()
+	record := &recordedHold{}
+	previous := holdServiceMutation
+	holdServiceMutation = func(string) (func(), error) {
+		record.acquired++
+		record.held = true
+		return func() {
+			record.released++
+			record.held = false
+		}, nil
+	}
+	t.Cleanup(func() { holdServiceMutation = previous })
+	return record
+}
+
+// refuseSingletonHold points the singleton hold of the command family at a
+// failure for the duration of the test.
+func refuseSingletonHold(t *testing.T, reason error) {
+	t.Helper()
+	previous := holdServiceMutation
+	holdServiceMutation = func(string) (func(), error) { return nil, reason }
+	t.Cleanup(func() { holdServiceMutation = previous })
+}
+
+// holdObservingManager reports, per operation, whether the desktop singleton
+// was held at the moment the mutation ran.
+type holdObservingManager struct {
+	fakeManager
+	hold     *recordedHold
+	observed map[string]bool
+}
+
+func (m *holdObservingManager) note(operation string) {
+	if m.observed == nil {
+		m.observed = make(map[string]bool)
+	}
+	m.observed[operation] = m.hold != nil && m.hold.held
+}
+
+func (m *holdObservingManager) Install(ctx context.Context, opts service.InstallOptions) (service.InstallOptions, error) {
+	m.note("install")
+	return m.fakeManager.Install(ctx, opts)
+}
+
+func (m *holdObservingManager) Start(ctx context.Context) error {
+	m.note("start")
+	return m.fakeManager.Start(ctx)
+}
+
+func (m *holdObservingManager) Restart(ctx context.Context) error {
+	m.note("restart")
+	return m.fakeManager.Restart(ctx)
+}
+
+// refusingHoldManager fails the test when a mutation runs at all: it backs
+// the refusal case, where the failed hold must end the command before the
+// service is touched.
+type refusingHoldManager struct {
+	fakeManager
+	t *testing.T
+}
+
+func (m *refusingHoldManager) Install(context.Context, service.InstallOptions) (service.InstallOptions, error) {
+	m.t.Fatal("the installation touched the service although the singleton hold failed")
+	return service.InstallOptions{}, nil
+}
+
+func (m *refusingHoldManager) Start(context.Context) error {
+	m.t.Fatal("the start touched the service although the singleton hold failed")
+	return nil
+}
+
+func (m *refusingHoldManager) Restart(context.Context) error {
+	m.t.Fatal("the restart touched the service although the singleton hold failed")
+	return nil
+}
+
+// temporaryServiceProgram returns the path of a file the install command
+// accepts as an executable.
+func temporaryServiceProgram(t *testing.T) string {
+	t.Helper()
+	program := filepath.Join(t.TempDir(), "hfdesk")
+	if err := os.WriteFile(program, []byte("not a program\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return program
+}
+
+// TestServiceMutationsHoldTheDesktopSingleton proves the invariant for every
+// command that starts or restarts the service: install (first installation
+// and update over an existing registration alike), start and restart hold the
+// per-session desktop singleton while the mutation runs and release it when
+// the command ends. A mutation without the hold would leave the window a
+// relaunch of the desktop app could pass on a positively stopped service.
+func TestServiceMutationsHoldTheDesktopSingleton(t *testing.T) {
+	program := temporaryServiceProgram(t)
+
+	for _, tc := range []struct {
+		name      string
+		args      []string
+		operation string
+	}{
+		{"install", []string{"install", "--system", "--executable", program}, "install"},
+		{"start", []string{"start"}, "start"},
+		{"restart", []string{"restart"}, "restart"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := &holdObservingManager{
+				fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+			}
+			useFakeManager(t, manager)
+			record := useRecordedHold(t)
+			manager.hold = record
+
+			var stdout, stderr bytes.Buffer
+			code := runServiceCommand(tc.args, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("the command must exit with 0, got %d:\n%s", code, stderr.String())
+			}
+			held, ran := manager.observed[tc.operation]
+			if !ran {
+				t.Fatalf("the %s did not run, observations: %v", tc.operation, manager.observed)
+			}
+			if !held {
+				t.Errorf("the %s ran without the desktop singleton held: a relaunch in that window could start a second server",
+					tc.operation)
+			}
+			if record.acquired != 1 || record.released != 1 {
+				t.Errorf("the hold was acquired %d times and released %d times, want one of each",
+					record.acquired, record.released)
+			}
+			if record.held {
+				t.Error("the hold survived the end of the command: a later launch would be refused as already running")
+			}
+		})
+	}
+}
+
+// TestServiceMutationRefusesWhenTheSingletonCannotBeHeld proves the refusal
+// fails closed for every command that starts or restarts the service: a hold
+// that cannot be established ends the command with the reason before the
+// service is touched.
+func TestServiceMutationRefusesWhenTheSingletonCannotBeHeld(t *testing.T) {
+	program := temporaryServiceProgram(t)
+	reason := errors.New("the per-session desktop singleton cannot be named: the session of the process cannot be read")
+
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"install", []string{"install", "--system", "--executable", program}},
+		{"start", []string{"start"}},
+		{"restart", []string{"restart"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useFakeManager(t, &refusingHoldManager{fakeManager: fakeManager{
+				status: service.Status{State: service.StateStopped},
+			}, t: t})
+			refuseSingletonHold(t, reason)
+
+			var stdout, stderr bytes.Buffer
+			code := runServiceCommand(tc.args, &stdout, &stderr)
+			if code != serviceFailureExitCode {
+				t.Fatalf("the refused command must exit with %d, got %d:\n%s", serviceFailureExitCode, code, stderr.String())
+			}
+			for _, want := range []string{"nothing was changed", reason.Error()} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("the error does not mention %q:\n%s", want, stderr.String())
+				}
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("a refused command must not report a result:\n%s", stdout.String())
+			}
+		})
+	}
+}
+
+// TestServiceReadAndStopPathsNeverHoldTheSingleton proves the preserved side
+// of the boundary: stop, uninstall and status change nothing that starts or
+// restarts the service, and they never take the singleton hold.
+func TestServiceReadAndStopPathsNeverHoldTheSingleton(t *testing.T) {
+	useFakeManager(t, fakeManager{status: service.Status{State: service.StateStopped}})
+	record := useRecordedHold(t)
+
+	for _, args := range [][]string{{"stop"}, {"uninstall"}, {"status"}} {
+		var stdout, stderr bytes.Buffer
+		if code := runServiceCommand(args, &stdout, &stderr); code != 0 {
+			t.Fatalf("%v must exit with 0, got %d:\n%s", args, code, stderr.String())
+		}
+	}
+	if record.acquired != 0 {
+		t.Errorf("the hold was acquired %d times by read and stop paths, want none", record.acquired)
 	}
 }

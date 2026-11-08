@@ -40,3 +40,12 @@ func supportsUserScope() bool {
 func supportsNamedServiceAccount() bool {
 	return true
 }
+
+// holdDesktopSingleton reports that there is nothing to hold.
+//
+// The per-session desktop singleton belongs to the Windows desktop host.
+// A platform without that host has no such object, so the invariant it
+// protects has no object to hold here: the release ends nothing.
+func holdDesktopSingleton(string) (func(), error) {
+	return func() {}, nil
+}

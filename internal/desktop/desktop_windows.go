@@ -134,6 +134,10 @@ func run(o Options, logPath string) (err error) {
 	// log file break its rotation, because the rename of the rotation
 	// fails while the other process holds the file, and a failed
 	// rotation stops the persistent log.
+	// A lock that exists but cannot be accessed is a different failure
+	// than a lock this identity could not create: the report names the
+	// other Windows identity that holds the object, and the launch still
+	// starts no server.
 	lock, err := acquireInstanceLock()
 	if err != nil {
 		// The logging pipeline does not exist yet, so the failure cannot
@@ -141,7 +145,7 @@ func run(o Options, logPath string) (err error) {
 		// surface the user has, and it names no log file, because there
 		// is none.
 		reportStartupFailure("HFDesk could not start",
-			fmt.Sprintf("HFDesk could not create its single instance lock.\n\n%v", err), "")
+			instanceLockStartupText(err), "")
 		return err
 	}
 	defer lock.Release()

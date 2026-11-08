@@ -738,3 +738,27 @@ func setCredentialFields(opts *InstallOptions, sentinel string) {
 		value.Field(i).SetString(sentinel)
 	}
 }
+
+// TestHoldDesktopSingletonWithoutADesktopHostHoldsNothing proves the contract
+// of the hold on a platform that has no per-session desktop singleton: the
+// hold succeeds with a release that ends nothing, so a service mutation of
+// the command line never refuses for an object that does not exist here.
+//
+// The object exists on Windows only, where its hold, name and release are
+// proven by the Windows tests of this package instead.
+func TestHoldDesktopSingletonWithoutADesktopHostHoldsNothing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the singleton object exists on Windows; its hold is proven by the Windows tests")
+	}
+	release, err := HoldDesktopSingleton("")
+	if err != nil {
+		t.Fatalf("a mutation would refuse although this platform has no singleton object: %v", err)
+	}
+	if release == nil {
+		t.Fatal("the hold returned no release")
+	}
+	// Releasing twice must be harmless: the command defers one release,
+	// and nothing here may close a handle that does not exist.
+	release()
+	release()
+}

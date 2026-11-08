@@ -707,3 +707,48 @@ func TestServiceSiblingMissingTextNamesTheFolder(t *testing.T) {
 		}
 	}
 }
+
+// TestServiceSingletonHoldRefusedTextStatesNoActionAndOneCommand proves the
+// report of a mutation that refused before it changed anything because the
+// desktop singleton could not be held: it states that no service action was
+// performed, carries the cause of the failed hold and exactly one next
+// action.
+//
+// A refusal because another Windows identity owns the object already names
+// its own step inside the cause, so it carries no second command; every other
+// cause ends with the command that reads the state, and no report carries
+// both.
+func TestServiceSingletonHoldRefusedTextStatesNoActionAndOneCommand(t *testing.T) {
+	cause := errors.New("the per-session desktop singleton cannot be named: the session of the process cannot be read")
+	for _, action := range []serviceAction{serviceActionInstall, serviceActionUpdate, serviceActionStart} {
+		text := serviceSingletonHoldRefusedText(action, cause)
+		for _, want := range []string{
+			serviceActionFailureHeadline(action),
+			"No service action was performed",
+			cause.Error(),
+			`"hfdesk service status"`,
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("the report of %q %q does not mention %q", action, text, want)
+			}
+		}
+	}
+
+	denied := fmt.Errorf(
+		"the desktop singleton %q exists but this Windows identity cannot access it: another HFDesk process under a different Windows account created it; end that process and try again%w",
+		`Local\HFDesk.Desktop.test.1`, service.ErrSingletonAccessDenied)
+	text := serviceSingletonHoldRefusedText(serviceActionUpdate, denied)
+	for _, want := range []string{
+		serviceActionFailureHeadline(serviceActionUpdate),
+		"No service action was performed",
+		"this Windows identity cannot access it",
+		"end that process and try again",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the identity refusal %q does not mention %q", text, want)
+		}
+	}
+	if strings.Contains(text, "hfdesk service status") {
+		t.Errorf("the identity refusal %q carries a second next action next to its own step", text)
+	}
+}

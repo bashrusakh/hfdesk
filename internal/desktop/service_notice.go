@@ -431,6 +431,44 @@ func serviceAlreadyRegisteredText(detail string) string {
 		`Run "hfdesk service install" from an elevated shell to point the registration at the program in the folder you run it from.`
 }
 
+// serviceActionFailureHeadline returns the first line of the report of a
+// failed service action: the action that failed, in the words every report of
+// that action starts with.
+func serviceActionFailureHeadline(action serviceAction) string {
+	switch action {
+	case serviceActionInstall:
+		return "HFDesk could not install the Windows service."
+	case serviceActionUpdate:
+		return "HFDesk could not update the Windows service."
+	default:
+		return "HFDesk could not start the Windows service."
+	}
+}
+
+// serviceSingletonHoldRefusedText returns the report of a mutation that
+// refused before it changed anything because the per-session desktop
+// singleton could not be held.
+//
+// The report states that no service action was performed — the hold is taken
+// before the first change, so a failed hold touched nothing — and names the
+// cause of the failed hold as its next part. A refusal because another
+// Windows identity owns the object already names the step that ends that
+// hold, so it carries the only next action of this report; every other cause
+// ends with the command that reads the state, and no report carries both
+// commands.
+func serviceSingletonHoldRefusedText(action serviceAction, err error) string {
+	detail := ""
+	if err != nil {
+		detail = err.Error()
+	}
+	text := serviceActionFailureHeadline(action) + "\n\n" +
+		"No service action was performed: " + detail
+	if !errors.Is(err, service.ErrSingletonAccessDenied) {
+		text += "\n\n" + serviceStatusCommandText
+	}
+	return text
+}
+
 // serviceActionFailureText returns the report of a failed service action: the
 // action that failed, the error of the service control manager and the one next
 // action of the state the attempt left.
@@ -456,15 +494,15 @@ func serviceActionFailureText(action serviceAction, err error, program string) s
 		if isAlreadyRegisteredRefusal(err) {
 			return serviceAlreadyRegisteredText(detail)
 		}
-		return "HFDesk could not install the Windows service.\n\n" + detail + "\n\n" +
+		return serviceActionFailureHeadline(action) + "\n\n" + detail + "\n\n" +
 			"A registration may remain.\n\n" +
 			serviceFolderAccessText(program) + "\n\n" +
 			serviceUninstallCommandText
 	case serviceActionUpdate:
-		return "HFDesk could not update the Windows service.\n\n" + detail + "\n\n" +
+		return serviceActionFailureHeadline(action) + "\n\n" + detail + "\n\n" +
 			serviceStatusCommandText
 	default:
-		return "HFDesk could not start the Windows service.\n\n" + detail + "\n\n" +
+		return serviceActionFailureHeadline(action) + "\n\n" + detail + "\n\n" +
 			"The start was not confirmed.\n\n" +
 			serviceStatusCommandText
 	}

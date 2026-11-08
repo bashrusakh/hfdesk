@@ -431,6 +431,41 @@ func (e *InstallStartError) Unwrap() error {
 // callers classify with errors.Is, never by wording.
 var ErrAlreadyRegistered = errors.New("")
 
+// ErrSingletonAccessDenied classifies a refusal to hold the per-session
+// desktop singleton: the object exists, but the Windows identity of this
+// process has no access to it, because another identity created it. It
+// carries no text of its own so that %w adds nothing to the message shown to
+// the user verbatim; callers classify with errors.Is, never by wording.
+var ErrSingletonAccessDenied = errors.New("")
+
+// HoldDesktopSingleton holds the per-session desktop singleton object across
+// one service mutation.
+//
+// The object is the single-instance lock of the Windows desktop host: its
+// existence tells a launch of the desktop app of the same user session that
+// an HFDesk instance of that session already runs or is being changed. A
+// mutation that starts or restarts the service therefore holds it from before
+// the first change through the whole mutation, including a rollback and the
+// restart of a running instance, and releases it before the final report. A
+// launch that finds the object reports the running instance instead of
+// binding the address the mutation needs.
+//
+// name names the object when the caller received it (the service gate passes
+// the lock of its own launch). An empty name computes the object of the
+// calling session itself, so a caller without a name — the helper of a
+// hand-typed command line, or the service command — still holds the very
+// object a relaunch in this session would find; one computation owns the name
+// shape, so the desktop host, the helper and the command cannot drift apart.
+//
+// A hold that cannot be established returns an error and no release, and the
+// caller refuses the mutation before it changes anything: the hold fails
+// closed. The platform owns the object: Windows has it, and a platform
+// without the desktop host has no such object to hold, so the release of a
+// hold there ends nothing.
+func HoldDesktopSingleton(name string) (release func(), err error) {
+	return holdDesktopSingleton(name)
+}
+
 type installStarter interface {
 	InstallAndStart(context.Context, InstallOptions) (InstallStartResult, error)
 }

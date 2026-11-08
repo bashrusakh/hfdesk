@@ -24,10 +24,14 @@
 //
 //	--service-action install --wait-pid N --handover-ready-event NAME
 //	  --handover-success-event NAME --instance-mutex NAME
-//	--service-action update|start
+//	--service-action update|start [--instance-mutex NAME]
 //
 // and the helper performs the action, reports it in a native message box and
-// ends without a server, a tray icon or a window. The flags are private to the
+// ends without a server, a tray icon or a window. An update or a start holds
+// the per-session desktop singleton through its mutation: the gate passes the
+// lock of its own launch with --instance-mutex, and a command line without
+// the flag holds the object of the helper's own session, which it computes
+// itself. The flags are private to the
 // desktop executable: they are not part of the options of the hfdesk command,
 // and they are not documented in its usage.
 package main
@@ -145,7 +149,7 @@ func parseHostOptions(args []string) (app.Options, string, error) {
 
 const serviceHelperUsage = "Usage: hfdesk-desktop --service-action install --wait-pid N " +
 	"--handover-ready-event NAME --handover-success-event NAME --instance-mutex NAME\n" +
-	"       hfdesk-desktop --service-action update|start"
+	"       hfdesk-desktop --service-action update|start [--instance-mutex NAME]"
 
 func parseServiceHelperCommand(args []string) (desktop.ServiceActionOptions, bool, error) {
 	var helper desktop.ServiceActionOptions

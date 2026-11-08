@@ -162,6 +162,56 @@ func TestSecondLaunchOpensTheWebUIOfTheRunningInstance(t *testing.T) {
 	}
 }
 
+// TestSecondLaunchReportsAnIdentityItCannotAccess proves that a relaunch
+// whose identity has no access to the singleton object gets an honest report:
+// the object exists and another Windows account created it, so the launch
+// starts no server — the safe direction — and the notice names that fact and
+// the step that ends it instead of reading like an internal failure or like
+// the notice of a running instance it never reached.
+func TestSecondLaunchReportsAnIdentityItCannotAccess(t *testing.T) {
+	name, err := instanceMutexName()
+	if err != nil {
+		t.Fatalf("read the per-session singleton name: %v", err)
+	}
+	probe, err := acquireInstanceLock()
+	if err != nil {
+		t.Fatalf("probe the per-session singleton: %v", err)
+	}
+	if probe.Exists() {
+		probe.Release()
+		t.Skip("another desktop test or app owns the per-session singleton")
+	}
+	probe.Release()
+	createDeniedDesktopSingleton(t, name)
+
+	lock, err := acquireInstanceLock()
+	if err == nil {
+		lock.Release()
+		t.Fatal("the relaunch took a singleton object that denies this identity")
+	}
+	if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		t.Fatalf("acquireInstanceLock() = %v, want the access denial of the existing object", err)
+	}
+
+	text := instanceLockStartupText(err)
+	for _, want := range []string{
+		"single instance object",
+		"cannot access it",
+		"different Windows account",
+		"starts no server",
+		"start HFDesk again",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the report %q does not mention %q", text, want)
+		}
+	}
+	// The identity refusal is distinct from the notice of a launch that
+	// found a running instance: this launch never reached that check.
+	if strings.Contains(text, alreadyRunningCaption) || strings.Contains(text, "HFDesk is already running") {
+		t.Errorf("the report %q claims a running instance, want the identity refusal", text)
+	}
+}
+
 // shownMessage is a message box that a test recorded instead of showing.
 type shownMessage struct {
 	caption string

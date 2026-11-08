@@ -8,18 +8,11 @@ package desktop
 import (
 	"errors"
 	"fmt"
-	"os"
 	"runtime"
 
+	"github.com/bashrusakh/hfdesk/internal/service"
 	"golang.org/x/sys/windows"
 )
-
-// instanceMutexPrefix is the prefix of the name of the single instance
-// mutex.
-//
-// The Local prefix keeps the object inside the namespace of the session, so
-// a second session of the same user does not see it.
-const instanceMutexPrefix = `Local\HFDesk.Desktop.`
 
 // instanceLock is the named mutex that keeps a single desktop instance.
 //
@@ -82,18 +75,32 @@ func acquireInstanceLock() (*instanceLock, error) {
 
 // instanceMutexName returns the name of the single instance mutex.
 //
-// The name is scoped to the interactive user and to the session: the
-// security identifier of the user and the id of the session of the process.
+// The name is computed by the service layer: the elevated helper and the
+// service command hold this very object across their mutations, and one
+// computation of the user, the session and the shape keeps the desktop host
+// and those holders from naming different objects.
 func instanceMutexName() (string, error) {
-	sid, err := currentUserSID()
-	if err != nil {
-		return "", err
+	return service.DesktopSingletonName()
+}
+
+// instanceLockStartupText returns the report of a launch that could not take
+// its single instance lock.
+//
+// The ordinary failure names the lock that could not be created. A refusal
+// because the identity of this launch has no access to the object is a
+// different fact: the object exists and another Windows identity created it,
+// so the launch starts no server — the safe direction — and the notice says
+// which process holds the object instead of reading like an internal failure.
+// It never claims a running instance the way the notice of a second launch
+// over the same object does: this launch could not even reach that object's
+// owner check.
+func instanceLockStartupText(err error) string {
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		return "HFDesk found its single instance object, but this Windows identity cannot access it.\n\n" +
+			"Another HFDesk process running under a different Windows account created it — for example an elevated helper that another administrator approved — so this launch starts no server: two instances never compete for the same address.\n\n" +
+			"End that other HFDesk process (Task Manager lists it) and start HFDesk again."
 	}
-	session, err := currentSessionID()
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%s%s.%d", instanceMutexPrefix, sid, session), nil
+	return fmt.Sprintf("HFDesk could not create its single instance lock.\n\n%v", err)
 }
 
 // currentUserSID returns the security identifier of the user of the process.
@@ -105,15 +112,6 @@ func currentUserSID() (string, error) {
 		return "", fmt.Errorf("desktop: read the user of the process: %w", err)
 	}
 	return user.User.Sid.String(), nil
-}
-
-// currentSessionID returns the id of the session of the process.
-func currentSessionID() (uint32, error) {
-	var session uint32
-	if err := windows.ProcessIdToSessionId(uint32(os.Getpid()), &session); err != nil {
-		return 0, fmt.Errorf("desktop: read the session of the process: %w", err)
-	}
-	return session, nil
 }
 
 // Exists reports that another instance of the desktop host holds the lock.
