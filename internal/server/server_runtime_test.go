@@ -349,6 +349,141 @@ func TestBrowserURLFollowsTheConfiguredWildcardFamily(t *testing.T) {
 	}
 }
 
+// TestServeBrowserURLReachesAnIPv6OnlyWildcardListener proves that a
+// caller-provided IPv6-only wildcard listener with an empty configured
+// address is sent to the IPv6 loopback: 127.0.0.1 never reaches a socket
+// with IPV6_V6ONLY set, so mapping the wildcard to the IPv4 loopback names
+// an address that refuses the connection.
+func TestServeBrowserURLReachesAnIPv6OnlyWildcardListener(t *testing.T) {
+	listener, err := net.Listen("tcp6", "[::]:0")
+	if err != nil {
+		t.Skipf("no IPv6 wildcard listener is available: %v", err)
+	}
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "jobs.json"))
+	registerTestJobManagerCleanup(t, m)
+	s := &Server{jobs: m}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- s.Serve(ctx, listener) }()
+	waitForServerBoundAddr(t, s, listener.Addr().String())
+
+	_, port := splitAddrHostPort(s.BoundAddr())
+	want := "http://[::1]:" + strconv.Itoa(port)
+	if got := s.BrowserURL(); got != want {
+		t.Errorf("BrowserURL() = %q, want %q for the IPv6-only wildcard listener %s", got, want, listener.Addr())
+	}
+	// Both sides of the mapping: the IPv6 loopback reaches the listener and
+	// the IPv4 loopback does not, which is the defect the mapping fixes. The
+	// IPv6 dial needs a loopback address on the host, which a minimal
+	// machine may lack even though the wildcard bind succeeded.
+	if probe, probeErr := net.Listen("tcp6", net.JoinHostPort("::1", "0")); probeErr != nil {
+		t.Logf("the reachability of ::1 is not checked on this host: %v", probeErr)
+	} else {
+		_ = probe.Close()
+		if conn, err := net.DialTimeout("tcp", net.JoinHostPort("::1", strconv.Itoa(port)), 2*time.Second); err != nil {
+			t.Errorf("dial the IPv6 loopback of the listener: %v", err)
+		} else {
+			_ = conn.Close()
+		}
+	}
+	if conn, err := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 2*time.Second); err == nil {
+		_ = conn.Close()
+		t.Error("the IPv4 loopback unexpectedly reached the IPv6-only listener; the fixture cannot prove the defect")
+	}
+
+	cancel()
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after the context was cancelled")
+	}
+}
+
+// TestServeBrowserURLKeepsTheDualStackWildcardReachable proves the other
+// side: a wildcard listener without IPV6_V6ONLY keeps the IPv4 loopback of
+// the earlier behavior (which it accepts) and the URL it reports is
+// reachable.
+func TestServeBrowserURLKeepsTheDualStackWildcardReachable(t *testing.T) {
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	only, known := listenerIPv6Only(listener.Addr(), listener)
+	if !known {
+		listener.Close()
+		t.Skip("the wildcard listener did not expose its address-family behavior")
+	}
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "jobs.json"))
+	registerTestJobManagerCleanup(t, m)
+	s := &Server{jobs: m}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- s.Serve(ctx, listener) }()
+	waitForServerBoundAddr(t, s, listener.Addr().String())
+
+	_, port := splitAddrHostPort(s.BoundAddr())
+	wantHost := "127.0.0.1"
+	if only {
+		// An exotic host may default a wildcard bind to IPv6 alone; then
+		// the IPv6 loopback is the reachable spelling.
+		wantHost = "::1"
+	}
+	if got, want := s.BrowserURL(), "http://"+net.JoinHostPort(wantHost, strconv.Itoa(port)); got != want {
+		t.Errorf("BrowserURL() = %q, want %q for the dual-stack wildcard listener %s", got, want, listener.Addr())
+	}
+	if conn, err := net.DialTimeout("tcp", net.JoinHostPort(wantHost, strconv.Itoa(port)), 2*time.Second); err != nil {
+		t.Errorf("dial the loopback of the listener: %v", err)
+	} else {
+		_ = conn.Close()
+	}
+
+	cancel()
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after the context was cancelled")
+	}
+}
+
+// noSocketListener hides the socket of a listener so the address-family
+// behavior cannot be read from it.
+type noSocketListener struct{ inner net.Listener }
+
+func (l *noSocketListener) Accept() (net.Conn, error) { return l.inner.Accept() }
+func (l *noSocketListener) Close() error              { return l.inner.Close() }
+func (l *noSocketListener) Addr() net.Addr            { return l.inner.Addr() }
+
+// TestListenerIPv6OnlyIsUnknownWithoutTheSocket proves the probe reports
+// uncertainty instead of a guess: a listener that does not expose its socket
+// yields known=false, and a non-wildcard address does not ask the question.
+func TestListenerIPv6OnlyIsUnknownWithoutTheSocket(t *testing.T) {
+	inner, err := net.Listen("tcp6", "[::]:0")
+	if err != nil {
+		t.Skipf("no IPv6 wildcard listener is available: %v", err)
+	}
+	defer inner.Close()
+
+	if only, known := listenerIPv6Only(inner.Addr(), &noSocketListener{inner: inner}); known {
+		t.Errorf("listenerIPv6Only() known = true for a listener without socket access (only = %t)", only)
+	}
+	if _, known := listenerIPv6Only(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8080}, inner); known {
+		t.Error("listenerIPv6Only() known = true for a concrete IPv4 address")
+	}
+	if only, known := listenerIPv6Only(inner.Addr(), inner); !known || !only {
+		t.Errorf("listenerIPv6Only() = (%t, %t) for an IPv6-only wildcard listener, want (true, true)", only, known)
+	}
+}
+
 // TestActiveJobCounts proves the running/queued split: a job that was
 // dispatched but is not marked running yet occupies an active slot, exactly
 // like in the dispatcher.
