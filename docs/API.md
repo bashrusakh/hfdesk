@@ -939,10 +939,13 @@ POST /api/settings
 
 Settings include runtime paths, concurrency, verification, endpoint, proxy settings, the HF cache directory, and extra local scan folders.
 
-`POST /api/settings` is refused while the server is shutting down. Once
-settings admission is sealed (server shutdown, or the graceful
-desktop-to-service handover drain), updates that were already admitted finish
-normally, but every new update is rejected with `503` instead of being applied.
+`POST /api/settings` is refused once settings admission is sealed, which
+happens only in the graceful desktop-to-service handover: the handover
+shutdown waits for the server to stop and then seals admission, so updates
+that were already admitted finish normally, but every new update is rejected
+with `503` instead of being applied. A shutdown that is not a committed
+handover — a plain desktop quit or the console host stopping — does not seal
+admission: settings updates arriving during its HTTP drain are still accepted.
 The response uses the standard error format above; `503` has no dedicated
 entry in the status-to-code mapping, so `error_detail.code` is the generic
 `server_error`:

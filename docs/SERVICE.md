@@ -783,10 +783,11 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   the unit file (for example because an override owns it), the update is refused
   rather than editing an administrator-owned drop-in or claiming that a
   shadowed base-file edit took effect. The command itself must be rewritable
-  too: only an `ExecStart=` whose program is followed by `service run` —
-  directly or behind an `env` prefix, which is kept — is updated, and any
-  other form (a shell-wrapped script, an unknown wrapper) is refused before
-  anything is changed, with an error that names the line. On Windows, the
+  too: only an `ExecStart=` that is the program alone, or the program
+  followed by `service run` — directly or behind an `env` prefix, which is
+  kept — is updated, and any other form (a shell-wrapped script, an unknown
+  wrapper) is refused before anything is changed, with an error that names
+  the line. On Windows, the
   readable SCM settings
   that HFDesk does not own are written back with the new command line. The
   Windows identity remains the fixed `LocalService` account, and an SCM password
