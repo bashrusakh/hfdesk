@@ -141,7 +141,13 @@ func TestCompleteHandoverBoundsAStalledJobsPersistence(t *testing.T) {
 	t.Cleanup(func() { handoverJoinBudget = previousBudget })
 
 	stall := make(chan struct{})
-	t.Cleanup(func() { close(stall) })
+	// Release the stalled final write and join the close coordinator before
+	// the TempDir cleanup runs: an abandoned finishClose must not outlive the
+	// directory it would otherwise write into.
+	t.Cleanup(func() {
+		close(stall)
+		<-s.jobs.closeDone
+	})
 	s.jobs.persistStateFile = func(string, []*Job) error {
 		<-stall
 		return nil
@@ -198,6 +204,22 @@ func TestCompleteHandoverBoundsAStalledAdmittedSettingsWrite(t *testing.T) {
 		}
 	}
 	t.Cleanup(release)
+	// The bounded drain abandons the jobs close coordinator: Close returned
+	// on the expired join context while finishClose still writes the final
+	// jobs state into this test's TempDir. Release the admitted write and
+	// join that coordinator before the TempDir cleanup runs, or its
+	// MkdirAll/write races RemoveAll ("directory not empty"). Close joins an
+	// already-running coordinator and triggers the spawn when the drain never
+	// reached it, so every exit path leaves no writer behind.
+	t.Cleanup(func() {
+		release()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := s.jobs.Close(ctx); err != nil {
+			t.Errorf("join the abandoned jobs close coordinator: %v", err)
+			<-s.jobs.closeDone
+		}
+	})
 
 	done := make(chan error, 1)
 	go func() { done <- s.CompleteHandover() }()

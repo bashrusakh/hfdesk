@@ -2501,10 +2501,13 @@ func TestServiceHelperInstallRejectsABadImageBeforeReady(t *testing.T) {
 		want  string
 	}{
 		{
+			// The file must be readable as a whole DOS header (64 bytes),
+			// so the refusal comes from the missing MZ signature class
+			// instead of the short-read class the truncated case pins.
 			name: "not a Windows program",
 			image: func(t *testing.T) string {
 				path := filepath.Join(t.TempDir(), "hfdesk.exe")
-				if err := os.WriteFile(path, []byte("this is not a program"), 0o644); err != nil {
+				if err := os.WriteFile(path, []byte(strings.Repeat("this is not a program\n", 8)), 0o644); err != nil {
 					t.Fatalf("write the fixture: %v", err)
 				}
 				return path
