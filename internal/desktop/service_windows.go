@@ -63,14 +63,21 @@ func lookupServiceStatus(ctx context.Context) (service.Status, error) {
 // serviceGate decides whether this launch starts its own server.
 //
 // The Windows service is a second HFDesk on the same machine and binds the same
-// address, so a launch that finds a registration never starts a server of its
-// own: it asks the user what to do and ends.
+// address, so a launch that finds a registration asks the user what to do and
+// ends without a server of its own — with one exception: a positively confirmed
+// stopped service has nothing serving the address, and its dialog offers to
+// work in desktop mode as the default answer. That answer continues this
+// launch exactly like a launch without a registration, and the launch never
+// starts the service itself, so a stopped service stays stopped.
 //
-// The gate runs before the application is created and reports true only when the
-// machine has no registration, which is the launch the desktop host had before
-// the service existed. A registration that cannot be read is not a machine
-// without one: the gate starts no server and reports the failure with a notice
-// that names the way to read the state and to try again.
+// The gate runs before the application is created and reports true when the
+// machine has no registration and when the user chose the desktop mode for a
+// positively confirmed stopped service. Every other registration state ends
+// the launch here: the running service keeps its gate unchanged, and a state
+// that was not confirmed stopped is never continued. A registration that cannot
+// be read is not a machine without one: the gate starts no server and reports
+// the failure with a notice that names the way to read the state and to try
+// again.
 //
 // A service that is starting or stopping is not a state to decide on, so the
 // gate waits for it to settle first; one that did not settle within the budget
@@ -117,6 +124,24 @@ func serviceGate() bool {
 		"dataDir", prompt.DataDir)
 
 	switch showServiceChoice(prompt) {
+	case serviceChoiceDesktop:
+		// The desktop mode is the default answer of the stopped dialog and
+		// the only answer that continues this launch. It is honored only
+		// for a positively confirmed stopped service: nothing serves the
+		// address this launch would bind, and this launch never starts the
+		// service, so the registration stays untouched. Every other state
+		// ends the launch here — a running service and a state that was
+		// not confirmed stopped never get a server next to themselves,
+		// even if an answer reached the gate that no dialog of theirs
+		// offers.
+		if !servicePromptStopped(prompt) {
+			desktopLog.Info("the desktop mode was not offered for this service state: this launch starts no server",
+				"state", string(prompt.State))
+			return false
+		}
+		desktopLog.Info("the launch continues in desktop mode: the service stays stopped and the registration is untouched",
+			"state", string(prompt.State))
+		return true
 	case serviceChoiceOpen:
 		// The URL is derived again from the registration: the dialog only
 		// carried it, so the address the browser opens is the address of

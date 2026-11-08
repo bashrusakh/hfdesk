@@ -434,7 +434,7 @@ func TestServiceGateStartsAStoppedServiceWithTheElevatedHelper(t *testing.T) {
 	})
 	replaceSeam(t, &showServiceChoice, func(prompt serviceChoicePrompt) serviceChoice {
 		if got, want := serviceGateOpenLabel(prompt), "Start service"; got != want {
-			t.Errorf("the first button is %q, want %q", got, want)
+			t.Errorf("the start button is %q, want %q", got, want)
 		}
 		return serviceChoiceStart
 	})
@@ -465,6 +465,124 @@ func TestServiceGateStartsAStoppedServiceWithTheElevatedHelper(t *testing.T) {
 	}
 	if len(*messages) != 0 {
 		t.Errorf("the gate showed %v, want the helper to report the outcome", *messages)
+	}
+}
+
+// TestServiceGateContinuesInDesktopModeForAStoppedService proves that the
+// default answer of the stopped dialog continues the launch into desktop mode.
+//
+// The gate's true answer is the launch a machine without a registration gets,
+// so the application is created after it. Nothing starts or changes the
+// service on the way: the elevated helper is the only code here that could
+// touch the registration, and a stopped service stays stopped. The prompt has
+// to be the positively confirmed stopped one — only that state reaches the
+// layout whose default button is the desktop mode.
+func TestServiceGateContinuesInDesktopModeForAStoppedService(t *testing.T) {
+	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+		return runningServiceStatus(service.StateStopped, "127.0.0.1:18080"), nil
+	})
+	replaceSeam(t, &showServiceChoice, func(prompt serviceChoicePrompt) serviceChoice {
+		if !servicePromptStopped(prompt) {
+			t.Errorf("the dialog was not asked about a positively confirmed stopped service: state %q, running %t",
+				prompt.State, prompt.Running)
+		}
+		if got, want := serviceGateOpenLabel(prompt), "Start service"; got != want {
+			t.Errorf("the start button is %q, want %q", got, want)
+		}
+		return serviceChoiceDesktop
+	})
+	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+		t.Fatal("the desktop mode launched an elevated helper: it starts or changes the service")
+		return 0, nil
+	})
+	replaceSeam(t, &openBrowser, func(string) error {
+		t.Fatal("the desktop mode opened a browser although no server exists yet")
+		return nil
+	})
+	messages := recordMessages(t)
+
+	if !serviceGate() {
+		t.Fatal("the service gate ended the launch although the user chose to work in desktop mode")
+	}
+	if len(*messages) != 0 {
+		t.Errorf("the gate showed %v, want no notice", *messages)
+	}
+}
+
+// TestServiceGateNeverContinuesWithoutAConfirmedStoppedService proves the
+// other side of the invariant: the desktop mode is honored only for a
+// positively confirmed stopped service. A running service and states that were
+// not confirmed stopped never get a server next to themselves, even if an
+// answer reached the gate that no dialog of theirs offers.
+func TestServiceGateNeverContinuesWithoutAConfirmedStoppedService(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status service.Status
+	}{
+		{name: "running", status: runningServiceStatus(service.StateRunning, "127.0.0.1:18080")},
+		{name: "failed", status: runningServiceStatus(service.StateFailed, "127.0.0.1:18080")},
+		{name: "broken without an instance", status: runningServiceStatus(service.StateBroken, "127.0.0.1:18080")},
+		// The state reads stopped but the supervisor reports a serving
+		// instance: the running fact wins, so this is a running gate.
+		{name: "stopped with the running fact", status: func() service.Status {
+			status := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
+			status.Running = true
+			return status
+		}()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+				return tc.status, nil
+			})
+			replaceSeam(t, &showServiceChoice, func(serviceChoicePrompt) serviceChoice {
+				return serviceChoiceDesktop
+			})
+			replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+				t.Fatal("the gate launched an elevated helper although the desktop mode was not offered")
+				return 0, nil
+			})
+			replaceSeam(t, &openBrowser, func(string) error {
+				t.Fatal("the gate opened a browser although the launch ends without a server")
+				return nil
+			})
+			messages := recordMessages(t)
+
+			if serviceGate() {
+				t.Fatal("the service gate continued into desktop mode although the service was not confirmed stopped")
+			}
+			if len(*messages) != 0 {
+				t.Errorf("the gate showed %v, want no notice", *messages)
+			}
+		})
+	}
+}
+
+// TestServiceGateCancelOfAStoppedServiceChangesNothing proves that Cancel of
+// the stopped dialog behaves exactly like the Cancel of every other dialog of
+// the gate: the launch ends and touches neither the browser, nor the helper,
+// nor the service.
+func TestServiceGateCancelOfAStoppedServiceChangesNothing(t *testing.T) {
+	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+		return runningServiceStatus(service.StateStopped, "127.0.0.1:18080"), nil
+	})
+	replaceSeam(t, &showServiceChoice, func(serviceChoicePrompt) serviceChoice {
+		return serviceChoiceCancel
+	})
+	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+		t.Fatal("the gate launched a helper after the user cancelled the dialog")
+		return 0, nil
+	})
+	replaceSeam(t, &openBrowser, func(string) error {
+		t.Fatal("the gate opened a browser after the user cancelled the dialog")
+		return nil
+	})
+	messages := recordMessages(t)
+
+	if serviceGate() {
+		t.Fatal("a cancelled launch of a stopped service continued into desktop mode")
+	}
+	if len(*messages) != 0 {
+		t.Errorf("the gate showed %v after the user cancelled the dialog", *messages)
 	}
 }
 
@@ -581,7 +699,7 @@ func TestServiceGateStartsAStoppingServiceAfterItSettled(t *testing.T) {
 			t.Errorf("the dialog asked about the state %q, want the settled stopped service", prompt.State)
 		}
 		if got, want := serviceGateOpenLabel(prompt), "Start service"; got != want {
-			t.Errorf("the first button is %q, want %q", got, want)
+			t.Errorf("the start button is %q, want %q", got, want)
 		}
 		return serviceChoiceStart
 	})

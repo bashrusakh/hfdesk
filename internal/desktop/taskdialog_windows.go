@@ -14,7 +14,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// The identifiers of the three buttons of the service gate dialog.
+// The identifiers of the buttons of the service gate dialog.
 //
 // The task dialog reports the id of the pressed button back, so the answer of
 // the user is a value of the dialog and not a position in a list. The ids start
@@ -24,7 +24,48 @@ const (
 	serviceGateOpenButtonID   = 101
 	serviceGateUpdateButtonID = 102
 	serviceGateCancelButtonID = 103
+	// serviceGateDesktopButtonID is the button that continues the launch
+	// into desktop mode. Only the dialog of a positively confirmed stopped
+	// service has it, and it is that dialog's default button, so Enter
+	// selects it.
+	serviceGateDesktopButtonID = 104
 )
+
+// serviceGateButton is one button of the choice dialog: the command id the
+// dialog reports back and the label the user reads.
+type serviceGateButton struct {
+	id    int32
+	label string
+}
+
+// serviceGateButtonLayout returns the buttons of the choice dialog in display
+// order and the id of the default button, for the state of the prompt.
+//
+// The positively confirmed stopped service is the only dialog with the desktop
+// mode. It comes first and is the default, so Enter continues this launch into
+// desktop mode — the answer that changes nothing on the machine. Every other
+// dialog keeps the open/start button first and as its default: the action the
+// user asked for by starting HFDesk again.
+//
+// The layout is a pure function, so a test can prove the buttons, their order
+// and the default of every state without a dialog: the real dialog blocks the
+// process until the user answers it.
+func serviceGateButtonLayout(prompt serviceChoicePrompt) (buttons []serviceGateButton, defaultButton int32) {
+	first := serviceGateButton{id: serviceGateOpenButtonID, label: serviceGateOpenLabel(prompt)}
+	if servicePromptStopped(prompt) {
+		return []serviceGateButton{
+			{id: serviceGateDesktopButtonID, label: serviceGateDesktopLabel},
+			first,
+			{id: serviceGateUpdateButtonID, label: serviceGateUpdateLabel},
+			{id: serviceGateCancelButtonID, label: serviceGateCancelLabel},
+		}, serviceGateDesktopButtonID
+	}
+	return []serviceGateButton{
+		first,
+		{id: serviceGateUpdateButtonID, label: serviceGateUpdateLabel},
+		{id: serviceGateCancelButtonID, label: serviceGateCancelLabel},
+	}, first.id
+}
 
 // The task dialog flags of the Windows API.
 //
@@ -176,9 +217,10 @@ func marshalTaskDialogConfig(cfg taskDialogConfig, buttons []taskDialogButton) (
 
 // taskDialogChoice shows the service gate as a task dialog.
 //
-// The dialog names the three actions on its buttons, so the user reads what
-// each answer does. The first button is the default: it is the action the user
-// asked for by starting HFDesk again.
+// The dialog names the actions on its buttons, so the user reads what each
+// answer does. The default button — the one Enter selects — is the first
+// button of the layout: the action the user asked for by starting HFDesk
+// again, and the desktop mode for a positively confirmed stopped service.
 func taskDialogChoice(prompt serviceChoicePrompt) (serviceChoice, error) {
 	if err := taskDialogIndirect.Find(); err != nil {
 		return serviceChoiceCancel, fmt.Errorf("the task dialog of the common controls is not available: %w", err)
@@ -196,31 +238,26 @@ func taskDialogChoice(prompt serviceChoicePrompt) (serviceChoice, error) {
 	if err != nil {
 		return serviceChoiceCancel, err
 	}
-	openLabel, err := windows.UTF16PtrFromString(serviceGateOpenLabel(prompt))
-	if err != nil {
-		return serviceChoiceCancel, err
-	}
-	updateLabel, err := windows.UTF16PtrFromString(serviceGateUpdateLabel)
-	if err != nil {
-		return serviceChoiceCancel, err
-	}
-	cancelLabel, err := windows.UTF16PtrFromString(serviceGateCancelLabel)
-	if err != nil {
-		return serviceChoiceCancel, err
+
+	layout, defaultButton := serviceGateButtonLayout(prompt)
+	labels := make([]*uint16, len(layout))
+	buttons := make([]taskDialogButton, len(layout))
+	for i, item := range layout {
+		label, err := windows.UTF16PtrFromString(item.label)
+		if err != nil {
+			return serviceChoiceCancel, err
+		}
+		labels[i] = label
+		buttons[i] = taskDialogButton{id: item.id, text: label}
 	}
 
-	buttons := [3]taskDialogButton{
-		{id: serviceGateOpenButtonID, text: openLabel},
-		{id: serviceGateUpdateButtonID, text: updateLabel},
-		{id: serviceGateCancelButtonID, text: cancelLabel},
-	}
 	configRecord, buttonRecord := marshalTaskDialogConfig(taskDialogConfig{
 		dwFlags:            tdfAllowDialogCancellation,
 		pszWindowTitle:     title,
 		pszMainInstruction: instruction,
 		pszContent:         content,
-		nDefaultButton:     serviceGateOpenButtonID,
-	}, buttons[:])
+		nDefaultButton:     defaultButton,
+	}, buttons)
 
 	var pressed int32
 	result, _, _ := taskDialogIndirect.Call(
@@ -233,9 +270,7 @@ func taskDialogChoice(prompt serviceChoicePrompt) (serviceChoice, error) {
 	runtime.KeepAlive(buttonRecord)
 	runtime.KeepAlive(configRecord)
 	runtime.KeepAlive(buttons)
-	runtime.KeepAlive(cancelLabel)
-	runtime.KeepAlive(updateLabel)
-	runtime.KeepAlive(openLabel)
+	runtime.KeepAlive(labels)
 	runtime.KeepAlive(content)
 	runtime.KeepAlive(instruction)
 	runtime.KeepAlive(title)
@@ -248,13 +283,15 @@ func taskDialogChoice(prompt serviceChoicePrompt) (serviceChoice, error) {
 	return serviceGateChoiceForButton(prompt, pressed)
 }
 
-// serviceGateFirstChoice returns the action of the first button of the choice
-// dialog.
+// serviceGateFirstChoice returns the action of the open/start button of the
+// choice dialog.
 //
-// The first button is the action the user asked for by starting HFDesk again:
-// a running service is opened, and a service that does not run is started. The
+// The button is the action the user asked for by starting HFDesk again: a
+// running service is opened, and a service that does not run is started. The
 // label of the button is derived from the same predicate, so the label and the
-// action are two renderings of one decision and cannot drift apart.
+// action are two renderings of one decision and cannot drift apart. The
+// positively confirmed stopped service has the desktop mode in front of it as
+// a button of its own, so this button is its second one and names the start.
 func serviceGateFirstChoice(prompt serviceChoicePrompt) serviceChoice {
 	if servicePromptRunning(prompt) {
 		return serviceChoiceOpen
@@ -266,17 +303,23 @@ func serviceGateFirstChoice(prompt serviceChoicePrompt) serviceChoice {
 // performs.
 //
 // The task dialog reports ids and not positions, so the answer is read from the
-// id alone, together with the status the dialog was opened for. The first button
-// is the only id whose action depends on the status: it opens a running service
-// and starts one that is not running. Everything else is a fixed answer.
+// id alone, together with the status the dialog was opened for. The open/start
+// id is the only id whose action depends on the status: it opens a running
+// service and starts one that is not running. The desktop id is a fixed answer
+// that only the stopped dialog can produce, and the gate re-checks the state
+// before it honors it. Everything else is a fixed answer as well.
 //
-// The mapping is a pure function, so a test can prove both states of the first
-// button and the other ids without a dialog: the real dialog blocks the process
-// until the user answers it.
+// The mapping is a pure function, so a test can prove both states of the
+// open/start button and the other ids without a dialog: the real dialog blocks
+// the process until the user answers it.
 func serviceGateChoiceForButton(prompt serviceChoicePrompt, pressed int32) (serviceChoice, error) {
 	switch pressed {
 	case serviceGateOpenButtonID:
 		return serviceGateFirstChoice(prompt), nil
+	case serviceGateDesktopButtonID:
+		// Only the dialog of a positively confirmed stopped service has
+		// this button; the gate re-checks that state before it continues.
+		return serviceChoiceDesktop, nil
 	case serviceGateUpdateButtonID:
 		return serviceChoiceUpdate, nil
 	case serviceGateCancelButtonID, messageBoxCancel, 0:
@@ -296,18 +339,18 @@ func serviceGateChoiceForButton(prompt serviceChoicePrompt, pressed int32) (serv
 // No and Cancel onto the actions. Cancel is the default button, so a stray
 // Enter changes nothing: the actions of the other two buttons change the
 // machine.
+//
+// A positively confirmed stopped service has four actions, so it is asked in
+// two boxes instead: the first one picks between the desktop mode, a service
+// action and no action, and the second one names the service action when one
+// is wanted. Its first box defaults to Yes, because the desktop mode changes
+// nothing on the machine — the same rule that makes the desktop button the
+// default of the task dialog.
 func messageBoxChoice(prompt serviceChoicePrompt) serviceChoice {
-	text, err := windows.UTF16PtrFromString(serviceGateChooseText(prompt))
-	if err != nil {
-		return serviceChoiceCancel
+	if servicePromptStopped(prompt) {
+		return messageBoxStoppedChoice(prompt)
 	}
-	caption, err := windows.UTF16PtrFromString(serviceGateCaption)
-	if err != nil {
-		return serviceChoiceCancel
-	}
-	result, _ := windows.MessageBox(0, text, caption,
-		windows.MB_YESNOCANCEL|windows.MB_ICONQUESTION|windows.MB_DEFBUTTON3|
-			windows.MB_SETFOREGROUND|windows.MB_TOPMOST)
+	result := showGateMessageBox(serviceGateChooseText(prompt), windows.MB_DEFBUTTON3)
 	switch result {
 	case messageBoxYes:
 		if servicePromptRunning(prompt) {
@@ -319,4 +362,54 @@ func messageBoxChoice(prompt serviceChoicePrompt) serviceChoice {
 	default:
 		return serviceChoiceCancel
 	}
+}
+
+// messageBoxStoppedChoice asks a stopped registration with its first message
+// box: the desktop mode, a service action or no action.
+func messageBoxStoppedChoice(prompt serviceChoicePrompt) serviceChoice {
+	switch showGateMessageBox(serviceGateChooseText(prompt), windows.MB_DEFBUTTON1) {
+	case messageBoxYes:
+		return serviceChoiceDesktop
+	case messageBoxNo:
+		return messageBoxServiceActionChoice(prompt)
+	default:
+		return serviceChoiceCancel
+	}
+}
+
+// messageBoxServiceActionChoice asks a stopped registration which service
+// action it should get: the start or the update.
+//
+// Cancel stays the default button: both other answers change the machine, so
+// a stray Enter changes nothing — the rule the ordinary fallback follows. The
+// two answers are the actions of the ordinary fallback of a service that does
+// not run, so they behave exactly like its Yes and No.
+func messageBoxServiceActionChoice(prompt serviceChoicePrompt) serviceChoice {
+	switch showGateMessageBox(serviceGateServiceActionChooseText(prompt), windows.MB_DEFBUTTON3) {
+	case messageBoxYes:
+		return serviceChoiceStart
+	case messageBoxNo:
+		return serviceChoiceUpdate
+	default:
+		return serviceChoiceCancel
+	}
+}
+
+// showGateMessageBox shows one box of the fallback of the service gate and
+// reports the id of the answer. A text or a caption that cannot be converted
+// reports the Cancel id: without a readable question the box asks for no
+// action.
+func showGateMessageBox(text string, defaultButton uint32) int32 {
+	textPtr, err := windows.UTF16PtrFromString(text)
+	if err != nil {
+		return messageBoxCancel
+	}
+	caption, err := windows.UTF16PtrFromString(serviceGateCaption)
+	if err != nil {
+		return messageBoxCancel
+	}
+	result, _ := windows.MessageBox(0, textPtr, caption,
+		windows.MB_YESNOCANCEL|windows.MB_ICONQUESTION|defaultButton|
+			windows.MB_SETFOREGROUND|windows.MB_TOPMOST)
+	return result
 }

@@ -200,10 +200,13 @@ func run(o Options, logPath string) (err error) {
 
 	// The Windows service binds the same address, so the gate reads the
 	// registration before the application is created: a launch that finds one
-	// asks the user what to do and ends without starting a server. It runs
-	// after the logging pipeline (its records are the support material of the
-	// launch) and before app.New, the first step that can create a server. A
-	// launch that ends here publishes no state.
+	// asks the user what to do and ends without starting a server — except a
+	// positively confirmed stopped service whose dialog was answered with the
+	// desktop mode, which continues this launch like a launch without a
+	// registration and never starts the service. It runs after the logging
+	// pipeline (its records are the support material of the launch) and before
+	// app.New, the first step that can create a server. A launch that ends
+	// here publishes no state.
 	if !serviceGate() {
 		return nil
 	}

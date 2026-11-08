@@ -107,8 +107,12 @@ func serviceGateInstruction(prompt serviceChoicePrompt) string {
 // gate.
 //
 // The content names what the running service serves, what an update does and
-// that the service keeps its own data. The task dialog and the message box
-// fallback share it, so the two cannot tell the user different things.
+// that the service keeps its own data. The positively confirmed stopped
+// service gets the sentence of the desktop mode instead of the sentence of a
+// launch that ends: it is the one state whose dialog can continue this launch,
+// and the sentence states what that answer does and that it never starts the
+// service. The task dialog and the message box fallback share the content, so
+// the two cannot tell the user different things.
 func serviceGateContent(prompt serviceChoicePrompt) string {
 	var text string
 	if servicePromptRunning(prompt) && prompt.URL != "" {
@@ -118,8 +122,12 @@ func serviceGateContent(prompt serviceChoicePrompt) string {
 		text += prompt.Detail + "\n\n"
 	}
 
-	text += "This launch of the desktop app started no server of its own, so two instances never compete for the same address.\n\n" +
-		"Update re-registers the service from the hfdesk program next to this app. It keeps the settings of the service and its running state: a running service keeps running, and a stopped service stays stopped.\n\n" +
+	if servicePromptStopped(prompt) {
+		text += "Work in desktop mode continues this launch as a normal desktop app: it starts its own server and never starts the service, so the service stays stopped and two instances never compete for the same address.\n\n"
+	} else {
+		text += "This launch of the desktop app started no server of its own, so two instances never compete for the same address.\n\n"
+	}
+	text += "Update re-registers the service from the hfdesk program next to this app. It keeps the settings of the service and its running state: a running service keeps running, and a stopped service stays stopped.\n\n" +
 		"The service keeps its own data"
 	if prompt.DataDir != "" {
 		text += " in " + prompt.DataDir
@@ -167,8 +175,11 @@ func serviceGateUnreadableText(err error) string {
 		"Check the service state with \"hfdesk service status\" from an elevated shell, then start the desktop app again."
 }
 
-// serviceGateOpenLabel returns the label of the first button of the choice
-// dialog.
+// serviceGateOpenLabel returns the label of the open/start button of the
+// choice dialog: the button that opens a running service and starts one that
+// does not run. It is the first button of every dialog except the one of a
+// positively confirmed stopped service, where the desktop mode comes first and
+// this button names the start.
 func serviceGateOpenLabel(prompt serviceChoicePrompt) string {
 	if servicePromptRunning(prompt) {
 		return "Open HFDesk"
@@ -176,10 +187,14 @@ func serviceGateOpenLabel(prompt serviceChoicePrompt) string {
 	return "Start service"
 }
 
-// The labels of the other two buttons of the choice dialog.
+// The labels of the other buttons of the choice dialog.
 const (
-	serviceGateUpdateLabel = "Update service"
-	serviceGateCancelLabel = "Cancel"
+	// serviceGateDesktopLabel is the label of the button that continues the
+	// launch into desktop mode. Only the dialog of a positively confirmed
+	// stopped service has it, and it is that dialog's default button.
+	serviceGateDesktopLabel = "Work in desktop mode"
+	serviceGateUpdateLabel  = "Update service"
+	serviceGateCancelLabel  = "Cancel"
 )
 
 // serviceGateFallbackChoices returns the mapping of the answers of the
@@ -188,12 +203,32 @@ const (
 // A message box has no named buttons, so the text has to say what Yes, No and
 // Cancel do. Without the mapping the user would have to guess which answer
 // starts the service and which one updates it.
+//
+// The positively confirmed stopped service is asked in two boxes, so this is
+// the mapping of its first box: the desktop mode, a service action and no
+// action. The second box names the two service actions and is built by
+// serviceGateStartUpdateChoices.
 func serviceGateFallbackChoices(prompt serviceChoicePrompt) string {
-	open := "open HFDesk in your default browser"
-	if !servicePromptRunning(prompt) {
-		open = "start the service"
+	if servicePromptStopped(prompt) {
+		return "Choose Yes to work in desktop mode.\n" +
+			"Choose No to start or update the service.\n" +
+			"Choose Cancel to change nothing."
 	}
-	return "Choose Yes to " + open + ".\n" +
+	if servicePromptRunning(prompt) {
+		return "Choose Yes to open HFDesk in your default browser.\n" +
+			"Choose No to update the service.\n" +
+			"Choose Cancel to change nothing."
+	}
+	return serviceGateStartUpdateChoices()
+}
+
+// serviceGateStartUpdateChoices returns the mapping of the answers of the box
+// that picks the service action: the same two service actions and no action
+// the ordinary fallback of a service that does not run asks about. It is the
+// second box of the stopped fallback and the whole mapping of every other
+// dialog that does not run.
+func serviceGateStartUpdateChoices() string {
+	return "Choose Yes to start the service.\n" +
 		"Choose No to update the service.\n" +
 		"Choose Cancel to change nothing."
 }
@@ -202,6 +237,14 @@ func serviceGateFallbackChoices(prompt serviceChoicePrompt) string {
 // choice dialog.
 func serviceGateChooseText(prompt serviceChoicePrompt) string {
 	return serviceGateText(prompt) + "\n\n" + serviceGateFallbackChoices(prompt)
+}
+
+// serviceGateServiceActionChooseText returns the text of the second message
+// box of the stopped fallback: it names the state again and maps Yes, No and
+// Cancel onto the two service actions and no action, so the box reads as a
+// question of its own after the first box was dismissed.
+func serviceGateServiceActionChooseText(prompt serviceChoicePrompt) string {
+	return serviceGateInstruction(prompt) + "\n\n" + serviceGateStartUpdateChoices()
 }
 
 // serviceVersionName returns the product name with the build version of the

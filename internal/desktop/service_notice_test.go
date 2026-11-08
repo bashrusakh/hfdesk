@@ -57,6 +57,8 @@ func TestInstallServiceTextWithoutADataDirectoryStaysTrue(t *testing.T) {
 //
 // The user started HFDesk again, so the running instance is what they were
 // looking for: the first button opens it instead of starting a second instance.
+// The dialog never offers the desktop mode: that answer belongs to the stopped
+// service alone.
 func TestServiceGateTextAsksToOpenARunningService(t *testing.T) {
 	prompt := serviceChoicePrompt{
 		State:   service.StateRunning,
@@ -76,6 +78,9 @@ func TestServiceGateTextAsksToOpenARunningService(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Errorf("the dialog %q does not mention %q", text, want)
 		}
+	}
+	if strings.Contains(text, "Work in desktop mode") {
+		t.Errorf("the dialog %q offers the desktop mode next to a running service", text)
 	}
 
 	if got, want := serviceGateOpenLabel(prompt), "Open HFDesk"; got != want {
@@ -105,7 +110,81 @@ func TestServiceGateTextAsksToStartAStoppedService(t *testing.T) {
 		t.Errorf("the dialog %q claims an address of a service that is stopped", text)
 	}
 	if got, want := serviceGateOpenLabel(prompt), "Start service"; got != want {
-		t.Errorf("the first button is %q, want %q", got, want)
+		t.Errorf("the start button is %q, want %q", got, want)
+	}
+}
+
+// TestServiceGateTextOffersTheDesktopModeForAStoppedService proves that the
+// dialog of a positively confirmed stopped service offers the desktop mode and
+// states what that answer does: it starts the server of this app, never starts
+// the service and leaves the registration alone. The dialog never claims an
+// address for a service that does not serve, and it never carries the sentence
+// of the dialogs that always end the launch, because this one can continue it.
+func TestServiceGateTextOffersTheDesktopModeForAStoppedService(t *testing.T) {
+	prompt := serviceChoicePrompt{
+		State:   service.StateStopped,
+		Listen:  "127.0.0.1:8080",
+		DataDir: `C:\ProgramData\HFDesk`,
+	}
+
+	text := serviceGateText(prompt)
+	for _, want := range []string{
+		"installed, but it is not running",
+		"Work in desktop mode continues this launch as a normal desktop app",
+		"never starts the service",
+		"service stays stopped",
+		"stopped service stays stopped",
+		prompt.DataDir,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the dialog %q does not mention %q", text, want)
+		}
+	}
+	for _, unwanted := range []string{
+		// The service does not serve, so no address is offered.
+		"The web UI of the service is at",
+		// This dialog can continue the launch, so the sentence of the
+		// dialogs that always end it does not belong to it.
+		"started no server of its own",
+	} {
+		if strings.Contains(text, unwanted) {
+			t.Errorf("the dialog %q carries %q", text, unwanted)
+		}
+	}
+	if got, want := serviceGateDesktopLabel, "Work in desktop mode"; got != want {
+		t.Errorf("the desktop button is %q, want %q", got, want)
+	}
+}
+
+// TestServicePromptStoppedRecognifiesOnlyAConfirmedStoppedService proves the
+// classification the desktop mode depends on: the observed stopped state
+// without the running fact. Every other state keeps its gate, and a
+// registration whose state could not be read never builds a prompt at all —
+// the gate reports it before the dialog exists, so an error is never read as a
+// stopped service or as a machine without one.
+func TestServicePromptStoppedRecognizesOnlyAConfirmedStoppedService(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		prompt serviceChoicePrompt
+		want   bool
+	}{
+		{name: "stopped", prompt: serviceChoicePrompt{State: service.StateStopped}, want: true},
+		// The supervisor's running fact wins over the diagnosed state, so
+		// a stopped state whose instance still serves is never continued.
+		{name: "stopped but the running fact is set", prompt: serviceChoicePrompt{State: service.StateStopped, Running: true}},
+		{name: "running", prompt: serviceChoicePrompt{State: service.StateRunning}},
+		{name: "starting", prompt: serviceChoicePrompt{State: service.StateStarting}},
+		{name: "stopping", prompt: serviceChoicePrompt{State: service.StateStopping}},
+		{name: "failed", prompt: serviceChoicePrompt{State: service.StateFailed}},
+		{name: "broken", prompt: serviceChoicePrompt{State: service.StateBroken}},
+		{name: "broken but running", prompt: serviceChoicePrompt{State: service.StateBroken, Running: true}},
+		{name: "not installed", prompt: serviceChoicePrompt{State: service.StateNotInstalled}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := servicePromptStopped(tc.prompt); got != tc.want {
+				t.Errorf("servicePromptStopped of the %s prompt = %t, want %t", tc.name, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -113,7 +192,10 @@ func TestServiceGateTextAsksToStartAStoppedService(t *testing.T) {
 // fallback names the actions its unnamed buttons perform.
 //
 // A message box has no named buttons: without the mapping the user would have
-// to guess which answer starts the service and which one updates it.
+// to guess which answer starts the service and which one updates it. The
+// positively confirmed stopped service has four actions but a box has three
+// answers, so it is asked in two boxes: the first maps the desktop mode, a
+// service action and no action, and the second names the two service actions.
 func TestServiceGateFallbackChoicesMapTheAnswers(t *testing.T) {
 	running := serviceGateFallbackChoices(serviceChoicePrompt{State: service.StateRunning})
 	for _, want := range []string{
@@ -125,10 +207,50 @@ func TestServiceGateFallbackChoicesMapTheAnswers(t *testing.T) {
 			t.Errorf("the fallback %q does not mention %q", running, want)
 		}
 	}
+	if strings.Contains(running, "desktop mode") {
+		t.Errorf("the fallback %q offers the desktop mode next to a running service", running)
+	}
 
 	stopped := serviceGateFallbackChoices(serviceChoicePrompt{State: service.StateStopped})
-	if !strings.Contains(stopped, "Choose Yes to start the service.") {
-		t.Errorf("the fallback %q does not offer to start the service", stopped)
+	for _, want := range []string{
+		"Choose Yes to work in desktop mode.",
+		"Choose No to start or update the service.",
+		"Choose Cancel to change nothing.",
+	} {
+		if !strings.Contains(stopped, want) {
+			t.Errorf("the first box of the stopped fallback %q does not mention %q", stopped, want)
+		}
+	}
+
+	// The second box of the stopped fallback keeps the two service actions
+	// reachable with the very mapping the ordinary fallback of a service
+	// that does not run asks about.
+	action := serviceGateStartUpdateChoices()
+	for _, want := range []string{
+		"Choose Yes to start the service.",
+		"Choose No to update the service.",
+		"Choose Cancel to change nothing.",
+	} {
+		if !strings.Contains(action, want) {
+			t.Errorf("the second box of the stopped fallback %q does not mention %q", action, want)
+		}
+	}
+	second := serviceGateServiceActionChooseText(serviceChoicePrompt{State: service.StateStopped})
+	if !strings.Contains(second, "installed, but it is not running") {
+		t.Errorf("the second box %q does not name the state it acts on", second)
+	}
+	if !strings.Contains(second, action) {
+		t.Errorf("the second box %q does not carry its mapping", second)
+	}
+
+	// A failed service is not a positively confirmed stopped one: its
+	// dialog ends the launch and never offers the desktop mode.
+	failed := serviceGateFallbackChoices(serviceChoicePrompt{State: service.StateFailed})
+	if !strings.Contains(failed, "Choose Yes to start the service.") {
+		t.Errorf("the fallback %q does not offer to start the service", failed)
+	}
+	if strings.Contains(failed, "desktop mode") {
+		t.Errorf("the fallback %q offers the desktop mode for a failed service", failed)
 	}
 
 	// The fallback carries the whole question, so a user who reads only the

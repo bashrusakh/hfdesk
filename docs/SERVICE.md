@@ -594,19 +594,25 @@ replaces the other.
   — its own config file, jobs, history and cache. The settings, jobs and models
   of the desktop app are **not** migrated and do not appear in the service.
 - **Startup detection.** A launch that finds a registration — and no desktop
-  app of its own already running — starts no server of its own and publishes no
-  state: it asks before anything serves.
+  app of its own already running — asks before anything serves: it starts no
+  server of its own and publishes no state, except when a positively confirmed
+  stopped service is answered with **Work in desktop mode**, the default
+  button. That answer continues the launch exactly like a launch without a
+  registration; every other answer ends it before anything serves. The gate
+  never starts the service and never changes the registration.
 
   | Registered state | Buttons |
   |---|---|
   | running | **Open HFDesk** / **Update service** / **Cancel** |
   | broken, but the instance still runs | **Open HFDesk** / **Update service** / **Cancel** |
-  | stopped, failed, or broken without a running instance | **Start service** / **Update service** / **Cancel** |
+  | stopped | **Work in desktop mode** (default) / **Start service** / **Update service** / **Cancel** |
+  | failed, or broken without a running instance | **Start service** / **Update service** / **Cancel** |
 
   A service that reports `starting` or `stopping` is not asked about: the
   launch waits for the state to settle and then asks about the state it
   reached — a service that came up offers **Open HFDesk**, a service that
-  stopped offers **Start service**. A service that is still starting or
+  stopped offers **Work in desktop mode** as its default answer next to
+  **Start service**. A service that is still starting or
   stopping when the wait ends is reported with a short notice that the launch
   changes nothing, and the launch starts no server of its own.
 
@@ -616,7 +622,10 @@ replaces the other.
   notice that names `hfdesk service status` from an elevated shell and asks the
   user to start the desktop app again.
 
-  **Open HFDesk** opens the registered address, **Start service** starts the
+  **Work in desktop mode** continues the launch as a normal desktop app: it
+  starts the server of this app, never starts the service and never changes the
+  registration, so a stopped service stays stopped. **Open HFDesk** opens the
+  registered address, **Start service** starts the
   registered service, and **Cancel** changes nothing. **Update service**
   re-registers the service from the folder of the new desktop program and keeps
   its settings and its running state: a running service keeps running on the new
@@ -628,9 +637,12 @@ replaces the other.
   program, and the report names the address it serves.
 - **The dialog** is a Windows task dialog, which needs the common controls
   version 6 that the embedded application manifest declares. A locally built
-  binary without that resource still works: it falls back to a message box that
-  asks the same question and maps Yes, No and Cancel onto the actions in its
-  text.
+  binary without that resource still works: it falls back to message boxes that
+  map Yes, No and Cancel onto the actions in their text. The stopped service
+  needs two boxes for its four actions — the first picks the desktop mode, a
+  service action or no action, and a stray Enter selects the desktop mode, the
+  answer that changes nothing on the machine — while every other state keeps
+  its single box.
 
 ### The identity of a machine-wide instance
 

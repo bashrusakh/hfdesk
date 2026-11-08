@@ -292,3 +292,111 @@ func TestServiceGateChoiceForButtonMapsTheOtherIds(t *testing.T) {
 		t.Errorf("the unknown button performs %v, want no action", choice)
 	}
 }
+
+// TestServiceGateButtonLayoutPerState proves which buttons each state gets, in
+// which order, which one Enter selects and what each id performs: the label,
+// the position and the action of a button are three renderings of one
+// decision, so a test reads them side by side.
+//
+// The positively confirmed stopped service is the only dialog with the desktop
+// mode, and it is its first button and its default — every other state keeps
+// the open/start button first and as its default.
+func TestServiceGateButtonLayoutPerState(t *testing.T) {
+	// The state reads stopped but the supervisor reports a serving
+	// instance: the running fact wins, so the dialog is the running one.
+	stoppedButRunning := serviceChoicePrompt{State: service.StateStopped, Running: true}
+
+	for _, tc := range []struct {
+		name        string
+		prompt      serviceChoicePrompt
+		wantLabels  []string
+		wantIDs     []int32
+		wantDefault int32
+		wantChoices []serviceChoice
+	}{
+		{
+			name:        "stopped",
+			prompt:      serviceChoicePrompt{State: service.StateStopped},
+			wantLabels:  []string{"Work in desktop mode", "Start service", "Update service", "Cancel"},
+			wantIDs:     []int32{serviceGateDesktopButtonID, serviceGateOpenButtonID, serviceGateUpdateButtonID, serviceGateCancelButtonID},
+			wantDefault: serviceGateDesktopButtonID,
+			wantChoices: []serviceChoice{serviceChoiceDesktop, serviceChoiceStart, serviceChoiceUpdate, serviceChoiceCancel},
+		},
+		{
+			name:        "running",
+			prompt:      serviceChoicePrompt{State: service.StateRunning},
+			wantLabels:  []string{"Open HFDesk", "Update service", "Cancel"},
+			wantIDs:     []int32{serviceGateOpenButtonID, serviceGateUpdateButtonID, serviceGateCancelButtonID},
+			wantDefault: serviceGateOpenButtonID,
+			wantChoices: []serviceChoice{serviceChoiceOpen, serviceChoiceUpdate, serviceChoiceCancel},
+		},
+		{
+			name:        "failed",
+			prompt:      serviceChoicePrompt{State: service.StateFailed},
+			wantLabels:  []string{"Start service", "Update service", "Cancel"},
+			wantIDs:     []int32{serviceGateOpenButtonID, serviceGateUpdateButtonID, serviceGateCancelButtonID},
+			wantDefault: serviceGateOpenButtonID,
+			wantChoices: []serviceChoice{serviceChoiceStart, serviceChoiceUpdate, serviceChoiceCancel},
+		},
+		{
+			name:        "broken without an instance",
+			prompt:      serviceChoicePrompt{State: service.StateBroken},
+			wantLabels:  []string{"Start service", "Update service", "Cancel"},
+			wantIDs:     []int32{serviceGateOpenButtonID, serviceGateUpdateButtonID, serviceGateCancelButtonID},
+			wantDefault: serviceGateOpenButtonID,
+			wantChoices: []serviceChoice{serviceChoiceStart, serviceChoiceUpdate, serviceChoiceCancel},
+		},
+		{
+			name:        "broken but running",
+			prompt:      serviceChoicePrompt{State: service.StateBroken, Running: true},
+			wantLabels:  []string{"Open HFDesk", "Update service", "Cancel"},
+			wantIDs:     []int32{serviceGateOpenButtonID, serviceGateUpdateButtonID, serviceGateCancelButtonID},
+			wantDefault: serviceGateOpenButtonID,
+			wantChoices: []serviceChoice{serviceChoiceOpen, serviceChoiceUpdate, serviceChoiceCancel},
+		},
+		{
+			name:        "stopped with the running fact",
+			prompt:      stoppedButRunning,
+			wantLabels:  []string{"Open HFDesk", "Update service", "Cancel"},
+			wantIDs:     []int32{serviceGateOpenButtonID, serviceGateUpdateButtonID, serviceGateCancelButtonID},
+			wantDefault: serviceGateOpenButtonID,
+			wantChoices: []serviceChoice{serviceChoiceOpen, serviceChoiceUpdate, serviceChoiceCancel},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buttons, defaultButton := serviceGateButtonLayout(tc.prompt)
+			if defaultButton != tc.wantDefault {
+				t.Errorf("the default button is %d, want %d: Enter must select %q",
+					defaultButton, tc.wantDefault, tc.wantLabels[0])
+			}
+			if len(buttons) != len(tc.wantLabels) {
+				t.Fatalf("the dialog has %d buttons %v, want %d %v",
+					len(buttons), buttonLabels(buttons), len(tc.wantLabels), tc.wantLabels)
+			}
+			for i, button := range buttons {
+				if button.label != tc.wantLabels[i] {
+					t.Errorf("the button %d is labelled %q, want %q", i, button.label, tc.wantLabels[i])
+				}
+				if button.id != tc.wantIDs[i] {
+					t.Errorf("the button %d has the id %d, want %d", i, button.id, tc.wantIDs[i])
+				}
+				choice, err := serviceGateChoiceForButton(tc.prompt, button.id)
+				if err != nil {
+					t.Fatalf("the button %d returned an error: %v", i, err)
+				}
+				if choice != tc.wantChoices[i] {
+					t.Errorf("the button %d performs %v, want %v", i, choice, tc.wantChoices[i])
+				}
+			}
+		})
+	}
+}
+
+// buttonLabels returns the labels of the buttons, for a failure message.
+func buttonLabels(buttons []serviceGateButton) []string {
+	labels := make([]string, 0, len(buttons))
+	for _, button := range buttons {
+		labels = append(labels, button.label)
+	}
+	return labels
+}

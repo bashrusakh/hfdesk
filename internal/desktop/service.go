@@ -103,6 +103,11 @@ const (
 	// serviceChoiceUpdate re-registers the service from the folder of the
 	// desktop executable.
 	serviceChoiceUpdate
+	// serviceChoiceDesktop continues the launch into desktop mode: the
+	// application is created as on a machine without a registration, while
+	// the registration stays untouched and the service stays stopped. The
+	// gate honors it only for a positively confirmed stopped service.
+	serviceChoiceDesktop
 )
 
 // serviceChoicePrompt describes the choice the service gate asks the user. The
@@ -160,6 +165,18 @@ func serviceStatusRunning(status service.Status) bool {
 // are three renderings of one decision.
 func servicePromptRunning(prompt serviceChoicePrompt) bool {
 	return prompt.Running || serviceStateRunning(prompt.State)
+}
+
+// servicePromptStopped reports whether the prompt describes a positively
+// confirmed stopped service.
+//
+// The stopped case is decided on the observed stopped state together with the
+// absence of the running fact: a pending state settled into it, and a
+// registration whose state could not be read never builds a prompt at all. It
+// is the one registration state whose gate may continue into desktop mode,
+// because nothing serves the address this launch would bind.
+func servicePromptStopped(prompt serviceChoicePrompt) bool {
+	return prompt.State == service.StateStopped && !servicePromptRunning(prompt)
 }
 
 // serviceStateSettled reports whether the state is a state that lasts.
