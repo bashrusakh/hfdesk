@@ -55,8 +55,10 @@ type ServiceActionOptions struct {
 	Action string
 
 	// WaitPID is the original desktop process for a tray-install handover.
-	// A positive value requires all three handover names below; zero means
-	// this is an ordinary service-gate action.
+	// A positive value requires all the handover names below; zero means no
+	// wait for a desktop exit — the ordinary service-gate action, or an
+	// update that carries InstanceMutex alone to hold the singleton through
+	// its mutation.
 	WaitPID int
 
 	// ReadyEvent and SuccessEvent name the per-attempt handover events.
@@ -64,7 +66,10 @@ type ServiceActionOptions struct {
 	SuccessEvent string
 
 	// InstanceMutex is the existing per-session desktop singleton object the
-	// helper holds until its service mutation and any rollback finish.
+	// helper holds until its service mutation and any rollback finish. A
+	// positive WaitPID requires it; an update may carry it on its own,
+	// without a wait, because the desktop gate that asked for it has already
+	// ended while the update still stops and restarts a running instance.
 	InstanceMutex string
 
 	// Version is the build version of the desktop host that launched the

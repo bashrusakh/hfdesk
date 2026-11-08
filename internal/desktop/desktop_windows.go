@@ -207,7 +207,7 @@ func run(o Options, logPath string) (err error) {
 	// pipeline (its records are the support material of the launch) and before
 	// app.New, the first step that can create a server. A launch that ends
 	// here publishes no state.
-	if !serviceGate() {
+	if !serviceGate(lock.name) {
 		return nil
 	}
 

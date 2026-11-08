@@ -36,6 +36,11 @@ func replaceSeam[T any](t *testing.T, seam *T, value T) {
 	t.Cleanup(func() { *seam = previous })
 }
 
+// testGateSingleton is the desktop singleton identity the gate tests pass:
+// the update choice hands it to the helper, and the tests that never launch a
+// helper only carry it through.
+const testGateSingleton = `Local\HFDesk.Test.Gate.1`
+
 // fakeServiceManager records the calls of the service helper.
 //
 // It implements the manager of the service layer, so a test can drive the
@@ -296,7 +301,7 @@ func TestServiceGateContinuesWhenNoServiceIsInstalled(t *testing.T) {
 		return serviceChoiceCancel
 	})
 
-	if !serviceGate() {
+	if !serviceGate(testGateSingleton) {
 		t.Fatal("the service gate stopped a launch on a machine without a service")
 	}
 }
@@ -392,7 +397,7 @@ func TestServiceGateEndsTheLaunchWhenTheRegistrationCannotBeRead(t *testing.T) {
 	slog.SetDefault(slog.New(records))
 	t.Cleanup(func() { slog.SetDefault(previousLogger) })
 
-	if serviceGate() {
+	if serviceGate(testGateSingleton) {
 		t.Fatal("the service gate let a launch whose registration could not be read start its own server")
 	}
 	if len(*messages) != 1 {
@@ -446,7 +451,7 @@ func TestServiceGateStartsAStoppedServiceWithTheElevatedHelper(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate() {
+	if serviceGate(testGateSingleton) {
 		t.Fatal("the service gate let a launch with an installed service start its own server")
 	}
 	if len(launches) != 1 {
@@ -501,7 +506,7 @@ func TestServiceGateContinuesInDesktopModeForAStoppedService(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if !serviceGate() {
+	if !serviceGate(testGateSingleton) {
 		t.Fatal("the service gate ended the launch although the user chose to work in desktop mode")
 	}
 	if len(*messages) != 0 {
@@ -547,7 +552,7 @@ func TestServiceGateNeverContinuesWithoutAConfirmedStoppedService(t *testing.T) 
 			})
 			messages := recordMessages(t)
 
-			if serviceGate() {
+			if serviceGate(testGateSingleton) {
 				t.Fatal("the service gate continued into desktop mode although the service was not confirmed stopped")
 			}
 			if len(*messages) != 0 {
@@ -578,7 +583,7 @@ func TestServiceGateCancelOfAStoppedServiceChangesNothing(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate() {
+	if serviceGate(testGateSingleton) {
 		t.Fatal("a cancelled launch of a stopped service continued into desktop mode")
 	}
 	if len(*messages) != 0 {
@@ -618,7 +623,7 @@ func TestServiceGateOpensAStartingServiceAfterItSettled(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate() {
+	if serviceGate(testGateSingleton) {
 		t.Fatal("the service gate let a launch with an installed service start its own server")
 	}
 	if len(opened) != 1 || opened[0] != "http://127.0.0.1:18080" {
@@ -667,7 +672,7 @@ func TestServiceGateOpensABrokenButRunningService(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate() {
+	if serviceGate(testGateSingleton) {
 		t.Fatal("the service gate let a launch with an installed service start its own server")
 	}
 	if len(opened) != 1 || opened[0] != "http://127.0.0.1:18080" {
@@ -714,7 +719,7 @@ func TestServiceGateStartsAStoppingServiceAfterItSettled(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate() {
+	if serviceGate(testGateSingleton) {
 		t.Fatal("the service gate let a launch with an installed service start its own server")
 	}
 	if len(launches) != 1 || launches[0].Action != serviceActionStart {
@@ -748,7 +753,7 @@ func TestServiceGateEndsAPendingLaunchWithoutAChoice(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate() {
+	if serviceGate(testGateSingleton) {
 		t.Fatal("the service gate let a launch with an installed service start its own server")
 	}
 	if len(*messages) != 1 {
@@ -782,11 +787,18 @@ func TestServiceGateUpdatesTheServiceWithTheElevatedHelper(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate() {
+	if serviceGate(testGateSingleton) {
 		t.Fatal("the service gate let a launch with an installed service start its own server")
 	}
 	if len(launches) != 1 || launches[0].Action != serviceActionUpdate {
 		t.Fatalf("the gate launched %v, want the update of the service", launches)
+	}
+	if launches[0].WaitPID != 0 {
+		t.Errorf("the update helper waits for the process %d, want no wait: the gate started no server", launches[0].WaitPID)
+	}
+	if launches[0].InstanceMutex != testGateSingleton {
+		t.Errorf("the update helper holds the singleton %q, want this launch's singleton %q",
+			launches[0].InstanceMutex, testGateSingleton)
 	}
 	if len(*messages) != 0 {
 		t.Errorf("the gate showed %v, want the helper to report the outcome", *messages)
@@ -812,7 +824,7 @@ func TestServiceGateCancelChangesNothing(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate() {
+	if serviceGate(testGateSingleton) {
 		t.Fatal("the service gate let a cancelled launch start its own server")
 	}
 	if len(*messages) != 0 {
@@ -834,7 +846,7 @@ func TestServiceGateReportsARefusedHelperLaunch(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate() {
+	if serviceGate(testGateSingleton) {
 		t.Fatal("the service gate let a launch with an installed service start its own server")
 	}
 	if len(*messages) != 1 {
@@ -1947,6 +1959,12 @@ func TestServiceHelperArgumentsNameTheActionAndHandover(t *testing.T) {
 	if want := "--service-action update"; update != want {
 		t.Errorf("the arguments are %q, want %q", update, want)
 	}
+	updateWithMutex := serviceHelperArguments(elevatedLaunch{
+		Action: serviceActionUpdate, InstanceMutex: `Local\HFDesk.Desktop.sid.1`,
+	})
+	if want := `--service-action update --instance-mutex Local\HFDesk.Desktop.sid.1`; updateWithMutex != want {
+		t.Errorf("the arguments are %q, want %q", updateWithMutex, want)
+	}
 }
 
 // TestServiceHelperInstallReportsAMissingConsoleProgram proves that the helper
@@ -2011,5 +2029,330 @@ func TestServiceHelperStartReportsTheAddress(t *testing.T) {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
 		}
+	}
+}
+
+// TestServiceHelperUpdateSingletonArgumentRules proves the helper accepts
+// exactly the update command line the gate sends — the singleton alone,
+// without a wait — and still refuses handover names without the process to
+// wait for, so no action gains a wait it did not have.
+func TestServiceHelperUpdateSingletonArgumentRules(t *testing.T) {
+	if err := validateServiceHandoverOptions(serviceActionUpdate,
+		ServiceActionOptions{Action: "update", InstanceMutex: `Local\m`}); err != nil {
+		t.Errorf("the update that carries only the singleton was rejected: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		action serviceAction
+		o      ServiceActionOptions
+	}{
+		{"update with event names but no process", serviceActionUpdate,
+			ServiceActionOptions{Action: "update", ReadyEvent: "ready", InstanceMutex: `Local\m`}},
+		{"update with a wait but no event names", serviceActionUpdate,
+			ServiceActionOptions{Action: "update", WaitPID: 4321}},
+		{"start with a singleton", serviceActionStart,
+			ServiceActionOptions{Action: "start", InstanceMutex: `Local\m`}},
+		{"install without a handover", serviceActionInstall,
+			ServiceActionOptions{Action: "install"}},
+	} {
+		if err := validateServiceHandoverOptions(tc.action, tc.o); err == nil {
+			t.Errorf("%s was accepted, want the refusal of incomplete handover arguments", tc.name)
+		}
+	}
+}
+
+// singletonObservingManager reports whether the per-session desktop singleton
+// exists at the moment the update mutation runs.
+type singletonObservingManager struct {
+	*fakeServiceManager
+	existedDuringInstall []bool
+}
+
+func (m *singletonObservingManager) Install(ctx context.Context, opts service.InstallOptions) (service.InstallOptions, error) {
+	lock, err := acquireInstanceLock()
+	existed := err == nil && lock.Exists()
+	if err == nil {
+		lock.Release()
+	}
+	m.existedDuringInstall = append(m.existedDuringInstall, existed)
+	return m.fakeServiceManager.Install(ctx, opts)
+}
+
+// TestServiceHelperUpdateHoldsTheDesktopSingletonThroughItsMutation proves
+// both sides of the update window: while the mutation runs, the per-session
+// singleton exists — a desktop launched in that window finds the running
+// instance instead of binding the address of the stopped service — and after
+// the report the singleton is gone again, so ordinary launches are not
+// refused. The hold is also proven to end before the final notice, the
+// release point of the established install mechanism.
+func TestServiceHelperUpdateHoldsTheDesktopSingletonThroughItsMutation(t *testing.T) {
+	name, err := instanceMutexName()
+	if err != nil {
+		t.Fatalf("read the per-session singleton name: %v", err)
+	}
+	// Both sides are only provable from a clean start: a leftover singleton
+	// would fail the release check for the wrong reason and could make the
+	// hold check pass without the helper.
+	probe, err := acquireInstanceLock()
+	if err != nil {
+		t.Fatalf("probe the per-session singleton before the update: %v", err)
+	}
+	if probe.Exists() {
+		probe.Release()
+		t.Skip("another desktop test or app owns the per-session singleton")
+	}
+	probe.Release()
+
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return `C:\portable\hfdesk.exe`, nil
+	})
+	stopped := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
+	manager := &singletonObservingManager{fakeServiceManager: &fakeServiceManager{
+		statuses: []service.Status{stopped, stopped},
+	}}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+
+	var messages []shownMessage
+	existedAtNotice := make([]bool, 0, 1)
+	replaceSeam(t, &showMessage, func(caption, text string, icon uint32) {
+		lock, lockErr := acquireInstanceLock()
+		existedAtNotice = append(existedAtNotice, lockErr == nil && lock.Exists())
+		if lockErr == nil {
+			lock.Release()
+		}
+		messages = append(messages, shownMessage{caption: caption, text: text, icon: icon})
+	})
+
+	if err := RunServiceAction(ServiceActionOptions{Action: "update", InstanceMutex: name}); err != nil {
+		t.Fatalf("the update that holds the singleton failed: %v", err)
+	}
+	if len(manager.existedDuringInstall) != 1 || !manager.existedDuringInstall[0] {
+		t.Fatalf("the singleton existed during the mutation = %v, want [true]: a desktop launched in that window would start a second server",
+			manager.existedDuringInstall)
+	}
+	if len(existedAtNotice) != 1 || existedAtNotice[0] {
+		t.Fatalf("the singleton existed when the final notice was shown = %v, want [false]: the hold must end before the notice",
+			existedAtNotice)
+	}
+	after, err := acquireInstanceLock()
+	if err != nil {
+		t.Fatalf("probe the per-session singleton after the update: %v", err)
+	}
+	if after.Exists() {
+		after.Release()
+		t.Fatal("the singleton survived the end of the update: a later launch would be refused as already running")
+	}
+	after.Release()
+	if len(messages) != 1 || messages[0].caption != serviceUpdatedCaption {
+		t.Fatalf("the helper showed %v, want the report of the finished update", messages)
+	}
+}
+
+// TestServiceHelperUpdateFailsWhenTheSingletonCannotBeHeld proves the update
+// fails closed when the singleton cannot be taken: an update that cannot hold
+// the window must not stop and restart an instance a relaunch could then bind.
+func TestServiceHelperUpdateFailsWhenTheSingletonCannotBeHeld(t *testing.T) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return `C:\portable\hfdesk.exe`, nil
+	})
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		t.Fatal("the update touched the service without holding the desktop singleton")
+		return nil, nil
+	})
+	messages := recordMessages(t)
+
+	// A name that cannot be encoded as a Windows object name makes the hold
+	// itself fail: the update must then refuse to touch the service.
+	err := RunServiceAction(ServiceActionOptions{Action: "update", InstanceMutex: "Local\x00invalid"})
+	if err == nil {
+		t.Fatal("the update ran although the singleton name could not be used")
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the helper showed %d message boxes, want the failure of the update", len(*messages))
+	}
+	if caption := serviceFailureCaption(serviceActionUpdate); (*messages)[0].caption != caption {
+		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
+	}
+	for _, want := range []string{"could not update", "hfdesk service status"} {
+		if !strings.Contains((*messages)[0].text, want) {
+			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+		}
+	}
+}
+
+// TestServiceHelperUpdateRejectsAVanishedRegistration proves a stopped-service
+// update never accepts a registration that is gone: StateNotInstalled is not
+// the settled stopped state the update waits for, so the action fails
+// immediately with the cause instead of reporting an update it cannot verify.
+func TestServiceHelperUpdateRejectsAVanishedRegistration(t *testing.T) {
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return `C:\portable\hfdesk.exe`, nil
+	})
+	manager := &fakeServiceManager{statuses: []service.Status{
+		runningServiceStatus(service.StateStopped, "127.0.0.1:18080"),
+		{State: service.StateNotInstalled},
+	}}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	if err := RunServiceAction(ServiceActionOptions{Action: "update"}); err == nil {
+		t.Fatal("the update succeeded although the registration is gone")
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the helper showed %d message boxes, want the failure of the update", len(*messages))
+	}
+	if caption := serviceFailureCaption(serviceActionUpdate); (*messages)[0].caption != caption {
+		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
+	}
+	for _, want := range []string{"could not update", "registration of the service is gone", "hfdesk service status"} {
+		if !strings.Contains((*messages)[0].text, want) {
+			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+		}
+	}
+}
+
+// TestServiceHelperStartRejectsAVanishedRegistration proves the same rule for
+// the start action: a registration that disappears before the start is
+// confirmed is named as gone instead of being waited out until the verify
+// budget ends with a state the machine no longer has.
+func TestServiceHelperStartRejectsAVanishedRegistration(t *testing.T) {
+	manager := &fakeServiceManager{statuses: []service.Status{
+		runningServiceStatus(service.StateStopped, "127.0.0.1:18080"),
+		{State: service.StateNotInstalled},
+	}}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	if err := RunServiceAction(ServiceActionOptions{Action: "start"}); err == nil {
+		t.Fatal("the start succeeded although the registration is gone")
+	}
+	if len(*messages) != 1 || !strings.Contains((*messages)[0].text, "registration of the service is gone") {
+		t.Fatalf("the helper showed %v, want the report of the vanished registration", *messages)
+	}
+}
+
+// TestServiceGateRechecksTheStateBeforeDesktopMode proves the desktop mode is
+// admitted only for a state that is still positively stopped when the choice
+// is honored: the dialog is modal, and a service another actor started while
+// it was open would serve the address this launch binds.
+func TestServiceGateRechecksTheStateBeforeDesktopMode(t *testing.T) {
+	reads := 0
+	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+		reads++
+		if reads == 1 {
+			return runningServiceStatus(service.StateStopped, "127.0.0.1:18080"), nil
+		}
+		return runningServiceStatus(service.StateRunning, "127.0.0.1:18080"), nil
+	})
+	replaceSeam(t, &showServiceChoice, func(serviceChoicePrompt) serviceChoice {
+		return serviceChoiceDesktop
+	})
+	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+		t.Fatal("the gate launched a helper for a launch that ends without a server")
+		return 0, nil
+	})
+	replaceSeam(t, &openBrowser, func(string) error {
+		t.Fatal("the gate opened a browser although this launch starts no server")
+		return nil
+	})
+	messages := recordMessages(t)
+
+	if serviceGate(testGateSingleton) {
+		t.Fatal("the gate admitted desktop mode although the service was started while the dialog was open")
+	}
+	if reads != 2 {
+		t.Errorf("the gate read the state %d times, want the original read and the re-check", reads)
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the gate showed %v, want the notice of the changed state", *messages)
+	}
+	if caption := serviceGateChangedCaption; (*messages)[0].caption != caption {
+		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
+	}
+	for _, want := range []string{"changed while the dialog was open", "running now", "started no server", "hfdesk service status"} {
+		if !strings.Contains((*messages)[0].text, want) {
+			t.Errorf("the notice %q does not mention %q", (*messages)[0].text, want)
+		}
+	}
+}
+
+// TestServiceGateStopsWhenTheRecheckIsNotPositivelyStopped covers the other
+// re-read outcomes: a registration that is gone, a state that cannot be read
+// again and a state still in transition are all not the positively confirmed
+// stopped service the dialog asked about, so none of them admits a server and
+// each is reported with its own honest notice.
+func TestServiceGateStopsWhenTheRecheckIsNotPositivelyStopped(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		second    service.Status
+		secondErr error
+		timeout   time.Duration
+		caption   string
+		want      string
+	}{
+		{
+			name:    "registration removed while the dialog was open",
+			second:  service.Status{State: service.StateNotInstalled},
+			caption: serviceGateChangedCaption,
+			want:    "no longer registered",
+		},
+		{
+			name:      "state unreadable while the dialog was open",
+			secondErr: errors.New("the service control manager did not answer"),
+			caption:   serviceGateUnreadableCaption,
+			want:      "hfdesk service status",
+		},
+		{
+			name:    "service still starting when the dialog closed",
+			second:  runningServiceStatus(service.StateStarting, "127.0.0.1:18080"),
+			timeout: 50 * time.Millisecond,
+			caption: serviceGatePendingCaption,
+			want:    "still starting",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reads := 0
+			replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+				reads++
+				if reads == 1 {
+					return runningServiceStatus(service.StateStopped, "127.0.0.1:18080"), nil
+				}
+				return tc.second, tc.secondErr
+			})
+			if tc.timeout != 0 {
+				replaceSeam(t, &serviceStatusTimeout, tc.timeout)
+			}
+			replaceSeam(t, &showServiceChoice, func(serviceChoicePrompt) serviceChoice {
+				return serviceChoiceDesktop
+			})
+			replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+				t.Fatal("the gate launched a helper for a launch that ends without a server")
+				return 0, nil
+			})
+			replaceSeam(t, &openBrowser, func(string) error {
+				t.Fatal("the gate opened a browser although this launch starts no server")
+				return nil
+			})
+			messages := recordMessages(t)
+
+			if serviceGate(testGateSingleton) {
+				t.Fatal("the gate admitted desktop mode although the re-read state is not positively stopped")
+			}
+			if len(*messages) != 1 {
+				t.Fatalf("the gate showed %v, want one honest notice", *messages)
+			}
+			if (*messages)[0].caption != tc.caption {
+				t.Errorf("the caption is %q, want %q", (*messages)[0].caption, tc.caption)
+			}
+			if !strings.Contains((*messages)[0].text, tc.want) {
+				t.Errorf("the notice %q does not mention %q", (*messages)[0].text, tc.want)
+			}
+		})
 	}
 }

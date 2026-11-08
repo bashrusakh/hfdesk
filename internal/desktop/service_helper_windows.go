@@ -102,6 +102,22 @@ func RunServiceAction(o ServiceActionOptions) error {
 		// Authorization is settled: only the singleton outlives it, through
 		// the service mutation, and is released before the final notice.
 		handover.releaseAuthorizationHandles()
+	} else if action == serviceActionUpdate && strings.TrimSpace(o.InstanceMutex) != "" {
+		// The gate that asked for this update ended without a handover —
+		// nothing waits for a desktop exit — but the mutation still needs
+		// the singleton: it stops and restarts a running instance, and a
+		// relaunch in that window would find a positively stopped service
+		// and could bind the address the instance needs. The hold starts
+		// before any mutation and ends with the action: the reporter paths
+		// release it before the final notice, and the deferred close covers
+		// every other return.
+		mutex, holdErr := holdDesktopSingleton(o.InstanceMutex)
+		if holdErr != nil {
+			(&serviceActionReporter{action: action}).failure(holdErr, "")
+			return holdErr
+		}
+		handover = &helperHandover{mutex: mutex}
+		defer handover.close()
 	}
 	return runServiceAction(action, o.Version, &serviceActionReporter{action: action, handover: handover})
 }
@@ -116,6 +132,15 @@ func validateServiceHandoverOptions(action serviceAction, o ServiceActionOptions
 		if action == serviceActionInstall {
 			return errors.New("desktop: service installation requires a graceful desktop handover")
 		}
+		return nil
+	}
+	// An update carries the singleton identity alone: it holds the desktop
+	// singleton through its mutation without waiting for a desktop exit,
+	// because the gate that asked for it already ended. Every other
+	// combination still needs the complete install handover below.
+	if action == serviceActionUpdate && o.WaitPID == 0 &&
+		strings.TrimSpace(o.ReadyEvent) == "" && strings.TrimSpace(o.SuccessEvent) == "" &&
+		strings.TrimSpace(o.InstanceMutex) != "" {
 		return nil
 	}
 	if action != serviceActionInstall || o.WaitPID <= 0 ||
@@ -227,6 +252,13 @@ func updateWindowsService(reporter *serviceActionReporter, version string) error
 	}
 	status, err := waitForServiceState(ctx, manager, wasRunning)
 	if err != nil {
+		if errors.Is(err, errServiceRegistrationGone) {
+			// The registration disappeared while the update ran: the report
+			// names that fact instead of a state the machine no longer has,
+			// and never claims an update that cannot be verified.
+			reporter.failure(err, opts.Executable)
+			return err
+		}
 		expected := "stopped"
 		if wasRunning {
 			expected = "running"
@@ -330,12 +362,24 @@ func verifiedVersion(installed service.InstallOptions) string {
 	return installed.ExpectedVersion
 }
 
+// errServiceRegistrationGone reports a service whose registration disappeared
+// while an action was verifying the state it expected: a machine without a
+// registration has no state the action could confirm, so the action fails
+// honestly instead of accepting "not installed" as the settled stopped state
+// a stopped-service update waits for.
+var errServiceRegistrationGone = errors.New(
+	"the registration of the service is gone: HFDesk is no longer registered as a Windows service")
+
 // waitForServiceState waits for the service to reach the expected state.
 //
 // The wait ends as soon as the service reached a settled state that matches the
 // expectation, so an action that already holds does not wait. A pending state is
 // not a result: a started instance is reported as starting first, and the
 // caller reports what it read after the instance settled.
+//
+// A registration that is gone is not a result either: StateNotInstalled never
+// matches the expectation, whatever the action waits for, and is rejected as
+// soon as it is read instead of being treated as a settled non-running state.
 //
 // The expectation is checked against the supervisor's running fact: a
 // registration whose program is gone is reported as broken while its process
@@ -346,6 +390,9 @@ func waitForServiceState(ctx context.Context, manager service.Manager, wantRunni
 		status, err := manager.Status(ctx)
 		if err != nil {
 			return status, fmt.Errorf("the state of the service cannot be read: %w", err)
+		}
+		if status.State == service.StateNotInstalled {
+			return status, errServiceRegistrationGone
 		}
 		if serviceStatusRunning(status) == wantRunning && serviceStateSettled(status.State) {
 			return status, nil

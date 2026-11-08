@@ -36,7 +36,8 @@ type elevatedLaunch struct {
 	// Action is the service action of the helper.
 	Action serviceAction
 	// WaitPID is the original desktop process for an install handover.
-	// Zero leaves start and update actions on their ordinary path.
+	// Zero leaves start on its ordinary path; an update may still carry
+	// InstanceMutex alone.
 	WaitPID int
 	// ReadyEvent and SuccessEvent are the per-attempt handover event names.
 	ReadyEvent   string
@@ -192,15 +193,21 @@ func shellExecuteElevatedProcess(l elevatedLaunch) (*elevatedProcess, error) {
 // serviceHelperArguments returns the command line of the elevated helper.
 //
 // Install carries the process, event names, and existing singleton identity of
-// its handover. Start and update carry no wait state.
+// its handover. An update from the service gate carries the singleton identity
+// alone: its mutation stops and restarts a running instance after the launching
+// desktop ended, so the helper holds the singleton across that window without
+// waiting for an exit. Start carries no wait state.
 func serviceHelperArguments(l elevatedLaunch) string {
 	args := []string{"--service-action", string(l.Action)}
-	if l.WaitPID > 0 {
+	switch {
+	case l.WaitPID > 0:
 		args = append(args,
 			"--wait-pid", strconv.Itoa(l.WaitPID),
 			"--handover-ready-event", l.ReadyEvent,
 			"--handover-success-event", l.SuccessEvent,
 			"--instance-mutex", l.InstanceMutex)
+	case strings.TrimSpace(l.InstanceMutex) != "":
+		args = append(args, "--instance-mutex", l.InstanceMutex)
 	}
 	return strings.Join(args, " ")
 }

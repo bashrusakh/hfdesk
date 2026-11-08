@@ -82,7 +82,10 @@ func lookupServiceStatus(ctx context.Context) (service.Status, error) {
 // A service that is starting or stopping is not a state to decide on, so the
 // gate waits for it to settle first; one that did not settle within the budget
 // is reported with a notice and ends the launch as well.
-func serviceGate() bool {
+//
+// instanceMutex is the per-session singleton of this launch: the update choice
+// hands it to the elevated helper, whose mutation outlives this process.
+func serviceGate(instanceMutex string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceStatusTimeout)
 	defer cancel()
 
@@ -139,8 +142,42 @@ func serviceGate() bool {
 				"state", string(prompt.State))
 			return false
 		}
+		// The dialog is modal: while it was open, another actor may have
+		// started the service, and the snapshot the dialog was built from
+		// cannot admit a server next to a service that now serves the same
+		// address. The state is therefore read again — with a fresh
+		// budget, because the dialog itself may have consumed the budget
+		// of this launch — and only a state that is still positively
+		// stopped continues. An unreadable or pending re-read is not a
+		// confirmed stopped service and ends the launch with its notice.
+		recheckCtx, recheckCancel := context.WithTimeout(context.Background(), serviceStatusTimeout)
+		fresh, err := serviceGateStatus(recheckCtx)
+		recheckCancel()
+		if err != nil {
+			if errors.Is(err, errServiceGatePending) {
+				desktopLog.Info("the service changed while the dialog was open: this launch starts no server",
+					"state", string(fresh.State))
+				showMessage(serviceGatePendingCaption,
+					serviceGatePendingText(fresh.State), windows.MB_ICONINFORMATION)
+				return false
+			}
+			desktopLog.Error("the service state could not be read again after the desktop-mode choice: this launch starts no server",
+				"error", err)
+			showMessage(serviceGateUnreadableCaption,
+				serviceGateUnreadableText(err), windows.MB_ICONERROR)
+			return false
+		}
+		freshPrompt := serviceChoicePrompt{State: fresh.State, Running: fresh.Running}
+		if !servicePromptStopped(freshPrompt) {
+			desktopLog.Info("the service state changed while the dialog was open: this launch starts no server",
+				"state", string(fresh.State),
+				"running", fresh.Running)
+			showMessage(serviceGateChangedCaption,
+				serviceGateChangedText(freshPrompt), windows.MB_ICONINFORMATION)
+			return false
+		}
 		desktopLog.Info("the launch continues in desktop mode: the service stays stopped and the registration is untouched",
-			"state", string(prompt.State))
+			"state", string(freshPrompt.State))
 		return true
 	case serviceChoiceOpen:
 		// The URL is derived again from the registration: the dialog only
@@ -155,13 +192,17 @@ func serviceGate() bool {
 			reportBrowserFailure(url, err)
 		}
 	case serviceChoiceStart:
-		if _, err := launchServiceHelper(serviceActionStart, 0); err != nil {
+		if _, err := launchServiceHelper(serviceActionStart, 0, ""); err != nil {
 			reportServiceLaunchFailure(serviceActionStart, err)
 		}
 	case serviceChoiceUpdate:
 		// The gate started no server, so nothing holds the listen address
-		// and the helper has nothing to wait for.
-		if _, err := launchServiceHelper(serviceActionUpdate, 0); err != nil {
+		// and the helper has nothing to wait for. The singleton is
+		// different from that address: the update stops and restarts a
+		// running instance after this launch has ended, so the helper
+		// holds this launch's singleton through the whole mutation,
+		// including a rollback and the restart.
+		if _, err := launchServiceHelper(serviceActionUpdate, 0, instanceMutex); err != nil {
 			reportServiceLaunchFailure(serviceActionUpdate, err)
 		}
 	default:
@@ -304,15 +345,19 @@ func desktopExecutable() (string, error) {
 // desktop never implements a second service client, and the helper runs the
 // same actions the user would run from a console. The process id of the helper
 // is returned, so the caller can record which helper performs the action.
-func launchServiceHelper(action serviceAction, waitPID int) (uint32, error) {
+//
+// instanceMutex is handed to an update, which holds that desktop singleton
+// through its mutation; every other action carries no wait state.
+func launchServiceHelper(action serviceAction, waitPID int, instanceMutex string) (uint32, error) {
 	executable, err := desktopExecutable()
 	if err != nil {
 		return 0, err
 	}
 	pid, err := launchElevated(elevatedLaunch{
-		Executable: executable,
-		Action:     action,
-		WaitPID:    waitPID,
+		Executable:    executable,
+		Action:        action,
+		WaitPID:       waitPID,
+		InstanceMutex: instanceMutex,
 	})
 	if err != nil {
 		return 0, err

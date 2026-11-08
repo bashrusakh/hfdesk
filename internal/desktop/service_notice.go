@@ -33,6 +33,11 @@ const (
 	// launch that could not read the registration of the service.
 	serviceGateUnreadableCaption = "HFDesk - the service state cannot be read"
 
+	// serviceGateChangedCaption is the caption of the notice of a launch
+	// that chose the desktop mode for a stopped service and then re-read a
+	// state that is no longer positively stopped.
+	serviceGateChangedCaption = "HFDesk - the service state changed"
+
 	// serviceSiblingMissingCaption is the caption of the notice that the
 	// console program of the service is missing.
 	serviceSiblingMissingCaption = "HFDesk - the hfdesk program is missing"
@@ -173,6 +178,42 @@ func serviceGateUnreadableText(err error) string {
 	return text + "An HFDesk service may be installed and running on this machine. " +
 		"This launch started no server of its own, so it cannot compete with that instance for the same address.\n\n" +
 		"Check the service state with \"hfdesk service status\" from an elevated shell, then start the desktop app again."
+}
+
+// serviceGateChangedText returns the text of the notice of a launch that
+// chose the desktop mode for a positively confirmed stopped service and then
+// re-read a state that is no longer that.
+//
+// The dialog is modal and can outlive the snapshot it was built from: a
+// service another actor started in the meantime would serve the address this
+// launch binds, so the launch does not continue. The text is the result (no
+// server was started), the cause (the state the re-read reported) and one
+// next action (the command that reads the state before trying again).
+func serviceGateChangedText(prompt serviceChoicePrompt) string {
+	return "The state of the HFDesk service changed while the dialog was open.\n\n" +
+		"It is " + serviceGateStatePhrase(prompt) + " now, so this launch did not continue into desktop mode: " +
+		"it started no server of its own, so two instances never compete for the same address.\n\n" +
+		"Check the state with \"hfdesk service status\" from an elevated shell, then start the desktop app again."
+}
+
+// serviceGateStatePhrase describes the state of a prompt for a notice of the
+// gate. A prompt that is not the positively confirmed stopped one is named by
+// the fact that decides it: the running fact first, then the diagnosed state.
+func serviceGateStatePhrase(prompt serviceChoicePrompt) string {
+	switch {
+	case servicePromptRunning(prompt):
+		return "running"
+	case prompt.State == service.StateNotInstalled:
+		return "no longer registered"
+	case prompt.State == service.StateFailed:
+		return "in a failed state"
+	case prompt.State == service.StateBroken:
+		return "reported as broken"
+	case prompt.State == service.StateUnknown:
+		return "in an unknown state"
+	default:
+		return string(prompt.State)
+	}
 }
 
 // serviceGateOpenLabel returns the label of the open/start button of the

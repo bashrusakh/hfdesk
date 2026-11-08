@@ -598,8 +598,12 @@ replaces the other.
   server of its own and publishes no state, except when a positively confirmed
   stopped service is answered with **Work in desktop mode**, the default
   button. That answer continues the launch exactly like a launch without a
-  registration; every other answer ends it before anything serves. The gate
-  never starts the service and never changes the registration.
+  registration — and it is honored only after the service state is read again
+  when the answer is taken: the dialog is modal, so a service that is no
+  longer positively stopped at that re-read ends the launch with a notice
+  instead of binding the address the service now needs. Every other answer
+  ends it before anything serves. The gate never starts the service and never
+  changes the registration.
 
   | Registered state | Buttons |
   |---|---|
