@@ -62,6 +62,12 @@ func preflightExecutableImage(executable string) error {
 	return preflightExecutableImageWithSupport(executable, scmWindowsExecutableSupport)
 }
 
+// PreflightExecutableImage runs the installation's executable-image preflight
+// without mutating anything.
+func PreflightExecutableImage(executable string) error {
+	return preflightExecutableImage(executable)
+}
+
 func preflightExecutableImageWithSupport(executable string, support func(uint16) scmExecutableSupport) error {
 	return preflightExecutableImageUsing(executable, pe.ExecutableMachine, support)
 }

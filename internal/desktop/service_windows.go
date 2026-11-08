@@ -192,7 +192,11 @@ func serviceGate(instanceMutex string) bool {
 			reportBrowserFailure(url, err)
 		}
 	case serviceChoiceStart:
-		if _, err := launchServiceHelper(serviceActionStart, 0, ""); err != nil {
+		// The start takes the service out of the positively stopped state
+		// this gate decided on, so the helper holds this launch's singleton
+		// through the start: a relaunch in that window must not bind the
+		// address the starting instance needs.
+		if _, err := launchServiceHelper(serviceActionStart, 0, instanceMutex); err != nil {
 			reportServiceLaunchFailure(serviceActionStart, err)
 		}
 	case serviceChoiceUpdate:
@@ -346,8 +350,8 @@ func desktopExecutable() (string, error) {
 // same actions the user would run from a console. The process id of the helper
 // is returned, so the caller can record which helper performs the action.
 //
-// instanceMutex is handed to an update, which holds that desktop singleton
-// through its mutation; every other action carries no wait state.
+// instanceMutex is handed to an update or a start, which hold that desktop
+// singleton through their mutation; every other action carries no wait state.
 func launchServiceHelper(action serviceAction, waitPID int, instanceMutex string) (uint32, error) {
 	executable, err := desktopExecutable()
 	if err != nil {

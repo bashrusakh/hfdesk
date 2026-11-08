@@ -7,6 +7,7 @@ package desktop
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -40,6 +41,93 @@ func replaceSeam[T any](t *testing.T, seam *T, value T) {
 // the update choice hands it to the helper, and the tests that never launch a
 // helper only carry it through.
 const testGateSingleton = `Local\HFDesk.Test.Gate.1`
+
+// requireFreeSingleton returns the name of the per-session singleton and skips
+// the test when another owner holds it: both sides of a hold check are only
+// provable from a clean start, or a leftover would fail the release check for
+// the wrong reason and could make the hold check pass without the action.
+func requireFreeSingleton(t *testing.T) string {
+	t.Helper()
+	name, err := instanceMutexName()
+	if err != nil {
+		t.Fatalf("read the per-session singleton name: %v", err)
+	}
+	probe, err := acquireInstanceLock()
+	if err != nil {
+		t.Fatalf("probe the per-session singleton: %v", err)
+	}
+	if probe.Exists() {
+		probe.Release()
+		t.Skip("another desktop test or app owns the per-session singleton")
+	}
+	probe.Release()
+	return name
+}
+
+// recordMessagesWithSingletonProbe replaces the message box with a recorder
+// that also notes, per message, whether the singleton still existed when the
+// box was shown: the hold has to end before the final notice.
+func recordMessagesWithSingletonProbe(t *testing.T) (*[]shownMessage, *[]bool) {
+	t.Helper()
+	messages := &[]shownMessage{}
+	existedAtNotice := &[]bool{}
+	replaceSeam(t, &showMessage, func(caption, text string, icon uint32) {
+		lock, err := acquireInstanceLock()
+		*existedAtNotice = append(*existedAtNotice, err == nil && lock.Exists())
+		if err == nil {
+			lock.Release()
+		}
+		*messages = append(*messages, shownMessage{caption: caption, text: text, icon: icon})
+	})
+	return messages, existedAtNotice
+}
+
+// requireSingletonReleased fails the test when the singleton survived the end
+// of the action: a later launch would be refused as already running.
+func requireSingletonReleased(t *testing.T) {
+	t.Helper()
+	after, err := acquireInstanceLock()
+	if err != nil {
+		t.Fatalf("probe the per-session singleton after the action: %v", err)
+	}
+	if after.Exists() {
+		after.Release()
+		t.Fatal("the singleton survived the end of the action: a later launch would be refused as already running")
+	}
+	after.Release()
+}
+
+// testPEMachineIA64 is a PE machine type no x86-64 Windows executes.
+const testPEMachineIA64 = 0x0200
+
+// testPEImage writes a structurally complete minimal PE image with the given
+// COFF machine into the temp folder of the test and returns its path: DOS
+// header, PE signature + COFF header, a PE32+ optional header without data
+// directories and one section header without raw data — the minimum the
+// image reader of the service layer accepts before it reports the machine.
+func testPEImage(t *testing.T, machine uint16) string {
+	t.Helper()
+	const (
+		peOffset     = 64
+		optionalSize = 112
+	)
+	image := make([]byte, peOffset+24+optionalSize+40)
+	image[0], image[1] = 'M', 'Z'
+	binary.LittleEndian.PutUint32(image[0x3C:], peOffset)
+	copy(image[peOffset:], []byte{'P', 'E', 0, 0})
+	binary.LittleEndian.PutUint16(image[peOffset+4:], machine)
+	binary.LittleEndian.PutUint16(image[peOffset+6:], 1)
+	binary.LittleEndian.PutUint16(image[peOffset+20:], optionalSize)
+	binary.LittleEndian.PutUint16(image[peOffset+22:], 0x0002) // executable image
+	optional := image[peOffset+24:]
+	binary.LittleEndian.PutUint16(optional, 0x20B) // PE32+
+	binary.LittleEndian.PutUint32(optional[16:], 1)
+	path := filepath.Join(t.TempDir(), "hfdesk.exe")
+	if err := os.WriteFile(path, image, 0o644); err != nil {
+		t.Fatalf("write the PE fixture: %v", err)
+	}
+	return path
+}
 
 // fakeServiceManager records the calls of the service helper.
 //
@@ -462,6 +550,10 @@ func TestServiceGateStartsAStoppedServiceWithTheElevatedHelper(t *testing.T) {
 	}
 	if launches[0].WaitPID != 0 {
 		t.Errorf("the helper waits for the process %d, want no wait: the gate started no server", launches[0].WaitPID)
+	}
+	if launches[0].InstanceMutex != testGateSingleton {
+		t.Errorf("the start helper holds the singleton %q, want this launch's singleton %q",
+			launches[0].InstanceMutex, testGateSingleton)
 	}
 	if self, err := os.Executable(); err != nil {
 		t.Fatalf("read the path of the desktop executable: %v", err)
@@ -1663,11 +1755,20 @@ func TestServiceHelperKeepsAnUnconfirmedCleanupResult(t *testing.T) {
 	}
 }
 
+// stubConsoleProgram points the console-program lookup at a real executable
+// the image preflight accepts: the test binary of this process.
+func stubConsoleProgram(t *testing.T) {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("read the test executable: %v", err)
+	}
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) { return self, nil })
+}
+
 func TestServiceHelperRequiresBothSuccessfulShutdownAndDesktopExit(t *testing.T) {
 	replaceSeam(t, &serviceVerifyBudget, 100*time.Millisecond)
-	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
-		return `C:\portable\hfdesk.exe`, nil
-	})
+	stubConsoleProgram(t)
 	manager := &fakeServiceManager{}
 	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
 		return manager, nil
@@ -1711,6 +1812,7 @@ func TestServiceHelperRequiresBothSuccessfulShutdownAndDesktopExit(t *testing.T)
 }
 
 func TestServiceHelperRejectsDesktopExitWithoutSuccessfulShutdown(t *testing.T) {
+	stubConsoleProgram(t)
 	handover := testHelperHandover(t)
 	replaceSeam(t, &prepareHelperHandover, func(ServiceActionOptions) (*helperHandover, error) { return handover, nil })
 	manager := &fakeServiceManager{}
@@ -1749,6 +1851,7 @@ func TestServiceHelperRejectsDesktopExitWithoutSuccessfulShutdown(t *testing.T) 
 func TestServiceHelperDoesNotReviveAfterHandoverTimeout(t *testing.T) {
 	replaceSeam(t, &serviceWaitBudget, 50*time.Millisecond)
 	replaceSeam(t, &serviceParentExitBudget, 50*time.Millisecond)
+	stubConsoleProgram(t)
 	handover := testHelperHandover(t)
 	lateParent := duplicateTestHandle(t, handover.parent)
 	lateSuccess := duplicateTestHandle(t, handover.success)
@@ -2032,14 +2135,24 @@ func TestServiceHelperStartReportsTheAddress(t *testing.T) {
 	}
 }
 
-// TestServiceHelperUpdateSingletonArgumentRules proves the helper accepts
-// exactly the update command line the gate sends — the singleton alone,
+// TestServiceHelperSingletonArgumentRules proves the helper accepts exactly
+// the gate command lines — update and start carrying the singleton alone,
 // without a wait — and still refuses handover names without the process to
 // wait for, so no action gains a wait it did not have.
-func TestServiceHelperUpdateSingletonArgumentRules(t *testing.T) {
-	if err := validateServiceHandoverOptions(serviceActionUpdate,
-		ServiceActionOptions{Action: "update", InstanceMutex: `Local\m`}); err != nil {
-		t.Errorf("the update that carries only the singleton was rejected: %v", err)
+func TestServiceHelperSingletonArgumentRules(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		action serviceAction
+		o      ServiceActionOptions
+	}{
+		{"update carries the singleton alone", serviceActionUpdate,
+			ServiceActionOptions{Action: "update", InstanceMutex: `Local\m`}},
+		{"start carries the singleton alone", serviceActionStart,
+			ServiceActionOptions{Action: "start", InstanceMutex: `Local\m`}},
+	} {
+		if err := validateServiceHandoverOptions(tc.action, tc.o); err != nil {
+			t.Errorf("%s was rejected: %v", tc.name, err)
+		}
 	}
 	for _, tc := range []struct {
 		name   string
@@ -2050,8 +2163,8 @@ func TestServiceHelperUpdateSingletonArgumentRules(t *testing.T) {
 			ServiceActionOptions{Action: "update", ReadyEvent: "ready", InstanceMutex: `Local\m`}},
 		{"update with a wait but no event names", serviceActionUpdate,
 			ServiceActionOptions{Action: "update", WaitPID: 4321}},
-		{"start with a singleton", serviceActionStart,
-			ServiceActionOptions{Action: "start", InstanceMutex: `Local\m`}},
+		{"install with the singleton alone", serviceActionInstall,
+			ServiceActionOptions{Action: "install", InstanceMutex: `Local\m`}},
 		{"install without a handover", serviceActionInstall,
 			ServiceActionOptions{Action: "install"}},
 	} {
@@ -2062,20 +2175,29 @@ func TestServiceHelperUpdateSingletonArgumentRules(t *testing.T) {
 }
 
 // singletonObservingManager reports whether the per-session desktop singleton
-// exists at the moment the update mutation runs.
+// exists at the moment the service mutation runs.
 type singletonObservingManager struct {
 	*fakeServiceManager
-	existedDuringInstall []bool
+	existedDuringMutation []bool
 }
 
-func (m *singletonObservingManager) Install(ctx context.Context, opts service.InstallOptions) (service.InstallOptions, error) {
+func (m *singletonObservingManager) observe() {
 	lock, err := acquireInstanceLock()
 	existed := err == nil && lock.Exists()
 	if err == nil {
 		lock.Release()
 	}
-	m.existedDuringInstall = append(m.existedDuringInstall, existed)
+	m.existedDuringMutation = append(m.existedDuringMutation, existed)
+}
+
+func (m *singletonObservingManager) Install(ctx context.Context, opts service.InstallOptions) (service.InstallOptions, error) {
+	m.observe()
 	return m.fakeServiceManager.Install(ctx, opts)
+}
+
+func (m *singletonObservingManager) Start(ctx context.Context) error {
+	m.observe()
+	return m.fakeServiceManager.Start(ctx)
 }
 
 // TestServiceHelperUpdateHoldsTheDesktopSingletonThroughItsMutation proves
@@ -2086,22 +2208,7 @@ func (m *singletonObservingManager) Install(ctx context.Context, opts service.In
 // refused. The hold is also proven to end before the final notice, the
 // release point of the established install mechanism.
 func TestServiceHelperUpdateHoldsTheDesktopSingletonThroughItsMutation(t *testing.T) {
-	name, err := instanceMutexName()
-	if err != nil {
-		t.Fatalf("read the per-session singleton name: %v", err)
-	}
-	// Both sides are only provable from a clean start: a leftover singleton
-	// would fail the release check for the wrong reason and could make the
-	// hold check pass without the helper.
-	probe, err := acquireInstanceLock()
-	if err != nil {
-		t.Fatalf("probe the per-session singleton before the update: %v", err)
-	}
-	if probe.Exists() {
-		probe.Release()
-		t.Skip("another desktop test or app owns the per-session singleton")
-	}
-	probe.Release()
+	name := requireFreeSingleton(t)
 
 	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
@@ -2113,72 +2220,98 @@ func TestServiceHelperUpdateHoldsTheDesktopSingletonThroughItsMutation(t *testin
 	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
 		return manager, nil
 	})
-
-	var messages []shownMessage
-	existedAtNotice := make([]bool, 0, 1)
-	replaceSeam(t, &showMessage, func(caption, text string, icon uint32) {
-		lock, lockErr := acquireInstanceLock()
-		existedAtNotice = append(existedAtNotice, lockErr == nil && lock.Exists())
-		if lockErr == nil {
-			lock.Release()
-		}
-		messages = append(messages, shownMessage{caption: caption, text: text, icon: icon})
-	})
+	messages, existedAtNotice := recordMessagesWithSingletonProbe(t)
 
 	if err := RunServiceAction(ServiceActionOptions{Action: "update", InstanceMutex: name}); err != nil {
 		t.Fatalf("the update that holds the singleton failed: %v", err)
 	}
-	if len(manager.existedDuringInstall) != 1 || !manager.existedDuringInstall[0] {
+	if len(manager.existedDuringMutation) != 1 || !manager.existedDuringMutation[0] {
 		t.Fatalf("the singleton existed during the mutation = %v, want [true]: a desktop launched in that window would start a second server",
-			manager.existedDuringInstall)
+			manager.existedDuringMutation)
 	}
-	if len(existedAtNotice) != 1 || existedAtNotice[0] {
+	if len(*existedAtNotice) != 1 || (*existedAtNotice)[0] {
 		t.Fatalf("the singleton existed when the final notice was shown = %v, want [false]: the hold must end before the notice",
-			existedAtNotice)
+			*existedAtNotice)
 	}
-	after, err := acquireInstanceLock()
-	if err != nil {
-		t.Fatalf("probe the per-session singleton after the update: %v", err)
-	}
-	if after.Exists() {
-		after.Release()
-		t.Fatal("the singleton survived the end of the update: a later launch would be refused as already running")
-	}
-	after.Release()
-	if len(messages) != 1 || messages[0].caption != serviceUpdatedCaption {
-		t.Fatalf("the helper showed %v, want the report of the finished update", messages)
+	requireSingletonReleased(t)
+	if len(*messages) != 1 || (*messages)[0].caption != serviceUpdatedCaption {
+		t.Fatalf("the helper showed %v, want the report of the finished update", *messages)
 	}
 }
 
-// TestServiceHelperUpdateFailsWhenTheSingletonCannotBeHeld proves the update
-// fails closed when the singleton cannot be taken: an update that cannot hold
-// the window must not stop and restart an instance a relaunch could then bind.
-func TestServiceHelperUpdateFailsWhenTheSingletonCannotBeHeld(t *testing.T) {
-	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
-		return `C:\portable\hfdesk.exe`, nil
-	})
-	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
-		t.Fatal("the update touched the service without holding the desktop singleton")
-		return nil, nil
-	})
-	messages := recordMessages(t)
+// TestServiceHelperStartHoldsTheDesktopSingletonThroughItsMutation is the
+// same both-sides proof for the gate's start: the start takes the service out
+// of the positively stopped state the gate decided on, so the singleton has
+// to exist while the start runs and to be gone again after the report.
+func TestServiceHelperStartHoldsTheDesktopSingletonThroughItsMutation(t *testing.T) {
+	name := requireFreeSingleton(t)
 
-	// A name that cannot be encoded as a Windows object name makes the hold
-	// itself fail: the update must then refuse to touch the service.
-	err := RunServiceAction(ServiceActionOptions{Action: "update", InstanceMutex: "Local\x00invalid"})
-	if err == nil {
-		t.Fatal("the update ran although the singleton name could not be used")
+	stopped := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
+	running := runningServiceStatus(service.StateRunning, "127.0.0.1:18080")
+	manager := &singletonObservingManager{fakeServiceManager: &fakeServiceManager{
+		statuses: []service.Status{stopped, running},
+	}}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages, existedAtNotice := recordMessagesWithSingletonProbe(t)
+
+	if err := RunServiceAction(ServiceActionOptions{Action: "start", InstanceMutex: name}); err != nil {
+		t.Fatalf("the start that holds the singleton failed: %v", err)
 	}
-	if len(*messages) != 1 {
-		t.Fatalf("the helper showed %d message boxes, want the failure of the update", len(*messages))
+	if manager.starts != 1 {
+		t.Fatalf("the helper started the service %d times, want one start", manager.starts)
 	}
-	if caption := serviceFailureCaption(serviceActionUpdate); (*messages)[0].caption != caption {
-		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
+	if len(manager.existedDuringMutation) != 1 || !manager.existedDuringMutation[0] {
+		t.Fatalf("the singleton existed during the start = %v, want [true]: a desktop launched in that window would start a second server",
+			manager.existedDuringMutation)
 	}
-	for _, want := range []string{"could not update", "hfdesk service status"} {
-		if !strings.Contains((*messages)[0].text, want) {
-			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
-		}
+	if len(*existedAtNotice) != 1 || (*existedAtNotice)[0] {
+		t.Fatalf("the singleton existed when the final notice was shown = %v, want [false]: the hold must end before the notice",
+			*existedAtNotice)
+	}
+	requireSingletonReleased(t)
+	if len(*messages) != 1 || (*messages)[0].caption != serviceStartedCaption {
+		t.Fatalf("the helper showed %v, want the report of the started service", *messages)
+	}
+}
+
+// TestServiceHelperFailsWhenTheSingletonCannotBeHeld proves the hold fails
+// closed for both gate actions: an update or a start that cannot hold the
+// window must not move the service a relaunch could then bind.
+func TestServiceHelperFailsWhenTheSingletonCannotBeHeld(t *testing.T) {
+	for _, tc := range []struct {
+		action serviceAction
+		result string
+	}{
+		{serviceActionUpdate, "could not update"},
+		{serviceActionStart, "could not start"},
+	} {
+		t.Run(string(tc.action), func(t *testing.T) {
+			replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+				t.Fatal("the action touched the service without holding the desktop singleton")
+				return nil, nil
+			})
+			messages := recordMessages(t)
+
+			// A name that cannot be encoded as a Windows object name makes
+			// the hold itself fail: the action must then refuse to run.
+			err := RunServiceAction(ServiceActionOptions{Action: string(tc.action), InstanceMutex: "Local\x00invalid"})
+			if err == nil {
+				t.Fatal("the action ran although the singleton name could not be used")
+			}
+			if len(*messages) != 1 {
+				t.Fatalf("the helper showed %d message boxes, want the failure of the action", len(*messages))
+			}
+			if caption := serviceFailureCaption(tc.action); (*messages)[0].caption != caption {
+				t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
+			}
+			for _, want := range []string{tc.result, "hfdesk service status"} {
+				if !strings.Contains((*messages)[0].text, want) {
+					t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+				}
+			}
+		})
 	}
 }
 
@@ -2354,5 +2487,131 @@ func TestServiceGateStopsWhenTheRecheckIsNotPositivelyStopped(t *testing.T) {
 				t.Errorf("the notice %q does not mention %q", (*messages)[0].text, tc.want)
 			}
 		})
+	}
+}
+
+// TestServiceHelperInstallRejectsABadImageBeforeReady proves the console
+// program is checked before the ready signal: a program the host cannot
+// execute fails with no ready event sent — so the desktop never commits its
+// shutdown and stays open — and the service is never touched.
+func TestServiceHelperInstallRejectsABadImageBeforeReady(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		image func(t *testing.T) string
+		want  string
+	}{
+		{
+			name: "not a Windows program",
+			image: func(t *testing.T) string {
+				path := filepath.Join(t.TempDir(), "hfdesk.exe")
+				if err := os.WriteFile(path, []byte("this is not a program"), 0o644); err != nil {
+					t.Fatalf("write the fixture: %v", err)
+				}
+				return path
+			},
+			want: "no MZ signature",
+		},
+		{
+			name: "truncated image",
+			image: func(t *testing.T) string {
+				path := filepath.Join(t.TempDir(), "hfdesk.exe")
+				if err := os.WriteFile(path, []byte("MZ"), 0o644); err != nil {
+					t.Fatalf("write the fixture: %v", err)
+				}
+				return path
+			},
+			want: "read the DOS header",
+		},
+		{
+			name:  "machine the host cannot execute",
+			image: func(t *testing.T) string { return testPEImage(t, testPEMachineIA64) },
+			want:  "cannot execute",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The budgets shorten the falsification of this test: without
+			// the preflight the helper would sign ready and then time out
+			// in the authorization wait, and the test must fail fast on
+			// the sent ready signal instead of hanging.
+			replaceSeam(t, &serviceWaitBudget, 50*time.Millisecond)
+			replaceSeam(t, &serviceParentExitBudget, 50*time.Millisecond)
+			handover := testHelperHandover(t)
+			readyProbe := duplicateTestHandle(t, handover.ready)
+			replaceSeam(t, &prepareHelperHandover, func(ServiceActionOptions) (*helperHandover, error) { return handover, nil })
+			replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) { return tc.image(t), nil })
+			replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+				t.Fatal("the installation touched the service although the image preflight failed")
+				return nil, nil
+			})
+			messages := recordMessages(t)
+
+			err := RunServiceAction(ServiceActionOptions{
+				Action: "install", WaitPID: 4321,
+				ReadyEvent: "ready", SuccessEvent: "success", InstanceMutex: "mutex",
+			})
+			if err == nil {
+				t.Fatal("the installation accepted an image the host cannot execute")
+			}
+			if result, waitErr := windows.WaitForSingleObject(readyProbe, 0); waitErr != nil || result != uint32(windows.WAIT_TIMEOUT) {
+				t.Fatalf("the ready signal was sent before the preflight passed: result=%#x err=%v", result, waitErr)
+			}
+			if len(*messages) != 1 {
+				t.Fatalf("the helper showed %d message boxes, want the failure of the installation", len(*messages))
+			}
+			if caption := serviceFailureCaption(serviceActionInstall); (*messages)[0].caption != caption {
+				t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
+			}
+			for _, want := range []string{"No service action was performed", tc.want} {
+				if !strings.Contains((*messages)[0].text, want) {
+					t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+				}
+			}
+		})
+	}
+}
+
+// TestServiceHelperInstallSignalsReadyAfterAPassedPreflight proves the
+// legitimate program still flows: the preflight accepts the real executable,
+// the ready signal is sent, and the installation runs after authorization —
+// the preflight moved the rejection earlier without gating the normal path.
+func TestServiceHelperInstallSignalsReadyAfterAPassedPreflight(t *testing.T) {
+	replaceSeam(t, &serviceVerifyBudget, 100*time.Millisecond)
+	stubConsoleProgram(t)
+	running := runningServiceStatus(service.StateRunning, "0.0.0.0:18080")
+	manager := &fakeServiceManager{
+		statuses:      []service.Status{running},
+		installResult: service.InstallOptions{Executable: `C:\portable\hfdesk.exe`, Listen: running.Listen, Paths: running.Paths},
+	}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	handover := testHelperHandover(t)
+	replaceSeam(t, &prepareHelperHandover, func(ServiceActionOptions) (*helperHandover, error) { return handover, nil })
+	messages := recordMessages(t)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- RunServiceAction(ServiceActionOptions{
+			Action: "install", WaitPID: 4321,
+			ReadyEvent: "ready", SuccessEvent: "success", InstanceMutex: "mutex",
+		})
+	}()
+	if result, err := windows.WaitForSingleObject(handover.ready, 2_000); err != nil || result != windows.WAIT_OBJECT_0 {
+		t.Fatalf("the helper did not signal ready after the preflight passed: result=%#x err=%v", result, err)
+	}
+	if err := windows.SetEvent(handover.success); err != nil {
+		t.Fatalf("signal successful completion: %v", err)
+	}
+	if err := windows.SetEvent(handover.parent); err != nil {
+		t.Fatalf("signal desktop exit: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("the authorized installation failed: %v", err)
+	}
+	if len(manager.steps) != 1 || manager.steps[0] != "install-start" {
+		t.Fatalf("the helper used service steps %v, want one install after authorization", manager.steps)
+	}
+	if len(*messages) != 1 || (*messages)[0].caption != serviceInstalledCaption {
+		t.Fatalf("the helper showed %v, want the report of the installation", *messages)
 	}
 }

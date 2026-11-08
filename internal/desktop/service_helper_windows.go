@@ -91,6 +91,13 @@ func RunServiceAction(o ServiceActionOptions) error {
 			return err
 		}
 		defer handover.close()
+		// Ready authorizes the desktop shutdown, so the image the action
+		// would put in service is checked before it: a program the host
+		// cannot execute must fail while the desktop is still open.
+		if err := preflightServiceProgram(); err != nil {
+			(&serviceActionReporter{action: action, handover: handover}).handoverFailure(err)
+			return err
+		}
 		if err := handover.signalReady(); err != nil {
 			(&serviceActionReporter{action: action, handover: handover}).handoverFailure(err)
 			return err
@@ -102,15 +109,16 @@ func RunServiceAction(o ServiceActionOptions) error {
 		// Authorization is settled: only the singleton outlives it, through
 		// the service mutation, and is released before the final notice.
 		handover.releaseAuthorizationHandles()
-	} else if action == serviceActionUpdate && strings.TrimSpace(o.InstanceMutex) != "" {
-		// The gate that asked for this update ended without a handover —
+	} else if (action == serviceActionUpdate || action == serviceActionStart) &&
+		strings.TrimSpace(o.InstanceMutex) != "" {
+		// The gate that asked for this action ended without a handover —
 		// nothing waits for a desktop exit — but the mutation still needs
-		// the singleton: it stops and restarts a running instance, and a
-		// relaunch in that window would find a positively stopped service
-		// and could bind the address the instance needs. The hold starts
-		// before any mutation and ends with the action: the reporter paths
-		// release it before the final notice, and the deferred close covers
-		// every other return.
+		// the singleton: it takes the service out of the positively
+		// stopped state that gate decided on, and a relaunch in that
+		// window could bind the address the instance needs. The hold
+		// starts before any mutation and ends with the action: the
+		// reporter paths release it before the final notice, and the
+		// deferred close covers every other return.
 		mutex, holdErr := holdDesktopSingleton(o.InstanceMutex)
 		if holdErr != nil {
 			(&serviceActionReporter{action: action}).failure(holdErr, "")
@@ -120,6 +128,21 @@ func RunServiceAction(o ServiceActionOptions) error {
 		defer handover.close()
 	}
 	return runServiceAction(action, o.Version, &serviceActionReporter{action: action, handover: handover})
+}
+
+// preflightServiceProgram checks the console program of this folder with the
+// image preflight the installation runs, before the ready signal; the
+// installation keeps its own copy for a file that changes after this point.
+func preflightServiceProgram() error {
+	executable, err := desktopExecutable()
+	if err != nil {
+		return err
+	}
+	console, err := findSiblingExecutable(filepath.Dir(executable), executable)
+	if err != nil {
+		return fmt.Errorf("the console program of the service is missing: %w", err)
+	}
+	return service.PreflightExecutableImage(console)
 }
 
 func validateServiceHandoverOptions(action serviceAction, o ServiceActionOptions) error {
@@ -134,11 +157,11 @@ func validateServiceHandoverOptions(action serviceAction, o ServiceActionOptions
 		}
 		return nil
 	}
-	// An update carries the singleton identity alone: it holds the desktop
-	// singleton through its mutation without waiting for a desktop exit,
-	// because the gate that asked for it already ended. Every other
-	// combination still needs the complete install handover below.
-	if action == serviceActionUpdate && o.WaitPID == 0 &&
+	// An update or a start carries the singleton identity alone: it holds
+	// the desktop singleton through its mutation without waiting for a
+	// desktop exit, because the gate that asked for it already ended. Every
+	// other combination still needs the complete install handover below.
+	if (action == serviceActionUpdate || action == serviceActionStart) && o.WaitPID == 0 &&
 		strings.TrimSpace(o.ReadyEvent) == "" && strings.TrimSpace(o.SuccessEvent) == "" &&
 		strings.TrimSpace(o.InstanceMutex) != "" {
 		return nil

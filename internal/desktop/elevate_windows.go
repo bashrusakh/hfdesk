@@ -36,8 +36,8 @@ type elevatedLaunch struct {
 	// Action is the service action of the helper.
 	Action serviceAction
 	// WaitPID is the original desktop process for an install handover.
-	// Zero leaves start on its ordinary path; an update may still carry
-	// InstanceMutex alone.
+	// Zero leaves start on its ordinary path; an update or a start may
+	// still carry InstanceMutex alone.
 	WaitPID int
 	// ReadyEvent and SuccessEvent are the per-attempt handover event names.
 	ReadyEvent   string
@@ -193,10 +193,10 @@ func shellExecuteElevatedProcess(l elevatedLaunch) (*elevatedProcess, error) {
 // serviceHelperArguments returns the command line of the elevated helper.
 //
 // Install carries the process, event names, and existing singleton identity of
-// its handover. An update from the service gate carries the singleton identity
-// alone: its mutation stops and restarts a running instance after the launching
-// desktop ended, so the helper holds the singleton across that window without
-// waiting for an exit. Start carries no wait state.
+// its handover. An update or start from the service gate carries the singleton
+// identity alone: its mutation moves the service after the launching desktop
+// ended, so the helper holds the singleton across that window without waiting
+// for an exit. Every other command carries no wait state.
 func serviceHelperArguments(l elevatedLaunch) string {
 	args := []string{"--service-action", string(l.Action)}
 	switch {
