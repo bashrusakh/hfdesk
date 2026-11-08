@@ -2338,7 +2338,9 @@ func TestPreflightDataPathLeavesDescriptorReadFailureInconclusive(t *testing.T) 
 }
 
 // TestSCMPreflightExecutableAccess checks that a definite denial refuses, an
-// allowed descriptor passes and an unreadable one refuses nothing.
+// allowed descriptor passes and an unreadable one refuses nothing. The
+// refusal tells the user to grant execute access; it never demands read
+// access to a native program.
 func TestSCMPreflightExecutableAccess(t *testing.T) {
 	previous := scmCheckExecutableAccess
 	t.Cleanup(func() { scmCheckExecutableAccess = previous })
@@ -2372,12 +2374,108 @@ func TestSCMPreflightExecutableAccess(t *testing.T) {
 			if !scmTestNamesPath(err.Error(), executable) {
 				t.Errorf("preflightExecutableAccess() = %v, want the refused executable path %q", err, executable)
 			}
-			for _, want := range []string{scmServiceIdentityName, tc.reason, "read and execute"} {
+			for _, want := range []string{scmServiceIdentityName, tc.reason, "grant the account execute access"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("preflightExecutableAccess() = %v, want %q in the refusal", err, want)
 				}
 			}
+			for _, unwanted := range []string{"read and execute", "grant the account read"} {
+				if strings.Contains(err.Error(), unwanted) {
+					t.Errorf("preflightExecutableAccess() = %v, want no demand to grant %q for a native program", err, unwanted)
+				}
+			}
 		})
+	}
+}
+
+// TestSCMPreflightExecutableAccessAcceptsExecuteOnlyNativeProgram pins the
+// Windows contract of the program check: the program image is checked for
+// execute only. An NTFS "Execute file" entry that withholds read data passes
+// preflight, the preflight asks AccessCheck for the execute right of the
+// program and never for its data, and a program the account cannot execute is
+// still refused with a message that asks for execute access only.
+func TestSCMPreflightExecutableAccessAcceptsExecuteOnlyNativeProgram(t *testing.T) {
+	token := scmTestImpersonationToken(t)
+	user, err := token.GetTokenUser()
+	if err != nil {
+		t.Fatalf("GetTokenUser() = %v", err)
+	}
+	if user.User.Sid == nil {
+		t.Fatal("GetTokenUser() returned no user SID")
+	}
+	sid := user.User.Sid.String()
+
+	root := t.TempDir()
+	executable := filepath.Join(root, "hfdesk.exe")
+	if err := os.WriteFile(executable, []byte("test program image"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) = %v", executable, err)
+	}
+	resolved, err := scmResolvePath(executable)
+	if err != nil {
+		t.Fatalf("resolve %q: %v", executable, err)
+	}
+
+	// The execute-only descriptor carries execute but no read data for the
+	// program, so the real AccessCheck accepts the right the fixed preflight
+	// asks for and refuses the read+execute mask the preflight used to ask
+	// for: the old mask refused exactly this fixture.
+	executeOnly := scmTestAccessCheckDescriptor(t, sid, fmt.Sprintf("D:P(A;;FX;;;%s)", sid))
+	for _, tc := range []struct {
+		name    string
+		desired uint32
+		allowed bool
+	}{
+		{"execute right of the program", windows.FILE_EXECUTE, true},
+		{"the former read and execute mask", windows.GENERIC_READ | windows.GENERIC_EXECUTE, false},
+	} {
+		allowed, err := scmAccessCheckDescriptor(token, executeOnly, tc.desired)
+		if err != nil {
+			t.Fatalf("AccessCheck(%s) = %v", tc.name, err)
+		}
+		if allowed != tc.allowed {
+			t.Errorf("AccessCheck(%s) = %v, want %v", tc.name, allowed, tc.allowed)
+		}
+	}
+
+	// The preflight passes the execute-only native program...
+	access := &scmTestPathAccess{
+		check: func(_ string, desired uint32) (bool, error) {
+			return scmAccessCheckDescriptor(token, executeOnly, desired)
+		},
+		// The traverse-bypass privilege isolates this fixture on the
+		// program object itself; the traversal route is covered by its
+		// own tests.
+		privilege: true,
+	}
+	if err := preflightExecutableAccess(executable, access); err != nil {
+		t.Fatalf("preflightExecutableAccess() = %v, want the execute-only program to pass", err)
+	}
+	if len(access.calls) != 1 {
+		t.Fatalf("AccessCheck calls = %+v, want only the program object checked", access.calls)
+	}
+	if call := access.calls[0]; call.path != resolved || call.desired != windows.FILE_EXECUTE {
+		t.Errorf("AccessCheck(%q, 0x%X), want the program checked at %q with FILE_EXECUTE only", call.path, call.desired, resolved)
+	}
+
+	// ...and still refuses a program the account cannot execute.
+	readOnly := scmTestAccessCheckDescriptor(t, sid, fmt.Sprintf("D:P(A;;FR;;;%s)", sid))
+	denied := &scmTestPathAccess{
+		check: func(_ string, desired uint32) (bool, error) {
+			return scmAccessCheckDescriptor(token, readOnly, desired)
+		},
+		privilege: true,
+	}
+	err = preflightExecutableAccess(executable, denied)
+	if err == nil {
+		t.Fatal("preflightExecutableAccess() = nil, want the refusal of a program without execute access")
+	}
+	if !strings.Contains(err.Error(), "grant the account execute access") {
+		t.Errorf("preflightExecutableAccess() = %v, want the refusal to ask for execute access", err)
+	}
+	for _, unwanted := range []string{"read and execute", "grant the account read"} {
+		if strings.Contains(err.Error(), unwanted) {
+			t.Errorf("preflightExecutableAccess() = %v, want no demand to grant %q", err, unwanted)
+		}
 	}
 }
 

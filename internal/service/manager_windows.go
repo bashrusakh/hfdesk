@@ -2600,9 +2600,11 @@ const (
 
 var scmCheckExecutableAccess = scmExecutableAccessOf
 
-// preflightExecutableAccess refuses a program the account cannot read and
-// execute, and a parent it cannot traverse. An unreadable descriptor is not a
-// denial: the installation reports that it could not check.
+// preflightExecutableAccess refuses a program the account cannot execute, and
+// a parent it cannot traverse. The program image is checked for execute only:
+// Windows supports an image the account runs without reading it, so read data
+// is not demanded of the program. An unreadable descriptor is not a denial:
+// the installation reports that it could not check.
 func preflightExecutableAccess(executable string, pathAccess ...scmPathAccess) error {
 	var effective scmPathAccess
 	if len(pathAccess) != 0 {
@@ -2611,7 +2613,7 @@ func preflightExecutableAccess(executable string, pathAccess ...scmPathAccess) e
 	access, reason := scmCheckExecutableAccess(executable, effective)
 	switch access {
 	case scmExecutableAccessDenied:
-		return fmt.Errorf("service: executable %q is not usable by the account the instance runs as (%s): %s: grant the account read and execute access to the program, or choose a program the account can use", executable, scmServiceIdentityName, reason)
+		return fmt.Errorf("service: executable %q is not usable by the account the instance runs as (%s): %s: grant the account execute access to the program, or choose a program the account can use", executable, scmServiceIdentityName, reason)
 	case scmExecutableAccessInconclusive:
 		log.Printf("service: effective access to executable %q for %s is inconclusive (%s)", executable, scmServiceIdentityName, reason)
 	}
@@ -2619,7 +2621,14 @@ func preflightExecutableAccess(executable string, pathAccess ...scmPathAccess) e
 }
 
 func scmExecutableAccessOf(executable string, access scmPathAccess) (scmExecutableAccess, string) {
-	return scmCheckPathAccess(executable, windows.GENERIC_READ|windows.GENERIC_EXECUTE, access)
+	// Only the execute right is required of the program image. GENERIC_READ
+	// would demand the read data that an execute-only program legitimately
+	// withholds, and GENERIC_EXECUTE would additionally demand read-control,
+	// read-attributes and synchronize rights that a bare "Execute file"
+	// access control entry does not carry. Every access control entry form
+	// that grants execution grants FILE_EXECUTE, so a program the account
+	// cannot execute is still refused by this mask.
+	return scmCheckPathAccess(executable, windows.FILE_EXECUTE, access)
 }
 
 // scmParentDirs returns the directories above a path, the immediate parent first.
