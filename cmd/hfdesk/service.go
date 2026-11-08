@@ -747,28 +747,51 @@ func serviceInstall(args []string, stdout io.Writer) error {
 }
 
 // expectedInstallVersion returns the build version of the registered program
-// when that program is the running binary itself. A local build ("dev") and a
-// named --executable are not a version the installation may demand.
+// when that program is the image the kernel executes. A local build ("dev")
+// and a named --executable are not a version the installation may demand, and
+// neither is a registration whose file no longer is the running image.
+//
+// The identity of the running image is read from the procfs magic link
+// /proc/self/exe: it stats the inode the kernel loaded even when the path was
+// replaced while this process kept running. os.Executable cannot prove that
+// identity — its documented contract does not guarantee the path still points
+// at the started executable, and on Linux the standard library trims the
+// " (deleted)" suffix procfs appends to a replaced image — so two stats of
+// path names would both see the replacement and stamp the old compiled-in
+// Version against a file that reports another one, which a verified start
+// would then reject as a mismatch.
+//
+// When the running image cannot be identified (a host without procfs, an
+// unreadable link), no version claim is stamped: the uncertainty stays
+// visible in an empty expectation instead of demanding a version the
+// registered program may not report.
 func expectedInstallVersion(executable string) string {
 	if Version == "" || Version == "dev" {
-		return ""
-	}
-	running, err := os.Executable()
-	if err != nil {
 		return ""
 	}
 	registered, err := os.Stat(executable)
 	if err != nil {
 		return ""
 	}
-	current, err := os.Stat(running)
+	running, err := runningImageInfo()
 	if err != nil {
 		return ""
 	}
-	if !os.SameFile(registered, current) {
+	if !os.SameFile(registered, running) {
 		return ""
 	}
 	return Version
+}
+
+// runningImageInfo resolves the file info of the running image itself. It is
+// a variable so the tests can exercise a file replaced under a running image.
+var runningImageInfo = procfsRunningImageInfo
+
+// procfsRunningImageInfo stats the procfs magic link of the running image.
+// The magic link resolves to the executed inode on every Linux host, whether
+// or not its path name still exists.
+func procfsRunningImageInfo() (os.FileInfo, error) {
+	return os.Stat("/proc/self/exe")
 }
 
 // writeInstallSummary prints what was registered.

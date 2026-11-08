@@ -414,6 +414,33 @@ func (m *systemdManager) serviceAccount(opts InstallOptions) (*user.User, error)
 	return resolveServiceAccount(opts)
 }
 
+// accountValidationOptions returns the options whose account an installation
+// validates.
+//
+// An update of an existing registration that named no account validates the
+// account the supervisor really loads: the User= of a unit may come from a
+// drop-in the unit source does not contain, and that loaded identity — not
+// the default account of the platform, which the machine may never have
+// created — is what the instance runs as. An account the request named
+// explicitly is validated exactly as requested, and a first installation
+// validates what its request carries, so neither path changes here.
+//
+// The loaded configuration is read best-effort: when the supervisor cannot
+// answer, the account stays what the request and the unit source say, which
+// is the behavior of the registration without a readable loaded identity.
+func (m *systemdManager) accountValidationOptions(ctx context.Context, requested, opts InstallOptions, registered bool) InstallOptions {
+	if m.scope != ScopeSystem || !registered || requested.Explicit.ServiceUser {
+		return opts
+	}
+	loaded, err := m.registrationUnitConfig(ctx)
+	if err != nil || !loaded.loaded || loaded.user == "" {
+		return opts
+	}
+	validation := opts
+	validation.ServiceUser = loaded.user
+	return validation
+}
+
 // errNotWritable reports that the service account cannot write into a
 // directory. The caller turns it into the guidance of the installation.
 var errNotWritable = errors.New("the service account cannot write into the directory")
@@ -1123,8 +1150,11 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	// not a privilege of the process, so it is validated the same way:
 	// before the root requirement, before any directory is created and
 	// before the unit file is written. A refused installation leaves
-	// nothing behind.
-	account, err := m.serviceAccount(opts)
+	// nothing behind. An update without a named account validates the
+	// loaded identity of the registration (which a drop-in may provide)
+	// and not the default account of the platform.
+	accountOpts := m.accountValidationOptions(ctx, requested, opts, registered)
+	account, err := m.serviceAccount(accountOpts)
 	if err != nil {
 		return opts, err
 	}

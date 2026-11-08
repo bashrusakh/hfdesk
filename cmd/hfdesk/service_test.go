@@ -2756,7 +2756,11 @@ func TestServiceInstallPassesTheVersionOfTheRunningProgram(t *testing.T) {
 		{
 			name:    "the running program of a release build",
 			version: "1.2.3",
-			want:    "1.2.3",
+			// The version claim follows the identity of the running image on
+			// this host, not the platform seam of the command line: only a
+			// Linux host can prove the identity through procfs, so a host
+			// without it stamps no claim.
+			want: expectedRunningImageStamp("1.2.3"),
 		},
 		{
 			name:    "a local build",
@@ -2803,6 +2807,94 @@ func TestServiceInstallPassesTheVersionOfTheRunningProgram(t *testing.T) {
 				t.Errorf("the expected version is %q, want %q", got.ExpectedVersion, tc.want)
 			}
 		})
+	}
+}
+
+// expectedRunningImageStamp is the version claim an installation of the
+// running release build stamps on this host: the identity of the running
+// image is provable through procfs on Linux and is not provable elsewhere.
+func expectedRunningImageStamp(version string) string {
+	if runtime.GOOS == "linux" {
+		return version
+	}
+	return ""
+}
+
+// TestExpectedInstallVersionFollowsTheRunningImage proves the version claim
+// names the image the kernel executes: a registered file that was replaced
+// while the image keeps running carries no claim, and the untouched
+// registration keeps its claim.
+//
+// The replacement is a rename over the running test binary, which is how an
+// update lands a new file at an old path: the executed inode loses its name
+// and the path holds another file, while the compiled-in Version still
+// describes the old image. A claim stamped for the replacement would make a
+// verified start of the healthy new program fail as a version mismatch.
+func TestExpectedInstallVersionFollowsTheRunningImage(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the running image is identified through /proc/self/exe, which this host does not have")
+	}
+	previousVersion := Version
+	Version = "1.2.3"
+	t.Cleanup(func() { Version = previousVersion })
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() = %v", err)
+	}
+	if got := expectedInstallVersion(exe); got != "1.2.3" {
+		t.Fatalf("expectedInstallVersion() = %q for the untouched running image, want %q", got, "1.2.3")
+	}
+
+	replacement := exe + ".hfdesk-test-replacement"
+	backup := exe + ".hfdesk-test-backup"
+	if err := os.WriteFile(replacement, []byte("a different program image\n"), 0o755); err != nil {
+		t.Fatalf("write the replacement file: %v", err)
+	}
+	// The backup is an identical copy for the rest of the run: the
+	// replacement below unlinks the executed inode, which is exactly how an
+	// update lands a new file at a path a running program keeps using.
+	original, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatalf("read the running image %q: %v", exe, err)
+	}
+	if err := os.WriteFile(backup, original, 0o755); err != nil {
+		t.Fatalf("write the backup file: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Rename(backup, exe)
+		_ = os.Remove(replacement)
+	})
+	if err := os.Rename(replacement, exe); err != nil {
+		t.Skipf("the running image cannot be replaced on this host: %v", err)
+	}
+	if got := expectedInstallVersion(exe); got != "" {
+		t.Errorf("expectedInstallVersion() = %q for a replaced registered file, want no version claim", got)
+	}
+	if err := os.Rename(backup, exe); err != nil {
+		t.Fatalf("restore the registered file %q: %v", exe, err)
+	}
+}
+
+// TestExpectedInstallVersionWithholdsAnUnknownImage proves that a running
+// image the installation cannot identify yields no version claim: uncertainty
+// stays visible instead of a claim that may name the wrong program.
+func TestExpectedInstallVersionWithholdsAnUnknownImage(t *testing.T) {
+	previousImage := runningImageInfo
+	runningImageInfo = func() (os.FileInfo, error) {
+		return nil, errors.New("the running image is not identifiable")
+	}
+	t.Cleanup(func() { runningImageInfo = previousImage })
+	previousVersion := Version
+	Version = "1.2.3"
+	t.Cleanup(func() { Version = previousVersion })
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() = %v", err)
+	}
+	if got := expectedInstallVersion(exe); got != "" {
+		t.Errorf("expectedInstallVersion() = %q with an unknown running image, want no version claim", got)
 	}
 }
 

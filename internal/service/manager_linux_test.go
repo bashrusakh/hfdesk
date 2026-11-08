@@ -1860,6 +1860,118 @@ func TestSystemdInstallRefusesAMissingServiceAccount(t *testing.T) {
 	}
 }
 
+// TestSystemdAccountValidationUsesTheLoadedIdentityOfAnExistingUnit checks
+// which account an update of an existing registration validates: the account
+// the supervisor really loads — a drop-in may provide User= although the
+// unit source names none, and the default account of the platform may not
+// exist on the machine — while an explicitly named account, a first
+// installation, a user scope and an unreadable loaded identity all keep the
+// account of the request.
+func TestSystemdAccountValidationUsesTheLoadedIdentityOfAnExistingUnit(t *testing.T) {
+	systemdRecordingSupervisor(t)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", systemdTestExecutable(t))
+	exe := os.Getenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE")
+	current, err := user.Current()
+	if err != nil {
+		t.Fatalf("user.Current() = %v", err)
+	}
+
+	for _, tc := range []struct {
+		name        string
+		scope       Scope
+		registered  bool
+		serviceUser string
+		explicit    bool
+		loadedUser  string
+		loadedErr   error
+		want        string
+		wantReads   int
+	}{
+		{
+			name:       "an existing unit validates the loaded account",
+			scope:      ScopeSystem,
+			registered: true,
+			loadedUser: current.Username,
+			want:       current.Username,
+			wantReads:  1,
+		},
+		{
+			name:        "an explicitly named account is validated as requested",
+			scope:       ScopeSystem,
+			registered:  true,
+			serviceUser: "hfdesk-named-account",
+			explicit:    true,
+			loadedUser:  current.Username,
+			want:        "hfdesk-named-account",
+			wantReads:   0,
+		},
+		{
+			name:       "a first installation keeps the request",
+			scope:      ScopeSystem,
+			registered: false,
+			loadedUser: current.Username,
+			want:       "",
+			wantReads:  0,
+		},
+		{
+			name:       "an unreadable loaded identity keeps the request",
+			scope:      ScopeSystem,
+			registered: true,
+			loadedErr:  errors.New("the supervisor does not answer"),
+			want:       "",
+			wantReads:  1,
+		},
+		{
+			name:       "a loaded identity without an account keeps the request",
+			scope:      ScopeSystem,
+			registered: true,
+			loadedUser: "",
+			want:       "",
+			wantReads:  1,
+		},
+		{
+			name:       "a user scope validates no service account",
+			scope:      ScopeUser,
+			registered: true,
+			loadedUser: current.Username,
+			want:       "",
+			wantReads:  0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reads := 0
+			m := &systemdManager{
+				scope: tc.scope,
+				readServiceProperties: func(context.Context, string) (map[string]dbus.Variant, error) {
+					reads++
+					if tc.loadedErr != nil {
+						return nil, tc.loadedErr
+					}
+					return systemdTypedProperties(exe, []string{exe}, nil, "", tc.loadedUser, "", nil), nil
+				},
+			}
+			requested := InstallOptions{Scope: tc.scope, Executable: exe}
+			requested.ServiceUser = tc.serviceUser
+			requested.Explicit.ServiceUser = tc.explicit
+			// The merged options carry the named account when the request
+			// named one, and the unit source's account (none here) when it
+			// did not — the drop-in case of the defect.
+			opts := requested
+			if !tc.explicit {
+				opts.ServiceUser = ""
+			}
+
+			got := m.accountValidationOptions(context.Background(), requested, opts, tc.registered)
+			if got.ServiceUser != tc.want {
+				t.Errorf("accountValidationOptions().ServiceUser = %q, want %q", got.ServiceUser, tc.want)
+			}
+			if reads != tc.wantReads {
+				t.Errorf("the loaded configuration was read %d times, want %d", reads, tc.wantReads)
+			}
+		})
+	}
+}
+
 // TestSystemdRenderUnitNamesTheServiceAccount checks that the unit of a
 // machine-wide instance names the service account, and that the group of the
 // unit is the primary group of that account and never the name of the
