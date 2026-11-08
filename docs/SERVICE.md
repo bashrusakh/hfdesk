@@ -454,6 +454,111 @@ only then is it started again on the current binary.
 - The unit keeps the process in the foreground (`Type=simple`) and restarts it
   on failure. It holds no access data.
 
+#### The supported unit-file subset
+
+HFDesk implements only the subset of the systemd unit-file syntax described
+here — it is not a general systemd unit editor. A directive outside the subset
+is either refused before the unit file is changed or preserved exactly as
+written, without interpretation. The subset grows only by an explicit
+amendment with regression tests; it never grows by accumulating "one more
+exception" on demand.
+
+**`ExecStart=` forms.** An update works on the `ExecStart=` line of the
+`[Service]` section and recognizes exactly these shapes:
+
+- the program alone;
+- the program followed by `service run` and its run flags — directly, or
+  behind an `env` prefix of option words and `NAME=VALUE` assignments.
+
+A command of any other shape is refused before anything is changed, with an
+error that names the line:
+
+- a shell-string wrapper (`sh -c "..."`), an unknown wrapper, or an ambiguous
+  `env` form — `env -u NAME /path/to/hfdesk service run ...` stops at the bare
+  `NAME`, which could be the option's value or the program, so the shape is
+  not read as either and the line is refused;
+- for an update that must verify a running start: a command without the
+  `service run` vector carrying all three required flags `--config`,
+  `--state-dir` and `--log-dir`. The refusal happens before the running
+  service is stopped and before the unit is rewritten; the same command still
+  updates while its service is stopped, because a stopped instance has no
+  start to verify.
+
+Line-level states follow the same spirit: more than one `ExecStart=` line in
+`[Service]`, or a unit with no `[Service]` section at all, is refused before
+the unit file is written; a `[Service]` section whose `ExecStart=` line is
+missing or empty receives the canonical command of the installation.
+
+When the line is rewritten, only the program slot changes: a recognized `env`
+prefix stays exactly as written in front of the new program, the words behind
+the program keep their order, and a run flag named explicitly on the command
+line is merged into the run vector, replacing the occurrence the line already
+carries — flags the command does not name are left alone.
+
+**Directives HFDesk reads — and what it preserves.** From the unit file,
+HFDesk takes exactly these registration facts — `ExecStart`,
+`WorkingDirectory`, `User`, `Group` and `Environment` — and reads them only
+inside `[Service]`. `EnvironmentFile=` is read only as systemd reports it in
+the loaded configuration: HFDesk never opens the file it names and never
+interprets its contents. An update rewrites `ExecStart=`
+always, `WorkingDirectory=` only when `--state-dir` is named again, and
+`User=`/`Group=` only when `--service-user` is named again; every other line
+is preserved exactly as written — directives HFDesk does not interpret,
+comments, blank lines, section headers, and the whole physical form
+(indentation, line ending, continuation) of any line it does not change. A
+line it does change keeps its indentation and line ending and replaces its
+whole, possibly continued, value with the new one.
+
+After the rewrite the installation proves through systemd that the loaded
+command, environment, environment files, working directory and service
+identity came through unchanged unless the matching flag was named, and a
+rollback that cannot load the previous environment and environment files
+again fails instead of claiming restoration. HFDesk never rewrites an
+administrator-owned drop-in: it writes only its own unit file, and an update
+whose effective command systemd reports differently from the unit file —
+because a drop-in or another override owns it — is refused rather than edited
+around.
+
+**Variables, specifiers and unexpandable values.** A value HFDesk cannot
+expand itself stays uninterpreted: it is preserved as written, checked
+against what systemd actually loaded, and never guessed. A word is dynamic
+when it carries a specifier such as `%h` or a variable reference such as
+`$NAME` or `${NAME}` — a doubled `%%` or `$$` is the literal character
+instead. A dynamic run flag the update does not name keeps its source text,
+and the update fails if the value systemd loaded for that flag changed across
+the write. Where a decision needs the expanded value — the listen address of a
+verification, for example — HFDesk reads the argv of the live service process
+instead of expanding the expression itself. A value the target directive
+cannot carry faithfully is refused by name instead of written altered: a state
+directory that ends in a space, for instance, cannot be written as
+`WorkingDirectory=`, because systemd strips the trailing space. When HFDesk
+writes a value itself, it doubles a literal `%` in every directive and a
+literal `$` in command words, because systemd expands specifiers everywhere
+and unit variables only in the command line.
+
+**Lines, quotes and words.** A directive is a logical line: a physical line
+whose trailing backslashes are an odd number continues onto the next physical
+line, comment lines in between are skipped, and a carriage return before the
+newline is not part of the value. A section header is `[Name]`, a directive is
+`Key=value` split at the first `=`, and blank lines and lines starting with
+`#` or `;` are comments. Inside a value, whitespace separates words, `'` and
+`"` group characters into one word and may open and close inside a word,
+backslash escapes are decoded in the C style (`\a \b \f \n \r \t \v \\ \" \'
+\s`, `\xNN`, `\uNNNN`, `\UNNNNNNNN` and three octal digits), an escape the
+decoder does not know stays in the text literally, a decoded escape never
+splits the word again, and `%%` is a literal percent sign. A shape or word
+boundary these rules cannot prove is treated conservatively — refused with the
+line named, or preserved exactly as written — never turned into a guess.
+
+**Why the subset exists.** An update of a running instance is only accepted
+where it can be verified: after the restart HFDesk reads the argv of the live
+service process and accepts it only when it parses as the canonical
+`service run` vector carrying every required flag — the same list the parser
+enforces when a service starts. A command outside that vector can start but
+can never be proven after a restart, so the accepted update domain is
+deliberately the verifiable domain: what HFDesk can rewrite it can also prove,
+and what it cannot prove it refuses while the instance still runs.
+
 ### macOS (launchd)
 
 - The user scope is a per-user **LaunchAgent** at
@@ -814,10 +919,12 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   followed by `service run` — directly or behind an `env` prefix, which is
   kept — is rewritten, and any other form (a shell-wrapped script, an unknown
   wrapper) is refused before anything is changed, with an error that names
-  the line. A command without the `service run` vector and its required flags
-  (`--config`, `--state-dir`, `--log-dir`) can be updated only while its
-  service is stopped: an update that must verify a running start requires
-  that canonical vector, and a running service registered with a command that
+  the line. See [The supported unit-file subset](#the-supported-unit-file-subset)
+  for the exact syntax an update handles. A command without the `service run`
+  vector and its required flags (`--config`, `--state-dir`, `--log-dir`) can
+  be updated only while its service is stopped: an update that must verify a
+  running start requires that canonical vector, and a running service
+  registered with a command that
   lacks it is refused before anything is changed — the unit is not rewritten
   and the service is not stopped — with an error that names the line and the
   vector to set. On Windows, the
