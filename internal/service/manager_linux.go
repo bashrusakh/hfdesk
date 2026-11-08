@@ -3709,24 +3709,35 @@ func validateSystemdExecStartUpdate(content, executable string) error {
 }
 
 // systemdExecStartProgramSlot returns the index of the token an ExecStart
-// update replaces with the new program.
+// update replaces with the new program, or refuses a command whose shape
+// systemdExecStartSlot does not recognize: those forms are refused instead
+// of being turned into a command that cannot start.
+func systemdExecStartProgramSlot(tokens []systemdWord, executable string) (int, error) {
+	slot, ok := systemdExecStartSlot(tokens)
+	if !ok {
+		return 0, systemdExecStartRefusal(tokens, executable)
+	}
+	return slot, nil
+}
+
+// systemdExecStartSlot returns the index of the program token of a command
+// and whether the command has a recognized shape: the program alone, or the
+// program followed by the canonical "service run" vector, optionally behind
+// an "env" prefix of options and NAME=VALUE assignments that stays intact.
 //
 // The registered process is the HFDesk program that receives the canonical
-// "service run" argument vector as its first arguments, so the command is
-// either the program alone or the program followed by "service run". An
-// "env" wrapper locates the same program behind its own options and
-// NAME=VALUE assignments, and its prefix stays untouched.
-//
-// Every other shape cannot be rewritten reliably: a shell script string
-// hides the program inside a quoted word, an unknown wrapper may consume
-// the words after it differently, and a command without the run vector is
-// not the HFDesk service command. Those forms are refused instead of being
-// turned into a command that cannot start.
-func systemdExecStartProgramSlot(tokens []systemdWord, executable string) (int, error) {
+// "service run" argument vector as its first arguments. Every other shape
+// cannot be read reliably: a shell script string hides the program inside a
+// quoted word, an unknown wrapper may consume the words after it
+// differently, and a command without the run vector is not the HFDesk
+// service command. The argument parser uses the same rule as the update, so
+// the run flags of a recognized command are read after the program and
+// never from the words of the wrapper prefix.
+func systemdExecStartSlot(tokens []systemdWord) (int, bool) {
 	if len(tokens) <= 1 {
 		// The program alone carries no argument the rewrite could
 		// mismatch.
-		return 0, nil
+		return 0, true
 	}
 	slot := 0
 	if !tokens[0].dynamic && filepath.Base(tokens[0].value) == "env" {
@@ -3736,9 +3747,9 @@ func systemdExecStartProgramSlot(tokens []systemdWord, executable string) (int, 
 		}
 	}
 	if slot+2 >= len(tokens) || tokens[slot+1].value != "service" || tokens[slot+2].value != "run" {
-		return 0, systemdExecStartRefusal(tokens, executable)
+		return 0, false
 	}
-	return slot, nil
+	return slot, true
 }
 
 // systemdEnvPrefixWord reports whether word is an argument an "env" wrapper
@@ -4252,6 +4263,14 @@ type parsedUnit struct {
 	DynamicRunArgs   map[string]bool
 	// ExecArgs are the arguments of the executable.
 	ExecArgs []string
+	// RunOffset is the index of the canonical run vector ("service run")
+	// in ExecArgs. It skips the words of a recognized wrapper prefix (env
+	// options and NAME=VALUE assignments before the program), so the run
+	// flags are read after the program exactly as for a direct command,
+	// and never from the words of the wrapper itself. An unrecognized
+	// command keeps 0, the position the vector starts at in a direct
+	// command.
+	RunOffset int
 	// WorkingDirectory is the working directory of the unit.
 	WorkingDirectory        string
 	WorkingDirectoryDynamic bool
@@ -4285,8 +4304,11 @@ func (u parsedUnit) paths() runtimepaths.Paths {
 }
 
 // flagValue returns the value of a flag of the argument vector of the unit.
+//
+// The vector is read from the run vector, after a recognized wrapper
+// prefix, so the words of the wrapper are never mistaken for run flags.
 func (u parsedUnit) flagValue(flag string) string {
-	return runArgValue(u.ExecArgs, flag)
+	return runArgValue(u.ExecArgs[u.RunOffset:], flag)
 }
 
 // parseUnit reads the registration facts of a unit file.
@@ -4332,7 +4354,12 @@ func parseUnit(content string) parsedUnit {
 			for i := 1; i < len(tokens); i++ {
 				unit.ExecArgsDynamic[i-1] = tokens[i].dynamic
 			}
-			unit.DynamicRunArgs = dynamicRunArgValues(tokens[1:])
+			// The run flags follow the program token, behind a
+			// recognized wrapper prefix; an unrecognized command
+			// keeps reading from the first argument, as before.
+			runOffset, _ := systemdExecStartSlot(tokens)
+			unit.RunOffset = runOffset
+			unit.DynamicRunArgs = dynamicRunArgValues(tokens[1+runOffset:])
 			unit.ExecStart = words[0]
 			unit.ExecArgs = words[1:]
 		case "WorkingDirectory":

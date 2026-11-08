@@ -6547,6 +6547,91 @@ func TestSystemdInstallRepairsAnEnvWrappedExecStart(t *testing.T) {
 	}
 }
 
+// TestSystemdWrapperRegistrationReportsPreservedRunFlags checks that the
+// options read back from a recognized wrapper form are the flags the
+// instance really runs with: registrationOptions and the effective options
+// of an update report the values behind the "env" prefix, the words of the
+// prefix itself are never mistaken for run flags, and a dynamic run flag
+// behind the wrapper is still reported as dynamic.
+func TestSystemdWrapperRegistrationReportsPreservedRunFlags(t *testing.T) {
+	t.Run("registrationOptions reads the run flags behind the wrapper", func(t *testing.T) {
+		unit := `[Service]
+ExecStart=/usr/bin/env -i HF_ARGS=--listen HF_HOME=/srv/hfdesk /opt/hfdesk/hfdesk service run --config /srv/etc/hfdesk.json --state-dir /srv/state --log-dir /srv/log --listen 127.0.0.1:19090 --cache-dir /srv/cache --hub-dir /srv/cache/hub --local-dir /srv/models
+WorkingDirectory=/srv/state
+`
+		got := registrationOptions(parseUnit(unit), ScopeUser)
+		if got.Listen != "127.0.0.1:19090" {
+			t.Errorf("listen = %q, want the registered 127.0.0.1:19090; the --listen-shaped word of the env prefix must not be read as a run flag", got.Listen)
+		}
+		wantPaths := runtimepaths.Paths{
+			ConfigFile: "/srv/etc/hfdesk.json",
+			StateDir:   "/srv/state",
+			LogDir:     "/srv/log",
+		}
+		if got.Paths != wantPaths {
+			t.Errorf("paths = %+v, want the registered %+v", got.Paths, wantPaths)
+		}
+		for _, pair := range []struct {
+			name string
+			got  string
+			want string
+		}{
+			{"cache root", got.CacheDir, "/srv/cache"},
+			{"hub dir", got.HubDir, "/srv/cache/hub"},
+			{"local dir", got.LocalDir, "/srv/models"},
+		} {
+			if pair.got != pair.want {
+				t.Errorf("%s = %q, want the registered %q", pair.name, pair.got, pair.want)
+			}
+		}
+	})
+
+	t.Run("a dynamic run flag behind the wrapper stays dynamic", func(t *testing.T) {
+		unit := "[Service]\nExecStart=/usr/bin/env HF_HOME=%h /opt/hfdesk/hfdesk service run --config /srv/etc/hfdesk.json --state-dir %h/state --log-dir /srv/log --listen 127.0.0.1:19090\n"
+		parsed := parseUnit(unit)
+		if !parsed.DynamicRunArgs["state-dir"] {
+			t.Errorf("DynamicRunArgs = %v, want the dynamic --state-dir behind the wrapper", parsed.DynamicRunArgs)
+		}
+		if parsed.DynamicRunArgs["listen"] {
+			t.Errorf("DynamicRunArgs = %v, want the static --listen not marked dynamic", parsed.DynamicRunArgs)
+		}
+		if got := registrationOptions(parsed, ScopeUser).Listen; got != "127.0.0.1:19090" {
+			t.Errorf("listen = %q, want the static address registered next to the dynamic flag", got)
+		}
+	})
+
+	t.Run("an update reports the preserved registration", func(t *testing.T) {
+		logPath := systemdRecordingSupervisor(t)
+		root := t.TempDir()
+		oldExecutable := systemdTestExecutable(t)
+		newExecutable := systemdTestExecutable(t)
+		previous := systemdExistingOptions(t, oldExecutable, root)
+		m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+		_, tail, _ := splitRenderedExecStart(t, previousUnit, oldExecutable)
+		wrapped := systemdWrapExecStart(t, previousUnit, oldExecutable, "/usr/bin/env HF_HOME=/srv/hfdesk hfdesk"+tail)
+		for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
+			if err := os.WriteFile(name, []byte(wrapped), 0o644); err != nil {
+				t.Fatalf("write the wrapped unit %q: %v", name, err)
+			}
+		}
+		t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+		t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+
+		effective, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+		if err != nil {
+			t.Fatalf("Install() = %v, want the update of the wrapped unit", err)
+		}
+		want := previous
+		want.Executable = newExecutable
+		if !reflect.DeepEqual(effective, want) {
+			t.Errorf("Install() returned\n%+v\nwant the preserved registration\n%+v", effective, want)
+		}
+		if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 0 {
+			t.Errorf("the stopped instance was restarted %d times", got)
+		}
+	})
+}
+
 type systemdLosslessUpdateFixture struct {
 	logPath       string
 	manager       *systemdManager
