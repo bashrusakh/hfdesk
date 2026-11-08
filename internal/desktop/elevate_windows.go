@@ -73,10 +73,14 @@ var shellExecuteEx = windows.NewLazySystemDLL("shell32.dll").NewProc("ShellExecu
 
 // shellExecuteInfo is the SHELLEXECUTEINFO of the Windows API.
 //
-// The struct mirrors the C declaration field by field, including the padding
-// the 64-bit ABI inserts around the 32-bit fields: the shell reads a pointer
-// out of every field, so a field at the wrong offset would make the call read
-// a string out of a flag.
+// The struct mirrors the C declaration field by field. The padding of the
+// 64-bit ABI around the 32-bit fields is inserted by the Go compiler itself,
+// because a field's alignment is architecture dependent: an explicitly
+// spelled padding field would occupy a real slot on the 32-bit ABI, where the
+// native structure has none, and shift every later field — the shell reads a
+// pointer out of every field, so a field at the wrong offset would make the
+// call read a string out of a flag. cbSize is the size of this struct at the
+// call site, so it has to match the native size of the running architecture.
 type shellExecuteInfo struct {
 	// cbSize is the size of the struct.
 	cbSize uint32
@@ -94,8 +98,6 @@ type shellExecuteInfo struct {
 	lpDirectory *uint16
 	// nShow is the show state of the program.
 	nShow int32
-	// _ is the padding of the 64-bit ABI.
-	_ uint32
 	// hInstApp is the instance of the application.
 	hInstApp uintptr
 	// lpIDList is the item identifier list of the shell.
@@ -106,8 +108,6 @@ type shellExecuteInfo struct {
 	hkeyClass uintptr
 	// dwHotKey is the hot key of the launched program.
 	dwHotKey uint32
-	// _ is the padding of the 64-bit ABI.
-	_ uint32
 	// hIcon is the union of hIcon and hMonitor.
 	hIcon uintptr
 	// hProcess is the handle of the started process. It is only set when

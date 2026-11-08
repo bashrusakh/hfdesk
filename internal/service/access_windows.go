@@ -315,6 +315,17 @@ func scmPathTraversalDirectories(sourcePath, resolvedPath string) ([]string, err
 			break
 		}
 		add(resolvedPrefix)
+		// Every ancestor of the resolved prefix is on the route the
+		// platform walks when it follows the reparse point. The ancestors of
+		// the final endpoint are checked below, but a nested reparse point
+		// makes the route deviate: an intermediate directory that only this
+		// prefix resolution passes through — for example the directory a
+		// junction lives under before another link moves the route
+		// elsewhere — has to grant traversal as well when the token has no
+		// SeChangeNotifyPrivilege bypass.
+		for _, dir := range scmParentDirs(resolvedPrefix) {
+			add(dir)
+		}
 	}
 	for _, dir := range scmParentDirs(resolvedPath) {
 		add(dir)

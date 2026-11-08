@@ -2720,6 +2720,78 @@ func TestSCMPathRouteUsesNativeAccessCheckForSourceDenials(t *testing.T) {
 	}
 }
 
+// TestSCMPathRouteChecksEveryAncestorOfAResolvedReparseRoute proves the
+// traversal route covers the ancestors of every resolved prefix, not only the
+// final endpoint: a nested reparse route whose intermediate target lives
+// under a directory outside either endpoint's parents passes through that
+// directory, and without SeChangeNotifyPrivilege the token needs
+// FILE_TRAVERSE there.
+func TestSCMPathRouteChecksEveryAncestorOfAResolvedReparseRoute(t *testing.T) {
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "source")
+	deniedDir := filepath.Join(root, "denied")
+	middleDir := filepath.Join(deniedDir, "middle")
+	targetDir := filepath.Join(root, "target")
+	for _, dir := range []string{sourceDir, deniedDir, middleDir, targetDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", dir, err)
+		}
+	}
+	// source/junction -> denied/middle, denied/middle/nested -> target: the
+	// route to the file passes through denied, which is an ancestor of
+	// neither the source path nor the resolved endpoint.
+	firstLink := filepath.Join(sourceDir, "junction")
+	scmTestCreateDirectorySymlink(t, middleDir, firstLink)
+	nestedLink := filepath.Join(middleDir, "nested")
+	scmTestCreateDirectorySymlink(t, targetDir, nestedLink)
+	sourcePath := filepath.Join(firstLink, "nested", "hfdesk.exe")
+	if err := os.WriteFile(filepath.Join(targetDir, "hfdesk.exe"), []byte("test image"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	resolvedDenied, err := scmResolvePath(deniedDir)
+	if err != nil {
+		t.Fatalf("resolve the intermediate ancestor %q: %v", deniedDir, err)
+	}
+	denyTraverse := func(path string, desired uint32) bool {
+		return desired&windows.FILE_TRAVERSE != 0 &&
+			strings.EqualFold(filepath.Clean(path), filepath.Clean(resolvedDenied))
+	}
+
+	// Without the traverse privilege the intermediate ancestor is checked
+	// and its denial stops the route.
+	access := &scmTestPathAccess{
+		check: func(path string, desired uint32) (bool, error) {
+			return !denyTraverse(path, desired), nil
+		},
+	}
+	decision, reason := scmCheckPathAccess(sourcePath, windows.FILE_EXECUTE, access)
+	if decision != scmExecutableAccessDenied || !scmTestNamesPath(reason, resolvedDenied) {
+		t.Fatalf("route with a denied intermediate ancestor = %v, %q; want the traversal of %q denied",
+			decision, reason, resolvedDenied)
+	}
+
+	// The other side: the same route passes when the ancestor grants
+	// traversal.
+	allowed := &scmTestPathAccess{
+		check: func(string, uint32) (bool, error) { return true, nil },
+	}
+	if decision, reason := scmCheckPathAccess(sourcePath, windows.FILE_EXECUTE, allowed); decision != scmExecutableAccessAllowed {
+		t.Fatalf("route with a granted intermediate ancestor = %v, %q; want allowed", decision, reason)
+	}
+
+	// The privilege keeps its semantics: with SeChangeNotifyPrivilege
+	// enabled the traversal route is not required.
+	bypass := &scmTestPathAccess{
+		check: func(path string, desired uint32) (bool, error) {
+			return !denyTraverse(path, desired), nil
+		},
+		privilege: true,
+	}
+	if decision, reason := scmCheckPathAccess(sourcePath, windows.FILE_EXECUTE, bypass); decision != scmExecutableAccessAllowed {
+		t.Fatalf("route with the traverse-bypass privilege = %v, %q; want allowed without the traversal", decision, reason)
+	}
+}
+
 func TestSCMPathAccessHonorsTraversePrivilegeAndUnknownEvidence(t *testing.T) {
 	root := t.TempDir()
 	parent := filepath.Join(root, "parent")
