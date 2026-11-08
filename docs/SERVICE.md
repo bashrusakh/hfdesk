@@ -797,9 +797,15 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   shadowed base-file edit took effect. The command itself must be rewritable
   too: only an `ExecStart=` that is the program alone, or the program
   followed by `service run` — directly or behind an `env` prefix, which is
-  kept — is updated, and any other form (a shell-wrapped script, an unknown
+  kept — is rewritten, and any other form (a shell-wrapped script, an unknown
   wrapper) is refused before anything is changed, with an error that names
-  the line. On Windows, the
+  the line. A command without the `service run` vector and its required flags
+  (`--config`, `--state-dir`, `--log-dir`) can be updated only while its
+  service is stopped: an update that must verify a running start requires
+  that canonical vector, and a running service registered with a command that
+  lacks it is refused before anything is changed — the unit is not rewritten
+  and the service is not stopped — with an error that names the line and the
+  vector to set. On Windows, the
   readable SCM settings
   that HFDesk does not own are written back with the new command line. The
   Windows identity remains the fixed `LocalService` account, and an SCM password

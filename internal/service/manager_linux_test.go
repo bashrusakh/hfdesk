@@ -6566,6 +6566,125 @@ func TestSystemdInstallRefusesUnrewritableExecStartBeforeChangingTheUnit(t *test
 	}
 }
 
+// TestSystemdInstallRefusesAnUnverifiableRunningExecStartBeforeChangingTheUnit
+// checks the rule that an update which must verify a running start requires a
+// verifiable existing command: a hand-edited registration whose ExecStart=
+// cannot show the live process the canonical "service run" vector with its
+// required flags is refused before anything changes — no stop, no unit write,
+// no restart — while the stopped instance of the same command keeps updating.
+// The refusal names the found command, the canonical vector as the next
+// action, and states that neither the registration nor the running service
+// was touched.
+func TestSystemdInstallRefusesAnUnverifiableRunningExecStartBeforeChangingTheUnit(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tail string
+	}{
+		{name: "the program alone"},
+		{name: "a run vector without the required flags", tail: " service run --listen 127.0.0.1:19090"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := systemdRecordingSupervisor(t)
+			root := t.TempDir()
+			oldExecutable := systemdTestExecutable(t)
+			newExecutable := systemdTestExecutable(t)
+			previous := systemdExistingOptions(t, oldExecutable, root)
+			m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+			// The verification wait only matters without the refusal
+			// rule: a disabled rule must fail fast into the churn this
+			// test guards against instead of burning the shutdown budget.
+			m.restartWait = 250 * time.Millisecond
+			value := oldExecutable + tc.tail
+			edited := systemdWrapExecStart(t, previousUnit, oldExecutable, value)
+			for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
+				if err := os.WriteFile(name, []byte(edited), 0o644); err != nil {
+					t.Fatalf("write the hand-edited unit %q: %v", name, err)
+				}
+			}
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+
+			_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+			if err == nil {
+				t.Fatal("Install() = nil, want the refusal of the unverifiable running command")
+			}
+			for _, want := range []string{"was refused", "not changed", "not stopped", value, "service run", "--config", newExecutable} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Install() = %q, want it to contain %q", err, want)
+				}
+			}
+			content, readErr := os.ReadFile(unitPath)
+			if readErr != nil || string(content) != edited {
+				t.Errorf("the refused update changed the unit: read err=%v\n%s", readErr, content)
+			}
+			calls := systemdSupervisorCalls(t, logPath)
+			for _, command := range []string{"daemon-reload", "enable", "restart", "start"} {
+				if count := systemdSupervisorCallsTo(calls, command, unitName); count != 0 {
+					t.Errorf("the refused update issued %q %d times: %v", command, count, calls)
+				}
+			}
+		})
+	}
+}
+
+// TestSystemdInstallUpdatesAnUnverifiableCommandOfAStoppedInstance checks
+// the preserved side of the rule: a stopped instance has no start to verify,
+// so the same hand-edited commands keep updating exactly as before — the
+// program slot takes the new program, the run vector stays as it is, and
+// nothing is started.
+func TestSystemdInstallUpdatesAnUnverifiableCommandOfAStoppedInstance(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		tail      string
+		wantExtra string
+	}{
+		{name: "the program alone"},
+		{
+			name:      "a run vector without the required flags",
+			tail:      " service run --listen 127.0.0.1:19090",
+			wantExtra: " service run --listen 127.0.0.1:19090",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := systemdRecordingSupervisor(t)
+			root := t.TempDir()
+			oldExecutable := systemdTestExecutable(t)
+			newExecutable := systemdTestExecutable(t)
+			previous := systemdExistingOptions(t, oldExecutable, root)
+			m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+			edited := systemdWrapExecStart(t, previousUnit, oldExecutable, oldExecutable+tc.tail)
+			for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
+				if err := os.WriteFile(name, []byte(edited), 0o644); err != nil {
+					t.Fatalf("write the hand-edited unit %q: %v", name, err)
+				}
+			}
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+
+			if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
+				t.Fatalf("Install() = %v, want the stopped update of an unverifiable command accepted", err)
+			}
+			content, readErr := os.ReadFile(unitPath)
+			if readErr != nil {
+				t.Fatalf("read the updated unit: %v", readErr)
+			}
+			want := `ExecStart="` + newExecutable + `"` + tc.wantExtra
+			if !strings.Contains(string(content), want) {
+				t.Errorf("the updated unit does not hold %q:\n%s", want, content)
+			}
+			if strings.Contains(string(content), oldExecutable) {
+				t.Errorf("the updated unit still names the old program %q:\n%s", oldExecutable, content)
+			}
+			calls := systemdSupervisorCalls(t, logPath)
+			for _, command := range []string{"restart", "start"} {
+				if count := systemdSupervisorCallsTo(calls, command, unitName); count != 0 {
+					t.Errorf("a stopped instance was %sed %d times:\n%s", command, count, strings.Join(calls, "\n"))
+				}
+			}
+		})
+	}
+}
+
 // TestSystemdInstallRepairsAnEnvWrappedExecStart checks the rewrite the
 // update promises for a recognized wrapper: the "env" prefix and its
 // arguments stay, the program slot takes the new program, the run arguments

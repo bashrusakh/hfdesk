@@ -33,6 +33,37 @@ func RunArgsHelp() []struct{ Name, Usage string } {
 	}
 }
 
+// requiredRunFlags names the flags of the run vector an instance start must
+// carry: a missing flag means a broken registration, not a default. The
+// parser refuses a vector that misses one, and an update that has to verify a
+// running start refuses a registered command that cannot show the same set —
+// one list, so the update domain and the verification domain cannot drift
+// apart.
+var requiredRunFlags = []string{"config", "state-dir", "log-dir"}
+
+// runOptionValue returns the parsed value of a run flag by its name without
+// the leading dashes ("config" for "--config"); an unknown name has no value.
+func runOptionValue(opts RunOptions, name string) string {
+	switch name {
+	case "config":
+		return opts.Paths.ConfigFile
+	case "state-dir":
+		return opts.Paths.StateDir
+	case "log-dir":
+		return opts.Paths.LogDir
+	case "listen":
+		return opts.Listen
+	case "cache-dir":
+		return opts.CacheDir
+	case "hub-dir":
+		return opts.HubDir
+	case "local-dir":
+		return opts.LocalDir
+	default:
+		return ""
+	}
+}
+
 // ParseRunArgs parses the argument vector of the service host process into
 // the options of the headless host.
 //
@@ -54,16 +85,9 @@ func ParseRunArgs(args []string) (RunOptions, error) {
 
 	// An instance is only started with a complete path model. A missing
 	// flag means a broken registration, not a default.
-	for _, required := range []struct {
-		flag  string
-		value string
-	}{
-		{"--config", opts.Paths.ConfigFile},
-		{"--state-dir", opts.Paths.StateDir},
-		{"--log-dir", opts.Paths.LogDir},
-	} {
-		if required.value == "" {
-			return RunOptions{}, fmt.Errorf("service: missing required flag %s", required.flag)
+	for _, name := range requiredRunFlags {
+		if runOptionValue(opts, name) == "" {
+			return RunOptions{}, fmt.Errorf("service: missing required flag --%s", name)
 		}
 	}
 
@@ -160,25 +184,7 @@ func parseRunArgsValues(args []string) (RunOptions, error) {
 // same parser as ParseRunArgs. It is intentionally tolerant of other missing
 // required values because status must still describe a damaged registration.
 func runArgValue(args []string, flag string) string {
-	opts := parseRunArgValues(args)
-	switch strings.TrimLeft(flag, "-") {
-	case "config":
-		return opts.Paths.ConfigFile
-	case "state-dir":
-		return opts.Paths.StateDir
-	case "log-dir":
-		return opts.Paths.LogDir
-	case "listen":
-		return opts.Listen
-	case "cache-dir":
-		return opts.CacheDir
-	case "hub-dir":
-		return opts.HubDir
-	case "local-dir":
-		return opts.LocalDir
-	default:
-		return ""
-	}
+	return runOptionValue(parseRunArgValues(args), strings.TrimLeft(flag, "-"))
 }
 
 func parseRunArgValues(args []string) RunOptions {

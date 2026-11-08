@@ -1101,6 +1101,14 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 		if err := validateSystemdExecStartUpdate(string(sourceContent), opts.Executable); err != nil {
 			return opts, err
 		}
+		// An update of a running instance verifies the restarted start
+		// against the live process argv, so the existing command must be
+		// verifiable: refused here, at the same boundary and before any
+		// mutation, while a stopped instance keeps updating without a
+		// start to verify.
+		if err := m.refuseUnverifiableRunningExecStart(ctx, string(sourceContent), opts.Executable); err != nil {
+			return opts, err
+		}
 	}
 	// A machine-wide instance must not adopt the state of the user who
 	// runs the install command. The check runs before the root
@@ -3858,6 +3866,14 @@ func systemdEnvPrefixWord(word systemdWord) bool {
 // rewrite. The error states the result (nothing was changed), the cause (the
 // command it found, named in the message) and the next action.
 func systemdExecStartRefusal(tokens []systemdWord, executable string) error {
+	return fmt.Errorf("service: the update was refused and the registration was not changed: the existing ExecStart=%q is not a command an installation can rewrite. Set the ExecStart= line to start with the program %q followed by \"service run\" (an \"env\" prefix before the program is kept) and run the installation again",
+		shownSystemdCommand(tokens), executable)
+}
+
+// shownSystemdCommand renders the command of an ExecStart= line for an error
+// message: the source words the line carries, truncated after a few words so
+// a long vector stays readable.
+func shownSystemdCommand(tokens []systemdWord) string {
 	const shownWords = 6
 	shown := make([]string, 0, shownWords+1)
 	for i, token := range tokens {
@@ -3867,8 +3883,73 @@ func systemdExecStartRefusal(tokens []systemdWord, executable string) error {
 		}
 		shown = append(shown, token.source)
 	}
-	return fmt.Errorf("service: the update was refused and the registration was not changed: the existing ExecStart=%q is not a command an installation can rewrite. Set the ExecStart= line to start with the program %q followed by \"service run\" (an \"env\" prefix before the program is kept) and run the installation again",
-		strings.Join(shown, " "), executable)
+	return strings.Join(shown, " ")
+}
+
+// systemdExecStartVerifiable reports whether the registered command can be
+// verified after a restart: the verification reads the argv of the live
+// process and accepts only what ParseRunArgs accepts, so the command must
+// carry the canonical "service run" vector with every flag of
+// requiredRunFlags — the same list the parser enforces. The program alone and
+// a run vector missing one of those flags can start, but can never be
+// verified. An unrecognized shape is refused by the rewrite rule before this
+// predicate runs.
+func systemdExecStartVerifiable(tokens []systemdWord) bool {
+	slot, ok := systemdExecStartSlot(tokens)
+	if !ok || len(tokens) <= 1 {
+		return false
+	}
+	// A recognized command of more than one word carries "service run"
+	// right behind the program slot, exactly as the runtime argv does.
+	args := make([]string, 0, len(tokens)-1-slot)
+	for _, token := range tokens[slot+1:] {
+		args = append(args, token.value)
+	}
+	parsed := parseRunArgValues(args)
+	for _, name := range requiredRunFlags {
+		if runOptionValue(parsed, name) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// systemdUnverifiableRunningRefusal reports a recognized ExecStart= command
+// whose start HFDesk cannot verify for the instance it finds running. Like
+// systemdExecStartRefusal the error states the result (nothing was changed,
+// nothing was stopped), the cause (the command it found, named in the
+// message) and the next action.
+func systemdUnverifiableRunningRefusal(tokens []systemdWord, executable string) error {
+	required := "--" + strings.Join(requiredRunFlags, " --")
+	return fmt.Errorf("service: the update was refused: the registration was not changed and the running service was not stopped. The existing ExecStart=%q does not carry \"service run\" with the required flags %s, so HFDesk cannot verify the start of this command. Set the ExecStart= line to start with the program %q followed by \"service run\" and the required flags %s (an \"env\" prefix before the program is kept) and run the update again",
+		shownSystemdCommand(tokens), required, executable, required)
+}
+
+// refuseUnverifiableRunningExecStart applies the rule that an update which
+// must verify a running start requires a verifiable existing command: a
+// restart of a command without the canonical run vector would be followed by
+// a verification that can only fail, and only after the working instance was
+// already restarted. The refusal happens before any mutation; a stopped
+// instance has no start to verify and keeps updating as before. The state is
+// asked of the supervisor only for a command the rule may refuse, so a
+// verifiable registration gains no new supervisor interaction.
+func (m *systemdManager) refuseUnverifiableRunningExecStart(ctx context.Context, content, executable string) error {
+	value, ok := systemdExecStartValue(content)
+	if !ok {
+		return nil
+	}
+	tokens := splitSystemdWordTokens(strings.TrimSpace(value))
+	if len(tokens) == 0 || systemdExecStartVerifiable(tokens) {
+		return nil
+	}
+	running, err := m.registrationRunning(ctx)
+	if err != nil {
+		return err
+	}
+	if !running {
+		return nil
+	}
+	return systemdUnverifiableRunningRefusal(tokens, executable)
 }
 
 func systemdSourceWord(source string) systemdWord {
