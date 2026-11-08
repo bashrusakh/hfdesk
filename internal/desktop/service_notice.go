@@ -380,14 +380,14 @@ func isAlreadyRegisteredRefusal(err error) bool {
 // registration this attempt never touched, because removing it would take away
 // a service the user did not ask to remove here. The next actions are the ones
 // this state offers: the startup gate of the next launch of the desktop app,
-// and the update that points the existing registration at the program it runs
-// from. The folder guidance of a failed installation is left out as well: the
-// cause is known, and it is not the folder of the program.
+// and the installation that points the existing registration at the program it
+// runs from. The folder guidance of a failed installation is left out as well:
+// the cause is known, and it is not the folder of the program.
 func serviceAlreadyRegisteredText(detail string) string {
 	return "HFDesk could not install the Windows service.\n\n" + detail + "\n\n" +
 		"The service registration already exists, and this attempt did not create, change or start it.\n\n" +
 		"Start HFDesk again: with the registration in place, its startup gate offers to open or start the service and to update it. " +
-		`Run "hfdesk service update" from an elevated shell to point the registration at the program in the folder you run it from.`
+		`Run "hfdesk service install" from an elevated shell to point the registration at the program in the folder you run it from.`
 }
 
 // serviceActionFailureText returns the report of a failed service action: the

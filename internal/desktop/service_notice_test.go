@@ -414,7 +414,7 @@ func TestServiceActionFailureTextOfAnAlreadyRegisteredFirstInstall(t *testing.T)
 			"The service registration already exists, and this attempt did not create, change or start it.",
 			"Start HFDesk again",
 			"startup gate offers to open or start the service and to update it",
-			`"hfdesk service update"`,
+			`"hfdesk service install"`,
 			"elevated shell",
 		} {
 			if !strings.Contains(text, want) {
@@ -449,7 +449,7 @@ func TestServiceActionFailureTextOfAnAlreadyRegisteredFirstInstall(t *testing.T)
 	for _, want := range []string{
 		reworded.Error(),
 		"did not create, change or start it",
-		`"hfdesk service update"`,
+		`"hfdesk service install"`,
 	} {
 		if !strings.Contains(rewordedText, want) {
 			t.Errorf("the report %q does not mention %q", rewordedText, want)

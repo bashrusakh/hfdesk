@@ -1530,7 +1530,7 @@ func TestServiceHelperInstallReportsARegistrationConflictWithoutStatusLookup(t *
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the refusal of the existing registration", len(*messages))
 	}
-	for _, want := range []string{"already registered", "did not create, change or start it", `"hfdesk service update"`} {
+	for _, want := range []string{"already registered", "did not create, change or start it", `"hfdesk service install"`} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
 		}
