@@ -51,7 +51,17 @@ func acquirePublicationDomain(t *testing.T, repo *RepoDir, sha string) *blobDoma
 	if err != nil {
 		t.Fatal(err)
 	}
-	domain, err := acquireBlobDomain(t.Context(), repo.BlobPath(sha), dst)
+	// The current scoped acquire with production's cache path derivation and
+	// the same cache-owned realm Download uses.
+	realm, err := repo.cache.ownershipRealmForData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, domainDst, proofPath, paths, err := downloadOwnershipPaths(true, repo, dst, dst, PlanItem{SHA256: sha})
+	if err != nil {
+		t.Fatal(err)
+	}
+	domain, err := acquireBlobDomainScoped(t.Context(), key, domainDst, realm, paths, proofPath)
 	if err != nil {
 		t.Fatal(err)
 	}

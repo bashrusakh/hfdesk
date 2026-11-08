@@ -192,7 +192,7 @@ func TestRangedMultipart_OutOfOrderRangesProduceExactBytes(t *testing.T) {
 		}
 		t.Errorf("unexpected artifacts after publish: %v", names)
 	}
-	if _, err := os.Stat(stagingOwnershipLockPath(dst + ".incomplete")); !os.IsNotExist(err) {
+	if _, err := os.Stat(dst + ".incomplete" + stagingLockSuffix); !os.IsNotExist(err) {
 		t.Errorf("an obsolete payload-side ownership lock exists: %v", err)
 	}
 	if files, _ := multipartPartFiles(dst); len(files) != 0 {

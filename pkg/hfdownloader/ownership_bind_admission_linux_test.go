@@ -50,9 +50,21 @@ func TestOwnershipTreeAdmissionBindView(t *testing.T) {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		lower := strings.ToLower(string(output))
-		if strings.Contains(lower, "unshare failed") &&
-			(strings.Contains(lower, "operation not permitted") || strings.Contains(lower, "permission denied") || strings.Contains(lower, "invalid argument")) {
-			t.Skipf("private mount namespace is unavailable: %s", strings.TrimSpace(string(output)))
+		// Skip only environment capability denial: the runner refusing
+		// namespace creation or the uid_map/gid_map write (EPERM/EACCES/EINVAL).
+		// Once the child test itself has run, its failure is a genuine mechanism
+		// breakage and must fail, whatever the message says.
+		capabilityDenied := (strings.Contains(lower, "operation not permitted") ||
+			strings.Contains(lower, "permission denied") ||
+			strings.Contains(lower, "invalid argument")) &&
+			(strings.Contains(lower, "unshare") ||
+				strings.Contains(lower, "uid_map") ||
+				strings.Contains(lower, "gid_map"))
+		childRan := strings.Contains(lower, "--- fail") ||
+			strings.Contains(lower, "=== run") ||
+			strings.Contains(lower, "panic")
+		if capabilityDenied && !childRan {
+			t.Skipf("namespace setup is denied by this environment: %s", strings.TrimSpace(string(output)))
 		}
 		t.Fatalf("bind-view child failed: %v\n%s", err, output)
 	}

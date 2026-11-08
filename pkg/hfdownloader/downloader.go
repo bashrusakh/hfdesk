@@ -898,36 +898,56 @@ LOOP:
 	wg.Wait()
 
 	// Reconcile each skipped shared blob's own snapshot/friendly paths after all
-	// transfers finish. Link failures fail the job; continue checking other links.
+	// transfers finish. Success requires every skipped blob to still be complete
+	// and reachable: a vanished blob, a failed availability/ownership check, and
+	// a link failure are distinct job errors. Every link is still checked; a
+	// cancelled job reports its cancellation, not a reconcile side effect.
 	var reconcileErr error
+	recordReconcile := func(err error) {
+		if reconcileErr == nil && jobCtx.Err() == nil {
+			reconcileErr = err
+		}
+	}
 	if useHFCache && repoDir != nil {
 		skippedLinksMu.Lock()
 		links := append([]skippedBlobLink(nil), skippedLinks...)
 		skippedLinksMu.Unlock()
 		for _, link := range links {
+			if jobCtx.Err() != nil {
+				break
+			}
 			status, _, cerr := repoDir.CheckBlob(link.sha256)
-			if cerr != nil || status != BlobComplete {
+			if cerr != nil {
+				recordReconcile(fmt.Errorf("%w: the blob of skipped %s could not be re-confirmed (%s): %w",
+					ErrCacheBlobCheckFailed, link.relativePath, status, cerr))
+				continue
+			}
+			if status != BlobComplete {
+				recordReconcile(fmt.Errorf("%w: blob %s of skipped %s is %s at final reconciliation; run the download again to fetch it",
+					ErrCacheBlobUnavailable, link.sha256, link.relativePath, status))
 				continue
 			}
 			blobPath := repoDir.BlobPath(link.sha256)
 			domainDst, derr := repoDir.blobDomainDst(link.sha256)
-			if derr == nil {
-				var domain *blobDomain
-				domain, derr = acquireBlobDomainScoped(jobCtx, blobPath, domainDst, ownership, []string{blobPath}, blobPath)
-				if derr == nil {
-					if _, statErr := os.Stat(blobPath); statErr != nil {
-						derr = fmt.Errorf("%w: blob %s disappeared before link reconciliation: %w", ErrCacheLinkUnreachable, link.sha256, statErr)
-					} else {
-						derr = createCacheEntryLinksScoped(jobCtx, repoDir, link.commit, link.relativePath, link.filterSubdir, link.sha256, !friendlyView, ownership, friendlyOwnership)
-					}
-					domain.release()
-				}
-			}
 			if derr != nil {
-				if reconcileErr == nil {
-					reconcileErr = derr
-				}
+				recordReconcile(fmt.Errorf("%w: resolve the ownership scope of blob %s for skipped %s: %w",
+					ErrCacheBlobCheckFailed, link.sha256, link.relativePath, derr))
 				continue
+			}
+			domain, derr := acquireBlobDomainScoped(jobCtx, blobPath, domainDst, ownership, []string{blobPath}, blobPath)
+			if derr != nil {
+				recordReconcile(fmt.Errorf("%w: acquire the ownership scope of blob %s for skipped %s: %w",
+					ErrCacheBlobCheckFailed, link.sha256, link.relativePath, derr))
+				continue
+			}
+			if _, statErr := os.Stat(blobPath); statErr != nil {
+				derr = fmt.Errorf("%w: blob %s disappeared before link reconciliation: %w", ErrCacheBlobUnavailable, link.sha256, statErr)
+			} else {
+				derr = createCacheEntryLinksScoped(jobCtx, repoDir, link.commit, link.relativePath, link.filterSubdir, link.sha256, !friendlyView, ownership, friendlyOwnership)
+			}
+			domain.release()
+			if derr != nil {
+				recordReconcile(derr)
 			}
 		}
 	}
@@ -958,13 +978,15 @@ LOOP:
 		emit(ProgressEvent{Level: "error", Event: "error", Message: drainedErr.Error()})
 		return drainedErr
 	}
+	// A cancellation landing after a reconcile error was recorded still reports
+	// the cancellation: it is not a failure of a cancelled job, and jobCtx can
+	// only be cancelled here by an abort (handled above) or the caller's context.
+	if jobCtx.Err() != nil {
+		return jobCtx.Err()
+	}
 	if reconcileErr != nil {
 		emit(ProgressEvent{Level: "error", Event: "error", Message: reconcileErr.Error()})
 		return reconcileErr
-	}
-
-	if ctx.Err() != nil {
-		return ctx.Err()
 	}
 
 	// Post-download finalization (refs, building the friendly view, rebuild
@@ -1004,13 +1026,12 @@ LOOP:
 		}
 	}
 
-	// Write/update the rebuild shell script if using HF cache (unless friendly view disabled)
+	// Write/update the rebuild shell script if using HF cache (unless friendly
+	// view disabled). WriteRebuildScript admits the script entry itself, so
+	// the write must not arrive already holding those same keys; the job
+	// context still bounds its wait.
 	if hfCache != nil && friendlyView {
-		err := withExternalWriter(jobCtx, friendlyOwnership, hfCache.RebuildScriptPath(), func() error {
-			_, err := hfCache.WriteRebuildScript()
-			return err
-		})
-		if err != nil {
+		if _, err := hfCache.writeRebuildScriptCtx(jobCtx); err != nil {
 			emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to write rebuild script: %v", err)})
 		}
 	}
@@ -1466,6 +1487,25 @@ func absoluteAttemptCeiling(retries int) int {
 	return (retries + 1) * maxAttemptsPerRetry
 }
 
+// syncSinglePartPayload orders previously written partial bytes durable before
+// a sidecar persist may claim framing_complete; tests may replace it to
+// observe the ordering.
+var syncSinglePartPayload = func(f *os.File) error { return f.Sync() }
+
+// persistSinglePartIdentity writes the sidecar, ordering the partial's written
+// bytes durable first whenever the record claims framing_complete: a persisted
+// resume claim must be true under power loss, not only under a process crash,
+// matching the ranged family's checkpoint rule. Checkpoint boundary only,
+// never per write chunk.
+func persistSinglePartIdentity(out *os.File, sidecar string, id singlePartIdentity) error {
+	if id.FramingComplete {
+		if err := syncSinglePartPayload(out); err != nil {
+			return fmt.Errorf("sync single-part payload of %s before its framing claim: %w", id.Path, err)
+		}
+	}
+	return writeSinglePartIdentity(sidecar, id)
+}
+
 // downloadSingle resumes dst.part only with a matching pinned sidecar and
 // validates response framing. An exact-size partial without clean-framing
 // proof revalidates its final byte. Required digest proofs run before rename;
@@ -1533,7 +1573,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	sizeValid := !((it.Size > 0 && pos > it.Size) || (it.Size <= 0 && pos > 0))
 	identity.FramingComplete = it.Size > 0 && pos == it.Size && recorded != nil &&
 		recorded.FramingComplete && recorded.inheritableBy(identity)
-	if err := writeSinglePartIdentity(sidecar, identity); err != nil {
+	if err := persistSinglePartIdentity(out, sidecar, identity); err != nil {
 		return false, fmt.Errorf("write single-part identity %s: %w", sidecar, err)
 	}
 
@@ -1608,7 +1648,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 			pos, countedUpTo = 0, 0
 			forceLastByteRange = false
 			identity.FramingComplete = false
-			if err := writeSinglePartIdentity(sidecar, identity); err != nil {
+			if err := persistSinglePartIdentity(out, sidecar, identity); err != nil {
 				return false, fmt.Errorf("write single-part identity %s: %w", sidecar, err)
 			}
 		}
@@ -1752,7 +1792,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						// exact-size restart shortcut; failure loses only the shortcut, not this
 						// run's framing proof.
 						identity.FramingComplete = true
-						if werr := writeSinglePartIdentity(sidecar, identity); werr != nil {
+						if werr := persistSinglePartIdentity(out, sidecar, identity); werr != nil {
 							downloadLog.Warn("cannot persist single-part clean-framing completion",
 								"repo", job.Repo,
 								"path", it.RelativePath,

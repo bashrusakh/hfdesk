@@ -2559,9 +2559,21 @@ func TestDestinationDomainWaitTimesOut(t *testing.T) {
 		t.Fatalf("live destination status = %v err=%v, want downloading", status, err)
 	}
 	key, lockSrc := testDomainIdentity(dst)
+	// The cache-owned realm derivation used by the fixture above, so the
+	// second claimant contends on the scope that fixture holds.
+	hubDir := filepath.Dir(filepath.Dir(filepath.Dir(key)))
+	realm, rerr := NewHFCacheResolved(hubDir, hubDir).ownershipRealmForData()
+	if rerr != nil {
+		t.Fatalf("second claimant ownership realm: %v", rerr)
+	}
+	proofPath := lockSrc
+	paths := []string{lockSrc, key, lockSrc + ".incomplete", key + ".incomplete"}
+	if canonicalSHA256(filepath.Base(key)) {
+		proofPath = key
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	_, err = acquireBlobDomain(ctx, key, lockSrc)
+	_, err = acquireBlobDomainScoped(ctx, key, lockSrc, realm, paths, proofPath)
 	if err == nil {
 		t.Fatalf("destination wait = %v, want a context deadline", err)
 	}

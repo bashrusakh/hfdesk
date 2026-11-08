@@ -142,7 +142,7 @@ func TestFlatModeMultipartHeadFailFastPreservesSingleRoutePartial(t *testing.T) 
 // partial and sidecar must survive until it publishes; the waiter then runs
 // HEAD and fails without disturbing the completed destination.
 func TestFlatModeMultipartHeadFailFastDoesNotUnlinkLiveSingleWriter(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	const total = 4_096

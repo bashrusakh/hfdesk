@@ -108,7 +108,7 @@ func (h *flatModeGatedHub) awaitPayloadEntered(t *testing.T) {
 // Tests both single/multipart contention directions. The multipart-owner case
 // uses an unpinned revision so resume routing does not change the route under test.
 func TestDownloadFlatModeRoutesExcludeEachOther(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	t.Run("single-request owner excludes the multipart writer", func(t *testing.T) {
@@ -182,7 +182,7 @@ func testFlatModeRoutesExcludeEachOther(t *testing.T, ownerThreshold, writerThre
 // Single-request writers of one flat destination serialize; the waiter
 // transfers only after the first owner releases.
 func TestDownloadFlatModeSingleRouteWritersAreExcluded(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	const total = 4_096
@@ -237,7 +237,7 @@ func TestDownloadFlatModeSingleRouteWritersAreExcluded(t *testing.T) {
 // Unknown-size handoff retains the domain acquired before HEAD; reacquiring it
 // would self-contend, while dropping it would transfer unowned.
 func TestDownloadFlatModeUnknownSizeHandoffUsesOneDomain(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	const total = 4_096
@@ -281,7 +281,7 @@ func TestDownloadFlatModeUnknownSizeHandoffUsesOneDomain(t *testing.T) {
 // Cleanup preserves a live flat-destination owner's partial and removes it
 // once that domain is free.
 func TestCleanupJobPartFilesFlatModeRespectsTheDestinationDomain(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	out := t.TempDir()

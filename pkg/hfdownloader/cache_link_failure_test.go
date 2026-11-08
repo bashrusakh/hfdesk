@@ -76,7 +76,7 @@ func TestPreDownloadSkipLinkFailureFailsTheItem(t *testing.T) {
 // exists" skip: the blob was published while the item waited for the
 // ownership domain, and the item's own link creation fails.
 func TestPostDomainSkipLinkFailureFailsTheItem(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	const total = 4_096

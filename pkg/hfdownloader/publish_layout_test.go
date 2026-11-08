@@ -25,6 +25,100 @@ func completeRangeLayout(size int64, n int) []RangeProgress {
 	return ranges
 }
 
+// Publish refuses missing/foreign claims under the held destination domain
+// and still accepts an owned claim with a complete layout.
+func TestStagingPublishRefusesForeignClaim(t *testing.T) {
+	payload := []byte("someone else's payload")
+	makeDownload := func(t *testing.T) (*stagingDownload, string, string) {
+		t.Helper()
+		dir := t.TempDir()
+		staging := filepath.Join(dir, "x.incomplete")
+		pub := filepath.Join(dir, "x.bin")
+		if err := os.WriteFile(staging, payload, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		domain := acquireTestDomain(t, pub)
+		d := &stagingDownload{
+			ctx:    context.Background(),
+			dst:    pub,
+			stg:    staging,
+			pub:    pub,
+			meta:   staging + ".meta",
+			it:     PlanItem{RelativePath: "x.bin", Size: int64(len(payload))},
+			ranges: completeRangeLayout(int64(len(payload)), 1),
+			domain: domain,
+		}
+		return d, staging, pub
+	}
+
+	t.Run("foreign record", func(t *testing.T) {
+		d, staging, pub := makeDownload(t)
+		foreign := IncompleteMeta{
+			PID:       os.Getpid(),
+			Instance:  "another-process-instance",
+			Host:      processHostname,
+			StartedAt: time.Now().UTC(),
+			Size:      int64(len("someone else's payload")),
+			Version:   stagingMetaVersion,
+			Repo:      "o/r",
+			Path:      "x.bin",
+			Ranges:    buildRangeLayout(int64(len("someone else's payload")), 1),
+		}
+		if err := writeStagingMeta(d.meta, &foreign); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.publish(); !errors.Is(err, errStagingClaimLost) {
+			t.Fatalf("publish with a foreign record = %v, want errStagingClaimLost", err)
+		}
+		if _, err := os.Stat(staging); err != nil {
+			t.Errorf("publish moved a foreign staging file: %v", err)
+		}
+		if _, err := os.Stat(pub); !os.IsNotExist(err) {
+			t.Errorf("publish created the destination under a foreign record, stat err=%v", err)
+		}
+	})
+
+	t.Run("missing record", func(t *testing.T) {
+		d, staging, pub := makeDownload(t)
+		if err := d.publish(); !errors.Is(err, errStagingClaimLost) {
+			t.Fatalf("publish with a missing record = %v, want errStagingClaimLost", err)
+		}
+		if _, err := os.Stat(staging); err != nil {
+			t.Errorf("publish moved an unclaimed staging file: %v", err)
+		}
+		if _, err := os.Stat(pub); !os.IsNotExist(err) {
+			t.Errorf("publish created the destination without a claim, stat err=%v", err)
+		}
+	})
+
+	t.Run("owned record still publishes", func(t *testing.T) {
+		d, staging, pub := makeDownload(t)
+		ours := IncompleteMeta{
+			PID:       os.Getpid(),
+			Instance:  processInstanceToken,
+			Host:      processHostname,
+			StartedAt: time.Now().UTC(),
+			Size:      int64(len("someone else's payload")),
+			Version:   stagingMetaVersion,
+			Repo:      "o/r",
+			Path:      "x.bin",
+			Ranges:    completeRangeLayout(int64(len("someone else's payload")), 1),
+		}
+		if err := writeStagingMeta(d.meta, &ours); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.publish(); err != nil {
+			t.Fatalf("publish of an owned record: %v", err)
+		}
+		if _, err := os.Stat(staging); !os.IsNotExist(err) {
+			t.Errorf("published staging file survived, stat err=%v", err)
+		}
+		if got, err := os.ReadFile(pub); err != nil || string(got) != "someone else's payload" {
+			t.Errorf("published payload = %q (err=%v)", got, err)
+		}
+	})
+}
+
 type publishLayoutCase struct {
 	name string
 	// live is the in-memory layout of the download.

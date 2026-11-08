@@ -137,7 +137,7 @@ func TestDownload_FreeLockFencedRecordWithLivePIDResumes(t *testing.T) {
 		t.Fatal(err)
 	}
 	// An obsolete staging lock file may remain, but the destination-domain lock is free.
-	if err := os.WriteFile(stagingOwnershipLockPath(staging), nil, 0o644); err != nil {
+	if err := os.WriteFile(staging+stagingLockSuffix, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 

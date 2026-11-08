@@ -4,7 +4,8 @@
 package hfdownloader
 
 // Ownership waiters release their transfer slot and reacquire it before
-// transfer, in cache and flat mode and for both in-process and OS-lock waits.
+// transfer, in cache and flat mode and for both in-process and external-scope
+// waits.
 
 import (
 	"bytes"
@@ -207,7 +208,7 @@ func awaitSlotFileDone(t *testing.T, done <-chan string, rel string) {
 }
 
 func TestDownloadSlotLeaseFlatMode(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	payloadA := bytes.Repeat([]byte("a"), 4_096)
@@ -266,7 +267,7 @@ func TestDownloadSlotLeaseFlatMode(t *testing.T) {
 }
 
 func TestDownloadSlotLeaseCrossProcessWait(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	payloadA := bytes.Repeat([]byte("a"), 4_096)
@@ -303,7 +304,7 @@ func TestDownloadSlotLeaseCrossProcessWait(t *testing.T) {
 	awaitSlotFileDone(t, done, "b.bin")
 	assertExactFile(t, dstB, payloadB)
 	if got := hub.payloadCount("a.bin"); got != 0 {
-		t.Fatalf("a.bin issued %d payload requests while its OS ownership lock was held, want 0", got)
+		t.Fatalf("a.bin issued %d payload requests while its ownership scope was held, want 0", got)
 	}
 
 	releaseOwner()
@@ -313,7 +314,7 @@ func TestDownloadSlotLeaseCrossProcessWait(t *testing.T) {
 			t.Fatalf("Download: %v", err)
 		}
 	case <-time.After(60 * time.Second):
-		t.Fatal("Download did not finish after the OS ownership lock was released")
+		t.Fatal("Download did not finish after the ownership scope was released")
 	}
 	assertExactFile(t, dstA, payloadA)
 	if got := hub.payloadCount("a.bin"); got != 1 {
@@ -322,7 +323,7 @@ func TestDownloadSlotLeaseCrossProcessWait(t *testing.T) {
 }
 
 func TestDownloadSlotLeaseCacheMode(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	payloadA := bytes.Repeat([]byte("a"), 4_096)
@@ -397,7 +398,7 @@ func assertOwnershipContractLinksMissing(t *testing.T, cacheDir, rel string) {
 // An unknown-size item yields its slot during the domain wait, then keeps
 // the acquired domain through the multipart-to-single handoff.
 func TestDownloadSlotLeaseFlatModeUnknownSizeHandoff(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	payloadA := bytes.Repeat([]byte("a"), 4_096)
@@ -452,7 +453,7 @@ func TestDownloadSlotLeaseFlatModeUnknownSizeHandoff(t *testing.T) {
 }
 
 func TestDownloadSlotLeaseCancellation(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	for _, tc := range []struct {
@@ -545,7 +546,7 @@ func TestDownloadSlotLeaseCancellation(t *testing.T) {
 }
 
 func TestDownloadSlotLeaseBoundsConcurrentTransfers(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	for _, tc := range []struct {
@@ -643,19 +644,28 @@ func (r *slotNoticeRecorder) counts() (begins, ends int) {
 // Failed acquisition keeps the slot returned so error reporting cannot wait
 // for an unrelated transfer.
 func TestDownloadSlotLeaseFailedDomainAcquisitionDoesNotRetakeTheSlot(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	dst := filepath.Join(t.TempDir(), "tmp-blob")
-	owner, err := acquireStagingOwnershipLock(dst)
+	// Hold the destination's external scope the way a foreign writer does.
+	realm, err := newOwnershipRealm(DefaultOwnershipDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer owner.release()
+	holder, err := realm.acquireWriter(context.Background(), []string{dst, dst + ".part", dst + ".incomplete"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Release()
 
+	key, domainDst, proofPath, ownershipPaths, err := downloadOwnershipPaths(false, nil, dst, dst, PlanItem{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	notice := &slotNoticeRecorder{}
 	ctx := withDownloadSlotWaitNotice(context.Background(), notice)
-	domain, err := acquireBlobDomainWithin(ctx, "failed-acquisition-key", dst, 0, 100*time.Millisecond, true)
+	domain, err := acquireBlobDomainScopedWithin(ctx, key, domainDst, realm, ownershipPaths, proofPath, 0, 100*time.Millisecond)
 	if !errors.Is(err, errStagingOwnershipBusy) {
 		t.Fatalf("acquisition error = %v, want errStagingOwnershipBusy", err)
 	}
@@ -674,15 +684,22 @@ func TestDownloadSlotLeaseFailedDomainAcquisitionDoesNotRetakeTheSlot(t *testing
 }
 
 func TestDownloadSlotLeaseFreePathDoesNotReleaseOrRetake(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	dst := filepath.Join(t.TempDir(), "tmp-blob")
-	key := flatDomainKey(dst)
+	key, domainDst, proofPath, ownershipPaths, err := downloadOwnershipPaths(false, nil, dst, dst, PlanItem{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := newOwnershipRealm(DefaultOwnershipDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	notice := &slotNoticeRecorder{}
 	ctx := withDownloadSlotWaitNotice(context.Background(), notice)
 
-	domain, err := acquireBlobDomainWithin(ctx, key, dst, 0, 100*time.Millisecond, true)
+	domain, err := acquireBlobDomainScopedWithin(ctx, key, domainDst, realm, ownershipPaths, proofPath, 0, 100*time.Millisecond)
 	if err != nil {
 		t.Fatalf("uncontended domain acquisition: %v", err)
 	}

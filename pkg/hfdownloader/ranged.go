@@ -305,6 +305,13 @@ func stageStagingClaimRecord(metaPath string, data []byte) (string, error) {
 		_ = os.Remove(tmp)
 		return "", fmt.Errorf("stage initial claim record %s: %w", metaPath, err)
 	}
+	// The record must reach the medium before it can be installed: a rename of
+	// unwritten bytes would leave a checkpoint unreadable after power loss.
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("stage initial claim record %s: %w", metaPath, err)
+	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tmp)
 		return "", fmt.Errorf("stage initial claim record %s: %w", metaPath, err)
@@ -807,9 +814,23 @@ func (d *stagingDownload) flushMeta() error {
 	return d.flushMetaLocked()
 }
 
+// syncStagingPayload orders previously written payload bytes durable before a
+// persisted checkpoint claims them as its high-water mark. The default syncs
+// the real staging file; tests may replace it to observe the ordering.
+var syncStagingPayload = func(f *os.File) error { return f.Sync() }
+
 // flushMetaLocked requires metaMu, then takes the metadata gate and rechecks
 // the process-instance token before replacement. A nil layout claims no bytes.
 func (d *stagingDownload) flushMetaLocked() error {
+	// A checkpoint's high-water-mark claim must be true under power loss, not
+	// only under a process crash: order the payload bytes this record may
+	// claim durable before the record is persisted. Checkpoint boundaries only,
+	// never per write chunk.
+	if d.out != nil {
+		if err := syncStagingPayload(d.out); err != nil {
+			return fmt.Errorf("sync staging payload of %s before its checkpoint: %w", d.it.RelativePath, err)
+		}
+	}
 	meta := newClaimMeta(d.it, d.job, d.commit, d.commitPinned)
 	meta.StartedAt = d.startedAt
 	meta.ProofPending = d.proofPending

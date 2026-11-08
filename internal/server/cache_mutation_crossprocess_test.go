@@ -686,3 +686,232 @@ func TestLocalSelectedDeleteRefusesCrossProcessWriter(t *testing.T) {
 		t.Fatalf("finished local selection left %s behind: %v", seedPath, err)
 	}
 }
+
+const (
+	xprocHoldRootEnv  = "HFDESK_XPROC_HOLD_ROOT"
+	xprocHoldEntryEnv = "HFDESK_XPROC_HOLD_ENTRY"
+	xprocHoldTreeEnv  = "HFDESK_XPROC_HOLD_TREE"
+	xprocHoldReadyEnv = "HFDESK_XPROC_HOLD_READY"
+	xprocHoldGoEnv    = "HFDESK_XPROC_HOLD_GO"
+)
+
+// TestCrossProcessScopeHolderHelper holds one destination admission scope — an
+// entry's scope or a tree's — for its parent test; it never runs standalone.
+func TestCrossProcessScopeHolderHelper(t *testing.T) {
+	entry, tree := os.Getenv(xprocHoldEntryEnv), os.Getenv(xprocHoldTreeEnv)
+	if entry == "" && tree == "" {
+		t.Skip("scope holder helper needs its parent fixture")
+	}
+	admission, err := hfdownloader.OpenCacheAdmission(context.Background(), os.Getenv(xprocHoldRootEnv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var release func()
+	if tree != "" {
+		release, err = admission.AdmitTreeRemoval(context.Background(), tree)
+	} else {
+		release, err = admission.AdmitEntryReplacement(context.Background(), entry)
+	}
+	if err != nil {
+		t.Fatalf("hold scope: %v", err)
+	}
+	defer release()
+	if err := os.WriteFile(os.Getenv(xprocHoldReadyEnv), []byte("ready"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitForFile(t, os.Getenv(xprocHoldGoEnv))
+}
+
+type crossProcessScopeHolder struct {
+	cmd               *exec.Cmd
+	output            bytes.Buffer
+	readyPath, goPath string
+}
+
+// startCrossProcessScopeHolder re-executes this test binary as a holder of one
+// cache admission scope, following the cross-process writer helper's shape.
+func startCrossProcessScopeHolder(t *testing.T, root, entryPath, treePath string) *crossProcessScopeHolder {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	markerDir := t.TempDir()
+	holder := &crossProcessScopeHolder{
+		cmd:       exec.Command(exe, "-test.run=^TestCrossProcessScopeHolderHelper$"),
+		readyPath: filepath.Join(markerDir, "ready"),
+		goPath:    filepath.Join(markerDir, "go"),
+	}
+	holder.cmd.Env = append(os.Environ(),
+		xprocHoldRootEnv+"="+root,
+		xprocHoldEntryEnv+"="+entryPath,
+		xprocHoldTreeEnv+"="+treePath,
+		xprocHoldReadyEnv+"="+holder.readyPath,
+		xprocHoldGoEnv+"="+holder.goPath)
+	holder.cmd.Stdout = &holder.output
+	holder.cmd.Stderr = &holder.output
+	if err := holder.cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = holder.cmd.Process.Kill()
+		_ = holder.cmd.Wait()
+	})
+	return holder
+}
+
+func (holder *crossProcessScopeHolder) await(t *testing.T) {
+	t.Helper()
+	waitForFile(t, holder.readyPath)
+}
+
+func (holder *crossProcessScopeHolder) release(t *testing.T) {
+	t.Helper()
+	if err := os.WriteFile(holder.goPath, []byte("go"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- holder.cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("scope holder failed: %v\n%s", err, holder.output.String())
+		}
+	case <-time.After(30 * time.Second):
+		_ = holder.cmd.Process.Kill()
+		t.Fatalf("scope holder did not finish\n%s", holder.output.String())
+	}
+}
+
+// Mirror pull's snapshot symlink-leaf replacement and its directory creation
+// must both be refused through the real server route while a holder in ANOTHER
+// process owns the destination entry/tree scope: this process's JobManager
+// sees no activity, so only the cross-process admission can refuse. The held
+// repository survives untouched, an unrelated repository still mirrors while
+// the holder is in flight, and both operations succeed afterwards.
+func TestMirrorEntryAndDirectoryMutationsRefuseCrossProcessHolder(t *testing.T) {
+	isolateCacheState(t)
+	cacheDir := t.TempDir()
+	hubDir := filepath.Join(cacheDir, "hub")
+	s := New(Config{CacheDir: cacheDir, MaxActive: 1, Concurrency: 1, Verify: "sha256"})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = s.jobs.Close(ctx)
+	})
+
+	blobName := strings.Repeat("a", 64)
+	payload := []byte("mirror entry replacement payload")
+	source := t.TempDir()
+	srcRepo := filepath.Join(source, "hub", "models--owner--model")
+	srcOther := filepath.Join(source, "hub", "models--owner--other")
+	for path, data := range map[string][]byte{
+		filepath.Join(srcRepo, "blobs", blobName):     payload,
+		filepath.Join(srcOther, "blobs", "other.bin"): []byte("other"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srcEntry := filepath.Join(srcRepo, "snapshots", "seedcommit", "model.bin")
+	if err := os.MkdirAll(filepath.Dir(srcEntry), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "..", "blobs", blobName), srcEntry); err != nil {
+		t.Fatal(err)
+	}
+
+	pull := func() MirrorSyncResult {
+		t.Helper()
+		body, err := json.Marshal(map[string]any{"target": source, "force": true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := cacheRequest(t, s, http.MethodPost, "/api/mirror/pull", string(body))
+		if w.Code != http.StatusOK {
+			t.Fatalf("mirror pull: status=%d body=%s", w.Code, w.Body.String())
+		}
+		var res MirrorSyncResult
+		if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+
+	dstRepo := filepath.Join(hubDir, "models--owner--model")
+	dstEntry := filepath.Join(dstRepo, "snapshots", "seedcommit", "model.bin")
+	if err := os.MkdirAll(filepath.Dir(dstEntry), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldTarget := filepath.Join("..", "..", "blobs", strings.Repeat("b", 64))
+	if err := os.Symlink(oldTarget, dstEntry); err != nil {
+		t.Fatal(err)
+	}
+
+	// Entry-replacement class: the destination snapshot entry's scope is held
+	// by another process, so the symlink-leaf replacement is refused while the
+	// admitted file copy of the unrelated repository still proceeds.
+	holder := startCrossProcessScopeHolder(t, hubDir, dstEntry, "")
+	holder.await(t)
+	res := pull()
+	joinedErrors := strings.Join(res.Errors, "\n")
+	if res.Success || !strings.Contains(joinedErrors, "copy owner/model") || !strings.Contains(joinedErrors, "admit entry replacement") {
+		t.Fatalf("symlink-leaf replacement did not report its refused admission: success=%v errors=%v", res.Success, res.Errors)
+	}
+	if got, err := os.Readlink(dstEntry); err != nil || got != oldTarget {
+		t.Fatalf("destination entry mutated while its scope was held: %q %v", got, err)
+	}
+	if res.Copied != 1 || len(res.Repos) != 1 || res.Repos[0] != "owner/other" {
+		t.Fatalf("unrelated repository did not mirror while the holder was in flight: copied=%d repos=%v errors=%v", res.Copied, res.Repos, res.Errors)
+	}
+	holder.release(t)
+
+	// With the holder gone the replacement completes normally.
+	if err := os.RemoveAll(dstRepo); err != nil {
+		t.Fatal(err)
+	}
+	res = pull()
+	if !res.Success || res.Copied != 1 {
+		t.Fatalf("mirror after release: success=%v copied=%d errors=%v", res.Success, res.Copied, res.Errors)
+	}
+	gotTarget, err := os.Readlink(dstEntry)
+	if err != nil {
+		t.Fatalf("destination entry missing after admitted replacement: %v", err)
+	}
+
+	// Directory-creation class: the destination repository's tree scope is held
+	// by another process, so creating directories inside it is refused before
+	// any directory materializes.
+	if err := os.RemoveAll(dstRepo); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dstRepo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	treeHolder := startCrossProcessScopeHolder(t, hubDir, "", dstRepo)
+	treeHolder.await(t)
+	res = pull()
+	joinedErrors = strings.Join(res.Errors, "\n")
+	if res.Success || !strings.Contains(joinedErrors, "copy owner/model") || !strings.Contains(joinedErrors, "admit directory") {
+		t.Fatalf("directory creation did not report its refused admission: success=%v errors=%v", res.Success, res.Errors)
+	}
+	if entries, err := os.ReadDir(dstRepo); err != nil || len(entries) != 0 {
+		t.Fatalf("held repository gained directories during the refused mirror: %v %v", entries, err)
+	}
+	treeHolder.release(t)
+
+	res = pull()
+	if !res.Success || res.Copied != 1 {
+		t.Fatalf("mirror after the tree holder released: success=%v copied=%d errors=%v", res.Success, res.Copied, res.Errors)
+	}
+	gotAgain, err := os.Readlink(dstEntry)
+	if err != nil || gotAgain != gotTarget {
+		t.Fatalf("destination entry after the admitted replacement: %q %v (want %q)", gotAgain, err, gotTarget)
+	}
+	if got, err := os.ReadFile(filepath.Join(dstRepo, "blobs", blobName)); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("mirrored payload: %q %v", got, err)
+	}
+}

@@ -108,7 +108,7 @@ func waitForNonEmptyFile(t *testing.T, path string, timeout time.Duration) []byt
 }
 
 func TestPathDerivedDestinationDomainExcludesASecondWriter(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	const total = 4_096
@@ -200,7 +200,7 @@ func TestPathDerivedDestinationDomainExcludesASecondWriter(t *testing.T) {
 // A child holds the path-derived domain and a sidecarless partial. The writer
 // must wait for release, then obtain the file without inheriting unproven bytes.
 func TestPathDerivedDestinationDomainExcludesAnotherProcess(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	const total = 4_096
@@ -271,7 +271,7 @@ func TestPathDerivedDestinationDomainExcludesAnotherProcess(t *testing.T) {
 
 // Explicit cancellation removes this writer's staging while it still holds the domain.
 func TestCancelledJobRemovesItsOwnPathDerivedArtifacts(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	const total = 4_096
@@ -320,7 +320,7 @@ func TestCancelledJobRemovesItsOwnPathDerivedArtifacts(t *testing.T) {
 }
 
 func TestContentAddressedDestinationDomainIsUnchanged(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	const total = 4_096
@@ -434,7 +434,7 @@ func TestCacheDstDomainKeyUsesNameBasedIdentityForBothClasses(t *testing.T) {
 }
 
 func TestPathDerivedDestinationCleanupUsesSameNameBasedIdentity(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	restoreWait := stagingLockCleanupWait
@@ -573,7 +573,7 @@ func newTwoPathDerivedHub(t *testing.T, files []twoPathDerivedFile) (*httptest.S
 // overlaps both transfers; success and exact published bytes verify the
 // path-derived namespace keeps their domains disjoint.
 func TestPathDerivedDigestNamedFilesDoNotDeadlockWithComputedBlobDomains(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	x := []byte(strings.Repeat("x", 1_024))

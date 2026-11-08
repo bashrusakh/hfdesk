@@ -326,8 +326,19 @@ func TestPublishBlobNoReplaceRefusesToOverwrite(t *testing.T) {
 	if err := os.WriteFile(dst, winner, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Hold the destination's domain for fallback placement too.
-	domain, err := acquireBlobDomain(t.Context(), dst, filepath.Join(dir, "owner"))
+	// Hold the destination's domain for fallback placement too: the current
+	// scoped acquire over the destination's real paths, keyed by dst so the
+	// fallback can prove it holds the target.
+	owner := filepath.Join(dir, "owner")
+	ownerDir, derr := resolveOwnershipDir("")
+	if derr != nil {
+		t.Fatal(derr)
+	}
+	realm, rerr := newOwnershipRealm(ownerDir)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	domain, err := acquireBlobDomainScoped(t.Context(), dst, owner, realm, []string{dst, owner}, dst)
 	if err != nil {
 		t.Fatal(err)
 	}

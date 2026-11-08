@@ -409,6 +409,11 @@ revalidation leaves the final byte uncommitted for a later retry/restart. A
 fresh transfer records the flag false before any byte is trusted and sets it
 only after `io.Copy` returns nil and every exact body-length check passes. When
 the expected size is unknown the exact-size shortcut does not apply.
+Like the ranged record's durable high-water marks, a persisted sidecar never
+claims bytes that are not durable: before a persist may set
+`framing_complete` the partial's written bytes are synced, and the sidecar
+itself is synced before its rename publishes the claim, so both hold under
+power loss, not only a process crash.
 
 Write the sidecar after discarding unproven bytes and before trusting inherited
 bytes, so it describes the on-disk partial. Remove it only with the partial on
@@ -655,7 +660,10 @@ A blob alone is not a reachable requested path. Transfer and both blob-exists
 skip paths must create snapshot and enabled friendly entries; link failure
 returns `ErrCacheLinkUnreachable` (detectable with `errors.Is`) and emits no
 `file_done` success. Skipped-item reconciliation must surface link failures as
-a job error, not merely a warning; its other duties are unchanged.
+a job error, not merely a warning; it must also re-confirm that every skipped
+blob is still complete and reachable before the job may succeed, failing with
+`ErrCacheBlobUnavailable` when a blob vanished or is incomplete and with
+`ErrCacheBlobCheckFailed` when that re-confirmation itself fails.
 `NoFriendlyView` omits only the friendly entry, not the required snapshot.
 
 Job success means every requested file is present and reachable through its
@@ -689,12 +697,25 @@ Known limitations outside the downloader domain: a mirror file copy is still a
 non-atomic truncate-and-write performed under its entry admission, and it checks
 nothing itself beyond `io.Copy`'s error contract — the copied byte count is
 discarded, the explicit size comparison happens only in the opt-in verify pass,
-and that verification compares size rather than content hashes; the mirror's
-symlink-leaf replacement and plain directory creation take no admission at all;
-and HF selected-GGUF deletion removes blob payloads under repository and
-friendly tree admission rather than each blob's domain. None of these operations
-performs domain-exclusive placement, so do not extend downloader publication
-guarantees to them.
+and that verification compares size rather than content hashes; and HF
+selected-GGUF deletion removes blob payloads under repository and friendly tree
+admission rather than each blob's domain. The mirror's symlink-leaf replacement
+takes entry admission and its directory creation takes the shared admitted
+directory-creation class (a directory that already exists needs no admission
+because nothing is mutated); the sync/rebuild path creates, replaces and
+removes snapshot/friendly entries, prunes empty directories and writes the
+rebuild script through those same shared primitives, so a live holder of an
+entry or tree scope excludes those mutations in every participant — after the
+per-entry bounded wait for the link and script funnels, immediately on the
+non-waiting admission surface the mirror already uses for file writes and tree
+removals. These admissions coordinate through the shared control tree's file
+locks like the established file and tree admissions: a foreign machine is
+excluded only when it shares that control filesystem, while the host-identity
+fence model that refuses unproven foreign-host owners governs staging records,
+which entry replacement and directory creation neither read nor write — that
+inter-machine case is not exercised by a single-host test. None of these
+operations performs domain-exclusive placement, so do not extend downloader
+publication guarantees to them.
 
 # Retry, cancellation and lifecycle
 
@@ -736,7 +757,9 @@ ownership section above).
 # Error Handling
 
 `Download` returns the first error; canceled transfers may resume later.
-Required cache-entry failures use `ErrCacheLinkUnreachable`; `NoFriendlyView`
+Required cache-entry failures use `ErrCacheLinkUnreachable`; skipped-blob
+reconciliation failures use `ErrCacheBlobUnavailable` (vanished or incomplete)
+or `ErrCacheBlobCheckFailed` (the re-confirmation itself failed); `NoFriendlyView`
 exempts only the omitted friendly entry, never the snapshot. Live-owner timeout
 fails the item. Unproven records use `ErrStagingOwnershipUnproven` and remain
 for manual recovery; unknown ownership uses `ErrBlobOwnershipUnknown`, preserves

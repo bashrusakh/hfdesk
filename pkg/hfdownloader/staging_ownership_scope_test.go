@@ -3,7 +3,10 @@
 
 package hfdownloader
 
-// Covers ownership probes and claim checks, plus live/crashed helper processes.
+// Cross-process destination-scope ownership over staging claims: a live
+// holder excludes a second claimant even with an aged record, a crashed
+// holder's scope is released at process exit so the next run resumes, and no
+// payload-side legacy lock file is ever created.
 
 import (
 	"bytes"
@@ -17,127 +20,6 @@ import (
 	"testing"
 	"time"
 )
-
-func TestStagingOwnershipLockProbe(t *testing.T) {
-	if !stagingOSLockAvailable {
-		t.Skip("this platform has no OS ownership lock primitive")
-	}
-	staging := filepath.Join(t.TempDir(), "x.incomplete")
-
-	if busy, err := stagingOwnershipBusy(staging); err != nil || busy {
-		t.Fatalf("probe of a never-created lock = (%v, %v), want (false, nil)", busy, err)
-	}
-	lock, err := acquireStagingOwnershipLock(staging)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if busy, err := stagingOwnershipBusy(staging); err != nil || !busy {
-		t.Fatalf("probe under a held lock = (%v, %v), want (true, nil)", busy, err)
-	}
-	lock.release()
-	if busy, err := stagingOwnershipBusy(staging); err != nil || busy {
-		t.Fatalf("probe after release = (%v, %v), want (false, nil)", busy, err)
-	}
-	// The lock file is persistent by design: unlinking it would allow two
-	// owners on different inodes.
-	if _, err := os.Stat(stagingOwnershipLockPath(staging)); err != nil {
-		t.Errorf("the lock file must persist after release: %v", err)
-	}
-}
-
-// Publish refuses missing/foreign claims under the ownership lock and still
-// accepts an owned claim with a complete layout.
-func TestStagingPublishRefusesForeignClaim(t *testing.T) {
-	payload := []byte("someone else's payload")
-	makeDownload := func(t *testing.T) (*stagingDownload, string, string) {
-		t.Helper()
-		dir := t.TempDir()
-		staging := filepath.Join(dir, "x.incomplete")
-		pub := filepath.Join(dir, "x.bin")
-		if err := os.WriteFile(staging, payload, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		domain := acquireTestDomain(t, pub)
-		d := &stagingDownload{
-			ctx:    context.Background(),
-			dst:    pub,
-			stg:    staging,
-			pub:    pub,
-			meta:   staging + ".meta",
-			it:     PlanItem{RelativePath: "x.bin", Size: int64(len(payload))},
-			ranges: completeRangeLayout(int64(len(payload)), 1),
-			domain: domain,
-		}
-		return d, staging, pub
-	}
-
-	t.Run("foreign record", func(t *testing.T) {
-		d, staging, pub := makeDownload(t)
-		foreign := IncompleteMeta{
-			PID:       os.Getpid(),
-			Instance:  "another-process-instance",
-			Host:      processHostname,
-			StartedAt: time.Now().UTC(),
-			Size:      int64(len("someone else's payload")),
-			Version:   stagingMetaVersion,
-			Repo:      "o/r",
-			Path:      "x.bin",
-			Ranges:    buildRangeLayout(int64(len("someone else's payload")), 1),
-		}
-		if err := writeStagingMeta(d.meta, &foreign); err != nil {
-			t.Fatal(err)
-		}
-		if err := d.publish(); !errors.Is(err, errStagingClaimLost) {
-			t.Fatalf("publish with a foreign record = %v, want errStagingClaimLost", err)
-		}
-		if _, err := os.Stat(staging); err != nil {
-			t.Errorf("publish moved a foreign staging file: %v", err)
-		}
-		if _, err := os.Stat(pub); !os.IsNotExist(err) {
-			t.Errorf("publish created the destination under a foreign record, stat err=%v", err)
-		}
-	})
-
-	t.Run("missing record", func(t *testing.T) {
-		d, staging, pub := makeDownload(t)
-		if err := d.publish(); !errors.Is(err, errStagingClaimLost) {
-			t.Fatalf("publish with a missing record = %v, want errStagingClaimLost", err)
-		}
-		if _, err := os.Stat(staging); err != nil {
-			t.Errorf("publish moved an unclaimed staging file: %v", err)
-		}
-		if _, err := os.Stat(pub); !os.IsNotExist(err) {
-			t.Errorf("publish created the destination without a claim, stat err=%v", err)
-		}
-	})
-
-	t.Run("owned record still publishes", func(t *testing.T) {
-		d, staging, pub := makeDownload(t)
-		ours := IncompleteMeta{
-			PID:       os.Getpid(),
-			Instance:  processInstanceToken,
-			Host:      processHostname,
-			StartedAt: time.Now().UTC(),
-			Size:      int64(len("someone else's payload")),
-			Version:   stagingMetaVersion,
-			Repo:      "o/r",
-			Path:      "x.bin",
-			Ranges:    completeRangeLayout(int64(len("someone else's payload")), 1),
-		}
-		if err := writeStagingMeta(d.meta, &ours); err != nil {
-			t.Fatal(err)
-		}
-		if err := d.publish(); err != nil {
-			t.Fatalf("publish of an owned record: %v", err)
-		}
-		if _, err := os.Stat(staging); !os.IsNotExist(err) {
-			t.Errorf("published staging file survived, stat err=%v", err)
-		}
-		if got, err := os.ReadFile(pub); err != nil || string(got) != "someone else's payload" {
-			t.Errorf("published payload = %q (err=%v)", got, err)
-		}
-	})
-}
 
 const (
 	stagingOSLockChildEnv  = "HFDESK_STAGING_OSLOCK_CHILD"
@@ -173,11 +55,11 @@ func writeOSLockChildResult(t *testing.T, path string, res stagingOSLockChildRes
 	}
 }
 
-// TestStagingOSLockChildProcess is the re-executed helper that claims and seeds
-// staging, then holds the lock or exits without releasing it.
-func TestStagingOSLockChildProcess(t *testing.T) {
+// TestOwnershipScopeChildProcess is the re-executed helper that claims and
+// seeds staging, then holds the ownership scope or exits without releasing it.
+func TestOwnershipScopeChildProcess(t *testing.T) {
 	if os.Getenv(stagingOSLockChildEnv) != "1" {
-		t.Skip("helper process for the staging ownership lock tests")
+		t.Skip("helper process for the ownership scope tests")
 	}
 	raw, err := os.ReadFile(os.Getenv(stagingOSLockConfigEnv))
 	if err != nil {
@@ -242,7 +124,7 @@ func TestStagingOSLockChildProcess(t *testing.T) {
 		return
 	}
 	// Deliberately age the payload and record: an age-based model would call
-	// this owner stale. Only the OS ownership lock keeps ownership here.
+	// this owner stale. Only the held ownership scope keeps ownership here.
 	past := time.Now().Add(-2 * time.Hour)
 	for _, p := range []string{cfg.Staging, metaPath} {
 		if err := os.Chtimes(p, past, past); err != nil {
@@ -252,12 +134,13 @@ func TestStagingOSLockChildProcess(t *testing.T) {
 	}
 
 	if cfg.Mode == "crash" {
-		// Exit while holding the domain; os.Exit skips defers and the kernel releases it.
+		// Exit while holding the scope; os.Exit skips defers and the kernel
+		// releases the external lock.
 		os.Exit(0)
 	}
 
 	// "hold": signal readiness, wait for the parent's release, then complete
-	// the file under the still-held ownership lock.
+	// the file under the still-held ownership scope.
 	if err := os.WriteFile(cfg.ReadyPath, []byte("ready"), 0o644); err != nil {
 		writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{Err: err.Error()})
 		return
@@ -305,7 +188,7 @@ func startStagingOSLockChild(t *testing.T, cfg stagingOSLockChildConfig) (*exec.
 	if err := os.WriteFile(cfgPath, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(exe, "-test.run=^TestStagingOSLockChildProcess$", "-test.timeout=120s")
+	cmd := exec.Command(exe, "-test.run=^TestOwnershipScopeChildProcess$", "-test.timeout=120s")
 	cmd.Env = append(os.Environ(),
 		stagingOSLockChildEnv+"=1",
 		stagingOSLockConfigEnv+"="+cfgPath)
@@ -319,13 +202,14 @@ func startStagingOSLockChild(t *testing.T, cfg stagingOSLockChildConfig) (*exec.
 	return cmd, &out
 }
 
-// An aged record cannot allow takeover while the child holds the domain;
-// after the parent signals it, the child completes and publishes.
-func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
+// An aged record cannot allow takeover while the child holds the scope;
+// after the parent signals it, the child completes and publishes. No
+// payload-side legacy lock file may ever be created.
+func TestOwnershipScopeHeldByLiveProcessBlocksTakeover(t *testing.T) {
 	if os.Getenv(stagingOSLockChildEnv) == "1" {
 		t.Skip("child process")
 	}
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	const total = 8_000
@@ -361,7 +245,7 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 		if time.Now().After(deadline) {
 			_ = cmd.Process.Kill()
 			debug, _ := os.ReadFile(cfg.ResultPath)
-			t.Fatalf("helper never acquired the ownership lock (result=%q); output:\n%s", debug, childOut.String())
+			t.Fatalf("helper never acquired the ownership scope (result=%q); output:\n%s", debug, childOut.String())
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
@@ -386,9 +270,29 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 	}
 
 	shortBlobOwnershipWait(t, 250*time.Millisecond)
-	if _, derr := blobDomainAcquire(context.Background(), flatDomainKey(dst), flatDomainLockSrc(dst)); !errors.Is(derr, errStagingOwnershipBusy) {
+	// The second claimant acquires the way production does: the ownership-realm
+	// scope over real destination paths from downloadOwnershipPaths.
+	ownerDir := cfg.OwnershipDir
+	if ownerDir == "" {
+		ownerDir = DefaultOwnershipDir()
+	}
+	secondRealm, rerr := newOwnershipRealm(ownerDir)
+	if rerr != nil {
 		_ = cmd.Process.Kill()
-		t.Fatalf("second claimant error = %v, want errStagingOwnershipBusy while the OS lock is held", derr)
+		t.Fatalf("second claimant ownership realm: %v", rerr)
+	}
+	key, domainDst, proofPath, ownershipPaths, perr := downloadOwnershipPaths(false, nil, dst, dst, PlanItem{})
+	if perr != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("second claimant ownership paths: %v", perr)
+	}
+	second, derr := acquireBlobDomainScoped(context.Background(), key, domainDst, secondRealm, ownershipPaths, proofPath)
+	if derr == nil {
+		second.release()
+	}
+	if !errors.Is(derr, errStagingOwnershipBusy) {
+		_ = cmd.Process.Kill()
+		t.Fatalf("second claimant error = %v, want errStagingOwnershipBusy while the ownership scope is held", derr)
 	}
 	// Cleanup must preserve the waiting child's data while its domain is held.
 	if err := CleanupJobPartFiles(Settings{OutputDir: dir}, []string{dst}); err != nil {
@@ -433,18 +337,21 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 			t.Errorf("%s survived the helper's successful publish, stat err=%v", filepath.Base(p), err)
 		}
 	}
-	if _, err := os.Stat(stagingOwnershipLockPath(staging)); !os.IsNotExist(err) {
+	// Residue check: current writers never create the legacy payload-side
+	// .lock file beside the payload (see the doc.go residue contract).
+	if _, err := os.Stat(staging + stagingLockSuffix); !os.IsNotExist(err) {
 		t.Errorf("an obsolete payload-side lock was created: %v", err)
 	}
 	assertExternalRealmLockFiles(t, cfg.OwnershipDir)
 }
 
-// A crashed process releases its lock; the next claimant resumes and publishes.
-func TestStagingOSLockReleasedByCrashedProcess(t *testing.T) {
+// A crashed process releases its scope; a fresh record with a committed
+// prefix lets the next claimant resume exactly the missing suffix and publish.
+func TestOwnershipScopeReleasedByCrashedProcess(t *testing.T) {
 	if os.Getenv(stagingOSLockChildEnv) == "1" {
 		t.Skip("child process")
 	}
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	const total = 8_000
@@ -472,8 +379,22 @@ func TestStagingOSLockReleasedByCrashedProcess(t *testing.T) {
 	if err := cmd.Wait(); err != nil {
 		t.Fatalf("crashing helper exited with %v; output:\n%s", err, childOut.String())
 	}
-	if busy, err := stagingOwnershipBusy(staging); err != nil || busy {
-		t.Fatalf("probe after the owner died = (%v, %v), want (false, nil)", busy, err)
+	// The destination scope must be free again once the holder died.
+	ownerDir := cfg.OwnershipDir
+	if ownerDir == "" {
+		ownerDir = DefaultOwnershipDir()
+	}
+	realm, rerr := newOwnershipRealm(ownerDir)
+	if rerr != nil {
+		t.Fatalf("ownership realm after the owner died: %v", rerr)
+	}
+	_, _, _, ownershipPaths, perr := downloadOwnershipPaths(false, nil, dst, dst, PlanItem{})
+	if perr != nil {
+		t.Fatalf("ownership paths after the owner died: %v", perr)
+	}
+	busy, probeErr := realm.probeWriter(context.Background(), ownershipPaths)
+	if probeErr != nil || busy {
+		t.Fatalf("scope probe after the owner died = (%v, %v), want (false, nil)", busy, probeErr)
 	}
 	// The record is deliberately fresh (the child just wrote it) and the
 	// payload holds a committed prefix.
@@ -494,7 +415,7 @@ func TestStagingOSLockReleasedByCrashedProcess(t *testing.T) {
 		t.Fatalf("takeover after the holder died: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("takeover after death took %v; the OS lock must be released at process exit", elapsed)
+		t.Errorf("takeover after death took %v; the ownership scope must be released at process exit", elapsed)
 	}
 	if len(*gotRanges) != 1 || (*gotRanges)[0] != fmt.Sprintf("bytes=%d-%d", prefix, total-1) {
 		t.Errorf("takeover fetched %v, want exactly the missing suffix bytes=%d-%d", *gotRanges, prefix, total-1)
@@ -505,7 +426,7 @@ func TestStagingOSLockReleasedByCrashedProcess(t *testing.T) {
 			t.Errorf("%s survived the successful takeover publish, stat err=%v", filepath.Base(p), err)
 		}
 	}
-	if _, err := os.Stat(stagingOwnershipLockPath(staging)); !os.IsNotExist(err) {
+	if _, err := os.Stat(staging + stagingLockSuffix); !os.IsNotExist(err) {
 		t.Errorf("an obsolete payload-side lock was created: %v", err)
 	}
 	assertExternalRealmLockFiles(t, cfg.OwnershipDir)

@@ -82,6 +82,10 @@ func readSinglePartIdentity(path string) (*singlePartIdentity, error) {
 	return &id, nil
 }
 
+// syncSingleIdentityRecord orders sidecar bytes durable before the rename
+// publishes them; tests may replace it to observe the ordering.
+var syncSingleIdentityRecord = func(f *os.File) error { return f.Sync() }
+
 // writeSinglePartIdentity atomically replaces the sidecar via a sibling temp.
 func writeSinglePartIdentity(path string, id singlePartIdentity) error {
 	id.Version = singleIdentityVersion
@@ -97,6 +101,12 @@ func writeSinglePartIdentity(path string, id singlePartIdentity) error {
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	// The record must reach the medium before the rename publishes it: a
+	// rename of unwritten bytes would leave the claim torn after power loss.
+	if err := syncSingleIdentityRecord(tmp); err != nil {
 		tmp.Close()
 		return err
 	}

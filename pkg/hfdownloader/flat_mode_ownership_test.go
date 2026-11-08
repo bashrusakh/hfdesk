@@ -123,7 +123,7 @@ func TestFlatDownloadKeepsLockShapedOrdinaryFilenameIndependent(t *testing.T) {
 // A second multipart writer fails while the destination is held and neither
 // creates nor overwrites it; absent and pre-existing targets are covered.
 func TestDownloadFlatModeMultipartRouteExcludesSecondWriter(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	for _, tc := range []struct {
@@ -184,7 +184,7 @@ func testFlatModeMultipartRouteExcludesSecondWriter(t *testing.T, preexisting []
 		select {
 		case <-contended:
 		default:
-			t.Fatalf("the download finished without observing the contended ownership lock (err=%v)", res.err)
+			t.Fatalf("the download finished without observing the contended ownership domain (err=%v)", res.err)
 		}
 	case <-time.After(60 * time.Second):
 		t.Fatal("the writer never observed the contended destination domain")
@@ -199,7 +199,7 @@ func testFlatModeMultipartRouteExcludesSecondWriter(t *testing.T, preexisting []
 	}
 
 	if res.err == nil {
-		t.Fatalf("the second writer reported success although a live owner holds the staging lock (skips=%v, done=%v)",
+		t.Fatalf("the second writer reported success although a live owner holds the destination scope (skips=%v, done=%v)",
 			res.skips, res.done)
 	}
 	if !errors.Is(res.err, errStagingOwnershipBusy) {
@@ -212,7 +212,7 @@ func testFlatModeMultipartRouteExcludesSecondWriter(t *testing.T, preexisting []
 		t.Errorf("Download error = %v, want the actionable scope-held message", res.err)
 	}
 	if len(res.skips) != 0 {
-		t.Errorf("skips = %v, want none: the file is not present while the live owner holds the lock", res.skips)
+		t.Errorf("skips = %v, want none: the file is not present while the live owner holds the scope", res.skips)
 	}
 	if len(res.done) != 0 {
 		t.Errorf("file_done events = %v, want none: the file is not present", res.done)

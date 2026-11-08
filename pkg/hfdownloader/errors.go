@@ -52,6 +52,17 @@ var (
 	// could not be linked. A disabled friendly view is not a link failure.
 	ErrCacheLinkUnreachable = errors.New("the file is in the cache but its cache path is not reachable")
 
+	// ErrCacheBlobUnavailable means a previously skipped shared blob is missing
+	// or incomplete at final reconciliation; the job fails instead of reporting
+	// the skipped file as present and reachable. Distinguishable via errors.Is.
+	ErrCacheBlobUnavailable = errors.New("a skipped file's shared blob is no longer complete in the cache")
+
+	// ErrCacheBlobCheckFailed means a previously skipped shared blob could not
+	// be re-confirmed at final reconciliation because its availability or
+	// ownership check failed; the underlying cause is wrapped. Distinguishable
+	// via errors.Is.
+	ErrCacheBlobCheckFailed = errors.New("a skipped file's shared blob could not be re-confirmed")
+
 	// ErrStagingOwnershipUnproven means a record's owner cannot be proven live or
 	// dead (for example unreadable state, or an unfenced record without death/self
 	// evidence). The pair is preserved for manual removal; use errors.Is to detect it.

@@ -696,8 +696,10 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 		return err
 	}
 
-	// Create destination directory
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+	// Create the destination directory under the shared directory-creation
+	// admission: an existing directory needs no admission because nothing is
+	// mutated, and a missing one is created while its admission is held.
+	if err := admission.AdmitDirectories(context.Background(), []string{filepath.Dir(dstPath)}); err != nil {
 		return err
 	}
 
@@ -732,7 +734,7 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 			if err := mirrorNoSymlinkPath(dstCache, dst); err != nil {
 				return err
 			}
-			return os.MkdirAll(dst, info.Mode())
+			return admission.AdmitDirectories(context.Background(), []string{dst})
 		}
 
 		// Check if it's a symlink
@@ -750,9 +752,18 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 			if !hfdownloader.PathInside(repoPath, resolved) {
 				return fmt.Errorf("refusing escaping symlink %s -> %s (resolves outside repo)", path, link)
 			}
+			// The unlink of the old leaf and the creation of its replacement
+			// run while this entry's admission is held, so neither can race a
+			// live writer or replacer of the same entry in any participant.
+			release, err := admission.AdmitEntryReplacement(context.Background(), dst)
+			if err != nil {
+				return err
+			}
 			os.Remove(dst)
 			// lgtm[go/path-injection]
-			return os.Symlink(link, dst)
+			err = os.Symlink(link, dst)
+			release()
+			return err
 		}
 
 		// Copy file

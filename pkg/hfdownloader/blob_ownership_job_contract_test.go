@@ -76,19 +76,6 @@ func assertOwnershipContractLinks(t *testing.T, cacheDir, rel string) {
 	}
 }
 
-// Install before launching writers; this package-level hook is not concurrent-safe.
-func installDomainContentionProbe(t *testing.T) <-chan struct{} {
-	t.Helper()
-	contended := make(chan struct{})
-	var once sync.Once
-	restore := stagingOwnershipContentionHook
-	stagingOwnershipContentionHook = func(string) {
-		once.Do(func() { close(contended) })
-	}
-	t.Cleanup(func() { stagingOwnershipContentionHook = restore })
-	return contended
-}
-
 func installBlobDomainContentionProbe(t *testing.T) <-chan struct{} {
 	t.Helper()
 	contended := make(chan struct{})
@@ -117,10 +104,10 @@ func shortBlobOwnershipWait(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { blobOwnershipWaitBudget = restore })
 }
 
-// A separate OS-lock handle publishes while Download waits. Both routes must
-// reuse the blob and create links without transferring it again.
+// A separately held ownership domain publishes while Download waits. Both
+// routes must reuse the blob and create links without transferring it again.
 func TestDownloadWaitsForLiveForeignDomainOwnerAndReusesPublishedBlob(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	for _, tc := range []struct {
@@ -145,7 +132,7 @@ func testDownloadWaitsForLiveForeignDomainOwner(t *testing.T, threshold string) 
 	cacheDir := t.TempDir()
 	repo := ownershipContractRepo(t, cacheDir)
 
-	// Hold the foreign-owner lock in a separate open file description.
+	// Hold the foreign owner's domain before Download starts.
 	owner := acquireTestDomainFresh(t, mustDomainDst(t, repo, sha))
 
 	srv, getRanges := recordingHub(t, full, "model.bin", true)
@@ -188,7 +175,7 @@ func testDownloadWaitsForLiveForeignDomainOwner(t *testing.T, threshold string) 
 }
 
 func TestDownloadWaitsForLiveForeignDomainOwnerThatFails(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	const total = 4_096
@@ -237,7 +224,7 @@ func TestDownloadWaitsForLiveForeignDomainOwnerThatFails(t *testing.T) {
 }
 
 func TestDownloadFailsWhenLiveForeignOwnerHoldsDomainPastBudget(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	shortBlobOwnershipWait(t, 300*time.Millisecond)
@@ -292,7 +279,7 @@ func TestDownloadFailsWhenLiveForeignOwnerHoldsDomainPastBudget(t *testing.T) {
 
 // Both routes must reuse the sibling's blob after the domain wait.
 func TestDownloadSameProcessSiblingWriterReusesPublishedBlob(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	for _, tc := range []struct {
@@ -411,7 +398,7 @@ func testDownloadSameProcessSiblingWriter(t *testing.T, threshold string) {
 
 // Cleanup must preserve a live writer's partial while removing unowned artifacts.
 func TestCleanupLeavesAnotherLiveWritersPartialAlone(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	restoreWait := stagingLockCleanupWait
@@ -502,7 +489,7 @@ func TestCleanupLeavesAnotherLiveWritersPartialAlone(t *testing.T) {
 }
 
 func TestCleanupRemovesOwnPartialAfterCancel(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	const sha = "4444444444444444444444444444444444444444444444444444444444444444"
@@ -701,6 +688,13 @@ type blobOwnershipChildConfig struct {
 	PublishPayloadBase64 string `json:"publish_payload_base64"`
 	// PublishGoPath is the file whose appearance asks the helper to publish.
 	PublishGoPath string `json:"publish_go_path"`
+	// HoldCacheRoot with HoldEntryPath or HoldTreePath makes the helper hold
+	// one cache admission scope (entry replacement or tree removal) instead of
+	// a blob domain: the parent then drives a mutating operation against a
+	// live holder in another process.
+	HoldCacheRoot string `json:"hold_cache_root"`
+	HoldEntryPath string `json:"hold_entry_path"`
+	HoldTreePath  string `json:"hold_tree_path"`
 }
 
 // TestBlobOwnershipChildProcess is a re-executed lock holder. It writes a live
@@ -716,6 +710,27 @@ func TestBlobOwnershipChildProcess(t *testing.T) {
 	var cfg blobOwnershipChildConfig
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		t.Fatalf("child config: %v", err)
+	}
+	if cfg.HoldEntryPath != "" || cfg.HoldTreePath != "" {
+		admission, aerr := OpenCacheAdmission(context.Background(), cfg.HoldCacheRoot)
+		if aerr != nil {
+			t.Fatalf("child cache admission: %v", aerr)
+		}
+		var release func()
+		if cfg.HoldTreePath != "" {
+			release, err = admission.AdmitTreeRemoval(context.Background(), cfg.HoldTreePath)
+		} else {
+			release, err = admission.AdmitEntryReplacement(context.Background(), cfg.HoldEntryPath)
+		}
+		if err != nil {
+			t.Fatalf("child scope hold: %v", err)
+		}
+		defer release()
+		if err := os.WriteFile(cfg.ReadyPath, []byte("ready"), 0o644); err != nil {
+			t.Fatalf("child ready marker: %v", err)
+		}
+		waitForFile(t, cfg.GoPath, 120*time.Second)
+		return
 	}
 	if cfg.DownloadEndpoint != "" {
 		settings := Settings{
@@ -840,7 +855,7 @@ func waitForFile(t *testing.T, path string, timeout time.Duration) {
 }
 
 func TestCleanupLeavesOldMultipartFamilyUnderLiveDomain(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	restoreWait := stagingLockCleanupWait

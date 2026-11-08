@@ -217,7 +217,7 @@ func TestCheckBlobProbeErrorPrecedesMissingOrMalformedMetadata(t *testing.T) {
 // Download waits for a proven live owner; if it remains past the bounded
 // budget, return the live-owner error rather than successful skip.
 func TestDownloadProvenOwnerIsNotASuccessfulSkip(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	const total = 4_096
@@ -304,5 +304,36 @@ func TestDownloadProvenOwnerIsNotASuccessfulSkip(t *testing.T) {
 	got, rerr := os.ReadFile(repo.IncompletePath(sha))
 	if rerr != nil || !bytes.Equal(got, partial) {
 		t.Errorf("the live owner's staging changed: %q, %v", got, rerr)
+	}
+}
+
+// A failing external ownership probe makes CheckBlob report unknown
+// ownership, never stale/free or proven-live status.
+func TestCheckBlobUnsupportedExternalProbeIsUnknown(t *testing.T) {
+	oldOpen := ownershipLockOpen
+	defer func() { ownershipLockOpen = oldOpen }()
+
+	cache := NewHFCache(t.TempDir())
+	repo, err := cache.Repo("owner/repo", RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("d", 64)
+	staging := repo.IncompletePath(sha)
+	if err := os.WriteFile(staging, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta := IncompleteMeta{Version: stagingMetaVersion, Repo: "owner/repo", Path: "model.bin", Size: 100, LockFenced: true, Ranges: buildRangeLayout(100, 1)}
+	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &meta); err != nil {
+		t.Fatal(err)
+	}
+	ownershipLockOpen = func(string, ownershipLockMode) (ownershipLockHandle, error) { return nil, errOwnershipUnavailable }
+	status, _, err := repo.CheckBlob(sha)
+	// Probe failure is unknown ownership, not stale/free or proven-live status.
+	if !errors.Is(err, ErrBlobOwnershipUnknown) || status != BlobOwnershipUnknown {
+		t.Fatalf("CheckBlob with unavailable probe = %v, %v; want an unknown-ownership error, not stale/free", status, err)
 	}
 }

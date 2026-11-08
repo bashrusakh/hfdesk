@@ -213,13 +213,15 @@ or job ownership behavior. This section is the agent-level summary; when it and
   not publish through this primitive: the mirror takes entry admission per
   copied destination file — the copy itself stays a non-atomic
   truncate-and-write checked only by `io.Copy`'s error contract, with the
-  explicit size comparison in the opt-in verify pass — and tree admission per
-  removed repository, while its symlink-leaf replacement and plain directory
-  creation take no admission; selected-GGUF deletion takes repository and
-  friendly tree admission for HF locations and flat-realm entry admission over
-  the member paths for local locations, rather than the blob domain. Neither
-  performs domain-exclusive placement, so no publication guarantee extends to
-  them.
+  explicit size comparison in the opt-in verify pass — tree admission per
+  removed repository, entry admission for its symlink-leaf replacement and
+  admitted directory creation for directories it creates; the sync/rebuild
+  path creates, replaces and removes snapshot/friendly entries, prunes empty
+  directories and writes the rebuild script through the same shared admission
+  funnels; selected-GGUF deletion takes repository and friendly tree admission
+  for HF locations and flat-realm entry admission over the member paths for
+  local locations, rather than the blob domain. Neither performs
+  domain-exclusive placement, so no publication guarantee extends to them.
 - JOB CONTRACT: success means every requested file is present AND reachable at
   its snapshot/friendly path. A file owned by another live writer is never a
   completed skip: wait bounded, re-check the content-addressed blob, otherwise

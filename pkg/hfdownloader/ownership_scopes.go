@@ -1018,6 +1018,51 @@ func (a *CacheAdmission) AdmitFileWrite(ctx context.Context, path string) (func(
 	return lease.Release, nil
 }
 
+// AdmitEntryReplacement takes entry-level admission for replacing or removing the
+// single entry — a regular file or a symlink leaf — at path: the same per-entry keys
+// AdmitFileWrite takes, held by the caller across the unlink of the old entry and
+// the creation of its replacement (or across a single-entry removal). The caller
+// performs the entry mutation itself; this method performs no payload I/O. It never
+// waits; a live writer, replacer or remover of that entry refuses with
+// ErrOwnershipBusy, wrapped with the entry path.
+func (a *CacheAdmission) AdmitEntryReplacement(ctx context.Context, path string) (func(), error) {
+	lease, err := a.realm.acquireWriter(ctx, []string{path}, 0)
+	if err != nil {
+		return nil, fmt.Errorf("admit entry replacement %q: %w", path, err)
+	}
+	return lease.Release, nil
+}
+
+// AdmitDirectories admits and performs directory creation — mkdir of each listed
+// directory together with its missing parents, and nothing else — under the shared
+// directory-creation admission. A directory that already exists needs no admission
+// because no mutation happens. It never waits; a live writer or tree removal that
+// holds a listed directory refuses with ErrOwnershipBusy.
+func (a *CacheAdmission) AdmitDirectories(ctx context.Context, dirs []string) error {
+	return a.realm.admitDirectoryCreation(ctx, dirs, 0)
+}
+
+// admitDirectoryCreation is the mkdir-only entry into ensureDirectories: existing
+// directories are skipped without taking admission, so a caller pays admission only
+// for creation that actually happens.
+func (r *ownershipRealm) admitDirectoryCreation(ctx context.Context, dirs []string, wait time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for _, dir := range dirs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if info, statErr := os.Stat(dir); statErr == nil && info.IsDir() {
+			continue
+		}
+		if err := r.ensureDirectories(ctx, []string{dir}, wait); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // FlatAdmission issues non-blocking admissions against the flat OutputDir
 // ownership realm — the hashed lock files under OwnershipDir — that flat-mode
 // writers coordinate through. The flat realm has no control tree: lock state

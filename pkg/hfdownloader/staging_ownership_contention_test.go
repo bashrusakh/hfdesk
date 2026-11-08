@@ -3,7 +3,7 @@
 
 package hfdownloader
 
-// A shared status probe can conflict with an exclusive claim on Unix. That
+// A shared external-scope probe can conflict with an exclusive claim. That
 // contention is not proof of a live writer: retry or fail rather than report a
 // successful skip. Tests exercise this through Download.
 
@@ -13,50 +13,14 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// stagingProbeHolder holds a probe-like lock until the test releases it.
-type stagingProbeHolder struct {
-	release func()
-	held    func() bool
-}
-
-type stagingProbeHoldMode int
-
-const (
-	// probeHoldShared holds the lock the way a read-only probe does.
-	probeHoldShared stagingProbeHoldMode = iota
-	// probeHoldExclusive holds the lock the way a real writer does.
-	probeHoldExclusive
-)
-
-func startStagingProbeHolder(t *testing.T, staging string, mode stagingProbeHoldMode) *stagingProbeHolder {
-	t.Helper()
-	if !stagingOSLockAvailable {
-		t.Skip("this platform has no OS ownership lock primitive")
-	}
-	// Make sure the lock file exists so it can be opened.
-	own, err := acquireStagingOwnershipLock(staging)
-	if err != nil {
-		t.Fatal(err)
-	}
-	own.release()
-
-	h, err := openStagingProbeHandle(stagingOwnershipLockPath(staging), mode)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &stagingProbeHolder{
-		release: func() { h.release() },
-		held:    func() bool { return h.held() },
-	}
-}
+// startExternalScopeProbeHolder takes the current external realm's shared
+// writer probe over the given paths; a shared probe is never a writer.
 
 func startExternalScopeProbeHolder(t *testing.T, paths ...string) *ownershipLease {
 	t.Helper()
@@ -73,21 +37,6 @@ func startExternalScopeProbeHolder(t *testing.T, paths ...string) *ownershipLeas
 		t.Fatalf("acquire shared external scope probe: %v", err)
 	}
 	return lease
-}
-
-type stagingProbeHandle struct {
-	releaseFn func()
-	heldFn    func() bool
-}
-
-func (h stagingProbeHandle) release() {
-	if h.releaseFn != nil {
-		h.releaseFn()
-	}
-}
-
-func (h stagingProbeHandle) held() bool {
-	return h.heldFn != nil && h.heldFn()
 }
 
 type contentionDownloadFixture struct {
@@ -312,189 +261,5 @@ func TestDownload_CancellationWhileWaitingForOwnershipIsPrompt(t *testing.T) {
 	}
 	if !errors.Is(out.err, context.Canceled) {
 		t.Errorf("Download error = %v, want context.Canceled", out.err)
-	}
-}
-
-// Repeated claims under shared-probe pressure must not report a live writer
-// when none exists.
-func TestDownload_ConcurrentProbeAndClaimStressNeverReportsFalseSuccess(t *testing.T) {
-	if !stagingOSLockAvailable {
-		t.Skip("this platform has no OS ownership lock primitive")
-	}
-	dir := t.TempDir()
-	pub := filepath.Join(dir, "stress.bin")
-	staging := flatDomainLockSrc(pub)
-
-	// Give the domain lock its persistent presence so the probes can open it.
-	own, err := acquireStagingOwnershipLock(staging)
-	if err != nil {
-		t.Fatal(err)
-	}
-	own.release()
-
-	stop := make(chan struct{})
-	var probes sync.WaitGroup
-	probes.Add(1)
-	go func() {
-		defer probes.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			handle, err := openStagingProbeHandle(stagingOwnershipLockPath(staging), probeHoldShared)
-			if err != nil {
-				continue
-			}
-			// Hold the shared probe longer to increase the contention window.
-			time.Sleep(500 * time.Microsecond)
-			handle.release()
-		}
-	}()
-
-	var contentionCount atomic.Int64
-	restoreHook := stagingOwnershipContentionHook
-	stagingOwnershipContentionHook = func(staging string) {
-		contentionCount.Add(1)
-	}
-	defer func() { stagingOwnershipContentionHook = restoreHook }()
-
-	// Keep the contention window short so the stress finishes quickly; the
-	// behavior under test is the classification, not the duration.
-	shortBlobOwnershipWait(t, 200*time.Millisecond)
-
-	// Repeated acquisitions under shared-reader pressure must not report a foreign
-	// live owner; no competing writer exists in this test.
-	key, lockSrc := flatDomainKey(pub), flatDomainLockSrc(pub)
-	var falseSkips int
-	var uncertain int
-	for i := 0; i < 60; i++ {
-		domain, err := acquireBlobDomain(context.Background(), key, lockSrc)
-		if err == nil {
-			domain.release()
-			continue
-		}
-		if errors.Is(err, errStagingOwnershipBusy) {
-			falseSkips++
-			continue
-		}
-		if errors.Is(err, errStagingOwnershipUncertain) {
-			uncertain++
-			continue
-		}
-		t.Fatalf("acquisition %d: %v", i, err)
-	}
-	close(stop)
-	probes.Wait()
-
-	if contentionCount.Load() == 0 {
-		t.Skip("no contention was observed; the probes did not overlap the claims")
-	}
-	if falseSkips != 0 {
-		t.Fatalf("%d claims reported a live owner although no writer exists (false successful skip)", falseSkips)
-	}
-	// A claim that could not resolve the contention must be an explicit
-	// uncertain failure, never a successful skip.
-	if uncertain > 0 {
-		t.Logf("%d claims ended uncertain (actionable failure, not a skip)", uncertain)
-	}
-}
-
-func TestDownload_ConcurrentProbeStressCompletesTheFile(t *testing.T) {
-	if !stagingOSLockAvailable {
-		t.Skip("this platform has no OS ownership lock primitive")
-	}
-	f := newContentionDownloadFixture(t)
-
-	stop := make(chan struct{})
-	var probes sync.WaitGroup
-	probes.Add(1)
-	go func() {
-		defer probes.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			handle, err := openStagingProbeHandle(stagingOwnershipLockPath(f.staging), probeHoldShared)
-			if err != nil {
-				continue
-			}
-			time.Sleep(500 * time.Microsecond)
-			handle.release()
-		}
-	}()
-
-	out := f.runDownload(t, context.Background())
-	close(stop)
-	probes.Wait()
-
-	if len(out.skips) > 0 {
-		t.Fatalf("the job recorded a successful skip under probe contention: %v", out.skips)
-	}
-	if out.err != nil {
-		t.Fatalf("Download under probe contention: %v", out.err)
-	}
-	assertExactFile(t, f.dst, f.full)
-}
-
-// The non-owning probe detects exclusive writers, not other readers.
-func TestStagingOwnershipHolderObservation(t *testing.T) {
-	if !stagingOSLockAvailable {
-		t.Skip("this platform has no OS ownership lock primitive")
-	}
-	dir := t.TempDir()
-	staging := filepath.Join(dir, "x.incomplete")
-	lockPath := stagingOwnershipLockPath(staging)
-
-	// The lock file must exist for the probes to open it.
-	own, err := acquireStagingOwnershipLock(staging)
-	if err != nil {
-		t.Fatal(err)
-	}
-	own.release()
-
-	// With no holder, no exclusive holder is observed. The observation does
-	// NOT claim to distinguish "reader" from "nobody": a granted shared
-	// probe means exactly "no exclusive holder".
-	kind, err := observeStagingOSLockHolder(lockPath)
-	if err != nil {
-		t.Fatalf("observe with no holder: %v", err)
-	}
-	if kind != stagingLockHolderNotExclusive {
-		t.Errorf("holder kind with no holder = %v, want stagingLockHolderNotExclusive", kind)
-	}
-
-	reader := startStagingProbeHolder(t, staging, probeHoldShared)
-	kind, err = observeStagingOSLockHolder(lockPath)
-	if err != nil {
-		t.Fatalf("observe with a reader: %v", err)
-	}
-	if kind != stagingLockHolderNotExclusive {
-		t.Errorf("holder kind with a shared reader = %v, want stagingLockHolderNotExclusive", kind)
-	}
-	reader.release()
-
-	writer, err := acquireStagingOwnershipLock(staging)
-	if err != nil {
-		t.Fatal(err)
-	}
-	kind, err = observeStagingOSLockHolder(lockPath)
-	if err != nil {
-		t.Fatalf("observe with a writer: %v", err)
-	}
-	if kind != stagingLockHolderExclusive {
-		t.Errorf("holder kind with an exclusive writer = %v, want stagingLockHolderExclusive", kind)
-	}
-	writer.release()
-
-	kind, err = observeStagingOSLockHolder(lockPath)
-	if err != nil {
-		t.Fatalf("observe after release: %v", err)
-	}
-	if kind != stagingLockHolderNotExclusive {
-		t.Errorf("holder kind after release = %v, want stagingLockHolderNotExclusive", kind)
 	}
 }

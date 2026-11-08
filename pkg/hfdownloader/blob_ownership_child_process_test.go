@@ -24,7 +24,7 @@ func encodeOwnershipPayload(payload []byte) string {
 
 // Both routes must reuse a foreign owner's publication; the single route must re-check too.
 func TestDownloadWaitsForForeignProcessOwnerThatPublishesAndReusesTheBlob(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	for _, tc := range []struct {
@@ -121,7 +121,7 @@ func testDownloadWaitsForForeignProcessOwnerThatPublishes(t *testing.T, threshol
 
 // Cancellation must interrupt a foreign-owner wait without reporting success or deleting that owner's partial.
 func TestDownloadCancelWhileWaitingForForeignProcessOwnerAbortsPromptly(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	const total = 4_096

@@ -157,7 +157,7 @@ func TestClaimStaging_LegacyLockFencedRecordRemainsUnproven(t *testing.T) {
 	}
 	// The old payload-side lock may be free; LockFenced alone is not a
 	// proof for the current external realm/key protocol.
-	if err := os.WriteFile(stagingOwnershipLockPath(staging), nil, 0o644); err != nil {
+	if err := os.WriteFile(staging+stagingLockSuffix, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	beforePayload, err := os.ReadFile(staging)

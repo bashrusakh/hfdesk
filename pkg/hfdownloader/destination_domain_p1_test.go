@@ -79,7 +79,7 @@ func TestClaimStagingRequiresCoveringDomain(t *testing.T) {
 
 // The transfer holds its external item scope and creates no payload-side lock.
 func TestCacheTransferHoldsExternalDestinationScope(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	const total = 4_096
@@ -157,7 +157,7 @@ func TestCacheTransferHoldsExternalDestinationScope(t *testing.T) {
 	if berr != nil || !busy {
 		t.Errorf("external item scope while transferring = (%v, %v), want a held scope", busy, berr)
 	}
-	obsoleteLock := stagingOwnershipLockPath(repo.IncompletePath(sha))
+	obsoleteLock := repo.IncompletePath(sha) + stagingLockSuffix
 	if _, serr := os.Stat(obsoleteLock); !os.IsNotExist(serr) {
 		t.Errorf("the obsolete staging lock %s exists; the claim must not take a second fence (stat err=%v)",
 			filepath.Base(obsoleteLock), serr)
@@ -191,7 +191,7 @@ func TestCacheTransferHoldsExternalDestinationScope(t *testing.T) {
 
 // A legacy lock-fenced record is current only when its realm/key proof matches.
 func TestCheckBlobProbesTheDestinationDomain(t *testing.T) {
-	if !stagingOSLockAvailable {
+	if !ownershipOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	cache := NewHFCache(t.TempDir())
@@ -224,15 +224,15 @@ func TestCheckBlobProbesTheDestinationDomain(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Negative control: the legacy payload-side lock is not current ownership.
-	obsolete, err := acquireStagingOwnershipLock(staging)
-	if err != nil {
+	// Negative control: a legacy payload-side .lock residue file (left in the
+	// wild by old versions) is inert and is not current ownership.
+	obsolete := staging + stagingLockSuffix
+	if err := os.WriteFile(obsolete, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	status, _, cerr := repo.CheckBlob(sha)
-	obsolete.release()
 	if cerr != nil || status == BlobDownloading {
-		t.Fatalf("CheckBlob while only the obsolete staging lock is held = %v (err=%v), want not-downloading", status, cerr)
+		t.Fatalf("CheckBlob while only the legacy payload-side lock residue exists = %v (err=%v), want not-downloading", status, cerr)
 	}
 	// A fenced record with a free destination domain is reported stale.
 	if status != BlobStale {

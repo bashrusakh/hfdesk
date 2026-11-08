@@ -20,6 +20,21 @@
 
 ### Changed
 
+- Mirror and rebuild mutations now join the destination ownership admission end
+  to end (#151): the mirror's snapshot symlink-leaf replacement takes entry
+  admission and its directory creation takes admitted directory creation, and
+  the sync/rebuild path creates, replaces and removes snapshot/friendly
+  entries, prunes empty directories and writes the rebuild script through the
+  same shared admission funnels the download path uses. A second HFDesk
+  instance (or another machine sharing the control filesystem) holding an
+  entry's or tree's scope now excludes these mutations — refused with the
+  actionable ownership error after the established bounded wait on the link and
+  script funnels, immediately on the non-waiting admission surface the mirror
+  uses for file writes and tree removals — instead of racing a live writer.
+  Coordination stays file-based per path: independent files and repositories
+  remain parallel, and no publication guarantee is added, since these
+  operations still perform no domain-exclusive placement.
+
 - Replace payload-adjacent destination lock files with one external ownership
   realm for every download route (#140). `Settings.OwnershipDir` selects the
   realm; empty uses the captured per-user HFDesk config directory. Clients that
@@ -99,8 +114,9 @@
   through the no-replace primitive. The mirror copy itself checks nothing
   beyond `io.Copy`'s error contract (its explicit size comparison happens only
   in the opt-in verify pass, at size granularity rather than hashes), the
-  mirror's symlink-leaf replacement and plain directory creation take no
-  admission, and selected deletion's local-root branch takes flat-realm entry
+  mirror's symlink-leaf replacement and directory creation join that admission
+  too (entry admission and admitted directory creation respectively), and
+  selected deletion's local-root branch takes flat-realm entry
   admission over exactly the member paths it unlinks, resolved through the same
   `Settings.OwnershipDir` its writers use (default `DefaultOwnershipDir()`) —
   as strong as the flat realm's existing writer coordination: participants
