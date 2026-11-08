@@ -127,11 +127,15 @@ of the instance: the config file the instance owns wins over it (see
 `install` validates the installation before it writes anything: the
 executable must exist, be a regular file and be executable, the bind address
 must be usable, and the runtime paths must be absolute. On Windows the
-executable must also be a Windows executable of the architecture of the
-machine: a truncated download, a file that is not a program at all and a
-binary of another architecture are refused before the running instance is
-stopped. A failed installation restores the previous registration instead of
-leaving a half-written one behind, except when the rollback cannot prove that
+executable must also be a Windows executable: a truncated download and a file
+that is not a program at all are refused before the running instance is
+stopped. The machine type of the program is refused only when Windows reports
+this host cannot execute it: a machine type the host supports as a guest is
+accepted, and a support query Windows does not answer refuses nothing — the
+installation continues instead of inferring an incompatibility it could not
+establish. A failed installation restores the previous
+registration instead of leaving a half-written one behind, except when the
+rollback cannot prove that
 the instance the failed update started has stopped: the failed registration is
 kept then, so the registration and the process that runs never describe
 different programs, and the error says so.
@@ -426,11 +430,14 @@ hfdesk service status             # shows the broken registration
 hfdesk service install            # re-registers the current binary
 ```
 
-A reinstall repairs the registration and re-points it at the current binary. On
-Windows and Linux it does **not** start the service: the repaired registration
-stays stopped until `hfdesk service start`, or until the service is started from
-the tray of the Windows desktop app (see
-[The Windows desktop host](#the-windows-desktop-host)).
+A reinstall repairs the registration and re-points it at the current binary and,
+on Windows and Linux, keeps the state it finds: an instance that is not running
+is not started, so the repaired registration stays stopped until
+`hfdesk service start`, or until the service is started from the tray of the
+Windows desktop app (see
+[The Windows desktop host](#the-windows-desktop-host)). A running or starting
+instance on those platforms is interrupted by the reinstall: it is stopped, and
+only then is it started again on the current binary.
 
 ## Per-platform notes
 

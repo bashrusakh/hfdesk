@@ -148,7 +148,10 @@ never serve the same address; it then installs and starts the service from that
 folder and reports the result. A launch that finds an installed service starts
 no server of its own either: it asks whether to open the running service, to
 update it from the folder of this app, or to start a stopped one, and **Cancel**
-changes nothing.
+changes nothing. **Work in desktop mode** is the exception and the default
+answer for a positively confirmed stopped service: it continues the launch as
+an ordinary desktop app — the service state is read again when the answer is
+taken — and neither starts nor changes the service.
 
 The service is a second HFDesk with **separate data**: it keeps its own config,
 jobs, history and cache under `%ProgramData%\HFDesk`. The settings, jobs and
