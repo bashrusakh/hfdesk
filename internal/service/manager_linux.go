@@ -1092,6 +1092,16 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	if err := validateUnitPaths(validationOpts, registered); err != nil {
 		return opts, err
 	}
+	// An ExecStart= the update cannot rewrite into the new program is
+	// refused here: before the root requirement, before any directory is
+	// created and before the unit file is written. An installation must
+	// never leave a registration whose command cannot start, and a stopped
+	// instance has no later verification that would report it.
+	if registered {
+		if err := validateSystemdExecStartUpdate(string(sourceContent), opts.Executable); err != nil {
+			return opts, err
+		}
+	}
 	// A machine-wide instance must not adopt the state of the user who
 	// runs the install command. The check runs before the root
 	// requirement, before any directory is created and before the unit
@@ -3613,6 +3623,54 @@ func updateUnit(content string, opts InstallOptions, account *user.User) (string
 }
 
 func updateSystemdExecStartSource(content string, opts InstallOptions) (string, error) {
+	value, ok := systemdExecStartValue(content)
+	if !ok {
+		return systemdExecStart(opts), nil
+	}
+	tokens := splitSystemdWordTokens(strings.TrimSpace(value))
+	if len(tokens) == 0 {
+		return systemdExecStart(opts), nil
+	}
+	slot, err := systemdExecStartProgramSlot(tokens, opts.Executable)
+	if err != nil {
+		return "", err
+	}
+	// Only the program slot changes: a recognized wrapper prefix before it
+	// and the canonical arguments behind it stay exactly as they are.
+	prefix, command := tokens[:slot], tokens[slot:]
+	command[0] = systemdSourceWord(systemdCommandPrefix(command[0].source) + systemdQuoteCommandAlways(opts.Executable))
+	for _, option := range []struct {
+		name     string
+		value    string
+		explicit bool
+		present  bool
+	}{
+		{"config", opts.Paths.ConfigFile, opts.Explicit.Config, opts.Paths.ConfigFile != ""},
+		{"state-dir", opts.Paths.StateDir, opts.Explicit.StateDir, opts.Paths.StateDir != ""},
+		{"log-dir", opts.Paths.LogDir, opts.Explicit.LogDir, opts.Paths.LogDir != ""},
+		{"listen", listenArg(opts.Listen), opts.Explicit.Listen, listenArg(opts.Listen) != ""},
+		{"cache-dir", opts.CacheDir, opts.Explicit.CacheDir, opts.CacheDir != ""},
+		{"hub-dir", opts.HubDir, opts.Explicit.HubDir, opts.HubDir != ""},
+		{"local-dir", opts.LocalDir, opts.Explicit.LocalDir, opts.LocalDir != ""},
+	} {
+		if !option.explicit {
+			continue
+		}
+		command = replaceSystemdRunFlag(command, option.name, option.value, option.present)
+	}
+	words := make([]string, 0, len(prefix)+len(command))
+	for _, token := range prefix {
+		words = append(words, token.source)
+	}
+	for _, token := range command {
+		words = append(words, token.source)
+	}
+	return strings.Join(words, " "), nil
+}
+
+// systemdExecStartValue returns the value of the first ExecStart= directive
+// of the [Service] section, exactly as the line carries it.
+func systemdExecStartValue(content string) (string, bool) {
 	section := ""
 	for _, line := range systemdLogicalLines(content) {
 		trimmed := strings.TrimSpace(line.text)
@@ -3627,37 +3685,104 @@ func updateSystemdExecStartSource(content string, opts InstallOptions) (string, 
 		if !ok || strings.TrimSpace(key) != "ExecStart" {
 			continue
 		}
-		tokens := splitSystemdWordTokens(strings.TrimSpace(value))
-		if len(tokens) == 0 {
-			return systemdExecStart(opts), nil
-		}
-		tokens[0] = systemdSourceWord(systemdCommandPrefix(tokens[0].source) + systemdQuoteCommandAlways(opts.Executable))
-		for _, option := range []struct {
-			name     string
-			value    string
-			explicit bool
-			present  bool
-		}{
-			{"config", opts.Paths.ConfigFile, opts.Explicit.Config, opts.Paths.ConfigFile != ""},
-			{"state-dir", opts.Paths.StateDir, opts.Explicit.StateDir, opts.Paths.StateDir != ""},
-			{"log-dir", opts.Paths.LogDir, opts.Explicit.LogDir, opts.Paths.LogDir != ""},
-			{"listen", listenArg(opts.Listen), opts.Explicit.Listen, listenArg(opts.Listen) != ""},
-			{"cache-dir", opts.CacheDir, opts.Explicit.CacheDir, opts.CacheDir != ""},
-			{"hub-dir", opts.HubDir, opts.Explicit.HubDir, opts.HubDir != ""},
-			{"local-dir", opts.LocalDir, opts.Explicit.LocalDir, opts.LocalDir != ""},
-		} {
-			if !option.explicit {
-				continue
-			}
-			tokens = replaceSystemdRunFlag(tokens, option.name, option.value, option.present)
-		}
-		words := make([]string, len(tokens))
-		for i, token := range tokens {
-			words[i] = token.source
-		}
-		return strings.Join(words, " "), nil
+		return value, true
 	}
-	return systemdExecStart(opts), nil
+	return "", false
+}
+
+// validateSystemdExecStartUpdate refuses, before the installation changes
+// anything, an ExecStart= form that cannot be rewritten into the new
+// registration. updateSystemdExecStartSource applies the same rule when it
+// rewrites the line, so a registration is never left with a command the
+// merge corrupted.
+func validateSystemdExecStartUpdate(content, executable string) error {
+	value, ok := systemdExecStartValue(content)
+	if !ok {
+		return nil
+	}
+	tokens := splitSystemdWordTokens(strings.TrimSpace(value))
+	if len(tokens) == 0 {
+		return nil
+	}
+	_, err := systemdExecStartProgramSlot(tokens, executable)
+	return err
+}
+
+// systemdExecStartProgramSlot returns the index of the token an ExecStart
+// update replaces with the new program.
+//
+// The registered process is the HFDesk program that receives the canonical
+// "service run" argument vector as its first arguments, so the command is
+// either the program alone or the program followed by "service run". An
+// "env" wrapper locates the same program behind its own options and
+// NAME=VALUE assignments, and its prefix stays untouched.
+//
+// Every other shape cannot be rewritten reliably: a shell script string
+// hides the program inside a quoted word, an unknown wrapper may consume
+// the words after it differently, and a command without the run vector is
+// not the HFDesk service command. Those forms are refused instead of being
+// turned into a command that cannot start.
+func systemdExecStartProgramSlot(tokens []systemdWord, executable string) (int, error) {
+	if len(tokens) <= 1 {
+		// The program alone carries no argument the rewrite could
+		// mismatch.
+		return 0, nil
+	}
+	slot := 0
+	if !tokens[0].dynamic && filepath.Base(tokens[0].value) == "env" {
+		slot = 1
+		for slot < len(tokens) && systemdEnvPrefixWord(tokens[slot]) {
+			slot++
+		}
+	}
+	if slot+2 >= len(tokens) || tokens[slot+1].value != "service" || tokens[slot+2].value != "run" {
+		return 0, systemdExecStartRefusal(tokens, executable)
+	}
+	return slot, nil
+}
+
+// systemdEnvPrefixWord reports whether word is an argument an "env" wrapper
+// consumes before the program it executes: an option or a NAME=VALUE
+// assignment. A bare word there can be the value of an option ("env -u
+// NAME") or a program the wrapper runs with other arguments, and which of
+// the two it is cannot be read from the word alone, so such a form is not
+// recognized.
+func systemdEnvPrefixWord(word systemdWord) bool {
+	value := word.value
+	if strings.HasPrefix(value, "-") {
+		return true
+	}
+	name, _, ok := strings.Cut(value, "=")
+	if !ok || name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// systemdExecStartRefusal reports an ExecStart= form the update refuses to
+// rewrite. The error states the result (nothing was changed), the cause (the
+// command it found, named in the message) and the next action.
+func systemdExecStartRefusal(tokens []systemdWord, executable string) error {
+	const shownWords = 6
+	shown := make([]string, 0, shownWords+1)
+	for i, token := range tokens {
+		if i == shownWords {
+			shown = append(shown, "...")
+			break
+		}
+		shown = append(shown, token.source)
+	}
+	return fmt.Errorf("service: the update was refused and the registration was not changed: the existing ExecStart=%q is not a command an installation can rewrite. Set the ExecStart= line to start with the program %q followed by \"service run\" (an \"env\" prefix before the program is kept) and run the installation again",
+		strings.Join(shown, " "), executable)
 }
 
 func systemdSourceWord(source string) systemdWord {

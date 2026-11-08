@@ -6304,6 +6304,249 @@ func TestSystemdUpdatePreservesEscapedDollarArguments(t *testing.T) {
 	}
 }
 
+// splitRenderedExecStart locates the ExecStart= command of a rendered unit:
+// it returns the program part (including the "ExecStart=" key), the run
+// arguments behind it and the offset of the directive.
+func splitRenderedExecStart(t *testing.T, unit, executable string) (program, tail string, start int) {
+	t.Helper()
+	program = `ExecStart="` + executable + `"`
+	start = strings.Index(unit, program)
+	if start < 0 {
+		t.Fatalf("the rendered unit does not hold the command %q:\n%s", program, unit)
+	}
+	rest := unit[start:]
+	lineEnd := strings.Index(rest, "\n")
+	if lineEnd < 0 {
+		lineEnd = len(rest)
+	}
+	return program, rest[len(program):lineEnd], start
+}
+
+// systemdWrapExecStart replaces the ExecStart= command of a rendered unit
+// with a hand-edited value and keeps the rest of the unit file.
+func systemdWrapExecStart(t *testing.T, unit, executable, value string) string {
+	t.Helper()
+	program, tail, start := splitRenderedExecStart(t, unit, executable)
+	return unit[:start] + "ExecStart=" + value + unit[start+len(program)+len(tail):]
+}
+
+// TestSystemdExecStartUpdateRewritesOnlyRewritableCommands checks the merge
+// of the unit command: the program slot takes the new program while a
+// recognized wrapper and its arguments stay, and a form the merge cannot
+// rewrite is refused by name instead of being corrupted.
+func TestSystemdExecStartUpdateRewritesOnlyRewritableCommands(t *testing.T) {
+	const executable = "/opt/hfdesk-new/hfdesk"
+	const tail = "service run --listen 127.0.0.1:19090"
+	opts := InstallOptions{Scope: ScopeUser, Executable: executable}
+
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{
+			name:  "the program with its run vector",
+			value: "/opt/hfdesk-old/hfdesk " + tail,
+			want:  `"` + executable + `" ` + tail,
+		},
+		{
+			name:  "the program alone",
+			value: "/opt/hfdesk-old/hfdesk",
+			want:  `"` + executable + `"`,
+		},
+		{
+			name:  "an env wrapper",
+			value: "/usr/bin/env hfdesk " + tail,
+			want:  `/usr/bin/env "` + executable + `" ` + tail,
+		},
+		{
+			name:  "an env wrapper with options and assignments",
+			value: "/usr/bin/env -i HF_HOME=/srv/hfdesk hfdesk " + tail,
+			want:  `/usr/bin/env -i HF_HOME=/srv/hfdesk "` + executable + `" ` + tail,
+		},
+		{
+			name:  "a dynamic program source",
+			value: "%h/bin/hfdesk " + tail,
+			want:  `"` + executable + `" ` + tail,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := "[Unit]\nDescription=HFDesk\n\n[Service]\nExecStart=" + tc.value + "\nWorkingDirectory=/srv/state\n"
+			got, err := updateSystemdExecStartSource(content, opts)
+			if err != nil {
+				t.Fatalf("updateSystemdExecStartSource() = %v, want nil", err)
+			}
+			if got != tc.want {
+				t.Errorf("updateSystemdExecStartSource() = %q, want %q", got, tc.want)
+			}
+			if err := validateSystemdExecStartUpdate(content, executable); err != nil {
+				t.Errorf("validateSystemdExecStartUpdate() = %v, want nil for a rewritable form", err)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name  string
+		value string
+		form  string
+	}{
+		{
+			name:  "a shell script string",
+			value: `/bin/sh -c "exec hfdesk ` + tail + `"`,
+			form:  "/bin/sh -c",
+		},
+		{
+			name:  "an unknown wrapper",
+			value: "/usr/bin/timeout 30 hfdesk " + tail,
+			form:  "timeout 30",
+		},
+		{
+			name:  "an env wrapper with an option value",
+			value: "/usr/bin/env -u LD_PRELOAD hfdesk " + tail,
+			form:  "LD_PRELOAD",
+		},
+		{
+			name:  "a command without the run vector",
+			value: "/opt/hfdesk-old/hfdesk --serve",
+			form:  "--serve",
+		},
+		{
+			name:  "a command whose vector is not the run vector",
+			value: "/opt/hfdesk-old/hfdesk service status",
+			form:  "service status",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := "[Service]\nExecStart=" + tc.value + "\n"
+			if _, err := updateSystemdExecStartSource(content, opts); err == nil {
+				t.Fatal("updateSystemdExecStartSource() = nil, want the refusal of the unrewritable form")
+			}
+			err := validateSystemdExecStartUpdate(content, executable)
+			if err == nil {
+				t.Fatal("validateSystemdExecStartUpdate() = nil, want the refusal of the unrewritable form")
+			}
+			for _, want := range []string{"ExecStart=", tc.form, "not changed", executable} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("validateSystemdExecStartUpdate() = %q, want it to contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestSystemdInstallRefusesUnrewritableExecStartBeforeChangingTheUnit checks
+// that an update over a hand-edited unit whose ExecStart= feeds a shell
+// script is refused before anything changes, whether the instance runs or is
+// stopped: a stopped instance must never be left with a command that cannot
+// start, and a running instance keeps the supervisor untouched instead of
+// being restarted onto a broken command. The refusal names the form, states
+// that nothing changed and gives the next action.
+func TestSystemdInstallRefusesUnrewritableExecStartBeforeChangingTheUnit(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		active string
+	}{
+		{name: "a stopped instance", active: "inactive"},
+		{name: "a running instance", active: "active"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := systemdRecordingSupervisor(t)
+			root := t.TempDir()
+			oldExecutable := systemdTestExecutable(t)
+			newExecutable := systemdTestExecutable(t)
+			previous := systemdExistingOptions(t, oldExecutable, root)
+			m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+			wrapped := systemdWrapExecStart(t, previousUnit, oldExecutable,
+				`/bin/sh -c "exec hfdesk service run --listen 127.0.0.1:19090"`)
+			for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
+				if err := os.WriteFile(name, []byte(wrapped), 0o644); err != nil {
+					t.Fatalf("write the wrapped unit %q: %v", name, err)
+				}
+			}
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", tc.active)
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+
+			_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+			if err == nil {
+				t.Fatal("Install() = nil, want the refusal of the shell-wrapped ExecStart")
+			}
+			for _, want := range []string{"ExecStart=", "/bin/sh -c", "not changed", newExecutable} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Install() = %q, want it to contain %q", err, want)
+				}
+			}
+			content, readErr := os.ReadFile(unitPath)
+			if readErr != nil || string(content) != wrapped {
+				t.Errorf("the refused update changed the unit: read err=%v\n%s", readErr, content)
+			}
+			calls := systemdSupervisorCalls(t, logPath)
+			for _, command := range []string{"daemon-reload", "enable", "restart", "start"} {
+				if count := systemdSupervisorCallsTo(calls, command, unitName); count != 0 {
+					t.Errorf("the refused update issued %q %d times: %v", command, count, calls)
+				}
+			}
+		})
+	}
+}
+
+// TestSystemdInstallRepairsAnEnvWrappedExecStart checks the rewrite the
+// update promises for a recognized wrapper: the "env" prefix and its
+// arguments stay, the program slot takes the new program, the run arguments
+// and the other directives keep the registration's settings, and the stopped
+// instance is not started.
+func TestSystemdInstallRepairsAnEnvWrappedExecStart(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	_, tail, _ := splitRenderedExecStart(t, previousUnit, oldExecutable)
+	wrapped := systemdWrapExecStart(t, previousUnit, oldExecutable, "/usr/bin/env HF_HOME=/srv/hfdesk hfdesk"+tail)
+	for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
+		if err := os.WriteFile(name, []byte(wrapped), 0o644); err != nil {
+			t.Fatalf("write the wrapped unit %q: %v", name, err)
+		}
+	}
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+
+	if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
+		t.Fatalf("Install() = %v, want the preserved env-wrapped update", err)
+	}
+	content, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("read the updated unit: %v", err)
+	}
+
+	// The promised rewrite: wrapper prefix kept, program slot replaced,
+	// every run argument behind it untouched.
+	want := `ExecStart=/usr/bin/env HF_HOME=/srv/hfdesk "` + newExecutable + `"` + tail
+	if !strings.Contains(string(content), want) {
+		t.Errorf("the updated unit does not hold the promised command %q:\n%s", want, content)
+	}
+	if strings.Contains(string(content), oldExecutable) {
+		t.Errorf("the updated unit still names the old program %q:\n%s", oldExecutable, content)
+	}
+	for _, kept := range []string{
+		"WorkingDirectory=" + previous.Paths.StateDir,
+		"Restart=on-failure",
+		"Environment=HOME=",
+		"--listen " + previous.Listen,
+		"--cache-dir " + previous.CacheDir,
+	} {
+		if !strings.Contains(string(content), kept) {
+			t.Errorf("the env-wrapped update lost %q:\n%s", kept, content)
+		}
+	}
+	calls := systemdSupervisorCalls(t, logPath)
+	for _, command := range []string{"restart", "start"} {
+		if count := systemdSupervisorCallsTo(calls, command, unitName); count != 0 {
+			t.Errorf("a stopped instance was %sed %d times:\n%s", command, count, strings.Join(calls, "\n"))
+		}
+	}
+}
+
 type systemdLosslessUpdateFixture struct {
 	logPath       string
 	manager       *systemdManager
