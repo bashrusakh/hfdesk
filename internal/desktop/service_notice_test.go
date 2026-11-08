@@ -791,3 +791,64 @@ func TestServiceActionFailureTextOfAChangedAccountIsOneReport(t *testing.T) {
 		t.Errorf("the ordinary update report %q lost its state command", ordinary)
 	}
 }
+
+// TestServiceHelperNotReadyTextIsOneCoherentReport proves the report of a
+// helper that started but never became ready is one truthful message: it
+// states the result and why it follows from the readiness rule, carries the
+// observed cause verbatim, references the reason the helper reports in its
+// own box instead of repeating or contradicting it, and names one next
+// action. It never claims the helper could not be started — that is the
+// report of a launch that never ran, whose caption it must not share.
+func TestServiceHelperNotReadyTextIsOneCoherentReport(t *testing.T) {
+	earlyExit := &helperNotReadyError{cause: errors.New("desktop: the service helper exited before it became ready")}
+	// The report carries the reason of the helper wait as it is: a renamed
+	// or paraphrased cause would be the contradiction this report fixes.
+	if got := earlyExit.Error(); got != "desktop: the service helper exited before it became ready" {
+		t.Errorf("helperNotReadyError.Error() = %q, want the observed cause verbatim", got)
+	}
+	if serviceHelperNotReadyCaption == serviceFailureCaption(serviceActionInstall) {
+		t.Errorf("the caption of the not-ready report %q is the caption of the never-ran report, want a distinct one",
+			serviceHelperNotReadyCaption)
+	}
+
+	for _, action := range []serviceAction{serviceActionInstall, serviceActionUpdate, serviceActionStart} {
+		text := serviceHelperNotReadyText(action, earlyExit)
+		for _, want := range []string{
+			serviceActionUnchangedText(action),
+			"No service action was performed",
+			"the helper acts only after it becomes ready",
+			"desktop: the service helper exited before it became ready",
+			"shows its own message with the reason",
+			"If that message appeared, address what it names, then repeat the action",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("the report of %q %q does not mention %q", action, text, want)
+			}
+		}
+		if strings.Contains(text, "could not start its administrator helper") {
+			t.Errorf("the report of %q claims the helper could not be started although it was started", action)
+		}
+	}
+
+	timeout := serviceHelperNotReadyText(serviceActionUpdate,
+		&helperNotReadyError{cause: errors.New("desktop: the service helper did not become ready within 1m0s")})
+	if !strings.Contains(timeout, "did not become ready within 1m0s") {
+		t.Errorf("the report %q does not carry the observed cause of the timeout", timeout)
+	}
+}
+
+// TestServiceLaunchFailedTextKeepsTheNeverRanReport pins the report of a
+// helper that never ran: the wording a declined user account control prompt
+// and every other failed launch produce stays exactly as it is, so the two
+// states of the helper remain distinguishable by their text alone.
+func TestServiceLaunchFailedTextKeepsTheNeverRanReport(t *testing.T) {
+	text := serviceLaunchFailedText(serviceActionInstall, errors.New(elevationDeclined))
+	if !strings.HasPrefix(text, "HFDesk could not start its administrator helper.") {
+		t.Errorf("the report %q does not keep the head of a launch that never ran", text)
+	}
+	for _, want := range []string{elevationDeclined, "The service was not installed."} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the report %q does not mention %q", text, want)
+		}
+	}
+}

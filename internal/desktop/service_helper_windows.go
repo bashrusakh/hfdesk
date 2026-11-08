@@ -552,10 +552,20 @@ func (r *serviceActionReporter) notInstalled() error {
 // reportServiceLaunchFailure records the failure of a launch of the elevated
 // helper and reports it to the user.
 //
-// The helper never ran, so the report is the only surface the failure has: the
-// helper is the surface of the actions it performs, and this one did not start.
+// A helper that never ran gets the only report its failure has: the helper is
+// the surface of the actions it performs, and this one did not start. A
+// helper that was started but never became ready already showed — or is
+// showing — its own message with its own reason, so its report is the
+// distinct one: it references that message instead of contradicting it with
+// a caption that claims the helper could not start.
 func reportServiceLaunchFailure(action serviceAction, err error) {
 	if err == nil {
+		return
+	}
+	var notReady *helperNotReadyError
+	if errors.As(err, &notReady) {
+		desktopLog.Error("the elevated service helper started but did not become ready", "action", string(action), "error", err)
+		showMessage(serviceHelperNotReadyCaption, serviceHelperNotReadyText(action, err), windows.MB_ICONERROR)
 		return
 	}
 	desktopLog.Error("the elevated service helper could not be started", "action", string(action), "error", err)

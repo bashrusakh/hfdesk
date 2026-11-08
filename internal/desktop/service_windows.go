@@ -416,7 +416,12 @@ func launchServiceHandover(action serviceAction, waitPID int, instanceMutex stri
 	if err := waitForHelperReady(helper.handle, events.ready, serviceWaitBudget); err != nil {
 		helper.Close()
 		events.close()
-		return nil, err
+		// The helper was started: its report is the report of a helper
+		// that never became ready, not of a launch that never ran. The
+		// desktop never committed the shutdown before this evidence, so
+		// no service action was performed — the helper waits for the
+		// success signal that only a ready handover authorizes.
+		return nil, &helperNotReadyError{cause: err}
 	}
 	return &desktopHandover{events: events, helper: helper}, nil
 }

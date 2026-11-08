@@ -53,6 +53,14 @@ const (
 	// serviceStartedCaption is the caption of the report of a started
 	// service.
 	serviceStartedCaption = "HFDesk - service started"
+
+	// serviceHelperNotReadyCaption is the caption of the report of an
+	// elevated helper that started but never became ready. It is distinct
+	// from the report of a helper that never ran — a declined user account
+	// control prompt and a shell that could not start the program keep the
+	// caption and the wording they have today — because the two states have
+	// different causes and different next steps.
+	serviceHelperNotReadyCaption = "HFDesk - the administrator helper did not become ready"
 )
 
 // serviceFailureCaption returns the caption of a failed service action.
@@ -574,29 +582,87 @@ func serviceFolderAccessText(program string) string {
 	return `The Windows service runs as NT AUTHORITY\LocalService, so that account must be able to read ` + subject + ` and to traverse the folder that holds it.`
 }
 
+// helperNotReadyError reports that the elevated helper was started but never
+// became ready: it ended before its ready signal, or the signal never came
+// within the budget, or it was gone right after the signal. The helper acts
+// only after it becomes ready — the desktop commits its shutdown and the
+// success signal on that evidence alone — so every cause of this error means
+// that no service action was performed.
+//
+// The error is its own report class because the desktop cannot know the
+// reason the helper itself failed: the helper shows that reason in its own
+// message box before it ends, and a second box must reference that message
+// instead of contradicting it or repeating what it says.
+type helperNotReadyError struct {
+	cause error
+}
+
+func (e *helperNotReadyError) Error() string {
+	if e == nil || e.cause == nil {
+		return "the service helper did not become ready"
+	}
+	return e.cause.Error()
+}
+
+func (e *helperNotReadyError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// serviceActionUnchangedText returns the result sentence of a report whose
+// action never ran: the state the action did not reach, in the words every
+// report of the unchanged service starts with.
+func serviceActionUnchangedText(action serviceAction) string {
+	switch action {
+	case serviceActionInstall:
+		return "The service was not installed."
+	case serviceActionUpdate:
+		return "The service was not updated."
+	default:
+		return "The service was not started."
+	}
+}
+
+// serviceHelperNotReadyText returns the report of a helper that started but
+// never became ready.
+//
+// The report is one coherent message for this state: it states the result
+// (nothing was performed, because the helper acts only after it becomes
+// ready), the observed cause of the failed readiness, and one next action.
+// It never claims that the helper could not be started — it was started —
+// and it never repeats the reason the helper reports in its own box: it
+// references that message, which is where the user reads the actual reason
+// and the step that follows from it.
+func serviceHelperNotReadyText(action serviceAction, err error) string {
+	detail := ""
+	if err != nil {
+		detail = err.Error()
+	}
+	return serviceActionUnchangedText(action) +
+		" No service action was performed: the helper acts only after it becomes ready, and it never did.\n\n" +
+		detail + "\n\n" +
+		"The helper runs its checks before it becomes ready and shows its own message with the reason when one of them fails. " +
+		"If that message appeared, address what it names, then repeat the action."
+}
+
 // serviceLaunchFailedText returns the report of a failed launch of the elevated
 // helper.
 //
 // The desktop host reports the failure itself, because the helper never ran:
 // the helper is the only surface that reports the outcome of an action it
 // performed. A refused request for administrator rights and a helper that
-// could not be started both end here, before anything was changed.
+// could not be started both end here, before anything was changed. A helper
+// that was started but never became ready is a different state and has its
+// own report (serviceHelperNotReadyText).
 func serviceLaunchFailedText(action serviceAction, err error) string {
 	detail := ""
 	if err != nil {
 		detail = err.Error()
 	}
 
-	var unchanged string
-	switch action {
-	case serviceActionInstall:
-		unchanged = "The service was not installed."
-	case serviceActionUpdate:
-		unchanged = "The service was not updated."
-	default:
-		unchanged = "The service was not started."
-	}
-	return "HFDesk could not start its administrator helper.\n\n" + detail + "\n\n" + unchanged
+	return "HFDesk could not start its administrator helper.\n\n" + detail + "\n\n" + serviceActionUnchangedText(action)
 }
 
 // serviceSiblingMissingText returns the report of a missing console program.

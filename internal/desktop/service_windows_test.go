@@ -1144,6 +1144,12 @@ func TestTrayServiceInstallReportsARefusedElevation(t *testing.T) {
 	if len(*messages) != 1 {
 		t.Fatalf("the tray action showed %d message boxes, want one", len(*messages))
 	}
+	// A declined prompt is a launch that never ran: its report keeps the
+	// head and the wording it has, which stay distinct from the report of
+	// a helper that started and did not become ready.
+	if !strings.HasPrefix((*messages)[0].text, "HFDesk could not start its administrator helper.") {
+		t.Errorf("the message %q does not keep the report of a launch that never ran", (*messages)[0].text)
+	}
 	for _, want := range []string{elevationDeclined, "The service was not installed."} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the message %q does not mention %q", (*messages)[0].text, want)
@@ -1220,6 +1226,31 @@ func TestTrayServiceInstallReadinessFailureKeepsRetryAvailable(t *testing.T) {
 	}
 	if serviceInstallRunning.Load() {
 		t.Fatal("the failed pre-shutdown attempt kept the tray retry guard")
+	}
+	// The first attempt shows exactly one box, and it is the report of a
+	// helper that started and ended early: its own caption, the observed
+	// cause, and a reference to the message the helper shows itself —
+	// never the head of a launch that never ran, which would contradict
+	// the detail and duplicate what the helper already reported.
+	if len(*messages) != 1 {
+		t.Fatalf("the first attempt showed %d message boxes, want one: %v", len(*messages), *messages)
+	}
+	firstAttempt := (*messages)[0]
+	if firstAttempt.caption != serviceHelperNotReadyCaption {
+		t.Errorf("the caption is %q, want %q", firstAttempt.caption, serviceHelperNotReadyCaption)
+	}
+	for _, want := range []string{
+		"exited before it became ready",
+		"No service action was performed",
+		"shows its own message with the reason",
+	} {
+		if !strings.Contains(firstAttempt.text, want) {
+			t.Errorf("the first attempt report %q does not mention %q", firstAttempt.text, want)
+		}
+	}
+	if strings.Contains(firstAttempt.text, "could not start its administrator helper") {
+		t.Errorf("the first attempt report %q claims the helper could not be started although it was started",
+			firstAttempt.text)
 	}
 	handover := installServiceFromTray(`Local\HFDesk.Test.Retry`)
 	if handover == nil {
