@@ -1488,20 +1488,17 @@ func absoluteAttemptCeiling(retries int) int {
 }
 
 // syncSinglePartPayload orders previously written partial bytes durable before
-// a sidecar persist may claim framing_complete; tests may replace it to
-// observe the ordering.
+// any sidecar persist publishes the record that makes them inheritable; tests
+// may replace it to observe the ordering.
 var syncSinglePartPayload = func(f *os.File) error { return f.Sync() }
 
-// persistSinglePartIdentity writes the sidecar, ordering the partial's written
-// bytes durable first whenever the record claims framing_complete: a persisted
-// resume claim must be true under power loss, not only under a process crash,
-// matching the ranged family's checkpoint rule. Checkpoint boundary only,
-// never per write chunk.
+// persistSinglePartIdentity orders the partial's written bytes durable, then
+// writes the sidecar: every persisted record, whatever its claim state, sits
+// behind durable bytes, matching the ranged family's unconditional checkpoint
+// sync. Checkpoint boundary only, never per write chunk.
 func persistSinglePartIdentity(out *os.File, sidecar string, id singlePartIdentity) error {
-	if id.FramingComplete {
-		if err := syncSinglePartPayload(out); err != nil {
-			return fmt.Errorf("sync single-part payload of %s before its framing claim: %w", id.Path, err)
-		}
+	if err := syncSinglePartPayload(out); err != nil {
+		return fmt.Errorf("sync single-part payload of %s before its sidecar persist: %w", id.Path, err)
 	}
 	return writeSinglePartIdentity(sidecar, id)
 }
@@ -1788,20 +1785,17 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						}
 					}
 					if cerr == nil {
-						// Clean EOF and exact length establish framing. Persist that proof for the
-						// exact-size restart shortcut; failure loses only the shortcut, not this
-						// run's framing proof.
+						// Clean EOF and exact length establish framing. Persist that proof
+						// before publication: the claim must be durable, so a failed payload
+						// or record sync fails the item instead of publishing bytes whose
+						// durability ordering is known to be broken.
 						identity.FramingComplete = true
-						if werr := persistSinglePartIdentity(out, sidecar, identity); werr != nil {
-							downloadLog.Warn("cannot persist single-part clean-framing completion",
-								"repo", job.Repo,
-								"path", it.RelativePath,
-								"record", sidecar,
-								"error", werr,
-							)
+						werr := persistSinglePartIdentity(out, sidecar, identity)
+						attemptCancel()
+						if werr != nil {
+							return false, fmt.Errorf("persist single-part framing checkpoint %s: %w", sidecar, werr)
 						}
 						// Framing is complete; finalization checks any known size and required digest.
-						attemptCancel()
 						emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
 							Downloaded: countedUpTo, Total: it.Size})
 						return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)

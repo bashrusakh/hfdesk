@@ -409,11 +409,14 @@ revalidation leaves the final byte uncommitted for a later retry/restart. A
 fresh transfer records the flag false before any byte is trusted and sets it
 only after `io.Copy` returns nil and every exact body-length check passes. When
 the expected size is unknown the exact-size shortcut does not apply.
-Like the ranged record's durable high-water marks, a persisted sidecar never
-claims bytes that are not durable: before a persist may set
-`framing_complete` the partial's written bytes are synced, and the sidecar
-itself is synced before its rename publishes the claim, so both hold under
-power loss, not only a process crash.
+Durability is ordered as of each persist: before every sidecar persist the
+partial's written bytes are synced, and the record itself is synced before its
+rename publishes the claim, so both hold under power loss, not only a process
+crash. Unlike the ranged record's durable high-water marks, the sidecar carries
+no durable byte offset, so resume inherits the partial's stat-visible prefix;
+after a size-preserving media loss that prefix may include bytes written after
+the last persist, with holes below its stat size. Only known-digest proof, and
+only when `Verify` is not `"none"`, detects that.
 
 Write the sidecar after discarding unproven bytes and before trusting inherited
 bytes, so it describes the on-disk partial. Remove it only with the partial on
