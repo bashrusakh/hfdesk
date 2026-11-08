@@ -752,3 +752,42 @@ func TestServiceSingletonHoldRefusedTextStatesNoActionAndOneCommand(t *testing.T
 		t.Errorf("the identity refusal %q carries a second next action next to its own step", text)
 	}
 }
+
+// TestServiceActionFailureTextOfAChangedAccountIsOneReport proves the report
+// of an update that refused over a changed account: the headline names the
+// action, the message of the service layer carries the result, the cause and
+// the command that restores the supported identity — and the report adds no
+// second next action next to it.
+func TestServiceActionFailureTextOfAChangedAccountIsOneReport(t *testing.T) {
+	accountErr := fmt.Errorf(
+		"service: the registration of hfdesk runs as \"%s\", and an HFDesk update keeps the supported identity %s: "+
+			"nothing was changed and the service was not stopped. Restore the supported identity from an elevated "+
+			`shell by running: sc config hfdesk obj= "NT AUTHORITY\LocalService" password= "" — then run the installation again%w`,
+		`CONTOSO\svc-other`, `NT AUTHORITY\LocalService`, service.ErrServiceAccountMismatch)
+
+	text := serviceActionFailureText(serviceActionUpdate, accountErr, `C:\portable\hfdesk.exe`)
+	for _, want := range []string{
+		serviceActionFailureHeadline(serviceActionUpdate),
+		`runs as "CONTOSO\svc-other"`,
+		"nothing was changed and the service was not stopped",
+		`sc config hfdesk obj= "NT AUTHORITY\LocalService" password= ""`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the report %q does not mention %q", text, want)
+		}
+	}
+	if strings.Contains(text, "hfdesk service status") {
+		t.Errorf("the report %q carries the state command next to the restore command, want one next action", text)
+	}
+	if strings.Contains(text, "A registration may remain") || strings.Contains(text, "hfdesk service uninstall") {
+		t.Errorf("the report %q claims a change the refusal never made", text)
+	}
+
+	// An ordinary update failure keeps its state command: only the
+	// classified account refusal carries its own action.
+	ordinary := serviceActionFailureText(serviceActionUpdate,
+		errors.New("the service control manager refused the registration"), `C:\portable\hfdesk.exe`)
+	if !strings.Contains(ordinary, "hfdesk service status") {
+		t.Errorf("the ordinary update report %q lost its state command", ordinary)
+	}
+}

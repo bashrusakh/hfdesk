@@ -144,6 +144,68 @@ func TestSCMDisabledRunningRefusalRefusesBeforeItStopsTheInstance(t *testing.T) 
 	}
 }
 
+// TestSCMServiceAccountRefusalRefusesOnlyAChangedIdentity checks both sides
+// of the update refusal over the account of an existing registration.
+//
+// A registration that runs as the supported identity keeps updating exactly
+// as today — the update never refuses it because of its account, whether the
+// registration spells the account by name or by its well-known identifier.
+// A registration an administrator moved to any other identity is refused
+// with the result (nothing changed, nothing stopped), the cause (the account
+// the registration runs as, and the identity an update keeps) and one real
+// next action: the command that restores the supported identity. The
+// function only reads the account string, so a refusal cannot have touched
+// the service; the call site places it before the first write.
+func TestSCMServiceAccountRefusalRefusesOnlyAChangedIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		account string
+	}{
+		{"the registered account name", scmLocalServiceAccount},
+		{"another case of the same name", `nt authority\localservice`},
+		{"the well-known security identifier", scmLocalServiceAccountSID},
+		{"the identifier in lower case", "s-1-5-19"},
+	} {
+		t.Run("kept "+tc.name, func(t *testing.T) {
+			if err := scmServiceAccountRefusal(tc.account); err != nil {
+				t.Errorf("scmServiceAccountRefusal(%q) = %v, want nil: an update keeps this identity", tc.account, err)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name    string
+		account string
+		shown   string
+	}{
+		{"an administrator-changed account", `CONTOSO\svc-other`, `CONTOSO\svc-other`},
+		{"the built-in LocalSystem account", "LocalSystem", "LocalSystem"},
+		{"an empty start name", "", "LocalSystem"},
+		{"the network service account", `NT AUTHORITY\NetworkService`, `NT AUTHORITY\NetworkService`},
+	} {
+		t.Run("refused "+tc.name, func(t *testing.T) {
+			err := scmServiceAccountRefusal(tc.account)
+			if err == nil {
+				t.Fatalf("scmServiceAccountRefusal(%q) = nil, want the refusal of the update", tc.account)
+			}
+			if !errors.Is(err, ErrServiceAccountMismatch) {
+				t.Errorf("the refusal %v is not classified as ErrServiceAccountMismatch", err)
+			}
+			for _, want := range []string{
+				fmt.Sprintf("runs as \"%s\"", tc.shown),
+				"an HFDesk update keeps the supported identity " + scmLocalServiceAccount,
+				"nothing was changed and the service was not stopped",
+				`sc config hfdesk obj= "NT AUTHORITY\LocalService" password= ""`,
+				"run the installation again",
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the refusal %q does not mention %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 // TestSCMConfigForUpdatePreservesTheReadableRegistrationSettings checks that
 // an update changes the command line but keeps the other readable SCM settings,
 // including start type and delayed start. The fixed service identity and blank

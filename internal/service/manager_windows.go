@@ -61,6 +61,12 @@ const (
 	// paths of the instance are the machine-wide paths (%ProgramData%\HFDesk).
 	scmLocalServiceAccount = `NT AUTHORITY\LocalService`
 
+	// scmLocalServiceAccountSID is the well-known security identifier of
+	// that account: the service control manager accepts it wherever it
+	// accepts the account name, so a registration carrying it runs as the
+	// supported identity too.
+	scmLocalServiceAccountSID = "S-1-5-19"
+
 	// scmRegistrationPath is the place the registration lives in. The
 	// service control manager keeps its database in the registry, so the
 	// registration has no file of its own.
@@ -470,6 +476,21 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 			previous.processID = status.ProcessId
 		}
 		previous.config = previousConfig
+
+		// An administrator may have changed the account of the
+		// registration away from the supported identity. An update keeps
+		// that identity and refuses such a registration instead of
+		// writing the supported account back over the decision: the
+		// refusal happens before the registration is written, before the
+		// recovery policy is configured and before the instance is
+		// stopped, so nothing of the machine is touched.
+		if err := scmServiceAccountRefusal(previousConfig.ServiceStartName); err != nil {
+			// This refusal happens before any write of this attempt:
+			// no registration was written, so the directories this
+			// attempt created are safe to remove again.
+			result.createdDirsSafeToRemove = true
+			return result, err
+		}
 
 		// A running instance with a disabled start type cannot be put into
 		// service again after the installation stops it: the service control
@@ -1258,6 +1279,49 @@ func scmDisabledRunningRefusal(present, running bool, startType uint32) error {
 		return nil
 	}
 	return fmt.Errorf("service: %s is running, but its start type is disabled: Windows will not start it again after the installation stops it. Set the start type to manual or automatic, for example with \"sc config %s start= demand\", and run the installation again", ServiceName, ServiceName)
+}
+
+// scmServiceAccountRefusal returns the refusal of an update over a
+// registration whose account is not the supported identity.
+//
+// Windows registers the instance as the built-in LocalService account, and
+// an HFDesk update keeps that identity. An administrator may have changed
+// the account of the registration with the service control manager, and
+// writing the supported account back over that change would cancel the
+// decision without a word. The update refuses instead — before the
+// registration is written, before the recovery policy is configured and
+// before the instance is stopped — and names the command that restores the
+// supported identity. A registration that runs as the supported identity is
+// never refused: the update keeps its account exactly as it does today, and
+// a first installation is unaffected — it registers the supported identity
+// itself and never reaches this check.
+func scmServiceAccountRefusal(account string) error {
+	if scmSupportedServiceAccount(account) {
+		return nil
+	}
+	observed := strings.TrimSpace(account)
+	if observed == "" {
+		// An empty start name is how the service control manager reports
+		// the built-in LocalSystem account.
+		observed = "LocalSystem"
+	}
+	return fmt.Errorf(
+		"service: the registration of %s runs as \"%s\", and an HFDesk update keeps the supported identity %s: nothing was changed and the service was not stopped. Restore the supported identity from an elevated shell by running: sc config %s obj= \"%s\" password= \"\" — then run the installation again%w",
+		ServiceName, observed, scmLocalServiceAccount,
+		ServiceName, scmLocalServiceAccount, ErrServiceAccountMismatch)
+}
+
+// scmSupportedServiceAccount reports whether the account of an existing
+// registration is the supported identity.
+//
+// The service control manager stores the name the registration was created
+// with and resolves it case-insensitively; it also accepts the well-known
+// security identifier of the account, so both spellings of the same identity
+// keep updating and nothing else does.
+func scmSupportedServiceAccount(account string) bool {
+	account = strings.TrimSpace(account)
+	return strings.EqualFold(account, scmLocalServiceAccount) ||
+		strings.EqualFold(account, scmLocalServiceAccountSID)
 }
 
 // scmImageCheck is how much of the running instance an installation could prove.

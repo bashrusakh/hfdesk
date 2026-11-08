@@ -438,6 +438,14 @@ var ErrAlreadyRegistered = errors.New("")
 // the user verbatim; callers classify with errors.Is, never by wording.
 var ErrSingletonAccessDenied = errors.New("")
 
+// ErrServiceAccountMismatch classifies the refusal of a Windows update over
+// a registration whose account is not the supported identity: an
+// administrator changed it away from the built-in LocalService account, and
+// the update refuses instead of silently cancelling that decision. It carries
+// no text of its own so that %w adds nothing to the refusal message shown to
+// the user verbatim; callers classify with errors.Is, never by wording.
+var ErrServiceAccountMismatch = errors.New("")
+
 // HoldDesktopSingleton holds the per-session desktop singleton object across
 // one service mutation.
 //

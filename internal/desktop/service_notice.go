@@ -412,6 +412,18 @@ func isAlreadyRegisteredRefusal(err error) bool {
 	return errors.Is(err, service.ErrAlreadyRegistered)
 }
 
+// isServiceAccountRefusal reports whether err is the refusal of an update
+// over a registration whose account is not the supported identity.
+//
+// The service layer marks the refusal with its exported error, so the
+// classification is structural and survives a rewording of the manager
+// message. The message of the refusal carries its whole report — the result,
+// the cause and the command that restores the identity — so the report of
+// the helper shows it as it is and adds no second next action.
+func isServiceAccountRefusal(err error) bool {
+	return errors.Is(err, service.ErrServiceAccountMismatch)
+}
+
 // serviceAlreadyRegisteredText returns the report of a first-install refusal of
 // a registration the attempt did not create.
 //
@@ -499,6 +511,14 @@ func serviceActionFailureText(action serviceAction, err error, program string) s
 			serviceFolderAccessText(program) + "\n\n" +
 			serviceUninstallCommandText
 	case serviceActionUpdate:
+		// The refusal of a changed account states its own report: the
+		// result (nothing was changed), the cause (the account the
+		// registration runs as) and the command that restores the
+		// supported identity. Adding the state command here would give
+		// the report a second next action.
+		if isServiceAccountRefusal(err) {
+			return serviceActionFailureHeadline(action) + "\n\n" + detail
+		}
 		return serviceActionFailureHeadline(action) + "\n\n" + detail + "\n\n" +
 			serviceStatusCommandText
 	default:

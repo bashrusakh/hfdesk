@@ -531,7 +531,11 @@ same service at the same time.
 - The service identity is `LocalService`, a least-privilege Windows service
   account, not `LocalSystem`. It is **not configurable**: the built-in account
   has no name of its own and needs no credential, so a Windows instance
-  cannot run as another account.
+  cannot run as another account — HFDesk never registers one. An
+  administrator who changes the account of the registration with the service
+  control manager moves it outside what HFDesk updates keep: every update of
+  that registration is refused until the supported identity is restored (see
+  [Upgrading to a binary in another folder](#upgrading-to-a-binary-in-another-folder)).
 - The service-owned state under `%ProgramData%\HFDesk` is ACL-restricted. The
   service does **not** recursively re-ACL or re-own an existing model or cache
   tree: changing the ownership of a large, possibly shared tree is an explicit
@@ -820,7 +824,12 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   readable SCM settings
   that HFDesk does not own are written back with the new command line. The
   Windows identity remains the fixed `LocalService` account, and an SCM password
-  is never copied.
+  is never copied. An update never changes the account of a registration: one
+  whose account was changed away from `NT AUTHORITY\LocalService` — with the
+  service control manager, by an administrator — is refused before anything is
+  written or stopped, and the error names the command that restores the
+  supported identity, instead of the account being written back over the
+  administrator's decision.
 - Linux compares the loaded command through systemd's typed D-Bus argv
   properties. It does not infer argument boundaries from `systemctl show`'s
   joined display. If the loaded properties cannot be read, an existing update
@@ -850,7 +859,13 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   ran before. The error names the repair (`sc config hfdesk start= demand`, or an
   automatic start) and asks for another installation. A stopped Windows service
   with a disabled start type is allowed, because the installation does not start
-  it.
+  it. A Windows registration whose account was changed away from the supported
+  `LocalService` identity is refused as well, before the registration is written
+  and before the instance is stopped: an update keeps that identity and never
+  writes the account back over the administrator's decision. The error names the
+  repair (`sc config hfdesk obj= "NT AUTHORITY\LocalService" password= ""` from
+  an elevated shell) and asks for another installation; a registration that runs
+  as the supported identity keeps updating as before.
 - **The program is checked before anything is touched.** An installation
   checks the path and effective execute access before it writes a registration,
   creates an instance directory or stops a running instance. Linux uses the
