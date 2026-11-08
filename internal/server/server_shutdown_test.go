@@ -261,13 +261,22 @@ func TestServerReturnsFinalPersistenceTimeout(t *testing.T) {
 		close(allowWrite)
 		t.Fatal("server did not return after final persistence timeout")
 	}
+	handoverStarted := make(chan struct{})
 	handoverDone := make(chan error, 1)
-	go func() { handoverDone <- s.CompleteHandover() }()
+	go func() {
+		close(handoverStarted)
+		handoverDone <- s.CompleteHandover()
+	}()
+	<-handoverStarted
+	// The goroutine is inside CompleteHandover and the final persistence is
+	// still blocked, so the handover may only be pending here: it can return
+	// within this window only by not joining the close coordinator that
+	// waits for that persistence.
 	select {
 	case err := <-handoverDone:
 		close(allowWrite)
 		t.Fatalf("handover returned while final persistence was still blocked: %v", err)
-	default:
+	case <-time.After(250 * time.Millisecond):
 	}
 	close(allowWrite)
 	select {

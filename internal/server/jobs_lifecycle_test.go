@@ -381,6 +381,13 @@ func TestJobManagerCloseWaitsForTerminalHistoryAndReportsWriteFailures(t *testin
 			endpoint, _, _, _ := cacheDownloadFixture(t, tc.first)
 			m := newLifecycleTestManager(t, Config{CacheDir: t.TempDir(), Endpoint: endpoint.URL, MaxActive: 1})
 			entered, release := make(chan struct{}), make(chan struct{})
+			// The runner blocks in appendHistory until the test releases it.
+			// The release is idempotent and runs at the end of the test, so
+			// an assertion that fails first never leaves the runner blocked
+			// until the suite times out.
+			var releaseOnce sync.Once
+			releaseHistory := func() { releaseOnce.Do(func() { close(release) }) }
+			t.Cleanup(releaseHistory)
 			realAppend, historyErr := m.appendHistory, tc.historyErr
 			m.appendHistory = func(terminal *Job) error {
 				close(entered)
@@ -422,7 +429,7 @@ func TestJobManagerCloseWaitsForTerminalHistoryAndReportsWriteFailures(t *testin
 			default:
 			}
 
-			close(release)
+			releaseHistory()
 			ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
 			closeErr := m.Close(ctx)
 			cancel()
