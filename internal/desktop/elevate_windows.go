@@ -35,9 +35,14 @@ type elevatedLaunch struct {
 	Executable string
 	// Action is the service action of the helper.
 	Action serviceAction
-	// WaitPID is the process the helper waits for before it starts or
-	// restarts the service. Zero means there is nothing to wait for.
+	// WaitPID is the original desktop process for an install handover.
+	// Zero leaves start and update actions on their ordinary path.
 	WaitPID int
+	// ReadyEvent and SuccessEvent are the per-attempt handover event names.
+	ReadyEvent   string
+	SuccessEvent string
+	// InstanceMutex names the existing desktop singleton object to hold.
+	InstanceMutex string
 }
 
 // launchElevated starts the service helper with administrator rights.
@@ -46,6 +51,21 @@ type elevatedLaunch struct {
 // cannot answer a prompt of the user account control, and a real elevated
 // process would change the machine.
 var launchElevated = shellExecuteElevated
+
+var launchElevatedProcess = shellExecuteElevatedProcess
+
+type elevatedProcess struct {
+	handle windows.Handle
+	pid    uint32
+}
+
+func (p *elevatedProcess) Close() {
+	if p == nil || p.handle == 0 {
+		return
+	}
+	_ = windows.CloseHandle(p.handle)
+	p.handle = 0
+}
 
 // shellExecuteEx is the entry point of the shell of Windows.
 var shellExecuteEx = windows.NewLazySystemDLL("shell32.dll").NewProc("ShellExecuteExW")
@@ -94,33 +114,46 @@ type shellExecuteInfo struct {
 	hProcess uintptr
 }
 
-// shellExecuteElevated starts the service helper with administrator rights.
+// shellExecuteElevated starts the service helper with administrator rights and
+// closes the returned process handle after reading its pid.
 //
 // The verb "runas" asks the shell for an elevated process: the user account
 // control shows its prompt, and the call only returns after the user answered
 // it. The program is named by its absolute path and the arguments carry the
-// action and the process the helper waits for, so the helper never depends on
-// the working directory of the desktop host.
+// action and the per-attempt handover names, so the helper never depends on the
+// working directory or identity of the desktop host.
 //
 // A refusal of the user is reported as such: the desktop host is not allowed to
 // change the machine, and it keeps running untouched. Every other failure
 // carries the error of the shell.
 func shellExecuteElevated(l elevatedLaunch) (uint32, error) {
+	process, err := shellExecuteElevatedProcess(l)
+	if err != nil {
+		return 0, err
+	}
+	if process == nil {
+		return 0, nil
+	}
+	defer process.Close()
+	return process.pid, nil
+}
+
+func shellExecuteElevatedProcess(l elevatedLaunch) (*elevatedProcess, error) {
 	if !filepath.IsAbs(l.Executable) {
-		return 0, fmt.Errorf("the desktop program %q is not an absolute path", l.Executable)
+		return nil, fmt.Errorf("the desktop program %q is not an absolute path", l.Executable)
 	}
 
 	verb, err := windows.UTF16PtrFromString("runas")
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	program, err := windows.UTF16PtrFromString(l.Executable)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	parameters, err := windows.UTF16PtrFromString(serviceHelperArguments(l))
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	info := shellExecuteInfo{
 		cbSize:       uint32(unsafe.Sizeof(shellExecuteInfo{})),
@@ -141,39 +174,33 @@ func shellExecuteElevated(l elevatedLaunch) (uint32, error) {
 	if started == 0 {
 		if callErr != nil {
 			if errors.Is(callErr, windows.ERROR_CANCELLED) {
-				return 0, errors.New(elevationDeclined)
+				return nil, errors.New(elevationDeclined)
 			}
-			return 0, fmt.Errorf("the elevated service helper could not be started: %w", callErr)
+			return nil, fmt.Errorf("the elevated service helper could not be started: %w", callErr)
 		}
-		return 0, errors.New("the elevated service helper could not be started")
+		return nil, errors.New("the elevated service helper could not be started")
 	}
 
-	// The handle is asked for with SEE_MASK_NOCLOSEPROCESS, so the process
-	// is named after it. A launch that reports no handle is still a started
-	// helper: it waits for this process itself, so the host quits either
-	// way, and the missing handle is recorded instead of reported as a
-	// failure of the launch.
-	pid := uint32(0)
+	process := &elevatedProcess{}
 	if info.hProcess != 0 {
-		handle := windows.Handle(info.hProcess)
-		if named, err := windows.GetProcessId(handle); err == nil {
-			pid = named
-		}
-		_ = windows.CloseHandle(handle)
+		process.handle = windows.Handle(info.hProcess)
+		process.pid, _ = windows.GetProcessId(process.handle)
 	}
-	return pid, nil
+	return process, nil
 }
 
 // serviceHelperArguments returns the command line of the elevated helper.
 //
-// The action is the value of the hidden flag of the desktop executable, and the
-// process to wait for is the desktop host itself: the helper starts the service
-// only after this process exited, so the service never binds an address the
-// desktop still holds.
+// Install carries the process, event names, and existing singleton identity of
+// its handover. Start and update carry no wait state.
 func serviceHelperArguments(l elevatedLaunch) string {
 	args := []string{"--service-action", string(l.Action)}
 	if l.WaitPID > 0 {
-		args = append(args, "--wait-pid", strconv.Itoa(l.WaitPID))
+		args = append(args,
+			"--wait-pid", strconv.Itoa(l.WaitPID),
+			"--handover-ready-event", l.ReadyEvent,
+			"--handover-success-event", l.SuccessEvent,
+			"--instance-mutex", l.InstanceMutex)
 	}
 	return strings.Join(args, " ")
 }

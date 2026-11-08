@@ -22,8 +22,9 @@
 // The binary is also the elevated helper of the Windows service: the desktop
 // host starts the very same executable with the hidden flags
 //
-//	--service-action install|update|start
-//	--wait-pid N
+//	--service-action install --wait-pid N --handover-ready-event NAME
+//	  --handover-success-event NAME --instance-mutex NAME
+//	--service-action update|start
 //
 // and the helper performs the action, reports it in a native message box and
 // ends without a server, a tray icon or a window. The flags are private to the
@@ -33,10 +34,12 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/bashrusakh/hfdesk/internal/app"
 	"github.com/bashrusakh/hfdesk/internal/desktop"
@@ -62,24 +65,21 @@ func main() {
 // The exit code of the process is returned: zero for a process that ended
 // without a failure.
 func run() int {
+	return runWithArgs(os.Args[1:])
+}
+
+func runWithArgs(args []string) int {
 	// The helper runs first and on a flag set of its own: the service flags
 	// are private to the desktop executable, so they are neither part of the
 	// shared options of the server host nor part of its usage text.
 	//
-	// A command that the helper flag set does not accept is the command of
-	// the desktop host, and the flag set below reports its problems. A helper
-	// command is therefore recognized by its action flag and never by the
-	// absence of a host flag.
-	var helper desktop.ServiceActionOptions
-	var helperAction string
-	helperFlags := flag.NewFlagSet("hfdesk-desktop-service", flag.ContinueOnError)
-	helperFlags.SetOutput(io.Discard)
-	helperFlags.StringVar(&helperAction, "service-action", "",
-		"install, update or start the HFDesk service")
-	helperFlags.IntVar(&helper.WaitPID, "wait-pid", 0,
-		"wait for this process to exit before the service starts")
-	if err := helperFlags.Parse(os.Args[1:]); err == nil && helperAction != "" {
-		helper.Action = helperAction
+	// A command that carries any helper flag is handled here, even when its
+	// arguments are incomplete, so it cannot fall through and start a server.
+	helper, helperInvocation, helperErr := parseServiceHelperCommand(args)
+	if helperInvocation {
+		if helperErr != nil {
+			return desktop.ReportCommandLine(helperErr, serviceHelperUsage)
+		}
 		helper.Version = Version
 		if err := desktop.RunServiceAction(helper); err != nil {
 			// The helper reports its outcome to the user itself, in a native
@@ -109,7 +109,7 @@ func run() int {
 	}
 	app.RegisterFlags(fs, &opts)
 
-	if err := fs.Parse(os.Args[1:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		return desktop.ReportCommandLine(err, usageText.String())
 	}
 
@@ -121,4 +121,49 @@ func run() int {
 		return 1
 	}
 	return 0
+}
+
+const serviceHelperUsage = "Usage: hfdesk-desktop --service-action install --wait-pid N " +
+	"--handover-ready-event NAME --handover-success-event NAME --instance-mutex NAME\n" +
+	"       hfdesk-desktop --service-action update|start"
+
+func parseServiceHelperCommand(args []string) (desktop.ServiceActionOptions, bool, error) {
+	var helper desktop.ServiceActionOptions
+	var action string
+	flags := flag.NewFlagSet("hfdesk-desktop-service", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	flags.StringVar(&action, "service-action", "", "install, update or start the HFDesk service")
+	flags.IntVar(&helper.WaitPID, "wait-pid", 0, "the original desktop process")
+	flags.StringVar(&helper.ReadyEvent, "handover-ready-event", "", "the per-attempt helper-ready event")
+	flags.StringVar(&helper.SuccessEvent, "handover-success-event", "", "the per-attempt graceful-completion event")
+	flags.StringVar(&helper.InstanceMutex, "instance-mutex", "", "the existing per-session desktop singleton")
+	err := flags.Parse(args)
+	if !hasServiceHelperArgument(args) {
+		return desktop.ServiceActionOptions{}, false, nil
+	}
+	if err != nil {
+		return helper, true, err
+	}
+	if strings.TrimSpace(action) == "" {
+		return helper, true, errors.New("the service helper arguments do not name an action")
+	}
+	helper.Action = action
+	return helper, true, nil
+}
+
+func hasServiceHelperArgument(args []string) bool {
+	for _, arg := range args {
+		for _, name := range []string{
+			"--service-action", "-service-action",
+			"--wait-pid", "-wait-pid",
+			"--handover-ready-event", "-handover-ready-event",
+			"--handover-success-event", "-handover-success-event",
+			"--instance-mutex", "-instance-mutex",
+		} {
+			if arg == name || strings.HasPrefix(arg, name+"=") {
+				return true
+			}
+		}
+	}
+	return false
 }

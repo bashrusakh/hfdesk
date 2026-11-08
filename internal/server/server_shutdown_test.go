@@ -224,14 +224,20 @@ func TestServerUnexpectedServeErrorIsReturned(t *testing.T) {
 
 func TestServerReturnsFinalPersistenceTimeout(t *testing.T) {
 	addr := reserveServerTestAddr(t)
-	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "jobs.json"))
+	statePath := filepath.Join(t.TempDir(), "jobs.json")
+	m := newJobManagerWithStatePath(Config{}, nil, statePath)
 	registerTestJobManagerCleanup(t, m)
+	started := time.Now()
+	job := &Job{ID: "running", Status: JobStatusRunning, StartedAt: &started}
+	m.jobs[job.ID] = job
 	writeStarted := make(chan struct{})
 	allowWrite := make(chan struct{})
-	m.persistStateFile = func(string, []*Job) error {
+	var writes int
+	m.persistStateFile = func(path string, jobs []*Job) error {
+		writes++
 		close(writeStarted)
 		<-allowWrite
-		return nil
+		return saveJobsState(path, jobs)
 	}
 	s := &Server{jobs: m}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -255,11 +261,38 @@ func TestServerReturnsFinalPersistenceTimeout(t *testing.T) {
 		close(allowWrite)
 		t.Fatal("server did not return after final persistence timeout")
 	}
+	handoverDone := make(chan error, 1)
+	go func() { handoverDone <- s.CompleteHandover() }()
+	select {
+	case err := <-handoverDone:
+		close(allowWrite)
+		t.Fatalf("handover returned while final persistence was still blocked: %v", err)
+	default:
+	}
 	close(allowWrite)
 	select {
-	case <-m.closeDone:
+	case err := <-handoverDone:
+		if err != nil {
+			t.Fatalf("CompleteHandover after the original timeout: %v", err)
+		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("manager close coordinator did not finish after release")
+		t.Fatal("handover did not join the manager close coordinator after release")
+	}
+	loaded, err := loadJobsState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 1 || loaded[0].ID != job.ID || loaded[0].Status != JobStatusPaused {
+		t.Fatalf("final handover snapshot = %#v, want the running job paused", loaded)
+	}
+	if writes != 1 {
+		t.Fatalf("final state writes = %d, want one real final snapshot", writes)
+	}
+	if err := s.CompleteHandover(); err != nil {
+		t.Fatalf("repeated CompleteHandover: %v", err)
+	}
+	if writes != 1 {
+		t.Fatalf("repeated handover rewrote jobs state: %d writes", writes)
 	}
 }
 

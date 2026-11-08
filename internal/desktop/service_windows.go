@@ -180,10 +180,9 @@ func serviceGateStatus(ctx context.Context) (service.Status, error) {
 // to each other.
 //
 // The guard is held for the whole action and released by every path that ends
-// without a launched helper, so a declined confirmation, a missing console
-// program or a refused elevation leaves the tray item working. The successful
-// path keeps it: the host quits after the hand-over, and nothing may start a
-// second installation while the process ends.
+// without a ready helper handover, so a declined confirmation, a missing
+// console program, a refused elevation or an early helper failure leaves the
+// tray item working. A committed handover keeps it until the host exits.
 var serviceInstallRunning atomic.Bool
 
 // installServiceFromTray registers the Windows service from the tray.
@@ -193,18 +192,17 @@ var serviceInstallRunning atomic.Bool
 // desktop app. The console program is verified before the user is asked, so a
 // folder without it is reported instead of after the elevation prompt.
 //
-// The helper is launched elevated; it waits for this process before it starts
-// the service, so the desktop can stop its own server first. The action reports
-// true when the host has to quit, which is the case after a successful launch
-// and never after a failure.
-func installServiceFromTray() bool {
+// The helper is launched elevated and must open the ready/success events, the
+// original process handle, and this instance's singleton before it becomes
+// ready. The caller commits shutdown only after that acknowledgement.
+func installServiceFromTray(instanceMutex string) *desktopHandover {
 	if !serviceInstallRunning.CompareAndSwap(false, true) {
 		desktopLog.Info("an installation action is already running: this click on the tray item is ignored")
-		return false
+		return nil
 	}
 
-	// The guard is released when this call ends without a launched helper, so
-	// the tray item works again after every failure. The hand-over keeps it.
+	// The guard is released when this call ends without a ready helper, so the
+	// tray item works again after every pre-shutdown failure.
 	handedOver := false
 	defer func() {
 		if !handedOver {
@@ -215,7 +213,7 @@ func installServiceFromTray() bool {
 	executable, err := desktopExecutable()
 	if err != nil {
 		reportServiceLaunchFailure(serviceActionInstall, err)
-		return false
+		return nil
 	}
 
 	console, err := findSiblingExecutable(filepath.Dir(executable), executable)
@@ -225,23 +223,23 @@ func installServiceFromTray() bool {
 		showMessage(serviceSiblingMissingCaption,
 			serviceSiblingMissingText(filepath.Dir(executable), err),
 			windows.MB_ICONERROR)
-		return false
+		return nil
 	}
 
 	if !confirmServiceInstall(installServiceText(serviceDataDir())) {
 		desktopLog.Info("the service installation was not confirmed")
-		return false
+		return nil
 	}
 
-	pid, err := launchServiceHelper(serviceActionInstall, os.Getpid())
+	handover, err := launchServiceHandover(serviceActionInstall, os.Getpid(), instanceMutex)
 	if err != nil {
 		reportServiceLaunchFailure(serviceActionInstall, err)
-		return false
+		return nil
 	}
 	handedOver = true
 	desktopLog.Info("the elevated service installation is running",
-		"helperPID", pid, "console", console)
-	return true
+		"helperPID", handover.helper.pid, "console", console)
+	return handover
 }
 
 // serviceDataDir returns the data directory the service owns.
@@ -296,6 +294,56 @@ func launchServiceHelper(action serviceAction, waitPID int) (uint32, error) {
 	desktopLog.Info("the elevated service helper started",
 		"action", string(action), "pid", pid)
 	return pid, nil
+}
+
+func reportServiceHandoverFailure(err error) {
+	if err == nil {
+		return
+	}
+	desktopLog.Error("the desktop could not confirm the graceful service handover", "error", err)
+	showMessage(serviceFailureCaption(serviceActionInstall),
+		"HFDesk could not confirm the graceful service handover. The helper starts the service only after it receives a successful completion signal and the desktop exits.\n\n"+
+			"Read the current service state before trying again.\n\n"+err.Error(),
+		windows.MB_ICONERROR)
+}
+
+func launchServiceHandover(action serviceAction, waitPID int, instanceMutex string) (*desktopHandover, error) {
+	executable, err := desktopExecutable()
+	if err != nil {
+		return nil, err
+	}
+	events, err := newHandoverEvents()
+	if err != nil {
+		return nil, err
+	}
+	helper, err := launchElevatedProcess(elevatedLaunch{
+		Executable:    executable,
+		Action:        action,
+		WaitPID:       waitPID,
+		ReadyEvent:    events.readyName,
+		SuccessEvent:  events.successName,
+		InstanceMutex: instanceMutex,
+	})
+	if err != nil {
+		if helper != nil {
+			helper.Close()
+		}
+		events.close()
+		return nil, err
+	}
+	if helper == nil || helper.handle == 0 {
+		if helper != nil {
+			helper.Close()
+		}
+		events.close()
+		return nil, errors.New("the elevated service helper started without a process handle")
+	}
+	if err := waitForHelperReady(helper.handle, events.ready, serviceWaitBudget); err != nil {
+		helper.Close()
+		events.close()
+		return nil, err
+	}
+	return &desktopHandover{events: events, helper: helper}, nil
 }
 
 // confirmServiceInstall asks the user whether the Windows service is

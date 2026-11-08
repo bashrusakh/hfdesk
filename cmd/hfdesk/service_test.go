@@ -2788,13 +2788,16 @@ func TestServiceInstallPassesTheVersionOfTheRunningProgram(t *testing.T) {
 				options:     &got,
 			})
 
-			args := []string{"install"}
+			args := []string{"install", "--system"}
 			if tc.executable != nil {
 				args = append(args, "--executable", tc.executable(t))
 			}
 			var stdout, stderr bytes.Buffer
 			if code := runServiceCommand(args, &stdout, &stderr); code != 0 {
 				t.Fatalf("the installation must be accepted, got the exit code %d:\n%s", code, stderr.String())
+			}
+			if got.Scope != service.ScopeSystem {
+				t.Errorf("the installation scope is %q, want %q", got.Scope, service.ScopeSystem)
 			}
 			if got.ExpectedVersion != tc.want {
 				t.Errorf("the expected version is %q, want %q", got.ExpectedVersion, tc.want)

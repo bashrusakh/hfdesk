@@ -140,11 +140,21 @@ type Server struct {
 	// (jobs.UpdateConfig + SaveConfigFile). The generation re-check is taken
 	// under this lock so that only the latest committed writer persists, and
 	// an older writer cannot clobber a newer one's job-manager/file state.
-	persistMu           sync.Mutex
-	httpServer          *http.Server
-	jobs                *JobManager
-	wsHub               *WSHub
-	selectedDeleteHooks selectedDeleteHooks
+	persistMu sync.Mutex
+	// Guarded by persistMu; generation zero is not a persisted startup config.
+	settingsPersistedGen  uint64
+	settingsPersistErrGen uint64
+	settingsPersistErr    error
+	// Guarded by configMu together with settingsOps admission.
+	settingsSealed       bool
+	settingsOps          sync.WaitGroup
+	handoverOnce         sync.Once
+	handoverErr          error
+	saveSettingsConfigFn func(*ConfigFile, *string) error
+	httpServer           *http.Server
+	jobs                 *JobManager
+	wsHub                *WSHub
+	selectedDeleteHooks  selectedDeleteHooks
 	// boundAddr holds the effective address the server is actually bound to.
 	// It is written once the listener exists and read by BoundAddr and
 	// BrowserURL, which must work before the server finished starting.
@@ -247,9 +257,10 @@ func New(cfg Config) *Server {
 	jobs := NewJobManager(cfg, wsHub)
 	jobs.LoadState()
 	s := &Server{
-		config: cfg,
-		jobs:   jobs,
-		wsHub:  wsHub,
+		config:               cfg,
+		jobs:                 jobs,
+		wsHub:                wsHub,
+		saveSettingsConfigFn: saveSettingsConfig,
 	}
 	return s
 }

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 
 	"golang.org/x/sys/windows"
 )
@@ -30,6 +31,8 @@ const instanceMutexPrefix = `Local\HFDesk.Desktop.`
 type instanceLock struct {
 	// handle is the handle of the named mutex.
 	handle windows.Handle
+	// name lets the elevated helper hold this exact per-session object.
+	name string
 	// existing reports that the mutex was already there, which means that
 	// another instance of the desktop host is running.
 	existing bool
@@ -49,12 +52,17 @@ func acquireInstanceLock() (*instanceLock, error) {
 	if err != nil {
 		return nil, fmt.Errorf("desktop: build the name of the single instance lock: %w", err)
 	}
+	attrs, descriptor, err := restrictedObjectSecurity(windows.MUTEX_ALL_ACCESS, windows.READ_CONTROL)
+	if err != nil {
+		return nil, fmt.Errorf("desktop: secure the single instance lock: %w", err)
+	}
 
 	// The mutex is created without an owner: the existence of the named
 	// object is the lock. The operating system destroys the object when
 	// the last handle is closed, which happens when the process ends, also
 	// when it ends unexpectedly.
-	handle, err := windows.CreateMutex(nil, false, ptr)
+	handle, err := windows.CreateMutex(attrs, false, ptr)
+	runtime.KeepAlive(descriptor)
 	if handle == 0 {
 		if err == nil {
 			err = errors.New("the operating system returned no handle")
@@ -67,6 +75,7 @@ func acquireInstanceLock() (*instanceLock, error) {
 	}
 	return &instanceLock{
 		handle:   handle,
+		name:     name,
 		existing: errors.Is(err, windows.ERROR_ALREADY_EXISTS),
 	}, nil
 }

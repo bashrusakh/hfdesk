@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -207,6 +208,24 @@ func TestWaitReportsTheStartupFailure(t *testing.T) {
 
 	if err := application.Wait(); err == nil {
 		t.Error("Wait returned no error after a failed start")
+	}
+}
+
+func TestWaitForHandoverPreservesTheOriginalShutdownError(t *testing.T) {
+	useTemporaryConfigDir(t)
+	want := errors.New("initial graceful shutdown timed out")
+	done := make(chan struct{})
+	close(done)
+	application := &App{
+		server:   server.New(server.DefaultConfig()),
+		done:     done,
+		serveErr: want,
+	}
+	if err := application.Wait(); !errors.Is(err, want) {
+		t.Fatalf("initial Wait error = %v, want original timeout", err)
+	}
+	if err := application.WaitForHandover(); !errors.Is(err, want) {
+		t.Fatalf("handover result = %v, want original timeout preserved", err)
 	}
 }
 

@@ -54,11 +54,18 @@ type ServiceActionOptions struct {
 	// failure.
 	Action string
 
-	// WaitPID is the process the helper waits for before it starts or
-	// restarts the service: the desktop host passes its own process id, so
-	// the service never starts while the desktop still holds the listen
-	// address. Zero means there is nothing to wait for.
+	// WaitPID is the original desktop process for a tray-install handover.
+	// A positive value requires all three handover names below; zero means
+	// this is an ordinary service-gate action.
 	WaitPID int
+
+	// ReadyEvent and SuccessEvent name the per-attempt handover events.
+	ReadyEvent   string
+	SuccessEvent string
+
+	// InstanceMutex is the existing per-session desktop singleton object the
+	// helper holds until its service mutation and any rollback finish.
+	InstanceMutex string
 
 	// Version is the build version of the desktop host that launched the
 	// helper. It is reported to the user, so the message names the release

@@ -508,6 +508,13 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		newDownloadRoutes = sanitizeDownloadRoutes(*req.DownloadRoutes)
 	}
 
+	// Admit only validated updates, before Phase 2 can mutate live config.
+	if !s.beginSettingsOperation() {
+		writeError(w, http.StatusServiceUnavailable, "Server is shutting down", "settings cannot be changed during shutdown")
+		return
+	}
+	defer s.settingsOps.Done()
+
 	// Phase 2: build the new config on a local copy under withConfig (which
 	// takes the write lock for the whole mutation, so a concurrent read sees
 	// either the pre- or post-state, never a torn mix). The lock is released
@@ -620,32 +627,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// re-runs the scheduler, so a raised max-active starts queued jobs now.
 	s.jobs.UpdateConfig(finalCfg)
 
-	retries := finalCfg.Retries
-	fileCfg := &ConfigFile{
-		CacheDir:           finalCfg.CacheDir,
-		LocalDir:           finalCfg.LocalDir,
-		LocalScanDirs:      finalCfg.LocalScanDirs,
-		Connections:        finalCfg.Concurrency,
-		MaxActive:          finalCfg.MaxActive,
-		MultipartThreshold: finalCfg.MultipartThreshold,
-		MaxSpeed:           finalCfg.MaxSpeed,
-		Verify:             finalCfg.Verify,
-		Retries:            &retries,
-		StallTimeout:       finalCfg.StallTimeout,
-		Endpoint:           finalCfg.Endpoint,
-		DownloadRoutes:     finalCfg.DownloadRoutes,
-	}
-	if finalCfg.Proxy != nil {
-		fileCfg.Proxy = &ProxyConfig{
-			URL:                finalCfg.Proxy.URL,
-			Username:           finalCfg.Proxy.Username,
-			Password:           finalCfg.Proxy.Password,
-			NoProxy:            finalCfg.Proxy.NoProxy,
-			NoEnvProxy:         finalCfg.Proxy.NoEnvProxy,
-			InsecureSkipVerify: finalCfg.Proxy.InsecureSkipVerify,
-		}
-	}
-	if err := saveSettingsConfig(fileCfg, finalCfg.tokenWrite); err != nil {
+	if err := s.persistAdmittedSettings(finalCfg, currentGen); err != nil {
 		// Log error but don't fail the request - settings are still applied in-memory
 		writeJSON(w, http.StatusOK, SuccessResponse{
 			Success: true,
@@ -654,16 +636,63 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The pending explicit token intent is now durable for the exact intent
-	// this snapshot carried, so consume it by identity. If a newer explicit
-	// set/clear committed concurrently, keep it: that intent has its own
-	// tokenWriteGen and is not the one just persisted.
-	s.consumeTokenWrite(finalCfg.tokenWriteGen)
-
 	writeJSON(w, http.StatusOK, SuccessResponse{
 		Success: true,
 		Message: "Settings saved",
 	})
+}
+
+// settingsFileProjection is the shared persisted projection for updates and handover.
+func settingsFileProjection(cfg Config) *ConfigFile {
+	retries := cfg.Retries
+	fileCfg := &ConfigFile{
+		CacheDir:           cfg.CacheDir,
+		LocalDir:           cfg.LocalDir,
+		LocalScanDirs:      cfg.LocalScanDirs,
+		Connections:        cfg.Concurrency,
+		MaxActive:          cfg.MaxActive,
+		MultipartThreshold: cfg.MultipartThreshold,
+		MaxSpeed:           cfg.MaxSpeed,
+		Verify:             cfg.Verify,
+		Retries:            &retries,
+		StallTimeout:       cfg.StallTimeout,
+		Endpoint:           cfg.Endpoint,
+		DownloadRoutes:     cfg.DownloadRoutes,
+	}
+	if cfg.Proxy != nil {
+		fileCfg.Proxy = &ProxyConfig{
+			URL:                cfg.Proxy.URL,
+			Username:           cfg.Proxy.Username,
+			Password:           cfg.Proxy.Password,
+			NoProxy:            cfg.Proxy.NoProxy,
+			NoEnvProxy:         cfg.Proxy.NoEnvProxy,
+			InsecureSkipVerify: cfg.Proxy.InsecureSkipVerify,
+		}
+	}
+	return fileCfg
+}
+
+func (s *Server) persistSettingsSnapshot(cfg Config) error {
+	save := s.saveSettingsConfigFn
+	if save == nil {
+		save = saveSettingsConfig
+	}
+	return save(settingsFileProjection(cfg), cfg.tokenWrite)
+}
+
+// persistAdmittedSettings records only the result of an actual serialized
+// settings write. The caller holds persistMu and has selected the current gen.
+func (s *Server) persistAdmittedSettings(cfg Config, gen uint64) error {
+	if err := s.persistSettingsSnapshot(cfg); err != nil {
+		s.settingsPersistErrGen = gen
+		s.settingsPersistErr = err
+		return err
+	}
+	s.settingsPersistedGen = gen
+	s.settingsPersistErrGen = 0
+	s.settingsPersistErr = nil
+	s.consumeTokenWrite(cfg.tokenWriteGen)
+	return nil
 }
 
 // handleAnalyze analyzes a HuggingFace repository.

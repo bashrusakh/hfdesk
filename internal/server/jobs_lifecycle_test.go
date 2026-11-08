@@ -370,6 +370,82 @@ func TestJobManagerCloseTimeoutDoesNotCancelFinalPersistence(t *testing.T) {
 	}
 }
 
+func TestJobManagerCloseWaitsForTerminalHistoryAndReportsWriteFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, first string
+		status      JobStatus
+		historyErr  error
+	}{{"completed", "", JobStatusCompleted, nil}, {"failed", "fail", JobStatusFailed, errors.New("history write failed")}} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateCacheState(t)
+			endpoint, _, _, _ := cacheDownloadFixture(t, tc.first)
+			m := newLifecycleTestManager(t, Config{CacheDir: t.TempDir(), Endpoint: endpoint.URL, MaxActive: 1})
+			entered, release := make(chan struct{}), make(chan struct{})
+			realAppend, historyErr := m.appendHistory, tc.historyErr
+			m.appendHistory = func(terminal *Job) error {
+				close(entered)
+				<-release
+				if historyErr != nil {
+					return historyErr
+				}
+				return realAppend(terminal)
+			}
+			job, _, err := m.CreateJob(DownloadRequest{Repo: "owner/model"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("terminal runner did not reach history persistence")
+			}
+			if got, _ := m.GetJob(job.ID); got.Status != tc.status {
+				t.Fatalf("terminal status = %q, want %q", got.Status, tc.status)
+			}
+
+			var finalErr error
+			if historyErr != nil {
+				finalErr = errors.New("final job snapshot failed")
+				realPersist := m.persistStateFile
+				m.persistStateFile = func(path string, jobs []*Job) error {
+					return errors.Join(realPersist(path, jobs), finalErr)
+				}
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if err := m.Close(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("Close while terminal history is blocked = %v, want context.Canceled", err)
+			}
+			select {
+			case <-m.closeDone:
+				t.Fatal("close completed before the terminal history write")
+			default:
+			}
+
+			close(release)
+			ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+			closeErr := m.Close(ctx)
+			cancel()
+			if historyErr != nil {
+				if !errors.Is(closeErr, historyErr) || !errors.Is(closeErr, finalErr) {
+					t.Fatalf("close error = %v, want both history and final snapshot errors", closeErr)
+				}
+				return
+			}
+			if closeErr != nil {
+				t.Fatalf("Close after successful history persistence: %v", closeErr)
+			}
+			entries, err := LoadHistory()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 || entries[0].ID != job.ID || entries[0].Status != tc.status {
+				t.Fatalf("persisted terminal history = %#v, want job %s with status %s", entries, job.ID, tc.status)
+			}
+		})
+	}
+}
+
 func TestJobManagerClosePreventsLateLoadMerge(t *testing.T) {
 	m := newLifecycleTestManager(t, Config{})
 	loadStarted := make(chan struct{})

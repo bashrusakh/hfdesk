@@ -208,6 +208,10 @@ func freshServiceInstallGuard(t *testing.T) {
 	t.Cleanup(func() { serviceInstallRunning.Store(false) })
 }
 
+func runHelperInstallForTest(version string) error {
+	return runServiceAction(serviceActionInstall, version, &serviceActionReporter{action: serviceActionInstall})
+}
+
 // runningServiceStatus is the status of a running service of a test.
 func runningServiceStatus(state service.State, listen string) service.Status {
 	return service.Status{
@@ -727,12 +731,11 @@ func TestServiceGateReportsARefusedHelperLaunch(t *testing.T) {
 
 // TestTrayServiceInstallLaunchesTheHelperAfterTheConfirmation proves that the
 // tray action verifies the console program, confirms the installation and
-// launches the elevated helper with the process id of the desktop host.
+// waits until the elevated helper has opened its handover handles.
 //
-// The process id is what makes the installation safe: the helper waits for the
-// desktop to exit, so the service never starts while the desktop still holds the
-// listen address. The check of the console program runs before the question, so
-// the user is never asked to confirm an installation that cannot run.
+// Readiness prevents shutdown before the helper has the original process handle
+// and singleton. The helper later needs both successful completion and process
+// exit; the console program is still checked before confirmation.
 func TestTrayServiceInstallLaunchesTheHelperAfterTheConfirmation(t *testing.T) {
 	stubNoServiceRegistration(t)
 	freshServiceInstallGuard(t)
@@ -748,15 +751,17 @@ func TestTrayServiceInstallLaunchesTheHelperAfterTheConfirmation(t *testing.T) {
 	})
 
 	var launches []elevatedLaunch
-	replaceSeam(t, &launchElevated, func(l elevatedLaunch) (uint32, error) {
+	replaceSeam(t, &launchElevatedProcess, func(l elevatedLaunch) (*elevatedProcess, error) {
 		launches = append(launches, l)
-		return 5151, nil
+		return readyTestProcess(t, l), nil
 	})
 	messages := recordMessages(t)
 
-	if !installServiceFromTray() {
+	handover := installServiceFromTray(`Local\HFDesk.Test.1`)
+	if handover == nil {
 		t.Fatal("the tray action did not hand the installation over to the helper")
 	}
+	t.Cleanup(handover.close)
 	for _, want := range []string{
 		"starts at boot",
 		"administrator rights",
@@ -776,13 +781,19 @@ func TestTrayServiceInstallLaunchesTheHelperAfterTheConfirmation(t *testing.T) {
 	if launches[0].WaitPID != os.Getpid() {
 		t.Errorf("the helper waits for the process %d, want this desktop host %d", launches[0].WaitPID, os.Getpid())
 	}
+	if launches[0].ReadyEvent == "" || launches[0].SuccessEvent == "" || launches[0].ReadyEvent == launches[0].SuccessEvent {
+		t.Errorf("the helper handover events are %q and %q, want two distinct names", launches[0].ReadyEvent, launches[0].SuccessEvent)
+	}
+	if launches[0].InstanceMutex != `Local\HFDesk.Test.1` {
+		t.Errorf("the helper was given singleton %q, want the existing object", launches[0].InstanceMutex)
+	}
 	if len(*messages) != 0 {
 		t.Errorf("the tray action showed %v, want the helper to report the outcome", *messages)
 	}
 
 	// The guard is kept after a hand-over: the host ends on this answer, so a
 	// click that still reaches the tray may not start a second installation.
-	if installServiceFromTray() {
+	if installServiceFromTray(`Local\HFDesk.Test.1`) != nil {
 		t.Error("the tray action handed the installation over a second time")
 	}
 	if confirmations != 1 {
@@ -817,7 +828,7 @@ func TestTrayServiceInstallNamesTheDataDirectoryOfTheRegistration(t *testing.T) 
 	})
 	recordMessages(t)
 
-	if installServiceFromTray() {
+	if installServiceFromTray(`Local\HFDesk.Test.2`) != nil {
 		t.Fatal("the tray action quit the host although the confirmation was declined")
 	}
 	if !strings.Contains(confirmed, `D:\hfdesk`) {
@@ -838,13 +849,13 @@ func TestTrayServiceInstallDoesNothingWhenTheConfirmationIsDeclined(t *testing.T
 	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
-	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+	replaceSeam(t, &launchElevatedProcess, func(elevatedLaunch) (*elevatedProcess, error) {
 		t.Fatal("the tray action launched the helper without the consent of the user")
-		return 0, nil
+		return nil, nil
 	})
 	messages := recordMessages(t)
 
-	if installServiceFromTray() {
+	if installServiceFromTray(`Local\HFDesk.Test.3`) != nil {
 		t.Fatal("the tray action quit the host without the consent of the user")
 	}
 	if len(*messages) != 0 {
@@ -869,13 +880,13 @@ func TestTrayServiceInstallReportsAMissingConsoleProgram(t *testing.T) {
 	replaceSeam(t, &findSiblingExecutable, func(dir, _ string) (string, error) {
 		return "", errors.New("there is no hfdesk.exe in " + dir)
 	})
-	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+	replaceSeam(t, &launchElevatedProcess, func(elevatedLaunch) (*elevatedProcess, error) {
 		t.Fatal("the tray action launched the helper without the console program")
-		return 0, nil
+		return nil, nil
 	})
 	messages := recordMessages(t)
 
-	if installServiceFromTray() {
+	if installServiceFromTray(`Local\HFDesk.Test.4`) != nil {
 		t.Fatal("the tray action quit the host without the console program")
 	}
 	if len(*messages) != 1 {
@@ -898,12 +909,12 @@ func TestTrayServiceInstallReportsARefusedElevation(t *testing.T) {
 	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
-	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
-		return 0, errors.New(elevationDeclined)
+	replaceSeam(t, &launchElevatedProcess, func(elevatedLaunch) (*elevatedProcess, error) {
+		return nil, errors.New(elevationDeclined)
 	})
 	messages := recordMessages(t)
 
-	if installServiceFromTray() {
+	if installServiceFromTray(`Local\HFDesk.Test.5`) != nil {
 		t.Fatal("the tray action quit the host after the elevation prompt was refused")
 	}
 	if len(*messages) != 1 {
@@ -916,6 +927,50 @@ func TestTrayServiceInstallReportsARefusedElevation(t *testing.T) {
 	}
 	if icon := (*messages)[0].icon; icon != windows.MB_ICONERROR {
 		t.Errorf("the icon of the message is %d, want the error icon %d", icon, windows.MB_ICONERROR)
+	}
+}
+
+func TestTrayServiceInstallReadinessFailureKeepsRetryAvailable(t *testing.T) {
+	stubNoServiceRegistration(t)
+	freshServiceInstallGuard(t)
+	var confirmations, launches int
+	replaceSeam(t, &confirmServiceInstall, func(string) bool {
+		confirmations++
+		return true
+	})
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return `C:\portable\hfdesk.exe`, nil
+	})
+	replaceSeam(t, &launchElevatedProcess, func(l elevatedLaunch) (*elevatedProcess, error) {
+		launches++
+		if launches == 2 {
+			return readyTestProcess(t, l), nil
+		}
+		handle, err := windows.CreateEvent(nil, 1, 1, nil)
+		if err != nil {
+			return nil, err
+		}
+		return &elevatedProcess{handle: handle, pid: 5151}, nil
+	})
+	messages := recordMessages(t)
+
+	if handover := installServiceFromTray(`Local\HFDesk.Test.Retry`); handover != nil {
+		handover.close()
+		t.Fatal("the tray action committed after the helper had already exited")
+	}
+	if serviceInstallRunning.Load() {
+		t.Fatal("the failed pre-shutdown attempt kept the tray retry guard")
+	}
+	handover := installServiceFromTray(`Local\HFDesk.Test.Retry`)
+	if handover == nil {
+		t.Fatal("a retry could not proceed after the helper readiness failure")
+	}
+	defer handover.close()
+	if launches != 2 || confirmations != 2 {
+		t.Errorf("the retries launched %d helpers and asked %d confirmations, want two each", launches, confirmations)
+	}
+	if len(*messages) != 1 || !strings.Contains((*messages)[0].text, "exited before it became ready") {
+		t.Errorf("the first attempt report is %v, want the early helper exit", *messages)
 	}
 }
 
@@ -934,9 +989,9 @@ func TestTrayServiceInstallIgnoresAClickWhileAnActionRuns(t *testing.T) {
 	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
-	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+	replaceSeam(t, &launchElevatedProcess, func(elevatedLaunch) (*elevatedProcess, error) {
 		t.Error("the tray action launched a helper although the confirmation was declined")
-		return 0, nil
+		return nil, nil
 	})
 
 	entered := make(chan struct{})
@@ -952,12 +1007,12 @@ func TestTrayServiceInstallIgnoresAClickWhileAnActionRuns(t *testing.T) {
 	recordMessages(t)
 
 	first := make(chan bool, 1)
-	go func() { first <- installServiceFromTray() }()
+	go func() { first <- installServiceFromTray(`Local\HFDesk.Test.6`) != nil }()
 	<-entered
 
 	// The second click arrives while the first action waits for its
 	// confirmation.
-	if installServiceFromTray() {
+	if installServiceFromTray(`Local\HFDesk.Test.6`) != nil {
 		t.Error("the concurrent click on the tray item quit the host")
 	}
 	if got := atomic.LoadInt32(&confirmations); got != 1 {
@@ -971,7 +1026,7 @@ func TestTrayServiceInstallIgnoresAClickWhileAnActionRuns(t *testing.T) {
 
 	// The action ended without a hand-over, so the guard is released and the
 	// tray item asks again instead of being taken for a concurrent click.
-	if installServiceFromTray() {
+	if installServiceFromTray(`Local\HFDesk.Test.6`) != nil {
 		t.Error("the retried tray action quit the host although the confirmation was declined")
 	}
 	if got := atomic.LoadInt32(&confirmations); got != 2 {
@@ -1251,7 +1306,7 @@ func TestServiceHelperInstallStartsTheServiceAndReportsTheAddress(t *testing.T) 
 	})
 	messages := recordMessages(t)
 
-	if err := RunServiceAction(ServiceActionOptions{Action: "install", Version: "1.3.0"}); err != nil {
+	if err := runHelperInstallForTest("1.3.0"); err != nil {
 		t.Fatalf("the installation failed: %v", err)
 	}
 	if manager.starts != 1 {
@@ -1289,7 +1344,7 @@ func TestServiceHelperInstallReportsTheServiceOwnedCleanupResult(t *testing.T) {
 			manager := &fakeServiceManager{installStartErr: tc.cleanup}
 			replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) { return manager, nil })
 			messages := recordMessages(t)
-			if err := RunServiceAction(ServiceActionOptions{Action: "install", Version: "1.4.0"}); err == nil {
+			if err := runHelperInstallForTest("1.4.0"); err == nil {
 				t.Fatal("the installation succeeded although the verified start failed")
 			}
 			if len(manager.steps) != 1 || manager.steps[0] != "install-start" || manager.reads != 0 || manager.starts != 0 {
@@ -1313,7 +1368,7 @@ func TestServiceHelperInstallDoesNotCleanAConcurrentRegistrationByName(t *testin
 	manager := &fakeServiceManager{installStartErr: errors.New("the registration appeared during the first install")}
 	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) { return manager, nil })
 	messages := recordMessages(t)
-	if err := RunServiceAction(ServiceActionOptions{Action: "install"}); err == nil {
+	if err := runHelperInstallForTest(""); err == nil {
 		t.Fatal("the install succeeded although a concurrent registration appeared")
 	}
 	if len(manager.steps) != 1 || manager.steps[0] != "install-start" || manager.reads != 0 {
@@ -1331,7 +1386,7 @@ func TestServiceHelperInstallReportsARegistrationConflictWithoutStatusLookup(t *
 	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) { return manager, nil })
 	messages := recordMessages(t)
 
-	if err := RunServiceAction(ServiceActionOptions{Action: "install"}); err == nil {
+	if err := runHelperInstallForTest(""); err == nil {
 		t.Fatal("the first-install action accepted an existing registration")
 	}
 	if manager.reads != 0 || manager.starts != 0 || stepIndex(manager.steps, "uninstall") >= 0 {
@@ -1349,7 +1404,7 @@ func TestServiceHelperPassesTheVersionExpectationToTheServiceOwner(t *testing.T)
 	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) { return manager, nil })
 	recordMessages(t)
 
-	if err := RunServiceAction(ServiceActionOptions{Action: "install", Version: "1.4.0"}); err != nil {
+	if err := runHelperInstallForTest("1.4.0"); err != nil {
 		t.Fatalf("the first installation failed: %v", err)
 	}
 	if len(manager.installs) != 1 || manager.installs[0].ExpectedVersion != "1.4.0" {
@@ -1374,7 +1429,7 @@ func TestServiceHelperDoesNotReopenTheServiceAfterUnprovenCleanup(t *testing.T) 
 			}
 			replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) { return manager, nil })
 			messages := recordMessages(t)
-			if err := RunServiceAction(ServiceActionOptions{Action: "install"}); err == nil {
+			if err := runHelperInstallForTest(""); err == nil {
 				t.Fatal("the installation succeeded although the verified start failed")
 			}
 			if manager.reads != 0 || manager.starts != 0 || stepIndex(manager.steps, "uninstall") >= 0 {
@@ -1399,7 +1454,7 @@ func TestServiceHelperKeepsAnUnconfirmedCleanupResult(t *testing.T) {
 	}
 	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) { return manager, nil })
 	messages := recordMessages(t)
-	if err := RunServiceAction(ServiceActionOptions{Action: "install"}); err == nil {
+	if err := runHelperInstallForTest(""); err == nil {
 		t.Fatal("the installation succeeded although the service could not be verified")
 	}
 	if manager.reads != 0 || stepIndex(manager.steps, "uninstall") >= 0 {
@@ -1415,73 +1470,121 @@ func TestServiceHelperKeepsAnUnconfirmedCleanupResult(t *testing.T) {
 	}
 }
 
-// TestServiceHelperWaitsForTheDesktopBeforeItInstalls proves that the helper
-// waits for the desktop host before it changes the service.
-//
-// The desktop stops its own server through the graceful path and ends; the
-// helper starts the service only afterwards, so the service never binds an
-// address the desktop still holds.
-func TestServiceHelperWaitsForTheDesktopBeforeItInstalls(t *testing.T) {
+func TestServiceHelperRequiresBothSuccessfulShutdownAndDesktopExit(t *testing.T) {
 	replaceSeam(t, &serviceVerifyBudget, 100*time.Millisecond)
 	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
-	manager := &fakeServiceManager{
-		statuses: []service.Status{runningServiceStatus(service.StateRunning, "127.0.0.1:18080")},
-	}
+	manager := &fakeServiceManager{}
 	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
 		return manager, nil
 	})
-	waited := false
-	replaceSeam(t, &waitForProcess, func(pid int, budget time.Duration) error {
-		if pid != 4321 {
-			t.Errorf("the helper waited for the process %d, want 4321", pid)
-		}
-		if budget != serviceWaitBudget {
-			t.Errorf("the helper waited for %s, want the bounded budget %s", budget, serviceWaitBudget)
-		}
-		waited = true
-		manager.steps = append(manager.steps, "wait")
-		return nil
-	})
+	handover := testHelperHandover(t)
+	replaceSeam(t, &prepareHelperHandover, func(ServiceActionOptions) (*helperHandover, error) { return handover, nil })
 	recordMessages(t)
 
-	if err := RunServiceAction(ServiceActionOptions{Action: "install", WaitPID: 4321}); err != nil {
-		t.Fatalf("the installation failed: %v", err)
+	done := make(chan error, 1)
+	go func() {
+		done <- RunServiceAction(ServiceActionOptions{
+			Action: "install", WaitPID: 4321,
+			ReadyEvent: "ready", SuccessEvent: "success", InstanceMutex: "mutex",
+		})
+	}()
+	if result, err := windows.WaitForSingleObject(handover.ready, 2_000); err != nil || result != windows.WAIT_OBJECT_0 {
+		t.Fatalf("the helper did not signal ready: result=%#x err=%v", result, err)
 	}
-	if !waited {
-		t.Fatal("the helper did not wait for the desktop host")
+	select {
+	case err := <-done:
+		t.Fatalf("the helper returned before successful completion or desktop exit: %v", err)
+	case <-time.After(50 * time.Millisecond):
 	}
-	install := stepIndex(manager.steps, "install-start")
-	if wait := stepIndex(manager.steps, "wait"); install < 0 || wait < 0 || wait > install {
-		t.Fatalf("the steps of the helper are %v, want the wait before the installation", manager.steps)
+	if err := windows.SetEvent(handover.success); err != nil {
+		t.Fatalf("signal successful completion: %v", err)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("the helper returned after success but before the desktop exited: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := windows.SetEvent(handover.parent); err != nil {
+		t.Fatalf("signal desktop exit: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("the authorized installation failed: %v", err)
+	}
+	if len(manager.steps) != 1 || manager.steps[0] != "install-start" {
+		t.Fatalf("the helper used service steps %v, want one install after both signals", manager.steps)
 	}
 }
 
-// TestServiceHelperReportsAWaitThatTimesOut proves that a desktop host that does
-// not end is a failure of the action and not a reason to start the service
-// anyway.
-func TestServiceHelperReportsAWaitThatTimesOut(t *testing.T) {
-	replaceSeam(t, &waitForProcess, func(pid int, budget time.Duration) error {
-		return errors.New("the HFDesk desktop app (process 4321) did not exit within 1m0s")
-	})
+func TestServiceHelperRejectsDesktopExitWithoutSuccessfulShutdown(t *testing.T) {
+	handover := testHelperHandover(t)
+	replaceSeam(t, &prepareHelperHandover, func(ServiceActionOptions) (*helperHandover, error) { return handover, nil })
+	manager := &fakeServiceManager{}
 	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
-		t.Fatal("the helper touched the service although the desktop host did not exit")
-		return nil, nil
+		return manager, nil
 	})
 	messages := recordMessages(t)
 
-	if err := RunServiceAction(ServiceActionOptions{Action: "install", WaitPID: 4321}); err == nil {
-		t.Fatal("the installation succeeded although the desktop host did not exit")
+	done := make(chan error, 1)
+	go func() {
+		done <- RunServiceAction(ServiceActionOptions{
+			Action: "install", WaitPID: 4321,
+			ReadyEvent: "ready", SuccessEvent: "success", InstanceMutex: "mutex",
+		})
+	}()
+	if result, err := windows.WaitForSingleObject(handover.ready, 2_000); err != nil || result != windows.WAIT_OBJECT_0 {
+		t.Fatalf("the helper did not signal ready: result=%#x err=%v", result, err)
+	}
+	if err := windows.SetEvent(handover.parent); err != nil {
+		t.Fatalf("signal desktop exit: %v", err)
+	}
+	if err := <-done; err == nil {
+		t.Fatal("the installation succeeded although the desktop supplied no successful-shutdown signal")
+	}
+	if len(manager.steps) != 0 {
+		t.Errorf("the helper touched the service before authorization: %v", manager.steps)
 	}
 	if len(*messages) != 1 {
-		t.Fatalf("the helper showed %d message boxes, want the failure of the wait", len(*messages))
+		t.Fatalf("the helper showed %d message boxes, want the authorization failure", len(*messages))
 	}
-	if !strings.Contains((*messages)[0].text, "did not exit") {
-		t.Errorf("the report %q does not carry the reason of the failure", (*messages)[0].text)
+	if !strings.Contains((*messages)[0].text, "without confirming successful graceful completion") {
+		t.Errorf("the report %q does not identify the missing success signal", (*messages)[0].text)
 	}
-	if !strings.Contains((*messages)[0].text, "A registration may remain.") {
-		t.Errorf("the report %q does not state the state the attempt may have left", (*messages)[0].text)
+}
+
+func TestServiceHelperDoesNotReviveAfterHandoverTimeout(t *testing.T) {
+	replaceSeam(t, &serviceWaitBudget, 50*time.Millisecond)
+	replaceSeam(t, &serviceParentExitBudget, 50*time.Millisecond)
+	handover := testHelperHandover(t)
+	lateParent := duplicateTestHandle(t, handover.parent)
+	lateSuccess := duplicateTestHandle(t, handover.success)
+	replaceSeam(t, &prepareHelperHandover, func(ServiceActionOptions) (*helperHandover, error) { return handover, nil })
+	manager := &fakeServiceManager{}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) { return manager, nil })
+	recordMessages(t)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- RunServiceAction(ServiceActionOptions{
+			Action: "install", WaitPID: 4321,
+			ReadyEvent: "ready", SuccessEvent: "success", InstanceMutex: "mutex",
+		})
+	}()
+	if result, err := windows.WaitForSingleObject(handover.ready, 2_000); err != nil || result != windows.WAIT_OBJECT_0 {
+		t.Fatalf("the helper did not signal ready: result=%#x err=%v", result, err)
+	}
+	if err := <-done; err == nil {
+		t.Fatal("the helper accepted a handover that timed out")
+	}
+	if err := windows.SetEvent(lateSuccess); err != nil {
+		t.Fatalf("signal a late completion: %v", err)
+	}
+	if err := windows.SetEvent(lateParent); err != nil {
+		t.Fatalf("signal a late parent exit: %v", err)
+	}
+	if len(manager.steps) != 0 {
+		t.Errorf("late handover signals revived service actions: %v", manager.steps)
 	}
 }
 
@@ -1566,7 +1669,7 @@ func TestServiceHelperInstallNamesTheEffectiveProgram(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if err := RunServiceAction(ServiceActionOptions{Action: "install"}); err == nil {
+	if err := runHelperInstallForTest(""); err == nil {
 		t.Fatal("the installation succeeded although the service control manager refused it")
 	}
 	if len(*messages) != 1 {
@@ -1621,33 +1724,47 @@ func TestServiceHelperRejectsAnUnknownAction(t *testing.T) {
 	}
 }
 
-// TestServiceHelperArgumentsNameTheActionAndTheProcess proves that the command
-// line of the elevated helper carries the action and the process it waits for,
-// and that a launch without a process carries no wait flag.
-func TestServiceHelperArgumentsNameTheActionAndTheProcess(t *testing.T) {
-	install := serviceHelperArguments(elevatedLaunch{Action: serviceActionInstall, WaitPID: 4321})
-	if want := "--service-action install --wait-pid 4321"; install != want {
+func TestServiceHelperRejectsIncompleteInstallHandover(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		o    ServiceActionOptions
+	}{
+		{"no handover", ServiceActionOptions{Action: "install"}},
+		{"pid only", ServiceActionOptions{Action: "install", WaitPID: 4321}},
+		{"missing success event", ServiceActionOptions{Action: "install", WaitPID: 4321, ReadyEvent: "ready", InstanceMutex: "mutex"}},
+		{"missing mutex", ServiceActionOptions{Action: "install", WaitPID: 4321, ReadyEvent: "ready", SuccessEvent: "success"}},
+		{"names without pid", ServiceActionOptions{Action: "install", ReadyEvent: "ready", SuccessEvent: "success", InstanceMutex: "mutex"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+				t.Fatal("the helper touched the service with incomplete handover arguments")
+				return nil, nil
+			})
+			messages := recordMessages(t)
+			if err := RunServiceAction(tc.o); err == nil {
+				t.Fatal("the helper accepted incomplete handover arguments")
+			}
+			if len(*messages) != 1 || !strings.Contains((*messages)[0].text, "handover") {
+				t.Errorf("the helper report is %v, want the handover failure", *messages)
+			}
+		})
+	}
+}
+
+// TestServiceHelperArgumentsNameTheActionAndHandover proves that the helper
+// receives the event names and existing singleton identity of one handover.
+func TestServiceHelperArgumentsNameTheActionAndHandover(t *testing.T) {
+	install := serviceHelperArguments(elevatedLaunch{
+		Action: serviceActionInstall, WaitPID: 4321,
+		ReadyEvent: `Local\ready`, SuccessEvent: `Local\success`, InstanceMutex: `Local\HFDesk.Desktop.sid.1`,
+	})
+	if want := `--service-action install --wait-pid 4321 --handover-ready-event Local\ready ` +
+		`--handover-success-event Local\success --instance-mutex Local\HFDesk.Desktop.sid.1`; install != want {
 		t.Errorf("the arguments are %q, want %q", install, want)
 	}
 	update := serviceHelperArguments(elevatedLaunch{Action: serviceActionUpdate})
 	if want := "--service-action update"; update != want {
 		t.Errorf("the arguments are %q, want %q", update, want)
-	}
-}
-
-// TestWaitForProcessExitReportsATimeout proves that the wait for the desktop host
-// is bounded: the running test process is observed and the wait reports that it
-// did not exit within the budget.
-func TestWaitForProcessExitReportsATimeout(t *testing.T) {
-	err := waitForProcessExit(os.Getpid(), 50*time.Millisecond)
-	if err == nil {
-		t.Fatal("the wait for the running process succeeded, want a timeout")
-	}
-	if !strings.Contains(err.Error(), "did not exit within") {
-		t.Errorf("the error is %q, want the timeout of the wait", err)
-	}
-	if err := waitForProcessExit(0, time.Second); err != nil {
-		t.Errorf("the wait for no process failed: %v", err)
 	}
 }
 
@@ -1668,7 +1785,7 @@ func TestServiceHelperInstallReportsAMissingConsoleProgram(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if err := RunServiceAction(ServiceActionOptions{Action: "install"}); err == nil {
+	if err := runHelperInstallForTest(""); err == nil {
 		t.Fatal("the installation succeeded without the console program")
 	}
 	if len(*messages) != 1 {

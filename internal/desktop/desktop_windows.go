@@ -78,6 +78,7 @@ func Run(o Options) error {
 func run(o Options, logPath string) (err error) {
 	var pipeline *logging.Pipeline
 	var shutdown func()
+	var shutdownCoordinator desktopShutdownCoordinator
 
 	// logFailure reports the failure of the persistent log to the user. It
 	// is assigned when the pipeline is installed, and it is called before
@@ -104,7 +105,7 @@ func run(o Options, logPath string) (err error) {
 		end: func() {
 			removePublishedState(statePath)
 			if shutdown != nil {
-				stopServer(shutdown)
+				stopDesktopServer(shutdown, &shutdownCoordinator)
 			}
 			closePipeline(pipeline, logFailure)
 		},
@@ -241,8 +242,26 @@ func run(o Options, logPath string) (err error) {
 	var shutdownOnce sync.Once
 	shutdown = func() {
 		shutdownOnce.Do(func() {
+			handover, committed := shutdownCoordinator.beginShutdown()
 			cancel()
-			if err := application.Wait(); err != nil {
+			if committed {
+				defer handover.close()
+				err := completeHandoverWithNotice(handover, func() error {
+					waitErr := application.Wait()
+					if waitErr != nil {
+						desktopLog.Error("the server did not stop cleanly before service installation", "error", waitErr)
+					}
+					handoverErr := application.WaitForHandover()
+					if waitErr != nil && handoverErr == nil {
+						return waitErr
+					}
+					return handoverErr
+				})
+				handover.close()
+				if err != nil {
+					reportServiceHandoverFailure(err)
+				}
+			} else if err := application.Wait(); err != nil {
 				desktopLog.Error("the server did not stop cleanly", "error", err)
 			}
 			// The runtime window is closed after the server stopped, so
@@ -363,7 +382,7 @@ func run(o Options, logPath string) (err error) {
 			// runs and the job state is flushed. The wait is bounded,
 			// so a server that does not stop cannot keep the host from
 			// ending.
-			stopServer(shutdown)
+			stopDesktopServer(shutdown, &shutdownCoordinator)
 			closePipeline(pipeline, logFailure)
 			os.Exit(1)
 		}
@@ -393,16 +412,23 @@ func run(o Options, logPath string) (err error) {
 			// to run outside the message loop of the tray. The action
 			// therefore runs on a goroutine of its own.
 			//
-			// The host quits only after a successful launch of the elevated
-			// helper: a refused prompt or a missing console program leaves
-			// the running desktop untouched. The quit is the quit of the
-			// menu and of the signal handler, so the server is stopped
-			// through the graceful path before the process ends, and the
-			// helper starts the service only after this process exited.
+			// The host commits shutdown only after the elevated helper has
+			// opened its wait handles and acknowledged readiness. Earlier
+			// failures leave the running desktop untouched; after commit,
+			// every quit path joins persistence and the helper still requires
+			// both successful completion and this process's exit.
 			go guard.runBackground(func() {
-				if installServiceFromTray() {
-					requestQuit()
+				handover := installServiceFromTray(lock.name)
+				if handover == nil {
+					return
 				}
+				if !shutdownCoordinator.commit(handover) {
+					handover.close()
+					serviceInstallRunning.Store(false)
+					desktopLog.Info("service handover was not committed because desktop shutdown already started")
+					return
+				}
+				requestQuit()
 			})
 		},
 		quit: requestQuit,

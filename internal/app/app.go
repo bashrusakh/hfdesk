@@ -251,6 +251,16 @@ func (a *App) Wait() error {
 	return a.serveError()
 }
 
+// WaitForHandover joins handover persistence while retaining Wait's result;
+// call Wait first to inspect or log that result before the additional I/O wait.
+func (a *App) WaitForHandover() error {
+	waitErr := a.Wait()
+	if a.server == nil {
+		return waitErr
+	}
+	return errors.Join(waitErr, a.server.CompleteHandover())
+}
+
 // serveError returns the error the serving goroutine ended with.
 func (a *App) serveError() error {
 	a.mu.Lock()

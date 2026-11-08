@@ -17,15 +17,14 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// serviceWaitBudget bounds the wait for the desktop host that launched the
-// helper.
-//
-// The desktop stops its own server through the graceful path before it ends,
-// and the host bounds that shutdown itself (gracefulShutdownTimeout). This
-// budget covers the shutdown plus the exit of the process; a desktop that does
-// not end within it is reported as a failure of the action instead of starting
-// the service on an address that is still held.
-const serviceWaitBudget = 60 * time.Second
+// serviceWaitBudget bounds the helper-ready handshake and the wait for the
+// successful-completion evidence. It is a variable so tests can shorten it.
+var serviceWaitBudget = 60 * time.Second
+
+// serviceParentExitBudget bounds the subsequent wait for the original desktop
+// exit. It is separate on purpose: consuming the completion budget must never
+// zero the exit budget, or a legitimate install would fail at the transition.
+var serviceParentExitBudget = 60 * time.Second
 
 // serviceActionBudget bounds one service action of the helper.
 //
@@ -59,12 +58,6 @@ const serviceVerifyInterval = 200 * time.Millisecond
 // elevated shell.
 var newServiceManager = service.New
 
-// waitForProcess waits for a process to exit.
-//
-// It is a package level variable so the tests can prove that the helper waits
-// before it touches the service, without a second process.
-var waitForProcess = waitForProcessExit
-
 // RunServiceAction performs one action of the elevated helper.
 //
 // The helper is the desktop executable started with administrator rights and
@@ -72,10 +65,9 @@ var waitForProcess = waitForProcessExit
 // WebView2 window: it drives the service control manager and reports the
 // outcome in a native message box, because a GUI process has no console.
 //
-// The action waits for the desktop host that launched it before it starts or
-// restarts the service: the desktop stops its own server through the graceful
-// path and ends, and only then may the service bind the address. A wait that
-// times out is a failure of the action.
+// An install is accepted only with a complete tray handover. The helper opens
+// every required handle before it signals ready, then requires both the
+// successful-completion event and the original desktop process exit.
 //
 // The helper installs no logging pipeline: the rotating log file belongs to the
 // launch that runs the desktop host, and a second writer breaks its rotation.
@@ -87,20 +79,61 @@ func RunServiceAction(o ServiceActionOptions) error {
 		return err
 	}
 
+	if err := validateServiceHandoverOptions(action, o); err != nil {
+		(&serviceActionReporter{action: action}).handoverFailure(err)
+		return err
+	}
+	var handover *helperHandover
 	if o.WaitPID > 0 {
-		if err := waitForProcess(o.WaitPID, serviceWaitBudget); err != nil {
-			reportServiceFailure(action, err, "")
+		handover, err = prepareHelperHandover(o)
+		if err != nil {
+			(&serviceActionReporter{action: action}).handoverFailure(err)
 			return err
 		}
+		defer handover.close()
+		if err := handover.signalReady(); err != nil {
+			(&serviceActionReporter{action: action, handover: handover}).handoverFailure(err)
+			return err
+		}
+		if err := handover.waitForAuthorization(serviceWaitBudget, serviceParentExitBudget); err != nil {
+			(&serviceActionReporter{action: action, handover: handover}).handoverFailure(err)
+			return err
+		}
+		// Authorization is settled: only the singleton outlives it, through
+		// the service mutation, and is released before the final notice.
+		handover.releaseAuthorizationHandles()
 	}
+	return runServiceAction(action, o.Version, &serviceActionReporter{action: action, handover: handover})
+}
 
+func validateServiceHandoverOptions(action serviceAction, o ServiceActionOptions) error {
+	if o.WaitPID < 0 || uint64(o.WaitPID) > uint64(^uint32(0)) {
+		return errors.New("desktop: the original desktop process id is outside the Windows process-id range")
+	}
+	hasNames := strings.TrimSpace(o.ReadyEvent) != "" || strings.TrimSpace(o.SuccessEvent) != "" ||
+		strings.TrimSpace(o.InstanceMutex) != ""
+	if o.WaitPID == 0 && !hasNames {
+		if action == serviceActionInstall {
+			return errors.New("desktop: service installation requires a graceful desktop handover")
+		}
+		return nil
+	}
+	if action != serviceActionInstall || o.WaitPID <= 0 ||
+		strings.TrimSpace(o.ReadyEvent) == "" || strings.TrimSpace(o.SuccessEvent) == "" ||
+		strings.TrimSpace(o.InstanceMutex) == "" {
+		return errors.New("desktop: incomplete service handover arguments")
+	}
+	return nil
+}
+
+func runServiceAction(action serviceAction, version string, reporter *serviceActionReporter) error {
 	switch action {
 	case serviceActionInstall:
-		return installWindowsService(action, o.Version)
+		return installWindowsService(reporter, version)
 	case serviceActionUpdate:
-		return updateWindowsService(action, o.Version)
+		return updateWindowsService(reporter, version)
 	case serviceActionStart:
-		return startWindowsService(action)
+		return startWindowsService(reporter)
 	}
 	return fmt.Errorf("desktop: the service action %q cannot be performed", action)
 }
@@ -120,13 +153,13 @@ func RunServiceAction(o ServiceActionOptions) error {
 // app from starting its own server. Only a registration this action created is
 // removed again when the start fails; one that existed before, or that appeared
 // between the manager's lookup and its write, is never touched.
-func installWindowsService(action serviceAction, version string) error {
+func installWindowsService(reporter *serviceActionReporter, version string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceActionBudget)
 	defer cancel()
 
 	opts, manager, err := serviceInstallation(version)
 	if err != nil {
-		reportServiceFailure(action, err, "")
+		reporter.failure(err, "")
 		return err
 	}
 
@@ -134,9 +167,9 @@ func installWindowsService(action serviceAction, version string) error {
 	if err != nil {
 		var startErr *service.InstallStartError
 		if errors.As(err, &startErr) {
-			reportFirstInstallStartFailure(err, startErr, opts.Executable)
+			reporter.firstInstallStartFailure(err, startErr, opts.Executable)
 		} else {
-			reportServiceFailure(action, err, opts.Executable)
+			reporter.failure(err, opts.Executable)
 		}
 		return err
 	}
@@ -149,7 +182,7 @@ func installWindowsService(action serviceAction, version string) error {
 	report := serviceProgram(installed, opts)
 	desktopLog.Info("the service is installed", "executable", report, "listen", status.Listen,
 		"versionVerified", installed.VersionVerified)
-	showMessage(serviceInstalledCaption,
+	reporter.message(serviceInstalledCaption,
 		serviceInstalledText(verifiedVersion(installed), report, status.Paths.StateDir, serviceWebAddress(status)),
 		windows.MB_ICONINFORMATION)
 	return nil
@@ -166,29 +199,29 @@ func installWindowsService(action serviceAction, version string) error {
 // The update only re-points an existing registration: a machine without one is
 // a failure, because an update that registered a stopped service would leave an
 // instance that serves nothing.
-func updateWindowsService(action serviceAction, version string) error {
+func updateWindowsService(reporter *serviceActionReporter, version string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceActionBudget)
 	defer cancel()
 
 	opts, manager, err := serviceInstallation(version)
 	if err != nil {
-		reportServiceFailure(action, err, "")
+		reporter.failure(err, "")
 		return err
 	}
 
 	before, err := manager.Status(ctx)
 	if err != nil {
-		reportServiceFailure(action, fmt.Errorf("the state of the service before the update cannot be read: %w", err), "")
+		reporter.failure(fmt.Errorf("the state of the service before the update cannot be read: %w", err), "")
 		return err
 	}
 	if before.State == service.StateNotInstalled {
-		return reportServiceNotInstalled(action)
+		return reporter.notInstalled()
 	}
 	wasRunning := serviceStatusRunning(before)
 
 	installed, err := manager.Install(ctx, opts)
 	if err != nil {
-		reportServiceFailure(action, err, opts.Executable)
+		reporter.failure(err, opts.Executable)
 		return err
 	}
 	status, err := waitForServiceState(ctx, manager, wasRunning)
@@ -201,7 +234,7 @@ func updateWindowsService(action serviceAction, version string) error {
 		if wasRunning {
 			beforeText = "was running before the update"
 		}
-		reportServiceFailure(action, fmt.Errorf(
+		reporter.failure(fmt.Errorf(
 			"the update must leave the service %s, because it %s: %w",
 			expected, beforeText, err), serviceProgram(installed, opts))
 		return err
@@ -213,7 +246,7 @@ func updateWindowsService(action serviceAction, version string) error {
 		"state", string(status.State),
 		"wasRunning", wasRunning,
 		"versionVerified", installed.VersionVerified)
-	showMessage(serviceUpdatedCaption,
+	reporter.message(serviceUpdatedCaption,
 		serviceUpdatedText(verifiedVersion(installed), report, status.Paths.StateDir,
 			serviceWebAddress(status), serviceStatusRunning(status)),
 		windows.MB_ICONINFORMATION)
@@ -225,35 +258,35 @@ func updateWindowsService(action serviceAction, version string) error {
 // A machine without a registration is reported with the way to install it: the
 // start of a service that does not exist is not an error of the service control
 // manager the user could act on.
-func startWindowsService(action serviceAction) error {
+func startWindowsService(reporter *serviceActionReporter) error {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceActionBudget)
 	defer cancel()
 
 	manager, err := newServiceManager(service.ScopeSystem)
 	if err != nil {
-		reportServiceFailure(action, err, "")
+		reporter.failure(err, "")
 		return err
 	}
 	before, err := manager.Status(ctx)
 	if err != nil {
-		reportServiceFailure(action, fmt.Errorf("the state of the service cannot be read: %w", err), "")
+		reporter.failure(fmt.Errorf("the state of the service cannot be read: %w", err), "")
 		return err
 	}
 	if before.State == service.StateNotInstalled {
-		return reportServiceNotInstalled(action)
+		return reporter.notInstalled()
 	}
 	if err := manager.Start(ctx); err != nil {
-		reportServiceFailure(action, err, before.Executable)
+		reporter.failure(err, before.Executable)
 		return err
 	}
 	status, err := waitForServiceState(ctx, manager, true)
 	if err != nil {
-		reportServiceFailure(action, err, before.Executable)
+		reporter.failure(err, before.Executable)
 		return err
 	}
 
 	desktopLog.Info("the service is started", "executable", status.Executable, "listen", status.Listen)
-	showMessage(serviceStartedCaption,
+	reporter.message(serviceStartedCaption,
 		serviceStartedText(status.Executable, serviceWebAddress(status)),
 		windows.MB_ICONINFORMATION)
 	return nil
@@ -332,39 +365,6 @@ func waitForServiceState(ctx context.Context, manager service.Manager, wantRunni
 	}
 }
 
-// waitForProcessExit waits until the process exited.
-//
-// The process is observed through a handle of the process, so the wait ends on
-// the end of the process and not on a poll that could miss it. A process that
-// does not exist anymore is a process that exited: the helper then has nothing
-// to wait for and starts the service.
-func waitForProcessExit(pid int, budget time.Duration) error {
-	if pid <= 0 {
-		return nil
-	}
-	handle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(pid))
-	if err != nil {
-		if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
-			return nil
-		}
-		return fmt.Errorf("the HFDesk desktop app (process %d) cannot be observed: %w", pid, err)
-	}
-	defer windows.CloseHandle(handle)
-
-	event, err := windows.WaitForSingleObject(handle, uint32(budget/time.Millisecond))
-	if err != nil {
-		return fmt.Errorf("waiting for the HFDesk desktop app (process %d) failed: %w", pid, err)
-	}
-	switch event {
-	case windows.WAIT_OBJECT_0:
-		return nil
-	case uint32(windows.WAIT_TIMEOUT):
-		return fmt.Errorf("the HFDesk desktop app (process %d) did not exit within %s", pid, budget)
-	default:
-		return fmt.Errorf("waiting for the HFDesk desktop app (process %d) ended with the event %d", pid, event)
-	}
-}
-
 // serviceProgram returns the program the registration of the service runs: the
 // effective registration, or the request when the manager reports no program.
 func serviceProgram(installed, requested service.InstallOptions) string {
@@ -386,18 +386,42 @@ func serviceWebAddress(status service.Status) string {
 	return status.Listen
 }
 
-// reportServiceFailure records the failure of a service action and reports it to
-// the user: a GUI helper that only records a failure vanishes without telling
-// the user. The box carries the underlying error and the program of the action.
-func reportServiceFailure(action serviceAction, err error, program string) {
+type serviceActionReporter struct {
+	action   serviceAction
+	handover *helperHandover
+}
+
+func (r *serviceActionReporter) message(caption, text string, icon uint32) {
+	if r.handover != nil {
+		r.handover.close()
+	}
+	showMessage(caption, text, icon)
+}
+
+// failure reports a service-action failure after releasing the singleton that
+// the desktop helper held across the handover.
+func (r *serviceActionReporter) failure(err error, program string) {
 	if err == nil {
 		return
 	}
-	desktopLog.Error("the service action failed", "action", string(action), "error", err, "program", program)
-	showMessage(serviceFailureCaption(action), serviceActionFailureText(action, err, program), windows.MB_ICONERROR)
+	desktopLog.Error("the service action failed", "action", string(r.action), "error", err, "program", program)
+	r.message(serviceFailureCaption(r.action), serviceActionFailureText(r.action, err, program), windows.MB_ICONERROR)
 }
 
-func reportFirstInstallStartFailure(err error, cleanup *service.InstallStartError, program string) {
+func (r *serviceActionReporter) handoverFailure(err error) {
+	if err == nil {
+		return
+	}
+	if r.handover != nil {
+		r.handover.close()
+	}
+	desktopLog.Error("the service helper could not authorize the desktop handover", "action", string(r.action), "error", err)
+	showMessage(serviceFailureCaption(r.action),
+		"HFDesk could not confirm the desktop handover. No service action was performed.\n\n"+err.Error(),
+		windows.MB_ICONERROR)
+}
+
+func (r *serviceActionReporter) firstInstallStartFailure(err error, cleanup *service.InstallStartError, program string) {
 	if err == nil {
 		return
 	}
@@ -412,8 +436,15 @@ func reportFirstInstallStartFailure(err error, cleanup *service.InstallStartErro
 		"program", program,
 		"registrationRemoved", removed,
 		"cleanupError", cleanupErr)
-	showMessage(serviceFailureCaption(serviceActionInstall),
+	r.message(serviceFailureCaption(serviceActionInstall),
 		serviceInstallStartFailureText(err, program, cleanup), windows.MB_ICONERROR)
+}
+
+func (r *serviceActionReporter) notInstalled() error {
+	err := errors.New("HFDesk is not installed as a Windows service")
+	desktopLog.Error("the service action needs a registration", "action", string(r.action))
+	r.message(serviceFailureCaption(r.action), serviceNotInstalledText(r.action), windows.MB_ICONERROR)
+	return err
 }
 
 // reportServiceLaunchFailure records the failure of a launch of the elevated
@@ -427,13 +458,4 @@ func reportServiceLaunchFailure(action serviceAction, err error) {
 	}
 	desktopLog.Error("the elevated service helper could not be started", "action", string(action), "error", err)
 	showMessage(serviceFailureCaption(action), serviceLaunchFailedText(action, err), windows.MB_ICONERROR)
-}
-
-// reportServiceNotInstalled reports an action that needs a registration on a
-// machine without one.
-func reportServiceNotInstalled(action serviceAction) error {
-	err := errors.New("HFDesk is not installed as a Windows service")
-	desktopLog.Error("the service action needs a registration", "action", string(action))
-	showMessage(serviceFailureCaption(action), serviceNotInstalledText(action), windows.MB_ICONERROR)
-	return err
 }
