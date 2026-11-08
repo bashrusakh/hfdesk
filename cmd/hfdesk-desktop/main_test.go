@@ -105,3 +105,58 @@ func TestParseServiceHelperCommandAcceptsTheLegitimateInvocations(t *testing.T) 
 		}
 	}
 }
+
+// TestParseHostOptionsRejectsUnconsumedArguments proves the host path applies
+// the same fail-closed rule as the helper: flag parsing stops at the first
+// value that is not a flag, so every flag behind it would be silently dropped
+// and the host would start with options the command line never applied. Both
+// a stray value before a flag and the values after "--" are rejected by name.
+func TestParseHostOptionsRejectsUnconsumedArguments(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"--port", "8765", "stray"}, want: "stray"},
+		{args: []string{"stray"}, want: "stray"},
+		{args: []string{"--port", "8765", "--", "--no-open"}, want: "--no-open"},
+	} {
+		_, usage, err := parseHostOptions(tc.args)
+		if err == nil {
+			t.Errorf("parseHostOptions(%q) accepted a command line with unconsumed arguments", tc.args)
+			continue
+		}
+		if !strings.Contains(err.Error(), "was not consumed") || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("the error %q does not name the unconsumed arguments %q", err, tc.want)
+		}
+		if !strings.Contains(usage, "Usage: hfdesk-desktop") {
+			t.Errorf("the usage %q does not carry the usage text", usage)
+		}
+	}
+}
+
+// TestParseHostOptionsAcceptsTheLegitimateInvocations keeps the supported host
+// command lines green: no arguments, ordinary flags, and the flag-error path
+// that reports its own usage.
+func TestParseHostOptionsAcceptsTheLegitimateInvocations(t *testing.T) {
+	opts, _, err := parseHostOptions(nil)
+	if err != nil {
+		t.Fatalf("an empty command line was rejected: %v", err)
+	}
+	if opts.Port != 8080 {
+		t.Errorf("the default port is %d, want 8080", opts.Port)
+	}
+	opts, _, err = parseHostOptions([]string{"--port", "9090", "--no-open"})
+	if err != nil {
+		t.Fatalf("an ordinary command line was rejected: %v", err)
+	}
+	if opts.Port != 9090 || !opts.NoOpen {
+		t.Errorf("parsed options = %+v, want port 9090 and no-open", opts)
+	}
+	_, usage, err := parseHostOptions([]string{"--port", "not-a-number"})
+	if err == nil {
+		t.Fatal("a malformed flag value was accepted")
+	}
+	if !strings.Contains(usage, "Usage: hfdesk-desktop") {
+		t.Errorf("the usage %q does not carry the usage text of the flag error", usage)
+	}
+}

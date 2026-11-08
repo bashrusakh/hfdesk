@@ -92,12 +92,31 @@ func runWithArgs(args []string) int {
 		return 0
 	}
 
+	opts, usageText, err := parseHostOptions(args)
+	if err != nil {
+		return desktop.ReportCommandLine(err, usageText)
+	}
+
+	if err := desktop.Run(desktop.Options{App: opts, Version: Version}); err != nil {
+		// The desktop host reports its failures to the user itself, in a
+		// native message box. On a platform without a desktop host there
+		// is no message box, so the error goes to the console.
+		fmt.Fprintf(os.Stderr, "hfdesk-desktop: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// parseHostOptions reads the options of the desktop host and rejects arguments
+// flag parsing did not consume.
+//
+// The usage is collected on its own: the desktop host shows a command line
+// problem in a message box, and the box shows the error and the usage. The
+// output of the flag package is discarded, so the error is not reported a
+// second time.
+func parseHostOptions(args []string) (app.Options, string, error) {
 	var opts app.Options
 
-	// The usage is collected on its own: the desktop host shows the
-	// command line problem in a message box, and the box shows the error
-	// and the usage. The output of the flag package is discarded, so the
-	// error is not reported a second time.
 	var usageText bytes.Buffer
 	fs := flag.NewFlagSet("hfdesk-desktop", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -110,17 +129,18 @@ func runWithArgs(args []string) int {
 	app.RegisterFlags(fs, &opts)
 
 	if err := fs.Parse(args); err != nil {
-		return desktop.ReportCommandLine(err, usageText.String())
+		return opts, usageText.String(), err
 	}
 
-	if err := desktop.Run(desktop.Options{App: opts, Version: Version}); err != nil {
-		// The desktop host reports its failures to the user itself, in a
-		// native message box. On a platform without a desktop host there
-		// is no message box, so the error goes to the console.
-		fmt.Fprintf(os.Stderr, "hfdesk-desktop: %v\n", err)
-		return 1
+	// Fail closed like the helper: an unconsumed value means the flags
+	// behind it were dropped and the host would start without them.
+	if fs.NArg() != 0 {
+		fs.Usage()
+		return opts, usageText.String(), fmt.Errorf(
+			"the desktop host arguments are not all flags: %s was not consumed, and a value that is not a flag ends flag parsing, so the flags after it are ignored",
+			strings.Join(fs.Args(), " "))
 	}
-	return 0
+	return opts, usageText.String(), nil
 }
 
 const serviceHelperUsage = "Usage: hfdesk-desktop --service-action install --wait-pid N " +
