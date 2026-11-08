@@ -329,7 +329,7 @@ func reportServiceHandoverFailure(err error) {
 	desktopLog.Error("the desktop could not confirm the graceful service handover", "error", err)
 	showMessage(serviceFailureCaption(serviceActionInstall),
 		"HFDesk could not confirm the graceful service handover. The helper starts the service only after it receives a successful completion signal and the desktop exits.\n\n"+
-			"Read the current service state before trying again.\n\n"+err.Error(),
+			serviceStatusCommandText+"\n\n"+err.Error(),
 		windows.MB_ICONERROR)
 }
 

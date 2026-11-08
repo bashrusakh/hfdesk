@@ -1049,6 +1049,42 @@ func TestTrayServiceInstallReportsARefusedElevation(t *testing.T) {
 	}
 }
 
+// TestServiceHandoverFailureReportNamesTheStateCommand proves that the report
+// of an unconfirmed graceful handover ends its next action with the command
+// that really reads the state: the earlier wording asked the user to read the
+// service state without naming a way to do it and hinted at an unnamed retry.
+// The report keeps its result, its cause, the error of the wait and exactly
+// one next action.
+func TestServiceHandoverFailureReportNamesTheStateCommand(t *testing.T) {
+	messages := recordMessages(t)
+
+	reason := errors.New("the completion signal was never confirmed")
+	reportServiceHandoverFailure(reason)
+
+	if len(*messages) != 1 {
+		t.Fatalf("the handover failure showed %d message boxes, want one", len(*messages))
+	}
+	if caption := serviceFailureCaption(serviceActionInstall); (*messages)[0].caption != caption {
+		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
+	}
+	text := (*messages)[0].text
+	for _, want := range []string{
+		"could not confirm the graceful service handover",
+		"a successful completion signal and the desktop exits",
+		reason.Error(),
+		`"hfdesk service status"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the report %q does not mention %q", text, want)
+		}
+	}
+	for _, unwanted := range []string{"Read the current service state", "before trying again"} {
+		if strings.Contains(text, unwanted) {
+			t.Errorf("the report %q asks for %q without naming the command", text, unwanted)
+		}
+	}
+}
+
 func TestTrayServiceInstallReadinessFailureKeepsRetryAvailable(t *testing.T) {
 	stubNoServiceRegistration(t)
 	freshServiceInstallGuard(t)
