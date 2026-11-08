@@ -136,9 +136,9 @@ func TestCompleteHandoverBoundsAStalledJobsPersistence(t *testing.T) {
 	s, _ := newHandoverTestServer(t, DefaultConfig())
 
 	const budget = 50 * time.Millisecond
-	previousBudget := handoverJobsJoinBudget
-	handoverJobsJoinBudget = budget
-	t.Cleanup(func() { handoverJobsJoinBudget = previousBudget })
+	previousBudget := handoverJoinBudget
+	handoverJoinBudget = budget
+	t.Cleanup(func() { handoverJoinBudget = previousBudget })
 
 	stall := make(chan struct{})
 	t.Cleanup(func() { close(stall) })
@@ -166,6 +166,63 @@ func TestCompleteHandoverBoundsAStalledJobsPersistence(t *testing.T) {
 	// instead of joining the stalled write again.
 	if repeated := s.CompleteHandover(); repeated == nil || !errors.Is(repeated, context.DeadlineExceeded) {
 		t.Errorf("repeated handover result = %v, want the same deadline error", repeated)
+	}
+}
+
+// TestCompleteHandoverBoundsAStalledAdmittedSettingsWrite proves the drain of
+// admitted settings writes has a budget: a write that never finishes (a
+// stalled disk or network mount) must not block the handover forever, or Quit
+// would never finish, the desktop singleton would refuse every later launch,
+// and the elevated helper would abandon the attempt after its own budget. The
+// stalled drain ends inside the budget with an error, which the desktop keeps
+// as the cause of the refused handover instead of signaling success: no
+// service is installed or started for persistence that did not complete.
+func TestCompleteHandoverBoundsAStalledAdmittedSettingsWrite(t *testing.T) {
+	s, _ := newHandoverTestServer(t, DefaultConfig())
+
+	const budget = 50 * time.Millisecond
+	previousBudget := handoverJoinBudget
+	handoverJoinBudget = budget
+	t.Cleanup(func() { handoverJoinBudget = previousBudget })
+
+	// A settings mutation admitted before the seal that never finishes, like
+	// a write stuck on the storage: it releases only when the test ends.
+	if !s.beginSettingsOperation() {
+		t.Fatal("the settings mutation was not admitted before the seal")
+	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			s.settingsOps.Done()
+		}
+	}
+	t.Cleanup(release)
+
+	done := make(chan error, 1)
+	go func() { done <- s.CompleteHandover() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a stalled admitted settings write was reported as a completed handover")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("handover error = %v, want the deadline of the bounded drain", err)
+		}
+		if !strings.Contains(err.Error(), "admitted settings writes did not finish") {
+			t.Errorf("the error %q does not name the stalled settings drain", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("CompleteHandover did not return within 5s while an admitted settings write is still pending: the drain waits without a budget")
+	}
+
+	// The handover is sealed once: a repeated call reports the same outcome
+	// instead of draining again.
+	release()
+	if repeated := s.CompleteHandover(); repeated == nil ||
+		!errors.Is(repeated, context.DeadlineExceeded) ||
+		!strings.Contains(repeated.Error(), "admitted settings writes did not finish") {
+		t.Errorf("repeated handover result = %v, want the same drain deadline error", repeated)
 	}
 }
 
