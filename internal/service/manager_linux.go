@@ -1352,10 +1352,12 @@ type systemdEnvironmentFile struct {
 // The values come from the argument vector and the identity directives of the
 // unit, so an installation over an existing registration keeps what the
 // instance really runs with instead of what a command line would default to.
+// The executable names the program of the registered command, not the
+// wrapper token a recognized "env" prefix starts with.
 func registrationOptions(unit parsedUnit, scope Scope) InstallOptions {
 	opts := InstallOptions{
 		Scope:      scope,
-		Executable: unit.ExecStart,
+		Executable: unit.Program,
 		Listen:     unit.listen(),
 		Paths:      unit.paths(),
 		CacheDir:   unit.flagValue("--cache-dir"),
@@ -2236,6 +2238,15 @@ func (m *systemdManager) restartVerifyWait() time.Duration {
 // An empty executable skips only the path comparison. It does not waive the
 // requirement for a live HFDesk process. The wait is bounded by the shutdown
 // budget and the context of the installation.
+//
+// The registered command is compared program to program: the program is the
+// token at the slot of the command's shape, so a recognized "env" wrapper is
+// judged by the program it launches and never passes by its own wrapper path.
+// The supervisor's path= stays part of the comparison as the raw first word of
+// the command, which is the program of a plain command and the value a caller
+// that verifies a command by its first token (the restore of a wrapped
+// registration) passes. A command whose shape has no readable program slot
+// fails with the wrapper path named as the executable it is.
 func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable, listen, expectedVersion string) (bool, error) {
 	return m.verifyRunningExecutableWithListenSource(ctx, executable, listen, expectedVersion, false)
 }
@@ -2243,6 +2254,7 @@ func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable
 func (m *systemdManager) verifyRunningExecutableWithListenSource(ctx context.Context, executable, listen, expectedVersion string, dynamicListen bool) (bool, error) {
 	budget := m.restartVerifyWait()
 	deadline := time.Now().Add(budget)
+	expectedProgram := systemdLoadedExecutablePath(executable)
 	address := ""
 	if !dynamicListen {
 		address = probeServiceAddress(listen)
@@ -2258,12 +2270,16 @@ func (m *systemdManager) verifyRunningExecutableWithListenSource(ctx context.Con
 		} else {
 			show := parseSystemdShow(out)
 			path := execStartPath(out)
-			programMatches := show.State == StateRunning && (executable == "" || path == systemdLoadedExecutablePath(executable))
+			program, programReadable := execStartProgram(out)
+			programMatches := show.State == StateRunning && (executable == "" ||
+				program == expectedProgram || path == expectedProgram)
 			switch {
 			case !programMatches && executable == "":
 				detail = fmt.Sprintf("the supervisor reports the state %q", show.State)
+			case !programMatches && !programReadable:
+				detail = fmt.Sprintf("the supervisor reports the state %q with the executable %q of a command whose program slot cannot be read", show.State, path)
 			case !programMatches:
-				detail = fmt.Sprintf("the supervisor reports the state %q with the program %q", show.State, path)
+				detail = fmt.Sprintf("the supervisor reports the state %q with the program %q", show.State, program)
 			default:
 				// Active unit metadata is not a running process: RemainAfterExit
 				// can report active with MainPID=0. Use systemd's main process and
@@ -2292,7 +2308,7 @@ func (m *systemdManager) verifyRunningExecutableWithListenSource(ctx context.Con
 					if executable == "" {
 						detail = fmt.Sprintf("the supervisor reports the state %q, but the instance does not answer on %s: %v", show.State, address, probeErr)
 					} else {
-						detail = fmt.Sprintf("the supervisor reports the state %q with the program %q, but the instance does not answer on %s: %v", show.State, path, address, probeErr)
+						detail = fmt.Sprintf("the supervisor reports the state %q with the program %q, but the instance does not answer on %s: %v", show.State, program, address, probeErr)
 					}
 				} else {
 					confirmedOptions, confirmedPID, confirmErr := m.runtimeRunOptions(ctx)
@@ -2370,6 +2386,63 @@ func trimExecStartPath(value string) string {
 		return value[1 : len(value)-1]
 	}
 	return value
+}
+
+// execStartProgram returns the program of the registered command the
+// supervisor reports and whether the command's shape made a program slot
+// readable.
+//
+// The rule is the slot model of the update: the words come from the argv[] of
+// the property, and the program is the token behind a recognized "env"
+// prefix, the first word of a plain command. A shape the slot model does not
+// recognize has no readable program: the executed binary (path=) is returned
+// as the only program fact the supervisor gives, flagged unreadable, so a
+// wrapper never passes as the program it launches while a failure can still
+// name the wrapper as the executable it is. Without an argument vector the
+// executed binary alone is the observable command.
+func execStartProgram(output string) (program string, readable bool) {
+	path := execStartPath(output)
+	tokens := execStartArgvWords(output)
+	if len(tokens) == 0 {
+		tokens = []systemdWord{{source: path, value: path}}
+	}
+	slot, ok := systemdExecStartSlot(tokens)
+	if !ok {
+		return path, false
+	}
+	return tokens[slot].value, true
+}
+
+// execStartArgvWords returns the words of the argv[] field of the ExecStart
+// property, or nil when the property carries no vector. The display joins the
+// vector with spaces: the words are that joined form split back on
+// whitespace, which is exact for the words a registration writes; a boundary
+// the display itself cannot prove leaves the command unreadable instead of
+// guessed.
+func execStartArgvWords(output string) []systemdWord {
+	for _, line := range strings.Split(output, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || strings.TrimSpace(key) != "ExecStart" {
+			continue
+		}
+		_, rest, ok := strings.Cut(strings.TrimSpace(value), "argv[]=")
+		if !ok {
+			return nil
+		}
+		for _, end := range []string{" ;", " }"} {
+			if i := strings.Index(rest, end); i >= 0 {
+				rest = rest[:i]
+				break
+			}
+		}
+		rest = strings.TrimSuffix(rest, "}")
+		var words []systemdWord
+		for _, word := range strings.Fields(rest) {
+			words = append(words, systemdWord{source: word, value: word})
+		}
+		return words
+	}
+	return nil
 }
 
 // preflight rejects an installation the supervisor demonstrably cannot run:
@@ -3333,7 +3406,9 @@ func (m *systemdManager) Status(ctx context.Context) (Status, error) {
 	}
 
 	unit := parseUnit(string(content))
-	status.Executable = unit.ExecStart
+	// The status names the program the registration points at: behind a
+	// recognized wrapper the program is judged, not the wrapper token.
+	status.Executable = unit.Program
 	status.Listen = unit.listen()
 	status.Paths = unit.paths()
 	// The cache root of the instance is the cache dir of the config file
@@ -4263,6 +4338,13 @@ type parsedUnit struct {
 	DynamicRunArgs   map[string]bool
 	// ExecArgs are the arguments of the executable.
 	ExecArgs []string
+	// Program is the program of the registered command: the token at the
+	// program slot of systemdExecStartSlot — behind a recognized "env"
+	// wrapper the program the wrapper launches, for every other shape the
+	// first token, which is the binary the supervisor executes. An
+	// unreadable command therefore names its executed binary, never a
+	// guessed program.
+	Program string
 	// RunOffset is the index of the canonical run vector ("service run")
 	// in ExecArgs. It skips the words of a recognized wrapper prefix (env
 	// options and NAME=VALUE assignments before the program), so the run
@@ -4362,6 +4444,9 @@ func parseUnit(content string) parsedUnit {
 			unit.DynamicRunArgs = dynamicRunArgValues(tokens[1+runOffset:])
 			unit.ExecStart = words[0]
 			unit.ExecArgs = words[1:]
+			// The program of the command sits at the same slot; an
+			// unrecognized shape keeps the first token.
+			unit.Program = words[runOffset]
 		case "WorkingDirectory":
 			unit.WorkingDirectory, unit.WorkingDirectoryDynamic = parseSystemdWorkingDirectory(value)
 		case "User":

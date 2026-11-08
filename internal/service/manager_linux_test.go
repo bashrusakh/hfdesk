@@ -4691,6 +4691,76 @@ func TestSystemdExecStartPath(t *testing.T) {
 	}
 }
 
+// TestSystemdExecStartProgram checks the program of the registered command
+// as the supervisor reports it: the slot model reads the program behind a
+// recognized wrapper, keeps the executed binary of a plain command, and
+// reports a command without a readable program slot as unreadable instead of
+// guessing — including a vector whose word boundaries the display lost.
+func TestSystemdExecStartProgram(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		output   string
+		program  string
+		readable bool
+	}{
+		{
+			name:     "a plain command",
+			output:   "ExecStart={ path=/opt/hfdesk/bin/hfdesk ; argv[]=/opt/hfdesk/bin/hfdesk service run --listen 127.0.0.1:19090 ; ignore_errors=no }\n",
+			program:  "/opt/hfdesk/bin/hfdesk",
+			readable: true,
+		},
+		{
+			name:     "a recognized env wrapper",
+			output:   "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env -i HF_HOME=/srv/hfdesk /opt/hfdesk/hfdesk service run --listen 127.0.0.1:19090 ; ignore_errors=no }\n",
+			program:  "/opt/hfdesk/hfdesk",
+			readable: true,
+		},
+		{
+			name:     "a wrapper shape without a program slot",
+			output:   "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env bare-word /opt/hfdesk/hfdesk service run ; ignore_errors=no }\n",
+			program:  "/usr/bin/env",
+			readable: false,
+		},
+		{
+			name:     "a vector whose word boundaries the display lost",
+			output:   "ExecStart={ path=\"/srv/HF Desk/bin/hfdesk\" ; argv[]=/srv/HF Desk/bin/hfdesk service run ; ignore_errors=no }\n",
+			program:  "/srv/HF Desk/bin/hfdesk",
+			readable: false,
+		},
+		{
+			name:     "the executed binary alone",
+			output:   "ExecStart={ path=/opt/hf desk/bin/hfdesk }\n",
+			program:  "/opt/hf desk/bin/hfdesk",
+			readable: true,
+		},
+		{
+			name:     "a property without a vector",
+			output:   "ExecStart={ path=/bin/true ; ignore_errors=no }\n",
+			program:  "/bin/true",
+			readable: true,
+		},
+		{
+			name:     "an empty property",
+			output:   "ExecStart={ path= ; argv[]= }\n",
+			program:  "",
+			readable: true,
+		},
+		{
+			name:     "no property at all",
+			output:   "LoadState=not-found\n",
+			program:  "",
+			readable: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			program, readable := execStartProgram(tc.output)
+			if program != tc.program || readable != tc.readable {
+				t.Errorf("execStartProgram(%q) = (%q, %t), want (%q, %t)", tc.output, program, readable, tc.program, tc.readable)
+			}
+		})
+	}
+}
+
 // TestSystemdRestartVerifyWaitIsTheShutdownBudget checks that the verification
 // of a restarted instance is bounded by the shutdown budget of the service
 // layer, so the wait covers the orderly shutdown of the old process.
@@ -5770,7 +5840,14 @@ show)
 			executable="$HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_SECOND_RESTART"
 		fi
 	fi
-	if [ -n "$executable" ]; then
+	if [ -n "$HFDESK_TEST_SYSTEMCTL_EXEC_START" ]; then
+		# The registered command as systemd reports it: the first word is
+		# the executed path=, the whole vector the argv[]= the program
+		# slot is read from.
+		command="$HFDESK_TEST_SYSTEMCTL_EXEC_START"
+		path="${command%% *}"
+		printf 'ExecStart={ path=%s ; argv[]=%s ; ignore_errors=no }\n' "$path" "$command"
+	elif [ -n "$executable" ]; then
 		printf 'ExecStart={ path=%s }\n' "$executable"
 	fi
 	exit 0
@@ -6547,6 +6624,81 @@ func TestSystemdInstallRepairsAnEnvWrappedExecStart(t *testing.T) {
 	}
 }
 
+// TestSystemdUpdateOfARunningEnvWrappedExecStartPassesVerification checks
+// the verification a stopped instance never reaches: a running registration
+// whose command carries a recognized "env" wrapper is rewritten onto the new
+// program, restarted, and accepted. The supervisor reports the wrapper as the
+// path it executes, so the verification must compare the program slot of the
+// registered command — comparing the wrapper path would burn the wait, report
+// a failure and roll the update back although env really started the new
+// program.
+func TestSystemdUpdateOfARunningEnvWrappedExecStartPassesVerification(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+	previous.Listen = "127.0.0.1:" + strconv.Itoa(freePort(t))
+	for _, dir := range []string{filepath.Dir(previous.Paths.ConfigFile), previous.Paths.StateDir, previous.Paths.LogDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	_, tail, _ := splitRenderedExecStart(t, previousUnit, oldExecutable)
+	wrapped := systemdWrapExecStart(t, previousUnit, oldExecutable, "/usr/bin/env HF_HOME=/srv/hfdesk "+oldExecutable+tail)
+	for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
+		if err := os.WriteFile(name, []byte(wrapped), 0o644); err != nil {
+			t.Fatalf("write the wrapped unit %q: %v", name, err)
+		}
+	}
+	process := startSystemdRegisteredProcess(t, previous, "fixture-version")
+	restartCount := filepath.Join(root, "restart-count")
+	systemdRuntimePropertyReader(t, m, process.Process.Pid, process.Process.Pid, restartCount)
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_RESTART_COUNT", restartCount)
+	previousProbe := serviceReadinessProbe
+	serviceReadinessProbe = probeServiceReady
+	t.Cleanup(func() { serviceReadinessProbe = previousProbe })
+	previousInstallProbe := serviceInstallProbe
+	var probedListen []string
+	serviceInstallProbe = func(listen, expectedVersion string) (bool, error) {
+		probedListen = append(probedListen, listen)
+		return previousInstallProbe(listen, expectedVersion)
+	}
+	t.Cleanup(func() { serviceInstallProbe = previousInstallProbe })
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+	// The supervisor reports the loaded command of the rewrite: the
+	// wrapper path with the new program behind it.
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXEC_START", "/usr/bin/env HF_HOME=/srv/hfdesk "+newExecutable+tail)
+
+	if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
+		t.Fatalf("Install() = %v, want the running env-wrapped update accepted without rollback", err)
+	}
+	if !slices.Equal(probedListen, []string{previous.Listen}) {
+		t.Errorf("readiness probes = %v, want the registered address %q", probedListen, previous.Listen)
+	}
+
+	content, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("read the updated unit: %v", err)
+	}
+	want := `ExecStart=/usr/bin/env HF_HOME=/srv/hfdesk "` + newExecutable + `"` + tail
+	if !strings.Contains(string(content), want) {
+		t.Errorf("the updated unit does not hold the promised command %q:\n%s", want, content)
+	}
+	if strings.Contains(string(content), oldExecutable) {
+		t.Errorf("the updated unit still names the old program %q:\n%s", oldExecutable, content)
+	}
+	// A failed verification would restore the previous registration and
+	// restart the previous instance: exactly one restart is the update.
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 1 {
+		t.Errorf("the unit was restarted %d times, want exactly once for the accepted update:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
 // TestSystemdWrapperRegistrationReportsPreservedRunFlags checks that the
 // options read back from a recognized wrapper form are the flags the
 // instance really runs with: registrationOptions and the effective options
@@ -6583,6 +6735,9 @@ WorkingDirectory=/srv/state
 			if pair.got != pair.want {
 				t.Errorf("%s = %q, want the registered %q", pair.name, pair.got, pair.want)
 			}
+		}
+		if got.Executable != "/opt/hfdesk/hfdesk" {
+			t.Errorf("executable = %q, want the program of the wrapped command, not the wrapper token", got.Executable)
 		}
 	})
 
@@ -6628,6 +6783,13 @@ WorkingDirectory=/srv/state
 		}
 		if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 0 {
 			t.Errorf("the stopped instance was restarted %d times", got)
+		}
+	})
+
+	t.Run("the status names the program of the wrapped command", func(t *testing.T) {
+		status := systemdStatusOf(t, "/usr/bin/env", "HF_HOME=/srv/hfdesk", "/bin/true", "service", "run", "--listen", "127.0.0.1:19090")
+		if status.Executable != "/bin/true" {
+			t.Errorf("the executable = %q, want the program %q behind the wrapper, not the wrapper token", status.Executable, "/bin/true")
 		}
 	})
 }
@@ -7550,6 +7712,56 @@ func TestSystemdStaticReadinessRequiresLiveStableMatchingMainPID(t *testing.T) {
 	}
 }
 
+// TestSystemdVerifyRejectsAnUnintendedWrappedCommand checks the negative side
+// of the program comparison behind a wrapper: a wrapper that launches another
+// program fails with that program named as the detail, and a wrapper shape
+// whose program slot cannot be read fails while naming only the executable it
+// found — the wrapper path is evidence, never the program verdict.
+func TestSystemdVerifyRejectsAnUnintendedWrappedCommand(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command string
+		want    []string
+		wantNot []string
+	}{
+		{
+			name:    "another program behind the wrapper",
+			command: "/usr/bin/env HF_HOME=/srv/hfdesk /opt/hfdesk-other/hfdesk service run --listen 127.0.0.1:19090",
+			want:    []string{`with the program "/opt/hfdesk-other/hfdesk"`},
+		},
+		{
+			name:    "a wrapper shape without a readable program slot",
+			command: "/usr/bin/env bare-word /opt/hfdesk/hfdesk service run --listen 127.0.0.1:19090",
+			want:    []string{`with the executable "/usr/bin/env"`, "program slot cannot be read"},
+			wantNot: []string{"with the program"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = systemdRecordingSupervisor(t)
+			executable := systemdTestExecutable(t)
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", executable)
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_EXEC_START", tc.command)
+			manager := &systemdManager{scope: ScopeUser, restartWait: 20 * time.Millisecond}
+
+			_, err := manager.verifyRunningExecutable(context.Background(), executable, "127.0.0.1:19090", "fixture-version")
+			if err == nil {
+				t.Fatal("verifyRunningExecutable() = nil, want the wrapped command rejected")
+			}
+			for _, want := range append([]string{"does not run", executable}, tc.want...) {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("verification error = %q, want it to contain %q", err, want)
+				}
+			}
+			for _, not := range tc.wantNot {
+				if strings.Contains(err.Error(), not) {
+					t.Errorf("verification error = %q, want it not to contain %q", err, not)
+				}
+			}
+		})
+	}
+}
+
 func TestSystemdReadinessAcceptsLiveScriptWrapperWithHFDeskArgs(t *testing.T) {
 	_ = systemdRecordingSupervisor(t)
 	root := t.TempDir()
@@ -7609,6 +7821,51 @@ func TestSystemdReadinessAcceptsLiveScriptWrapperWithHFDeskArgs(t *testing.T) {
 	if err != nil || !verified {
 		t.Fatalf("verifyRunningExecutable() = (%t, %v), want the script wrapper's live HFDesk process; stderr: %s", verified, err, stderr.String())
 	}
+}
+
+// TestSystemdWrappedRegisteredCommandKeepsTheRuntimeChecks checks the second
+// fact of the verification behind a recognized wrapper: when the program slot
+// of the registered command matches, the live process still has to be the
+// HFDesk instance the readiness probe accepts — a stale process that reports
+// another version is rejected — and a caller that verifies the command by its
+// raw first token, as the restore of a wrapped registration does, still
+// matches the executed wrapper path.
+func TestSystemdWrappedRegisteredCommandKeepsTheRuntimeChecks(t *testing.T) {
+	setup := func(t *testing.T, processVersion string) (*systemdManager, string, string) {
+		t.Helper()
+		_ = systemdRecordingSupervisor(t)
+		listen := "127.0.0.1:" + strconv.Itoa(freePort(t))
+		process := startSystemdRuntimeProcess(t, filepath.Join(t.TempDir(), "runtime"), listen, processVersion)
+		executable := systemdTestExecutable(t)
+		t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
+		t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", executable)
+		t.Setenv("HFDESK_TEST_SYSTEMCTL_EXEC_START",
+			"/usr/bin/env HF_HOME=/srv/hfdesk "+executable+" service run --listen "+listen)
+		manager := &systemdManager{
+			scope:       ScopeUser,
+			restartWait: time.Second,
+			readServiceProperties: func(context.Context, string) (map[string]dbus.Variant, error) {
+				return map[string]dbus.Variant{"MainPID": dbus.MakeVariant(uint32(process.Process.Pid))}, nil
+			},
+		}
+		return manager, listen, executable
+	}
+
+	t.Run("a stale process that reports another version is rejected", func(t *testing.T) {
+		manager, listen, executable := setup(t, "old-version")
+		_, err := manager.verifyRunningExecutable(context.Background(), executable, listen, "fixture-version")
+		if err == nil || !strings.Contains(err.Error(), "does not run the expected version") {
+			t.Fatalf("verification error = %v, want the version rejection of the stale process", err)
+		}
+	})
+
+	t.Run("the raw first token of the command still matches", func(t *testing.T) {
+		manager, listen, _ := setup(t, "fixture-version")
+		verified, err := manager.verifyRunningExecutable(context.Background(), "/usr/bin/env", listen, "fixture-version")
+		if err != nil || !verified {
+			t.Fatalf("verifyRunningExecutable() = (%t, %v), want the raw wrapper-path expectation of the restore path accepted; stderr error: %v", verified, err, err)
+		}
+	})
 }
 
 func TestSystemdRuntimeListenProcessFixture(t *testing.T) {
