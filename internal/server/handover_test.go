@@ -4,6 +4,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -121,6 +122,50 @@ func TestCompleteHandoverDoesNotAdmitAnUnvalidatedBody(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("generation-zero startup override was written: %v", err)
+	}
+}
+
+// TestCompleteHandoverBoundsAStalledJobsPersistence proves the join of the
+// job-manager close coordinator has a budget: a final jobs-state write that
+// never completes must not block the handover forever, or Quit would never
+// finish, the desktop singleton would refuse every later launch, and the
+// elevated helper would abandon the attempt after its own budget. The stalled
+// attempt completes inside the budget with an error, which the desktop keeps
+// as the cause of the refused handover instead of signaling success.
+func TestCompleteHandoverBoundsAStalledJobsPersistence(t *testing.T) {
+	s, _ := newHandoverTestServer(t, DefaultConfig())
+
+	const budget = 50 * time.Millisecond
+	previousBudget := handoverJobsJoinBudget
+	handoverJobsJoinBudget = budget
+	t.Cleanup(func() { handoverJobsJoinBudget = previousBudget })
+
+	stall := make(chan struct{})
+	t.Cleanup(func() { close(stall) })
+	s.jobs.persistStateFile = func(string, []*Job) error {
+		<-stall
+		return nil
+	}
+
+	start := time.Now()
+	err := s.CompleteHandover()
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("a stalled jobs persistence was reported as a completed handover")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("handover error = %v, want the deadline of the bounded join", err)
+	}
+	if !strings.Contains(err.Error(), "final jobs state was not persisted") {
+		t.Errorf("the error %q does not name the stalled persistence", err)
+	}
+	if elapsed > time.Second {
+		t.Errorf("CompleteHandover returned after %s, want the %s join budget", elapsed, budget)
+	}
+	// The handover is sealed once: a repeated call reports the same outcome
+	// instead of joining the stalled write again.
+	if repeated := s.CompleteHandover(); repeated == nil || !errors.Is(repeated, context.DeadlineExceeded) {
+		t.Errorf("repeated handover result = %v, want the same deadline error", repeated)
 	}
 }
 
