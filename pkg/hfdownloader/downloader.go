@@ -156,12 +156,18 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	useHFCache := cfg.CacheDir != "" || cfg.OutputDir == ""
 	var hfCache *HFCache
 	var repoDir *RepoDir
+	var ownership *ownershipRealm
+	var friendlyOwnership *ownershipRealm
 
 	if useHFCache {
 		var err error
 		hfCache, err = cfg.BuildHFCache()
 		if err != nil {
 			return fmt.Errorf("build hf cache: %w", err)
+		}
+		ownership, err = hfCache.ownershipRealmForDataContext(ctx)
+		if err != nil {
+			return fmt.Errorf("resolve ownership realm: %w", err)
 		}
 		repoType := RepoTypeModel
 		if job.IsDataset {
@@ -186,6 +192,18 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	} else {
 		if cfg.OutputDir == "" {
 			cfg.OutputDir = "Storage"
+		}
+		ownerDir, err := resolveOwnershipDir(cfg.OwnershipDir)
+		if err != nil {
+			return fmt.Errorf("resolve ownership realm: %w", err)
+		}
+		cfg.OwnershipDir = ownerDir
+		ownership, err = newOwnershipRealm(ownerDir)
+		if err != nil {
+			return fmt.Errorf("open ownership realm: %w", err)
+		}
+		if err := validateOwnershipRealmOutside(ownership, cfg.OutputDir); err != nil {
+			return err
 		}
 	}
 
@@ -240,7 +258,7 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 				return failBranchVariant(fmt.Errorf("resolve branch variant space: %w", err))
 			}
 			localSpace = &space
-			if err := space.InvalidateRecords(job.Revision); err != nil {
+			if err := invalidateBranchVariantRecordsWithOwnership(ctx, ownership, space, job.Revision); err != nil {
 				return failBranchVariant(fmt.Errorf("invalidate prior branch variant completion records: %w", err))
 			}
 			if err := space.ensureStagingTree(job.Revision, plan.Commit); err != nil {
@@ -249,6 +267,12 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		}
 	}
 	friendlyView := !cfg.NoFriendlyView && !job.BranchVariant
+	if useHFCache && friendlyView {
+		friendlyOwnership, err = hfCache.ownershipRealmForFriendlyContext(ctx)
+		if err != nil {
+			return fmt.Errorf("resolve friendly-view ownership realm: %w", err)
+		}
+	}
 	if !plan.CommitPinned {
 		emit(ProgressEvent{Level: "warn", Event: "warning", Message: "revision is not pinned to an immutable commit; partial bytes will not be resumed across calls and cache metadata is revision-addressed"})
 	}
@@ -275,13 +299,12 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		}
 		emit(ProgressEvent{Event: "plan_item", Path: displayRel, Total: item.Size})
 	}
-
 	if !useHFCache {
 		base, err := localDownloadBase(job, cfg, localSpace)
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(base, 0o755); err != nil {
+		if err := ownership.ensureDirectories(ctx, []string{base}, blobOwnershipWaitBudget); err != nil {
 			return err
 		}
 	}
@@ -413,10 +436,6 @@ LOOP:
 							return false, "", fmt.Errorf("check %s: %w", finalRel, err)
 						}
 						if status == BlobComplete {
-							// The cached payload is insufficient if its requested links fail.
-							if err := cacheEntryLinkCreate(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, !friendlyView); err != nil {
-								return false, "", err
-							}
 							return true, "blob exists", nil
 						}
 						if status == BlobDownloading {
@@ -490,14 +509,6 @@ LOOP:
 				}
 			}
 
-			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-				return
-			}
-
 			alreadyOK, reason, err := skipCheck()
 			if err != nil {
 				select {
@@ -506,7 +517,7 @@ LOOP:
 				}
 				return
 			}
-			if alreadyOK {
+			if alreadyOK && !useHFCache {
 				recordSkippedBlobLink(it, finalRel, filterSubdir)
 				if _, loaded := skipOnce.LoadOrStore(finalRel, struct{}{}); !loaded {
 					emit(ProgressEvent{Event: "file_done", Path: finalRel, Message: "skip (" + reason + ")"})
@@ -524,31 +535,11 @@ LOOP:
 				return
 			}
 
-			// Register the per-file destination with the caller's in-flight
-			// tracker before any bytes hit disk. If the goroutine exits
-			// (cancel, pause, error) before the matching finalize call below,
-			// the dst stays in the caller's set and is the exact set of
-			// partial files the caller may safely remove.
-			if cfg.OnPartialFile != nil {
-				cfg.OnPartialFile(dst, false)
-			}
-
-			emit(ProgressEvent{Event: "file_start", Path: finalRel, Total: it.Size})
-			downloadLog.Info("file download started",
-				"repo", job.Repo,
-				"path", finalRel,
-				"bytes", it.Size,
-			)
-
 			itForIO := it
 			itForIO.RelativePath = finalRel
 
-			// Canonical-digest multipart items stage directly at the future blob;
-			// other transfers use the temp-and-store path.
 			blobDirect := useHFCache && canonicalSHA256(it.SHA256)
 			var mpOpts multipartOpts
-			// Resume identity uses the resolved plan commit, not a mutable branch name.
-			// An unresolved revision is unpinned and cannot authorize inherited bytes.
 			mpOpts.Commit = plan.Commit
 			mpOpts.CommitPinned = plan.CommitPinned
 			versionedStaging := dst + ".incomplete"
@@ -561,8 +552,78 @@ LOOP:
 				mpOpts.ContentAddressed = true
 				versionedStaging = mpOpts.Staging
 			}
-			// Keep ranged-capable items on multipart when current-format resume
-			// state exists; unsupported formats restart from zero.
+			var (
+				dlErr  error
+				domain *blobDomain
+			)
+			key, domainDst, proofPath, ownershipPaths, pathErr := downloadOwnershipPaths(useHFCache, repoDir, dst, publishPath, it)
+			if pathErr != nil {
+				dlErr = pathErr
+			} else {
+				domain, dlErr = acquireBlobDomainScoped(fileCtx, key, domainDst, ownership, ownershipPaths, proofPath)
+				if errors.Is(dlErr, errStagingOwnershipBusy) || errors.Is(dlErr, errStagingOwnershipUncertain) {
+					dlErr = blobOwnershipScopeError(it.SHA256, finalRel, dlErr)
+				} else if dlErr != nil {
+					dlErr = fmt.Errorf("acquire the ownership domain of %s: %w", finalRel, dlErr)
+				} else {
+					defer domain.release()
+					mpOpts.Domain = domain
+				}
+			}
+
+			if dlErr == nil && useHFCache && it.SHA256 != "" {
+				if _, statErr := os.Stat(repoDir.BlobPath(it.SHA256)); statErr == nil {
+					dlErr = errBlobAlreadyComplete
+				} else if !errors.Is(statErr, os.ErrNotExist) {
+					dlErr = fmt.Errorf("re-check blob %s: %w", it.SHA256, statErr)
+				}
+			}
+			if alreadyOK && dlErr == nil {
+				// A cache skip candidate that vanished before admission must transfer.
+				alreadyOK = false
+			}
+
+			if errors.Is(dlErr, errBlobAlreadyComplete) {
+				if err := createCacheEntryLinksScoped(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, !friendlyView, ownership, friendlyOwnership); err != nil {
+					select {
+					case errCh <- fmt.Errorf("download %s: %w", finalRel, err):
+					default:
+					}
+					return
+				}
+				recordSkippedBlobLink(it, finalRel, filterSubdir)
+				if _, loaded := skipOnce.LoadOrStore(finalRel, struct{}{}); !loaded {
+					emit(ProgressEvent{Event: "file_done", Path: finalRel, Message: "skip (blob exists)"})
+					atomic.AddInt64(&skippedCount, 1)
+					if manifestBuilder != nil {
+						manifestMu.Lock()
+						manifestBuilder.AddFile(it.RelativePath, it.SHA256, it.Size, it.LFS)
+						manifestMu.Unlock()
+					}
+				}
+				return
+			}
+			if dlErr != nil {
+				if errors.Is(dlErr, errBlobIncompleteOwned) && !errors.Is(dlErr, ErrStagingOwnershipUnproven) {
+					dlErr = blobLiveOwnerError(it.SHA256, finalRel)
+				}
+				fatal := fmt.Errorf("download %s: %w", finalRel, dlErr)
+				if errors.Is(dlErr, context.Canceled) || errors.Is(dlErr, context.DeadlineExceeded) {
+					downloadLog.Info("file download cancelled", "repo", job.Repo, "path", finalRel)
+				} else {
+					downloadLog.Error("file download failed", "repo", job.Repo, "path", finalRel, "error", dlErr)
+				}
+				if isFailFastError(dlErr) {
+					setFatalErr(fatal)
+				}
+				select {
+				case errCh <- fatal:
+				default:
+				}
+				return
+			}
+
+			// The domain is held before resume inspection, HEAD, or claim access.
 			resumeStaging := ""
 			if hasResumableStagingState(versionedStaging, versionedStaging+".meta", itForIO, job, plan.Commit, plan.CommitPinned) {
 				resumeStaging = versionedStaging
@@ -571,68 +632,19 @@ LOOP:
 			if !multipartRan && it.AcceptRanges && resumeStaging != "" {
 				multipartRan = true
 			}
-			// Without range support, warn and remove versioned state only after
-			// durable single-path completion.
 			obsoleteVersionedStaging := ""
 			if !it.AcceptRanges && resumeStaging != "" {
 				obsoleteVersionedStaging = resumeStaging
-			}
-			if !it.AcceptRanges && resumeStaging != "" {
 				emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf(
 					"resume state for %s cannot be used without HTTP range support; downloading the full file and attempting to discard the obsolete state after success",
 					finalRel)})
 			}
 
-			// Acquire one destination domain for all routes and cleanup. Cache keys
-			// derive from the temp name (tmp-<sha> or non-canonical tmp-path-); flat
-			// mode uses the persistent .incomplete.lock sibling. The claim reuses
-			// this fence, and waiters release their transfer slot. See doc.go.
-			var (
-				dlErr  error
-				domain *blobDomain
-			)
-			if useHFCache {
-				key, keyed := cacheDstDomainKey(dst)
-				if !keyed {
-					dlErr = fmt.Errorf("resolve the ownership domain of %s: the destination is not a cache staging name", finalRel)
-				} else {
-					dom, derr := blobDomainAcquire(fileCtx, key, dst)
-					switch {
-					case derr == nil:
-						domain = dom
-						defer domain.release()
-						mpOpts.Domain = domain
-						// Only a known digest supplies a target to re-check after waiting;
-						// otherwise transfer and let the store reuse any resulting blob.
-						if it.SHA256 != "" {
-							blobPath := repoDir.BlobPath(it.SHA256)
-							if _, serr := os.Stat(blobPath); serr == nil {
-								dlErr = errBlobAlreadyComplete
-							}
-						}
-					case errors.Is(derr, errStagingOwnershipBusy):
-						dlErr = blobLiveOwnerError(it.SHA256, finalRel)
-					default:
-						// Never transfer without the ownership fence; preserve prior partials.
-						dlErr = fmt.Errorf("acquire the ownership domain of %s: %w", finalRel, derr)
-					}
-				}
-			} else {
-				// Both flat transfer routes and cleanup share this persistent sibling lock.
-				flatDom := newFlatDestinationDomain(dst)
-				dom, derr := blobDomainAcquire(fileCtx, flatDom.key, flatDom.lockSrc)
-				switch {
-				case derr == nil:
-					domain = dom
-					defer domain.release()
-					mpOpts.Domain = domain
-				case errors.Is(derr, errStagingOwnershipBusy):
-					dlErr = blobLiveOwnerError(it.SHA256, finalRel)
-				default:
-					// Never transfer without the ownership fence; preserve prior partials.
-					dlErr = fmt.Errorf("acquire the ownership domain of %s: %w", finalRel, derr)
-				}
+			if cfg.OnPartialFile != nil {
+				cfg.OnPartialFile(dst, false)
 			}
+			emit(ProgressEvent{Event: "file_start", Path: finalRel, Total: it.Size})
+			downloadLog.Info("file download started", "repo", job.Repo, "path", finalRel, "bytes", it.Size)
 
 			directBlobPublished := blobDirect
 			if blobDirect && multipartRan {
@@ -657,7 +669,7 @@ LOOP:
 
 			if errors.Is(dlErr, errBlobAlreadyComplete) {
 				if useHFCache && it.SHA256 != "" {
-					if err := cacheEntryLinkCreate(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, !friendlyView); err != nil {
+					if err := createCacheEntryLinksScoped(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, !friendlyView, ownership, friendlyOwnership); err != nil {
 						fatal := fmt.Errorf("download %s: %w", finalRel, err)
 						select {
 						case errCh <- fatal:
@@ -813,7 +825,7 @@ LOOP:
 			case blobDirect && multipartRan:
 				// The ranged route already published the blob; create its required cache
 				// links. NoFriendlyView omits only the friendly entry, not the snapshot.
-				if err := cacheEntryLinkCreate(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, !friendlyView); err != nil {
+				if err := createCacheEntryLinksScoped(fileCtx, repoDir, plan.Commit, it.RelativePath, filterSubdir, it.SHA256, !friendlyView, ownership, friendlyOwnership); err != nil {
 					select {
 					case errCh <- fmt.Errorf("store file %s: %w", finalRel, err):
 					default:
@@ -850,7 +862,7 @@ LOOP:
 			// After successful single-path fallback, attempt claim-checked cleanup of
 			// obsolete ranged state while the destination domain is still held.
 			if obsoleteVersionedStaging != "" {
-				removeStagingArtifactsIfUnowned(obsoleteVersionedStaging, obsoleteVersionedStaging+".meta")
+				removeStagingArtifactsIfUnowned(obsoleteVersionedStaging, obsoleteVersionedStaging+".meta", domain)
 			}
 
 			// File is now at its final location; the partial (dst in HF
@@ -897,9 +909,23 @@ LOOP:
 			if cerr != nil || status != BlobComplete {
 				continue
 			}
-			if err := cacheEntryLinkCreate(jobCtx, repoDir, link.commit, link.relativePath, link.filterSubdir, link.sha256, !friendlyView); err != nil {
+			blobPath := repoDir.BlobPath(link.sha256)
+			domainDst, derr := repoDir.blobDomainDst(link.sha256)
+			if derr == nil {
+				var domain *blobDomain
+				domain, derr = acquireBlobDomainScoped(jobCtx, blobPath, domainDst, ownership, []string{blobPath}, blobPath)
+				if derr == nil {
+					if _, statErr := os.Stat(blobPath); statErr != nil {
+						derr = fmt.Errorf("%w: blob %s disappeared before link reconciliation: %w", ErrCacheLinkUnreachable, link.sha256, statErr)
+					} else {
+						derr = createCacheEntryLinksScoped(jobCtx, repoDir, link.commit, link.relativePath, link.filterSubdir, link.sha256, !friendlyView, ownership, friendlyOwnership)
+					}
+					domain.release()
+				}
+			}
+			if derr != nil {
 				if reconcileErr == nil {
-					reconcileErr = err
+					reconcileErr = derr
 				}
 				continue
 			}
@@ -957,7 +983,13 @@ LOOP:
 			ref = "main"
 		}
 		if plan.CommitPinned {
-			if err := repoDir.WriteRef(ref, plan.Commit); err != nil {
+			refPath, err := repoDir.RefPath(ref)
+			if err == nil {
+				err = withExternalWriter(jobCtx, ownership, refPath, func() error {
+					return repoDir.WriteRef(ref, plan.Commit)
+				})
+			}
+			if err != nil {
 				if job.BranchVariant {
 					return failBranchVariant(fmt.Errorf("write ref %q: %w", ref, err))
 				}
@@ -974,7 +1006,11 @@ LOOP:
 
 	// Write/update the rebuild shell script if using HF cache (unless friendly view disabled)
 	if hfCache != nil && friendlyView {
-		if _, err := hfCache.WriteRebuildScript(); err != nil {
+		err := withExternalWriter(jobCtx, friendlyOwnership, hfCache.RebuildScriptPath(), func() error {
+			_, err := hfCache.WriteRebuildScript()
+			return err
+		})
+		if err != nil {
 			emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to write rebuild script: %v", err)})
 		}
 	}
@@ -982,7 +1018,12 @@ LOOP:
 	// Write manifest file (hfd.yaml) if using HF cache (unless friendly view disabled)
 	if manifestBuilder != nil && repoDir != nil && friendlyView {
 		manifest := manifestBuilder.Build()
-		if _, err := manifest.Write(repoDir.FriendlyPath()); err != nil {
+		manifestPath := filepath.Join(repoDir.FriendlyPath(), ManifestFilename)
+		err := withExternalWriter(jobCtx, friendlyOwnership, manifestPath, func() error {
+			_, err := manifest.Write(repoDir.FriendlyPath())
+			return err
+		})
+		if err != nil {
 			emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf("failed to write manifest: %v", err)})
 		}
 	}
@@ -996,7 +1037,11 @@ LOOP:
 			manifestDir, err = localSpace.RecordDir(job.Revision, plan.Commit)
 		}
 		if err == nil {
-			_, err = manifest.Write(manifestDir)
+			manifestPath := filepath.Join(manifestDir, ManifestFilename)
+			err = withExternalWriter(jobCtx, ownership, manifestPath, func() error {
+				_, err := manifest.Write(manifestDir)
+				return err
+			})
 		}
 		if err != nil {
 			return failBranchVariant(fmt.Errorf("write branch variant completion manifest: %w", err))
@@ -1013,6 +1058,56 @@ LOOP:
 		"skipped", skippedCount,
 	)
 	return nil
+}
+
+func invalidateBranchVariantRecordsWithOwnership(ctx context.Context, realm *ownershipRealm, space BranchVariantLocalSpace, revision string) error {
+	recordDir, err := space.recordRevisionDir(revision)
+	if err != nil {
+		return err
+	}
+	for {
+		info, statErr := os.Lstat(recordDir)
+		if errors.Is(statErr, os.ErrNotExist) {
+			preparation, err := realm.prepareWriter(ctx, []string{filepath.Join(recordDir, ".hfdesk-record-admission")}, 0)
+			if err != nil {
+				return err
+			}
+			_, secondStatErr := os.Lstat(recordDir)
+			if secondStatErr == nil {
+				preparation.Release()
+				continue
+			}
+			if !errors.Is(secondStatErr, os.ErrNotExist) {
+				preparation.Release()
+				return secondStatErr
+			}
+			err = space.InvalidateRecords(revision)
+			preparation.Release()
+			return err
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("unsafe branch variant record directory %s", recordDir)
+		}
+		lease, err := realm.acquireTreeRemoval(ctx, recordDir, blobOwnershipWaitBudget)
+		if err != nil {
+			return err
+		}
+		err = space.InvalidateRecords(revision)
+		lease.Release()
+		return err
+	}
+}
+
+func withExternalWriter(ctx context.Context, realm *ownershipRealm, path string, write func() error) error {
+	lease, err := realm.acquireWriterWithWait(ctx, []string{path}, blobOwnershipWaitBudget, nil)
+	if err != nil {
+		return err
+	}
+	defer lease.Release()
+	return write()
 }
 
 func branchVariantStagingName(revision, commit string, item PlanItem) string {
@@ -1071,32 +1166,65 @@ func removePartialWithIdentity(dst string) {
 func CleanupJobPartFiles(settings Settings, dsts []string) error {
 	useHFCache := settings.CacheDir != "" || settings.OutputDir == ""
 	root := cleanupRoot(settings, useHFCache)
+	var realm *ownershipRealm
+	if useHFCache {
+		cache, err := settings.BuildHFCache()
+		if err != nil {
+			return err
+		}
+		realm, err = cache.ownershipRealmForData()
+		if err != nil {
+			return err
+		}
+	} else {
+		ownerDir, err := resolveOwnershipDir(settings.OwnershipDir)
+		if err != nil {
+			return err
+		}
+		realm, err = newOwnershipRealm(ownerDir)
+		if err != nil {
+			return err
+		}
+		if err := validateOwnershipRealmOutside(realm, settings.OutputDir); err != nil {
+			return err
+		}
+	}
 	for _, dst := range dsts {
 		if !pathWithinRoot(root, dst) {
 			downloadLog.Warn("skip cleanup for out-of-root partial destination", "path", dst)
 			continue
 		}
 		// Use the writer's domain so cleanup cannot unlink a live partial.
-		var key, lockSrc string
+		var key, domainDst, proofPath string
+		var paths []string
 		if useHFCache {
 			k, ok := cacheDstDomainKey(dst)
 			if !ok {
 				downloadLog.Warn("skip cleanup of a cache destination with no derivable ownership domain", "path", dst)
 				continue
 			}
-			key, lockSrc = k, dst
+			key, domainDst, proofPath = k, dst, dst
+			paths = appendPartialOwnershipPaths(paths, dst)
+			if sha, found := strings.CutPrefix(filepath.Base(dst), "tmp-"); found && canonicalSHA256(sha) {
+				blobPath := filepath.Join(filepath.Dir(dst), sha)
+				incomplete := blobPath + ".incomplete"
+				meta := incomplete + ".meta"
+				paths = appendUniqueOwnershipPaths(paths, blobPath, incomplete, meta, meta+stagingRecordTempSuffix)
+				proofPath = blobPath
+			}
 		} else {
 			flatDom := newFlatDestinationDomain(dst)
-			key, lockSrc = flatDom.key, flatDom.lockSrc
+			key, domainDst, proofPath = flatDom.key, flatDom.lockSrc, dst
+			paths = appendPartialOwnershipPaths(paths, dst)
 		}
-		domain, derr := blobDomainCleanupAcquire(context.Background(), key, lockSrc)
+		domain, derr := acquireBlobDomainScopedForCleanup(context.Background(), key, domainDst, realm, paths, proofPath)
 		if derr != nil {
 			// Preserve artifacts if an owner is live or ownership is uncertain.
 			downloadLog.Warn("skip cleanup of a destination owned by another live writer",
 				"path", dst, "error", derr)
 			continue
 		}
-		if err := removePartialArtifacts(dst); err != nil {
+		if err := removePartialArtifacts(dst, domain); err != nil {
 			downloadLog.Warn("cleanup partials failed", "path", dst, "error", err)
 		}
 		if useHFCache {
@@ -1124,7 +1252,7 @@ func removeBlobStagingForTemp(dst string, domain *blobDomain) {
 			"path", dst, "staging", staging)
 		return
 	}
-	removeStagingArtifactsIfUnowned(staging, staging+".meta")
+	removeStagingArtifactsIfUnowned(staging, staging+".meta", domain)
 }
 
 func cleanupRoot(settings Settings, useHFCache bool) string {
@@ -1136,6 +1264,41 @@ func cleanupRoot(settings Settings, useHFCache bool) string {
 		return cache.HubDir()
 	}
 	return settings.OutputDir
+}
+
+func downloadOwnershipPaths(useHFCache bool, repoDir *RepoDir, dst, publishPath string, it PlanItem) (key, domainDst, proofPath string, paths []string, err error) {
+	paths = appendPartialOwnershipPaths(paths, dst)
+	if useHFCache {
+		var ok bool
+		key, ok = cacheDstDomainKey(dst)
+		if !ok {
+			return "", "", "", nil, fmt.Errorf("the destination is not a cache staging name")
+		}
+		domainDst = dst
+		proofPath = dst
+		if canonicalSHA256(it.SHA256) {
+			blobPath := repoDir.BlobPath(it.SHA256)
+			incomplete := repoDir.IncompletePath(it.SHA256)
+			meta := repoDir.IncompleteMetaPath(it.SHA256)
+			paths = appendUniqueOwnershipPaths(paths, blobPath, incomplete, meta, meta+stagingRecordTempSuffix)
+			proofPath = blobPath
+		}
+		return key, domainDst, proofPath, paths, nil
+	}
+	flat := newFlatDestinationDomain(dst)
+	key, domainDst, proofPath = flat.key, flat.lockSrc, dst
+	if publishPath != dst {
+		paths = appendUniqueOwnershipPaths(paths, appendPartialOwnershipPaths(nil, publishPath)...)
+	}
+	return key, domainDst, proofPath, paths, nil
+}
+
+func appendPartialOwnershipPaths(paths []string, dst string) []string {
+	meta := dst + ".incomplete.meta"
+	return appendUniqueOwnershipPaths(paths,
+		dst, dst+".part", singlePartIdentityPath(dst),
+		dst+".incomplete", meta, meta+stagingRecordTempSuffix,
+		dst+".parts.json")
 }
 
 func pathWithinRoot(root, path string) bool {
@@ -1181,9 +1344,9 @@ func removeHFCacheTemp(dst string) {
 // removePartialArtifacts removes single, legacy and ranged artifacts under
 // the caller-held domain, with record checks for ranged state. Blob-keyed
 // ranged state is handled separately by removeBlobStagingForTemp.
-func removePartialArtifacts(dst string) error {
+func removePartialArtifacts(dst string, domain *blobDomain) error {
 	removePartialWithIdentity(dst)
-	removeStagingArtifactsIfUnowned(dst+".incomplete", dst+".incomplete.meta")
+	removeStagingArtifactsIfUnowned(dst+".incomplete", dst+".incomplete.meta", domain)
 	return removeLegacyMultipartParts(dst)
 }
 
@@ -1557,6 +1720,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 					body := newStallReader(resp.Body, stall, attemptCancel)
 					paced := cfg.SpeedLimiter.Reader(attemptCtx, body)
 					w := newBoundedAtWriter(out, base, limit)
+					w.measure = payloadIOMeasurementFromContext(ctx)
 					w.onWrite = func([]byte) {
 						end := base + w.written
 						if end <= countedUpTo {

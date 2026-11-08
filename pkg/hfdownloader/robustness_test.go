@@ -1445,8 +1445,40 @@ func TestDownloadSingle_OscillatingIgnoredRangeDoesNotRefund(t *testing.T) {
 // part error stops sibling part requests, returns the original error, and
 // preserves resumable bytes rather than treating the internal abort as a user
 // cancel.
+type blockedMultipartBody struct {
+	io.ReadCloser
+	ctx     context.Context
+	started chan struct{}
+	once    *sync.Once
+}
+
+func (b blockedMultipartBody) Read([]byte) (int, error) {
+	b.once.Do(func() { close(b.started) })
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+type blockingMultipartBodyTransport struct {
+	base    http.RoundTripper
+	started chan struct{}
+	once    sync.Once
+}
+
+func (t *blockingMultipartBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return resp, err
+	}
+	rng := req.Header.Get("Range")
+	if req.Method == http.MethodGet && rng != "" && !strings.HasPrefix(rng, "bytes=0-") {
+		resp.Body = blockedMultipartBody{ReadCloser: resp.Body, ctx: req.Context(), started: t.started, once: &t.once}
+	}
+	return resp, nil
+}
+
 func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 	release := make(chan struct{})
+	siblingBodyRead := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			w.Header().Set("Content-Length", "100000")
@@ -1455,15 +1487,24 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 		}
 		if strings.HasPrefix(r.Header.Get("Range"), "bytes=0-") {
 			// Part 0 is the permanent one: a 404 fails the whole file.
+			// Do not return it until the sibling has passed header validation and
+			// is blocked reading its body.
+			select {
+			case <-siblingBodyRead:
+			case <-r.Context().Done():
+				return
+			}
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		// Sibling part: advertise a body, flush headers, then withhold the body
-		// so it cannot finish on its own. The default client has no body
-		// timeout and StallTimeout is disabled, so only the fix's partCtx
-		// cancel (triggered by part 0's fail-fast) can unblock its io.Copy.
-		w.Header().Set("Content-Range", "bytes 50000-99999/100000")
-		w.Header().Set("Content-Length", "50000")
+		// Sibling part: echo the valid requested suffix and withhold its body.
+		var start, end int
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
+			http.Error(w, "bad range", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/100000", start, end))
+		w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
 		w.WriteHeader(http.StatusPartialContent)
 		if fl, ok := w.(http.Flusher); ok {
 			fl.Flush()
@@ -1483,7 +1524,8 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Seed a pinned v4 record with 499 committed bytes in range 1; the internal abort must preserve them.
+	// Seed a pinned v4 record with a 499-byte prefix in range 1; the requested
+	// suffix must validate before its body is held and then canceled.
 	full := bytes.Repeat([]byte("p"), 100_000)
 	seedRangedState(t, dst+".incomplete", "o/r", "pa.bin", 100_000,
 		[]RangeProgress{
@@ -1499,10 +1541,18 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 	cfg.CleanupPartialsOnCancel = func() bool { return true }
 
 	done := make(chan error, 1)
+	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	t.Cleanup(baseTransport.CloseIdleConnections)
+	client := &http.Client{Transport: &blockingMultipartBodyTransport{base: baseTransport, started: siblingBodyRead}}
 	go func() {
-		_, derr := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, opts, func(ProgressEvent) {})
+		_, derr := downloadMultipart(context.Background(), client, "", Job{Repo: "o/r"}, cfg, it, dst, opts, func(ProgressEvent) {})
 		done <- derr
 	}()
+	select {
+	case <-siblingBodyRead:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sibling response body Read was not entered after header validation")
+	}
 
 	select {
 	case err := <-done:

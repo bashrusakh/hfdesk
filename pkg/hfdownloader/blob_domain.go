@@ -3,13 +3,9 @@
 
 package hfdownloader
 
-// Blob destinations use one ownership domain across ranged and single-request
-// routes. The item holds it from before HEAD through publication and cleanup;
-// the ranged claim reuses that fence. Digest-less items use the reserved
-// tmp-path- name so their domain cannot collide with a content-addressed key.
-// Lock files are persistent: unlinking one could let another process lock a
-// new inode while the current owner still holds the old one. See doc.go for the
-// complete ownership and waiter contract.
+// Current writers combine a process-local waiter with an external realm scope.
+// Ranged claims and publication reuse the held scope; digest-less items retain
+// the reserved tmp-path- identity. See doc.go for the full protocol contract.
 
 import (
 	"context"
@@ -21,8 +17,8 @@ import (
 	"time"
 )
 
-// blobOwnershipWaitBudget bounds live-owner waits. It is an internal protocol
-// setting; cleanup uses its shorter best-effort budget instead.
+// blobOwnershipWaitBudget bounds external ownership-scope waits; cleanup uses
+// its shorter best-effort budget instead.
 var blobOwnershipWaitBudget = 60 * stagingOwnershipAcquireWait
 
 // errBlobOwnedByLiveWriter identifies a bounded wait that expired while a
@@ -34,6 +30,17 @@ func blobLiveOwnerError(sha, rel string) error {
 		return fmt.Errorf("%s is being downloaded by another process; try again later: %w", rel, errBlobOwnedByLiveWriter)
 	}
 	return fmt.Errorf("blob %s is being downloaded by another process; try again later: %w", sha, errBlobOwnedByLiveWriter)
+}
+
+func blobOwnershipScopeError(sha, rel string, cause error) error {
+	name := rel
+	if sha != "" {
+		name = "blob " + sha
+	}
+	if errors.Is(cause, errStagingOwnershipBusy) {
+		return fmt.Errorf("ownership scope for %s remains exclusively held; try again later: %w", name, cause)
+	}
+	return fmt.Errorf("ownership scope for %s could not be proven free; retry later: %w", name, cause)
 }
 
 // stagingUnprovenOwnerError reports a record whose owner cannot be proven live
@@ -90,7 +97,17 @@ type blobDomain struct {
 	dest     string
 	lock     *stagingOwnershipLock
 	entry    *blobDomainEntry
+	realm    *ownershipRealm
+	scope    *ownershipLease
+	proof    string
 	released bool
+}
+
+type blobDomainFence struct {
+	lock  *stagingOwnershipLock
+	realm *ownershipRealm
+	scope *ownershipLease
+	proof string
 }
 
 // acquireBlobDomain waits for an in-process holder and re-evaluates the key.
@@ -106,24 +123,134 @@ func acquireBlobDomainForCleanup(ctx context.Context, key, dst string) (*blobDom
 	return acquireBlobDomainWithin(ctx, key, dst, stagingLockCleanupWait, stagingLockCleanupWait, false)
 }
 
-var blobDomainCleanupAcquire = acquireBlobDomainForCleanup
+func acquireDefaultScopedBlobDomain(ctx context.Context, key, dst string) (*blobDomain, error) {
+	ownerDir, err := resolveOwnershipDir("")
+	if err != nil {
+		return nil, err
+	}
+	realm, err := newOwnershipRealm(ownerDir)
+	if err != nil {
+		return nil, err
+	}
+	proofPath := key
+	paths := []string{key, dst}
+	if strings.HasPrefix(key, flatDomainKeyPrefix) {
+		proofPath = strings.TrimPrefix(key, flatDomainKeyPrefix)
+		paths = appendUniqueOwnershipPaths(paths, proofPath, proofPath+".part", proofPath+".incomplete", proofPath+".incomplete.meta")
+	} else if strings.HasPrefix(filepath.Base(key), "path-") {
+		proofPath = dst
+		paths = appendUniqueOwnershipPaths(paths, dst+".part", dst+".incomplete", dst+".incomplete.meta")
+	} else {
+		paths = appendUniqueOwnershipPaths(paths, dst+".part", dst+".incomplete", dst+".incomplete.meta", key+".incomplete", key+".incomplete.meta")
+	}
+	return acquireBlobDomainScoped(ctx, key, dst, realm, paths, proofPath)
+}
+
+func acquireDefaultScopedBlobDomainForCleanup(ctx context.Context, key, dst string) (*blobDomain, error) {
+	ownerDir, err := resolveOwnershipDir("")
+	if err != nil {
+		return nil, err
+	}
+	realm, err := newOwnershipRealm(ownerDir)
+	if err != nil {
+		return nil, err
+	}
+	proofPath := key
+	paths := []string{key, dst}
+	if strings.HasPrefix(key, flatDomainKeyPrefix) {
+		proofPath = strings.TrimPrefix(key, flatDomainKeyPrefix)
+	}
+	return acquireBlobDomainScopedForCleanup(ctx, key, dst, realm, paths, proofPath)
+}
+
+var blobDomainCleanupAcquire = acquireDefaultScopedBlobDomainForCleanup
 
 // acquireBlobDomainWithin applies separate in-process and OS-lock budgets.
 // Download waits for in-process holders until context cancellation; cleanup
 // bounds that wait and reports live owners without waiting. With a slot notice,
 // it returns the transfer slot during waits and reacquires it only on success.
 func acquireBlobDomainWithin(ctx context.Context, key, dst string, slotWait, lockWait time.Duration, tolerateLiveOwner bool) (domain *blobDomain, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return acquireBlobDomainUsing(ctx, key, dst, slotWait, func(beginWait func()) (blobDomainFence, error) {
+		var lock *stagingOwnershipLock
+		var lockErr error
+		if tolerateLiveOwner {
+			lock, lockErr = acquireStagingOwnershipLockWaiting(ctx, dst, lockWait, beginWait)
+		} else {
+			lock, lockErr = acquireStagingOwnershipLockWithin(ctx, dst, lockWait)
+		}
+		return blobDomainFence{lock: lock}, lockErr
+	})
+}
+
+func acquireBlobDomainScoped(ctx context.Context, key, dst string, realm *ownershipRealm, paths []string, proofPath string) (*blobDomain, error) {
+	return acquireBlobDomainScopedWithin(ctx, key, dst, realm, paths, proofPath, 0, blobOwnershipWaitBudget)
+}
+
+func acquireBlobDomainScopedForCleanup(ctx context.Context, key, dst string, realm *ownershipRealm, paths []string, proofPath string) (*blobDomain, error) {
+	return acquireBlobDomainScopedWithin(ctx, key, dst, realm, paths, proofPath, stagingLockCleanupWait, stagingLockCleanupWait)
+}
+
+func acquireBlobDomainScopedWithin(ctx context.Context, key, dst string, realm *ownershipRealm, paths []string, proofPath string, slotWait, lockWait time.Duration) (*blobDomain, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if realm == nil {
+		return nil, fmt.Errorf("external ownership realm is unavailable")
+	}
+	return acquireBlobDomainUsing(ctx, key, dst, slotWait, func(beginWait func()) (blobDomainFence, error) {
+		scope, err := realm.acquireWriterWithWait(ctx, paths, lockWait, beginWait)
+		if err != nil {
+			if errors.Is(err, errOwnershipBusy) {
+				busy, probeErr := realm.probeWriter(ctx, paths)
+				if probeErr != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return blobDomainFence{}, ctxErr
+					}
+					return blobDomainFence{}, fmt.Errorf("%w: observe external ownership scope: %v", errStagingOwnershipUncertain, probeErr)
+				}
+				if busy {
+					return blobDomainFence{}, errStagingOwnershipBusy
+				}
+				return blobDomainFence{}, errStagingOwnershipUncertain
+			}
+			return blobDomainFence{}, err
+		}
+		if !scope.holdsCoverage(realm, proofPath) {
+			scope.Release()
+			return blobDomainFence{}, fmt.Errorf("external ownership lease does not cover its proof key")
+		}
+		proof, err := realm.fenceProofForHeldPath(proofPath)
+		if err != nil {
+			scope.Release()
+			return blobDomainFence{}, err
+		}
+		return blobDomainFence{realm: realm, scope: scope, proof: proof}, nil
+	})
+}
+
+func acquireBlobDomainUsing(ctx context.Context, key, dst string, slotWait time.Duration, acquire func(beginWait func()) (blobDomainFence, error)) (domain *blobDomain, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	notice := downloadSlotWaitNoticeFromContext(ctx)
 	waiting := false
 	beginWait := func() {
-		if notice == nil || waiting {
+		if waiting {
 			return
 		}
 		waiting = true
-		notice.beginWait()
+		if blobDomainContentionHook != nil {
+			blobDomainContentionHook(key)
+		}
+		if notice != nil {
+			notice.beginWait()
+		}
 	}
 	defer func() {
-		if !waiting {
+		if !waiting || notice == nil {
 			return
 		}
 		if domain == nil || err != nil {
@@ -159,9 +286,6 @@ func acquireBlobDomainWithin(ctx context.Context, key, dst string, slotWait, loc
 			entry = held
 			break
 		}
-		if blobDomainContentionHook != nil {
-			blobDomainContentionHook(key)
-		}
 		beginWait()
 		// A nil timeout disables only the timeout case; the context still bounds the wait.
 		var timeout <-chan time.Time
@@ -187,12 +311,7 @@ func acquireBlobDomainWithin(ctx context.Context, key, dst string, slotWait, loc
 		}
 	}
 
-	var lock *stagingOwnershipLock
-	if tolerateLiveOwner {
-		lock, err = acquireStagingOwnershipLockWaiting(ctx, dst, lockWait, beginWait)
-	} else {
-		lock, err = acquireStagingOwnershipLockWithin(ctx, dst, lockWait)
-	}
+	fence, err := acquire(beginWait)
 	if err != nil {
 		blobDomainOwners.Lock()
 		if blobDomainOwners.m[key] == entry {
@@ -202,10 +321,13 @@ func acquireBlobDomainWithin(ctx context.Context, key, dst string, slotWait, loc
 		close(entry.done)
 		return nil, err
 	}
-	return &blobDomain{key: key, dest: dst, lock: lock, entry: entry}, nil
+	return &blobDomain{
+		key: key, dest: dst, lock: fence.lock, entry: entry,
+		realm: fence.realm, scope: fence.scope, proof: fence.proof,
+	}, nil
 }
 
-var blobDomainAcquire = acquireBlobDomain
+var blobDomainAcquire = acquireDefaultScopedBlobDomain
 
 // blobDomainContentionHook lets tests observe in-process contention.
 var blobDomainContentionHook func(key string)
@@ -241,15 +363,15 @@ func flatDomainKey(dst string) string {
 	return flatDomainKeyPrefix + filepath.Clean(dst)
 }
 
-// flatDomainLockSrc uses the multipart staging name so all routes share the
-// persistent <destination>.incomplete.lock.
+// flatDomainLockSrc returns the shared ranged-staging path for legacy callers;
+// current ownership locks are external and never use this as a lock filename.
 func flatDomainLockSrc(dst string) string {
 	return dst + ".incomplete"
 }
 
 type flatDestinationDomain struct {
 	key string
-	// lockSrc is the name whose persistent .lock file fences the domain.
+	// lockSrc is the legacy field name for the ranged-staging path.
 	lockSrc string
 }
 
@@ -283,7 +405,20 @@ func (d *blobDomain) coversStaging(staging string) bool {
 }
 
 func (d *blobDomain) lockHeld() bool {
-	return d != nil && !d.released && d.lock != nil && d.lock.held()
+	if d == nil || d.released {
+		return false
+	}
+	if d.scope != nil {
+		return d.scope.Validate() == nil
+	}
+	return d.lock != nil && d.lock.held()
+}
+
+func (d *blobDomain) ownershipFenceProof() string {
+	if d == nil || d.scope == nil || !d.lockHeld() {
+		return ""
+	}
+	return d.proof
 }
 
 func (d *blobDomain) release() {
@@ -293,6 +428,9 @@ func (d *blobDomain) release() {
 	d.released = true
 	if d.lock != nil {
 		d.lock.release()
+	}
+	if d.scope != nil {
+		d.scope.Release()
 	}
 	if d.entry == nil {
 		return

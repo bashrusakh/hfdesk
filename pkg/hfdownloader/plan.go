@@ -757,7 +757,11 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 			}
 		}
 		for _, item := range plan.Items {
-			if !addressingProbeSafeForCache(probeRepoDir, useHFCache, item) {
+			safe := addressingProbeSafeForCache(ctx, probeRepoDir, useHFCache, item)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if !safe {
 				continue
 			}
 			if err := ctx.Err(); err != nil {
@@ -848,7 +852,7 @@ func redirectTargetsRevision(sourceURL, location string, job Job, revision strin
 // addressingProbeSafeForCache avoids issuing even a read-only capability GET
 // when a content-addressed cache item is already complete or its ownership
 // state is busy/unknown. The ordinary skip/ownership path remains authoritative.
-func addressingProbeSafeForCache(repoDir *RepoDir, useHFCache bool, item PlanItem) bool {
+func addressingProbeSafeForCache(ctx context.Context, repoDir *RepoDir, useHFCache bool, item PlanItem) bool {
 	if item.SHA256 == "" {
 		if !useHFCache {
 			return true
@@ -861,7 +865,11 @@ func addressingProbeSafeForCache(repoDir *RepoDir, useHFCache bool, item PlanIte
 		if err != nil {
 			return false
 		}
-		busy, err := stagingOwnershipStatusProbe(dst)
+		realm, err := repoDir.cache.ownershipRealmForDataContext(ctx)
+		if err != nil {
+			return false
+		}
+		busy, err := realm.probeWriter(context.Background(), []string{dst, dst + ".incomplete"})
 		return err == nil && !busy
 	}
 	if !useHFCache {
@@ -870,7 +878,7 @@ func addressingProbeSafeForCache(repoDir *RepoDir, useHFCache bool, item PlanIte
 	if repoDir == nil {
 		return false
 	}
-	status, _, err := repoDir.CheckBlob(item.SHA256)
+	status, _, err := repoDir.checkBlobContext(ctx, item.SHA256)
 	return err == nil && status == BlobMissing
 }
 

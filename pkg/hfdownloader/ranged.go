@@ -5,7 +5,7 @@ package hfdownloader
 
 // Ranged downloads write workers directly into one staging payload. Resume
 // records track committed ranges and are trusted only for a matching pinned
-// identity and valid framing. The destination ownership domain fences claim,
+// identity and valid framing. The external item scope fences claim,
 // transfer, proof, publication, and cleanup; only version-4 state resumes.
 // See doc.go for the complete ownership, resume, and publication contract.
 
@@ -58,7 +58,7 @@ var (
 // removeStagingArtifactsIfUnowned requires the caller's destination domain. It
 // takes the metadata gate and preserves live or unproven records; cleanup is
 // best-effort and skipped removals are logged.
-func removeStagingArtifactsIfUnowned(staging, metaPath string) {
+func removeStagingArtifactsIfUnowned(staging, metaPath string, domains ...*blobDomain) {
 	if stagingArtifactsAbsent(staging, metaPath) {
 		return
 	}
@@ -72,10 +72,11 @@ func removeStagingArtifactsIfUnowned(staging, metaPath string) {
 	meta, err := readStagingMeta(metaPath)
 	switch {
 	case err == nil:
-		// A record written under the ownership-domain fence belongs to a
-		// writer that cannot be alive while this caller holds the domain.
-		// An unfenced record is not proven dead by that fact alone.
-		if !meta.LockFenced && !stagingOwnerProvablyDead(meta) && !stagingOwnerIsSelf(meta) {
+		var fence string
+		if len(domains) > 0 {
+			fence = domains[0].ownershipFenceProof()
+		}
+		if !stagingMetaOwnershipProven(meta, fence) {
 			log.Printf("warning: skip cleanup of staging file %s: a live claim remains", staging)
 			return
 		}
@@ -86,6 +87,20 @@ func removeStagingArtifactsIfUnowned(staging, metaPath string) {
 		return
 	}
 	removeStagingArtifactsLocked(staging, metaPath)
+}
+
+func stagingMetaOwnershipProven(meta *IncompleteMeta, currentFence string) bool {
+	if meta == nil {
+		return false
+	}
+	return (currentFence != "" && meta.LockFenced && meta.OwnershipFence == currentFence) ||
+		stagingOwnerProvablyDead(meta) || stagingOwnerIsSelf(meta)
+}
+
+func setStagingCurrentFence(meta *IncompleteMeta, domain *blobDomain) {
+	proof := domain.ownershipFenceProof()
+	meta.OwnershipFence = proof
+	meta.LockFenced = proof != ""
 }
 
 // Observability counters used by tests and the opt-in local-I/O benchmark.
@@ -133,6 +148,10 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 	if !domain.coversStaging(staging) {
 		return nil, fmt.Errorf("refuse to claim staging %s: the held destination ownership domain does not cover it", staging)
 	}
+	currentFence := domain.ownershipFenceProof()
+	if currentFence == "" {
+		return nil, fmt.Errorf("refuse to claim staging %s: a current external ownership fence is required", staging)
+	}
 	// Persist the required proof gate before transfer; a resumed claim preserves
 	// any pending proof even if the current mode would not otherwise require it.
 	proofMode := it.SHA256 != "" && (cfg.Verify == "sha256" || cfg.Verify == "etag")
@@ -160,7 +179,7 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 		}
 		var retry bool
 		var cerr error
-		state, retry, cerr = claimStagingLocked(staging, metaPath, it, job, commit, commitPinned, proofMode)
+		state, retry, cerr = claimStagingLocked(staging, metaPath, it, job, commit, commitPinned, proofMode, currentFence)
 		lock.release()
 		if cerr != nil {
 			return nil, cerr
@@ -175,11 +194,12 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 
 // claimStagingLocked evaluates or transitions state under both ownership gates.
 // retry requests a fresh evaluation after unusable state or a create race.
-func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, proofMode bool) (*stagingClaimState, bool, error) {
+func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, proofMode bool, currentFence string) (*stagingClaimState, bool, error) {
 	raw, rerr := os.ReadFile(metaPath)
 	if errors.Is(rerr, os.ErrNotExist) {
 		meta := newClaimMeta(it, job, commit, commitPinned)
 		meta.ProofPending = proofMode
+		meta.OwnershipFence = currentFence
 		meta.LockFenced = true
 		return createStagingClaim(metaPath, meta)
 	}
@@ -195,9 +215,7 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 		return nil, false, newStagingUnprovenOwnerError(it, staging, metaPath)
 	}
 
-	// A free domain proves death only for records created under that fence.
-	// Preserve unfenced records unless same-host death is independently proven.
-	if !meta.LockFenced && !stagingOwnerProvablyDead(&meta) && !stagingOwnerIsSelf(&meta) {
+	if !stagingMetaOwnershipProven(&meta, currentFence) {
 		return nil, false, newStagingUnprovenOwnerError(it, staging, metaPath)
 	}
 
@@ -222,7 +240,8 @@ func claimStagingLocked(staging, metaPath string, it PlanItem, job Job, commit s
 	take.StartedAt = meta.StartedAt
 	take.Ranges = ranges
 	take.ProofPending = meta.ProofPending || proofMode
-	// This claim is fenced by the held domain, regardless of its predecessor.
+	// The successor is bound to the current external realm and item key.
+	take.OwnershipFence = currentFence
 	take.LockFenced = true
 	if err := writeStagingMetaFile(metaPath, &take); err != nil {
 		return nil, false, err
@@ -678,6 +697,7 @@ type boundedAtWriter struct {
 	base    int64
 	limit   int64
 	written int64
+	measure *payloadIOMeasurement
 	onWrite func(p []byte) // optional per-write hook (progress/hash feed)
 }
 
@@ -695,6 +715,9 @@ func (w *boundedAtWriter) Write(p []byte) (int, error) {
 	if n > 0 {
 		w.written += int64(n)
 		stagingWriteBytes.Add(int64(n))
+		if w.measure != nil {
+			w.measure.writeBytes.Add(int64(n))
+		}
 		if w.onWrite != nil {
 			w.onWrite(p[:n])
 		}
@@ -772,8 +795,8 @@ type hashWriter interface {
 	Sum([]byte) []byte
 }
 
-// fenced reports whether the destination domain and its OS lock remain held;
-// publication requires that fence.
+// fenced reports whether the external item scope remains held; publication
+// requires that fence.
 func (d *stagingDownload) fenced() bool {
 	return d.domain.lockHeld()
 }
@@ -790,7 +813,7 @@ func (d *stagingDownload) flushMetaLocked() error {
 	meta := newClaimMeta(d.it, d.job, d.commit, d.commitPinned)
 	meta.StartedAt = d.startedAt
 	meta.ProofPending = d.proofPending
-	meta.LockFenced = d.fenced()
+	setStagingCurrentFence(&meta, d.domain)
 	if d.ranges != nil {
 		if !normalizeRangesInPlace(d.ranges, d.it.Size) {
 			return fmt.Errorf("staging metadata flush: invalid range layout for %s", d.it.RelativePath)
@@ -938,7 +961,7 @@ func (d *stagingDownload) resetClaim(open *os.File) (*os.File, error) {
 		return nil, err
 	}
 	fresh := newClaimMeta(d.it, d.job, d.commit, d.commitPinned)
-	fresh.LockFenced = d.fenced()
+	setStagingCurrentFence(&fresh, d.domain)
 	if _, retry, err := createStagingClaim(d.meta, fresh); err != nil {
 		return nil, err
 	} else if retry {
@@ -1596,6 +1619,7 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 				body := newStallReader(rs.Body, stall, attemptCancel)
 				paced := d.cfg.SpeedLimiter.Reader(attemptCtx, body)
 				w := newBoundedAtWriter(d.out, wantStart, wantLen)
+				w.measure = payloadIOMeasurementFromContext(d.ctx)
 				w.onWrite = func(p []byte) {
 					end := wantStart + w.written
 					if end > countedUpTo {

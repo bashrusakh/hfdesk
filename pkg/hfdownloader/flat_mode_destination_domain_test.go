@@ -10,6 +10,7 @@ package hfdownloader
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -126,19 +127,6 @@ func testFlatModeRoutesExcludeEachOther(t *testing.T, ownerThreshold, writerThre
 	out := t.TempDir()
 	dst := legacyOutputDst(t, out)
 
-	var (
-		mu       sync.Mutex
-		acquired []string
-	)
-	oldAcquire := blobDomainAcquire
-	blobDomainAcquire = func(ctx context.Context, key, dst string) (*blobDomain, error) {
-		mu.Lock()
-		acquired = append(acquired, key)
-		mu.Unlock()
-		return oldAcquire(ctx, key, dst)
-	}
-	defer func() { blobDomainAcquire = oldAcquire }()
-
 	ownerResult := make(chan flatModeOutcome, 1)
 	go func() {
 		ownerResult <- runFlatModeDownload(context.Background(), flatModeSettings(out, hub.srv.URL, ownerThreshold))
@@ -188,17 +176,7 @@ func testFlatModeRoutesExcludeEachOther(t *testing.T, ownerThreshold, writerThre
 	}
 	assertExactFile(t, dst, full)
 
-	mu.Lock()
-	got := append([]string(nil), acquired...)
-	mu.Unlock()
-	if len(got) != 2 {
-		t.Errorf("ownership-domain acquisitions = %v, want both writers to use the one destination domain", got)
-	}
-	for _, key := range got {
-		if !strings.HasPrefix(key, flatDomainKeyPrefix) {
-			t.Errorf("ownership-domain key = %q, want a flat destination domain", key)
-		}
-	}
+	assertExternalRealmLockFiles(t, flatModeSettings(out, hub.srv.URL, ownerThreshold).OwnershipDir)
 }
 
 // Single-request writers of one flat destination serialize; the waiter
@@ -292,29 +270,11 @@ func TestDownloadFlatModeUnknownSizeHandoffUsesOneDomain(t *testing.T) {
 	out := t.TempDir()
 	dst := legacyOutputDst(t, out)
 
-	var (
-		mu       sync.Mutex
-		acquired []string
-	)
-	oldAcquire := blobDomainAcquire
-	blobDomainAcquire = func(ctx context.Context, key, dst string) (*blobDomain, error) {
-		mu.Lock()
-		acquired = append(acquired, key)
-		mu.Unlock()
-		return oldAcquire(ctx, key, dst)
-	}
-	defer func() { blobDomainAcquire = oldAcquire }()
-
 	res := runFlatModeDownload(context.Background(), flatModeSettings(out, srv.URL, "0"))
 	if res.err != nil {
 		t.Fatalf("Download: %v", res.err)
 	}
-	mu.Lock()
-	got := append([]string(nil), acquired...)
-	mu.Unlock()
-	if len(got) != 1 || !strings.HasPrefix(got[0], flatDomainKeyPrefix) {
-		t.Errorf("ownership-domain acquisitions = %v, want exactly one flat destination domain", got)
-	}
+	assertExternalRealmLockFiles(t, flatModeSettings(out, srv.URL, "0").OwnershipDir)
 	assertExactFile(t, dst, full)
 }
 
@@ -326,6 +286,15 @@ func TestCleanupJobPartFilesFlatModeRespectsTheDestinationDomain(t *testing.T) {
 	}
 	out := t.TempDir()
 	dst := legacyOutputDst(t, out)
+	cfg := Settings{OutputDir: out, OwnershipDir: filepath.Join(filepath.Dir(out), "hfdesk-ownership")}
+	realm, err := newOwnershipRealm(cfg.OwnershipDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err := realm.fenceProof(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	artifacts := map[string]string{
 		dst + ".part":            "the live writer's single-path partial",
@@ -338,13 +307,21 @@ func TestCleanupJobPartFilesFlatModeRespectsTheDestinationDomain(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	meta, err := json.Marshal(IncompleteMeta{LockFenced: true, OwnershipFence: fence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts[dst+".incomplete.meta"] = string(meta)
+	if err := os.WriteFile(dst+".incomplete.meta", meta, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	owner, err := acquireStagingOwnershipLock(flatDomainLockSrc(dst))
+	owner, err := realm.acquireWriter(context.Background(), []string{dst, dst + ".part", dst + ".incomplete"}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := CleanupJobPartFiles(Settings{OutputDir: out}, []string{dst}); err != nil {
+	if err := CleanupJobPartFiles(cfg, []string{dst}); err != nil {
 		t.Fatalf("CleanupJobPartFiles: %v", err)
 	}
 	for path, body := range artifacts {
@@ -357,8 +334,8 @@ func TestCleanupJobPartFilesFlatModeRespectsTheDestinationDomain(t *testing.T) {
 		}
 	}
 
-	owner.release()
-	if err := CleanupJobPartFiles(Settings{OutputDir: out}, []string{dst}); err != nil {
+	owner.Release()
+	if err := CleanupJobPartFiles(cfg, []string{dst}); err != nil {
 		t.Fatalf("CleanupJobPartFiles: %v", err)
 	}
 	for path := range artifacts {

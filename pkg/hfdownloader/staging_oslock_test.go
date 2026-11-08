@@ -145,16 +145,17 @@ const (
 )
 
 type stagingOSLockChildConfig struct {
-	Mode       string `json:"mode"` // "hold" or "crash"
-	Dst        string `json:"dst"`
-	Staging    string `json:"staging"`
-	Publish    string `json:"publish"`
-	Size       int64  `json:"size"`
-	Prefix     int64  `json:"prefix"`
-	ReadyPath  string `json:"ready"`
-	GoPath     string `json:"go"`
-	ResultPath string `json:"result"`
-	Commit     string `json:"commit"`
+	Mode         string `json:"mode"` // "hold" or "crash"
+	OwnershipDir string `json:"ownership_dir"`
+	Dst          string `json:"dst"`
+	Staging      string `json:"staging"`
+	Publish      string `json:"publish"`
+	Size         int64  `json:"size"`
+	Prefix       int64  `json:"prefix"`
+	ReadyPath    string `json:"ready"`
+	GoPath       string `json:"go"`
+	ResultPath   string `json:"result"`
+	Commit       string `json:"commit"`
 }
 
 type stagingOSLockChildResult struct {
@@ -191,8 +192,18 @@ func TestStagingOSLockChildProcess(t *testing.T) {
 	it := PlanItem{RelativePath: filepath.Base(cfg.Publish), URL: "http://127.0.0.1:1/lock.bin", Size: cfg.Size, AcceptRanges: true}
 	job := Job{Repo: "o/r"}
 	metaPath := cfg.Staging + ".meta"
-	// Hold the destination domain throughout the child claim and transfer.
-	domain, derr := acquireBlobDomain(context.Background(), flatDomainKey(cfg.Publish), cfg.Staging)
+	// Hold the external destination scope throughout the child claim and transfer.
+	ownerDir := cfg.OwnershipDir
+	if ownerDir == "" {
+		ownerDir = DefaultOwnershipDir()
+	}
+	realm, derr := newOwnershipRealm(ownerDir)
+	if derr != nil {
+		writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{Err: derr.Error()})
+		return
+	}
+	domain, derr := acquireBlobDomainScoped(context.Background(), flatDomainKey(cfg.Publish), cfg.Staging, realm,
+		[]string{cfg.Publish, cfg.Staging, cfg.Staging + ".meta", cfg.Staging + ".meta" + stagingRecordTempSuffix}, cfg.Publish)
 	if derr != nil {
 		writeOSLockChildResult(t, cfg.ResultPath, stagingOSLockChildResult{Err: derr.Error()})
 		return
@@ -328,16 +339,17 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 	metaPath := staging + ".meta"
 
 	cfg := stagingOSLockChildConfig{
-		Mode:       "hold",
-		Dst:        dst,
-		Staging:    staging,
-		Publish:    dst,
-		Size:       total,
-		Prefix:     prefix,
-		ReadyPath:  filepath.Join(dir, "ready"),
-		GoPath:     filepath.Join(dir, "go"),
-		ResultPath: filepath.Join(dir, "result.json"),
-		Commit:     commit,
+		Mode:         "hold",
+		OwnershipDir: DefaultOwnershipDir(),
+		Dst:          dst,
+		Staging:      staging,
+		Publish:      dst,
+		Size:         total,
+		Prefix:       prefix,
+		ReadyPath:    filepath.Join(dir, "ready"),
+		GoPath:       filepath.Join(dir, "go"),
+		ResultPath:   filepath.Join(dir, "result.json"),
+		Commit:       commit,
 	}
 	cmd, childOut := startStagingOSLockChild(t, cfg)
 
@@ -421,9 +433,10 @@ func TestStagingOSLockHeldByLiveProcessBlocksTakeover(t *testing.T) {
 			t.Errorf("%s survived the helper's successful publish, stat err=%v", filepath.Base(p), err)
 		}
 	}
-	if _, err := os.Stat(stagingOwnershipLockPath(staging)); err != nil {
-		t.Errorf("the persistent ownership lock file was removed: %v", err)
+	if _, err := os.Stat(stagingOwnershipLockPath(staging)); !os.IsNotExist(err) {
+		t.Errorf("an obsolete payload-side lock was created: %v", err)
 	}
+	assertExternalRealmLockFiles(t, cfg.OwnershipDir)
 }
 
 // A crashed process releases its lock; the next claimant resumes and publishes.
@@ -445,14 +458,15 @@ func TestStagingOSLockReleasedByCrashedProcess(t *testing.T) {
 	metaPath := staging + ".meta"
 
 	cfg := stagingOSLockChildConfig{
-		Mode:       "crash",
-		Dst:        dst,
-		Staging:    staging,
-		Publish:    dst,
-		Size:       total,
-		Prefix:     prefix,
-		ResultPath: filepath.Join(dir, "result.json"),
-		Commit:     commit,
+		Mode:         "crash",
+		OwnershipDir: DefaultOwnershipDir(),
+		Dst:          dst,
+		Staging:      staging,
+		Publish:      dst,
+		Size:         total,
+		Prefix:       prefix,
+		ResultPath:   filepath.Join(dir, "result.json"),
+		Commit:       commit,
 	}
 	cmd, childOut := startStagingOSLockChild(t, cfg)
 	if err := cmd.Wait(); err != nil {
@@ -491,7 +505,8 @@ func TestStagingOSLockReleasedByCrashedProcess(t *testing.T) {
 			t.Errorf("%s survived the successful takeover publish, stat err=%v", filepath.Base(p), err)
 		}
 	}
-	if _, err := os.Stat(stagingOwnershipLockPath(staging)); err != nil {
-		t.Errorf("the persistent ownership lock file was removed: %v", err)
+	if _, err := os.Stat(stagingOwnershipLockPath(staging)); !os.IsNotExist(err) {
+		t.Errorf("an obsolete payload-side lock was created: %v", err)
 	}
+	assertExternalRealmLockFiles(t, cfg.OwnershipDir)
 }

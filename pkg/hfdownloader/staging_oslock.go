@@ -3,13 +3,11 @@
 
 package hfdownloader
 
-// The persistent destination-domain lock is the cross-process ownership fence;
-// records retain identity and resume state. The lock file is never unlinked,
-// since replacing its inode could create two simultaneous owners. Observers
-// use a non-owning shared probe: it detects an exclusive writer but cannot
-// distinguish a reader from no holder, so claimants retry acquisition. Unix
-// uses flock, Windows uses exclusive CreateFile sharing; unsupported lock
-// operations fail closed without changing partial data.
+// These payload-adjacent locks implement the legacy internal protocol and are
+// not used by current Download/cache ownership paths. Current exclusion lives
+// in ownershipRealm; a legacy lock or record bit does not prove a current
+// fence. The in-memory channel below only coordinates transitions within one
+// process.
 
 import (
 	"context"
@@ -19,14 +17,13 @@ import (
 	"time"
 )
 
-// stagingOwnershipLockPath appends the persistent .lock suffix to the
-// caller-selected lock source; records can change without replacing this inode.
+// stagingOwnershipLockPath returns a legacy payload-side lock path.
 func stagingOwnershipLockPath(staging string) string { return staging + stagingLockSuffix }
 
 var (
-	// errStagingOwnershipBusy means exclusive acquisition was refused; observing
-	// the holder distinguishes a writer from shared readers.
-	errStagingOwnershipBusy = errors.New("staging ownership lock is held by another live writer")
+	// errStagingOwnershipBusy means a current external probe confirmed an
+	// exclusive holder for the requested ownership scope.
+	errStagingOwnershipBusy = errors.New("external ownership scope is exclusively held")
 
 	// errStagingOwnershipUncertain means a failed acquisition could not establish
 	// whether a live writer owns the lock; callers must fail closed.

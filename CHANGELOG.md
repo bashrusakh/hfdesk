@@ -16,27 +16,28 @@
 - Add a read-only Community feature for repository Discussions and Pull Requests: `GET /api/community/{owner}/{repo}` lists both types with paging and type/status filters, while `?num=N` returns a thread with sanitized comments and human-readable event summaries. The Model Details view now has Overview and Community tabs; the read-only Community tab is lazy-loaded, lists Discussions and Pull Requests, opens a thread with comments and events, and supports model and dataset repositories. The proxy uses the configured endpoint, proxy, and HF token without exposing the token to the browser (#136).
 - Report gated Hugging Face repositories as a dedicated access state instead of a partial analysis: the API returns HTTP 403 with error code `gated_repo`, the repository type, an accept link for the configured endpoint, and boolean-only token state, and the Model Details view shows configured-token and repository-agreement guidance without exposing the token.
 - Model Details now opens README, lineage, and related-download repository links in-place, with Back/Forward history across models, datasets, and revisions (#135).
-- Opt-in local-I/O benchmark for multipart finalization (`go test -bench BenchmarkRangedFinalization ./pkg/hfdownloader/`) recording total staging bytes written (including the transfer landing on disk), extra local payload writes beyond one file size, full-file hash bytes read, and the network-complete → file-done elapsed time: `Verify=size` shows ≈0×S extra local payload writes and no hash reread, `Verify=sha256` ≈1×S hash read (#140).
+- Opt-in synthetic HF-cache benchmark (`go test -run '^$' -bench BenchmarkRangedFinalization ./pkg/hfdownloader/`) uses public `Download` and records client-observed network-complete → `file_done` time plus payload reads/writes during that interval for known-LFS `Verify=size` and `Verify=sha256` with concurrency. `TestCacheDownloadMeasurementBoundary` (64 KiB) asserts this deterministically at the public `Download` boundary: `Verify=size` at 0×S post-network payload reads/writes and `Verify=sha256` at exactly 1×S reads/0×S writes. It checks snapshot/friendly reachability and counts verification and cache-copy fallback I/O; timings are environment-specific, not a latency budget or CI-sized fixture (#140).
 
 ### Changed
 
-- The destination ownership domain is now the ONE ownership fence of every
-  route (#140): an item takes it once, after its pre-download skip decision and
-  before the HEAD/claim, and holds it through the claim, transfer,
-  publication/store and cancel cleanup. The multipart claim trusts the held
-  domain instead of taking a second lock, `CheckBlob` probes the destination
-  domain lock, and the cleanup entry points collapse to one owner-checked
-  removal and one record-checked removal. Every cache destination owns one
-  domain, including digest-less path-derived destinations; a flat destination
-  uses the persistent `<destination>.incomplete.lock` next to the model file.
-  A live owner is waited for (bounded, context-aware, effective five minutes),
-  never skipped or taken over; a writer that cannot acquire the domain fails
-  before writing a payload and preserves existing partial data. The lock file is
-  persistent and is never unlinked. Mixed-version branch-only writers that still
-  held the obsolete `<staging>.lock` are intentionally unsupported: a fenced (or
-  provably dead/self) old/unsupported record is discarded, while an unfenced
-  record whose owner cannot be proven dead, of any version, is refused as
-  unproven and preserved.
+- Replace payload-adjacent destination lock files with one external ownership
+  realm for every download route (#140). `Settings.OwnershipDir` selects the
+  realm; empty uses the captured per-user HFDesk config directory. Clients that
+  share storage across profiles must configure the same accessible, nonoverlapping
+  realm. An item takes its scope after the skip decision and before resume/HEAD/
+  claim, and holds it through transfer, publication/store and cancel cleanup.
+  Cache snapshots and friendly entries acquire scopes for their actual paths
+  while the blob item key remains held. No new `.lock` payload sibling is
+  created; flat items named `foo.incomplete.lock` are ordinary independent
+  destinations. `CheckBlob` and cleanup use the same external realm/key
+  protocol. External locks are hashed beneath `<OwnershipDir>/v1/`, persistent
+  and never unlinked. A busy exclusive scope is waited for (bounded,
+  context-aware, effective five minutes), never taken over or reported as a
+  successful skip; unresolved reader contention also fails closed. Waiters
+  return and reacquire transfer slots. Mixed-version writers remain unsupported:
+  `LockFenced` alone is not current proof. New v4 records carry `OwnershipFence`
+  for the current realm/key; absent, unknown or mismatched live proofs are
+  preserved/refused unless independent self/death evidence permits reclaim.
 - The exported `(*hfdownloader.RepoDir).CleanupIncomplete` helper has been
   removed (#140): it deleted a staging payload and its record without the
   destination ownership domain or a record check, so it could remove another
@@ -50,12 +51,12 @@
   tiles the file with normalized completion, and its payload exists at the
   expected size before any create/truncate; a record whose payload was deleted
   or resized is discarded rather than published as zeros. The ranged record is
-  version 4 and is the only resumable version; a fenced older/unsupported record
-  (or one whose owner is provably dead or is this process, including a
+  version 4 and is the only resumable version; a record with a matching current
+  fence (or one whose owner is provably dead or is this process, including a
   branch-only version-3 record that described imported bytes) is discarded,
   never migrated, and the file is re-downloaded from zero while already-published
-  content stays untouched, while an unfenced record whose owner cannot be
-  proven dead is refused as unproven and preserved. Every pre-#140
+  content stays untouched, while a record without a matching current fence whose
+  owner cannot be proven dead is refused as unproven and preserved. Every pre-#140
   `.part-NN`/`.parts.json` family is likewise discarded, never migrated. Existing version-4 state keeps the
   multipart route for a ranged-capable item even below the configured threshold,
   so a threshold change does not ignore valid state; an item without usable
@@ -89,10 +90,21 @@
   digest is never hashed only after publication. A durable `ProofPending` flag
   forces a re-proof on resume in every mode except `none`, so a crash mid-proof
   or a later mode change cannot publish unproven ranges.
-- The mirror writer's non-atomic, size-only blob copy and the selected-GGUF
-  delete path remain the documented writers outside the destination ownership
-  domain, so the downloader's publication invariant does not depend on their
-  behavior (#140).
+- The mirror file copy, the mirror's `deleteExtra` removal and the HF branch of
+  selected-GGUF deletion now take cache-owned admission — entry admission per
+  copied destination file, tree admission per removed repository or per the
+  selected repository and its friendly view — instead of remaining writers
+  outside the destination ownership domain, while the downloader's publication
+  invariant still does not depend on their behavior: none of them publishes
+  through the no-replace primitive. The mirror copy itself checks nothing
+  beyond `io.Copy`'s error contract (its explicit size comparison happens only
+  in the opt-in verify pass, at size granularity rather than hashes), the
+  mirror's symlink-leaf replacement and plain directory creation take no
+  admission, and selected deletion's local-root branch takes flat-realm entry
+  admission over exactly the member paths it unlinks, resolved through the same
+  `Settings.OwnershipDir` its writers use (default `DefaultOwnershipDir()`) —
+  as strong as the flat realm's existing writer coordination: participants
+  exclude each other only when both resolve the same `OwnershipDir` (#140).
 - Ordinary downloads keep commit pinning on Hugging Face and commit-capable
   endpoints. A custom endpoint proven to serve files only by branch name may
   select one coherent unpinned plan before reservation; it starts retries from
@@ -109,26 +121,27 @@
   ownership lease (#140): `hfdownloader.Settings.StaleTimeout`,
   `hfdownloader.HFCache.StaleTimeout`, `hfdownloader.DefaultStaleTimeout` and
   the third `staleTimeout` argument of `NewHFCache`/`NewHFCacheResolved` no
-  longer exist. Ownership is fenced by the destination's persistent ownership
-  domain, with `LockFenced` describing the record written under it, and record
-  age never authorizes a takeover; there is no compatibility shim or
-  replacement setting.
+  longer exist. Ownership uses the external realm selected by
+  `Settings.OwnershipDir`; v4 record ownership uses `LockFenced` plus the exact
+  current `OwnershipFence` realm/key proof, never record age. There is no stale
+  timeout compatibility shim or replacement setting.
 - The diagnostic-only staging-record heartbeat was removed (#140). The record
   is not rewritten on a timer; it is diagnostics/resume state, not a
-  freshness-based lease, and only the destination domain plus `LockFenced`
-  determines ownership.
+  freshness-based lease; only the held external scope and matching
+  `LockFenced`/`OwnershipFence` pair prove current ownership.
 
 ### Fixed
 
 - A download job no longer reports success while a requested file is missing
-  because another writer owns it (#140): `completed` now means the file is
-  present and reachable at its snapshot/friendly path. The item waits for a
-  proven live owner (bounded, effective five minutes) and re-checks the
-  published content-addressed blob, downloads the file itself when the owner
-  released the domain without publishing, or fails with the actionable
-  live-owner error. A path-derived destination always re-downloads after the
-  wait. A waiting item no longer occupies a `MaxActiveDownloads` slot, so other
-  files of the job proceed even with a low limit. A link-creation failure now
+  because its external ownership scope is busy (#140): `completed` now means the
+  file is present and reachable at its snapshot/friendly path. The item waits
+  for an exclusive scope holder (bounded, effective five minutes) and re-checks
+  the published content-addressed blob, downloads the file itself when the
+  scope becomes free without publishing, or fails with an actionable scope-held
+  or unresolved-contention error. A path-derived destination always
+  re-downloads after the wait. A waiting item no longer occupies a
+  `MaxActiveDownloads` slot, so other files of the job proceed even with a low
+  limit. A link-creation failure now
   fails the item in both transfer and skip paths with
   `ErrCacheLinkUnreachable`, and the end-of-job link reconciliation reports a
   job error, so a job cannot finish successful with a missing path; a disabled
@@ -186,6 +199,7 @@
 - `GET /api/analyze` now supports an explicit `type=model|dataset` selector, so a repository that exists as both namespaces resolves without repeating the type-selection prompt (#135). `type` takes precedence over the legacy `dataset` parameter, and `type=model` combined with `dataset=true` is rejected as a conflict. The legacy `dataset` parameter keeps its pre-#135 behavior: only `dataset=true` forces the dataset namespace, while `dataset=false` still auto-detects.
 - The Model Details `HF Hub ↗` action now uses the endpoint reported by `GET /api/health` when settings have not loaded or the settings fetch failed, and stays hidden rather than guessing `huggingface.co`; health now reports the normalized effective `endpoint` (#135).
 - Filtered plan/download scans no longer succeed when no non-excluded path directly matches and no recognized dataset membership selects data: `POST /api/plan` now returns `400` with error code `no_filter_match` instead of a metadata-only plan, while empty repositories without filters still plan successfully.
+- Cache mutations now exclude live writers in every process sharing the cache, not just jobs of this server (#140): `DELETE /api/cache/{owner}/{repo}` and selected-GGUF deletion — HF and local locations alike — return `409` without unlinking anything while a live download uses the repository, its friendly view, or the selected member file (the local branch through the flat `Settings.OwnershipDir` realm it shares with flat writers), mirror `deleteExtra` removal reports the refusal in `errors[]` with `success: false` instead of deleting, and mirror in-place overwrite of a destination file refuses instead of truncating it. The exclusion lives in the cache itself (`H/.hfdesk-control`, `R/.hfdesk-control`), so a plain mirror target gains a hidden `.hfdesk-control` control directory. A local selected-delete likewise creates the flat ownership realm directory (`<DefaultOwnershipDir()>/v1/`) when it is absent, exactly as a flat download does. A whole-repository DELETE, a mirror `deleteExtra` removal, and the HF selected-GGUF delete treat a target that vanished between enumeration and removal as absent only after re-verifying the vanish while holding the missing target's creator-side admission, so a download starting in that window is excluded; an admission that can be neither established nor re-verified as vanished fails closed (`500`, or `errors[]` for mirror) instead of proceeding without exclusion. Mirror results count only what actually happened: `copied`/`copiedSize`/`repos` include only repositories whose copy (and verification, when requested) completed without error, `deleted`/`deletedSize` include only repositories actually removed, refused entries appear only in `errors`, and a re-verified vanished repository counts as removed at its scan-time size, like `os.RemoveAll`.
 
 ## [1.3.0-beta.1] - 2026-10-15
 

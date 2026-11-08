@@ -377,9 +377,7 @@ func TestRepoDir_FinalizeBlob(t *testing.T) {
 
 	// Create incomplete file
 	incompletePath := repo.IncompletePath(sha)
-	metaPath := repo.IncompleteMetaPath(sha)
 	os.WriteFile(incompletePath, content, 0644)
-	os.WriteFile(metaPath, []byte("{}"), 0644)
 
 	if err := repo.FinalizeBlob(sha); err != nil {
 		t.Fatalf("FinalizeBlob error: %v", err)

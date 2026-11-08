@@ -51,7 +51,11 @@ func computeSHA256Ctx(ctx context.Context, path string) (string, error) {
 	hashPassBytes.Add(size)
 
 	h := sha256.New()
-	if _, err := io.Copy(h, contextReader{ctx: ctx, r: f}); err != nil {
+	var source io.Reader = contextReader{ctx: ctx, r: f}
+	if measurement := payloadIOMeasurementFromContext(ctx); measurement != nil {
+		source = measuredPayloadReader{r: source, m: measurement}
+	}
+	if _, err := io.Copy(h, source); err != nil {
 		return "", err
 	}
 

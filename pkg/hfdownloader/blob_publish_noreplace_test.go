@@ -258,38 +258,52 @@ func newPlainHub(t *testing.T, total int, sha string, body []byte) (*httptest.Se
 	}
 }
 
-func TestSingleRouteFailsBeforePayloadMutationWhenTheDomainIsUnavailable(t *testing.T) {
-	oldAcquire := stagingOwnershipAcquire
-	stagingOwnershipAcquire = func(string) (*stagingOwnershipLock, error) {
-		return nil, errStagingOSLockUnsupported
+func denyCacheBlobEntryLock(t *testing.T, repo *RepoDir, sha string, denied error) {
+	t.Helper()
+	oldOpen := ownershipLockOpen
+	lockPath := filepath.Join(repo.cache.OwnershipDir(), "v1", "root", "children", repo.dirName(), "children", "blobs", "children", sha, "metadata", "entry.lock")
+	ownershipLockOpen = func(path string, mode ownershipLockMode) (ownershipLockHandle, error) {
+		if filepath.Clean(path) == filepath.Clean(lockPath) {
+			return nil, denied
+		}
+		return oldOpen(path, mode)
 	}
-	defer func() { stagingOwnershipAcquire = oldAcquire }()
+	t.Cleanup(func() { ownershipLockOpen = oldOpen })
+}
 
+func TestSingleRouteFailsBeforePayloadMutationWhenTheDomainIsUnavailable(t *testing.T) {
 	const total = 4_096
 	body := bytes.Repeat([]byte{0x5A}, total)
 	sha := singleTestSHA(body)
 	cacheDir := t.TempDir()
 	hub, served := newPlainHub(t, total, sha, body)
+	repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	denyCacheBlobEntryLock(t, repo, sha, errOwnershipUnavailable)
 
 	cfg := Settings{
 		CacheDir: cacheDir, Endpoint: hub.URL, Concurrency: 1, MaxActiveDownloads: 1,
 		MultipartThreshold: "1MB", Verify: "none", Retries: 0, StallTimeout: "0",
 	}
-	err := Download(t.Context(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ProgressEvent) {})
+	err = Download(t.Context(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ProgressEvent) {})
 	if err == nil {
 		t.Fatal("the download succeeded although the ownership domain was unavailable")
 	}
-	if !strings.Contains(err.Error(), "ownership domain") {
-		t.Fatalf("the download error = %v, want an actionable ownership-domain failure", err)
+	if !errors.Is(err, errOwnershipUnavailable) {
+		t.Fatalf("the download error = %v, want the injected destination-scope failure", err)
+	}
+	if !strings.Contains(err.Error(), "ownership") {
+		t.Fatalf("the download error = %v, want an actionable ownership failure", err)
 	}
 	if n := served(); n != 0 {
 		t.Errorf("the single-request route transferred the file %d times although the ownership domain was unavailable", n)
 	}
 
-	repo, rerr := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
-	if rerr != nil {
-		t.Fatal(rerr)
-	}
 	// The single-request route would stage at blobs/tmp-<sha>.part.
 	if _, serr := os.Stat(filepath.Join(repo.BlobsDir(), "tmp-"+sha+".part")); serr == nil {
 		t.Error("the single-request route wrote a payload although the ownership domain was unavailable")
@@ -300,48 +314,46 @@ func TestSingleRouteFailsBeforePayloadMutationWhenTheDomainIsUnavailable(t *test
 }
 
 func TestSingleRouteFailsBeforePayloadMutationWithADeniedOwnershipLock(t *testing.T) {
-	oldAcquire := stagingOwnershipAcquire
 	denied := errors.New("injected ownership lock permission denied")
-	stagingOwnershipAcquire = func(string) (*stagingOwnershipLock, error) { return nil, denied }
-	defer func() { stagingOwnershipAcquire = oldAcquire }()
 
 	const total = 4_096
 	body := bytes.Repeat([]byte{0x33}, total)
 	sha := singleTestSHA(body)
 	cacheDir := t.TempDir()
 	hub, served := newPlainHub(t, total, sha, body)
+	repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	denyCacheBlobEntryLock(t, repo, sha, denied)
 
 	cfg := Settings{
 		CacheDir: cacheDir, Endpoint: hub.URL, Concurrency: 1, MaxActiveDownloads: 1,
 		MultipartThreshold: "1MB", Verify: "none", Retries: 0, StallTimeout: "0",
 	}
-	err := Download(t.Context(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ProgressEvent) {})
+	err = Download(t.Context(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ProgressEvent) {})
 	if err == nil {
 		t.Fatal("the download succeeded although the ownership lock was denied")
 	}
-	if !strings.Contains(err.Error(), "ownership domain") {
-		t.Fatalf("the download error = %v, want an actionable ownership-domain failure", err)
+	if !errors.Is(err, denied) {
+		t.Fatalf("the download error = %v, want the injected destination-scope denial", err)
+	}
+	if !strings.Contains(err.Error(), "ownership") {
+		t.Fatalf("the download error = %v, want an actionable ownership failure", err)
 	}
 	if n := served(); n != 0 {
 		t.Errorf("the single-request route transferred the file %d times although the ownership lock was denied", n)
 	}
 
-	repo, rerr := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
-	if rerr != nil {
-		t.Fatal(rerr)
-	}
 	if _, serr := os.Stat(filepath.Join(repo.BlobsDir(), "tmp-"+sha+".part")); serr == nil {
 		t.Error("the single-request route wrote a payload although the ownership lock was denied")
 	}
 }
 
 func TestSingleRouteKeepsTheEarlierPartialWhenTheDomainIsUnavailable(t *testing.T) {
-	oldAcquire := stagingOwnershipAcquire
-	stagingOwnershipAcquire = func(string) (*stagingOwnershipLock, error) {
-		return nil, errStagingOSLockUnsupported
-	}
-	defer func() { stagingOwnershipAcquire = oldAcquire }()
-
 	const total = 4_096
 	body := bytes.Repeat([]byte{0x77}, total)
 	sha := singleTestSHA(body)
@@ -360,13 +372,18 @@ func TestSingleRouteKeepsTheEarlierPartialWhenTheDomainIsUnavailable(t *testing.
 	if err := os.WriteFile(partial, earlier, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	denyCacheBlobEntryLock(t, repo, sha, errOwnershipUnavailable)
 
 	cfg := Settings{
 		CacheDir: cacheDir, Endpoint: hub.URL, Concurrency: 1, MaxActiveDownloads: 1,
 		MultipartThreshold: "1MB", Verify: "none", Retries: 0, StallTimeout: "0",
 	}
-	if err := Download(t.Context(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ProgressEvent) {}); err == nil {
+	err = Download(t.Context(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ProgressEvent) {})
+	if err == nil {
 		t.Fatal("the download succeeded although the ownership domain was unavailable")
+	}
+	if !errors.Is(err, errOwnershipUnavailable) {
+		t.Fatalf("the download error = %v, want the injected destination-scope failure", err)
 	}
 	if n := served(); n != 0 {
 		t.Errorf("the single-request route transferred the file %d times although the ownership domain was unavailable", n)

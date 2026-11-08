@@ -63,18 +63,12 @@ func TestStagingOwnershipProbeIsNonOwning(t *testing.T) {
 	}
 }
 
-func TestCheckBlobUnsupportedFlockProbeIsNotFree(t *testing.T) {
+func TestCheckBlobUnsupportedExternalProbeIsUnknown(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
-	oldFlock := stagingOwnershipProbeFlock
-	defer func() { stagingOwnershipProbeFlock = oldFlock }()
-	stagingOwnershipProbeFlock = func(fd int, how int) error {
-		if how == syscall.LOCK_SH|syscall.LOCK_NB {
-			return syscall.ENOLCK
-		}
-		return syscall.Flock(fd, how)
-	}
+	oldOpen := ownershipLockOpen
+	defer func() { ownershipLockOpen = oldOpen }()
 
 	cache := NewHFCache(t.TempDir())
 	repo, err := cache.Repo("owner/repo", RepoTypeModel)
@@ -93,14 +87,9 @@ func TestCheckBlobUnsupportedFlockProbeIsNotFree(t *testing.T) {
 	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &meta); err != nil {
 		t.Fatal(err)
 	}
-	if own, err := acquireStagingOwnershipLock(mustDomainDst(t, repo, sha)); err != nil {
-		t.Fatal(err)
-	} else {
-		own.release()
-	}
-
+	ownershipLockOpen = func(string, ownershipLockMode) (ownershipLockHandle, error) { return nil, errOwnershipUnavailable }
 	status, _, err := repo.CheckBlob(sha)
-	// Probe failure is unknown ownership: return an error, not stale/free or proven-live status.
+	// Probe failure is unknown ownership, not stale/free or proven-live status.
 	if !errors.Is(err, ErrBlobOwnershipUnknown) || status != BlobOwnershipUnknown {
 		t.Fatalf("CheckBlob with ENOLCK probe = %v, %v; want an unknown-ownership error, not stale/free", status, err)
 	}

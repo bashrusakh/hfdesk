@@ -44,7 +44,7 @@ func IsStagingArtifactName(name string) bool {
 		folded = strings.ToLower(name)
 	}
 
-	// The single-request staging destination and everything derived from it:
+	// The single-request staging destination and its legacy lock-residue shape:
 	// tmp-<name>, tmp-<name>.part, tmp-<name>.part.meta, tmp-<name>.lock.
 	if strings.HasPrefix(folded, "tmp-") && len(folded) > len("tmp-") {
 		return true
@@ -57,7 +57,7 @@ func IsStagingArtifactName(name string) bool {
 		strings.HasSuffix(folded, ".meta.tmp") {
 		return true
 	}
-	// The persistent ownership lock beside a staging payload.
+	// Legacy payload-side lock residue; current ownership locks are external.
 	if strings.HasSuffix(folded, ".lock") {
 		return true
 	}

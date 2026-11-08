@@ -7,6 +7,7 @@ package hfdownloader
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -65,7 +66,36 @@ func acquireTestDomain(t testing.TB, dst string) *blobDomain {
 func acquireTestDomainFresh(t testing.TB, dst string) *blobDomain {
 	t.Helper()
 	key, lockSrc := testDomainIdentity(dst)
-	dom, err := acquireBlobDomain(context.Background(), key, lockSrc)
+	proofPath := dst
+	paths := []string{dst, lockSrc}
+	var realm *ownershipRealm
+	var err error
+	if cacheKey, ok := cacheDstDomainKey(dst); ok {
+		// Cache-domain fixtures must share the same H-derived control root as
+		// Download, not the legacy per-user flat-mode realm.
+		hubDir := filepath.Dir(filepath.Dir(filepath.Dir(cacheKey)))
+		cache := NewHFCacheResolved(hubDir, hubDir)
+		realm, err = cache.ownershipRealmForData()
+		if err != nil {
+			t.Fatalf("resolve the test cache-owned Hub realm: %v", err)
+		}
+		if canonicalSHA256(filepath.Base(cacheKey)) {
+			proofPath = cacheKey
+		}
+		paths = append(paths, cacheKey, dst+".incomplete", cacheKey+".incomplete")
+	} else {
+		ownerDir, resolveErr := resolveOwnershipDir("")
+		if resolveErr != nil {
+			t.Fatalf("resolve the test ownership realm: %v", resolveErr)
+		}
+		realm, err = newOwnershipRealm(ownerDir)
+		if err != nil {
+			t.Fatalf("create the test ownership realm: %v", err)
+		}
+		proofPath = strings.TrimPrefix(key, flatDomainKeyPrefix)
+		paths = append(paths, proofPath, proofPath+".incomplete")
+	}
+	dom, err := acquireBlobDomainScoped(context.Background(), key, lockSrc, realm, paths, proofPath)
 	if err != nil {
 		t.Fatalf("acquire the test destination ownership domain of %s: %v", dst, err)
 	}
@@ -88,7 +118,16 @@ func withTestDomain(t testing.TB, dst string, opts multipartOpts) multipartOpts 
 func acquireTestStagingDomain(t testing.TB, staging string) *blobDomain {
 	t.Helper()
 	dst := strings.TrimSuffix(staging, ".incomplete")
-	dom, err := acquireBlobDomain(context.Background(), flatDomainKey(dst), staging)
+	ownerDir, err := resolveOwnershipDir("")
+	if err != nil {
+		t.Fatalf("resolve the test ownership realm: %v", err)
+	}
+	realm, err := newOwnershipRealm(ownerDir)
+	if err != nil {
+		t.Fatalf("create the test ownership realm: %v", err)
+	}
+	dom, err := acquireBlobDomainScoped(context.Background(), flatDomainKey(dst), staging, realm,
+		[]string{dst, staging, staging + ".meta", staging + ".meta" + stagingRecordTempSuffix}, dst)
 	if err != nil {
 		t.Fatalf("acquire the test staging domain of %s: %v", staging, err)
 	}

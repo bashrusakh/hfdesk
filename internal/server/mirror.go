@@ -4,6 +4,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -343,7 +344,7 @@ func (s *Server) handleMirrorPush(w http.ResponseWriter, r *http.Request) {
 		var ok bool
 		release, ok = s.jobs.beginCacheMutation(destination)
 		if !ok {
-			writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+			writeError(w, http.StatusConflict, "Cache is busy", "An active download or another cache operation is using this cache; retry when it finishes")
 			return
 		}
 		defer release()
@@ -387,7 +388,7 @@ func (s *Server) handleMirrorPull(w http.ResponseWriter, r *http.Request) {
 		var ok bool
 		release, ok = s.jobs.beginCacheMutation(destination)
 		if !ok {
-			writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+			writeError(w, http.StatusConflict, "Cache is busy", "An active download or another cache operation is using this cache; retry when it finishes")
 			return
 		}
 		defer release()
@@ -576,21 +577,21 @@ func mirrorSyncHubs(srcCache, dstCache, repoFilter string, dryRun, verify, delet
 		}
 	}
 
-	// Calculate sizes
-	for _, e := range toCopy {
-		result.CopiedSize += e.Size
-		result.Repos = append(result.Repos, e.Repo)
-	}
-	for _, e := range toDelete {
-		result.DeletedSize += e.Size
-	}
-
-	result.Copied = len(toCopy)
-	result.Deleted = len(toDelete)
-	result.CopiedSizeHuman = humanSizeBytes(result.CopiedSize)
-	result.DeletedSizeHuman = humanSizeBytes(result.DeletedSize)
-
 	if dryRun {
+		// A dry run reports the planned work; a real run counts only the copies
+		// and removals that actually happened, so refused entries stay visible
+		// in errors instead of being reported as copied or deleted.
+		for _, e := range toCopy {
+			result.CopiedSize += e.Size
+			result.Repos = append(result.Repos, e.Repo)
+		}
+		for _, e := range toDelete {
+			result.DeletedSize += e.Size
+		}
+		result.Copied = len(toCopy)
+		result.Deleted = len(toDelete)
+		result.CopiedSizeHuman = humanSizeBytes(result.CopiedSize)
+		result.DeletedSizeHuman = humanSizeBytes(result.DeletedSize)
 		result.Message = fmt.Sprintf("Would copy %d repos (%s)", len(toCopy), result.CopiedSizeHuman)
 		if len(toDelete) > 0 {
 			result.Message += fmt.Sprintf(", delete %d repos (%s)", len(toDelete), result.DeletedSizeHuman)
@@ -598,50 +599,99 @@ func mirrorSyncHubs(srcCache, dstCache, repoFilter string, dryRun, verify, delet
 		return result, nil
 	}
 
+	result.CopiedSizeHuman = humanSizeBytes(result.CopiedSize)
+	result.DeletedSizeHuman = humanSizeBytes(result.DeletedSize)
+
 	if len(toCopy) == 0 && len(toDelete) == 0 {
 		result.Message = "Nothing to do - destination is in sync"
 		return result, nil
 	}
 
-	// Copy each repo
+	// Copy each repo. The counts reflect only entries whose copy (and
+	// verification, when requested) completed without error, so a refused or
+	// unverifiable copy stays visible in errors instead of being reported as
+	// copied.
 	for _, e := range toCopy {
+		clean := true
 		if err := copyRepoCache(e.Path, srcCache, dstCache); err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("copy %s: %v", e.Repo, err))
 			result.Success = false
+			clean = false
 		}
 
 		if verify {
 			if err := verifyRepoCache(e.Path, srcCache, dstCache); err != nil {
 				result.Errors = append(result.Errors, fmt.Sprintf("verify %s: %v", e.Repo, err))
 				result.Success = false
+				clean = false
 			}
 		}
+		if clean {
+			result.Copied++
+			result.CopiedSize += e.Size
+			result.Repos = append(result.Repos, e.Repo)
+		}
 	}
+	result.CopiedSizeHuman = humanSizeBytes(result.CopiedSize)
 
-	// Delete extra repos
+	// Delete extra repos under their cache-owned tree admission so no
+	// participant sharing the destination loses a live writer's payload. A
+	// destination path that vanished between scan and delete is admitted by
+	// the shared re-verified-vanish rule and removed as a no-op, exactly like
+	// os.RemoveAll, so it counts as deleted (at its scan-time size) and never
+	// as an error.
 	for _, e := range toDelete {
-		if err := mirrorNoSymlinkPath(dstCache, e.Path); err != nil {
+		if err := removeMirrorExtraRepo(dstCache, e); err != nil {
 			result.Errors = append(result.Errors, err.Error())
 			result.Success = false
 			continue
 		}
-		if err := os.RemoveAll(e.Path); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", e.Repo, err))
-			result.Success = false
-		}
+		result.Deleted++
+		result.DeletedSize += e.Size
 	}
+	result.DeletedSizeHuman = humanSizeBytes(result.DeletedSize)
 
-	result.Message = fmt.Sprintf("Copied %d repos (%s)", len(toCopy), result.CopiedSizeHuman)
+	result.Message = fmt.Sprintf("Copied %d repos (%s)", result.Copied, result.CopiedSizeHuman)
 	if len(toDelete) > 0 {
-		result.Message += fmt.Sprintf(", deleted %d repos (%s)", len(toDelete), result.DeletedSizeHuman)
+		result.Message += fmt.Sprintf(", deleted %d repos (%s)", result.Deleted, result.DeletedSizeHuman)
 	}
 
 	return result, nil
 }
 
+// removeMirrorExtraRepo removes one destination repository only while holding its
+// cache-owned tree admission. It never waits: a live writer's conflict is reported instead of deleting.
+// A repository that vanished between scan and delete satisfies the shared re-verified-vanish rule and
+// is removed as a tolerated no-op, matching os.RemoveAll, rather than reported as a delete failure.
+func removeMirrorExtraRepo(dstCache string, e mirrorEntry) error {
+	admission, err := hfdownloader.OpenCacheAdmission(context.Background(), dstCache)
+	if err != nil {
+		return fmt.Errorf("delete %s: %w", e.Repo, err)
+	}
+	release, err := admission.AdmitTreeRemoval(context.Background(), e.Path)
+	if err != nil {
+		return fmt.Errorf("delete %s: %w", e.Repo, err)
+	}
+	defer release()
+	if err := mirrorNoSymlinkPath(dstCache, e.Path); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(e.Path); err != nil {
+		return fmt.Errorf("delete %s: %w", e.Repo, err)
+	}
+	return nil
+}
+
 // copyRepoCache copies a repo from source to destination cache.
 func copyRepoCache(repoPath, srcCache, dstCache string) error {
 	dstPath, err := mirrorRepoDestination(repoPath, srcCache, dstCache)
+	if err != nil {
+		return err
+	}
+
+	// Entry-level admission for this repository's destination files excludes live writers in
+	// every process sharing the destination; unrelated repositories stay independent.
+	admission, err := hfdownloader.OpenCacheAdmission(context.Background(), dstCache)
 	if err != nil {
 		return err
 	}
@@ -709,7 +759,13 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 		if err := mirrorNoSymlinkPath(dstCache, dst); err != nil {
 			return err
 		}
-		return copyFileForMirror(path, dst)
+		release, err := admission.AdmitFileWrite(context.Background(), dst)
+		if err != nil {
+			return err
+		}
+		copyErr := copyFileForMirror(path, dst)
+		release()
+		return copyErr
 	})
 }
 

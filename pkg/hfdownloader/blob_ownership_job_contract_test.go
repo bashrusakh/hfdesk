@@ -146,16 +146,12 @@ func testDownloadWaitsForLiveForeignDomainOwner(t *testing.T, threshold string) 
 	repo := ownershipContractRepo(t, cacheDir)
 
 	// Hold the foreign-owner lock in a separate open file description.
-	owner, err := acquireStagingOwnershipLock(mustDomainDst(t, repo, sha))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer owner.release()
+	owner := acquireTestDomainFresh(t, mustDomainDst(t, repo, sha))
 
 	srv, getRanges := recordingHub(t, full, "model.bin", true)
 	cfg := ownershipContractSettings(cacheDir, srv.URL, threshold)
 
-	contended := installDomainContentionProbe(t)
+	contended := installBlobDomainContentionProbe(t)
 	result := make(chan ownershipContractOutcome, 1)
 	go func() { result <- runOwnershipContractDownload(context.Background(), cfg) }()
 
@@ -202,16 +198,12 @@ func TestDownloadWaitsForLiveForeignDomainOwnerThatFails(t *testing.T) {
 	cacheDir := t.TempDir()
 	repo := ownershipContractRepo(t, cacheDir)
 
-	owner, err := acquireStagingOwnershipLock(mustDomainDst(t, repo, sha))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer owner.release()
+	owner := acquireTestDomainFresh(t, mustDomainDst(t, repo, sha))
 
 	srv, getRanges := recordingHub(t, full, "model.bin", true)
 	cfg := ownershipContractSettings(cacheDir, srv.URL, "0")
 
-	contended := installDomainContentionProbe(t)
+	contended := installBlobDomainContentionProbe(t)
 	result := make(chan ownershipContractOutcome, 1)
 	go func() { result <- runOwnershipContractDownload(context.Background(), cfg) }()
 
@@ -257,11 +249,18 @@ func TestDownloadFailsWhenLiveForeignOwnerHoldsDomainPastBudget(t *testing.T) {
 	cacheDir := t.TempDir()
 	repo := ownershipContractRepo(t, cacheDir)
 
-	owner, err := acquireStagingOwnershipLock(mustDomainDst(t, repo, sha))
+	realm, err := NewHFCache(cacheDir).ownershipRealmForData()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer owner.release()
+	dst := mustDomainDst(t, repo, sha)
+	owner, err := realm.acquireWriter(context.Background(), []string{
+		repo.BlobPath(sha), dst, dst + ".part", repo.IncompletePath(sha), repo.IncompleteMetaPath(sha),
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Release()
 
 	srv, getRanges := recordingHub(t, full, "model.bin", true)
 	cfg := ownershipContractSettings(cacheDir, srv.URL, "0")
@@ -271,8 +270,8 @@ func TestDownloadFailsWhenLiveForeignOwnerHoldsDomainPastBudget(t *testing.T) {
 	if out.err == nil {
 		t.Fatalf("the download reported success although the live owner still holds the domain (skips=%v)", out.skips)
 	}
-	if !errors.Is(out.err, errBlobOwnedByLiveWriter) {
-		t.Errorf("Download error = %v, want the actionable live-owner error", out.err)
+	if !errors.Is(out.err, errStagingOwnershipBusy) {
+		t.Errorf("Download error = %v, want the exclusive-scope-held error", out.err)
 	}
 	if !strings.Contains(out.err.Error(), sha) || !strings.Contains(out.err.Error(), "try again later") {
 		t.Errorf("Download error = %v, want the blob key and the retry action in the message", out.err)
@@ -534,17 +533,167 @@ func TestCleanupRemovesOwnPartialAfterCancel(t *testing.T) {
 	}
 }
 
+func TestSeparateProcessDownloadsShareCacheAnchorAndReleaseWaiterSlot(t *testing.T) {
+	if !ownershipOSLockAvailable {
+		t.Skip("this platform has no external ownership lock primitive")
+	}
+	base := t.TempDir()
+	cacheDir := filepath.Join(base, "cache")
+	fullA, fullB := rangedTestPayload(4_096), bytes.Repeat([]byte("b"), 4_096)
+	shaA, shaB := singleTestSHA(fullA), singleTestSHA(fullB)
+	tree := "[" + lfsTreeNode("a.bin", len(fullA), shaA) + "," + lfsTreeNode("b.bin", len(fullB), shaB) + "]"
+	var (
+		mu       sync.Mutex
+		payloads = map[string]int{}
+		aEntered = make(chan struct{})
+		bEntered = make(chan struct{})
+		releaseA = make(chan struct{})
+		release  sync.Once
+		aOnce    sync.Once
+		bOnce    sync.Once
+	)
+	defer func() { release.Do(func() { close(releaseA) }) }()
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_, _ = w.Write([]byte(tree))
+		case strings.Contains(r.URL.Path, "/resolve/"):
+			rel := filepath.Base(r.URL.Path)
+			body := fullA
+			if rel == "b.bin" {
+				body = fullB
+			}
+			if r.Method == http.MethodGet && r.Header.Get("X-HFDesk-Addressing-Probe") != "1" {
+				mu.Lock()
+				payloads[rel]++
+				mu.Unlock()
+				if rel == "a.bin" {
+					aOnce.Do(func() { close(aEntered) })
+					select {
+					case <-releaseA:
+					case <-r.Context().Done():
+						return
+					}
+				} else if rel == "b.bin" {
+					bOnce.Do(func() { close(bEntered) })
+				}
+			}
+			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
+
+	child := startBlobOwnershipChild(t, blobOwnershipChildConfig{
+		DownloadEndpoint: hub.URL, CacheDir: cacheDir,
+		ReadyPath: filepath.Join(base, "child-ready"), GoPath: filepath.Join(base, "child-go"),
+	})
+	select {
+	case <-aEntered:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the child Download did not enter the gated a.bin payload request")
+	}
+	waitForFile(t, filepath.Join(base, "child-ready"), 10*time.Second)
+
+	contended := installBlobDomainContentionProbe(t)
+	parentEvents := make(chan ProgressEvent, 64)
+	parentResult := make(chan error, 1)
+	var eventMu sync.Mutex
+	var skippedA bool
+	settings := Settings{
+		CacheDir: cacheDir, Endpoint: hub.URL,
+		Concurrency: 1, MaxActiveDownloads: 1, MultipartThreshold: "0",
+		Verify: "size", Retries: 0, StallTimeout: "0",
+	}
+	go func() {
+		parentResult <- Download(context.Background(), Job{Repo: "owner/model", Revision: "main"}, settings, func(ev ProgressEvent) {
+			if ev.Event == "file_done" && ev.Path == "a.bin" && strings.Contains(ev.Message, "skip") {
+				eventMu.Lock()
+				skippedA = true
+				eventMu.Unlock()
+			}
+			select {
+			case parentEvents <- ev:
+			default:
+			}
+		})
+	}()
+	awaitContention(t, contended, "the child's external item scope")
+
+	bDone := false
+	timer := time.NewTimer(60 * time.Second)
+	defer timer.Stop()
+	for !bDone {
+		select {
+		case ev := <-parentEvents:
+			if ev.Event == "file_done" && ev.Path == "b.bin" {
+				if strings.Contains(ev.Message, "skip") {
+					t.Fatalf("b.bin unexpectedly skipped before the child completed: %q", ev.Message)
+				}
+				bDone = true
+			}
+		case err := <-parentResult:
+			t.Fatalf("parent Download ended while the child held a.bin: %v", err)
+		case <-timer.C:
+			t.Fatal("the parent retained its only transfer slot while waiting; b.bin did not complete")
+		}
+	}
+	select {
+	case <-bEntered:
+	default:
+		t.Fatal("b.bin completed without a payload request")
+	}
+	mu.Lock()
+	seenA, seenB := payloads["a.bin"], payloads["b.bin"]
+	mu.Unlock()
+	if seenA != 1 || seenB != 1 {
+		t.Fatalf("payload GET counts while a.bin was held = a:%d b:%d, want 1 each", seenA, seenB)
+	}
+
+	release.Do(func() { close(releaseA) })
+	releaseBlobOwnershipChild(t, child, filepath.Join(base, "child-go"))
+	select {
+	case err := <-parentResult:
+		if err != nil {
+			t.Fatalf("parent Download: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("parent did not reuse the blob after the child released its item")
+	}
+	eventMu.Lock()
+	gotSkippedA := skippedA
+	eventMu.Unlock()
+	if !gotSkippedA {
+		t.Fatal("the parent did not report the published a.bin as a skip after waiting")
+	}
+
+	repo, err := NewHFCacheResolved(cacheDir, "").Repo("owner/model", RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertExactFile(t, repo.BlobPath(shaA), fullA)
+	assertExactFile(t, repo.BlobPath(shaB), fullB)
+	assertOwnershipContractLinks(t, cacheDir, "a.bin")
+	assertOwnershipContractLinks(t, cacheDir, "b.bin")
+}
+
 const (
 	blobOwnershipChildEnv  = "HFDESK_BLOB_OWNERSHIP_CHILD"
 	blobOwnershipConfigEnv = "HFDESK_BLOB_OWNERSHIP_CONFIG"
 )
 
 type blobOwnershipChildConfig struct {
-	DomainDst   string `json:"domain_dst"`
-	PartialPath string `json:"partial_path"`
-	Payload     string `json:"payload"`
-	ReadyPath   string `json:"ready_path"`
-	GoPath      string `json:"go_path"`
+	DomainDst        string `json:"domain_dst"`
+	OwnershipDir     string `json:"ownership_dir"`
+	DownloadEndpoint string `json:"download_endpoint"`
+	CacheDir         string `json:"cache_dir"`
+	PartialPath      string `json:"partial_path"`
+	Payload          string `json:"payload"`
+	ReadyPath        string `json:"ready_path"`
+	GoPath           string `json:"go_path"`
 	// PublishPath is written only after PublishGoPath appears, letting the parent
 	// establish contention before publication.
 	PublishPath string `json:"publish_path"`
@@ -568,7 +717,55 @@ func TestBlobOwnershipChildProcess(t *testing.T) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		t.Fatalf("child config: %v", err)
 	}
-	owner, err := acquireStagingOwnershipLock(cfg.DomainDst)
+	if cfg.DownloadEndpoint != "" {
+		settings := Settings{
+			CacheDir: cfg.CacheDir, OwnershipDir: cfg.OwnershipDir, Endpoint: cfg.DownloadEndpoint,
+			Concurrency: 1, MaxActiveDownloads: 1, MultipartThreshold: "0",
+			Verify: "size", Retries: 0, StallTimeout: "0",
+		}
+		err := Download(context.Background(), Job{Repo: "owner/model", Revision: "main"}, settings, func(ev ProgressEvent) {
+			if ev.Event == "file_start" && ev.Path == "a.bin" {
+				if err := os.WriteFile(cfg.ReadyPath, []byte("ready"), 0o644); err != nil {
+					t.Errorf("child ready marker: %v", err)
+				}
+			}
+		})
+		if err != nil {
+			t.Fatalf("child Download: %v", err)
+		}
+		waitForFile(t, cfg.GoPath, 120*time.Second)
+		return
+	}
+	var realm *ownershipRealm
+	if _, isCachePath := cacheDstDomainKey(cfg.DomainDst); isCachePath {
+		hubDir := filepath.Dir(filepath.Dir(filepath.Dir(cfg.DomainDst)))
+		cache := NewHFCacheResolved(hubDir, hubDir)
+		realm, err = cache.ownershipRealmForData()
+	} else {
+		ownerDir, resolveErr := resolveOwnershipDir(cfg.OwnershipDir)
+		if resolveErr != nil {
+			t.Fatalf("child ownership path: %v", resolveErr)
+		}
+		realm, err = newOwnershipRealm(ownerDir)
+	}
+	if err != nil {
+		t.Fatalf("child ownership realm: %v", err)
+	}
+	key, domainDst := testDomainIdentity(cfg.DomainDst)
+	proofPath := cfg.DomainDst
+	paths := []string{cfg.DomainDst, domainDst, cfg.PartialPath}
+	if !strings.HasPrefix(key, flatDomainKeyPrefix) {
+		if canonicalSHA256(filepath.Base(key)) {
+			proofPath = key
+			paths = append(paths, key, key+".incomplete", key+".incomplete.meta")
+		}
+	} else {
+		proofPath = strings.TrimPrefix(key, flatDomainKeyPrefix)
+	}
+	if cfg.PublishPath != "" {
+		paths = append(paths, cfg.PublishPath)
+	}
+	owner, err := acquireBlobDomainScoped(context.Background(), key, domainDst, realm, paths, proofPath)
 	if err != nil {
 		t.Fatalf("child domain: %v", err)
 	}

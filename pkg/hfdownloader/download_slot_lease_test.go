@@ -279,8 +279,12 @@ func TestDownloadSlotLeaseCrossProcessWait(t *testing.T) {
 	dstA := slotLeaseFlatDst(t, out, "a.bin")
 	dstB := slotLeaseFlatDst(t, out, "b.bin")
 
-	// Hold only the OS lock to exercise the foreign-process wait path.
-	owner, err := acquireStagingOwnershipLock(flatDomainLockSrc(dstA))
+	// Hold an external realm scope without the process-local domain map.
+	realm, err := newOwnershipRealm(DefaultOwnershipDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := realm.acquireWriter(context.Background(), []string{dstA, dstA + ".part", dstA + ".incomplete"}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +294,7 @@ func TestDownloadSlotLeaseCrossProcessWait(t *testing.T) {
 			return
 		}
 		ownerReleased = true
-		owner.release()
+		owner.Release()
 	}
 	defer releaseOwner()
 
@@ -467,13 +471,17 @@ func TestDownloadSlotLeaseCancellation(t *testing.T) {
 			},
 		},
 		{
-			name: "cross-process OS lock",
+			name: "external OS realm lock",
 			hold: func(t *testing.T, dst string) func() {
-				lock, err := acquireStagingOwnershipLock(flatDomainLockSrc(dst))
+				realm, err := newOwnershipRealm(DefaultOwnershipDir())
 				if err != nil {
 					t.Fatal(err)
 				}
-				return lock.release
+				lease, err := realm.acquireWriter(context.Background(), []string{dst, dst + ".part", dst + ".incomplete"}, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return lease.Release
 			},
 		},
 	} {
@@ -496,9 +504,6 @@ func TestDownloadSlotLeaseCancellation(t *testing.T) {
 
 			// Install the package hook before launching the item.
 			contended := installBlobDomainContentionProbe(t)
-			if tc.name == "cross-process OS lock" {
-				contended = installDomainContentionProbe(t)
-			}
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()

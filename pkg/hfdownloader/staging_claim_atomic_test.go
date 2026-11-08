@@ -106,6 +106,14 @@ func TestTakeoverReplacementFailurePreservesAndResumesValidatedRecord(t *testing
 	old.PID = 99999999
 	old.Host = "some-other-host"
 	old.LockFenced = true
+	realm, err := newOwnershipRealm(DefaultOwnershipDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.OwnershipFence, err = realm.fenceProof(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
 	old.Ranges = buildRangeLayout(total, 2)
 	old.Ranges[0].Committed, old.Ranges[0].Done = prefix, true
 	if err := writeStagingMeta(metaPath, &old); err != nil {

@@ -184,15 +184,16 @@ const (
 )
 
 type stagingTakeoverChildConfig struct {
-	Index       int    `json:"index"`
-	Dst         string `json:"dst"`
-	Staging     string `json:"staging"`
-	Publish     string `json:"publish"`
-	URL         string `json:"url"`
-	GoPath      string `json:"go"`
-	ResultPath  string `json:"result"`
-	Size        int64  `json:"size"`
-	Concurrency int    `json:"concurrency"`
+	Index        int    `json:"index"`
+	OwnershipDir string `json:"ownership_dir"`
+	Dst          string `json:"dst"`
+	Staging      string `json:"staging"`
+	Publish      string `json:"publish"`
+	URL          string `json:"url"`
+	GoPath       string `json:"go"`
+	ResultPath   string `json:"result"`
+	Size         int64  `json:"size"`
+	Concurrency  int    `json:"concurrency"`
 }
 
 type stagingTakeoverChildResult struct {
@@ -236,7 +237,16 @@ func TestStagingTakeoverChildProcess(t *testing.T) {
 
 	it := PlanItem{RelativePath: "takeover.bin", URL: cfg.URL, Size: cfg.Size, AcceptRanges: true}
 	key, lockSrc := testDomainIdentity(cfg.Dst)
-	domain, derr := acquireBlobDomain(context.Background(), key, lockSrc)
+	ownerDir := cfg.OwnershipDir
+	if ownerDir == "" {
+		ownerDir = DefaultOwnershipDir()
+	}
+	realm, rerr := newOwnershipRealm(ownerDir)
+	if rerr != nil {
+		t.Fatalf("child ownership realm: %v", rerr)
+	}
+	domain, derr := acquireBlobDomainScoped(context.Background(), key, lockSrc, realm,
+		[]string{cfg.Dst, cfg.Staging, cfg.Staging + ".meta", cfg.Publish}, cfg.Dst)
 	res := stagingTakeoverChildResult{Index: cfg.Index, Instance: processInstanceToken}
 	if derr != nil {
 		res.Err = derr.Error()
@@ -359,15 +369,16 @@ func TestClaimStagingConcurrentTakeover(t *testing.T) {
 		cfgPaths[i] = filepath.Join(dir, fmt.Sprintf("cfg-%d.json", i))
 		resultPaths[i] = filepath.Join(dir, fmt.Sprintf("result-%d.json", i))
 		cfg := stagingTakeoverChildConfig{
-			Index:       i,
-			Dst:         dst,
-			Staging:     staging,
-			Publish:     dst,
-			URL:         srv.URL + "/takeover.bin",
-			GoPath:      goPath,
-			ResultPath:  resultPaths[i],
-			Size:        total,
-			Concurrency: concurrency,
+			Index:        i,
+			OwnershipDir: DefaultOwnershipDir(),
+			Dst:          dst,
+			Staging:      staging,
+			Publish:      dst,
+			URL:          srv.URL + "/takeover.bin",
+			GoPath:       goPath,
+			ResultPath:   resultPaths[i],
+			Size:         total,
+			Concurrency:  concurrency,
 		}
 		data, merr := json.Marshal(cfg)
 		if merr != nil {

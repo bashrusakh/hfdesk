@@ -2030,7 +2030,12 @@ func TestLocalBranchVariantRefusesSymlinkedAppOwnedComponent(t *testing.T) {
 			if err == nil {
 				t.Fatal("local branch variant accepted a symlinked app-owned component")
 			}
-			if !strings.Contains(err.Error(), "unsafe branch variant layout") {
+			if tc.name == "revision directory" {
+				want := "invalidate prior branch variant completion records: unsafe branch variant record directory " + link
+				if err.Error() != want {
+					t.Fatalf("local branch variant error = %v, want %q", err, want)
+				}
+			} else if !strings.Contains(err.Error(), "unsafe branch variant layout") {
 				t.Fatalf("local branch variant error = %v, want the unsafe-layout refusal", err)
 			}
 			mu.Lock()
@@ -2929,8 +2934,8 @@ func branchStagingFiles(blobsDir string) []string {
 		if !strings.HasPrefix(name, "tmp-") {
 			continue
 		}
-		// Persistent destination-domain locks and the single-path identity
-		// sidecar are metadata for one stage, not additional staging payloads.
+		// Legacy payload-side lock residue and the single-path identity sidecar
+		// are metadata for one stage, not additional staging payloads.
 		if strings.HasSuffix(name, ".lock") || strings.HasSuffix(name, ".part.meta") {
 			continue
 		}
@@ -3521,8 +3526,6 @@ func TestLocalBranchVariantPayloadHoldsOnlyTheVariantFiles(t *testing.T) {
 		switch {
 		case strings.HasPrefix(file.rel, "payload/"+revision+"/"):
 		case file.rel == "records/"+revision+"/"+commit+"/"+ManifestFilename:
-		case strings.HasPrefix(file.rel, "staging/") && strings.HasSuffix(file.rel, ".incomplete.lock"):
-			// The lifetime destination-domain lock is persistent by contract.
 		default:
 			t.Errorf("reserved space holds %q after the download, want only the payload files and the completion record", file.rel)
 		}

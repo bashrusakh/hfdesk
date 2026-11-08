@@ -42,10 +42,25 @@ func TestDownload_OwnedClaimIsNotCountedAsSkipped(t *testing.T) {
 		t.Fatal(err)
 	}
 	shortBlobOwnershipWait(t, 250*time.Millisecond)
-	hold, _ := acquireStagingOwnershipLock(filepath.Join(blobsDir, "tmp-"+sha))
-	if hold != nil {
-		defer hold.release()
+	repo, err := NewHFCache(cacheDir).Repo("o/r", RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
 	}
+	realm, err := repo.cache.ownershipRealmForData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	domainDst, err := repo.blobDomainDst(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := realm.acquireWriter(context.Background(), []string{
+		repo.BlobPath(sha), domainDst, staging, staging + ".meta",
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Release()
 
 	cfg := Settings{
 		CacheDir:           cacheDir,
@@ -59,7 +74,7 @@ func TestDownload_OwnedClaimIsNotCountedAsSkipped(t *testing.T) {
 	}
 	var doneMessage string
 	var skips []string
-	err := Download(context.Background(), Job{Repo: "o/r", Revision: "main"}, cfg, func(ev ProgressEvent) {
+	err = Download(context.Background(), Job{Repo: "o/r", Revision: "main"}, cfg, func(ev ProgressEvent) {
 		if ev.Event == "done" {
 			doneMessage = ev.Message
 		}
@@ -70,8 +85,8 @@ func TestDownload_OwnedClaimIsNotCountedAsSkipped(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Download reported success although a live writer owns the item (done=%q)", doneMessage)
 	}
-	if !errors.Is(err, errBlobOwnedByLiveWriter) {
-		t.Errorf("Download error = %v, want the actionable live-owner error", err)
+	if !errors.Is(err, errStagingOwnershipBusy) {
+		t.Errorf("Download error = %v, want the exclusive-scope-held error", err)
 	}
 	if len(skips) != 0 {
 		t.Errorf("the live-owned item was counted as a skip: %v", skips)

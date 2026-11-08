@@ -4,6 +4,7 @@
 package hfdownloader
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -344,6 +345,15 @@ func TestCleanupJobPartFiles_HFCacheBlobStaging(t *testing.T) {
 	}
 	sha := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	otherSha := "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+	cache := NewHFCache(cacheDir)
+	realm, err := cache.ownershipRealmForData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err := realm.fenceProof(filepath.Join(blobsDir, sha))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	tracked := map[string]string{
 		"tmp-" + sha:                      "completed temp window residue",
@@ -361,7 +371,11 @@ func TestCleanupJobPartFiles_HFCacheBlobStaging(t *testing.T) {
 	}
 	for name, body := range tracked {
 		if strings.HasSuffix(name, ".meta") {
-			body = `{"lock_fenced":true}`
+			record, err := json.Marshal(IncompleteMeta{LockFenced: true, OwnershipFence: fence})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body = string(record)
 		}
 		if err := os.WriteFile(filepath.Join(blobsDir, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
@@ -372,7 +386,7 @@ func TestCleanupJobPartFiles_HFCacheBlobStaging(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Lock-fenced records plus the free OS lock permit cleanup.
+	// A matching current realm/key proof permits cleanup.
 
 	if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{filepath.Join(blobsDir, "tmp-"+sha)}); err != nil {
 		t.Fatalf("CleanupJobPartFiles: %v", err)
@@ -400,15 +414,27 @@ func TestCleanupJobPartFiles_LegacyRangedStaging(t *testing.T) {
 		"model.bin.incomplete.meta": "A/model.bin staging metadata",
 		"weights.bin.incomplete":    "B/weights.bin staging (concurrent job)",
 	}
+	realm, err := newOwnershipRealm(DefaultOwnershipDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err := realm.fenceProof(filepath.Join(repoDir, "model.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, body := range files {
 		if strings.HasSuffix(name, ".meta") {
-			body = `{"lock_fenced":true}`
+			record, err := json.Marshal(IncompleteMeta{LockFenced: true, OwnershipFence: fence})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body = string(record)
 		}
 		if err := os.WriteFile(filepath.Join(repoDir, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// A lock-fenced record with a free lifetime lock is safely reclaimable.
+	// A matching current realm/key proof permits cleanup.
 	if err := CleanupJobPartFiles(Settings{OutputDir: tmpDir}, []string{filepath.Join(repoDir, "model.bin")}); err != nil {
 		t.Fatalf("CleanupJobPartFiles: %v", err)
 	}

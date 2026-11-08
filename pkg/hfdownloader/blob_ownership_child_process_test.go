@@ -82,7 +82,7 @@ func testDownloadWaitsForForeignProcessOwnerThatPublishes(t *testing.T, threshol
 	srv, getRanges := recordingHub(t, full, "model.bin", true)
 	cfg := ownershipContractSettings(cacheDir, srv.URL, threshold)
 
-	contended := installDomainContentionProbe(t)
+	contended := installBlobDomainContentionProbe(t)
 	result := make(chan ownershipContractOutcome, 1)
 	go func() { result <- runOwnershipContractDownload(context.Background(), cfg) }()
 
@@ -159,7 +159,7 @@ func TestDownloadCancelWhileWaitingForForeignProcessOwnerAbortsPromptly(t *testi
 
 	// The probe is installed before the writer starts: the hook is a
 	// package-level variable.
-	contended := installDomainContentionProbe(t)
+	contended := installBlobDomainContentionProbe(t)
 	result := make(chan ownershipContractOutcome, 1)
 	go func() { result <- runOwnershipContractDownload(ctx, cfg) }()
 

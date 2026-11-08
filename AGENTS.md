@@ -134,31 +134,50 @@ The canonical, detailed contract for downloader and cache correctness is
 or job ownership behavior. This section is the agent-level summary; when it and
 `doc.go` differ, `doc.go` is authoritative and this summary must be updated.
 
-- ONE destination ownership domain per destination, acquired ONCE at item
-  level for every route (cache single, cache multipart, flat single, flat
-  multipart), after the skip decision and before the HEAD/claim, and held
-  through the claim, transfer, publication/store and cancel cleanup. A
-  content-addressed cache item uses key `blobs/<sha>` and lock
-  `blobs/tmp-<sha>.lock`; a digest-less item stages at
-  `blobs/tmp-path-<sanitized path>` with key `blobs/path-<sanitized path>` and
-  lock `blobs/tmp-path-<sanitized path>.lock`; a flat destination uses its path
-  as the key and `<destination>.incomplete.lock` as the lock. The lock file is
-  persistent and never unlinked. `FinalizeBlob` and every writer of
-  `blobs/<sha>` participate in that key's domain.
-- The multipart claim takes NO second lock: it receives the held domain,
-  verifies that the domain covers its staging path, fails closed otherwise,
-  serializes its record transitions with the intra-item metadata gate, and
-  records `LockFenced`. `CheckBlob` probes the destination domain lock, not the
-  obsolete `<staging>.lock`. Ownership is the destination domain plus
-  `LockFenced`; the record is diagnostics/resume state, not a freshness lease,
-  so there is no heartbeat and no timer rewrite, and `StaleTimeout` is removed
-  (do not reintroduce an age-based timeout, lease or takeover). A proven live
-  owner is waited for (bounded, context-aware, effective 5 minutes), never
-  skipped and never taken over. An unavailable domain fails the item before it
-  writes a payload and preserves existing partial data. Unfenced or unreadable
-  current-format records are preserved
-  and refused with `ErrStagingOwnershipUnproven`; never auto-delete such a
-  record or its persistent domain lock.
+- Cache ownership is cache-owned by default: Hub items use the durable control
+  tree at `H/.hfdesk-control/v1` derived only from the frozen `HubDir` H, while
+  friendly-view items use `R/.hfdesk-control/v1` derived from the frozen cache
+  root R. The downloader link operation scopes each actual H/R output it
+  mutates; server deletion, mirror destructive steps and the HF branch of
+  selected-GGUF deletion participate through the cache-owned admission API
+  (`OpenCacheAdmission`, `AdmitTreeRemoval`/`AdmitFileWrite`), and selected
+  deletion's local-root branch through the same API against the flat
+  `OwnershipDir` realm (`OpenFlatAdmission`, `AdmitFileWrites`) — as strong as
+  the flat writers' existing coordination: both sides must resolve the same
+  `OwnershipDir` (default per-user). Tree removals admit the tree first and
+  treat a missing target as gone only after re-verifying the vanish while
+  holding its creator-side keys; an admission that establishes neither fails
+  closed. Shared H clients converge without per-user `OwnershipDir` setup.
+  `Settings.OwnershipDir` is for flat `OutputDir` mode only; a non-empty value
+  in cache mode is rejected instead of selecting another cache namespace.
+  Cache-owned node metadata is separated from payload components, IDs/profiles
+  are persistent, and lock files are regular metadata files that are never
+  unlinked. Current writers create no payload-side domain-lock files.
+- ONE destination scope is acquired after the authoritative skip decision and
+  before resume inspection/HEAD/claim, then held through transfer,
+  publication/store and cancel cleanup. Content-addressed cache items use
+  logical key `blobs/<sha>` across single and ranged routes; digest-less items
+  use the reserved `tmp-path-` namespace; flat items use their destination path.
+  Scope leases include actual staging/publish paths. Snapshot and enabled
+  friendly mutations acquire their actual paths while the blob domain remains
+  held. Missing parents use the preparation gates, create-parent phase and
+  physical-key promotion before payload mutation. `FinalizeBlob`, cache store,
+  `CheckBlob` and applicable cleanup/probes participate in the applicable
+  cache-owned H/R or flat-mode realm/key protocol.
+- The multipart claim takes NO second item lock: it receives the held scope,
+  verifies coverage of its staging path, fails closed otherwise, and serializes
+  record transitions with the intra-item metadata gate. New/updated v4 records
+  carry `LockFenced` plus `OwnershipFence`, bound to the current realm and item
+  key. `LockFenced` alone is legacy diagnostic data, not proof. The shared
+  predicate in claim, `CheckBlob`, `FinalizeBlob` and unowned cleanup accepts
+  only an exact current proof or independent self/death evidence; unknown or
+  mismatched live records are preserved and refused with
+  `ErrStagingOwnershipUnproven`. `CheckBlob` probes the applicable item scope with
+  a non-owning shared lease, never the obsolete payload-side lock. Claim records
+  are not freshness leases: no heartbeat, timer rewrite or age-based takeover;
+  `StaleTimeout` remains removed. Ownership waits are bounded/context-aware at
+  five minutes and waiters return/reacquire transfer slots. Unavailable or
+  unresolved ownership fails before payload mutation and preserves partials.
 - Resume is v4-only: the version-4 `<staging>.incomplete`/`.meta` record and
   the version-1 `<dst>.part.meta` sidecar are the only resume state. Any other
   version is never migrated: a fenced old-version record (or one whose owner is
@@ -190,8 +209,17 @@ or job ownership behavior. This section is the agent-level summary; when it and
   no-replace normally, and domain-exclusive check-then-rename on a filesystem
   without hard links. The cache store's cross-device copy fallback runs inside
   the domain, but its final rename is not no-replace. A loser of a publication
-  race discards its own staging pair. The mirror writer and the selected-GGUF
-  delete path are outside the domain (known limitation).
+  race discards its own staging pair. Mirror and selected-GGUF operations do
+  not publish through this primitive: the mirror takes entry admission per
+  copied destination file — the copy itself stays a non-atomic
+  truncate-and-write checked only by `io.Copy`'s error contract, with the
+  explicit size comparison in the opt-in verify pass — and tree admission per
+  removed repository, while its symlink-leaf replacement and plain directory
+  creation take no admission; selected-GGUF deletion takes repository and
+  friendly tree admission for HF locations and flat-realm entry admission over
+  the member paths for local locations, rather than the blob domain. Neither
+  performs domain-exclusive placement, so no publication guarantee extends to
+  them.
 - JOB CONTRACT: success means every requested file is present AND reachable at
   its snapshot/friendly path. A file owned by another live writer is never a
   completed skip: wait bounded, re-check the content-addressed blob, otherwise

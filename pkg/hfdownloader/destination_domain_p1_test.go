@@ -3,8 +3,7 @@
 
 package hfdownloader
 
-// Covers fail-closed claims and confirms the destination lock—not the obsolete
-// staging lock—defines ownership.
+// Covers fail-closed claims and external realm ownership.
 
 import (
 	"bytes"
@@ -78,9 +77,8 @@ func TestClaimStagingRequiresCoveringDomain(t *testing.T) {
 	}
 }
 
-// The transfer holds blobs/tmp-<sha>.lock, never the obsolete
-// blobs/<sha>.incomplete.lock; only the domain lock persists after publication.
-func TestCacheTransferHoldsOnlyTheDestinationDomainLock(t *testing.T) {
+// The transfer holds its external item scope and creates no payload-side lock.
+func TestCacheTransferHoldsExternalDestinationScope(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
@@ -97,6 +95,10 @@ func TestCacheTransferHoldsOnlyTheDestinationDomainLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	domainDst, err := repo.blobDomainDst(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := repo.cache.ownershipRealmForData()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,8 +153,9 @@ func TestCacheTransferHoldsOnlyTheDestinationDomainLock(t *testing.T) {
 		t.Fatal("the transfer never started")
 	}
 
-	if busy, berr := stagingOwnershipBusy(domainDst); berr != nil || !busy {
-		t.Errorf("destination domain lock while transferring = (%v, %v), want a held lock", busy, berr)
+	busy, berr := realm.probeWriter(context.Background(), []string{repo.BlobPath(sha), repo.IncompletePath(sha), domainDst})
+	if berr != nil || !busy {
+		t.Errorf("external item scope while transferring = (%v, %v), want a held scope", busy, berr)
 	}
 	obsoleteLock := stagingOwnershipLockPath(repo.IncompletePath(sha))
 	if _, serr := os.Stat(obsoleteLock); !os.IsNotExist(serr) {
@@ -174,8 +177,7 @@ func TestCacheTransferHoldsOnlyTheDestinationDomainLock(t *testing.T) {
 	blobsDir := repo.BlobsDir()
 	names := dirEntryNames(t, blobsDir)
 	want := map[string]bool{
-		sha:                    true,
-		"tmp-" + sha + ".lock": true,
+		sha: true,
 	}
 	for _, name := range names {
 		if !want[name] {
@@ -187,8 +189,7 @@ func TestCacheTransferHoldsOnlyTheDestinationDomainLock(t *testing.T) {
 	}
 }
 
-// Holding only <staging>.lock must not report a writer; holding
-// blobs/tmp-<sha>.lock must report one.
+// A legacy lock-fenced record is current only when its realm/key proof matches.
 func TestCheckBlobProbesTheDestinationDomain(t *testing.T) {
 	if !stagingOSLockAvailable {
 		t.Skip("this platform has no OS ownership lock primitive")
@@ -201,21 +202,29 @@ func TestCheckBlobProbesTheDestinationDomain(t *testing.T) {
 	if err := repo.EnsureDirs(); err != nil {
 		t.Fatal(err)
 	}
+	realm, err := repo.cache.ownershipRealmForData()
+	if err != nil {
+		t.Fatal(err)
+	}
 	sha := strings.Repeat("b", 64)
 	staging := repo.IncompletePath(sha)
 	if err := os.WriteFile(staging, []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	meta := IncompleteMeta{
-		PID: os.Getpid(), Instance: processInstanceToken, Host: processHostname,
+		PID: os.Getpid(), Instance: "foreign-instance", Host: processHostname,
 		StartedAt: time.Now().UTC(), Size: 7, Version: stagingMetaVersion,
 		Repo: "owner/model", Path: "model.bin", Ranges: buildRangeLayout(7, 1), LockFenced: true,
+	}
+	meta.OwnershipFence, err = realm.fenceProof(repo.BlobPath(sha))
+	if err != nil {
+		t.Fatal(err)
 	}
 	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &meta); err != nil {
 		t.Fatal(err)
 	}
 
-	// Negative control: the obsolete <staging>.lock is not ownership.
+	// Negative control: the legacy payload-side lock is not current ownership.
 	obsolete, err := acquireStagingOwnershipLock(staging)
 	if err != nil {
 		t.Fatal(err)
@@ -230,7 +239,12 @@ func TestCheckBlobProbesTheDestinationDomain(t *testing.T) {
 		t.Errorf("status with a free destination domain = %v, want BlobStale", status)
 	}
 
-	domain, err := acquireStagingOwnershipLock(mustDomainDst(t, repo, sha))
+	domainDst, err := repo.blobDomainDst(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	domain, err := acquireBlobDomainScoped(context.Background(), repo.BlobPath(sha), domainDst, realm,
+		[]string{repo.BlobPath(sha), staging, repo.IncompleteMetaPath(sha), domainDst}, repo.BlobPath(sha))
 	if err != nil {
 		t.Fatal(err)
 	}

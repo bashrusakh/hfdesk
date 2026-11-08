@@ -73,10 +73,15 @@ func TestCleanupJobPartFiles_RespectsLiveClaim(t *testing.T) {
 		// A live owner holds the destination's ownership-domain lock for its
 		// whole interval; cleanup must treat that, not record age, as the
 		// authoritative ownership signal.
-		hold, _ := acquireStagingOwnershipLock(dst)
-		if hold != nil {
-			defer hold.release()
+		realm, err := NewHFCache(cacheDir).ownershipRealmForData()
+		if err != nil {
+			t.Fatal(err)
 		}
+		owner, err := realm.acquireWriter(context.Background(), []string{filepath.Join(blobsDir, sha), dst, staging, metaPath}, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer owner.Release()
 
 		if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{dst}); err != nil {
 			t.Fatalf("CleanupJobPartFiles: %v", err)
@@ -179,8 +184,7 @@ func TestCleanupJobPartFiles_RespectsLiveClaim(t *testing.T) {
 	})
 }
 
-// CheckBlob treats a free lock as owner-death proof only for fenced records;
-// unfenced records require same-host process-death evidence.
+// CheckBlob trusts only the held realm/key proof or independent self/death evidence.
 func TestCheckBlob_OwnershipIdentity(t *testing.T) {
 	tmpDir := t.TempDir()
 	cache := NewHFCache(tmpDir)
@@ -217,11 +221,19 @@ func TestCheckBlob_OwnershipIdentity(t *testing.T) {
 
 	foreign := base
 	foreign.Instance = "different-process-instance"
+	realm, err := cache.ownershipRealmForData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign.OwnershipFence, err = realm.fenceProof(repo.BlobPath(sha))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &foreign); err != nil {
 		t.Fatal(err)
 	}
 	if status, _, err := repo.CheckBlob(sha); err != nil || status != BlobStale {
-		t.Fatalf("lock-fenced foreign instance with our PID and a free lock = %v (err=%v), want BlobStale", status, err)
+		t.Fatalf("current-fenced foreign instance with our PID and a free realm key = %v (err=%v), want BlobStale", status, err)
 	}
 
 	// An unfenced record does not become safe merely because the new lock probe

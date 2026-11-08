@@ -20,12 +20,21 @@ const (
 	RepoTypeDataset RepoType = "dataset"
 )
 
+var errCacheOwnershipDirNotSupported = errors.New("OwnershipDir is only supported for flat OutputDir mode; HF cache ownership is rooted at HubDir and CacheDir")
+
 // HFCache represents the HuggingFace cache root directory.
 // It follows the official HuggingFace Hub cache structure.
 type HFCache struct {
 	// Root is the cache root directory (e.g., ~/.cache/huggingface)
-	Root   string
-	hubDir string // Resolved once; never reinterpret ambient ENV in accessors.
+	Root                 string
+	hubDir               string // Resolved once; never reinterpret ambient ENV in accessors.
+	ownershipConfigErr   error
+	ownershipInitGate    chan struct{}
+	ownerRealm           *ownershipRealm
+	ownershipErr         error
+	friendlyInitGate     chan struct{}
+	friendlyRealm        *ownershipRealm
+	friendlyOwnershipErr error
 }
 
 // DefaultCacheDir returns the default HuggingFace cache directory.
@@ -50,6 +59,16 @@ func NewHFCache(root string) *HFCache {
 	return NewHFCacheResolved(root, os.Getenv("HF_HUB_CACHE"))
 }
 
+// NewHFCacheWithOwnershipDir is retained for source compatibility, but a
+// cache-owned HFCache cannot relocate its Hub anchor through OwnershipDir.
+// Ownership operations on the returned cache report the configuration error.
+func NewHFCacheWithOwnershipDir(root, ownershipDir string) *HFCache {
+	if root == "" {
+		root = DefaultCacheDir()
+	}
+	return NewHFCacheResolvedWithOwnershipDir(root, os.Getenv("HF_HUB_CACHE"), ownershipDir)
+}
+
 // rootedOrFallback returns p when p is a rooted (absolute) filesystem path
 // and fallback otherwise. The rooted test is stated with strings.HasPrefix,
 // the primitive code scanning models as a path guard; returning p inside the
@@ -66,6 +85,13 @@ func rootedOrFallback(p, fallback string) string {
 // association without consulting ENV. An empty hubDir means root/hub.
 // Callers freezing destinations must supply the resolved nonempty root.
 func NewHFCacheResolved(root, hubDir string) *HFCache {
+	return NewHFCacheResolvedWithOwnershipDir(root, hubDir, "")
+}
+
+// NewHFCacheResolvedWithOwnershipDir freezes the cache association without
+// consulting storage environment overrides. A non-empty OwnershipDir is
+// rejected when ownership is first used; cache controls are derived from H/R.
+func NewHFCacheResolvedWithOwnershipDir(root, hubDir, ownershipDir string) *HFCache {
 	// Cache instances carry physical paths, not paths that can silently change
 	// meaning if the caller later changes its working directory.
 	if absolute, err := filepath.Abs(root); err == nil {
@@ -83,15 +109,140 @@ func NewHFCacheResolved(root, hubDir string) *HFCache {
 		hubDir = absolute
 	}
 	hubDir = rootedOrFallback(hubDir, filepath.Join(root, "hub"))
+	var ownershipConfigErr error
+	if ownershipDir != "" {
+		ownershipConfigErr = errCacheOwnershipDirNotSupported
+	}
 	return &HFCache{
-		Root:   root,
-		hubDir: hubDir,
+		Root:               root,
+		hubDir:             hubDir,
+		ownershipConfigErr: ownershipConfigErr,
+		ownershipInitGate:  newOwnershipInitGate(),
+		friendlyInitGate:   newOwnershipInitGate(),
 	}
 }
 
 // HubDir returns the path to the hub/ directory.
 func (c *HFCache) HubDir() string {
 	return c.hubDir
+}
+
+// OwnershipDir returns the effective cache-owned Hub control root.
+func (c *HFCache) OwnershipDir() string {
+	return filepath.Join(c.HubDir(), ".hfdesk-control")
+}
+
+func (c *HFCache) ownershipRealmForData() (*ownershipRealm, error) {
+	return c.ownershipRealmForDataWait(context.Background(), blobOwnershipWaitBudget)
+}
+
+func (c *HFCache) ownershipRealmForDataContext(ctx context.Context) (*ownershipRealm, error) {
+	return c.ownershipRealmForDataWait(ctx, blobOwnershipWaitBudget)
+}
+
+func (c *HFCache) ownershipRealmForDataWait(ctx context.Context, wait time.Duration) (*ownershipRealm, error) {
+	return c.initializeOwnershipRealm(ctx, wait, false)
+}
+
+func (c *HFCache) ownershipRealmForFriendly() (*ownershipRealm, error) {
+	return c.ownershipRealmForFriendlyWait(context.Background(), blobOwnershipWaitBudget)
+}
+
+func (c *HFCache) ownershipRealmForFriendlyContext(ctx context.Context) (*ownershipRealm, error) {
+	return c.ownershipRealmForFriendlyWait(ctx, blobOwnershipWaitBudget)
+}
+
+func (c *HFCache) ownershipRealmForFriendlyWait(ctx context.Context, wait time.Duration) (*ownershipRealm, error) {
+	if sameCacheRootPath(c.Root, c.HubDir()) {
+		return c.ownershipRealmForDataWait(ctx, wait)
+	}
+	return c.initializeOwnershipRealm(ctx, wait, true)
+}
+
+func (c *HFCache) initializeOwnershipRealm(ctx context.Context, wait time.Duration, friendly bool) (*ownershipRealm, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	waitCtx, cancel := ownershipWaitContext(ctx, wait)
+	defer cancel()
+	gate := c.ownershipInitGate
+	if friendly {
+		gate = c.friendlyInitGate
+	}
+	select {
+	case <-waitCtx.Done():
+		return nil, waitCtx.Err()
+	case <-gate:
+	}
+	defer func() { gate <- struct{}{} }()
+	if err := waitCtx.Err(); err != nil {
+		return nil, err
+	}
+	if c.ownershipConfigErr != nil {
+		return nil, c.ownershipConfigErr
+	}
+	if friendly {
+		if c.friendlyRealm != nil {
+			return c.friendlyRealm, nil
+		}
+		if c.friendlyOwnershipErr != nil {
+			return nil, c.friendlyOwnershipErr
+		}
+		controlRoot := filepath.Join(c.Root, ".hfdesk-control")
+		realm, err := newCacheOwnershipRealmContext(waitCtx, c.Root, controlRoot, wait)
+		if err == nil {
+			err = waitCtx.Err()
+		}
+		if err != nil {
+			if !retryableOwnershipInitError(err) {
+				c.friendlyOwnershipErr = err
+			}
+			return nil, err
+		}
+		c.friendlyRealm = realm
+		return realm, nil
+	}
+	if c.ownerRealm != nil {
+		return c.ownerRealm, nil
+	}
+	if c.ownershipErr != nil {
+		return nil, c.ownershipErr
+	}
+	controlRoot := filepath.Join(c.HubDir(), ".hfdesk-control")
+	realm, err := newCacheOwnershipRealmContext(waitCtx, c.HubDir(), controlRoot, wait)
+	if err == nil {
+		err = waitCtx.Err()
+	}
+	if err != nil {
+		if !retryableOwnershipInitError(err) {
+			c.ownershipErr = err
+		}
+		return nil, err
+	}
+	c.ownerRealm = realm
+	return realm, nil
+}
+
+func newOwnershipInitGate() chan struct{} {
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{}
+	return gate
+}
+
+func retryableOwnershipInitError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errOwnershipBusy)
+}
+
+func sameCacheRootPath(a, b string) bool {
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	if ai, err := os.Stat(a); err == nil {
+		if bi, err := os.Stat(b); err == nil {
+			return os.SameFile(ai, bi)
+		}
+	}
+	return false
 }
 
 // ModelsDir returns the path to the friendly models/ directory.
@@ -221,17 +372,16 @@ func (r *RepoDir) SnapshotDir(commit string) (string, error) {
 
 // EnsureDirs creates all necessary directories for this repo.
 func (r *RepoDir) EnsureDirs() error {
+	realm, err := r.cache.ownershipRealmForData()
+	if err != nil {
+		return err
+	}
 	dirs := []string{
 		r.BlobsDir(),
 		r.RefsDir(),
 		r.SnapshotsDir(),
 	}
-	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("create directory %s: %w", dir, err)
-		}
-	}
-	return nil
+	return realm.ensureDirectories(context.Background(), dirs, blobOwnershipWaitBudget)
 }
 
 // IncompleteMeta records transfer identity, ownership, and resumable range
@@ -246,10 +396,10 @@ type IncompleteMeta struct {
 	Instance string `json:"instance,omitempty"`
 	// Host permits same-host PID liveness checks; an empty or different host disables that evidence.
 	Host string `json:"host,omitempty"`
-	// LockFenced means the record was created under the destination domain lock.
-	// An unfenced record requires matching process-instance identity or same-host
-	// owner-death proof before takeover.
-	LockFenced bool `json:"lock_fenced,omitempty"`
+	// LockFenced marks a scope-protected record; alone it is not current proof.
+	// OwnershipFence binds that claim to the external realm and item key.
+	LockFenced     bool   `json:"lock_fenced,omitempty"`
+	OwnershipFence string `json:"ownership_fence,omitempty"`
 	// Version identifies the record format; only the current version is resumable.
 	Version int    `json:"version,omitempty"`
 	Repo    string `json:"repo,omitempty"`
@@ -289,8 +439,8 @@ const (
 	// BlobComplete means the content-addressed blob exists.
 	BlobComplete
 
-	// BlobDownloading means a live owner holds the domain, or an unfenced
-	// record cannot yet be proven stale. It is not a successful skip.
+	// BlobDownloading means an exclusive scope holder or an unproven owner
+	// prevents a safe resume decision. It is not a successful skip.
 	BlobDownloading
 
 	// BlobStale means no live owner was proven. An unreadable record can be
@@ -322,12 +472,19 @@ func (s BlobStatus) String() string {
 }
 
 // CheckBlob returns published-blob status and available ranged metadata.
-// If no blob exists, an .incomplete payload triggers a destination-lock probe:
-// exclusive ownership is BlobDownloading; probe failure returns BlobOwnershipUnknown
+// If no blob exists, an .incomplete payload triggers an external scope probe:
+// an exclusive holder is BlobDownloading; probe failure returns BlobOwnershipUnknown
 // with an error. BlobStale alone does not prove resumability; the claim checks it.
 // With neither blob nor staged payload it returns BlobMissing, even if a single
 // writer holds the domain. Callers still acquire the domain before work.
 func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) {
+	return r.checkBlobContext(context.Background(), sha256)
+}
+
+func (r *RepoDir) checkBlobContext(ctx context.Context, sha256 string) (BlobStatus, *IncompleteMeta, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	blobPath := r.BlobPath(sha256)
 	incompletePath := r.IncompletePath(sha256)
 	metaPath := r.IncompleteMetaPath(sha256)
@@ -344,39 +501,32 @@ func (r *RepoDir) CheckBlob(sha256 string) (BlobStatus, *IncompleteMeta, error) 
 		return BlobMissing, nil, fmt.Errorf("stat incomplete file: %w", err)
 	}
 
-	// Probe the persistent destination domain, not the obsolete staging lock.
-	// The non-blocking probe covers suspended and in-process writers.
-	domainDst, derr := r.blobDomainDst(sha256)
-	if derr != nil {
+	realm, err := r.cache.ownershipRealmForDataContext(ctx)
+	if err != nil {
 		meta, _ := r.readIncompleteMeta(metaPath)
-		return BlobOwnershipUnknown, meta, fmt.Errorf("%w: cannot resolve the ownership domain of the incomplete download %s: %w",
-			ErrBlobOwnershipUnknown, incompletePath, derr)
+		return BlobOwnershipUnknown, meta, fmt.Errorf("%w: cannot resolve the external ownership realm: %w", ErrBlobOwnershipUnknown, err)
 	}
-	busy, probeErr := stagingOwnershipStatusProbe(domainDst)
-	if probeErr == nil && busy {
+	probe, probeErr := ownershipWriterProbe(ctx, realm, []string{blobPath, incompletePath, metaPath})
+	if errors.Is(probeErr, errOwnershipBusy) {
 		return BlobDownloading, nil, nil
 	}
-	if probeErr != nil || !stagingOSLockAvailable {
+	if probeErr != nil {
 		meta, _ := r.readIncompleteMeta(metaPath)
-		cause := probeErr
-		if cause == nil {
-			cause = errStagingOSLockUnsupported
-		}
 		return BlobOwnershipUnknown, meta, fmt.Errorf("%w: cannot determine the owner of the incomplete download %s: %w",
-			ErrBlobOwnershipUnknown, incompletePath, cause)
+			ErrBlobOwnershipUnknown, incompletePath, probeErr)
 	}
+	defer probe.Release()
 
 	meta, err := r.readIncompleteMeta(metaPath)
 	if err != nil {
 		return BlobStale, nil, nil
 	}
 
-	// A free lock proves death only for fenced records; otherwise require
-	// same-host process evidence.
-	if meta.LockFenced {
-		return BlobStale, meta, nil
+	fence, err := realm.fenceProof(blobPath)
+	if err != nil {
+		return BlobOwnershipUnknown, meta, fmt.Errorf("%w: cannot identify the blob ownership key: %w", ErrBlobOwnershipUnknown, err)
 	}
-	if stagingOwnerProvablyDead(meta) {
+	if stagingMetaOwnershipProven(meta, fence) {
 		return BlobStale, meta, nil
 	}
 	return BlobDownloading, meta, nil
@@ -406,28 +556,34 @@ func (r *RepoDir) FinalizeBlob(sha256 string) error {
 	incompletePath := r.IncompletePath(sha256)
 	blobPath := r.BlobPath(sha256)
 
-	// The blobs directory must exist before the domain's lock file can be
-	// created next to the destination.
-	if err := os.MkdirAll(filepath.Dir(blobPath), 0755); err != nil {
-		return fmt.Errorf("create blobs directory: %w", err)
-	}
-
 	dst, err := r.blobDomainDst(sha256)
 	if err != nil {
 		return fmt.Errorf("resolve the ownership domain of blob %s: %w", sha256, err)
 	}
-	domain, err := blobDomainAcquire(context.Background(), blobPath, dst)
+	realm, err := r.cache.ownershipRealmForData()
+	if err != nil {
+		return fmt.Errorf("resolve the external ownership realm of blob %s: %w", sha256, err)
+	}
+	domain, err := acquireBlobDomainScoped(context.Background(), blobPath, dst, realm,
+		[]string{blobPath, incompletePath, r.IncompleteMetaPath(sha256), r.IncompleteMetaPath(sha256) + stagingRecordTempSuffix}, blobPath)
 	if err != nil {
 		return fmt.Errorf("acquire the ownership domain of blob %s: %w", sha256, err)
 	}
 	defer domain.release()
 
+	meta, metaErr := r.readIncompleteMeta(r.IncompleteMetaPath(sha256))
+	if metaErr == nil && !stagingMetaOwnershipProven(meta, domain.ownershipFenceProof()) {
+		return newStagingUnprovenOwnerError(PlanItem{SHA256: sha256}, incompletePath, r.IncompleteMetaPath(sha256))
+	}
+	if metaErr != nil && !errors.Is(metaErr, os.ErrNotExist) {
+		return fmt.Errorf("refuse to finalize blob %s with unreadable ownership metadata: %w", sha256, newStagingUnprovenOwnerError(PlanItem{SHA256: sha256}, incompletePath, r.IncompleteMetaPath(sha256)))
+	}
+
 	if err := blobPublishPlace(incompletePath, blobPath, domain); err != nil {
 		return fmt.Errorf("finalize blob %s: %w", sha256, err)
 	}
 
-	// Remove metadata file
-	_ = os.Remove(r.IncompleteMetaPath(sha256))
+	removeStagingArtifactsIfUnowned(incompletePath, r.IncompleteMetaPath(sha256), domain)
 
 	return nil
 }
@@ -714,7 +870,11 @@ func (r *RepoDir) friendlyLinkRoot() string {
 
 // EnsureFriendlyDir creates the friendly view directory for this repo.
 func (r *RepoDir) EnsureFriendlyDir() error {
-	return os.MkdirAll(r.FriendlyPath(), 0755)
+	realm, err := r.cache.ownershipRealmForFriendly()
+	if err != nil {
+		return err
+	}
+	return realm.ensureDirectories(context.Background(), []string{r.FriendlyPath()}, blobOwnershipWaitBudget)
 }
 
 // --- Download Workflow Helpers ---
@@ -744,6 +904,31 @@ func (r *RepoDir) storeDownloadedFileCtx(ctx context.Context, tempFile, relative
 
 // storeDownloadedFileInDomain reuses a matching blob-key domain or acquires the required one.
 func (r *RepoDir) storeDownloadedFileInDomain(ctx context.Context, tempFile, relativePath, commit, sha256, filterSubdir string, noFriendly bool, domain *blobDomain) (*StoreFileResult, error) {
+	realm, err := r.cache.ownershipRealmForDataContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve the external ownership realm: %w", err)
+	}
+	insideRealm, err := ownershipPathIsWithin(realm.root, filepath.Dir(tempFile))
+	if err != nil {
+		return nil, fmt.Errorf("validate temporary-file ownership path: %w", err)
+	}
+	if insideRealm {
+		return nil, fmt.Errorf("temporary file %q overlaps the external ownership realm", tempFile)
+	}
+	insideHub := ownershipPathWithinRoot(realm.dataRoot, tempFile)
+	if !insideHub {
+		if canonical, pathErr := canonicalOwnershipPath(tempFile, false); pathErr == nil {
+			insideHub = ownershipPathWithinRoot(realm.dataRoot, canonical)
+		}
+	}
+	var temporaryLease *ownershipLease
+	if domain == nil && sha256 == "" && insideHub {
+		temporaryLease, err = realm.acquireWriterWithWait(ctx, []string{tempFile}, blobOwnershipWaitBudget, nil)
+		if err != nil {
+			return nil, fmt.Errorf("acquire temporary-file ownership: %w", err)
+		}
+		defer temporaryLease.Release()
+	}
 	// Compute SHA256 if not provided
 	if sha256 == "" {
 		computed, err := computeSHA256Ctx(ctx, tempFile)
@@ -759,16 +944,16 @@ func (r *RepoDir) storeDownloadedFileInDomain(ctx context.Context, tempFile, rel
 
 	blobPath := r.BlobPath(sha256)
 
-	if err := os.MkdirAll(filepath.Dir(blobPath), 0755); err != nil {
-		return nil, fmt.Errorf("create blobs directory: %w", err)
-	}
-
-	if domain == nil || !domain.holdsBlobKey(blobPath) {
+	if domain == nil || !domain.holdsBlobKey(blobPath) || domain.scope == nil {
 		dst, derr := r.blobDomainDst(sha256)
 		if derr != nil {
 			return nil, fmt.Errorf("resolve the ownership domain of blob %s: %w", sha256, derr)
 		}
-		d, derr := blobDomainAcquire(ctx, blobPath, dst)
+		paths := []string{blobPath}
+		if domain == nil && temporaryLease == nil && insideHub {
+			paths = appendUniqueOwnershipPaths(paths, tempFile)
+		}
+		d, derr := acquireBlobDomainScoped(ctx, blobPath, dst, realm, paths, blobPath)
 		if derr != nil {
 			return nil, fmt.Errorf("acquire the ownership domain of blob %s: %w", sha256, derr)
 		}
@@ -798,8 +983,15 @@ func (r *RepoDir) storeDownloadedFileInDomain(ctx context.Context, tempFile, rel
 		}
 	}
 
-	// Required cache-link failures propagate as ErrCacheLinkUnreachable; noFriendly omits only the friendly link.
-	if err := cacheEntryLinkCreate(ctx, r, commit, relativePath, filterSubdir, sha256, noFriendly); err != nil {
+	// Links have their own scoped lease; the blob domain remains held through them.
+	friendlyRealm := realm
+	if !noFriendly {
+		friendlyRealm, err = r.cache.ownershipRealmForFriendlyContext(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("resolve friendly-view ownership: %w", err)
+		}
+	}
+	if err := createCacheEntryLinksScoped(ctx, r, commit, relativePath, filterSubdir, sha256, noFriendly, realm, friendlyRealm); err != nil {
 		return nil, err
 	}
 
@@ -863,7 +1055,13 @@ func copyFileAtomicCtx(ctx context.Context, src, dst string) error {
 	// succeeds the staging path no longer exists, so os.Remove is a no-op.
 	defer os.Remove(stagingPath)
 
-	if _, err := io.Copy(staging, contextReader{ctx: ctx, r: in}); err != nil {
+	var source io.Reader = contextReader{ctx: ctx, r: in}
+	var destination io.Writer = staging
+	if measurement := payloadIOMeasurementFromContext(ctx); measurement != nil {
+		source = measuredPayloadReader{r: source, m: measurement}
+		destination = measuredPayloadWriter{w: destination, m: measurement}
+	}
+	if _, err := io.Copy(destination, source); err != nil {
 		staging.Close()
 		return err
 	}

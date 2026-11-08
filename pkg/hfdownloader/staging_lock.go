@@ -3,9 +3,9 @@
 
 package hfdownloader
 
-// The per-path metadata gate serializes intra-item record transitions. Shared
-// staging mutation also requires the destination's lifetime OS lock; a local
-// gate or record age cannot establish cross-process ownership.
+// The per-path metadata gate serializes intra-item record transitions. It never
+// establishes cross-process ownership; shared mutation requires the held
+// external item scope, and record age is never an ownership signal.
 
 import (
 	"context"

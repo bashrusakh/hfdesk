@@ -20,11 +20,10 @@ import (
 )
 
 func TestStagingOwnershipUnavailableFailsClosed(t *testing.T) {
-	oldAcquire, oldProbe := stagingOwnershipAcquire, stagingOwnershipStatusProbe
-	defer func() { stagingOwnershipAcquire, stagingOwnershipStatusProbe = oldAcquire, oldProbe }()
+	oldOpen := ownershipLockOpen
+	defer func() { ownershipLockOpen = oldOpen }()
 	lockErr := errors.New("injected ownership lock permission denied")
-	stagingOwnershipAcquire = func(string) (*stagingOwnershipLock, error) { return nil, lockErr }
-	stagingOwnershipStatusProbe = func(string) (bool, error) { return false, lockErr }
+	ownershipLockOpen = func(string, ownershipLockMode) (ownershipLockHandle, error) { return nil, lockErr }
 
 	dir := t.TempDir()
 	staging := filepath.Join(dir, "payload.incomplete")
@@ -60,6 +59,7 @@ func TestStagingOwnershipUnavailableFailsClosed(t *testing.T) {
 		t.Fatalf("claim/cleanup changed metadata: err=%v", err)
 	}
 
+	ownershipLockOpen = oldOpen
 	cache := NewHFCache(dir)
 	repo, err := cache.Repo("o/r", RepoTypeModel)
 	if err != nil {
@@ -78,6 +78,7 @@ func TestStagingOwnershipUnavailableFailsClosed(t *testing.T) {
 	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &cacheMeta); err != nil {
 		t.Fatal(err)
 	}
+	ownershipLockOpen = func(string, ownershipLockMode) (ownershipLockHandle, error) { return nil, lockErr }
 	// An unavailable probe must return BlobOwnershipUnknown with its error.
 	status, _, err := repo.CheckBlob(sha)
 	if !errors.Is(err, ErrBlobOwnershipUnknown) {
@@ -95,10 +96,9 @@ func TestStagingOwnershipUnavailableFailsClosed(t *testing.T) {
 
 // Download must report an unavailable ownership probe instead of successful skip.
 func TestDownloadUnknownOwnershipIsAnObservableError(t *testing.T) {
-	oldProbe := stagingOwnershipStatusProbe
-	defer func() { stagingOwnershipStatusProbe = oldProbe }()
+	oldProbe := ownershipWriterProbe
+	defer func() { ownershipWriterProbe = oldProbe }()
 	probeErr := errors.New("injected ownership probe permission denied")
-	stagingOwnershipStatusProbe = func(string) (bool, error) { return false, probeErr }
 
 	const total = 4_096
 	full := rangedTestPayload(total)
@@ -126,6 +126,7 @@ func TestDownloadUnknownOwnershipIsAnObservableError(t *testing.T) {
 	if err := writeStagingMeta(repo.IncompleteMetaPath(sha), &meta); err != nil {
 		t.Fatal(err)
 	}
+	ownershipWriterProbe = func(context.Context, *ownershipRealm, []string) (*ownershipLease, error) { return nil, probeErr }
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -173,11 +174,8 @@ func TestDownloadUnknownOwnershipIsAnObservableError(t *testing.T) {
 // Probe failure must remain unknown ownership even with missing or malformed
 // metadata; it must not become BlobStale.
 func TestCheckBlobProbeErrorPrecedesMissingOrMalformedMetadata(t *testing.T) {
-	oldProbe := stagingOwnershipStatusProbe
-	defer func() { stagingOwnershipStatusProbe = oldProbe }()
-	stagingOwnershipStatusProbe = func(string) (bool, error) {
-		return false, errStagingOSLockUnsupported
-	}
+	oldProbe := ownershipWriterProbe
+	defer func() { ownershipWriterProbe = oldProbe }()
 
 	for _, tc := range []struct {
 		name string
@@ -187,6 +185,7 @@ func TestCheckBlobProbeErrorPrecedesMissingOrMalformedMetadata(t *testing.T) {
 		{name: "malformed metadata", meta: []byte("{")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			ownershipWriterProbe = oldProbe
 			cache := NewHFCache(t.TempDir())
 			repo, err := cache.Repo("owner/repo", RepoTypeModel)
 			if err != nil {
@@ -203,6 +202,9 @@ func TestCheckBlobProbeErrorPrecedesMissingOrMalformedMetadata(t *testing.T) {
 				if err := os.WriteFile(repo.IncompleteMetaPath(sha), tc.meta, 0o644); err != nil {
 					t.Fatal(err)
 				}
+			}
+			ownershipWriterProbe = func(context.Context, *ownershipRealm, []string) (*ownershipLease, error) {
+				return nil, errOwnershipUnavailable
 			}
 			status, _, err := repo.CheckBlob(sha)
 			if !errors.Is(err, ErrBlobOwnershipUnknown) || status != BlobOwnershipUnknown {
@@ -246,11 +248,21 @@ func TestDownloadProvenOwnerIsNotASuccessfulSkip(t *testing.T) {
 	// A real writer holds the destination domain's lifetime lock for the whole
 	// run. The item's bounded domain acquisition then reports the live owner.
 	shortBlobOwnershipWait(t, 250*time.Millisecond)
-	own, err := acquireStagingOwnershipLock(mustDomainDst(t, repo, sha))
+	realm, err := repo.cache.ownershipRealmForData()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer own.release()
+	domainDst, err := repo.blobDomainDst(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	own, err := realm.acquireWriter(context.Background(), []string{
+		repo.BlobPath(sha), domainDst, repo.IncompletePath(sha), repo.IncompleteMetaPath(sha),
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer own.Release()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -279,8 +291,8 @@ func TestDownloadProvenOwnerIsNotASuccessfulSkip(t *testing.T) {
 	if dlErr == nil {
 		t.Fatalf("Download reported success although a live owner holds the item; skips=%v", skips)
 	}
-	if !errors.Is(dlErr, errBlobOwnedByLiveWriter) {
-		t.Errorf("Download error = %v, want the actionable live-owner error", dlErr)
+	if !errors.Is(dlErr, errStagingOwnershipBusy) {
+		t.Errorf("Download error = %v, want the exclusive-scope-held error", dlErr)
 	}
 	if len(skips) != 0 {
 		t.Errorf("the job recorded a successful skip although the live owner holds the item: %v", skips)

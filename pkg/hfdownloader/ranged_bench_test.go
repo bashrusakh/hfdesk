@@ -3,11 +3,12 @@
 
 package hfdownloader
 
-// Opt-in local-I/O finalization benchmark:
+// Opt-in normal-cache local-I/O benchmark:
 // go test -run '^$' -bench BenchmarkRangedFinalization ./pkg/hfdownloader/
-// BENCHSIZE sets payload bytes (default 1 GiB).
+// BENCHSIZE sets synthetic payload bytes (default 1 GiB).
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -18,22 +19,10 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
-
-// Small indirection so the benchmark's setup hashing does not go through
-// computeSHA256Ctx (which would pollute the hash-pass counters it reports).
-type benchHash struct {
-	h interface {
-		Write([]byte) (int, error)
-		Sum([]byte) []byte
-	}
-}
-
-func newBenchHash() *benchHash               { return &benchHash{h: sha256.New()} }
-func benchHashWrite(bh *benchHash, p []byte) { _, _ = bh.h.Write(p) }
-func benchHashSum(bh *benchHash) string      { return hex.EncodeToString(bh.h.Sum(nil)) }
 
 func benchFileSize() int64 {
 	if v := os.Getenv("BENCHSIZE"); v != "" {
@@ -74,108 +63,165 @@ func (r *benchPatternReader) Read(p []byte) (int, error) {
 	return int(n), nil
 }
 
-// BenchmarkRangedFinalization compares size and sha256 completion on loopback.
-// Per-iteration metrics (S is payload size):
-//   - stagingWriteBytes×S: all staging payload writes divided by S, including transfer.
-//   - extraLocalWrites×S: max(staging writes - S, 0) / S, not total local I/O.
-//   - hashReadBytes×S: counted full-file SHA reads / S (size: 0, sha256: 1 here).
-//   - finalizeMs: file_finalizing to successful publication, including optional
-//     proof and publication cleanup, excluding caller cache links and manifest.
-//   - totalUs: timed domain setup and downloadMultipart, including loopback transfer
-//     and finalization; not the top-level Download job.
-func BenchmarkRangedFinalization(b *testing.B) {
-	size := benchFileSize()
+type cacheDownloadMeasurement struct {
+	completionToDone time.Duration
+	postReadBytes    int64
+	postWriteBytes   int64
+	preWriteBytes    int64
+}
 
+func runCacheDownloadMeasurement(tb testing.TB, size int64, mode string) cacheDownloadMeasurement {
+	tb.Helper()
 	block := make([]byte, 4<<20)
 	for i := range block {
 		block[i] = byte(i % 251)
 	}
+	h := sha256.New()
+	if _, err := io.Copy(h, &benchPatternReader{remain: size, block: block}); err != nil {
+		tb.Fatalf("hash synthetic setup payload: %v", err)
+	}
+	sha := hex.EncodeToString(h.Sum(nil))
 
-	newServer := func() *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_, _ = w.Write([]byte(`{"sha":"bench-commit"}`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_, _ = w.Write([]byte("[" + lfsTreeNode("bench.bin", int(size), sha) + "]"))
+		case strings.Contains(r.URL.Path, "/resolve/"):
 			if r.Method == http.MethodHead {
 				w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 				w.Header().Set("Accept-Ranges", "bytes")
 				return
 			}
 			var start, end int64
-			if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil || end >= size {
+			if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil || start < 0 || end < start || end >= size {
 				http.Error(w, "bad range", http.StatusBadRequest)
 				return
 			}
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
 			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 			w.WriteHeader(http.StatusPartialContent)
-			pr := &benchPatternReader{remain: end - start + 1, block: block, off: start % int64(len(block))}
-			buf := make([]byte, 512<<10)
-			for {
-				n, err := pr.Read(buf)
-				if n > 0 {
-					if _, werr := w.Write(buf[:n]); werr != nil {
-						return
-					}
-				}
-				if err != nil {
-					return
-				}
+			reader := &benchPatternReader{remain: end - start + 1, block: block, off: start % int64(len(block))}
+			if _, err := io.Copy(w, reader); err != nil {
+				return
 			}
-		}))
-	}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	tb.Cleanup(srv.Close)
 
+	cacheDir := tb.TempDir()
+	measurement := &payloadIOMeasurement{}
+	ctx := withPayloadIOMeasurement(context.Background(), measurement)
+	var networkComplete, fileDone time.Time
+	var readsAtComplete, writesAtComplete int64
+	err := Download(ctx, Job{Repo: "owner/model", Revision: "main"}, Settings{
+		CacheDir:           cacheDir,
+		Endpoint:           srv.URL,
+		Concurrency:        4,
+		MaxActiveDownloads: 1,
+		MultipartThreshold: "1KB",
+		Verify:             mode,
+		Retries:            0,
+		StallTimeout:       "0",
+	}, func(ev ProgressEvent) {
+		if ev.Event == "file_finalizing" && networkComplete.IsZero() {
+			// The ranged path emits this synchronously after every response body
+			// reached clean EOF and before proof/publication starts.
+			networkComplete = time.Now()
+			readsAtComplete, writesAtComplete = measurement.snapshot()
+		}
+		if ev.Event == "file_done" {
+			fileDone = time.Now()
+		}
+	})
+	if err != nil {
+		tb.Fatalf("Download: %v", err)
+	}
+	if networkComplete.IsZero() || fileDone.IsZero() || fileDone.Before(networkComplete) {
+		tb.Fatalf("missing or out-of-order client completion events: network=%v file_done=%v", networkComplete, fileDone)
+	}
+	readsAtDone, writesAtDone := measurement.snapshot()
+	if writesAtComplete != size {
+		tb.Fatalf("local payload writes at network completion=%d, want %d transferred bytes", writesAtComplete, size)
+	}
+	repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
+	if err != nil {
+		tb.Fatalf("cache repo: %v", err)
+	}
+	snapshot, err := repo.SnapshotPath("bench-commit", "bench.bin")
+	if err != nil {
+		tb.Fatalf("snapshot path: %v", err)
+	}
+	paths := []string{repo.BlobPath(sha), snapshot, filepath.Join(repo.FriendlyPath(), "bench.bin")}
+	for _, path := range paths {
+		fi, statErr := os.Stat(path)
+		if statErr != nil {
+			tb.Fatalf("required cache payload path %s is not reachable: %v", path, statErr)
+		}
+		if fi.Size() != size {
+			tb.Fatalf("cache path %s payload size=%d, want %d", path, fi.Size(), size)
+		}
+	}
+	return cacheDownloadMeasurement{
+		completionToDone: fileDone.Sub(networkComplete),
+		postReadBytes:    readsAtDone - readsAtComplete,
+		postWriteBytes:   writesAtDone - writesAtComplete,
+		preWriteBytes:    writesAtComplete,
+	}
+}
+
+func TestCacheDownloadMeasurementBoundary(t *testing.T) {
+	const size = 64 * 1024
+	sizeMode := runCacheDownloadMeasurement(t, size, "size")
+	shaMode := runCacheDownloadMeasurement(t, size, "sha256")
+	if sizeMode.completionToDone < 0 || shaMode.completionToDone < 0 {
+		t.Fatal("network-complete to file_done duration must be non-negative")
+	}
+	if sizeMode.postReadBytes != 0 || sizeMode.postWriteBytes != 0 {
+		t.Errorf("Verify=size post-network payload I/O = read %d, write %d; want none on normal same-filesystem cache publication", sizeMode.postReadBytes, sizeMode.postWriteBytes)
+	}
+	if shaMode.postReadBytes != size || shaMode.postWriteBytes != 0 {
+		t.Errorf("Verify=sha256 post-network payload I/O = read %d, write %d; want one %d-byte proof read and no rewrite", shaMode.postReadBytes, shaMode.postWriteBytes, size)
+	}
+}
+
+func TestPayloadIOMeasurementCountsCacheCopyFallback(t *testing.T) {
+	content := bytes.Repeat([]byte("fallback-payload"), 128)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "source")
+	dst := filepath.Join(dir, "destination")
+	if err := os.WriteFile(src, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	measurement := &payloadIOMeasurement{}
+	if err := copyFileAtomicCtx(withPayloadIOMeasurement(context.Background(), measurement), src, dst); err != nil {
+		t.Fatalf("copy fallback: %v", err)
+	}
+	reads, writes := measurement.snapshot()
+	if reads != int64(len(content)) || writes != int64(len(content)) {
+		t.Errorf("copy fallback I/O = read %d, write %d; want %d bytes each", reads, writes, len(content))
+	}
+	assertExactFile(t, dst, content)
+}
+
+// BenchmarkRangedFinalization measures the public HF-cache Download boundary
+// from client-observed network completion to file_done, including payload I/O
+// in proof and any cache copy fallback. Snapshot/friendly entries are checked
+// reachable and refer to the published blob in both verification modes.
+func BenchmarkRangedFinalization(b *testing.B) {
+	size := benchFileSize()
 	for _, mode := range []string{"size", "sha256"} {
 		b.Run("verify="+mode, func(b *testing.B) {
 			b.SetBytes(size)
-			it := PlanItem{RelativePath: "bench.bin", Size: size, AcceptRanges: true}
-			if mode == "sha256" {
-				h := newBenchHash()
-				pr := &benchPatternReader{remain: size, block: block}
-				buf := make([]byte, 512<<10)
-				for {
-					n, err := pr.Read(buf)
-					if n > 0 {
-						benchHashWrite(h, buf[:n])
-					}
-					if err != nil {
-						break
-					}
-				}
-				it.LFS = true
-				it.SHA256 = benchHashSum(h)
-			}
 			for i := 0; i < b.N; i++ {
-				tmpDir := b.TempDir()
-				dst := filepath.Join(tmpDir, "bench.bin")
-				srv := newServer()
-				it.URL = srv.URL + "/bench.bin"
-				cfg := Settings{Concurrency: 4, Retries: 0, StallTimeout: "0", Verify: mode}
-
-				stagingWriteBytes.Store(0)
-				hashPassCount.Store(0)
-				hashPassBytes.Store(0)
-
-				start := time.Now()
-				if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(b, dst, multipartOpts{}), func(ProgressEvent) {}); err != nil {
-					b.Fatalf("downloadMultipart: %v", err)
-				}
-				elapsed := time.Since(start)
-				srv.Close()
-
-				written := stagingWriteBytes.Load()
-				read := hashPassBytes.Load()
-				extraWrites := written - size
-				if extraWrites < 0 {
-					extraWrites = 0
-				}
-				b.ReportMetric(float64(written)/float64(size), "stagingWriteBytes×S")
-				b.ReportMetric(float64(extraWrites)/float64(size), "extraLocalWrites×S")
-				b.ReportMetric(float64(read)/float64(size), "hashReadBytes×S")
-				b.ReportMetric(float64(finalizationNanos.Load())/1e6, "finalizeMs")
-				b.ReportMetric(float64(elapsed.Microseconds()), "totalUs")
-
-				fi, err := os.Stat(dst)
-				if err != nil || fi.Size() != size {
-					b.Fatalf("published file wrong: %v", err)
-				}
+				m := runCacheDownloadMeasurement(b, size, mode)
+				b.ReportMetric(float64(m.preWriteBytes)/float64(size), "preCompleteWrites×S")
+				b.ReportMetric(float64(m.postReadBytes)/float64(size), "postCompleteReads×S")
+				b.ReportMetric(float64(m.postWriteBytes)/float64(size), "postCompleteWrites×S")
+				b.ReportMetric(float64(m.completionToDone.Microseconds()), "networkCompleteToFileDoneUs")
 			}
 		})
 	}

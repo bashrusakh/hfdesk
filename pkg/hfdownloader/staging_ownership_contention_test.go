@@ -58,6 +58,23 @@ func startStagingProbeHolder(t *testing.T, staging string, mode stagingProbeHold
 	}
 }
 
+func startExternalScopeProbeHolder(t *testing.T, paths ...string) *ownershipLease {
+	t.Helper()
+	ownerDir, err := resolveOwnershipDir("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm, err := newOwnershipRealm(ownerDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := realm.probeWriterLease(context.Background(), paths)
+	if err != nil {
+		t.Fatalf("acquire shared external scope probe: %v", err)
+	}
+	return lease
+}
+
 type stagingProbeHandle struct {
 	releaseFn func()
 	heldFn    func() bool
@@ -152,20 +169,18 @@ func (f *contentionDownloadFixture) runDownload(t *testing.T, ctx context.Contex
 func TestDownload_StatusProbeInFlightDoesNotSkipTheFile(t *testing.T) {
 	f := newContentionDownloadFixture(t)
 
-	probe := startStagingProbeHolder(t, f.staging, probeHoldShared)
-	if !probe.held() {
+	probe := startExternalScopeProbeHolder(t, f.dst)
+	if err := probe.Validate(); err != nil {
 		t.Fatal("the probe did not take the lock file")
 	}
-	defer probe.release()
+	defer probe.Release()
 
 	// The acquisition hook signals contention while the test still holds the probe.
 	contended := make(chan struct{})
 	var once sync.Once
-	restore := stagingOwnershipContentionHook
-	stagingOwnershipContentionHook = func(staging string) {
-		once.Do(func() { close(contended) })
-	}
-	defer func() { stagingOwnershipContentionHook = restore }()
+	restore := blobDomainContentionHook
+	blobDomainContentionHook = func(string) { once.Do(func() { close(contended) }) }
+	defer func() { blobDomainContentionHook = restore }()
 
 	result := make(chan downloadOutcome, 1)
 	go func() { result <- f.runDownload(t, context.Background()) }()
@@ -185,7 +200,7 @@ func TestDownload_StatusProbeInFlightDoesNotSkipTheFile(t *testing.T) {
 		t.Fatal("the claim never observed the contended ownership lock")
 	}
 
-	probe.release()
+	probe.Release()
 
 	var out downloadOutcome
 	select {
@@ -210,8 +225,8 @@ func TestDownload_StatusProbeInFlightDoesNotSkipTheFile(t *testing.T) {
 func TestDownload_UnresolvableContentionFailsInsteadOfSkipping(t *testing.T) {
 	f := newContentionDownloadFixture(t)
 
-	probe := startStagingProbeHolder(t, f.staging, probeHoldShared)
-	defer probe.release()
+	probe := startExternalScopeProbeHolder(t, f.dst)
+	defer probe.Release()
 
 	// Shrink the acquisition window so the test does not wait the production
 	// bound; the behavior under test is the classification, not the duration.
@@ -220,11 +235,9 @@ func TestDownload_UnresolvableContentionFailsInsteadOfSkipping(t *testing.T) {
 	// Prove the contention really happened while the probe held the lock.
 	contended := make(chan struct{})
 	var once sync.Once
-	restoreHook := stagingOwnershipContentionHook
-	stagingOwnershipContentionHook = func(staging string) {
-		once.Do(func() { close(contended) })
-	}
-	defer func() { stagingOwnershipContentionHook = restoreHook }()
+	restoreHook := blobDomainContentionHook
+	blobDomainContentionHook = func(string) { once.Do(func() { close(contended) }) }
+	defer func() { blobDomainContentionHook = restoreHook }()
 
 	out := f.runDownload(t, context.Background())
 
@@ -240,7 +253,7 @@ func TestDownload_UnresolvableContentionFailsInsteadOfSkipping(t *testing.T) {
 		t.Fatal("Download succeeded although the ownership lock never became free")
 	}
 	if !errors.Is(out.err, errStagingOwnershipUncertain) {
-		t.Errorf("Download error = %v, want errStagingOwnershipUncertain", out.err)
+		t.Errorf("Download error = %v, want an uncertain-scope failure while a shared probe is held", out.err)
 	}
 	if _, err := os.Stat(f.dst); err == nil {
 		t.Error("the destination exists although the download failed")
@@ -254,17 +267,15 @@ func TestDownload_UnresolvableContentionFailsInsteadOfSkipping(t *testing.T) {
 func TestDownload_CancellationWhileWaitingForOwnershipIsPrompt(t *testing.T) {
 	f := newContentionDownloadFixture(t)
 
-	probe := startStagingProbeHolder(t, f.staging, probeHoldShared)
-	defer probe.release()
+	probe := startExternalScopeProbeHolder(t, f.dst)
+	defer probe.Release()
 
 	// Cancel only after destination-domain acquisition reports lock contention.
 	contended := make(chan struct{})
 	var once sync.Once
-	restoreHook := stagingOwnershipContentionHook
-	stagingOwnershipContentionHook = func(staging string) {
-		once.Do(func() { close(contended) })
-	}
-	defer func() { stagingOwnershipContentionHook = restoreHook }()
+	restoreHook := blobDomainContentionHook
+	blobDomainContentionHook = func(string) { once.Do(func() { close(contended) }) }
+	defer func() { blobDomainContentionHook = restoreHook }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -128,7 +128,7 @@ func TestClaimStaging_FallbackLiveOwnerIsNotTakenOver(t *testing.T) {
 	}
 }
 
-func TestClaimStaging_LockFencedFreeLockIsTakenOver(t *testing.T) {
+func TestClaimStaging_LegacyLockFencedRecordRemainsUnproven(t *testing.T) {
 	const total = 4_096
 	full := rangedTestPayload(total)
 	sha := singleTestSHA(full)
@@ -155,21 +155,32 @@ func TestClaimStaging_LockFencedFreeLockIsTakenOver(t *testing.T) {
 	if err := writeStagingMeta(metaPath, meta); err != nil {
 		t.Fatal(err)
 	}
-	// The persistent lock file exists but is held by nobody.
+	// The old payload-side lock may be free; LockFenced alone is not a
+	// proof for the current external realm/key protocol.
 	if err := os.WriteFile(stagingOwnershipLockPath(staging), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	it := PlanItem{RelativePath: "fenced.bin", Size: total, LFS: true, SHA256: sha}
-	state, err := claimStaging(context.Background(), staging, pub, metaPath, it, Job{Repo: "o/r"}, "commit123", true,
-		Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}, false, acquireTestDomain(t, pub))
+	beforePayload, err := os.ReadFile(staging)
 	if err != nil {
-		t.Fatalf("lock-fenced record with a free lock must be take-over-able: %v", err)
+		t.Fatal(err)
 	}
-	if state.fresh {
-		t.Error("take-over reported a fresh claim")
+	beforeMeta, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(state.ranges) != 2 || state.ranges[0].Committed != total/2 {
-		t.Errorf("take-over ranges = %+v, want the validated committed prefix", state.ranges)
+	it := PlanItem{RelativePath: "fenced.bin", Size: total, LFS: true, SHA256: sha}
+	_, err = claimStaging(context.Background(), staging, pub, metaPath, it, Job{Repo: "o/r"}, "commit123", true,
+		Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}, false, acquireTestDomain(t, pub))
+	if !errors.Is(err, ErrStagingOwnershipUnproven) {
+		t.Fatalf("legacy lock-fenced record error = %v, want ownership unproven", err)
+	}
+	afterPayload, err := os.ReadFile(staging)
+	if err != nil || !bytes.Equal(afterPayload, beforePayload) {
+		t.Errorf("legacy payload changed: %v", err)
+	}
+	afterMeta, err := os.ReadFile(metaPath)
+	if err != nil || !bytes.Equal(afterMeta, beforeMeta) {
+		t.Errorf("legacy metadata changed: %v", err)
 	}
 }
 

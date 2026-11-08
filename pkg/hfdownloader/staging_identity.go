@@ -4,8 +4,8 @@
 package hfdownloader
 
 // Instance tokens distinguish PID reuse and shared PID 1, but exclusion comes
-// from the lifetime domain lock. Unfenced takeover requires same-instance
-// identity or matching-host PID-death evidence, never record age.
+// from the held external scope plus its recorded realm/key proof. Legacy or
+// mismatched proofs require independent self/death evidence; age is never used.
 
 import (
 	"crypto/rand"

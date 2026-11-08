@@ -135,41 +135,75 @@ destination. `ScanPlan` preview event paths remain repository-relative.
 
 # Ownership: one destination domain
 
-Exactly one live writer may own a destination. The exclusion fence is the
-destination ownership domain: an in-process slot keyed by the destination plus
-an OS-level exclusive lock on its persistent domain lock file. The item acquires
-the domain ONCE, after its pre-download skip decision and before the HEAD/claim,
-and holds it for the whole ownership interval: claim read, create/resume,
-transfer, hashing, publication/store and cancel cleanup. It is released when the
-item returns.
+Exactly one participating writer may own an item at a time. Each operation
+combines an in-process keyed waiter with the applicable persistent OS lock set.
+In cache mode, Hub data uses the cache-owned control root
+`H/.hfdesk-control/v1`, derived only from the frozen Hub root H; friendly-view
+data uses the independent root `R/.hfdesk-control/v1`, derived from the frozen
+cache root R. Cache clients sharing H therefore find the same Hub anchor without
+per-user configuration or an R-derived path. The item acquires its scope after
+the authoritative skip decision and before resume inspection, HEAD or claim,
+and holds it through transfer, proof, publication/store and cancel cleanup.
+Cache-link creation scopes the actual snapshot path under H and the enabled
+friendly path under R while the blob item domain remains held.
 
-The domain identity is name-based and differs by destination kind:
+`Settings.OwnershipDir` selects the external realm only for flat `OutputDir`
+mode; empty uses the per-user default `<UserConfigDir>/HFDesk/ownership` (or the
+documented home fallback). A non-empty value in cache mode is rejected rather
+than selecting a second cache namespace; the legacy `NewHFCache*WithOwnershipDir`
+constructors report that configuration error when an ownership operation is
+attempted. Hub and friendly control roots are independent when H and R are
+independent. Cache control nodes persist opaque anchor/node IDs; each node stores
+leases and profiles in a `metadata/` branch separate from user components in
+`children/`. Profile changes and malformed IDs fail closed. Cache lock files are
+persistent and never unlinked; flat-mode hashed lock files remain under
+`<OwnershipDir>/v1/`. No current writer creates payload-side domain-lock files.
+Existing payload-side `.lock` files from older versions are not current ownership
+proof and are not automatically migrated or removed. Server deletion, mirror
+destructive steps and the HF branch of selected-GGUF deletion participate in
+these cache-root scopes through the cache-owned admission API
+(`OpenCacheAdmission` with `AdmitTreeRemoval`/`AdmitFileWrite`); selected
+deletion's local-root branch participates through the same admission API
+against the flat `Settings.OwnershipDir` realm (`OpenFlatAdmission` with
+`AdmitFileWrites`). None of them participates through this library's transfer
+internals.
 
-  - A content-addressed cache item (a supplied canonical SHA-256) uses the
-    destination name `blobs/tmp-<sha>` (the single-request staging name and the
-    destination key, even when a ranged LFS transfer writes directly to
-    `blobs/<sha>.incomplete`). Its name is the digest, so its domain is exactly
-    the blob key's domain: key `blobs/<sha>`, lock `blobs/tmp-<sha>.lock`. The
-    publication's `holdsBlobKey` check applies to this key.
+The logical domain identity remains name-based and differs by destination
+kind; external locks themselves are hashes of realm-scoped physical item keys:
+
+  - A content-addressed cache item uses the canonical `blobs/<sha>` key across
+    the single and ranged routes. Its scope covers the blob publication target
+    and route-owned staging artifacts; actual link paths get their own scoped
+    lease while the blob key remains held.
   - An item without a known digest (the planner permits an empty SHA-256) stages
     at the STRUCTURALLY NON-CANONICAL `blobs/tmp-path-<sanitized relative path>`.
-    Its domain key is `blobs/path-<sanitized relative path>` and its lock is
-    `blobs/tmp-path-<sanitized relative path>.lock`. "path-" is not a 64-hex
-    digest, so neither identity can be reached by a blob key or lock, and the
-    staging name can never equal a content-addressed `tmp-<sha>` name.
-  - A legacy/output (flat) destination has no `blobs/`-style internal identity,
-    so it borrows the multipart staging name: the domain key is the destination
-    path and the lifetime lock is the persistent sibling
-    `<destination>.incomplete.lock`. No new artifact name appears next to the
-    user's model file. Because every route takes that domain, every flat
-    TRANSFER leaves the persistent zero-byte
-    `<destination>.incomplete.lock` next to the file, even when no multipart
-    transfer ran: the shared domain/staging lock is created by the item-level
-    acquisition, not by a multipart transfer. A destination skipped before that
-    acquisition (an already complete file) leaves no lock. The unknown-size
-    hand-off from the multipart route to
-    the single-request path keeps the domain the item already holds instead of
-    taking it a second time.
+    Its logical domain key is `blobs/path-<sanitized relative path>` and remains
+    distinct from canonical blob keys. After hashing, store acquires the
+    computed blob key while retaining ownership of its temporary file.
+  - A flat destination is keyed by its actual path. Its scope covers the
+    destination and route-owned partial/staging paths. No
+    `<destination>.incomplete.lock` payload sibling is created, so a requested
+    file such as `foo.incomplete.lock` is an independent ordinary item.
+
+Scopes lock shared ancestor-directory identities and exclusive item entries.
+Missing parent components use short exclusive preparation gates: create parents
+while held, promote to the final physical keys, then release preparation before
+payload I/O. Supported path identity details depend on the platform/filesystem;
+do not claim universal casefold, bind-view or cross-client alias detection.
+Tree mutations must use exclusive tree admission. Server HTTP DELETE, mirror
+`deleteExtra` removal and the HF branch of selected-GGUF deletion take it
+through `AdmitTreeRemoval` before removing anything; the local-root branch of
+selected-GGUF deletion takes `AdmitFileWrites` entry admission over exactly the
+member paths it unlinks, against the flat `Settings.OwnershipDir` realm that
+flat writers resolve the same way (`DefaultOwnershipDir()` when unset). Both
+selected-delete branches therefore exclude writers in other processes; local
+exclusion is exactly as strong as the flat realm's existing writer
+coordination — two participants exclude each other only when both resolve the
+same `OwnershipDir`. A tree-removal admission whose target is missing must
+re-verify the vanish while holding the missing target's creator-side keys — a
+bare or wrapped ENOENT from resolution is not proof that the target is gone —
+and an admission that can establish neither a live-writer conflict nor a
+re-verified vanish fails closed instead of admitting.
 
 The `path-` prefix separates digest-less destination domains from content-addressed
 blob domains and their staging names. Without it, digest-named files whose contents
@@ -185,70 +219,69 @@ so neither can adopt/delete the other's live partial or overtake its publication
 A busy destination domain is not completion proof: wait without takeover, then
 re-check the content-addressed target and download if it was not published. Flat
 and path-derived destinations have no such target and download after waiting.
-The kernel releases the lock on process exit; a suspended owner retains it.
-Unix uses `flock(LOCK_EX|LOCK_NB)` and Windows a held exclusive-share
-`CreateFile` handle (`dwShareMode=0`).
+The OS releases control-file lock handles on process exit; a suspended owner
+retains them. Unix uses shared/exclusive `flock`; Windows uses `LockFileEx` over
+cache-node metadata locks or flat-mode external lock files.
 
-Cross-process ownership waits use an internal budget of 60 times the 5s
-acquisition window (5 minutes), inside the item's goroutine. In-process domain
-waits are bounded by the item context. An expired live-owner wait fails the item
-with its blob key or path and a retry instruction; it is never successful completion.
+Ownership waits use an internal five-minute budget in the item's
+goroutine. In-process waits are bounded by the item context. Both release the
+transfer slot while waiting and reacquire it before transfer. An exclusive
+scope holder is waited for; unresolved contention fails with a retry instruction,
+never successful completion.
 
-If the domain lock cannot be acquired (unsupported, denied, or filesystem
-error), the operation fails before mutating claims or payloads and preserves
-existing partial data. This is an operation-time safety error, not a permanent
-platform-support policy. The domain lock file is persistent: it is never
-unlinked (that would let two processes own different inodes) and is excluded
-from cache statistics, listings, mirrors and cache deletion like every other
-`.lock` artifact.
+If a cache-owned or flat-mode lock cannot be acquired (unsupported, denied, or
+filesystem error), the operation fails before mutating claims or payloads and
+preserves existing partial data. This is an operation-time safety error, not a
+permanent platform-support policy. Control lock files are persistent: never
+unlink them (two processes could otherwise lock different inodes). Cache-mode
+locks live only under the hidden H/R control roots, not beside model payloads;
+flat-mode locks live in the configured external realm. None are payload items.
 
-The multipart claim reuses the held domain: it takes no second OS lock or
-in-process ownership slot, rejects nil/released/non-covering domains before
-mutation, and records `LockFenced=true` under the per-path metadata gate. This
-gate serializes intra-item transitions, not competing writers. Do not restore
-the obsolete `<staging>.lock` fence, which self-conflicts in flat mode.
-Mixed-version writers remain unsupported: fenced, provably dead or self-owned
-unsupported records are discarded; any unfenced record whose owner is not
-proven dead or self is preserved and refused as unproven, before version checks.
-Do not add mixed-version compatibility or contend on the obsolete lock.
+The multipart claim reuses the held cache or flat scope and takes no second item lock
+or transfer slot. It rejects nil/released/non-covering scopes before mutation and
+records both `LockFenced=true` and a versioned `OwnershipFence` proof for the
+held realm/item key under the per-path metadata gate. That gate serializes
+intra-item transitions, not competing writers. `LockFenced` by itself is legacy
+diagnostic data, not proof for the current cache/flat protocol. A held current
+scope makes only a record carrying its exact current proof stale. Missing,
+unknown or mismatched proofs are preserved/refused unless self-identity or
+same-host owner-death evidence independently permits reclaim; the ownership
+check runs before the record-version branch. Mixed-version writers remain
+unsupported, and age, ambiguous identity or a free cache/flat key are insufficient.
 
-A held domain makes a `LockFenced` predecessor stale. An unfenced record is
-preserved and refused unless it belongs to this process instance or same-host
-evidence proves its owner dead; age, ambiguous identity and a free new lock
-are insufficient.
+All ownership observations are non-owning shared leases. A refused shared probe
+proves an exclusive scope holder; a granted probe cannot distinguish another
+reader from no holder. Claimants retry real exclusive acquisition within the
+bounded cancellable window, then fail if the scope is not proven free. An observer
+never takes an exclusive lock or impersonates a writer.
 
-All ownership observations are non-owning: shared flock on Unix and shared-access
-open on Windows. A refused shared probe proves an exclusive holder; a granted
-one cannot distinguish another reader from no holder. Claimants must retry real
-exclusive acquisition within the bounded cancellable window; an observer must
-never take the exclusive lock and impersonate a writer. Unresolved contention
-is an actionable failure, never a successful skip.
-
-`CheckBlob` trusts an existing published blob. With a ranged payload it probes
-`blobs/tmp-<sha>.lock`, never the obsolete staging lock. An exclusive holder is
-`BlobDownloading`; a free lock permits record checks: fenced or provably dead
-records are `BlobStale`, while an unfenced owner not proven dead remains
-`BlobDownloading`. A malformed/unreadable record with a free lock is reported
-conservatively as `BlobStale`, not as permission to resume or delete it: the
-claim refuses it as unproven and preserves it. Probe failure or unsupported
-locking returns `BlobOwnershipUnknown` with `ErrBlobOwnershipUnknown`, not a
-successful skip. Without a ranged payload it returns `BlobMissing`, even if
-a single-route writer holds the domain; callers still acquire the domain.
+`CheckBlob` trusts an existing published blob. With ranged staging it probes the
+cache/flat scope for the blob key and staging record. An exclusive holder is
+`BlobDownloading`; a free scope permits record checks: an exact current proof or
+independent self/death evidence is `BlobStale`, while an unproven live owner
+remains `BlobDownloading`. A malformed/unreadable record with a free scope is
+reported conservatively as `BlobStale`, not as permission to resume or delete
+it: claim/cleanup still preserve and refuse it as unproven. Probe failure or
+unsupported locking returns `BlobOwnershipUnknown` with
+`ErrBlobOwnershipUnknown`, never a successful skip. Without ranged staging it
+returns `BlobMissing`, even if a single-request writer holds an item scope;
+callers still acquire the scope.
 
 The claim record is diagnostics/resume state, not a freshness-based ownership
-lease. Ownership is the held destination domain plus `LockFenced`. The record
-is not rewritten on a timer and has no heartbeat; record age is never an
-ownership signal. The former age-based configuration (`Settings.StaleTimeout`,
+lease. Ownership is the held destination scope; a matching `LockFenced` plus
+`OwnershipFence` record proves only that the predecessor used the same
+realm/key. The record is not rewritten on a timer and has no heartbeat; record
+age is never an ownership signal. The former age-based configuration (`Settings.StaleTimeout`,
 `HFCache.StaleTimeout` and `DefaultStaleTimeout`) has been removed; do not
 reintroduce an age-based timeout, lease or takeover input. Every mutation
 re-reads claim identity, so a checkpoint cannot resurrect a replaced claim. The
 claim carries a per-process instance token plus PID/host diagnostics, so PID
 reuse and containers sharing PID 1 are not treated as the same writer. Publish
-checks the record and the still-held domain lock before rename, and checks
+checks the record and the still-held cache/flat scope before rename, and checks
 cancellation immediately before the rename; a missing or foreign record is
 refused with `errStagingClaimLost` and is never renamed. Record transitions are
 serialized by the per-staging metadata mutex;
-the destination domain (held by the item) excludes foreign current-version
+the cache/flat scope (held by the item) excludes foreign current-version
 mutators and makes that gate intra-item state.
 
 Fresh claims install a complete staged document with atomic hard-link
@@ -258,14 +291,14 @@ predecessor with the complete successor. Staging always uses a fresh inode:
 leftover temp aliases must never be truncated through the authoritative record.
 Hard-link support is not a download prerequisite.
 
-Destination-domain acquisition returns the item's transfer slot during both
-in-process and OS-lock waits, then reacquires it before returning the held domain
+Ownership-scope acquisition returns the item's transfer slot during both
+in-process and OS-lock waits, then reacquires it before returning the held scope
 for transfer; acquisition failure leaves the slot returned. The multipart
 claim neither waits for ownership nor moves the lease. In-process waits end with
 the item context; waits for a proven foreign owner use the ownership budget,
 while the metadata gate uses `stagingLockWait`. Waiting items emit no transfer
-progress, and a live-owner timeout fails the job. Returning the slot prevents a
-slot/domain wait cycle.
+progress, and an unresolved scope wait fails the job. Returning the slot prevents
+a slot/domain wait cycle.
 
 # Resume identity
 
@@ -275,15 +308,16 @@ otherwise) and persist their committed byte ranges in versioned metadata next
 to it, so an interrupted transfer resumes from its durable high-water marks
 without re-downloading valid bytes — even when the connection count changes
 between runs. Range-record version 4 marks ranges Done only after the response
-body reaches clean EOF. It is the ONLY resumable version. A FENCED record of
-any other version — including a branch-only version-3 record whose
-`legacy_migrated` flag described imported bytes — is discarded under the
-claim's ownership and local metadata serialization, and the file is
-re-downloaded from zero. So is an unfenced old-version record whose owner is
-provably dead or is this process. An UNFENCED old-version record whose owner
-cannot be proven dead is refused as unproven before the version-discard branch
-and preserved. Partial downloads from old formats are never migrated; a warning
-is logged when old artifacts are discarded.
+body reaches clean EOF. It is the ONLY resumable version. After ownership is
+established by an exact current scope/key proof or independent self/death
+evidence, a record of any other version — including a branch-only version-3
+record whose `legacy_migrated` flag described imported bytes — is discarded
+under the claim's ownership and local metadata serialization, and the file is
+re-downloaded from zero. A legacy `LockFenced` bit without current proof does
+not establish ownership: if its owner cannot independently be proven dead or
+self, the record is refused as unproven before the version-discard branch and
+preserved. Partial downloads from old formats are never migrated; a warning is
+logged when proven-reclaimable old artifacts are discarded.
 
 A version-4 record resumes only when repo, resolved commit, path and expected
 size match, both identities are pinned, and SHA values are either both absent
@@ -298,21 +332,21 @@ automatically: it is refused with `ErrStagingOwnershipUnproven` and its record
 and payload are preserved for the operator. Already-published blobs, completed
 files and the snapshot/friendly entries are untouched.
 
-The two staging refusals are told apart because they need different operator
-actions. A PROVEN live owner keeps the transient live-owner message ("blob
-<sha> is being downloaded by another process; try again later"); the owner may
-publish the file at any moment, so the operator simply retries. An UNPROVEN
-record reports that its staging state "cannot be proven to belong to a live or
-dead owner (legacy or unreadable record)", that the partial is preserved, and
-that removing the staging pair is the recovery; only this case carries
-`ErrStagingOwnershipUnproven`, so a caller can tell the two apart with
-`errors.Is`. OPERATOR PROCEDURE: remove the staging pair (`<staging>` and
-`<staging>.meta`, for example `blobs/<sha>.incomplete` and
-`blobs/<sha>.incomplete.meta`) and retry the download; the item then starts from
-zero. Never remove the destination's persistent domain lock
-(`blobs/tmp-<sha>.lock` for a cache destination, `<destination>.incomplete.lock`
-for a flat one), and never remove a staging pair whose owner is a PROVEN live
-owner — that owner is still writing to it.
+An exclusive scope holder, unresolved shared-reader contention, and an UNPROVEN
+record have distinct outcomes. An exclusive holder is waited for, then reported
+with an actionable retry error if it remains. A shared reader can prevent an
+exclusive acquisition without proving a writer; unresolved contention fails
+closed without claiming a live writer. An UNPROVEN record reports that its
+staging state "cannot be proven to belong to a live or dead owner (legacy or
+unreadable record)", that the partial is preserved, and that removing the
+staging pair is the recovery; only this case carries
+`ErrStagingOwnershipUnproven`. OPERATOR PROCEDURE: remove that staging pair
+(`<staging>` and `<staging>.meta`, for example `blobs/<sha>.incomplete` and
+`blobs/<sha>.incomplete.meta`) only after establishing that no client is using
+it. Never remove a persistent lock file under either cache-owned
+`<H-or-R>/.hfdesk-control/v1/` tree or flat-mode `<OwnershipDir>/v1/` while any
+participant may hold it; old payload-side `.lock` artifacts are not current
+ownership proof and are not automatically migrated or deleted.
 
 Resolve one commit for the tree walk and every per-file URL (`lfsURL`, `rawURL`);
 otherwise a moving branch can make the recorded identity describe different
@@ -484,8 +518,12 @@ Without hard-link support, placement checks and renames under the blob key's
 exclusive domain, refusing to run without that matching domain. No domain
 participant can create the target between check and rename, so participants
 do not replace an existing blob. This is not unconditional no-replace: mirror
-and selected-GGUF operations are outside the domain. Hard links are not a
-prerequisite for downloading.
+and selected-GGUF operations do not publish through this primitive. The mirror
+admits each copied destination file and each removed repository tree, and
+selected-GGUF deletion admits the repository and its friendly view, so against
+ownership participants their exclusion comes from that admission rather than
+from placement; the no-replace property itself is not claimed for them. Hard
+links are not a prerequisite for downloading.
 
 If the placement itself fails (a cross-device move, for example), the cache
 store falls back to copying the payload to a staging file in the destination
@@ -546,7 +584,7 @@ mode except "none" — including "size" — whenever the item carries a known
 digest, so a crash mid-proof, a mismatch whose cleanup fails, or a later
 Verify-mode change cannot publish unproven all-Done ranges. On a mismatch the
 flag stays set, poison (a zero-length payload) is attempted only while the claim
-is still owned under the metadata gate and lifetime OS lock, and the owned
+is still owned under the metadata gate and external item scope, and the owned
 discard is attempted; if ownership cannot be verified the poison is skipped and
 the durable flag remains the guard, so the next run re-proves or discards.
 Publication itself is refused while a known digest's proof is still pending.
@@ -568,17 +606,19 @@ classification, and every consumer of a cache uses it: the mirror scan, copy
 and verification, the cache statistics, the cache listing, the cache selection
 and the cache deletion.
 
-The staging shapes are derived from the code that creates them:
+The classifier recognizes current staging shapes and retained legacy residue
+shapes:
 
   - `tmp-<name>` - the single-request staging destination (a content digest, or
     the structurally non-canonical `tmp-path-<name>` form for an item without a
     known digest) and everything derived from it: `tmp-<name>.part` (the
     single-request partial), `tmp-<name>.part.meta` (its identity sidecar) and
-    `tmp-<name>.lock` (the destination domain's persistent lock)
+    the legacy `tmp-<name>.lock` residue shape (new locks are external)
   - `<name>.incomplete` - the ranged staging payload
   - `<name>.incomplete.meta` - its resume record
   - `<name>.incomplete.meta.tmp` / `<name>.meta.tmp` - the atomic record temp
-  - `<name>.lock` - the persistent ownership lock beside a staging payload
+  - `<name>.lock` - a legacy payload-side lock residue shape; cache-mode locks
+    live under node `metadata/` branches and flat-mode locks in the external realm
   - `<name>.part` - the single-request partial (the flat-mode destination's
     partial)
   - `<name>.part.meta` - the single-request identity sidecar
@@ -628,27 +668,33 @@ like the pre-download skip; it does not re-verify content, so do not claim a
 content proof for this path.
 
 Cleanup removes a cache destination's temp, single partial, obsolete multipart
-family and blob-keyed staging only while holding the same name-derived domain
-as the writer: `tmp-<name>` maps to `blobs/<name>` and `tmp-<name>.lock`; the
-`tmp-path-` namespace remains disjoint from canonical blob domains. With a live
-owner, cleanup leaves artifacts untouched and reports contention. Own explicit-cancel
-cleanup runs before domain release. External cleanup cannot distinguish a
-job's earlier bytes from another current owner of that destination, so it
-leaves the destination alone even if the cancelling job once wrote there.
+family and blob-keyed staging only while holding the same external item scope as
+the writer. `tmp-<name>` maps to the logical `blobs/<name>` key; the
+`tmp-path-` namespace remains disjoint from canonical blob domains. Flat cleanup
+uses the destination item path and acquires no sibling `.incomplete.lock` file.
+With an exclusive holder or an unproven record, cleanup leaves artifacts
+untouched. Own explicit-cancel cleanup runs before scope release. External cleanup
+cannot distinguish a job's earlier bytes from another current owner of that
+destination, so it leaves the destination alone even if the cancelling job once
+wrote there.
 
-Flat cleanup uses the writer's `<destination>.incomplete.lock` domain, never
-unlinking it. Under the domain, `removeStagingArtifactsLocked` removes while
-the metadata gate is held; `removeStagingArtifactsIfUnowned` takes that gate
-and removes only a pair with no live or unproven owner. Versioned pairs stay
-record-checked; single `.part`, obsolete `.part-NN` and `.parts.json` retain
-their cleanup. A cache destination with no derivable domain is skipped with
-a warning, never removed without ownership.
+Under the item scope, `removeStagingArtifactsLocked` removes while the metadata
+gate is held; `removeStagingArtifactsIfUnowned` takes that gate and removes only
+a pair whose current scope/key proof or independent self/death evidence proves
+reclaimable. Versioned pairs stay record-checked; single `.part`, obsolete
+`.part-NN` and `.parts.json` retain their cleanup. A cache destination with no
+derivable scope is skipped with a warning, never removed without ownership.
 
-Known limitations outside the downloader domain: mirror copies can truncate
-and overwrite destination blobs using size-only checks, and selected-GGUF
-deletion removes selected blob payloads without taking their domain. Neither
-is fenced by domain-exclusive placement. Do not extend downloader publication
-guarantees to those operations.
+Known limitations outside the downloader domain: a mirror file copy is still a
+non-atomic truncate-and-write performed under its entry admission, and it checks
+nothing itself beyond `io.Copy`'s error contract — the copied byte count is
+discarded, the explicit size comparison happens only in the opt-in verify pass,
+and that verification compares size rather than content hashes; the mirror's
+symlink-leaf replacement and plain directory creation take no admission at all;
+and HF selected-GGUF deletion removes blob payloads under repository and
+friendly tree admission rather than each blob's domain. None of these operations
+performs domain-exclusive placement, so do not extend downloader publication
+guarantees to them.
 
 # Retry, cancellation and lifecycle
 

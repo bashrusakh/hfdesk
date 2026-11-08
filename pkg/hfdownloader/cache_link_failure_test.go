@@ -22,17 +22,15 @@ import (
 	"time"
 )
 
-// breakSnapshotEntry blocks snapshot creation with a regular file at the
-// commit directory, avoiding permission- or symlink-dependent failures.
-func breakSnapshotEntry(t *testing.T, repo *RepoDir, commit string) {
+// failSnapshotEntryLink injects an actual link-creation error after ownership
+// admission, keeping the failure regression focused on the link operation.
+func failSnapshotEntryLink(t *testing.T) {
 	t.Helper()
-	dir := filepath.Join(repo.SnapshotsDir(), commit)
-	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
-		t.Fatal(err)
+	oldCreate := cacheEntryLinkCreate
+	cacheEntryLinkCreate = func(_ context.Context, _ *RepoDir, _, relativePath, _, _ string, _ bool) error {
+		return fmt.Errorf("%w: the snapshot entry of %s could not be created: injected link failure", ErrCacheLinkUnreachable, relativePath)
 	}
-	if err := os.WriteFile(dir, []byte("not a directory"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(func() { cacheEntryLinkCreate = oldCreate })
 }
 
 func publishBlob(t *testing.T, repo *RepoDir, sha string, content []byte) {
@@ -51,7 +49,7 @@ func TestPreDownloadSkipLinkFailureFailsTheItem(t *testing.T) {
 	cacheDir := t.TempDir()
 	repo := ownershipContractRepo(t, cacheDir)
 	publishBlob(t, repo, sha, full)
-	breakSnapshotEntry(t, repo, "commit123")
+	failSnapshotEntryLink(t)
 
 	srv, _ := recordingHub(t, full, "model.bin", true)
 	cfg := ownershipContractSettings(cacheDir, srv.URL, "0")
@@ -89,18 +87,15 @@ func TestPostDomainSkipLinkFailureFailsTheItem(t *testing.T) {
 	repo := ownershipContractRepo(t, cacheDir)
 
 	// Hold the blob domain so the item must wait before rechecking publication.
-	owner, err := acquireStagingOwnershipLock(mustDomainDst(t, repo, sha))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer owner.release()
+	owner := acquireTestDomainFresh(t, mustDomainDst(t, repo, sha))
 
 	srv, _ := recordingHub(t, full, "model.bin", true)
 	cfg := ownershipContractSettings(cacheDir, srv.URL, "0")
 
-	// The probe is installed before the writer starts: the hook is a
-	// package-level variable.
-	contended := installDomainContentionProbe(t)
+	// The probe and link failure are installed before the writer starts: both
+	// hooks are package-level variables.
+	contended := installBlobDomainContentionProbe(t)
+	failSnapshotEntryLink(t)
 	result := make(chan ownershipContractOutcome, 1)
 	go func() { result <- runOwnershipContractDownload(context.Background(), cfg) }()
 	awaitContention(t, contended, "the blob key's ownership domain")
@@ -108,8 +103,6 @@ func TestPostDomainSkipLinkFailureFailsTheItem(t *testing.T) {
 	// Publish before releasing the domain to exercise the post-domain skip.
 	publishBlob(t, repo, sha, full)
 	owner.release()
-
-	breakSnapshotEntry(t, repo, "commit123")
 
 	var out ownershipContractOutcome
 	select {
@@ -298,7 +291,7 @@ func TestTransferPathLinkFailureCarriesTheUnreachableSentinel(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cacheDir := t.TempDir()
 			repo := ownershipContractRepo(t, cacheDir)
-			breakSnapshotEntry(t, repo, "commit123")
+			failSnapshotEntryLink(t)
 
 			srv, _ := recordingHub(t, full, "model.bin", tc.lfs)
 			cfg := ownershipContractSettings(cacheDir, srv.URL, "0")

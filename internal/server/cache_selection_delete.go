@@ -1225,6 +1225,18 @@ func (m *JobManager) beginCacheMutation(paths ...string) (func(), bool) {
 			}
 		}
 	}
+	// Active writers own these destinations: frozen plan entries name the
+	// exact paths, and the job destination is the conservative fallback.
+	for _, activity := range m.runActivities {
+		if activity.planKnown && plannedRawEntriesConflict(clean, activity.planned) {
+			m.mu.Unlock()
+			return nil, false
+		}
+		if hfReservationConflictsJob(clean, activity.job) {
+			m.mu.Unlock()
+			return nil, false
+		}
+	}
 	if m.mutationScopes == nil {
 		m.mutationScopes = make(map[uint64][]frozenMutationPath)
 	}
@@ -1257,6 +1269,15 @@ func (m *JobManager) jobBlockedByDeleteLocked(job *Job) bool {
 	}
 	for _, targets := range m.deleteReservations {
 		if jobMayWriteSelectedPaths(job, frozenPhysicalPaths(targets), inventoryWritableNamespace) {
+			return true
+		}
+	}
+	// Only admission-gate (directory) mutations hold writers; observed entry cleanup does not.
+	for id, scopes := range m.mutationScopes {
+		if m.mutationScopeKinds[id] != writeScopeDirectory {
+			continue
+		}
+		if hfReservationConflictsJob(scopes, job) {
 			return true
 		}
 	}
@@ -2117,6 +2138,29 @@ func selectedLocalLocationCandidate(cfg Config, repo, locationID string) *cacheS
 	return nil
 }
 
+// writeSelectedHFAdmission reports a refused or failed cache-tree admission before any selected
+// entry is unlinked: a conflict keeps the endpoint's established 409 message family; any other
+// failure (including one that only resembles a vanished path) stops the deletion rather than
+// proceeding without cross-process exclusion.
+func writeSelectedHFAdmission(w http.ResponseWriter, err error) {
+	if errors.Is(err, hfdownloader.ErrOwnershipBusy) {
+		writeError(w, http.StatusConflict, "HF cache is busy", "An operation may change references in this HF repository or its friendly view; retry after it finishes")
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "HF deletion failed", err.Error())
+}
+
+// writeSelectedLocalAdmission reports a refused or failed flat-realm admission before any local
+// member is pinned or unlinked: a conflict keeps the endpoint's established local 409 family;
+// any other failure stops the deletion rather than proceeding without cross-process exclusion.
+func writeSelectedLocalAdmission(w http.ResponseWriter, err error) {
+	if errors.Is(err, hfdownloader.ErrOwnershipBusy) {
+		writeError(w, http.StatusConflict, "Selected GGUF is busy", "A queued or active operation may write this exact GGUF group; retry when it finishes")
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "Local deletion failed", err.Error())
+}
+
 func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Request) {
 	var req selectedDeleteRequest
 	if err := readJSON(r, &req); err != nil {
@@ -2230,6 +2274,35 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		defer release()
+		// The in-process reservation cannot see writers in other processes sharing this cache: take
+		// the downloader's cache-owned admission for the repository tree and its friendly view before
+		// the first unlink and hold it through the operation. Nonblocking: a live foreign writer
+		// refuses with the same 409 family above; a failed admission rolls both reservations back.
+		hubAdmission, err := hfdownloader.OpenCacheAdmission(r.Context(), cache.HubDir())
+		if err != nil {
+			writeSelectedHFAdmission(w, err)
+			return
+		}
+		repoRelease, err := hubAdmission.AdmitTreeRemoval(r.Context(), rd.Path())
+		if err != nil {
+			writeSelectedHFAdmission(w, err)
+			return
+		}
+		defer repoRelease()
+		if friendlyPath := rd.FriendlyPath(); friendlyPath != "" {
+			friendlyAdmission, err := hfdownloader.OpenCacheAdmission(r.Context(), cfg.cacheRoot())
+			if err != nil {
+				writeSelectedHFAdmission(w, err)
+				return
+			}
+			friendlyRelease, err := friendlyAdmission.AdmitTreeRemoval(r.Context(), friendlyPath)
+			if err != nil {
+				// repoRelease is deferred above, so this refusal rolls back both admissions.
+				writeSelectedHFAdmission(w, err)
+				return
+			}
+			defer friendlyRelease()
+		}
 		var fresh *cacheSelectionGroup
 		for _, loc := range cacheSelectionLocations(cfg, req.Repo) {
 			if loc.ID != req.LocationID || loc.kind != "hf" || !loc.CanDelete {
@@ -2392,6 +2465,27 @@ func (s *Server) handleSelectedCacheDelete(w http.ResponseWriter, r *http.Reques
 	if s.selectedDeleteHooks.afterGroupValidation != nil {
 		s.selectedDeleteHooks.afterGroupValidation()
 	}
+	// The in-process reservation cannot see flat-mode writers in other processes
+	// sharing this local root: take the downloader's flat-realm entry admission
+	// for the exact member paths — mirroring the in-process reservation's scope —
+	// before any identity-pin or unlink side effect, and hold it through the
+	// deletion. Refusal rolls back both planes: the deferred cleanup above
+	// releases the reservation when this returns.
+	// "" resolves the default realm and is correct only while nothing in the
+	// product sets OwnershipDir for server-driven flat jobs; if that setting
+	// ever becomes reachable here, pass the writers' same cfg.OwnershipDir
+	// source (downloader.go's flat branches) so the two sides cannot diverge.
+	flatAdmission, err := hfdownloader.OpenFlatAdmission(r.Context(), "")
+	if err != nil {
+		writeSelectedLocalAdmission(w, err)
+		return
+	}
+	memberRelease, err := flatAdmission.AdmitFileWrites(r.Context(), physicalPaths)
+	if err != nil {
+		writeSelectedLocalAdmission(w, err)
+		return
+	}
+	defer memberRelease()
 	pinPaths := make(map[string]cacheSelectionMember, len(group.Members))
 	for _, member := range group.Members {
 		pinPaths[filepath.ToSlash(filepath.FromSlash(member.Path))] = member

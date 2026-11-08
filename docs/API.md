@@ -1002,34 +1002,50 @@ an LFS item remains unknown-size after HEAD, Download uses the single-path temp
 and the normal cache-store path, so the blob and its snapshot/friendly entries
 are created from the completed file.
 
-Every destination has ONE ownership domain, acquired once after the skip
-decision and before the HEAD/claim and held through transfer, publication/store
-and cancel cleanup. A live owner is waited for (bounded, context-aware, effective
-five minutes), never skipped and never taken over; when the wait expires the
-item fails with an actionable error and the job does not report success. A
-suspended owner keeps the lock and a crashed owner releases it at death. A writer
-that cannot acquire the domain fails before writing a payload and preserves
-existing partial data. Mixed-version writers from a branch-only build that
-still held the obsolete `<staging>.lock` are unsupported: a fenced (or provably
-dead/self) old/unsupported record is discarded, while an unfenced record whose
-owner cannot be proven dead — of any version — is refused as unproven and
-preserved. In flat mode the persistent
-`<destination>.incomplete.lock` remains next to the model file and is never
-removed; every flat TRANSFER leaves it, even when no multipart transfer ran (a
-destination skipped before the item-level acquisition leaves no lock). A
-waiting writer that obtains the domain downloads a flat destination or an item
-without a known digest itself; only a published content-addressed blob is
-completion proof by existence. Cleanup of a destination's staging
-artifacts, including obsolete pre-#140 parts, runs only while that destination's
-domain is held, so a cancelled job never deletes another live writer's partial.
-A route removes only the artifacts it creates.
+Cache mode derives its ownership roots from the frozen storage associations:
+Hub items use `H/.hfdesk-control/v1`, derived only from `HubDir` H, and
+friendly-view items use `R/.hfdesk-control/v1`, derived from cache root R. They
+are independent when H and R are independent; a cache link operation admits its
+actual snapshot and friendly paths under the corresponding roots. Clients
+sharing H converge without a per-user ownership setting. `OwnershipDir` is a
+library `hfdownloader.Settings` option for flat `OutputDir` mode only; cache-mode
+use of a non-empty value is rejected rather than selecting another control
+namespace. It is not an HTTP setting. Cache node IDs and profiles persist in a
+typed control tree whose `metadata/` branches are separate from user components
+in `children/`. The legacy cache constructors that accept `OwnershipDir` return
+a cache whose ownership operations report the same configuration error. Current
+writers create no payload-side lock siblings. In
+particular a flat model named `foo.incomplete.lock` is an ordinary destination,
+independent of `foo`.
 
-An unproven staging record (unfenced, unreadable or unparseable current-format
-state) is preserved, never taken over, and refused with
+An exclusive scope holder is waited for (bounded, context-aware, effective five
+minutes), never taken over; unresolved reader contention also fails closed. A
+waiting item returns its `MaxActiveDownloads` slot and reacquires it before
+transfer. A writer that cannot acquire the applicable H/R cache scope or flat
+realm fails before writing a payload and preserves existing partial data. Cache
+operations that require cache-owned admission — whole-repository delete, mirror
+removal and overwrite, selected HF deletion — likewise fail closed with `500`
+(or `errors[]` for mirror) when the control tree cannot be established on the
+filesystem, rather than mutating without exclusion.
+Mixed-version writers from a branch-only build that still relied on obsolete
+payload-side lock files are unsupported. New v4 records carry `LockFenced` and
+an `OwnershipFence` bound to the current cache-root/key or flat realm/key;
+`LockFenced` alone is not proof. A legacy, unknown or mismatched proof is
+preserved/refused unless self-identity or same-host owner death independently
+permits reclaim. Only a published content-addressed blob is completion proof by
+existence; an arbitrary destination follows the authoritative skip decision.
+Cleanup of staging artifacts, including obsolete pre-#140 parts, runs under the
+applicable item scope and removes only route-owned artifacts. A route removes
+only the artifacts it creates.
+
+An unproven staging record (including a legacy `LockFenced`-only record, an
+unknown/mismatched realm proof, or unreadable/unparseable current-format state)
+is preserved, never taken over, and refused with
 `ErrStagingOwnershipUnproven`; the operator removes the staging pair and retries,
-and never removes the persistent domain lock or a pair whose owner is a proven
-live owner. A proven live owner keeps the transient "blob <sha> is being
-downloaded by another process; try again later" message. `CheckBlob` reports
+after establishing that no client still uses it. Never remove persistent cache
+metadata locks under an H/R `.hfdesk-control/v1` tree or flat-mode locks under
+`<OwnershipDir>/v1/` while a participant may hold them.
+`CheckBlob` reports
 `BlobDownloading`, `BlobStale`, or `BlobOwnershipUnknown` plus an
 `ErrBlobOwnershipUnknown` error; the incomplete payload is preserved and an
 unknown state is never a successful skip. The exact domain keys, staging names
@@ -1272,9 +1288,20 @@ all confirmed members intact. Unrelated staging files do not by themselves
 prevent deleting a completed selection; ordinary opaque keys and `.part` /
 `.parts.json` names outside these producer-shaped namespaces remain eligible.
 The server does not cancel jobs. HF mutation excludes writers to the
-selected repository reference namespace and associated friendly view. Local
-selected-delete admission uses complete frozen plan destinations when
-available. A matching run activity with a known and complete plan is
+selected repository reference namespace and associated friendly view. For an
+HF location this now also holds across processes: before the first unlink the
+delete takes cache-owned admission over the repository tree and its friendly
+view and holds it through the operation, so a live download in another process
+sharing the cache refuses the request with the same `409`. The local-root
+location kind gets the same protection through the flat ownership realm: entry
+admission over the exact member paths is taken before any identity pin or
+unlink and held through the deletion, so a flat-mode writer in another process
+holding any member refuses with the same `409`. As for flat writers generally,
+two participants exclude each other only when both resolve the same
+`Settings.OwnershipDir` (defaulting to the per-user `DefaultOwnershipDir()`);
+that is the flat realm's existing coordination boundary, not a new
+restriction. Local selected-delete admission uses complete frozen plan
+destinations when available. A matching run activity with a known and complete plan is
 authoritative: if none of its frozen destinations overlaps the selected entry
 (including revalidated raw alias spellings), that activity cannot write the
 entry and is skipped; any overlapping or unresolved destination remains
@@ -1319,7 +1346,11 @@ HFDesk support policy. Regular-file deletion remains supported on the released
 platforms above. The Darwin hard-link pin fallback described above is a separate
 platform-specific behavior.
 The older `DELETE /api/cache/{owner}/{repo}` remains the separate
-whole-repository operation.
+whole-repository operation. It returns `409` without removing anything while an
+active download or another cache operation is using that repository or its
+friendly view, in this process or in another process sharing the cache; when
+cache ownership cannot be established on the filesystem it fails closed with
+`500` instead of removing anything.
 
 `locationId` is optional. When supplied, it must match a currently discovered
 location for this repo/type; unknown or stale IDs return `400` rather than
@@ -1469,7 +1500,12 @@ POST   /api/mirror/pull
 Mirror operations compare and synchronize selected local H with the explicit
 target root's `hub` child, regardless of local ENV. Mapping, verification, and
 `deleteExtra` remain bounded to those Hub roots. Mirror diff retains `localPath`
-as R and adds local `effectiveHubDir` and `hubDirSource`.
+as R and adds local `effectiveHubDir` and `hubDirSource`. A plain mirror
+destination gains a hidden `.hfdesk-control` control directory that holds the
+cache-owned admission state below. A local `DELETE /api/cache-selection`
+similarly creates the flat ownership realm directory
+(`<DefaultOwnershipDir()>/v1/`) when it does not exist yet, exactly as a flat
+download does.
 
 The mirror's scan, copy and verification use the same staging-artifact
 classification as the cache surfaces, scoped to the `blobs/` namespace: a
@@ -1479,11 +1515,23 @@ verification cover the same set, so a legitimate file outside `blobs/` (a
 snapshot entry named `tokenizer.model.meta`, for example) is copied and
 verified. A published blob is verified by size, a snapshot entry by its link
 target, and an unusual published blob name is copied and verified like any
-other content. The mirror copy is outside the downloader's destination
-ownership domain and uses a non-atomic truncate-and-write with a size-only
-check, so it is not fenced against a concurrent download of the same blob; the
-selected-GGUF delete path also removes blob payloads outside that domain. The
-canonical classification is in `pkg/hfdownloader/doc.go`.
+other content. Each mirror file copy takes cache-owned entry admission for its
+destination file and each `deleteExtra` removal takes cache-owned tree
+admission over the destination repository, so a live writer in any process
+sharing that cache is refused first: an in-place overwrite reports the refusal
+in `errors[]` with `success: false` and leaves the destination file intact, and
+a refused removal does the same instead of deleting. The copy itself remains a
+non-atomic truncate-and-write checked only by `io.Copy`'s error contract: its
+copied byte count is discarded, an explicit size comparison happens only in the
+opt-in `verify` pass, and that verification compares size rather than content
+hashes. It does not use the downloader's no-replace publication tiers, and the
+mirror's symlink replacement of a leaf link and creation of plain directories
+take no admission. A destination repository that vanishes between scan and
+deletion counts as deleted (at its scan-time size), like `os.RemoveAll`, not as
+an error; `deleted`/`deletedSize` count only repositories actually removed, and
+`copied`/`copiedSize`/`repos` count only repositories whose copy (and
+verification, when requested) completed without error. The canonical
+classification is in `pkg/hfdownloader/doc.go`.
 
 ## History and Disk
 

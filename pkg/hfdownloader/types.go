@@ -4,6 +4,7 @@
 package hfdownloader
 
 import (
+	"os"
 	"time"
 )
 
@@ -162,6 +163,11 @@ type Job struct {
 //	    Token:              os.Getenv("HF_TOKEN"),
 //	}
 type Settings struct {
+	// OwnershipDir selects the external ownership realm for flat OutputDir mode.
+	// Cache mode derives independent control roots from frozen HubDir and CacheDir;
+	// a non-empty OwnershipDir is rejected rather than selecting another namespace.
+	OwnershipDir string
+
 	// CacheDir is the HuggingFace cache root directory.
 	// Downloads use the official HF Hub cache structure:
 	//   <CacheDir>/hub/models--<owner>--<repo>/blobs/
@@ -428,12 +434,16 @@ func DefaultSettings() Settings {
 // BuildHFCache creates an HFCache from Settings.
 // This is the recommended way to get a cache instance.
 func (s Settings) BuildHFCache() (*HFCache, error) {
-	if s.HubDir != "" {
-		root := s.CacheDir
-		if root == "" {
-			root = DefaultCacheDir()
-		}
-		return NewHFCacheResolved(root, s.HubDir), nil
+	if s.OwnershipDir != "" {
+		return nil, errCacheOwnershipDirNotSupported
 	}
-	return NewHFCache(s.CacheDir), nil
+	root := s.CacheDir
+	if root == "" {
+		root = DefaultCacheDir()
+	}
+	hub := s.HubDir
+	if hub == "" {
+		hub = os.Getenv("HF_HUB_CACHE")
+	}
+	return NewHFCacheResolved(root, hub), nil
 }

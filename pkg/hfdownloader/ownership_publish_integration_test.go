@@ -110,7 +110,7 @@ func TestDownload_FreeLockFencedRecordWithLivePIDResumes(t *testing.T) {
 	blobsDir := blobDirFor(t, cacheDir)
 	staging := filepath.Join(blobsDir, sha+".incomplete")
 	ranges := []RangeProgress{{Start: 0, End: total - 1, Committed: total / 2}}
-	seedRangedState(t, staging, "o/r", "model.bin", total, ranges, good)
+	seedRangedState(t, staging, "owner/model", "model.bin", total, ranges, good)
 	meta, err := readStagingMeta(staging + ".meta")
 	if err != nil {
 		t.Fatal(err)
@@ -123,6 +123,15 @@ func TestDownload_FreeLockFencedRecordWithLivePIDResumes(t *testing.T) {
 	meta.Commit = "commit123"
 	meta.SHA256 = sha
 	meta.LockFenced = true
+	cache := NewHFCache(cacheDir)
+	realm, err := cache.ownershipRealmForData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.OwnershipFence, err = realm.fenceProof(filepath.Join(blobsDir, sha))
+	if err != nil {
+		t.Fatal(err)
+	}
 	meta.ProofPending = false
 	if err := writeStagingMeta(staging+".meta", meta); err != nil {
 		t.Fatal(err)
@@ -132,7 +141,26 @@ func TestDownload_FreeLockFencedRecordWithLivePIDResumes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv, gets := proofRecoveryHub(t, good)
+	var requestedRangesMu sync.Mutex
+	var requestedRanges []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_, _ = w.Write([]byte("[" + lfsTreeNode("model.bin", total, sha) + "]"))
+		case strings.Contains(r.URL.Path, "/resolve/"):
+			if r.Method == http.MethodGet && r.Header.Get("X-HFDesk-Addressing-Probe") != "1" {
+				requestedRangesMu.Lock()
+				requestedRanges = append(requestedRanges, r.Header.Get("Range"))
+				requestedRangesMu.Unlock()
+			}
+			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(good))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
 	cfg := Settings{
 		CacheDir:           cacheDir,
 		Endpoint:           srv.URL,
@@ -151,8 +179,12 @@ func TestDownload_FreeLockFencedRecordWithLivePIDResumes(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Download: %v", err)
 	}
-	if gets.Load() == 0 {
-		t.Error("the resumable crash record was skipped instead of resumed")
+	requestedRangesMu.Lock()
+	gotRanges := append([]string(nil), requestedRanges...)
+	requestedRangesMu.Unlock()
+	wantRange := fmt.Sprintf("bytes=%d-%d", total/2, total-1)
+	if len(gotRanges) != 1 || gotRanges[0] != wantRange {
+		t.Errorf("payload ranges = %v, want exactly the missing suffix %q", gotRanges, wantRange)
 	}
 	assertExactFile(t, filepath.Join(blobsDir, sha), good)
 	if !strings.Contains(doneMessage, "downloaded 1") {

@@ -227,7 +227,7 @@ func TestPathDerivedDestinationDomainExcludesAnotherProcess(t *testing.T) {
 
 	// The probe is installed before the writer starts: the hook is a
 	// package-level variable.
-	contended := installDomainContentionProbe(t)
+	contended := installBlobDomainContentionProbe(t)
 	result := make(chan ownershipContractOutcome, 1)
 	go func() { result <- runOwnershipContractDownload(context.Background(), cfg) }()
 
@@ -338,36 +338,6 @@ func TestContentAddressedDestinationDomainIsUnchanged(t *testing.T) {
 	if want := repo.BlobPath(sha); key != want {
 		t.Errorf("the domain key = %q, want the blob key %q", key, want)
 	}
-	if got, want := stagingOwnershipLockPath(dst), dst+".lock"; got != want {
-		t.Errorf("the domain lock = %q, want %q", got, want)
-	}
-
-	// The writer's domain, observed through the production seam.
-	type acquisition struct {
-		key          string
-		dst          string
-		domain       *blobDomain
-		holdsBlobKey bool
-	}
-	var (
-		mu           sync.Mutex
-		acquisitions []acquisition
-	)
-	oldAcquire := blobDomainAcquire
-	blobDomainAcquire = func(ctx context.Context, k, d string) (*blobDomain, error) {
-		dom, err := oldAcquire(ctx, k, d)
-		mu.Lock()
-		acquisitions = append(acquisitions, acquisition{
-			key:          k,
-			dst:          d,
-			domain:       dom,
-			holdsBlobKey: dom != nil && dom.holdsBlobKey(repo.BlobPath(sha)),
-		})
-		mu.Unlock()
-		return dom, err
-	}
-	defer func() { blobDomainAcquire = oldAcquire }()
-
 	srv, _ := recordingHub(t, full, "model.bin", true)
 	cfg := ownershipContractSettings(cacheDir, srv.URL, "0")
 	out := runOwnershipContractDownload(context.Background(), cfg)
@@ -375,30 +345,39 @@ func TestContentAddressedDestinationDomainIsUnchanged(t *testing.T) {
 		t.Fatalf("Download: %v", out.err)
 	}
 
-	mu.Lock()
-	got := append([]acquisition(nil), acquisitions...)
-	mu.Unlock()
-	if len(got) == 0 {
-		t.Fatal("the writer took no ownership domain")
-	}
-	first := got[0]
-	if first.key != repo.BlobPath(sha) {
-		t.Errorf("the writer's domain key = %q, want the blob key %q", first.key, repo.BlobPath(sha))
-	}
-	if first.dst != dst {
-		t.Errorf("the writer's domain destination = %q, want %q", first.dst, dst)
-	}
-	// Publication must hold the domain of the content-addressed key it publishes.
-	if !first.holdsBlobKey {
-		t.Error("the writer's domain does not hold the blob key it publishes")
-	}
-
-	// The persistent lock belongs beside tmp-<sha>, not beside the published blob.
-	if _, err := os.Stat(dst + ".lock"); err != nil {
-		t.Errorf("the domain lock file %s is missing: %v", dst+".lock", err)
+	if _, err := os.Stat(dst + ".lock"); !os.IsNotExist(err) {
+		t.Errorf("a payload-side lock appeared next to the temp, stat err=%v", err)
 	}
 	if _, err := os.Stat(repo.BlobPath(sha) + ".lock"); !os.IsNotExist(err) {
-		t.Errorf("a lock file appeared next to the blob, stat err=%v", err)
+		t.Errorf("a payload-side lock appeared next to the blob, stat err=%v", err)
+	}
+	assertCacheOwnedControlLocks(t, repo, sha)
+}
+
+func assertCacheOwnedControlLocks(t *testing.T, repo *RepoDir, sha string) {
+	t.Helper()
+	root := filepath.Join(repo.cache.OwnershipDir(), "v1", "root")
+	repoNode := filepath.Join(root, "children", repo.dirName())
+	blobsNode := filepath.Join(repoNode, "children", "blobs")
+	blobNode := filepath.Join(blobsNode, "children", sha)
+	paths := []string{
+		filepath.Join(root, "metadata", "anchor-id"),
+		filepath.Join(root, "metadata", "profile"),
+		filepath.Join(root, "metadata", "bootstrap.lock"),
+		filepath.Join(repoNode, "metadata", "node-id"),
+		filepath.Join(blobsNode, "metadata", "children.lock"),
+		filepath.Join(blobNode, "metadata", "entry.lock"),
+		filepath.Join(blobNode, "metadata", "children.lock"),
+	}
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Errorf("cache-owned control entry %s: %v", path, err)
+			continue
+		}
+		if strings.HasSuffix(path, ".lock") && info.Size() != 0 {
+			t.Errorf("cache-owned control lock %s is %d bytes, want zero", path, info.Size())
+		}
 	}
 }
 
@@ -414,9 +393,6 @@ func TestCacheDstDomainKeyUsesNameBasedIdentityForBothClasses(t *testing.T) {
 	if want := filepath.Join(blobsDir, sha); blobKey != want {
 		t.Errorf("content-addressed domain key = %q, want the blob key %q", blobKey, want)
 	}
-	if got, want := stagingOwnershipLockPath(contentDst), contentDst+".lock"; got != want {
-		t.Errorf("content-addressed domain lock = %q, want %q", got, want)
-	}
 
 	pathDst := filepath.Join(blobsDir, "tmp-path-"+sha)
 	pathKey, ok := cacheDstDomainKey(pathDst)
@@ -426,17 +402,26 @@ func TestCacheDstDomainKeyUsesNameBasedIdentityForBothClasses(t *testing.T) {
 	if want := filepath.Join(blobsDir, "path-"+sha); pathKey != want {
 		t.Errorf("path-derived domain key = %q, want %q", pathKey, want)
 	}
-	if got, want := stagingOwnershipLockPath(pathDst), pathDst+".lock"; got != want {
-		t.Errorf("path-derived domain lock = %q, want %q", got, want)
-	}
 	if pathDst == contentDst {
 		t.Errorf("the path-derived and content-addressed destinations share the staging name %q", pathDst)
 	}
 	if pathKey == blobKey {
 		t.Errorf("path-derived domain key %q equals the blob key", pathKey)
 	}
-	if got := stagingOwnershipLockPath(pathDst); got == stagingOwnershipLockPath(contentDst) {
-		t.Errorf("the path-derived lock file %q equals the blob domain lock", got)
+	realm, err := newOwnershipRealm(filepath.Join(t.TempDir(), "ownership"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentFence, err := realm.fenceProof(blobKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pathFence, err := realm.fenceProof(pathDst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contentFence == pathFence {
+		t.Errorf("path-derived item proof aliases the content-addressed blob proof %q", contentFence)
 	}
 
 	// Only a blobs/tmp-<name> staging name is a cache destination.
@@ -473,9 +458,6 @@ func TestPathDerivedDestinationCleanupUsesSameNameBasedIdentity(t *testing.T) {
 	if want := filepath.Join(repo.BlobsDir(), "path-"+rel); key != want {
 		t.Errorf("path-derived domain key = %q, want %q", key, want)
 	}
-	if got, want := stagingOwnershipLockPath(dst), dst+".lock"; got != want {
-		t.Fatalf("path-derived domain lock = %q, want %q", got, want)
-	}
 	contentDst := filepath.Join(repo.BlobsDir(), "tmp-"+rel)
 	if dst == contentDst {
 		t.Fatalf("the path-derived and content-addressed destinations share the staging name %q", dst)
@@ -483,6 +465,9 @@ func TestPathDerivedDestinationCleanupUsesSameNameBasedIdentity(t *testing.T) {
 	domain, err := blobDomainAcquire(context.Background(), key, dst)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if domain.ownershipFenceProof() == "" {
+		t.Fatal("the path-derived destination has no current external fence proof")
 	}
 	released := false
 	defer func() {
@@ -509,6 +494,9 @@ func TestPathDerivedDestinationCleanupUsesSameNameBasedIdentity(t *testing.T) {
 	}
 	if _, err := os.Stat(partial); !os.IsNotExist(err) {
 		t.Errorf("the released destination's own partial survived cleanup, stat err=%v", err)
+	}
+	if _, err := os.Stat(dst + ".lock"); !os.IsNotExist(err) {
+		t.Errorf("cleanup created a payload-side lock, stat err=%v", err)
 	}
 }
 
@@ -646,8 +634,8 @@ func TestPathDerivedDigestNamedFilesDoNotDeadlockWithComputedBlobDomains(t *test
 		if want := filepath.Join(repo.BlobsDir(), "path-"+rel); key != want {
 			t.Errorf("path-derived domain key = %q, want %q", key, want)
 		}
-		if _, err := os.Stat(dst + ".lock"); err != nil {
-			t.Errorf("the path-derived destination domain lock %s is missing: %v", dst+".lock", err)
+		if _, err := os.Stat(dst + ".lock"); !os.IsNotExist(err) {
+			t.Errorf("a path-derived payload-side lock was created: %v", err)
 		}
 		contentDst := filepath.Join(repo.BlobsDir(), "tmp-"+rel)
 		if dst == contentDst {

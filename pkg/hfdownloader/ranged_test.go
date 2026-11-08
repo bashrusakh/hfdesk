@@ -174,16 +174,12 @@ func TestRangedMultipart_OutOfOrderRangesProduceExactBytes(t *testing.T) {
 
 	assertExactFile(t, dst, full)
 
-	// No payload-artifact residue: the destination plus the persistent
-	// ownership lock file (never unlinked, by design) remain in the directory.
+	// No payload-side ownership fence is created beside an ordinary file.
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	allowed := map[string]bool{
-		filepath.Base(dst): true,
-		filepath.Base(stagingOwnershipLockPath(dst + ".incomplete")): true,
-	}
+	allowed := map[string]bool{filepath.Base(dst): true}
 	for _, e := range entries {
 		if !allowed[e.Name()] {
 			t.Errorf("unexpected artifact after publish: %s", e.Name())
@@ -196,8 +192,8 @@ func TestRangedMultipart_OutOfOrderRangesProduceExactBytes(t *testing.T) {
 		}
 		t.Errorf("unexpected artifacts after publish: %v", names)
 	}
-	if _, err := os.Stat(stagingOwnershipLockPath(dst + ".incomplete")); err != nil {
-		t.Errorf("the persistent ownership lock file was removed: %v", err)
+	if _, err := os.Stat(stagingOwnershipLockPath(dst + ".incomplete")); !os.IsNotExist(err) {
+		t.Errorf("an obsolete payload-side ownership lock exists: %v", err)
 	}
 	if files, _ := multipartPartFiles(dst); len(files) != 0 {
 		t.Errorf("no .part-NN payload files may be created, got %v", files)
@@ -891,6 +887,10 @@ func TestRangedMultipart_TwoClaimsOneWriter(t *testing.T) {
 	}
 	key := blob
 	lockSrc := filepath.Join(filepath.Dir(blob), "tmp-"+filepath.Base(blob))
+	realm, err := newOwnershipRealm(DefaultOwnershipDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var mu sync.Mutex
 	rangeGets := map[string]int{}
@@ -932,7 +932,10 @@ func TestRangedMultipart_TwoClaimsOneWriter(t *testing.T) {
 	cfg := Settings{Concurrency: 2, Retries: 1, StallTimeout: "0"}
 
 	run := func() (bool, error) {
-		domain, derr := acquireBlobDomain(context.Background(), key, lockSrc)
+		staging := blob + ".incomplete"
+		meta := staging + ".meta"
+		domain, derr := acquireBlobDomainScoped(context.Background(), key, lockSrc, realm,
+			[]string{blob, lockSrc, staging, meta, meta + stagingRecordTempSuffix}, blob)
 		if derr != nil {
 			return false, derr
 		}
