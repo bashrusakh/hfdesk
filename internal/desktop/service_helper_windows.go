@@ -142,8 +142,9 @@ func runServiceAction(action serviceAction, version string, reporter *serviceAct
 // runs.
 //
 // The registration is the default installation of the service layer, made for
-// the console program next to the helper: no field is named, so an installation
-// over an existing registration keeps every setting the instance runs with.
+// the console program next to the helper: no field is named. A registration
+// that already exists is refused by this first-install action instead of being
+// merged with: it is left untouched and reported as a conflict.
 // The installation never starts an instance itself, so the start is a separate
 // step; a service that cannot be started is reported as a failure of the
 // installation instead of leaving a registered instance that serves nothing.

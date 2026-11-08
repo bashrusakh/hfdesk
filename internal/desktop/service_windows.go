@@ -244,7 +244,8 @@ func installServiceFromTray(instanceMutex string) *desktopHandover {
 
 // serviceDataDir returns the data directory the service owns.
 //
-// An existing registration decides, because an installation merges with it; a
+// An existing registration decides, because the confirmation must name the
+// directory the service on this machine really owns and not a default; a
 // machine without a registration gets the default state directory of the scope.
 // It is a machine-wide directory, never the profile of the user who installs
 // it, so the confirmation names the directory the service will really own.

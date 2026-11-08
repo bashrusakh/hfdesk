@@ -8,6 +8,7 @@ package desktop
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -1365,7 +1366,11 @@ func TestServiceHelperInstallReportsTheServiceOwnedCleanupResult(t *testing.T) {
 func TestServiceHelperInstallDoesNotCleanAConcurrentRegistrationByName(t *testing.T) {
 	const console = `C:\portable\hfdesk.exe`
 	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) { return console, nil })
-	manager := &fakeServiceManager{installStartErr: errors.New("the registration appeared during the first install")}
+	// The exact refusal of the manager: a registration that appears before
+	// the write is not this attempt's registration, so the helper reports it
+	// without reopening the name to clean it up.
+	manager := &fakeServiceManager{installStartErr: fmt.Errorf(
+		"service: %s appeared during the first installation; no existing registration was changed", service.ServiceName)}
 	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) { return manager, nil })
 	messages := recordMessages(t)
 	if err := runHelperInstallForTest(""); err == nil {
@@ -1374,15 +1379,26 @@ func TestServiceHelperInstallDoesNotCleanAConcurrentRegistrationByName(t *testin
 	if len(manager.steps) != 1 || manager.steps[0] != "install-start" || manager.reads != 0 {
 		t.Errorf("the helper used steps %v and read status %d times, want no by-name cleanup", manager.steps, manager.reads)
 	}
-	if len(*messages) != 1 || !strings.Contains((*messages)[0].text, "registration appeared") {
+	if len(*messages) != 1 || !strings.Contains((*messages)[0].text, "appeared during the first installation") {
 		t.Errorf("the helper report is %v, want the concurrent-registration error", *messages)
+	}
+	// The attempt changed no registration, so the report offers no removal
+	// of a registration it never touched.
+	for _, unwanted := range []string{"A registration may remain", `"hfdesk service uninstall"`} {
+		if strings.Contains((*messages)[0].text, unwanted) {
+			t.Errorf("the helper report %v carries %q although this attempt changed no registration", *messages, unwanted)
+		}
 	}
 }
 
 func TestServiceHelperInstallReportsARegistrationConflictWithoutStatusLookup(t *testing.T) {
 	const console = `C:\portable\hfdesk.exe`
 	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) { return console, nil })
-	manager := &fakeServiceManager{installStartErr: errors.New("the service is already registered")}
+	// The exact refusal of the manager at the first-install boundary: the
+	// fixture carries the real message so the notice is exercised with the
+	// text the helper will really receive.
+	manager := &fakeServiceManager{installStartErr: fmt.Errorf(
+		"service: %s is already registered; the first-install action will not change or start it", service.ServiceName)}
 	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) { return manager, nil })
 	messages := recordMessages(t)
 
@@ -1392,8 +1408,18 @@ func TestServiceHelperInstallReportsARegistrationConflictWithoutStatusLookup(t *
 	if manager.reads != 0 || manager.starts != 0 || stepIndex(manager.steps, "uninstall") >= 0 {
 		t.Errorf("the helper read, started or removed a registration: steps=%v reads=%d starts=%d", manager.steps, manager.reads, manager.starts)
 	}
-	if len(*messages) != 1 || !strings.Contains((*messages)[0].text, "already registered") {
-		t.Errorf("the helper report is %v, want the existing-registration reason", *messages)
+	if len(*messages) != 1 {
+		t.Fatalf("the helper showed %d message boxes, want the refusal of the existing registration", len(*messages))
+	}
+	for _, want := range []string{"already registered", "did not create, change or start it", `"hfdesk service update"`} {
+		if !strings.Contains((*messages)[0].text, want) {
+			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
+		}
+	}
+	for _, unwanted := range []string{"A registration may remain", `"hfdesk service uninstall"`} {
+		if strings.Contains((*messages)[0].text, unwanted) {
+			t.Errorf("the report %q carries %q although this attempt changed no registration", (*messages)[0].text, unwanted)
+		}
 	}
 }
 

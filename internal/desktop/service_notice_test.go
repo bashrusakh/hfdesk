@@ -5,6 +5,7 @@ package desktop
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -253,6 +254,70 @@ func TestServiceInstalledTextNamesTheProgramTheAddressAndTheData(t *testing.T) {
 	// report never leaves a sentence without an address.
 	if text := serviceInstalledText("1.3.0", console, "", ""); !strings.Contains(text, "names no listen address") {
 		t.Errorf("the report %q does not report the missing address", text)
+	}
+}
+
+// TestServiceActionFailureTextOfAnAlreadyRegisteredFirstInstall proves that a
+// first-install refusal of an existing registration is reported as the
+// unchanged state it left: this attempt wrote no registration, so the report
+// carries neither the may-remain warning nor the removal of a registration it
+// never touched, and it names the next actions the state really offers.
+//
+// The refusals are spelled with the exact messages of the service layer, one
+// for a registration that exists when the install reads it and one for a
+// registration that appears before the write: a fixture that paraphrases them
+// would exercise a path the real manager never produces.
+func TestServiceActionFailureTextOfAnAlreadyRegisteredFirstInstall(t *testing.T) {
+	const program = `C:\portable\hfdesk.exe`
+	refusals := []string{
+		fmt.Sprintf("service: %s is already registered; the first-install action will not change or start it", service.ServiceName),
+		fmt.Sprintf("service: %s appeared during the first installation; no existing registration was changed", service.ServiceName),
+	}
+
+	for _, message := range refusals {
+		text := serviceActionFailureText(serviceActionInstall, errors.New(message), program)
+		for _, want := range []string{
+			message,
+			"The service registration already exists, and this attempt did not create, change or start it.",
+			"Start HFDesk again",
+			"startup gate offers to open or start the service and to update it",
+			`"hfdesk service update"`,
+			"elevated shell",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("the report %q does not mention %q", text, want)
+			}
+		}
+		for _, unwanted := range []string{
+			"A registration may remain",
+			`"hfdesk service uninstall"`,
+			"do not want to keep the registration",
+			// The folder guidance is the guidance of a failure whose cause is
+			// unknown: the refusal states its own cause.
+			program,
+			`NT AUTHORITY\LocalService`,
+		} {
+			if strings.Contains(text, unwanted) {
+				t.Errorf("the report %q carries %q although this attempt changed no registration", text, unwanted)
+			}
+		}
+		// One report, one place to act from: the state command of an
+		// unobservable outcome does not belong to a refusal that states the
+		// outcome itself.
+		if strings.Contains(text, "hfdesk service status") {
+			t.Errorf("the report %q names a state command next to the actions of an unchanged registration", text)
+		}
+	}
+
+	// A failure of the installation that is not this refusal keeps the
+	// wording of a report that may have written a registration: the class
+	// above must not swallow it.
+	generic := serviceActionFailureText(serviceActionInstall,
+		errors.New("the service control manager refused the registration"), program)
+	for _, want := range []string{"A registration may remain.", `"hfdesk service uninstall"`} {
+		if !strings.Contains(generic, want) {
+			t.Errorf("the generic report %q does not mention %q", generic, want)
+		}
 	}
 }
 

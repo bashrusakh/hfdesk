@@ -317,6 +317,50 @@ const (
 	serviceUninstallCommandText = `If you do not want to keep the registration, remove it from an elevated shell with "hfdesk service uninstall".`
 )
 
+// The refusal messages of the first-install path of the service layer: the
+// registration already exists, so the attempt changes no registration. The
+// manager returns them as plain errors, so the report recognizes them by the
+// text they carry; a sentinel error exported by the service layer would be the
+// better discriminator once one exists.
+var serviceAlreadyRegisteredRefusals = []string{
+	"is already registered; the first-install action will not change or start it",
+	"appeared during the first installation; no existing registration was changed",
+}
+
+// isAlreadyRegisteredRefusal reports whether err is the refusal of a
+// first-install attempt that found a registration it did not create.
+func isAlreadyRegisteredRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	for _, refusal := range serviceAlreadyRegisteredRefusals {
+		if strings.Contains(message, refusal) {
+			return true
+		}
+	}
+	return false
+}
+
+// serviceAlreadyRegisteredText returns the report of a first-install refusal of
+// a registration the attempt did not create.
+//
+// The refusal happens before this attempt writes, so the report states that
+// the registration already exists and that this attempt changed none of it: it
+// never says that a registration may remain and never offers the removal of a
+// registration this attempt never touched, because removing it would take away
+// a service the user did not ask to remove here. The next actions are the ones
+// this state offers: the startup gate of the next launch of the desktop app,
+// and the update that points the existing registration at the program it runs
+// from. The folder guidance of a failed installation is left out as well: the
+// cause is known, and it is not the folder of the program.
+func serviceAlreadyRegisteredText(detail string) string {
+	return "HFDesk could not install the Windows service.\n\n" + detail + "\n\n" +
+		"The service registration already exists, and this attempt did not create, change or start it.\n\n" +
+		"Start HFDesk again: with the registration in place, its startup gate offers to open or start the service and to update it. " +
+		`Run "hfdesk service update" from an elevated shell to point the registration at the program in the folder you run it from.`
+}
+
 // serviceActionFailureText returns the report of a failed service action: the
 // action that failed, the error of the service control manager and the one next
 // action of the state the attempt left.
@@ -327,7 +371,10 @@ const (
 // well, because a machine-wide service runs under its own account and a program
 // only the installing user can read is the common reason a first installation
 // fails. An installation whose service-owned first start failed is reported
-// from the cleanup facts returned by the service manager instead.
+// from the cleanup facts returned by the service manager instead. A first
+// installation that refused an existing registration is reported as the
+// unchanged state it left instead: that registration was never written by this
+// attempt, so neither the may-remain warning nor the removal belongs to it.
 func serviceActionFailureText(action serviceAction, err error, program string) string {
 	detail := ""
 	if err != nil {
@@ -336,6 +383,9 @@ func serviceActionFailureText(action serviceAction, err error, program string) s
 
 	switch action {
 	case serviceActionInstall:
+		if isAlreadyRegisteredRefusal(err) {
+			return serviceAlreadyRegisteredText(detail)
+		}
 		return "HFDesk could not install the Windows service.\n\n" + detail + "\n\n" +
 			"A registration may remain.\n\n" +
 			serviceFolderAccessText(program) + "\n\n" +
