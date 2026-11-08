@@ -4,6 +4,7 @@
 package desktop
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -317,29 +318,14 @@ const (
 	serviceUninstallCommandText = `If you do not want to keep the registration, remove it from an elevated shell with "hfdesk service uninstall".`
 )
 
-// The refusal messages of the first-install path of the service layer: the
-// registration already exists, so the attempt changes no registration. The
-// manager returns them as plain errors, so the report recognizes them by the
-// text they carry; a sentinel error exported by the service layer would be the
-// better discriminator once one exists.
-var serviceAlreadyRegisteredRefusals = []string{
-	"is already registered; the first-install action will not change or start it",
-	"appeared during the first installation; no existing registration was changed",
-}
-
 // isAlreadyRegisteredRefusal reports whether err is the refusal of a
 // first-install attempt that found a registration it did not create.
+//
+// The service layer marks both refusals (at the read and before the write)
+// with its exported error, so the classification is structural and survives a
+// rewording of the manager messages.
 func isAlreadyRegisteredRefusal(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := err.Error()
-	for _, refusal := range serviceAlreadyRegisteredRefusals {
-		if strings.Contains(message, refusal) {
-			return true
-		}
-	}
-	return false
+	return errors.Is(err, service.ErrAlreadyRegistered)
 }
 
 // serviceAlreadyRegisteredText returns the report of a first-install refusal of

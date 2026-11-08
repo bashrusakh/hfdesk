@@ -207,7 +207,7 @@ func (m *scmManager) install(ctx context.Context, opts InstallOptions, startFirs
 		return opts, Status{}, err
 	}
 	if startFirst && previous.present {
-		return opts, Status{}, fmt.Errorf("service: %s is already registered; the first-install action will not change or start it", ServiceName)
+		return opts, Status{}, fmt.Errorf("service: %s is already registered; the first-install action will not change or start it%w", ServiceName, ErrAlreadyRegistered)
 	}
 	if previous.present {
 		opts = mergeInstallOptions(opts, previous.options, previous.present)
@@ -414,7 +414,7 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 			// updated, started, stopped nor removed here.
 			_ = handle.Close()
 			result.createdDirsSafeToRemove = false
-			return result, fmt.Errorf("service: %s appeared during the first installation; no existing registration was changed", ServiceName)
+			return result, fmt.Errorf("service: %s appeared during the first installation; no existing registration was changed%w", ServiceName, ErrAlreadyRegistered)
 		}
 		// The service is registered already: the registration is updated
 		// instead of a second one being created.

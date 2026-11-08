@@ -1366,11 +1366,12 @@ func TestServiceHelperInstallReportsTheServiceOwnedCleanupResult(t *testing.T) {
 func TestServiceHelperInstallDoesNotCleanAConcurrentRegistrationByName(t *testing.T) {
 	const console = `C:\portable\hfdesk.exe`
 	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) { return console, nil })
-	// The exact refusal of the manager: a registration that appears before
-	// the write is not this attempt's registration, so the helper reports it
-	// without reopening the name to clean it up.
+	// The refusal of the manager, wrapped exactly like production wraps it: a
+	// registration that appears before the write is not this attempt's
+	// registration, so the helper reports it without reopening the name to
+	// clean it up.
 	manager := &fakeServiceManager{installStartErr: fmt.Errorf(
-		"service: %s appeared during the first installation; no existing registration was changed", service.ServiceName)}
+		"service: %s appeared during the first installation; no existing registration was changed%w", service.ServiceName, service.ErrAlreadyRegistered)}
 	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) { return manager, nil })
 	messages := recordMessages(t)
 	if err := runHelperInstallForTest(""); err == nil {
@@ -1394,11 +1395,11 @@ func TestServiceHelperInstallDoesNotCleanAConcurrentRegistrationByName(t *testin
 func TestServiceHelperInstallReportsARegistrationConflictWithoutStatusLookup(t *testing.T) {
 	const console = `C:\portable\hfdesk.exe`
 	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) { return console, nil })
-	// The exact refusal of the manager at the first-install boundary: the
-	// fixture carries the real message so the notice is exercised with the
-	// text the helper will really receive.
+	// The refusal of the manager at the first-install boundary, wrapped
+	// exactly like production wraps it, so the notice is exercised with the
+	// error the helper will really receive.
 	manager := &fakeServiceManager{installStartErr: fmt.Errorf(
-		"service: %s is already registered; the first-install action will not change or start it", service.ServiceName)}
+		"service: %s is already registered; the first-install action will not change or start it%w", service.ServiceName, service.ErrAlreadyRegistered)}
 	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) { return manager, nil })
 	messages := recordMessages(t)
 

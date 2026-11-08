@@ -424,6 +424,13 @@ func (e *InstallStartError) Unwrap() error {
 	return e.Cause
 }
 
+// ErrAlreadyRegistered classifies a refusal of the first-install path: the
+// action found a registration it did not create, at its read or between the
+// read and its write, so it changes nothing. It carries no text of its own so
+// that %w adds nothing to the refusal message shown to the user verbatim;
+// callers classify with errors.Is, never by wording.
+var ErrAlreadyRegistered = errors.New("")
+
 type installStarter interface {
 	InstallAndStart(context.Context, InstallOptions) (InstallStartResult, error)
 }

@@ -263,19 +263,30 @@ func TestServiceInstalledTextNamesTheProgramTheAddressAndTheData(t *testing.T) {
 // carries neither the may-remain warning nor the removal of a registration it
 // never touched, and it names the next actions the state really offers.
 //
-// The refusals are spelled with the exact messages of the service layer, one
-// for a registration that exists when the install reads it and one for a
-// registration that appears before the write: a fixture that paraphrases them
-// would exercise a path the real manager never produces.
+// The refusals are wrapped exactly like the manager wraps them, marker
+// included, so the report is exercised with the error the helper really
+// receives; the rendered detail stays byte-identical to the manager message.
 func TestServiceActionFailureTextOfAnAlreadyRegisteredFirstInstall(t *testing.T) {
 	const program = `C:\portable\hfdesk.exe`
-	refusals := []string{
-		fmt.Sprintf("service: %s is already registered; the first-install action will not change or start it", service.ServiceName),
-		fmt.Sprintf("service: %s appeared during the first installation; no existing registration was changed", service.ServiceName),
+	refusals := []error{
+		fmt.Errorf("service: %s is already registered; the first-install action will not change or start it%w", service.ServiceName, service.ErrAlreadyRegistered),
+		fmt.Errorf("service: %s appeared during the first installation; no existing registration was changed%w", service.ServiceName, service.ErrAlreadyRegistered),
 	}
 
-	for _, message := range refusals {
-		text := serviceActionFailureText(serviceActionInstall, errors.New(message), program)
+	// The marker adds nothing to the message the user reads: the rendered
+	// refusal stays byte-identical to the manager message.
+	for i, want := range []string{
+		"service: %s is already registered; the first-install action will not change or start it",
+		"service: %s appeared during the first installation; no existing registration was changed",
+	} {
+		if got, want := refusals[i].Error(), fmt.Sprintf(want, service.ServiceName); got != want {
+			t.Errorf("the rendered refusal %q is not byte-identical to the manager message %q", got, want)
+		}
+	}
+
+	for _, err := range refusals {
+		message := err.Error()
+		text := serviceActionFailureText(serviceActionInstall, err, program)
 		for _, want := range []string{
 			message,
 			"The service registration already exists, and this attempt did not create, change or start it.",
@@ -309,6 +320,33 @@ func TestServiceActionFailureTextOfAnAlreadyRegisteredFirstInstall(t *testing.T)
 		}
 	}
 
+	// The classification is structural: the marker classifies any wording, so
+	// a reworded refusal still gets the report of an unchanged registration.
+	reworded := fmt.Errorf("the registration of %s already exists%w", service.ServiceName, service.ErrAlreadyRegistered)
+	rewordedText := serviceActionFailureText(serviceActionInstall, reworded, program)
+	for _, want := range []string{
+		reworded.Error(),
+		"did not create, change or start it",
+		`"hfdesk service update"`,
+	} {
+		if !strings.Contains(rewordedText, want) {
+			t.Errorf("the report %q does not mention %q", rewordedText, want)
+		}
+	}
+	for _, unwanted := range []string{"A registration may remain", `"hfdesk service uninstall"`} {
+		if strings.Contains(rewordedText, unwanted) {
+			t.Errorf("the report %q of a reworded refusal carries %q although this attempt changed no registration", rewordedText, unwanted)
+		}
+	}
+
+	// The text markers are gone: the same clause without the marker no longer
+	// classifies, so a wording match cannot creep back unnoticed.
+	unmarked := serviceActionFailureText(serviceActionInstall,
+		errors.New("service: hfdesk is already registered; the first-install action will not change or start it"), program)
+	if !strings.Contains(unmarked, "A registration may remain.") {
+		t.Errorf("the report %q of an unmarked error swallowed the class of a failure that may have written a registration", unmarked)
+	}
+
 	// A failure of the installation that is not this refusal keeps the
 	// wording of a report that may have written a registration: the class
 	// above must not swallow it.
@@ -318,6 +356,12 @@ func TestServiceActionFailureTextOfAnAlreadyRegisteredFirstInstall(t *testing.T)
 		if !strings.Contains(generic, want) {
 			t.Errorf("the generic report %q does not mention %q", generic, want)
 		}
+	}
+
+	// A report without an error never classifies as a refusal: errors.Is on a
+	// nil error must keep the guard the old matcher had explicitly.
+	if isAlreadyRegisteredRefusal(nil) {
+		t.Error("a nil error was classified as a first-install refusal")
 	}
 }
 

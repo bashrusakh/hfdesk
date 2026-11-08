@@ -145,8 +145,8 @@ func runServiceAction(action serviceAction, version string, reporter *serviceAct
 // the console program next to the helper: no field is named. A registration
 // that already exists is refused by this first-install action instead of being
 // merged with: it is left untouched and reported as a conflict.
-// The installation never starts an instance itself, so the start is a separate
-// step; a service that cannot be started is reported as a failure of the
+// The installation starts its first instance itself, in the same action; a
+// service that cannot be started is reported as a failure of the
 // installation instead of leaving a registered instance that serves nothing.
 //
 // A failed first installation must not trap the user: the service gate ends
