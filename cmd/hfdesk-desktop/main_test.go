@@ -3,7 +3,10 @@
 
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseServiceHelperCommandSeparatesHostAndHelperArguments(t *testing.T) {
 	helper, handled, err := parseServiceHelperCommand([]string{
@@ -34,6 +37,71 @@ func TestParseServiceHelperCommandRejectsPartialHelperArguments(t *testing.T) {
 	} {
 		if _, handled, err := parseServiceHelperCommand(args); !handled || err == nil {
 			t.Errorf("parseServiceHelperCommand(%q) returned handled=%t, err=%v; want a rejected helper invocation", args, handled, err)
+		}
+	}
+}
+
+// TestParseServiceHelperCommandRejectsUnconsumedArguments proves the helper is
+// fail-closed on stray positional values: flag parsing stops at the first one,
+// so a value before --wait-pid would otherwise silently drop the wait and the
+// helper could run its action without the evidence the flags name. Both the
+// stray value before a flag and the values after "--" are rejected by name.
+func TestParseServiceHelperCommandRejectsUnconsumedArguments(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{
+			args: []string{"--service-action", "install", "stray", "--wait-pid", "4321"},
+			want: "stray",
+		},
+		{
+			args: []string{
+				"--service-action", "install", "--wait-pid", "4321",
+				"--handover-ready-event", `Local\ready`,
+				"--handover-success-event", `Local\success`,
+				"--instance-mutex", `Local\m`, "stray",
+			},
+			want: "stray",
+		},
+		{
+			args: []string{"--service-action", "update", "--", "--instance-mutex", `Local\m`},
+			want: "--instance-mutex",
+		},
+	} {
+		_, handled, err := parseServiceHelperCommand(tc.args)
+		if !handled || err == nil {
+			t.Errorf("parseServiceHelperCommand(%q) returned handled=%t, err=%v; want a rejected helper invocation",
+				tc.args, handled, err)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "was not consumed") {
+			t.Errorf("the error %q does not name the unconsumed arguments %q", err, tc.want)
+		}
+	}
+}
+
+// TestParseServiceHelperCommandAcceptsTheLegitimateInvocations keeps the
+// supported helper command lines green: the full install handover, the
+// ordinary flagless actions and the update that carries only the singleton.
+func TestParseServiceHelperCommandAcceptsTheLegitimateInvocations(t *testing.T) {
+	for _, args := range [][]string{
+		{"--service-action", "install", "--wait-pid", "4321",
+			"--handover-ready-event", `Local\ready`,
+			"--handover-success-event", `Local\success`,
+			"--instance-mutex", `Local\HFDesk.Desktop.sid.1`},
+		{"--service-action", "update"},
+		{"--service-action", "start"},
+		{"--service-action", "update", "--instance-mutex", `Local\HFDesk.Desktop.sid.1`},
+	} {
+		helper, handled, err := parseServiceHelperCommand(args)
+		if !handled || err != nil {
+			t.Errorf("parseServiceHelperCommand(%q) returned handled=%t, err=%v; want the accepted invocation",
+				args, handled, err)
+			continue
+		}
+		if helper.Action == "" {
+			t.Errorf("parseServiceHelperCommand(%q) named no action", args)
 		}
 	}
 }

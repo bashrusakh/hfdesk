@@ -144,6 +144,16 @@ func parseServiceHelperCommand(args []string) (desktop.ServiceActionOptions, boo
 	if err != nil {
 		return helper, true, err
 	}
+	// A value that is not a flag ends flag parsing, so every flag after it
+	// stays unconsumed: a helper that ran on silently dropped arguments
+	// could perform its service action without the evidence those flags
+	// name — for example without waiting for the desktop exit — so the
+	// invocation is rejected instead, naming what was left behind.
+	if flags.NArg() != 0 {
+		return helper, true, fmt.Errorf(
+			"the service helper arguments are not all flags: %s was not consumed, and a value that is not a flag ends flag parsing, so the flags after it are ignored",
+			strings.Join(flags.Args(), " "))
+	}
 	if strings.TrimSpace(action) == "" {
 		return helper, true, errors.New("the service helper arguments do not name an action")
 	}
