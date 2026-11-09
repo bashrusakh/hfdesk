@@ -1633,6 +1633,7 @@ type systemdLoadedDriftFields struct {
 	user                string
 	group               string
 	supplementaryGroups []string
+	environmentFiles    []systemdEnvironmentFile
 }
 
 // TestSystemdUpdateVerifiesThePreservedAndRequestedFields pins every
@@ -1670,6 +1671,13 @@ func TestSystemdUpdateVerifiesThePreservedAndRequestedFields(t *testing.T) {
 			cause: "systemd did not preserve the loaded supplementary groups",
 			drift: func(d *systemdLoadedDriftFields) {
 				d.supplementaryGroups = []string{"operator"}
+			},
+		},
+		{
+			name:  "the loaded environment files must be preserved",
+			cause: "systemd did not preserve the loaded environment and environment files",
+			drift: func(d *systemdLoadedDriftFields) {
+				d.environmentFiles = []systemdEnvironmentFile{{Path: "/operator/drifted.env"}}
 			},
 		},
 		{
@@ -1722,7 +1730,7 @@ func TestSystemdUpdateVerifiesThePreservedAndRequestedFields(t *testing.T) {
 			drift := systemdLoadedDriftFields{workingDirectory: previous.Paths.StateDir}
 			tc.drift(&drift)
 			driftedProperties := systemdTypedProperties(written.Executable, writtenArgv,
-				[]string{"HOME=" + home}, drift.workingDirectory, drift.user, drift.group, nil)
+				[]string{"HOME=" + home}, drift.workingDirectory, drift.user, drift.group, drift.environmentFiles)
 			driftedProperties["SupplementaryGroups"] = dbus.MakeVariant(drift.supplementaryGroups)
 			setSystemdTypedPropertySequence(t, m, oldProperties, driftedProperties, oldProperties)
 			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
@@ -1749,6 +1757,116 @@ func TestSystemdUpdateVerifiesThePreservedAndRequestedFields(t *testing.T) {
 			}
 			if string(content) != previousUnit {
 				t.Errorf("the unit file was not restored:\n%s\nwant\n%s", content, previousUnit)
+			}
+			if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 0 {
+				t.Errorf("the failed update restarted the stopped unit %d times:\n%s", got, strings.Join(systemdSupervisorCalls(t, logPath), "\n"))
+			}
+		})
+	}
+}
+
+// TestSystemdUpdateFailsClosedOnAnUnconfirmableSupplementaryGroupsSnapshot
+// pins the fail-closed rule of the supplementary-groups preservation: the
+// snapshot established the groups (a real list or the established empty
+// one), the typed answer after the write omits the property, and the
+// verification must fail with the established cause and the honest rollback
+// report instead of reading the gap as "no drift to check". When the
+// snapshot itself never carried the optional, no strictness is added: the
+// absent optional stays absent and the update succeeds.
+//
+// Every case discriminates: with the pre-fix condition (both answers known)
+// the incomplete answer skipped the check and rows 1 and 2 succeeded end to
+// end, and a symmetric "both answers must be present" rule refused row 3.
+func TestSystemdUpdateFailsClosedOnAnUnconfirmableSupplementaryGroupsSnapshot(t *testing.T) {
+	cases := []struct {
+		name       string
+		snapshot   func(map[string]dbus.Variant)
+		omitAnswer bool
+		cause      string // empty: the update must succeed
+	}{
+		{
+			name: "the snapshot expected groups the incomplete answer cannot confirm",
+			snapshot: func(properties map[string]dbus.Variant) {
+				properties["SupplementaryGroups"] = dbus.MakeVariant([]string{"operator"})
+			},
+			omitAnswer: true,
+			cause:      "systemd did not preserve the loaded supplementary groups",
+		},
+		{
+			name:       "the snapshot established an empty list the incomplete answer cannot confirm",
+			omitAnswer: true,
+			cause:      "systemd did not preserve the loaded supplementary groups",
+		},
+		{
+			name: "an absent snapshot optional stays absent",
+			snapshot: func(properties map[string]dbus.Variant) {
+				delete(properties, "SupplementaryGroups")
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := systemdRecordingSupervisor(t)
+			root := t.TempDir()
+			oldExecutable := systemdTestExecutable(t)
+			newExecutable := systemdTestExecutable(t)
+			previous := systemdExistingOptions(t, oldExecutable, root)
+			m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+
+			requested := DefaultInstallOptions(ScopeUser, newExecutable)
+			// The write is the canonical rendering of the merged facts,
+			// the same merge the installation performs over the
+			// canonical registration on disk.
+			written := mergeInstallOptions(requested, previous, true)
+			writtenArgv := append([]string{written.Executable}, RunArgs(written)...)
+			home, homeErr := unitHomeDir(previous)
+			if homeErr != nil {
+				t.Fatalf("unitHomeDir() = %v, want nil", homeErr)
+			}
+
+			oldProperties := systemdTestPropertiesFromUnit(previousUnit)
+			if tc.snapshot != nil {
+				tc.snapshot(oldProperties)
+			}
+			answeredProperties := systemdTypedProperties(written.Executable, writtenArgv,
+				[]string{"HOME=" + home}, previous.Paths.StateDir, "", "", nil)
+			if tc.omitAnswer {
+				delete(answeredProperties, "SupplementaryGroups")
+			}
+			setSystemdTypedPropertySequence(t, m, oldProperties, answeredProperties, oldProperties)
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+
+			_, err := m.Install(context.Background(), requested)
+			if tc.cause == "" {
+				if err != nil {
+					t.Fatalf("Install() = %v, want the absent snapshot optional to stay unchecked", err)
+				}
+				content, readErr := os.ReadFile(unitPath)
+				if readErr != nil || string(content) == previousUnit || parseUnit(string(content)).Program != newExecutable {
+					t.Errorf("the updated unit (error %v) =\n%s\nwant the canonical write of %s", readErr, content, newExecutable)
+				}
+				if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 0 {
+					t.Errorf("the stopped unit was restarted %d times:\n%s", got, strings.Join(systemdSupervisorCalls(t, logPath), "\n"))
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Install() = nil, want the verification failure %q", tc.cause)
+			}
+			for _, want := range []string{
+				tc.cause,
+				"the previous registration and captured loaded command/launch settings were restored",
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Install() = %q, want an error that mentions %q", err, want)
+				}
+			}
+			if strings.Contains(err.Error(), "started again") {
+				t.Errorf("Install() = %q, must not claim a restarted instance of a stopped update", err)
+			}
+			content, readErr := os.ReadFile(unitPath)
+			if readErr != nil || string(content) != previousUnit {
+				t.Errorf("the unit file was not restored (error %v):\n%s\nwant\n%s", readErr, content, previousUnit)
 			}
 			if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 0 {
 				t.Errorf("the failed update restarted the stopped unit %d times:\n%s", got, strings.Join(systemdSupervisorCalls(t, logPath), "\n"))

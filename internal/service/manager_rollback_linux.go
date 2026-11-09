@@ -22,10 +22,11 @@ import (
 // ExecStart is the strict-owned field: what the supervisor loads must be the
 // canonical command that was just written, typed property by typed
 // property. Every other launch field is preserved: WorkingDirectory, User,
-// Group, the environment and the environment files must equal their
-// pre-update snapshot unless the matching request flag was named — an
-// administrator drop-in layer therefore survives the write byte for byte in
-// its effective value, while a named flag is held to the value it asked for.
+// Group, the supplementary groups, the environment and the environment
+// files must equal their pre-update snapshot unless the matching request
+// flag was named — an administrator drop-in layer therefore survives the
+// write byte for byte in its effective value, while a named flag is held to
+// the value it asked for.
 func (m *systemdManager) verifyUpdatedUnit(ctx context.Context, opts InstallOptions, account *user.User, previous previousRegistration, written canonicalUnit) error {
 	loaded, err := m.registrationUnitConfig(ctx)
 	if err != nil {
@@ -40,7 +41,9 @@ func (m *systemdManager) verifyUpdatedUnit(ctx context.Context, opts InstallOpti
 	if !slices.Equal(loaded.environment, previous.loaded.environment) || !slices.Equal(loaded.environmentFiles, previous.loaded.environmentFiles) {
 		return errors.New("service: systemd did not preserve the loaded environment and environment files")
 	}
-	if previous.loaded.supplementaryGroupsKnown && loaded.supplementaryGroupsKnown && !slices.Equal(loaded.supplementaryGroups, previous.loaded.supplementaryGroups) {
+	// The snapshot established the groups, so an answer after the write
+	// that cannot confirm them fails closed instead of passing as no drift.
+	if previous.loaded.supplementaryGroupsKnown && (!loaded.supplementaryGroupsKnown || !slices.Equal(loaded.supplementaryGroups, previous.loaded.supplementaryGroups)) {
 		return errors.New("service: systemd did not preserve the loaded supplementary groups")
 	}
 	if !opts.Explicit.StateDir && loaded.workingDirectory != previous.loaded.workingDirectory {
