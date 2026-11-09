@@ -159,6 +159,11 @@ func TestRenderPlistForTheSystemScope(t *testing.T) {
 	if registration.GroupName != account.Group {
 		t.Errorf("GroupName = %q, want the primary group %q of the service account", registration.GroupName, account.Group)
 	}
+	// The account of the registration is the account an update that names
+	// none keeps.
+	if opts := registration.registrationOptions(ScopeSystem); opts.ServiceUser != account.Name {
+		t.Errorf("the service account of the registration = %q, want %q", opts.ServiceUser, account.Name)
+	}
 
 	// The machine-wide instance never reuses the home directory of the user
 	// who runs the install command.
@@ -971,6 +976,10 @@ func TestLaunchdLifecycle(t *testing.T) {
 		Scope:      ScopeUser,
 		Executable: darwinWriteFakeExecutable(t),
 		Listen:     DefaultListen,
+		// The test names the values it asserts below, so the merge of
+		// a registration this machine may already have cannot change
+		// them: an update keeps every field the request does not name.
+		Explicit: InstallFieldSet{Listen: true, Config: true, StateDir: true, LogDir: true},
 		Paths: runtimepaths.Paths{
 			ConfigFile: filepath.Join(stateDir, "hfdesk.json"),
 			StateDir:   stateDir,
@@ -1045,13 +1054,15 @@ func TestLaunchdLifecycle(t *testing.T) {
 	}
 
 	// The installation of a second time does not fail and does not create a
-	// second registration.
+	// second registration. The instance ran before it, so the update
+	// restarts it on the registration: the test waits for it to run again,
+	// exactly like after the first installation.
 	if _, err := launchd.Install(ctx, opts); err != nil {
 		t.Fatalf("Install() a second time: %v", err)
 	}
-	status, err = launchd.Status(ctx)
-	if err != nil {
-		t.Fatalf("Status(): %v", err)
+	status, running = darwinWaitForRunning(t, launchd, 15*time.Second)
+	if !running {
+		t.Fatalf("the instance does not run after the second installation: %s", status.Detail)
 	}
 	if status.State != StateRunning {
 		t.Errorf("the state after the second installation = %q, want %q", status.State, StateRunning)
@@ -1478,6 +1489,13 @@ func TestLaunchdSystemInstallRefusesAMissingServiceAccount(t *testing.T) {
 	if err != nil {
 		t.Logf("the registration %q cannot be read: %v", path, err)
 		before = &plistBackup{path: path}
+	}
+	if before.existed {
+		// An update merges with the registration of the machine, so
+		// the options of the test decide the outcome only when the
+		// machine has no registration: a registration of the machine
+		// is never touched by the test.
+		t.Skipf("the machine has a registration at %q: the test does not touch it", path)
 	}
 
 	opts := InstallOptions{
@@ -2032,6 +2050,13 @@ func TestLaunchdSystemInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T)
 	launchd, ok := manager.(*launchdManager)
 	if !ok {
 		t.Fatalf("newPlatformManager(ScopeSystem) = %T, want a launchd manager", manager)
+	}
+	// An update merges with the registration of the machine, so the
+	// options of the test decide the outcome only when the machine has no
+	// registration: a registration of the machine is never touched by the
+	// test.
+	if backup, err := backupPlist(launchd.plistPath()); err == nil && backup.existed {
+		t.Skipf("the machine has a registration at %q: the test does not touch it", launchd.plistPath())
 	}
 
 	stateDir := filepath.Join(root, "state")
@@ -3774,6 +3799,64 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
 		}
 	})
+
+	t.Run("a registration that ran with RunAtLoad false is started again", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{loaded: true, running: true, pid: darwinFakePID}
+		launchd.run = fake.run
+
+		// The restored registration carries RunAtLoad false — the
+		// value an update preserves — so the bootstrap of the rollback
+		// loads it but never starts it: the rollback has to start it
+		// explicitly for the instance to run like it did before.
+		restored, err := renderPlistWithRunAtLoad(darwinTempInstallOptions(t, t.TempDir()), nil, false)
+		if err != nil {
+			t.Fatalf("renderPlistWithRunAtLoad(): %v", err)
+		}
+		path := launchd.plistPath()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("create the registration directory: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(restored), plistMode); err != nil {
+			t.Fatalf("write the registration: %v", err)
+		}
+		backup, err := backupPlist(path)
+		if err != nil {
+			t.Fatalf("backupPlist(): %v", err)
+		}
+		// The installation wrote another registration and failed.
+		if err := os.WriteFile(path, []byte("<plist>the registration of the failed installation</plist>"), plistMode); err != nil {
+			t.Fatalf("write the registration of the failed installation: %v", err)
+		}
+
+		cause := errors.New("service: bootstrap " + launchd.target() + ": exit status 1")
+		state := launchdLoadState{
+			previous:     launchdSupervisorState{loaded: true, running: true},
+			bootstrapped: true,
+			replaced:     true,
+		}
+		if err := launchd.rollback(context.Background(), backup, state, cause); !errors.Is(err, cause) {
+			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
+		}
+
+		want := []string{
+			"bootout " + launchd.target(),
+			"bootstrap " + launchd.domain() + " " + path,
+			"kickstart " + launchd.target(),
+			"enable " + launchd.target(),
+		}
+		if !reflect.DeepEqual(fake.commands, want) {
+			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
+		}
+		// The restored bytes are on disk again.
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read the registration: %v", err)
+		}
+		if string(content) != restored {
+			t.Errorf("the restored registration = %q, want %q", content, restored)
+		}
+	})
 }
 
 // TestLaunchdDisabledLabel checks the reading of the database of the
@@ -3810,5 +3893,395 @@ func TestLaunchdDisabledLabel(t *testing.T) {
 				t.Errorf("launchdDisabledLabel() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// darwinReadRegistration parses the property list of the registration of the
+// manager.
+func darwinReadRegistration(t *testing.T, launchd *launchdManager) plistRegistration {
+	t.Helper()
+	content, err := os.ReadFile(launchd.plistPath())
+	if err != nil {
+		t.Fatalf("read the registration: %v", err)
+	}
+	registration, err := parsePlist(content)
+	if err != nil {
+		t.Fatalf("parse the registration: %v", err)
+	}
+	return registration
+}
+
+// darwinWriteRegistrationWithRunAtLoad writes the property list of an
+// installation with the given autostart value as the registration of the
+// manager.
+func darwinWriteRegistrationWithRunAtLoad(t *testing.T, launchd *launchdManager, opts InstallOptions, runAtLoad bool) {
+	t.Helper()
+	content, err := renderPlistWithRunAtLoad(opts, nil, runAtLoad)
+	if err != nil {
+		t.Fatalf("renderPlistWithRunAtLoad(): %v", err)
+	}
+	path := launchd.plistPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create the registration directory: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), plistMode); err != nil {
+		t.Fatalf("write the property list: %v", err)
+	}
+}
+
+// TestLaunchdRepeatInstallKeepsTheSettingsTheRequestDoesNotName checks the
+// merge of a repeat installation and the stopped state it preserves.
+//
+// The second installation names the bind address and the program only: every
+// other setting — the runtime paths and the cache layout — has to stay the
+// one the instance runs with, although the second request carries its own
+// values for all of them. The stopped instance must not be started by the
+// update, and the options the summary reports are the merged ones.
+func TestLaunchdRepeatInstallKeepsTheSettingsTheRequestDoesNotName(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{}
+	launchd.run = fake.run
+	ctx := context.Background()
+
+	// The first installation registers a custom layout.
+	first := darwinTempInstallOptions(t, t.TempDir())
+	first.Listen = "127.0.0.1:9090"
+	first.Explicit.Listen = true
+	first.CacheDir = filepath.Join(t.TempDir(), "cache")
+	first.HubDir = filepath.Join(first.CacheDir, "hub")
+	first.LocalDir = filepath.Join(t.TempDir(), "models")
+	if _, err := launchd.Install(ctx, first); err != nil {
+		t.Fatalf("Install(): %v", err)
+	}
+	// The instance stops again, so the update below is an update over a
+	// stopped registration.
+	if err := launchd.Stop(ctx); err != nil {
+		t.Fatalf("Stop(): %v", err)
+	}
+
+	// The second installation names the bind address and the program only.
+	// Its own values for the paths and the cache layout are request
+	// defaults and must not replace the settings of the registration.
+	second := darwinTempInstallOptions(t, t.TempDir())
+	second.Listen = "127.0.0.1:9911"
+	second.Explicit.Listen = true
+	second.CacheDir = filepath.Join(t.TempDir(), "cache")
+	second.HubDir = filepath.Join(second.CacheDir, "hub")
+	second.LocalDir = filepath.Join(t.TempDir(), "models")
+
+	fake.commands = nil
+	effective, err := launchd.Install(ctx, second)
+	if err != nil {
+		t.Fatalf("Install() a second time: %v", err)
+	}
+
+	registration := darwinReadRegistration(t, launchd)
+	// The named fields changed: the bind address and the program.
+	if registration.listen() != second.Listen {
+		t.Errorf("the listen address = %q, want the named %q", registration.listen(), second.Listen)
+	}
+	if registration.executable() != second.Executable {
+		t.Errorf("the executable = %q, want the request %q", registration.executable(), second.Executable)
+	}
+	// Everything the request did not name stayed the setting of the
+	// registration.
+	if registration.paths().ConfigFile != first.Paths.ConfigFile {
+		t.Errorf("the config file = %q, want the registered %q", registration.paths().ConfigFile, first.Paths.ConfigFile)
+	}
+	if registration.paths().StateDir != first.Paths.StateDir {
+		t.Errorf("the state dir = %q, want the registered %q", registration.paths().StateDir, first.Paths.StateDir)
+	}
+	if registration.paths().LogDir != first.Paths.LogDir {
+		t.Errorf("the log dir = %q, want the registered %q", registration.paths().LogDir, first.Paths.LogDir)
+	}
+	if registration.cacheDir() != first.CacheDir {
+		t.Errorf("the cache dir = %q, want the registered %q", registration.cacheDir(), first.CacheDir)
+	}
+	if registration.argumentValue("--hub-dir") != first.HubDir {
+		t.Errorf("the hub dir = %q, want the registered %q", registration.argumentValue("--hub-dir"), first.HubDir)
+	}
+	if registration.argumentValue("--local-dir") != first.LocalDir {
+		t.Errorf("the local dir = %q, want the registered %q", registration.argumentValue("--local-dir"), first.LocalDir)
+	}
+	// The effective options the summary reports are the merged ones.
+	if effective.Listen != second.Listen {
+		t.Errorf("the effective listen address = %q, want %q", effective.Listen, second.Listen)
+	}
+	if effective.Executable != second.Executable {
+		t.Errorf("the effective executable = %q, want %q", effective.Executable, second.Executable)
+	}
+	if effective.Paths.StateDir != first.Paths.StateDir {
+		t.Errorf("the effective state dir = %q, want the registered %q", effective.Paths.StateDir, first.Paths.StateDir)
+	}
+	if effective.CacheDir != first.CacheDir {
+		t.Errorf("the effective cache dir = %q, want the registered %q", effective.CacheDir, first.CacheDir)
+	}
+	if effective.LocalDir != first.LocalDir {
+		t.Errorf("the effective local dir = %q, want the registered %q", effective.LocalDir, first.LocalDir)
+	}
+	// The stopped instance stays stopped: the update reads the state of
+	// the registration and touches the supervisor nowhere else — no
+	// bootstrap and no kickstart can start the job.
+	want := []string{
+		"print " + launchd.target(),
+		"print-disabled " + launchd.domain(),
+	}
+	if !reflect.DeepEqual(fake.commands, want) {
+		t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
+	}
+	if fake.running {
+		t.Error("the update started the stopped instance")
+	}
+}
+
+// TestLaunchdRepeatInstallKeepsRunAtLoadAndAStoppedInstance checks the two
+// preservation rules of an update over a registration that is loaded but
+// does not run: the autostart key keeps the value the property list carries,
+// and the stale registration is unloaded without loading the new file, so
+// nothing starts.
+//
+// The registration carries RunAtLoad false — the value a first installation
+// never writes — so both rules discriminate: an update that renders the
+// default again writes <true/>, and an update that registers the new file
+// starts the job.
+func TestLaunchdRepeatInstallKeepsRunAtLoadAndAStoppedInstance(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	// The job is loaded but does not run: the state of an instance whose
+	// process exited while the registration stayed loaded.
+	fake := &darwinFakeLaunchd{loaded: true}
+	launchd.run = fake.run
+	ctx := context.Background()
+
+	darwinWriteRegistrationWithRunAtLoad(t, launchd, darwinTempInstallOptions(t, t.TempDir()), false)
+
+	// The update names the bind address only.
+	second := darwinTempInstallOptions(t, t.TempDir())
+	second.Listen = "127.0.0.1:9911"
+	second.Explicit.Listen = true
+	// The registration carries no cache root and no output directory:
+	// their absence is a setting of its own, and the values the second
+	// request carries must not fill it in.
+	second.CacheDir = filepath.Join(t.TempDir(), "cache")
+	second.LocalDir = filepath.Join(t.TempDir(), "models")
+	fake.commands = nil
+	if _, err := launchd.Install(ctx, second); err != nil {
+		t.Fatalf("Install() over a stopped instance: %v", err)
+	}
+
+	registration := darwinReadRegistration(t, launchd)
+	if registration.RunAtLoad {
+		t.Error("RunAtLoad = true, want the found value false of the existing registration")
+	}
+	if registration.listen() != second.Listen {
+		t.Errorf("the listen address = %q, want the named %q", registration.listen(), second.Listen)
+	}
+	if registration.cacheDir() != "" {
+		t.Errorf("the cache dir = %q, want the registered absence \"\"", registration.cacheDir())
+	}
+	if registration.argumentValue("--local-dir") != "" {
+		t.Errorf("the local dir = %q, want the registered absence \"\"", registration.argumentValue("--local-dir"))
+	}
+	// The stale registration is unloaded and the new file is not loaded:
+	// the stopped instance stays stopped, and a later start loads the
+	// property list this update wrote.
+	want := []string{
+		"print " + launchd.target(),
+		"print-disabled " + launchd.domain(),
+		"bootout " + launchd.target(),
+	}
+	if !reflect.DeepEqual(fake.commands, want) {
+		t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
+	}
+	if fake.running {
+		t.Error("the update started the stopped instance")
+	}
+	if fake.loaded {
+		t.Error("the stale registration is still loaded after the update")
+	}
+}
+
+// TestLaunchdRepeatInstallRestartsARunningInstance checks that an update of
+// a running instance ends with the new registration in service, through the
+// stop/start lifecycle of the manager, whether or not the property list
+// changed.
+//
+// The registration carries RunAtLoad false, so only the explicit start of
+// the lifecycle can bring the new program up: an update that merely
+// re-bootstraps the property list would leave the instance stopped. The
+// first round names nothing — the registration bytes do not change — and the
+// second round names the new program.
+func TestLaunchdRepeatInstallRestartsARunningInstance(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{loaded: true, running: true, pid: darwinFakePID}
+	launchd.run = fake.run
+	ctx := context.Background()
+
+	program := darwinTempInstallOptions(t, t.TempDir())
+	darwinWriteRegistrationWithRunAtLoad(t, launchd, program, false)
+
+	// The commands an update of a running instance issues: the state of
+	// the registration is read, the instance is stopped the way a stop
+	// stops it, and the registration is loaded and started the way a start
+	// starts it.
+	restart := []string{
+		"print " + launchd.target(),
+		"print-disabled " + launchd.domain(),
+		"print " + launchd.target(),
+		"kill SIGTERM " + launchd.target(),
+		"print " + launchd.target(),
+		"bootout " + launchd.target(),
+		"print " + launchd.target(),
+		"bootstrap " + launchd.domain() + " " + launchd.plistPath(),
+		"kickstart " + launchd.target(),
+		"enable " + launchd.target(),
+	}
+
+	// The update names nothing: the registration bytes do not change, and
+	// the running instance still has to end up running the registered
+	// program.
+	fake.commands = nil
+	if _, err := launchd.Install(ctx, program); err != nil {
+		t.Fatalf("Install() over a running instance: %v", err)
+	}
+	if !reflect.DeepEqual(fake.commands, restart) {
+		t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, restart)
+	}
+	if !fake.running {
+		t.Error("the instance does not run after the update")
+	}
+	registration := darwinReadRegistration(t, launchd)
+	if registration.RunAtLoad {
+		t.Error("RunAtLoad = true, want the found value false of the existing registration")
+	}
+
+	// The update names the new program: the registration carries it and
+	// the instance runs it.
+	next := darwinTempInstallOptions(t, t.TempDir())
+	fake.commands = nil
+	if _, err := launchd.Install(ctx, next); err != nil {
+		t.Fatalf("Install() with a new program over a running instance: %v", err)
+	}
+	if !reflect.DeepEqual(fake.commands, restart) {
+		t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, restart)
+	}
+	if !fake.running {
+		t.Error("the instance does not run on the new program after the update")
+	}
+	registration = darwinReadRegistration(t, launchd)
+	if registration.executable() != next.Executable {
+		t.Errorf("the executable = %q, want the request %q", registration.executable(), next.Executable)
+	}
+}
+
+// TestLaunchdRepeatInstallKeepsTheDataDirectories checks that an update never
+// touches the data of the instance: the cache tree and the files inside the
+// state directory survive both installations, in content and in ownership.
+//
+// The cache tree is a directory the instance named, not one the installation
+// creates: the installation never creates it, never writes into it and never
+// changes its ownership.
+func TestLaunchdRepeatInstallKeepsTheDataDirectories(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{}
+	launchd.run = fake.run
+	ctx := context.Background()
+
+	root := t.TempDir()
+	opts := darwinTempInstallOptions(t, root)
+	opts.CacheDir = filepath.Join(root, "cache")
+	opts.HubDir = filepath.Join(opts.CacheDir, "hub")
+	opts.LocalDir = filepath.Join(root, "models")
+	// The data of the instance exists before the installations: the local
+	// directory holds a model, the state directory holds the history.
+	if err := os.MkdirAll(opts.LocalDir, 0o755); err != nil {
+		t.Fatalf("create the local directory: %v", err)
+	}
+	model := filepath.Join(opts.LocalDir, "model.gguf")
+	if err := os.WriteFile(model, []byte("model bytes"), 0o644); err != nil {
+		t.Fatalf("write the model: %v", err)
+	}
+	cacheOwner, cacheGroup := darwinOwner(t, opts.LocalDir)
+
+	if _, err := launchd.Install(ctx, opts); err != nil {
+		t.Fatalf("Install(): %v", err)
+	}
+	history := filepath.Join(opts.Paths.StateDir, "history.json")
+	if err := os.WriteFile(history, []byte(`[{"id":"kept"}]`), 0o600); err != nil {
+		t.Fatalf("write the history: %v", err)
+	}
+
+	// The update names the bind address only.
+	update := opts
+	update.Listen = "127.0.0.1:9911"
+	update.Explicit.Listen = true
+	if _, err := launchd.Install(ctx, update); err != nil {
+		t.Fatalf("Install() a second time: %v", err)
+	}
+
+	content, err := os.ReadFile(model)
+	if err != nil {
+		t.Errorf("the model is gone after the update: %v", err)
+	} else if string(content) != "model bytes" {
+		t.Errorf("the model holds %q, want the bytes it had", content)
+	}
+	historyContent, err := os.ReadFile(history)
+	if err != nil {
+		t.Errorf("the history is gone after the update: %v", err)
+	} else if string(historyContent) != `[{"id":"kept"}]` {
+		t.Errorf("the history holds %q, want the records it had", historyContent)
+	}
+	if owner, group := darwinOwner(t, opts.LocalDir); owner != cacheOwner || group != cacheGroup {
+		t.Errorf("the owner of the local directory = %d:%d, want %d:%d", owner, group, cacheOwner, cacheGroup)
+	}
+	// The registration still names the data directories of the instance.
+	registration := darwinReadRegistration(t, launchd)
+	if registration.cacheDir() != opts.CacheDir {
+		t.Errorf("the cache dir = %q, want %q", registration.cacheDir(), opts.CacheDir)
+	}
+	if registration.argumentValue("--local-dir") != opts.LocalDir {
+		t.Errorf("the local dir = %q, want %q", registration.argumentValue("--local-dir"), opts.LocalDir)
+	}
+}
+
+// TestLaunchdRepeatInstallOverADamagedRegistrationAppliesTheRequest checks
+// that an installation over a property list it cannot read repairs the
+// registration instead of failing over it: no setting of an unreadable file
+// is merged in, the request decides everything and the default autostart is
+// written.
+func TestLaunchdRepeatInstallOverADamagedRegistrationAppliesTheRequest(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{}
+	launchd.run = fake.run
+	ctx := context.Background()
+
+	// A property list no parser can read.
+	path := launchd.plistPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create the registration directory: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("<plist><dict><key>Label</key>"), plistMode); err != nil {
+		t.Fatalf("write the damaged registration: %v", err)
+	}
+
+	request := darwinTempInstallOptions(t, t.TempDir())
+	request.CacheDir = filepath.Join(t.TempDir(), "cache")
+	request.HubDir = filepath.Join(request.CacheDir, "hub")
+	request.LocalDir = filepath.Join(t.TempDir(), "models")
+	if _, err := launchd.Install(ctx, request); err != nil {
+		t.Fatalf("Install() over a damaged registration: %v", err)
+	}
+
+	registration := darwinReadRegistration(t, launchd)
+	if registration.executable() != request.Executable {
+		t.Errorf("the executable = %q, want the request %q", registration.executable(), request.Executable)
+	}
+	if registration.paths().StateDir != request.Paths.StateDir {
+		t.Errorf("the state dir = %q, want the request %q", registration.paths().StateDir, request.Paths.StateDir)
+	}
+	if registration.cacheDir() != request.CacheDir {
+		t.Errorf("the cache dir = %q, want the request %q", registration.cacheDir(), request.CacheDir)
+	}
+	if !registration.RunAtLoad {
+		t.Error("RunAtLoad = false, want the default true of the rewrite")
 	}
 }

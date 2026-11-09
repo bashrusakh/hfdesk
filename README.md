@@ -274,16 +274,20 @@ hfdesk service status
 Service mode binds loopback by default (`127.0.0.1:8080`). Exposing the
 dashboard to the network needs an explicit `--listen 0.0.0.0:8080`.
 
-On Windows and Linux, `service install` over an existing registration keeps the
+On every platform, `service install` over an existing registration keeps the
 settings the command does not name again and the autostart state the
 registration already has — an enabled systemd unit stays enabled, a disabled
-one is not enabled again, a masked one refuses the installation, and a Windows
-start type and delayed-auto-start flag are written back as they are — and
-applies an update to a running instance, which is restarted on the new program;
-a stopped service stays stopped. On Linux the update applies only to the unit
-HFDesk owns: a hand-edited unit file, a drop-in that overrides the command and
-a fragment HFDesk did not write each refuse it before anything changes, and
-customizations belong in `hfdesk.service.d/*.conf`, which HFDesk never writes.
+one is not enabled again, a masked one refuses the installation, a Windows
+start type and delayed-auto-start flag are written back as they are, and a
+macOS property list keeps its `RunAtLoad` value — and applies an update to a
+running instance, which is restarted on the new program; a stopped service
+stays stopped. HFDesk owns the registrations it writes: on Linux the update
+applies only to the unit HFDesk owns — a hand-edited unit file, a drop-in that
+overrides the command and a fragment HFDesk did not write each refuse it before
+anything changes, and customizations belong in `hfdesk.service.d/*.conf`,
+which HFDesk never writes — and on macOS a key the HFDesk property list does
+not carry does not survive an update (see
+[docs/SERVICE.md](docs/SERVICE.md)).
 
 See [docs/SERVICE.md](docs/SERVICE.md) for the full reference: scopes, runtime
 paths, credentials, logs, and per-platform notes.

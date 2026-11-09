@@ -295,7 +295,7 @@ directory of the instance is the real log sink on macOS.
 
 | Command | Effect | A service that is not installed |
 |---|---|---|
-| `install` | Registers the service with the supervisor and enables it for the boot of the scope on a **first** installation; a **repeat** installation keeps the autostart state the registration already has — it never runs `enable` at all, so an enabled systemd unit stays enabled, a unit enabled with `systemctl enable --runtime` stays runtime-only instead of being made permanent, and a disabled one stays disabled — while a masked unit (persistent or `--runtime`) refuses the installation, and a Windows registration keeps its start type and its delayed-auto-start flag, while a running Windows service with a disabled start type refuses the installation. A macOS LaunchAgent starts the instance as soon as it is registered (`RunAtLoad`); a systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is updated in place on Windows and Linux — the settings the command does not name again are kept, a running instance is restarted on the new program, and a stopped one stays stopped — and replaced on macOS (see [Upgrades](#upgrades)). | It creates the registration. |
+| `install` | Registers the service with the supervisor and enables it for the boot of the scope on a **first** installation; a **repeat** installation keeps the autostart state the registration already has — it never runs `enable` at all, so an enabled systemd unit stays enabled, a unit enabled with `systemctl enable --runtime` stays runtime-only instead of being made permanent, and a disabled one stays disabled — while a masked unit (persistent or `--runtime`) refuses the installation, and a Windows registration keeps its start type and its delayed-auto-start flag, a macOS registration keeps the `RunAtLoad` value of its property list, while a running Windows service with a disabled start type refuses the installation. A macOS first installation registers the property list with `RunAtLoad`, so launchd starts the instance as soon as it is registered; a repeat installation starts nothing that did not run. A systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is updated in place on every platform — the settings the command does not name again are kept, a running instance is restarted on the new program, and a stopped one stays stopped (see [Upgrades](#upgrades)). | It creates the registration. |
 | `uninstall` | Removes the **registration only**. | Clean success: the registration is already gone. |
 | `start` | Starts the registered service. | **Error** that says the service is not installed. |
 | `stop` | Stops the registered service. | Clean success: there is nothing running to stop. |
@@ -359,9 +359,9 @@ The commands are idempotent where the wanted state is already reached:
 - `start` on a service that already runs succeeds.
 - `stop` on a service that is already stopped succeeds, and so does a `stop` on
   a service that is not installed at all: there is nothing running to stop.
-- `install` over an existing registration updates it in place on Windows and
-  Linux: the settings the command does not name again are kept, and an instance
-  that is not running is not started. On macOS the registration is replaced.
+- `install` over an existing registration updates it in place: the settings
+  the command does not name again are kept, and an instance that is not
+  running is not started.
 
 `start` and `restart` are the two commands that need a registration to work on:
 on a service that is not installed they fail with a readable "not installed"
@@ -634,8 +634,29 @@ confirm.
   `~/Library/LaunchAgents/com.hfdesk.hfdesk.plist`; the system scope is a
   **LaunchDaemon** at `/Library/LaunchDaemons/com.hfdesk.hfdesk.plist`.
 - The registration is managed with `launchctl bootstrap`, `bootout` and
-  `kickstart`. A job that is already loaded is re-bootstrapped so a changed
-  property list takes effect.
+  `kickstart`. A repeat installation updates the property list in place: the
+  registered settings are merged with the request and the autostart key
+  `RunAtLoad` keeps the value the property list carries. An instance that
+  does not run is never loaded or started by the installation — the stale
+  registration is unloaded when it was loaded, and a later start loads the
+  property list the installation wrote — and an instance that runs is
+  restarted on the new registration through the stop/start lifecycle of the
+  manager.
+- **HFDesk owns the property list it writes.** An update re-renders the file
+  from the settings of the registration and preserves them through that
+  merge: the registered program arguments (bind address, runtime paths and
+  cache layout), the working directory, the service account of a
+  machine-wide instance, and the `RunAtLoad` value. A key the HFDesk
+  property list does not carry — a hand-added scheduling key such as
+  `StartCalendarInterval` — does not survive an update, and a hand edit of
+  the policy keys the property list does carry (`KeepAlive`, `ProcessType`,
+  `ExitTimeOut`) is rewritten to HFDesk's rendering. A property list that
+  cannot be read at all records no setting: the installation repairs it
+  from the request instead of failing over it. The launchd override
+  database is not part of the property list: an installation clears the
+  `launchctl disable` flag of a job it loads into the domain, exactly as
+  before, never of a stopped job it leaves unloaded, and clearing the flag
+  starts nothing by itself.
 - The property list holds the label, the program arguments and the environment
   of the instance — no credential.
 - The **macOS CI job** is narrowed to the service package: the launchd
@@ -977,7 +998,7 @@ program is gone as `broken` (see
 
 ### Upgrading to a binary in another folder
 
-On Windows and Linux `install` **updates an existing registration in place**
+On every platform `install` **updates an existing registration in place**
 instead of replacing it, so an upgrade that installs the new release somewhere
 else is one command. It is run from the new binary, or names that program
 explicitly:
@@ -990,11 +1011,11 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
 - **The settings are kept.** Every setting the command does not name again
   stays as the instance runs with it: the bind address, the config file, the
   state and log directory, the cache root, the hub directory, the local output
-  directory and — on a machine-wide Linux instance — the service account. The
-  program of the registration always comes from the request: the invoked binary,
-  or `--executable`. A flag named again changes that setting, and `--cache-dir`
-  without `--hub-dir` moves the hub directory with the cache root, exactly as it
-  does on a first installation.
+  directory and — on a machine-wide Linux or macOS instance — the service
+  account. The program of the registration always comes from the invoked
+  binary or `--executable`. A flag named again changes that setting, and
+  `--cache-dir` without `--hub-dir` moves the hub directory with the cache
+  root, exactly as it does on a first installation.
 - **Native settings are kept too.** On Linux, an update regenerates the unit
   file HFDesk owns as its canonical rendering: the program always comes from
   the request, and a run option, the working directory or the service
@@ -1014,7 +1035,10 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   administrator-owned drop-in or claiming that a shadowed base-file edit took
   effect. On Windows, the
   readable SCM settings
-  that HFDesk does not own are written back with the new command line. The
+  that HFDesk does not own are written back with the new command line. On
+  macOS the property list HFDesk writes is regenerated from the merged
+  registration the same way, and exactly what that preserves is stated under
+  [macOS (launchd)](#macos-launchd). The
   Windows identity remains the fixed `LocalService` account, and an SCM password
   is never copied. An update never changes the account of a registration: one
   whose account was changed away from `NT AUTHORITY\LocalService` — with the
@@ -1037,8 +1061,12 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   being turned into a permanent one. On Windows the start
   type and the delayed-auto-start flag are written back as they are, so a manual
   or a disabled start stays manual or disabled and a delayed automatic start
-  stays delayed. Only a **first** installation enables the registration it
-  writes for the boot of its scope.
+  stays delayed. On macOS the property list keeps the `RunAtLoad` value it
+  carries — a first installation writes the default that starts the instance,
+  a repeat installation keeps the found value — and a job the installation
+  does not load keeps its `launchctl disable` flag untouched, so the override
+  state of a stopped instance survives the update. Only a **first**
+  installation enables the registration it writes for the boot of its scope.
 - **A state the installation cannot update is refused.** A masked systemd unit
   is refused before the unit file is written, whether the mask is persistent or
   was placed at runtime with `systemctl mask --runtime`: a persistent mask is a
@@ -1093,7 +1121,10 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   starting, is stopped and started again on the new program. The update requires
   the supervisor to report it running and the instance to pass readiness;
   program identity is checked separately as far as the platform can observe it.
-  How that is proven differs by platform. On Windows the running process image
+  How that is proven differs by platform. On macOS the restart is the manager's
+  own stop/start lifecycle: the graceful stop completes, launchd loads and
+  starts the new property list, and the report follows what launchd accepted —
+  without the readiness probe. On Windows the running process image
   is compared with the configured program, though Windows can refuse that read
   for a process of another account. In that case the update can still succeed
   only if readiness passes; it reports the running state and configured program
@@ -1165,8 +1196,14 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   directories. The error names the proven outcome in every case, so a failed
   installation never reports success from the registration write alone.
 
-macOS is unchanged: `install` there replaces the registration, so an upgrade on
-macOS stays the stop/replace/start procedure above.
+macOS is updated in place as well now: `install` there merges the request
+with the property list on disk, keeps the settings the command does not name
+again and the `RunAtLoad` value, never starts an instance that was stopped and
+restarts a running one on the new program through the manager's own stop/start
+lifecycle — with the existing verification depth of macOS, which reports the
+registration launchd accepted and does not run the readiness probe of the
+platforms above. The stop/replace/start procedure above therefore stays the
+upgrade path that needs no installation.
 
 The registered path is the **invoked** path, so a stable name keeps its name
 in the registration: a symbolic link `/usr/local/bin/hfdesk` that points at
