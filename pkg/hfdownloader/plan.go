@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"path"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/datasetselection"
+	"github.com/bashrusakh/hfdesk/internal/hubtree"
 )
 
 // unsafeRepoPath reports whether a relative path returned by the repo tree API
@@ -206,7 +208,10 @@ type PlanItem struct {
 // Plan contains the list of files to download.
 type Plan struct {
 	Items  []PlanItem `json:"items"`
-	Commit string     `json:"commit,omitempty"` // The commit resolved from the Hub lookup, else the revision-name fallback; see CommitResolved
+	Commit string     `json:"commit,omitempty"` // Commit hash for this plan (for HF cache snapshots)
+	// CommitPinned is true only when Commit is a resolved immutable revision.
+	// Resume requires pinned identities in both the record and current plan.
+	CommitPinned bool `json:"commit_pinned,omitempty"`
 	// CommitResolved reports whether Commit came from a successful Hub
 	// revision response rather than the job's revision-name fallback. Branch
 	// variants require a resolved commit so their content-addressed blobs and
@@ -255,8 +260,24 @@ func PlanRepo(ctx context.Context, job Job, cfg Settings) (*Plan, error) {
 	return scanRepo(ctx, httpc, cfg.Token, job, cfg)
 }
 
+type planAddressingMode struct {
+	revision string
+	commit   string
+	pinned   bool
+	resolved bool
+}
+
+const (
+	addressingProbeTimeout = 250 * time.Millisecond
+	addressingProbeBudget  = 3 * time.Second
+)
+
 // scanRepo walks the repo tree and builds a download plan.
 func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings) (*Plan, error) {
+	return scanRepoMode(ctx, httpc, token, job, cfg, nil)
+}
+
+func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job, cfg Settings, forced *planAddressingMode) (*Plan, error) {
 	var items []PlanItem
 	seen := make(map[string]struct{})      // ensure each relative path appears once in the plan
 	seenLower := make(map[string]struct{}) // ensure each path appears at most once modulo case
@@ -268,40 +289,62 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	directFilterMatch := false
 	datasetMembershipMatch := false
 
-	repoInfo, err := fetchRepoInfo(ctx, httpc, token, cfg.Endpoint, job)
-	commitSHA := job.Revision
-	commitResolved := false
-	if err != nil {
-		// Fall back to revision name if API call fails (e.g., some mirrors)
-		repoInfo = &RepoInfo{SHA: job.Revision}
-	} else if repoInfo != nil {
-		if repoInfo.SHA != "" {
-			commitSHA = repoInfo.SHA
+	mode := planAddressingMode{revision: job.Revision, commit: job.Revision}
+	custom := isCustomHubEndpoint(cfg.Endpoint)
+	if forced != nil {
+		mode = *forced
+	} else {
+		// REQUIRED metadata: one per-fetch TOTAL cap over headers + body, so a
+		// stalled endpoint can never hang planning under a deadline-less
+		// parent context. A caller deadline still wins (the ctx.Err() check
+		// below preserves cancellation semantics); only this internal cap
+		// expiry is reported as an actionable planning failure, in the same
+		// branch and shape as the other repo-info errors.
+		fetchCtx, cancelFetch := context.WithTimeout(ctx, metadataFetchTimeout)
+		repoInfo, infoErr := fetchRepoInfo(fetchCtx, httpc, token, cfg.Endpoint, job)
+		fetchTimedOut := errors.Is(fetchCtx.Err(), context.DeadlineExceeded)
+		cancelFetch()
+		if infoErr != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if custom && isEndpointStatus(infoErr, http.StatusNotFound) {
+				// Established custom-endpoint 404 exemption: the response was
+				// actually received, so it stays authoritative over the cap.
+			} else if fetchTimedOut {
+				return nil, fmt.Errorf("repo info API timed out after %s for %q: planning needs this metadata and the endpoint did not respond in time; check the endpoint, proxy, or network and retry (last error: %v)", metadataFetchTimeout, job.Repo, infoErr)
+			} else {
+				return nil, infoErr
+			}
+		} else if repoInfo != nil {
+			mode.commit = repoInfo.SHA
+			mode.resolved = safeCommitName(repoInfo.SHA)
+			mode.pinned = mode.resolved
+			if mode.pinned {
+				mode.revision = repoInfo.SHA
+			}
 		}
-		commitResolved = safeCommitName(repoInfo.SHA)
+		if !mode.pinned {
+			mode.revision = job.Revision
+			mode.commit = job.Revision
+			mode.resolved = false
+		}
 	}
+	if job.BranchVariant && !mode.pinned {
+		return nil, fmt.Errorf("branch variant %q requires a resolved commit from the Hub", job.Revision)
+	}
+	commitSHA, commitPinned, commitResolved := mode.commit, mode.pinned, mode.resolved
 
-	// Only a branch variant reads the tree and file bytes at the resolved
-	// commit. Its payload is keyed by that commit (HF-cache snapshot and
-	// completion record), and a branch name can move between the revision
-	// lookup and the later tree/file reads, which would otherwise combine one
-	// commit's planned file list with another commit's contents.
-	//
-	// An ordinary download keeps addressing the caller's revision/branch name.
-	// Commit pinning is not required for it, and a user-configured mirror may
-	// resolve the revision to a SHA while serving file bytes only by branch
-	// name; pinning would break such a mirror. Refs, destination naming,
-	// manifest Branch, and progress keep the caller's revision name below.
-	contentJob := job
-	if job.BranchVariant && commitResolved {
-		contentJob.Revision = commitSHA
-	}
+	// Use one resolved commit for the tree and file URLs. Without one, retain the
+	// requested revision; known-digest transfers require proof unless Verify=none.
+	transferJob := job
+	transferJob.Revision = mode.revision
 
 	// Collect every file node first. We need the full list before building the
 	// plan so we can detect a GGUF-only download and skip companion files that
 	// a self-contained GGUF doesn't need.
 	var fileNodes []hfNode
-	err = walkTree(ctx, httpc, token, cfg.Endpoint, contentJob, "", func(n hfNode) error {
+	err := walkTree(ctx, httpc, token, cfg.Endpoint, transferJob, "", func(n hfNode) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -326,6 +369,36 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		return nil
 	})
 	if err != nil {
+		// Caller cancellation keeps its established surface: the caller's
+		// own context error, unchanged, classified as cancellation — never
+		// reshaped into an internal budget expiry.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if errors.Is(err, hubtree.ErrPageFetchTimeout) {
+			// REQUIRED data (the plan's file list): a per-request budget
+			// expiry fails planning in the same class and shape as the
+			// repo-info timeout above. The underlying context expiry is
+			// formatted with %v so the failure classifier never reads this
+			// as caller cancellation, and an expired budget is not an
+			// authoritative response — it must never reach the branch
+			// fallback confirmation below (pinned rule: uncertainty never
+			// enables the fallback).
+			return nil, fmt.Errorf("tree page API timed out after %s for %q: planning needs this file list and the endpoint did not respond in time; check the endpoint, proxy, or network and retry (last error: %v)", metadataFetchTimeout, job.Repo, err)
+		}
+		if forced == nil && custom && !job.BranchVariant && mode.pinned && isEndpointStatus(err, http.StatusNotFound) {
+			// This confirmation is the same class of compatibility check as
+			// the addressing preflight, so it shares that family's total
+			// budget (addressingProbeBudget). Expiry is inconclusive: the
+			// lookup returns false and can never enable the branch fallback.
+			confirmCtx, cancelConfirm := context.WithTimeout(ctx, addressingProbeBudget)
+			confirmed := confirmedRevisionStillResolves(confirmCtx, httpc, token, cfg.Endpoint, job, mode.commit)
+			cancelConfirm()
+			if confirmed {
+				fallback := planAddressingMode{revision: job.Revision, commit: job.Revision}
+				return scanRepoMode(ctx, httpc, token, job, cfg, &fallback)
+			}
+		}
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -619,14 +692,12 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 		// marker any more than the direct model-selection branches do.
 		matchedFilter = filterAttribution(matchedFilter, job.ExactMatch)
 
-		// The URL addresses the revision the contentJob reads: the resolved
-		// commit for a branch variant, the caller's branch name for an
-		// ordinary download.
+		// Use the same identity as the tree walk.
 		var urlStr string
 		if isLFS {
-			urlStr = lfsURL(cfg.Endpoint, contentJob, rel)
+			urlStr = lfsURL(cfg.Endpoint, transferJob, rel)
 		} else {
-			urlStr = rawURL(cfg.Endpoint, contentJob, rel)
+			urlStr = rawURL(cfg.Endpoint, transferJob, rel)
 		}
 		// For LFS files, ALWAYS use LFS.Size (n.Size is the pointer file size, not actual)
 		var size int64
@@ -707,7 +778,181 @@ func scanRepo(ctx context.Context, httpc *http.Client, token string, job Job, cf
 	if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
 		return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
 	}
-	return &Plan{Items: items, Commit: commitSHA, CommitResolved: commitResolved}, nil
+	plan := &Plan{Items: items, Commit: commitSHA, CommitPinned: commitPinned, CommitResolved: commitResolved}
+	if forced == nil && custom && !job.BranchVariant && mode.pinned {
+		probeDeadline := time.Now().Add(addressingProbeBudget)
+		useHFCache := cfg.CacheDir != "" || cfg.OutputDir == ""
+		var probeRepoDir *RepoDir
+		if useHFCache {
+			if cache, err := cfg.BuildHFCache(); err == nil {
+				repoType := RepoTypeModel
+				if job.IsDataset {
+					repoType = RepoTypeDataset
+				}
+				repoID := job.Repo
+				if job.LocalRepo != "" {
+					repoID = job.LocalRepo
+				}
+				probeRepoDir, _ = cache.Repo(repoID, repoType)
+			}
+		}
+		for _, item := range plan.Items {
+			// Check the budget before every cache-side probe: the
+			// fully-cached path never reaches the deadline checks below.
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			// Start the cache-side probe only within the remaining budget
+			// and clamp its context to that remainder: the probe can wait
+			// minutes on the ownership init gate under a bare parent
+			// context. A cut probe fails gracefully (its false path) and
+			// the next iteration's deadline check ends the walk with the
+			// plan intact.
+			remaining := time.Until(probeDeadline)
+			if remaining <= 0 {
+				break
+			}
+			cacheCtx, cancelCache := context.WithTimeout(ctx, remaining)
+			safe := addressingProbeSafeForCache(cacheCtx, probeRepoDir, useHFCache, item)
+			cancelCache()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if !safe {
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			remaining = time.Until(probeDeadline)
+			if remaining <= 0 {
+				break
+			}
+			timeout := addressingProbeTimeout
+			if remaining < timeout {
+				timeout = remaining
+			}
+			probeCtx, cancelProbe := context.WithTimeout(ctx, timeout)
+			status, usable, location, probeErr := probeAddressing(probeCtx, httpc, token, item.URL, item.Size, false)
+			cancelProbe()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if probeErr != nil || !((status == http.StatusNotFound && !usable) || redirectTargetsRevision(item.URL, location, job, job.Revision)) {
+				continue
+			}
+			branchJob := job
+			branchURL := rawURL(cfg.Endpoint, branchJob, item.RelativePath)
+			if item.LFS {
+				branchURL = lfsURL(cfg.Endpoint, branchJob, item.RelativePath)
+			}
+			remaining = time.Until(probeDeadline)
+			if remaining <= 0 {
+				break
+			}
+			timeout = addressingProbeTimeout
+			if remaining < timeout {
+				timeout = remaining
+			}
+			probeCtx, cancelProbe = context.WithTimeout(ctx, timeout)
+			_, branchUsable, _, branchErr := probeAddressing(probeCtx, httpc, token, branchURL, item.Size, true)
+			cancelProbe()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if branchErr != nil || !branchUsable {
+				continue
+			}
+			// The revision re-check shares the preflight budget: a slow
+			// metadata response must not outlive it.
+			revCtx, cancelRev := context.WithDeadline(ctx, probeDeadline)
+			resolves := confirmedRevisionStillResolves(revCtx, httpc, token, cfg.Endpoint, job, mode.commit)
+			cancelRev()
+			if !resolves {
+				continue
+			}
+			fallback := planAddressingMode{revision: job.Revision, commit: job.Revision}
+			return scanRepoMode(ctx, httpc, token, job, cfg, &fallback)
+		}
+	}
+	return plan, nil
+}
+
+func isCustomHubEndpoint(endpoint string) bool {
+	return strings.TrimRight(getEndpoint(endpoint), "/") != strings.TrimRight(DefaultEndpoint, "/")
+}
+
+func isEndpointStatus(err error, status int) bool {
+	var statusErr *endpointStatusError
+	return errors.As(err, &statusErr) && statusErr.status == status
+}
+
+func confirmedRevisionStillResolves(ctx context.Context, httpc *http.Client, token, endpoint string, job Job, commit string) bool {
+	info, err := fetchRepoInfo(ctx, httpc, token, endpoint, job)
+	return err == nil && info != nil && safeCommitName(info.SHA) && info.SHA == commit
+}
+
+func redirectTargetsRevision(sourceURL, location string, job Job, revision string) bool {
+	if location == "" {
+		return false
+	}
+	source, err := url.Parse(sourceURL)
+	if err != nil {
+		return false
+	}
+	targetRef, err := url.Parse(location)
+	if err != nil {
+		return false
+	}
+	target := source.ResolveReference(targetRef)
+	path := target.EscapedPath()
+	if job.IsDataset {
+		return strings.Contains(path, "/datasets/"+job.Repo+"/raw/"+url.PathEscape(revision)+"/") ||
+			strings.Contains(path, "/datasets/"+job.Repo+"/resolve/"+url.PathEscape(revision)+"/")
+	}
+	return strings.Contains(path, "/"+job.Repo+"/raw/"+url.PathEscape(revision)+"/") ||
+		strings.Contains(path, "/"+job.Repo+"/resolve/"+url.PathEscape(revision)+"/")
+}
+
+// addressingCacheProbeHook lets tests observe each cache-side probe in the
+// custom-endpoint addressing preflight walk, under the probe's own context
+// so a seam can stand in for a context-bound internal wait.
+var addressingCacheProbeHook func(ctx context.Context)
+
+// addressingProbeSafeForCache avoids issuing even a read-only capability GET
+// when a content-addressed cache item is already complete or its ownership
+// state is busy/unknown. The ordinary skip/ownership path remains authoritative.
+func addressingProbeSafeForCache(ctx context.Context, repoDir *RepoDir, useHFCache bool, item PlanItem) bool {
+	if addressingCacheProbeHook != nil {
+		addressingCacheProbeHook(ctx)
+	}
+	if item.SHA256 == "" {
+		if !useHFCache {
+			return true
+		}
+		if repoDir == nil {
+			return false
+		}
+		tmpName := "tmp-path-" + strings.ReplaceAll(item.RelativePath, "/", "_")
+		dst, err := SafeJoin(repoDir.BlobsDir(), tmpName)
+		if err != nil {
+			return false
+		}
+		realm, err := repoDir.cache.ownershipRealmForDataContext(ctx)
+		if err != nil {
+			return false
+		}
+		busy, err := realm.probeWriter(ctx, []string{dst, dst + ".incomplete"})
+		return err == nil && !busy
+	}
+	if !useHFCache {
+		return true
+	}
+	if repoDir == nil {
+		return false
+	}
+	status, _, err := repoDir.checkBlobContext(ctx, item.SHA256)
+	return err == nil && status == BlobMissing
 }
 
 // isGGUFFilePath reports whether a path names a GGUF artifact, including the
@@ -1280,6 +1525,10 @@ func ScanPlan(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	}
 
 	if progress != nil {
+		if !plan.CommitPinned {
+			progress(ProgressEvent{Time: time.Now().UTC(), Level: "warn", Event: "warning", Repo: job.Repo, Revision: job.Revision,
+				Message: "revision is not pinned to an immutable commit; the plan is revision-addressed"})
+		}
 		for _, item := range plan.Items {
 			progress(ProgressEvent{
 				Time:     time.Now().UTC(),

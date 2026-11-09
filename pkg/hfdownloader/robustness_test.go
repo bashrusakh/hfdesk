@@ -111,7 +111,7 @@ func TestDownloadSingle_StalledTransferAbortsAndResumes(t *testing.T) {
 	}
 
 	start := time.Now()
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Commit: "stall-test-commit", CommitPinned: true}, func(ProgressEvent) {})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("downloadSingle: %v", err)
@@ -210,7 +210,7 @@ func TestDownloadSingle_MultiStallProgressResetsBudget(t *testing.T) {
 	}
 
 	start := time.Now()
-	if err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Commit: "stall-test-commit", CommitPinned: true}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
@@ -297,7 +297,7 @@ func TestDownloadMultipart_StalledPartRecoversAndAssembles(t *testing.T) {
 		BackoffMax:     "20ms",
 	}
 
-	if err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 	got, err := os.ReadFile(dst)
@@ -309,10 +309,8 @@ func TestDownloadMultipart_StalledPartRecoversAndAssembles(t *testing.T) {
 	}
 }
 
-// alwaysStallServer responds to every body request by declaring the full
-// length and then delivering no bytes at all, holding the connection open
-// until the client aborts the attempt. Every attempt therefore ends in a
-// stall, which lets tests exhaust the retry budget on stalls alone.
+// alwaysStallServer sends valid HEAD/range headers but no body bytes until
+// cancellation, so retries exhaust on body stalls rather than header rejection.
 func alwaysStallServer(t *testing.T, total int) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -327,7 +325,7 @@ func alwaysStallServer(t *testing.T, total int) *httptest.Server {
 				http.Error(w, "bad range", http.StatusBadRequest)
 				return
 			}
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total-1))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
 			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 			w.WriteHeader(http.StatusPartialContent)
 		} else {
@@ -369,12 +367,13 @@ func TestDownloadSingle_StallExhaustedSurfacesStallError(t *testing.T) {
 	}
 
 	var retryMsgs []string
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst,
+	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{},
 		func(ev ProgressEvent) {
 			if ev.Event == "retry" {
 				retryMsgs = append(retryMsgs, ev.Message)
 			}
 		})
+
 	if err == nil {
 		t.Fatal("expected an error when every attempt stalls")
 	}
@@ -432,7 +431,7 @@ func TestDownloadMultipart_StalledPartsSurfaceStallError(t *testing.T) {
 		BackoffMax:     "10ms",
 	}
 
-	err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 	if err == nil {
 		t.Fatal("expected an error when every part stalls")
 	}
@@ -479,7 +478,7 @@ func TestDownloadSingle_GenuineCancelNotRelabelledAsStall(t *testing.T) {
 		cancel()
 	}()
 
-	err := downloadSingle(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ProgressEvent) {})
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("genuine cancellation must keep context.Canceled, got %v", err)
 	}
@@ -528,7 +527,7 @@ func TestDownloadSingle_RetryAfterHonored(t *testing.T) {
 	}
 
 	start := time.Now()
-	if err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadSingle: %v", err)
 	}
 	elapsed := time.Since(start)
@@ -611,7 +610,7 @@ func TestDownloadMultipart_HeadRetryAfterHonored(t *testing.T) {
 	}
 
 	start := time.Now()
-	if err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 	elapsed := time.Since(start)
@@ -679,7 +678,7 @@ func TestDownloadMultipart_HeadThrottledBudgetExhausted(t *testing.T) {
 		StallTimeout:   "0",
 	}
 
-	err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 	if !errors.Is(err, ErrRateLimited) {
 		t.Errorf("error = %v, want ErrRateLimited (the exhausted transient error)", err)
 	}
@@ -772,7 +771,7 @@ func TestDownloadMultipart_HeadBodyClosedBeforeTransfer(t *testing.T) {
 	it := PlanItem{RelativePath: "headclose.bin", URL: srv.URL + "/headclose.bin", Size: int64(len(full)), AcceptRanges: true}
 	cfg := Settings{Concurrency: 2, Retries: 2, StallTimeout: "0"}
 
-	if err := downloadMultipart(context.Background(), httpc, "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {}); err != nil {
+	if _, err := downloadMultipart(context.Background(), httpc, "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {}); err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
 	if !closedWhenFirstGET.Load() {
@@ -811,9 +810,12 @@ func TestDownload_PermanentStatusFailsFast(t *testing.T) {
 				switch {
 				case r.URL.Path == "/api/models/o/r/revision/main":
 					json.NewEncoder(w).Encode(RepoInfo{SHA: "abc123"})
-				case r.URL.Path == "/api/models/o/r/tree/main":
+				case r.URL.Path == "/api/models/o/r/tree/abc123":
 					json.NewEncoder(w).Encode([]hfNode{{Type: "file", Path: "config.json", Size: 128}})
-				case r.URL.Path == "/o/r/raw/main/config.json":
+				case r.URL.Path == "/o/r/raw/abc123/config.json" && r.Header.Get("X-HFDesk-Addressing-Probe") == "1":
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte("x"))
+				case r.URL.Path == "/o/r/raw/abc123/config.json":
 					mu.Lock()
 					fileGets++
 					mu.Unlock()
@@ -861,7 +863,7 @@ func TestDownloadSingleStatusRetryPolicy(t *testing.T) {
 				w.WriteHeader(status)
 			}))
 			defer srv.Close()
-			err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 3, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}, PlanItem{RelativePath: "f", URL: srv.URL, Size: 10}, filepath.Join(t.TempDir(), "f"), func(ProgressEvent) {})
+			_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 3, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}, PlanItem{RelativePath: "f", URL: srv.URL, Size: 10}, filepath.Join(t.TempDir(), "f"), singleOpts{}, func(ProgressEvent) {})
 			var apiErr *APIError
 			if !errors.As(err, &apiErr) || apiErr.StatusCode != status {
 				t.Fatalf("error = %v, want APIError status %d", err, status)
@@ -879,7 +881,7 @@ func TestDownloadSingleStatusRetryPolicy(t *testing.T) {
 				w.WriteHeader(status)
 			}))
 			defer srv.Close()
-			_ = downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 2, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}, PlanItem{RelativePath: "f", URL: srv.URL, Size: 10}, filepath.Join(t.TempDir(), "f"), func(ProgressEvent) {})
+			_, _ = downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 2, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}, PlanItem{RelativePath: "f", URL: srv.URL, Size: 10}, filepath.Join(t.TempDir(), "f"), singleOpts{}, func(ProgressEvent) {})
 			if requests != 3 {
 				t.Errorf("made %d requests; retryable 5xx should make initial attempt plus two retries", requests)
 			}
@@ -911,7 +913,7 @@ func TestDownloadMultipart_FailFast(t *testing.T) {
 			t.Fatal(err)
 		}
 		it := PlanItem{RelativePath: "h.bin", URL: srv.URL + "/h.bin", Size: 10_000, AcceptRanges: true}
-		err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 4}, it, dst, func(ProgressEvent) {})
+		_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 4}, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 		if !errors.Is(err, ErrUnauthorized) {
 			t.Fatalf("error = %v, want ErrUnauthorized", err)
 		}
@@ -951,7 +953,7 @@ func TestDownloadMultipart_FailFast(t *testing.T) {
 			t.Fatal(err)
 		}
 		it := PlanItem{RelativePath: "p.bin", URL: srv.URL + "/p.bin", Size: 10_000, AcceptRanges: true}
-		err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 5}, it, dst, func(ProgressEvent) {})
+		_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 5}, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 		if !errors.Is(err, ErrNotFound) {
 			t.Fatalf("error = %v, want ErrNotFound", err)
 		}
@@ -1014,7 +1016,7 @@ func TestDownloadSingle_IgnoredRangeRestartIsNotProgress(t *testing.T) {
 		BackoffMax:     "10ms",
 		StallTimeout:   "0",
 	}
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ProgressEvent) {})
 	if err == nil {
 		t.Fatal("expected failure; ignored-Range restarts must not loop forever")
 	}
@@ -1043,7 +1045,7 @@ func TestDownloadSingle_FailFastRemovesEmptyPartial(t *testing.T) {
 	defer srv.Close()
 
 	it := PlanItem{RelativePath: "f.bin", URL: srv.URL + "/f.bin", Size: int64(len(full))}
-	err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 3}, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 3}, it, dst, singleOpts{}, func(ProgressEvent) {})
 	if err == nil {
 		t.Fatal("expected fail-fast error")
 	}
@@ -1084,7 +1086,7 @@ func TestDownloadSingle_CancelDuringBackoffReturnsPromptly(t *testing.T) {
 	}()
 
 	start := time.Now()
-	err := downloadSingle(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadSingle(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{}, func(ProgressEvent) {})
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected cancellation error")
@@ -1419,7 +1421,7 @@ func TestDownloadSingle_OscillatingIgnoredRangeDoesNotRefund(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		done <- downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+		done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Commit: "retry-test-commit", CommitPinned: true}, func(ProgressEvent) {})
 	}()
 
 	// Bound the test: a regression that refunds the budget forever would hang.
@@ -1443,8 +1445,40 @@ func TestDownloadSingle_OscillatingIgnoredRangeDoesNotRefund(t *testing.T) {
 // part error stops sibling part requests, returns the original error, and
 // preserves resumable bytes rather than treating the internal abort as a user
 // cancel.
+type blockedMultipartBody struct {
+	io.ReadCloser
+	ctx     context.Context
+	started chan struct{}
+	once    *sync.Once
+}
+
+func (b blockedMultipartBody) Read([]byte) (int, error) {
+	b.once.Do(func() { close(b.started) })
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+type blockingMultipartBodyTransport struct {
+	base    http.RoundTripper
+	started chan struct{}
+	once    sync.Once
+}
+
+func (t *blockingMultipartBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return resp, err
+	}
+	rng := req.Header.Get("Range")
+	if req.Method == http.MethodGet && rng != "" && !strings.HasPrefix(rng, "bytes=0-") {
+		resp.Body = blockedMultipartBody{ReadCloser: resp.Body, ctx: req.Context(), started: t.started, once: &t.once}
+	}
+	return resp, nil
+}
+
 func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 	release := make(chan struct{})
+	siblingBodyRead := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			w.Header().Set("Content-Length", "100000")
@@ -1453,15 +1487,24 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 		}
 		if strings.HasPrefix(r.Header.Get("Range"), "bytes=0-") {
 			// Part 0 is the permanent one: a 404 fails the whole file.
+			// Do not return it until the sibling has passed header validation and
+			// is blocked reading its body.
+			select {
+			case <-siblingBodyRead:
+			case <-r.Context().Done():
+				return
+			}
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		// Sibling part: advertise a body, flush headers, then withhold the body
-		// so it cannot finish on its own. The default client has no body
-		// timeout and StallTimeout is disabled, so only the fix's partCtx
-		// cancel (triggered by part 0's fail-fast) can unblock its io.Copy.
-		w.Header().Set("Content-Range", "bytes 50000-99999/100000")
-		w.Header().Set("Content-Length", "50000")
+		// Sibling part: echo the valid requested suffix and withhold its body.
+		var start, end int
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
+			http.Error(w, "bad range", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/100000", start, end))
+		w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
 		w.WriteHeader(http.StatusPartialContent)
 		if fl, ok := w.(http.Flusher); ok {
 			fl.Flush()
@@ -1481,16 +1524,15 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Pre-seed resumable bytes in a part file together with a matching layout
-	// file, so prepareMultipartResume preserves them; they must then survive the
-	// fail-fast abort. Without matching metadata the pre-existing behavior
-	// discards stale parts before any network I/O, which would mask this check.
-	if err := os.WriteFile(dst+".part-01", bytes.Repeat([]byte("y"), 500), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(100_000, 2, 50_000)); err != nil {
-		t.Fatal(err)
-	}
+	// Seed a pinned v4 record with a 499-byte prefix in range 1; the requested
+	// suffix must validate before its body is held and then canceled.
+	full := bytes.Repeat([]byte("p"), 100_000)
+	seedRangedState(t, dst+".incomplete", "o/r", "pa.bin", 100_000,
+		[]RangeProgress{
+			{Start: 0, End: 49_999},
+			{Start: 50_000, End: 99_999, Committed: 499},
+		}, full)
+	opts := multipartOpts{Commit: rangedSeedCommit, CommitPinned: true, Domain: acquireTestDomain(t, dst)}
 
 	it := PlanItem{RelativePath: "pa.bin", URL: srv.URL + "/pa.bin", Size: 100_000, AcceptRanges: true}
 	cfg := Settings{Concurrency: 2, Retries: 5, BackoffInitial: "5ms", BackoffMax: "10ms", StallTimeout: "0"}
@@ -1499,9 +1541,18 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 	cfg.CleanupPartialsOnCancel = func() bool { return true }
 
 	done := make(chan error, 1)
+	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	t.Cleanup(baseTransport.CloseIdleConnections)
+	client := &http.Client{Transport: &blockingMultipartBodyTransport{base: baseTransport, started: siblingBodyRead}}
 	go func() {
-		done <- downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+		_, derr := downloadMultipart(context.Background(), client, "", Job{Repo: "o/r"}, cfg, it, dst, opts, func(ProgressEvent) {})
+		done <- derr
 	}()
+	select {
+	case <-siblingBodyRead:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sibling response body Read was not entered after header validation")
+	}
 
 	select {
 	case err := <-done:
@@ -1512,9 +1563,20 @@ func TestDownloadMultipart_PermanentPartAbortsSiblings(t *testing.T) {
 		t.Fatal("downloadMultipart did not terminate after a permanent part error; sibling part was not aborted")
 	}
 
-	// T3: the pre-existing resumable part bytes must not have been deleted.
-	if fi, err := os.Stat(dst + ".part-01"); err != nil || fi.Size() != 500 {
-		t.Errorf("resumable .part-01 was removed/modified by the internal abort (stat err=%v)", err)
+	// Internal fail-fast abort preserves the existing committed prefix and its staging metadata.
+	staging := dst + ".incomplete"
+	if fi, err := os.Stat(staging); err != nil || fi.Size() != 100_000 {
+		t.Errorf("staging file was removed/modified by the internal abort (stat err=%v)", err)
+	}
+	meta, merr := readStagingMeta(staging + ".meta")
+	if merr != nil {
+		t.Fatalf("staging meta was removed by the internal abort: %v", merr)
+	}
+	if len(meta.Ranges) != 2 || meta.Ranges[1].Committed != 499 || meta.Ranges[1].Done {
+		t.Errorf("resumable range state lost: %+v", meta.Ranges)
+	}
+	if meta.Ranges[0].Committed != 0 || meta.Ranges[0].Done {
+		t.Errorf("failing range must hold no committed bytes: %+v", meta.Ranges[0])
 	}
 }
 
@@ -1561,7 +1623,7 @@ func TestDownloadMultipart_NonRetryablePartStopsSiblings(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 4, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}, PlanItem{RelativePath: "f", URL: srv.URL, Size: 100000, AcceptRanges: true}, dst, func(ProgressEvent) {})
+	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 2, Retries: 4, BackoffInitial: "1ms", BackoffMax: "1ms", StallTimeout: "0"}, PlanItem{RelativePath: "f", URL: srv.URL, Size: 100000, AcceptRanges: true}, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
 		t.Fatalf("error = %v, want original HTTP 400 APIError", err)
@@ -1682,9 +1744,10 @@ func TestDownloadSingle_InternalAbortPreservesResumablePartial(t *testing.T) {
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(dst+".part", bytes.Repeat([]byte("z"), 2_000), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		it := PlanItem{RelativePath: "keep.bin", Size: 100_000}
+		// The staged bytes are inheritable, so the internal abort has to
+		// preserve them (a user cancel still cleans them up).
+		seedSinglePartial(t, dst, bytes.Repeat([]byte("z"), 2_000), Job{Repo: "o/r"}, it, singleTestIdentity)
 
 		ctx, cancel := context.WithCancelCause(context.Background())
 		// Retries>0 with a long backoff keeps the goroutine parked in the
@@ -1693,10 +1756,12 @@ func TestDownloadSingle_InternalAbortPreservesResumablePartial(t *testing.T) {
 		cfg := Settings{Retries: 5, BackoffInitial: "5s", BackoffMax: "5s", StallTimeout: "0"}
 		cfg.CleanupPartialsOnCancel = func() bool { return true }
 
+		opts := singleTestIdentity
+		opts.Domain = acquireTestDomain(t, dst)
 		done := make(chan error, 1)
 		go func() {
 			it := PlanItem{RelativePath: "keep.bin", URL: "http://127.0.0.1:1/keep.bin", Size: 100_000}
-			done <- downloadSingle(ctx, &http.Client{}, "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+			done <- downloadSingleErr(ctx, &http.Client{}, "", Job{Repo: "o/r"}, cfg, it, dst, opts, func(ProgressEvent) {})
 		}()
 
 		// Give the goroutine time to fail its first attempt and enter the
@@ -1844,7 +1909,7 @@ func TestDownloadSingle_GrowingPrefixBounded(t *testing.T) {
 		done := make(chan error, 1)
 		start := time.Now()
 		go func() {
-			done <- downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+			done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Commit: "retry-test-commit", CommitPinned: true}, func(ProgressEvent) {})
 		}()
 
 		var err error
@@ -1900,7 +1965,7 @@ func TestDownloadSingle_GrowingPrefixBounded(t *testing.T) {
 				}
 			}
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, total-1, total))
-			w.Header().Set("Content-Length", strconv.FormatInt(total, 10))
+			w.Header().Set("Content-Length", strconv.FormatInt(total-start, 10))
 			w.WriteHeader(http.StatusPartialContent)
 			if fl, ok := w.(http.Flusher); ok {
 				fl.Flush()
@@ -1921,7 +1986,7 @@ func TestDownloadSingle_GrowingPrefixBounded(t *testing.T) {
 		done := make(chan error, 1)
 		start := time.Now()
 		go func() {
-			done <- downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+			done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Commit: "retry-test-commit", CommitPinned: true}, func(ProgressEvent) {})
 		}()
 
 		select {
@@ -1980,7 +2045,7 @@ func TestDownloadSingle_AppendCeilingBounded(t *testing.T) {
 			}
 		}
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, total-1, total))
-		w.Header().Set("Content-Length", strconv.FormatInt(total, 10))
+		w.Header().Set("Content-Length", strconv.FormatInt(total-start, 10))
 		w.WriteHeader(http.StatusPartialContent)
 		if fl, ok := w.(http.Flusher); ok {
 			fl.Flush()
@@ -2005,7 +2070,7 @@ func TestDownloadSingle_AppendCeilingBounded(t *testing.T) {
 	done := make(chan error, 1)
 	start := time.Now()
 	go func() {
-		done <- downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+		done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Commit: "retry-test-commit", CommitPinned: true}, func(ProgressEvent) {})
 	}()
 
 	select {
@@ -2031,10 +2096,8 @@ func TestDownloadSingle_AppendCeilingBounded(t *testing.T) {
 	}
 }
 
-// TestDownloadMultipart_GrowingPrefixBounded verifies the absolute ceiling on
-// the multipart part loop: a part server that answers 206 but streams a
-// strictly growing prefix (and aborts) advances the part high-water mark every
-// attempt, so without the ceiling it would refund forever.
+// Valid range headers plus an advancing truncated body refund the progress
+// budget repeatedly; the independent lifetime attempt ceiling must still terminate the loop.
 func TestDownloadMultipart_GrowingPrefixBounded(t *testing.T) {
 	tmpDir := t.TempDir()
 	dst := filepath.Join(tmpDir, "blobs", "tmp-mpgrow")
@@ -2044,11 +2107,7 @@ func TestDownloadMultipart_GrowingPrefixBounded(t *testing.T) {
 
 	const total = 100_000
 	const partCount = 2
-	// Declare a body far larger than anything sent so a part can never finish;
-	// each attempt appends a strictly growing prefix then aborts, so the part's
-	// on-disk offset advances on every attempt (the counterexample for the
-	// refund rule alone).
-	const declaredBody = int64(1) << 40
+	// Each aborted response advances the on-disk offset, exercising progress refunds.
 	const growthPerRequest = 100
 	var (
 		mu           sync.Mutex
@@ -2060,23 +2119,18 @@ func TestDownloadMultipart_GrowingPrefixBounded(t *testing.T) {
 			w.Header().Set("Accept-Ranges", "bytes")
 			return
 		}
+		var start, end int64
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil || end >= total {
+			http.Error(w, "bad range", http.StatusBadRequest)
+			return
+		}
 		mu.Lock()
 		partRequests++
 		n := partRequests
 		mu.Unlock()
-		start := int64(0)
-		if rng := r.Header.Get("Range"); rng != "" {
-			if _, err := fmt.Sscanf(rng, "bytes=%d-", &start); err != nil {
-				http.Error(w, "bad range", http.StatusBadRequest)
-				return
-			}
-		}
-		// Ignore the requested range: always 206 with a huge declared body,
-		// stream a strictly growing prefix, then abort. The client appends to
-		// its part file at the current offset, so pos grows every attempt while
-		// the part never completes.
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, declaredBody-1, declaredBody))
-		w.Header().Set("Content-Length", strconv.FormatInt(declaredBody, 10))
+		// Valid protocol fields: the exact requested range and its length.
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 		w.WriteHeader(http.StatusPartialContent)
 		if fl, ok := w.(http.Flusher); ok {
 			fl.Flush()
@@ -2102,7 +2156,8 @@ func TestDownloadMultipart_GrowingPrefixBounded(t *testing.T) {
 	done := make(chan error, 1)
 	start := time.Now()
 	go func() {
-		done <- downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+		_, derr := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
+		done <- derr
 	}()
 
 	select {
@@ -2116,34 +2171,21 @@ func TestDownloadMultipart_GrowingPrefixBounded(t *testing.T) {
 	mu.Lock()
 	n := partRequests
 	mu.Unlock()
-	// Two parts; each runs until its `attempt` index reaches the ceiling, so a
-	// part makes at most ceiling+1 requests.
+	// The lifetime ceiling permits at most ceiling+1 requests per range.
 	bound := partCount * (absoluteAttemptCeiling(cfg.Retries) + 1)
 	if n > bound {
 		t.Errorf("made %d part requests; want <= %d", n, bound)
+	}
+	if n <= partCount*(cfg.Retries+1) {
+		t.Errorf("made only %d part requests; growing-prefix refunds should have extended past the pure budget of %d", n, partCount*(cfg.Retries+1))
 	}
 	if elapsed := time.Since(start); elapsed > 8*time.Second {
 		t.Errorf("growing-prefix multipart termination took %v", elapsed)
 	}
 }
 
-// --- Second-round T2/T3 regression tests ---
-
-// TestDownloadSingle_RestartAboveHwmNoFreeRefund pins the T2 fix for the
-// "restart above previous max earns a later free refund" counterexample.
-//
-// Sequence (Retries=2), mirroring the reviewer's steps:
-//  1. an ordinary 206 attempt reaches 1000 -> hwm=1000 (legitimate refund);
-//  2. an ignored-Range 200 truncates to 0 and reaches 2000, then aborts
-//     (truncatedRestart -> no refund, but 2000 is now the real high-water);
-//  3. a bodyless 503 writes nothing (pos stays 2000).
-//
-// Under the pre-fix rule hwm was only updated on the refunding attempt, so it
-// stayed 1000 and the bodyless attempt 3 saw pos>hwm -> a free refund for zero
-// new bytes; the loop then needed 4 requests instead of 3 to exhaust the
-// budget. With the fix hwm is updated unconditionally after every attempt, so
-// attempt 3 is not progress and the budget is exhausted after exactly
-// Retries+1 requests.
+// The ignored-Range 200 restart advances the high-water mark without refunding
+// retries. A following bodyless 503 is not progress and must exhaust the budget.
 func TestDownloadSingle_RestartAboveHwmNoFreeRefund(t *testing.T) {
 	tmpDir := t.TempDir()
 	dst := filepath.Join(tmpDir, "blobs", "tmp-freefeat")
@@ -2200,7 +2242,7 @@ func TestDownloadSingle_RestartAboveHwmNoFreeRefund(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+		done <- downloadSingleErr(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, singleOpts{Commit: "retry-test-commit", CommitPinned: true}, func(ProgressEvent) {})
 	}()
 
 	select {
@@ -2219,19 +2261,9 @@ func TestDownloadSingle_RestartAboveHwmNoFreeRefund(t *testing.T) {
 	}
 }
 
-// TestDownloadMultipart_RestartAboveHwmNoFreeRefund pins the multipart
-// non-progress retry budget: each part performs exactly ONE advancing 206
-// attempt (which refunds once), followed only by BODYLESS attempts (no new
-// bytes -> no refund). The observed request count must therefore equal the
-// non-progress budget partCount*(Retries+1), not merely stay under the absolute
-// ceiling.
-//
-// Multipart has no truncation path, so the single-file "restart above the old
-// hwm then bodyless failure earns a free refund" counterexample cannot arise
-// here: a bodyless attempt never exceeds preHwm, so it can never refund under
-// any variant. This test therefore pins the current correct budget rule as a
-// regression guard; the discriminating case for the always-update-hwm fix is
-// the single-file TestDownloadSingle_RestartAboveHwmNoFreeRefund.
+// Each range gets one advancing, protocol-valid 206, then bodyless failures.
+// Assert the exact non-progress budget, not just the lifetime ceiling. Multipart
+// never truncates; the restart/high-water counterexample belongs to the single-path test.
 func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 	tmpDir := t.TempDir()
 	dst := filepath.Join(tmpDir, "blobs", "tmp-mpfree")
@@ -2252,16 +2284,12 @@ func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 			w.Header().Set("Accept-Ranges", "bytes")
 			return
 		}
-		start := int64(0)
-		if rng := r.Header.Get("Range"); rng != "" {
-			if _, err := fmt.Sscanf(rng, "bytes=%d-", &start); err != nil {
-				http.Error(w, "bad range", http.StatusBadRequest)
-				return
-			}
+		var start, end int64
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil || end >= total {
+			http.Error(w, "bad range", http.StatusBadRequest)
+			return
 		}
-		// Part 0 requests offsets below the midpoint; part 1 at/above it. Keying
-		// by part (not by the advancing start offset) lets each part perform its
-		// single advancing attempt exactly once.
+		// Key by range, not its changing start offset, to advance each range exactly once.
 		partIdx := 0
 		if start >= total/2 {
 			partIdx = 1
@@ -2272,8 +2300,8 @@ func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 		advanced[partIdx] = true
 		mu.Unlock()
 
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, total-1, total))
-		w.Header().Set("Content-Length", strconv.FormatInt(total, 10))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 		w.WriteHeader(http.StatusPartialContent)
 		if fl, ok := w.(http.Flusher); ok {
 			fl.Flush()
@@ -2295,7 +2323,8 @@ func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+		_, derr := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
+		done <- derr
 	}()
 
 	select {
@@ -2315,43 +2344,26 @@ func TestDownloadMultipart_RestartAboveHwmNoFreeRefund(t *testing.T) {
 	}
 }
 
-// TestDownloadMultipart_FinalizationAbortBeforeAssembly verifies T3 on the
-// finalization boundary: when the part context is cancelled by an internal
-// abort at the moment assembly is about to begin, downloadMultipart must not
-// start assembling, must PRESERVE the resumable .part-NN files, must not leave
-// an incomplete dst.part or a final dst, and must return the cancellation. A
-// user cancel with the same callback still runs cleanupPartialsOnCancel.
-//
-// The cancel is triggered deterministically from the emit callback on the
-// "file_finalizing" event, which downloadMultipart emits after the
-// cancelled-while-parts-running guard and immediately before assembly starts —
-// no timing/sleep dependence.
-func TestDownloadMultipart_FinalizationAbortBeforeAssembly(t *testing.T) {
-	setup := func(t *testing.T) string {
+// Cancel from file_finalizing before proof/publication: internal abort must
+// preserve staging and metadata, while explicit user cancellation cleans them up.
+func TestDownloadMultipart_FinalizationAbortBeforePublish(t *testing.T) {
+	setup := func(t *testing.T) (string, []byte) {
 		t.Helper()
 		tmpDir := t.TempDir()
 		dst := filepath.Join(tmpDir, "blobs", "tmp-finabort")
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		// Seed a complete part set plus layout so prepareMultipartResume keeps
-		// them and the part goroutines finish without any GET, reaching assembly.
+		// Seed a pinned, all-Done v4 record so finalization needs no payload transfer.
 		full := bytes.Repeat([]byte("p"), 20_000)
-		if err := os.WriteFile(dst+".part-00", full[:10_000], 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(dst+".part-01", full[10_000:], 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(20_000, 2, 10_000)); err != nil {
-			t.Fatal(err)
-		}
-		return dst
+		seedRangedState(t, dst+".incomplete", "o/r", "fin.bin", 20_000,
+			[]RangeProgress{{Start: 0, End: 19_999, Committed: 20_000, Done: true}}, full)
+		return dst, full
 	}
 
 	run := func(t *testing.T, cause func() error) string {
 		t.Helper()
-		dst := setup(t)
+		dst, full := setup(t)
 
 		ctx, cancel := context.WithCancelCause(context.Background())
 
@@ -2364,34 +2376,37 @@ func TestDownloadMultipart_FinalizationAbortBeforeAssembly(t *testing.T) {
 				w.Header().Set("Accept-Ranges", "bytes")
 				return
 			}
-			// Parts are already complete on disk, so no GET should occur.
-			http.Error(w, "unexpected part request", http.StatusInternalServerError)
+			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
 		}))
 		defer srv.Close()
 
 		emit := func(ev ProgressEvent) {
-			if ev.Event == "file_finalizing" && ev.Message == "assembling parts" {
-				cancel(cause()) // abort exactly at the assembly boundary
+			if ev.Event == "file_finalizing" && ev.Message == "finalizing" {
+				cancel(cause())
 			}
 		}
 
 		it := PlanItem{RelativePath: "fin.bin", URL: srv.URL + "/fin.bin", Size: 20_000, AcceptRanges: true}
-		err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, emit)
+		_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst,
+			withTestDomain(t, dst, multipartOpts{Commit: rangedSeedCommit, CommitPinned: true}), emit)
 		if err == nil {
 			t.Fatal("expected a cancellation error")
 		}
 		return dst
 	}
 
-	t.Run("internal abort preserves parts, removes incomplete dst.part", func(t *testing.T) {
+	t.Run("internal abort preserves staging and resume metadata", func(t *testing.T) {
 		dst := run(t, func() error { return abortError(errors.New("internal abort")) })
-		for _, p := range []string{dst + ".part-00", dst + ".part-01"} {
-			if fi, statErr := os.Stat(p); statErr != nil || fi.Size() == 0 {
-				t.Errorf("resumable %s was removed/modified (stat err=%v)", filepath.Base(p), statErr)
-			}
+		staging := dst + ".incomplete"
+		if fi, statErr := os.Stat(staging); statErr != nil || fi.Size() != 20_000 {
+			t.Errorf("resumable staging file was removed/modified (stat err=%v)", statErr)
 		}
-		if _, statErr := os.Stat(dst + ".part"); !os.IsNotExist(statErr) {
-			t.Errorf("incomplete dst.part should not exist (stat err=%v)", statErr)
+		meta, merr := readStagingMeta(staging + ".meta")
+		if merr != nil {
+			t.Fatalf("staging resume metadata was removed by the internal abort: %v", merr)
+		}
+		if got := committedTotal(meta.Ranges); got != 20_000 {
+			t.Errorf("committed bytes after the fully-committed abort = %d, want 20000", got)
 		}
 		if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
 			t.Errorf("final dst should not exist (stat err=%v)", statErr)
@@ -2400,96 +2415,12 @@ func TestDownloadMultipart_FinalizationAbortBeforeAssembly(t *testing.T) {
 
 	t.Run("user cancel still cleans up", func(t *testing.T) {
 		dst := run(t, func() error { return context.Canceled })
-		if files, _ := multipartPartFiles(dst); len(files) != 0 {
-			t.Errorf("user-cancel cleanup should remove part files, got %v", files)
+		staging := dst + ".incomplete"
+		if _, statErr := os.Stat(staging); !os.IsNotExist(statErr) {
+			t.Errorf("staging file should be removed by user-cancel cleanup (stat err=%v)", statErr)
 		}
-	})
-
-	// Mid-assembly abort: cancel partCtx while the assembly io.Copy is running.
-	// Assembly is entered after all parts are complete; the poll below waits for
-	// the intermediate dst.part to appear (a 64 MiB per-part copy takes far
-	// longer than the 1 ms poll), then cancels. This exercises the
-	// io.Copy/contextReader cancellation path and removeIncompleteAssembly. The
-	// internal abort must preserve the resumable .part-NN files and remove the
-	// incomplete dst.part.
-	t.Run("mid-assembly abort preserves parts", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		dst := filepath.Join(tmpDir, "blobs", "tmp-midabort")
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		const partSize = 64 << 20 // 64 MiB per part: assembly takes well over 1ms
-		payload := bytes.Repeat([]byte("m"), partSize)
-		if err := os.WriteFile(dst+".part-00", payload, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(dst+".part-01", payload, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := writeMultipartResumeLayout(dst, buildMultipartResumeLayout(int64(2*partSize), 2, partSize)); err != nil {
-			t.Fatal(err)
-		}
-
-		ctx, cancel := context.WithCancelCause(context.Background())
-		defer cancel(nil)
-		cfg := Settings{Concurrency: 2, Retries: 0, StallTimeout: "0"}
-		cfg.CleanupPartialsOnCancel = func() bool { return true }
-
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method == http.MethodHead {
-				w.Header().Set("Content-Length", strconv.Itoa(2*partSize))
-				w.Header().Set("Accept-Ranges", "bytes")
-				return
-			}
-			http.Error(w, "unexpected part request", http.StatusInternalServerError)
-		}))
-		defer srv.Close()
-
-		done := make(chan error, 1)
-		go func() {
-			it := PlanItem{RelativePath: "mid.bin", URL: srv.URL + "/mid.bin", Size: int64(2 * partSize), AcceptRanges: true}
-			done <- downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
-		}()
-
-		// Wait until assembly has created the intermediate dst.part, then abort.
-		waitDeadline := time.After(10 * time.Second)
-		cancelled := false
-		for !cancelled {
-			inProgress, err := os.Stat(dst + ".part")
-			if err == nil && inProgress.Size() > 0 {
-				cancel(abortError(errors.New("mid-assembly abort")))
-				cancelled = true
-				break
-			}
-			select {
-			case e := <-done:
-				t.Fatalf("downloadMultipart returned before the mid-assembly cancel landed: %v", e)
-			case <-waitDeadline:
-				t.Fatal("assembly never started; cannot exercise the mid-assembly path")
-			case <-time.After(time.Millisecond):
-			}
-		}
-
-		select {
-		case err := <-done:
-			if err == nil {
-				t.Fatal("expected a cancellation error")
-			}
-		case <-time.After(10 * time.Second):
-			t.Fatal("downloadMultipart did not terminate after the mid-assembly abort")
-		}
-
-		// Resumable part files preserved; incomplete dst.part removed; no final.
-		for _, p := range []string{dst + ".part-00", dst + ".part-01"} {
-			if fi, statErr := os.Stat(p); statErr != nil || fi.Size() != partSize {
-				t.Errorf("resumable %s was removed/modified (stat err=%v)", filepath.Base(p), statErr)
-			}
-		}
-		if _, statErr := os.Stat(dst + ".part"); !os.IsNotExist(statErr) {
-			t.Errorf("incomplete dst.part should have been removed (stat err=%v)", statErr)
-		}
-		if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
-			t.Errorf("final dst should not exist (stat err=%v)", statErr)
+		if _, statErr := os.Stat(staging + ".meta"); !os.IsNotExist(statErr) {
+			t.Errorf("staging metadata should be removed by user-cancel cleanup (stat err=%v)", statErr)
 		}
 	})
 }
@@ -2828,6 +2759,10 @@ func TestDownload_VerifyHeadAuthMiss(t *testing.T) {
 				headReqs++
 				mu.Unlock()
 				w.WriteHeader(headStatus)
+			case strings.HasSuffix(r.URL.Path, "config.json") && r.Header.Get("X-HFDesk-Addressing-Probe") == "1":
+				// Optional commit-addressing capability probe, not a payload transfer.
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(body[:1])
 			case strings.HasSuffix(r.URL.Path, "config.json"):
 				mu.Lock()
 				fileGets++

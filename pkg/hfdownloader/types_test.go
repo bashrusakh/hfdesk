@@ -17,7 +17,6 @@ func TestDefaultSettings(t *testing.T) {
 		expected interface{}
 	}{
 		{"CacheDir", cfg.CacheDir, ""},
-		{"StaleTimeout", cfg.StaleTimeout, "5m"},
 		{"Concurrency", cfg.Concurrency, 8},
 		{"MaxActiveDownloads", cfg.MaxActiveDownloads, 4},
 		{"MultipartThreshold", cfg.MultipartThreshold, "256MiB"},
@@ -47,9 +46,6 @@ func TestSettings_BuildHFCache(t *testing.T) {
 		if cache == nil {
 			t.Fatal("cache should not be nil")
 		}
-		if cache.StaleTimeout != DefaultStaleTimeout {
-			t.Errorf("StaleTimeout = %v, want %v", cache.StaleTimeout, DefaultStaleTimeout)
-		}
 	})
 
 	t.Run("custom cache dir", func(t *testing.T) {
@@ -60,52 +56,6 @@ func TestSettings_BuildHFCache(t *testing.T) {
 		}
 		if cache.Root != "/custom/path" {
 			t.Errorf("Root = %q, want /custom/path", cache.Root)
-		}
-	})
-
-	t.Run("custom stale timeout", func(t *testing.T) {
-		cfg := Settings{StaleTimeout: "10m"}
-		cache, err := cfg.BuildHFCache()
-		if err != nil {
-			t.Fatalf("BuildHFCache error: %v", err)
-		}
-		if cache.StaleTimeout != 10*time.Minute {
-			t.Errorf("StaleTimeout = %v, want 10m", cache.StaleTimeout)
-		}
-	})
-
-	t.Run("invalid stale timeout", func(t *testing.T) {
-		cfg := Settings{StaleTimeout: "invalid"}
-		_, err := cfg.BuildHFCache()
-		if err == nil {
-			t.Error("expected error for invalid stale timeout")
-		}
-	})
-
-	t.Run("various duration formats", func(t *testing.T) {
-		durations := []struct {
-			input    string
-			expected time.Duration
-		}{
-			{"1s", 1 * time.Second},
-			{"30s", 30 * time.Second},
-			{"1m", 1 * time.Minute},
-			{"5m", 5 * time.Minute},
-			{"1h", 1 * time.Hour},
-			{"1h30m", 90 * time.Minute},
-		}
-
-		for _, d := range durations {
-			t.Run(d.input, func(t *testing.T) {
-				cfg := Settings{StaleTimeout: d.input}
-				cache, err := cfg.BuildHFCache()
-				if err != nil {
-					t.Fatalf("BuildHFCache error: %v", err)
-				}
-				if cache.StaleTimeout != d.expected {
-					t.Errorf("StaleTimeout = %v, want %v", cache.StaleTimeout, d.expected)
-				}
-			})
 		}
 	})
 }

@@ -92,7 +92,7 @@ func TestSafeJoin(t *testing.T) {
 }
 
 func TestRepoRejectsTraversal(t *testing.T) {
-	c := NewHFCache("/root", 0)
+	c := NewHFCache("/root")
 	for _, bad := range []string{"../foo", "foo/..", "owner/..", "a/b/c", ""} {
 		if _, err := c.Repo(bad, RepoTypeModel); err == nil {
 			t.Errorf("Repo(%q) expected error, got nil", bad)
@@ -104,7 +104,7 @@ func TestRepoRejectsTraversal(t *testing.T) {
 }
 
 func TestRefAndSnapshotPropagateError(t *testing.T) {
-	c := NewHFCache("/root", 0)
+	c := NewHFCache("/root")
 	r, err := c.Repo("owner/name", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)

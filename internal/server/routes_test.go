@@ -5,7 +5,9 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1743,15 +1745,10 @@ func TestCreateJob_DedupDestinationIdentity_LocalDirOverride(t *testing.T) {
 	}
 }
 
-// --- PausedJob partial-cleanup destination freeze (e21c9c0 missed case) ---
-
-// seedPausedFrozenCleanupJob inserts a paused cache-mode job whose frozen
-// OutputDir points at rootDir and seeds real downloader partial artifacts
-// plus the per-job in-flight dst tracker under that same root, mirroring the
-// state cleanupPausedJobPartFiles sees for a paused job after its runJob
-// goroutine has already exited. Each dst contributes the artifact family
-// CleanupJobPartFiles removes (dst+".part", dst+".part-NN", dst+".parts.json").
-func seedPausedFrozenCleanupJob(t *testing.T, mgr *JobManager, id, repo, rootDir string) (*Job, string, []string) {
+// seedPausedFrozenCleanupJob seeds legacy artifacts plus one real cancelled v4
+// transfer under the job's frozen R/H roots. Only canonical tmp-<sha> names
+// derive blob staging; the lock_fenced-only pair is an explicit preserve control.
+func seedPausedFrozenCleanupJob(t *testing.T, mgr *JobManager, id, repo, rootDir string) (*Job, string, []string, []string) {
 	t.Helper()
 	blobsDir := filepath.Join(cacheHubLayoutDir(rootDir, repo), "blobs")
 	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
@@ -1759,17 +1756,104 @@ func seedPausedFrozenCleanupJob(t *testing.T, mgr *JobManager, id, repo, rootDir
 	}
 	dst1 := filepath.Join(blobsDir, "tmp-deadbeef00000000")
 	dst2 := filepath.Join(blobsDir, "tmp-cafebabe00000000")
-	artifacts := []string{dst1 + ".part", dst2 + ".part-00", dst2 + ".parts.json"}
-	for _, path := range artifacts {
-		if err := os.WriteFile(path, []byte("partial"), 0o644); err != nil {
+	if err := os.WriteFile(dst1+".part", []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{dst2 + ".part-00", dst2 + ".parts.json"} {
+		if err := os.WriteFile(path, []byte("legacy partial"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
+
+	// Create the positive ownership proof through the production transfer path.
+	ep, body, blobSHA, reached := cacheDownloadFixtureWithRanges(t, "pause", true)
+	dst3 := filepath.Join(blobsDir, "tmp-"+blobSHA)
+	var partialMu sync.Mutex
+	tracked := make(map[string]struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	settings := hfdownloader.Settings{
+		CacheDir:           rootDir,
+		HubDir:             filepath.Join(rootDir, "hub"),
+		Endpoint:           ep.URL,
+		Concurrency:        1,
+		MaxActiveDownloads: 1,
+		MultipartThreshold: "0",
+		Verify:             "sha256",
+		OnPartialFile: func(path string, finalized bool) {
+			partialMu.Lock()
+			defer partialMu.Unlock()
+			if finalized {
+				delete(tracked, path)
+			} else {
+				tracked[path] = struct{}{}
+			}
+		},
+	}
+	go func() {
+		done <- hfdownloader.Download(ctx, hfdownloader.Job{Repo: repo, Revision: "main"}, settings, nil)
+	}()
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("owned transfer never reached its blocked request")
+	}
+	partialMu.Lock()
+	_, trackedTransfer := tracked[dst3]
+	partialMu.Unlock()
+	if !trackedTransfer {
+		t.Fatalf("real transfer did not register its frozen destination %s", dst3)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled seed transfer error = %v, want context canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled seed transfer did not drain")
+	}
+	staging := filepath.Join(blobsDir, blobSHA+".incomplete")
+	metaPath := staging + ".meta"
+	metaBytes, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("real transfer v4 sidecar missing: %v", err)
+	}
+	var meta hfdownloader.IncompleteMeta
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta.Version != 4 || !meta.LockFenced || meta.OwnershipFence == "" || meta.SHA256 != blobSHA || meta.Size != int64(len(body)) {
+		t.Fatalf("real transfer did not leave current v4 ownership proof: %+v", meta)
+	}
+	if err := os.WriteFile(dst3, []byte("assembled temp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Retain an unproven record to verify cleanup preserves unknown ownership.
+	unprovenStaging := dst1 + ".incomplete"
+	unprovenMeta := unprovenStaging + ".meta"
+	if err := os.WriteFile(unprovenStaging, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unprovenMeta, []byte(`{"lock_fenced":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifacts := []string{
+		dst1 + ".part",
+		dst2 + ".part-00",
+		dst2 + ".parts.json",
+		dst3,
+		staging,
+		metaPath,
+	}
+	preserved := []string{unprovenStaging, unprovenMeta}
 	// A "completed" blob that must survive any cleanup.
 	if err := os.WriteFile(filepath.Join(blobsDir, "completed-blob"), []byte("done"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	tracker := map[string]struct{}{dst1: {}, dst2: {}}
+	tracker := map[string]struct{}{dst1: {}, dst2: {}, dst3: {}}
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	job := &Job{
@@ -1778,11 +1862,12 @@ func seedPausedFrozenCleanupJob(t *testing.T, mgr *JobManager, id, repo, rootDir
 		Status:          JobStatusPaused,
 		CreatedAt:       time.Now(),
 		OutputDir:       rootDir,
+		HubDir:          filepath.Join(rootDir, "hub"),
 		partialFilesPtr: &tracker,
 		partialFilesMu:  &sync.Mutex{},
 	}
 	mgr.jobs[id] = job
-	return job, blobsDir, artifacts
+	return job, blobsDir, artifacts, preserved
 }
 
 // TestJobDestFreeze_PausedCleanupTracksFrozenCacheRoot is the paused-cleanup
@@ -1791,10 +1876,10 @@ func seedPausedFrozenCleanupJob(t *testing.T, mgr *JobManager, id, repo, rootDir
 // frozen with (job.OutputDir), not the cache root currently configured in
 // settings.
 func TestJobDestFreeze_PausedCleanupTracksFrozenCacheRoot(t *testing.T) {
-	checkFrozenCleanup := func(t *testing.T, mgr *JobManager, cacheDirB, blobsA string, artifacts []string, end func(id string) bool) {
+	checkFrozenCleanup := func(t *testing.T, mgr *JobManager, cacheDirB, blobsA string, artifacts, preserved []string, end func(id string) bool) {
 		t.Helper()
 		// Partials must exist under the frozen root before the settings move.
-		for _, path := range artifacts {
+		for _, path := range append(append([]string(nil), artifacts...), preserved...) {
 			if _, err := os.Stat(path); err != nil {
 				t.Fatalf("precondition: %s should exist: %v", path, err)
 			}
@@ -1814,6 +1899,16 @@ func TestJobDestFreeze_PausedCleanupTracksFrozenCacheRoot(t *testing.T) {
 				t.Errorf("frozen-root partial %s was not cleaned up after settings moved the cache root (err=%v)", path, err)
 			}
 		}
+		for _, path := range preserved {
+			got, err := os.ReadFile(path)
+			want := []byte("partial")
+			if strings.HasSuffix(path, ".meta") {
+				want = []byte(`{"lock_fenced":true}`)
+			}
+			if err != nil || !bytes.Equal(got, want) {
+				t.Errorf("unproven ownership control %s changed: got %q err=%v", path, got, err)
+			}
+		}
 		if _, err := os.Stat(filepath.Join(blobsA, "completed-blob")); err != nil {
 			t.Errorf("completed blob should survive cleanup (err=%v)", err)
 		}
@@ -1828,12 +1923,12 @@ func TestJobDestFreeze_PausedCleanupTracksFrozenCacheRoot(t *testing.T) {
 		dirB := filepath.Join(root, "cacheB")
 		mgr := newTestJobManager(t, Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
 
-		job, blobsA, artifacts := seedPausedFrozenCleanupJob(t, mgr, "frozen-cancel", "owner/pausedfreeze", dirA)
+		job, blobsA, artifacts, preserved := seedPausedFrozenCleanupJob(t, mgr, "frozen-cancel", "owner/pausedfreeze", dirA)
 
 		// Settings move the cache root to B while the job is paused.
 		mgr.UpdateConfig(Config{CacheDir: dirB, MaxActive: 1})
 
-		checkFrozenCleanup(t, mgr, dirB, blobsA, artifacts, func(id string) bool {
+		checkFrozenCleanup(t, mgr, dirB, blobsA, artifacts, preserved, func(id string) bool {
 			if !mgr.CancelJob(job.ID) {
 				return false
 			}
@@ -1850,11 +1945,11 @@ func TestJobDestFreeze_PausedCleanupTracksFrozenCacheRoot(t *testing.T) {
 		dirB := filepath.Join(root, "cacheB")
 		mgr := newTestJobManager(t, Config{CacheDir: dirA, MaxActive: 1}, NewWSHub())
 
-		job, blobsA, artifacts := seedPausedFrozenCleanupJob(t, mgr, "frozen-dismiss", "owner/pausedfreeze", dirA)
+		job, blobsA, artifacts, preserved := seedPausedFrozenCleanupJob(t, mgr, "frozen-dismiss", "owner/pausedfreeze", dirA)
 
 		mgr.UpdateConfig(Config{CacheDir: dirB, MaxActive: 1})
 
-		checkFrozenCleanup(t, mgr, dirB, blobsA, artifacts, func(id string) bool {
+		checkFrozenCleanup(t, mgr, dirB, blobsA, artifacts, preserved, func(id string) bool {
 			res, _ := mgr.DismissJobResult(job.ID)
 			return res == DismissJobOK
 		})

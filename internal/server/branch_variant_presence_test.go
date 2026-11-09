@@ -43,7 +43,7 @@ func writePresenceRepo(t *testing.T, root, revision string) *hfdownloader.RepoDi
 		"config.json":       `{"model_type":"exl3","bits":4}`,
 		"model.safetensors": "branch-a-weights",
 	}
-	cache := hfdownloader.NewHFCacheResolved(root, "", 0)
+	cache := hfdownloader.NewHFCacheResolved(root, "")
 	repoDir, err := cache.Repo(presenceRepo, hfdownloader.RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)

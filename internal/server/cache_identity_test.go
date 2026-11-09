@@ -157,6 +157,10 @@ func TestCacheSettingsRawPreferenceAndRestart(t *testing.T) {
 // first="pause" blocks the first transfer until cancellation; first="fail"
 // fails just that run. Neither path mocks finalization or physical storage.
 func cacheDownloadFixture(t *testing.T, first string) (*httptest.Server, []byte, string, <-chan struct{}) {
+	return cacheDownloadFixtureWithRanges(t, first, false)
+}
+
+func cacheDownloadFixtureWithRanges(t *testing.T, first string, acceptRanges bool) (*httptest.Server, []byte, string, <-chan struct{}) {
 	t.Helper()
 	body := []byte("controlled complete cache weights")
 	hash := fmt.Sprintf("%x", sha256.Sum256(body))
@@ -169,6 +173,13 @@ func cacheDownloadFixture(t *testing.T, first string) (*httptest.Server, []byte,
 		case strings.Contains(r.URL.Path, "/tree/"):
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"type": "file", "path": "weights.safetensors", "size": len(body), "lfs": map[string]any{"oid": hash, "size": len(body)}}})
 		case strings.Contains(r.URL.Path, "/resolve/"):
+			if r.Header.Get("X-HFDesk-Addressing-Probe") == "1" {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(body)))
+				w.Header().Set("Content-Length", "1")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(body[:1])
+				return
+			}
 			if r.Method != "HEAD" && gets.Add(1) == 1 {
 				close(reached)
 				if first == "pause" {
@@ -182,6 +193,9 @@ func cacheDownloadFixture(t *testing.T, first string) (*httptest.Server, []byte,
 			}
 			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 			w.Header().Set("ETag", hash)
+			if acceptRanges {
+				w.Header().Set("Accept-Ranges", "bytes")
+			}
 			if r.Method != "HEAD" {
 				_, _ = w.Write(body)
 			}
@@ -217,6 +231,14 @@ func assertCacheArtifacts(t *testing.T, r, h string, body []byte, hash string) {
 	m, err := hfdownloader.ReadManifest(filepath.Join(r, "models", "owner", "model", hfdownloader.ManifestFilename))
 	if err != nil || m.TotalFiles != 1 || m.TotalSize != int64(len(body)) || m.Commit != "commit123" {
 		t.Fatalf("manifest=%+v %v", m, err)
+	}
+	if _, err := os.Stat(filepath.Join(r, "rebuild.sh")); err != nil {
+		t.Fatalf("friendly-root rebuild script missing: %v", err)
+	}
+	if filepath.Clean(r) != filepath.Clean(h) {
+		if _, err := os.Stat(filepath.Join(h, "rebuild.sh")); !os.IsNotExist(err) {
+			t.Fatalf("rebuild script was written under the Hub root instead of the friendly root: %v", err)
+		}
 	}
 }
 

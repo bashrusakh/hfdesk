@@ -357,7 +357,7 @@ func TestIntegration_HFCache(t *testing.T) {
 	}
 
 	// Now test HFCache operations
-	cache := NewHFCache(tmpDir, 5*time.Minute)
+	cache := NewHFCache(tmpDir)
 	if cache == nil {
 		t.Fatal("NewHFCache returned nil")
 	}

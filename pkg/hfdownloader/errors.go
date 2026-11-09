@@ -43,6 +43,30 @@ var (
 	// filters; path filters must use AppendFilterSubdir=false. Distinguishable
 	// via errors.Is.
 	ErrAppendFilterSubdirPathFilter = errors.New("AppendFilterSubdir cannot be combined with a path-shaped filter")
+
+	// ErrBlobOwnershipUnknown means CheckBlob could not establish whether a live
+	// owner exists. Callers must return the error, not skip; the partial is kept.
+	ErrBlobOwnershipUnknown = errors.New("the owner of the incomplete download could not be determined")
+
+	// ErrCacheLinkUnreachable means the blob exists but its requested cache path
+	// could not be linked. A disabled friendly view is not a link failure.
+	ErrCacheLinkUnreachable = errors.New("the file is in the cache but its cache path is not reachable")
+
+	// ErrCacheBlobUnavailable means a previously skipped shared blob is missing
+	// or incomplete at final reconciliation; the job fails instead of reporting
+	// the skipped file as present and reachable. Distinguishable via errors.Is.
+	ErrCacheBlobUnavailable = errors.New("a skipped file's shared blob is no longer complete in the cache")
+
+	// ErrCacheBlobCheckFailed means a previously skipped shared blob could not
+	// be re-confirmed at final reconciliation because its availability or
+	// ownership check failed; the underlying cause is wrapped. Distinguishable
+	// via errors.Is.
+	ErrCacheBlobCheckFailed = errors.New("a skipped file's shared blob could not be re-confirmed")
+
+	// ErrStagingOwnershipUnproven means a record's owner cannot be proven live or
+	// dead (for example unreadable state, or an unfenced record without death/self
+	// evidence). The pair is preserved for manual removal; use errors.Is to detect it.
+	ErrStagingOwnershipUnproven = errors.New("the staging state cannot be proven to belong to a live or dead owner")
 )
 
 // DownloadError wraps an error with file context.

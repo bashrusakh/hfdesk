@@ -4,6 +4,7 @@
 package hfdownloader
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -234,8 +235,21 @@ fi
 `
 
 // WriteRebuildScript writes the rebuild shell script to the cache directory.
-// Returns the path to the written script and any error.
+// The cache root's directory creation and the script entry itself join the
+// shared cache-mutation admission — the same scopes any other participant of
+// this cache admits — so a rebuild in one instance cannot overwrite the script
+// while another instance holds either scope. Returns the path to the written
+// script and any error.
 func (c *HFCache) WriteRebuildScript() (string, error) {
+	return c.writeRebuildScriptCtx(context.Background())
+}
+
+// writeRebuildScriptCtx is the context-bounded implementation used by the
+// downloader; the existing public context-free API remains unchanged.
+func (c *HFCache) writeRebuildScriptCtx(ctx context.Context) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	scriptPath := filepath.Join(c.Root, "rebuild.sh")
 
 	// Replace only the version marker, not shell percent expansions.
@@ -249,7 +263,8 @@ func (c *HFCache) WriteRebuildScript() (string, error) {
 		content = strings.Replace(content, `HUB_DIR="$SCRIPT_DIR/hub"`, "HUB_DIR="+quoted, 1)
 	}
 
-	// Check if script already exists and is current version
+	// Check if script already exists and is current version. An unchanged
+	// script needs no admission because nothing is mutated.
 	if existing, err := os.ReadFile(scriptPath); err == nil {
 		if string(existing) == content {
 			// Script exists and is current version
@@ -257,12 +272,22 @@ func (c *HFCache) WriteRebuildScript() (string, error) {
 		}
 	}
 
-	// Write the script
-	if err := os.MkdirAll(c.Root, 0o755); err != nil {
-		return "", err
+	// Admitted directory creation replaces the plain MkdirAll of the cache
+	// root; the write runs while this script entry's scope is held.
+	realm, err := c.ownershipRealmForFriendlyContext(ctx)
+	if err != nil {
+		return "", fmt.Errorf("admit rebuild script: %w", err)
 	}
-	if err := os.WriteFile(scriptPath, []byte(content), 0o755); err != nil {
-		return "", fmt.Errorf("write rebuild script: %w", err)
+	if err := realm.admitDirectoryCreation(ctx, []string{c.Root}, blobOwnershipWaitBudget); err != nil {
+		return "", fmt.Errorf("admit rebuild script directory: %w", err)
+	}
+	if err := withExternalWriter(ctx, realm, scriptPath, func() error {
+		if err := os.WriteFile(scriptPath, []byte(content), 0o755); err != nil {
+			return fmt.Errorf("write rebuild script: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return "", err
 	}
 
 	return scriptPath, nil
