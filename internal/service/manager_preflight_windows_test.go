@@ -1398,8 +1398,8 @@ func TestSCMInstanceStateRefusesADirectoryTheIdentityCannotUse(t *testing.T) {
 	root := t.TempDir()
 	opts := scmTestInstallOptions(t, root)
 
-	// The state directory existed before the installation. Access denial is
-	// injected through the native-query seam, without changing its ACL.
+	// Access denial is injected through the native-query seam, without
+	// changing its ACL.
 	stateDir := opts.Paths.StateDir
 	if err := os.MkdirAll(stateDir, 0o750); err != nil {
 		t.Fatalf("MkdirAll(%q) = %v, want nil", stateDir, err)
@@ -1457,8 +1457,6 @@ func TestSCMInstanceStateKeepsTheDescriptorOfAConfigFileThatExistedBefore(t *tes
 	root := t.TempDir()
 	opts := scmTestInstallOptions(t, root)
 
-	// The config directory and the config file existed before the
-	// installation.
 	configDir := filepath.Dir(opts.Paths.ConfigFile)
 	if err := os.MkdirAll(configDir, 0o750); err != nil {
 		t.Fatalf("MkdirAll(%q) = %v, want nil", configDir, err)

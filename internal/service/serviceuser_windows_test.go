@@ -197,7 +197,6 @@ func TestHoldDesktopSingletonHoldsAnObjectOfAnotherIdentityThroughReadControl(t 
 	}
 
 	release()
-	// A second release ends nothing instead of closing a handle twice.
 	release()
 
 	if handle, err := windows.OpenMutex(windows.READ_CONTROL, false, namePtr); err == nil {

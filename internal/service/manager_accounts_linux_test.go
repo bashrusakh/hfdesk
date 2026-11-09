@@ -561,8 +561,6 @@ func TestSystemdGrantInstanceDirsKeepsAWritablePreExistingDirectory(t *testing.T
 		if err := os.MkdirAll(dir.path, 0o700); err != nil {
 			t.Fatalf("create the %s %q: %v", dir.name, dir.path, err)
 		}
-		// The mode of a create call is filtered by the umask of the
-		// process, so the mode is set explicitly.
 		if err := os.Chmod(dir.path, 0o777); err != nil {
 			t.Fatalf("make the %s %q writable: %v", dir.name, dir.path, err)
 		}
@@ -605,14 +603,10 @@ func TestSystemdInstallRefusesAPreExistingDirectory(t *testing.T) {
 	}
 	account := systemdSecondAccount(t)
 
-	// The home of the user is a temporary directory, so the guard of the
-	// machine-wide scope does not refuse the paths of the test.
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
 	root := t.TempDir()
-	// The state directory exists before the installation and belongs to
-	// the user of the test: the service account cannot write into it.
 	state := filepath.Join(root, "state")
 	if err := os.Mkdir(state, 0o700); err != nil {
 		t.Fatalf("create the state directory: %v", err)
@@ -624,11 +618,6 @@ func TestSystemdInstallRefusesAPreExistingDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unitPath() = %v, want nil", err)
 	}
-	// The unit file of the machine scope lives in a fixed place of the
-	// machine. The test never writes it: the refusal happens before the
-	// unit file is written. The state of the file is compared before and
-	// after the installation, so a unit that is installed already is never
-	// touched by the test.
 	before, existedBefore, err := readUnitFile(path)
 	if err != nil {
 		t.Logf("the unit file %q cannot be read: %v", path, err)
@@ -661,7 +650,6 @@ func TestSystemdInstallRefusesAPreExistingDirectory(t *testing.T) {
 	if uid, gid := systemdOwner(t, state); uid != stateOwner || gid != stateGroup {
 		t.Errorf("the ownership of the state directory %q = %q:%q, want %q:%q", state, uid, gid, stateOwner, stateGroup)
 	}
-	// The refused installation writes no unit file.
 	after, existedAfter, err := readUnitFile(path)
 	if err != nil {
 		t.Logf("the unit file %q cannot be read: %v", path, err)
@@ -1040,8 +1028,6 @@ func TestSystemdCheckServiceAccountAccessUsesTheRealLocationOfTheDirectory(t *te
 		t.Fatalf("close the plain directory: %v", err)
 	}
 
-	// A directory outside of the state directory that the account of the
-	// check cannot write into.
 	foreign := filepath.Join(root, "foreign")
 	if err := os.Mkdir(foreign, 0o700); err != nil {
 		t.Fatalf("create the foreign directory: %v", err)
@@ -1107,8 +1093,6 @@ func TestSystemdCheckServiceAccountAccessUsesTheRealLocationOfTheDirectory(t *te
 			if err == nil {
 				t.Fatalf("checkServiceAccountAccess() = nil, want the refusal of the directory %q", tc.cache)
 			}
-			// The refusal names the directory, the account and the
-			// access that is missing.
 			message := err.Error()
 			for _, want := range []string{
 				"the service account " + strconv.Quote(other.Username),
@@ -1260,8 +1244,6 @@ func TestSystemdAccessCheckUsesTheEffectivePermission(t *testing.T) {
 			if err := os.Mkdir(dir, 0o700); err != nil {
 				t.Fatalf("create the directory: %v", err)
 			}
-			// The mode of a create call is filtered by the umask of
-			// the process, so the mode is set explicitly.
 			if err := os.Chmod(dir, tc.mode); err != nil {
 				t.Fatalf("set the mode of the directory: %v", err)
 			}
@@ -1557,8 +1539,6 @@ func TestSystemdGrantInstanceDirsUsesLoadedNativeUserAndGroup(t *testing.T) {
 func TestSystemdInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T) {
 	account := systemdSecondAccount(t)
 
-	// The home of the user is a temporary directory, so the guard of the
-	// machine-wide scope does not refuse the paths of the test.
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -1611,7 +1591,6 @@ func TestSystemdInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T) {
 	if uid, gid := systemdOwner(t, cache); uid != owner || gid != group {
 		t.Errorf("the ownership of the cache directory %q = %q:%q, want %q:%q", cache, uid, gid, owner, group)
 	}
-	// The refused installation creates no directory of the instance.
 	for _, dir := range instanceDirs(opts) {
 		if _, err := os.Stat(dir.path); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("the refused installation created the %s %q: %v", dir.name, dir.path, err)

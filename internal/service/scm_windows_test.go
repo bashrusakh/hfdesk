@@ -532,9 +532,6 @@ func TestSCMHandlerReportsACleanStopWhenTheShutdownFails(t *testing.T) {
 // code, and a failed start has to reach it even when nothing but the reported
 // status is read.
 func TestSCMHandlerReportsAFailureExitCodeWhenTheStartFails(t *testing.T) {
-	// The address of the instance is occupied by something that is not the
-	// HTTP server of the instance: the readiness fails for sure, because
-	// the port belongs to the test.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen() = %v, want nil", err)
@@ -559,9 +556,6 @@ func TestSCMHandlerReportsAFailureExitCodeWhenTheStartFails(t *testing.T) {
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	t.Cleanup(unblock)
 	handler.run = func(ctx context.Context, _ RunOptions, listening chan<- struct{}) error {
-		// The host never binds its own listener: the address of the
-		// instance belongs to the test, so the own-liveness signal
-		// stays open for the whole life of this host.
 		<-ctx.Done()
 		<-release
 		return nil
@@ -606,8 +600,6 @@ func TestSCMHandlerReportsAFailureExitCodeWhenTheHostFails(t *testing.T) {
 	fail := make(chan struct{})
 	var failOnce sync.Once
 	failHost := func() { failOnce.Do(func() { close(fail) }) }
-	// The host never outlives the test, not even when the test fails
-	// before it releases the host.
 	t.Cleanup(failHost)
 	handler := newSCMHandler(RunOptions{})
 	handler.readinessTimeout = 5 * time.Second

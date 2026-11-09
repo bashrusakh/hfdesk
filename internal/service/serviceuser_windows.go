@@ -52,7 +52,6 @@ func currentDesktopSessionIdentity() (string, uint32, error) {
 	if err != nil {
 		return "", 0, err
 	}
-	// The pseudo token of the current process needs no closing.
 	var session uint32
 	if err := windows.ProcessIdToSessionId(uint32(os.Getpid()), &session); err != nil {
 		return "", 0, fmt.Errorf("service: read the session of the process: %w", err)

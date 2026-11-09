@@ -98,9 +98,7 @@ func run(o Options, logPath string) (err error) {
 	//
 	// The shutdown is missing only while the host has not reached the
 	// server yet, and the server is started after the shutdown exists, so
-	// a missing shutdown means that no server is running: the process
-	// never ends with a running server that was not stopped through the
-	// graceful path.
+	// a missing shutdown means that no server is running.
 	guard := panicGuard{
 		logPath: logPath,
 		end: func() {
@@ -395,9 +393,7 @@ func run(o Options, logPath string) (err error) {
 			service.RemovePublishedState(statePath)
 			// The server is already serving: it is stopped through the
 			// normal path, so the jobs are quiesced, the HTTP drain
-			// runs and the job state is flushed. The wait is bounded,
-			// so a server that does not stop cannot keep the host from
-			// ending.
+			// runs and the job state is flushed.
 			stopDesktopServer(shutdown, &shutdownCoordinator)
 			closePipeline(pipeline, logFailure)
 			os.Exit(1)

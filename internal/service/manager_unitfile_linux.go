@@ -1192,8 +1192,6 @@ func systemdQuoteCommandAlways(value string) string {
 		case '\\':
 			b.WriteString(`\\`)
 		case '%':
-			// A percent sign starts a specifier of the supervisor, a
-			// doubled one is a literal percent sign.
 			b.WriteString("%%")
 		case '$':
 			// A dollar sign starts a variable of the unit, a doubled

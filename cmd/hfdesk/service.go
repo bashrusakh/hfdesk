@@ -1327,9 +1327,6 @@ func serviceRestart(args []string, stdout io.Writer) error {
 		return err
 	}
 	defer holdRelease()
-	// The command is about to start or restart the service: a desktop
-	// instance of this session that already serves the address ends the
-	// command here, before the first service step.
 	if service.LiveServingDesktop(singletonPreExisting) {
 		return servingDesktopRefusal()
 	}

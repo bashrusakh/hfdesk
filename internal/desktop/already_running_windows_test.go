@@ -54,7 +54,6 @@ func TestSecondLaunchReportsAFailedBrowserOpen(t *testing.T) {
 	openBrowser = func(string) error { return errors.New("the browser could not be started") }
 	defer func() { openBrowser = previousBrowser }()
 
-	// The message box is recorded instead of shown.
 	var messages []shownMessage
 	previousMessage := showMessage
 	showMessage = func(caption, text string, icon uint32) {

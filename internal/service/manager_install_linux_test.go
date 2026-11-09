@@ -1814,9 +1814,6 @@ func TestSystemdUpdateFailsClosedOnAnUnconfirmableSupplementaryGroupsSnapshot(t 
 			m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
 
 			requested := DefaultInstallOptions(ScopeUser, newExecutable)
-			// The write is the canonical rendering of the merged facts,
-			// the same merge the installation performs over the
-			// canonical registration on disk.
 			written := mergeInstallOptions(requested, previous, true)
 			writtenArgv := append([]string{written.Executable}, RunArgs(written)...)
 			home, homeErr := unitHomeDir(previous)

@@ -477,8 +477,6 @@ func (h *scmHandler) waitForReady(ctx context.Context, listen string, host *scmH
 			return false, err
 		case request, ok := <-r:
 			if !ok {
-				// The dispatcher closed the channel: the instance is
-				// asked to stop.
 				return true, nil
 			}
 			switch request.Cmd {

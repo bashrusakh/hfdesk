@@ -1739,7 +1739,6 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 			downloadStatus = "complete"
 		}
 	} else {
-		// No manifest - either downloaded by Python or external tool
 		downloadStatus = "unknown"
 	}
 

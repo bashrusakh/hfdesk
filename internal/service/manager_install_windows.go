@@ -765,8 +765,6 @@ func scmSupportedServiceAccount(account string) bool {
 		return true
 	}
 	if account == "" {
-		// An empty start name is how the service control manager reports
-		// the built-in LocalSystem account, not the supported identity.
 		return false
 	}
 	sid, err := scmAccountSecurityIdentifier(account)

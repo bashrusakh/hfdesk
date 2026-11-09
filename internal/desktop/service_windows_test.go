@@ -414,8 +414,6 @@ func TestLaunchWithAnUnreadableServiceStartsNoServer(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	// The launching goroutine starts a logging pipeline, so the logger of the
-	// process is put back when the test ends.
 	previousLogger := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(previousLogger) })
 
@@ -3109,8 +3107,6 @@ func TestServiceHelperRefusesAnUpdateOfARunningServiceBesideAServingDesktop(t *t
 		t.Fatalf("publish the state of the desktop instance: %v", err)
 	}
 
-	// The desktop instance of this session keeps the singleton held, so the
-	// probe around the hold of the action finds the object alive.
 	lock, err := acquireInstanceLock()
 	if err != nil {
 		t.Fatalf("acquire the desktop singleton of this session: %v", err)

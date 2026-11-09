@@ -1473,11 +1473,6 @@ func TestLaunchdSystemInstallRefusesAMissingServiceAccount(t *testing.T) {
 		t.Fatalf("newPlatformManager(ScopeSystem) = %T, want a launchd manager", manager)
 	}
 
-	// The property list of the machine-wide scope lives in a fixed place of
-	// the machine. The test never writes it: the refusal happens before
-	// the property list is written. The state of the file is compared
-	// before and after the installation, so a registration that exists
-	// already is never touched by the test.
 	path := launchd.plistPath()
 	before, err := backupPlist(path)
 	if err != nil {
@@ -1516,11 +1511,9 @@ func TestLaunchdSystemInstallRefusesAMissingServiceAccount(t *testing.T) {
 		}
 	}
 
-	// The refused installation creates no directory of the instance.
 	if _, err := os.Stat(stateDir); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("the refused installation created the state directory %q: %v", stateDir, err)
 	}
-	// The refused installation writes no property list.
 	after, err := backupPlist(path)
 	if err != nil {
 		t.Logf("the registration %q cannot be read: %v", path, err)
@@ -2077,7 +2070,6 @@ func TestLaunchdSystemInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T)
 	if owner, group := darwinOwner(t, cache); owner != beforeUID || group != beforeGID {
 		t.Errorf("the owner of the cache directory %q = %d:%d, want %d:%d", cache, owner, group, beforeUID, beforeGID)
 	}
-	// The refused installation creates no directory of the instance.
 	if _, err := os.Stat(stateDir); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("the refused installation created the state directory %q: %v", stateDir, err)
 	}
@@ -2122,8 +2114,6 @@ func TestLaunchdRefusesANamedDirTheAccountCannotWrite(t *testing.T) {
 	}
 	message := err.Error()
 
-	// The refusal names the directory, the account and the access that is
-	// missing.
 	for _, want := range []string{
 		"the service account " + strconv.Quote(account.Name),
 		strconv.Quote(cache),
@@ -2133,8 +2123,6 @@ func TestLaunchdRefusesANamedDirTheAccountCannotWrite(t *testing.T) {
 			t.Errorf("checkNamedDirs() = %q, want a message that mentions %q", message, want)
 		}
 	}
-	// The refusal never recommends a recursive ownership change of the
-	// tree.
 	if strings.Contains(message, "-R") {
 		t.Errorf("checkNamedDirs() = %q, want a message without a recursive ownership command", message)
 	}
@@ -2385,8 +2373,6 @@ func TestLaunchdCheckNamedDirsChecksAnExistingDirectoryInsideTheStateRoot(t *tes
 	// directory, and it cannot write there.
 	outsideMissing := filepath.Join(root, "outside-missing")
 
-	// A directory outside of the state directory that the account of the
-	// check cannot write into.
 	foreign := filepath.Join(root, "foreign")
 	if err := os.Mkdir(foreign, 0o700); err != nil {
 		t.Fatalf("create the foreign directory: %v", err)
@@ -2444,8 +2430,6 @@ func TestLaunchdCheckNamedDirsChecksAnExistingDirectoryInsideTheStateRoot(t *tes
 			if err == nil {
 				t.Fatalf("checkNamedDirs() = nil, want the refusal of the directory %q", tc.cache)
 			}
-			// The refusal names the directory, the account and the
-			// access that is missing.
 			message := err.Error()
 			for _, want := range []string{
 				"the service account " + strconv.Quote(account.Name),
@@ -2561,8 +2545,6 @@ func TestLaunchdAccessCheckUsesTheEffectivePermission(t *testing.T) {
 			if err := os.Mkdir(dir, 0o700); err != nil {
 				t.Fatalf("create the directory: %v", err)
 			}
-			// The mode of a create call is filtered by the umask of
-			// the process, so the mode is set explicitly.
 			if err := os.Chmod(dir, tc.mode); err != nil {
 				t.Fatalf("set the mode of the directory: %v", err)
 			}
@@ -2876,8 +2858,6 @@ func darwinScratchDir(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("create the scratch directory in %q: %v", darwinMachineTempRoot, err)
 	}
-	// The mode of a create call is filtered by the umask of the process,
-	// so the mode is set explicitly.
 	if err := os.Chmod(root, 0o755); err != nil {
 		t.Fatalf("make the scratch directory %q traversable: %v", root, err)
 	}
@@ -3324,8 +3304,6 @@ func TestLaunchdLifecycleOfAnAbsentRegistration(t *testing.T) {
 			t.Skipf("the machine has a registration at %q: the test does not touch it", path)
 		}
 
-		// The elevation requirement refuses a shell that is not
-		// elevated.
 		if err := launchd.requireElevatedFor("a stop", 501); err == nil {
 			t.Fatal("requireElevatedFor() = nil, want the refusal of a shell that is not elevated")
 		}
@@ -3783,8 +3761,6 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 		backup, _ := writeRegistration(t, launchd)
 
 		cause := errors.New("service: bootstrap " + launchd.target() + ": exit status 1")
-		// The failed attempt loaded the job: the rollback unloads it
-		// again, because it did not run before.
 		state := launchdLoadState{
 			previous:     launchdSupervisorState{loaded: false},
 			bootstrapped: true,

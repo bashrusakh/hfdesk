@@ -355,9 +355,6 @@ func (m *launchdManager) Start(ctx context.Context) error {
 		}
 		return fmt.Errorf("service: read the registration %q: %w", path, err)
 	}
-	// The elevation requirement is checked before the job is started: a
-	// permission error of the machine is a much less readable answer than
-	// the real reason.
 	if err := m.requireElevated("a start"); err != nil {
 		return err
 	}
@@ -403,9 +400,6 @@ func (m *launchdManager) Stop(ctx context.Context) error {
 		return fmt.Errorf("service: read the registration %q: %w", path, err)
 	}
 
-	// The elevation requirement is checked before the job is unloaded: a
-	// permission error of the machine is a much less readable answer than
-	// the real reason.
 	if err := m.requireElevated("a stop"); err != nil {
 		return err
 	}
@@ -464,9 +458,6 @@ func (m *launchdManager) Restart(ctx context.Context) error {
 		}
 		return fmt.Errorf("service: read the registration %q: %w", path, err)
 	}
-	// The elevation requirement is checked before the job is stopped and
-	// before the job is started: a permission error of the machine is a
-	// much less readable answer than the real reason.
 	if err := m.requireElevated("a restart"); err != nil {
 		return err
 	}
