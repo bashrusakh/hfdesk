@@ -497,12 +497,12 @@ func (m *launchdManager) Stop(ctx context.Context) error {
 	// launchd under the KeepAlive policy of the registration.
 	if _, err := m.launchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
 		if waitErr != nil {
-			return fmt.Errorf("%w (the registration could not be unloaded: %v)", waitErr, err)
+			return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the registration could not be unloaded: %v)", waitErr, err), statusReadHint)
 		}
 		return fmt.Errorf("service: bootout %s: %w", m.target(), err)
 	}
 	if waitErr != nil {
-		return fmt.Errorf("%w (the instance was unloaded anyway)", waitErr)
+		return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the instance was unloaded anyway)", waitErr), statusReadHint)
 	}
 	return nil
 }
@@ -671,7 +671,7 @@ func (m *launchdManager) requireElevatedFor(action string, uid int) error {
 	if uid == 0 {
 		return nil
 	}
-	return fmt.Errorf("service: %s in the system scope requires an elevated shell: the LaunchDaemon is registered in %s and started by the system domain, HFDesk never escalates privileges itself", action, launchDaemonsDir)
+	return AppendActionErrorIfUnnamed(fmt.Errorf("service: %s in the system scope requires an elevated shell: run the command from an elevated shell, the LaunchDaemon is registered in %s and started by the system domain, HFDesk never escalates privileges itself", action, launchDaemonsDir), statusReadHint)
 }
 
 // checkSystemPaths rejects a machine-wide installation that would reuse the
@@ -819,7 +819,7 @@ func resolveServiceAccount(opts InstallOptions) (*serviceAccount, error) {
 // commands that create it, so the administrator can run them and install
 // again.
 func missingServiceAccountError(name string) error {
-	return fmt.Errorf("service: the machine-wide instance needs the service account %q: create it with %q, %q and %q, then install again (HFDesk never creates accounts itself)",
+	return fmt.Errorf("service: the machine-wide instance needs the service account %q: create it with %q and %q, then add a UniqueID with the template command %q — the <a free numeric id> part is a placeholder: replace it with a free numeric id that is not in use — and install again (HFDesk never creates accounts itself)",
 		name,
 		fmt.Sprintf("dscl . -create /Users/%s UserShell /usr/bin/false", name),
 		fmt.Sprintf("dscl . -create /Users/%s UserHome %s", name, systemHome),
@@ -1538,7 +1538,7 @@ func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, stat
 		if state.previous.disabled {
 			base = m.restoreDisableFlag(ctx, base)
 		}
-		return fmt.Errorf("%w; %s", base, statusReadHint)
+		return AppendActionErrorIfUnnamed(base, statusReadHint)
 	}
 	// The registration of the failed attempt is unloaded when the attempt
 	// loaded the job or took over the registration of a job that was
@@ -1594,7 +1594,7 @@ func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, stat
 	// observed, and a job that was not disabled needs nothing back.
 	if state.previous.disabled {
 		if _, err := m.launchctl(ctx, "disable", m.target()); err != nil {
-			return fmt.Errorf("%w (the disable flag could not be restored: %v); %s", cause, err, statusReadHint)
+			return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the disable flag could not be restored: %v)", cause, err), statusReadHint)
 		}
 	}
 	return m.verifyRestoredRegistration(ctx, state, cause)
@@ -1628,19 +1628,19 @@ func (m *launchdManager) verifyRestoredRegistration(ctx context.Context, state l
 		// The attempt failed before it captured the state of the
 		// registration: there is nothing to compare a read back
 		// against, and the rollback claims only what it did itself.
-		return fmt.Errorf("%w (the property list was restored; the previous state of the registration was not captured); %s", cause, statusReadHint)
+		return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the property list was restored; the previous state of the registration was not captured)", cause), statusReadHint)
 	}
 	readback, err := m.supervisorState(context.WithoutCancel(ctx))
 	if err != nil {
-		return fmt.Errorf("%w (the state of the restored registration could not be read back: %v); %s", cause, err, statusReadHint)
+		return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the state of the restored registration could not be read back: %v)", cause, err), statusReadHint)
 	}
 	if readback.loaded != state.previous.loaded || readback.disabled != state.previous.disabled {
-		return fmt.Errorf("%w (the registration does not hold the previous state again); %s", cause, statusReadHint)
+		return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the registration does not hold the previous state again)", cause), statusReadHint)
 	}
 	if state.previous.running && !readback.running {
-		return fmt.Errorf("%w (the registration was restored, but the instance was not confirmed running); %s", cause, statusReadHint)
+		return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the registration was restored, but the instance was not confirmed running)", cause), statusReadHint)
 	}
-	return fmt.Errorf("%w (the registration was restored); %s", cause, statusReadHint)
+	return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the registration was restored)", cause), statusReadHint)
 }
 
 // plistBackup is the state of a property list before it was overwritten.

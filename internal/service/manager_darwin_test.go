@@ -1126,7 +1126,7 @@ func TestLaunchdMachineWideInstallNeedsAnElevatedShell(t *testing.T) {
 		if err == nil {
 			t.Fatal("requireElevatedFor() = nil, want the refusal of a shell that is not elevated")
 		}
-		want := fmt.Sprintf("service: %s in the system scope requires an elevated shell: the LaunchDaemon is registered in %s and started by the system domain, HFDesk never escalates privileges itself", action, launchDaemonsDir)
+		want := fmt.Sprintf("service: %s in the system scope requires an elevated shell: run the command from an elevated shell, the LaunchDaemon is registered in %s and started by the system domain, HFDesk never escalates privileges itself", action, launchDaemonsDir)
 		if err.Error() != want {
 			t.Errorf("requireElevatedFor() = %q, want %q", err, want)
 		}
@@ -1187,7 +1187,7 @@ func TestLaunchdMachineWideUninstallNeedsAnElevatedShell(t *testing.T) {
 		if err == nil {
 			t.Fatal("requireElevatedFor() = nil, want the refusal of a shell that is not elevated")
 		}
-		want := fmt.Sprintf("service: %s in the system scope requires an elevated shell: the LaunchDaemon is registered in %s and started by the system domain, HFDesk never escalates privileges itself", action, launchDaemonsDir)
+		want := fmt.Sprintf("service: %s in the system scope requires an elevated shell: run the command from an elevated shell, the LaunchDaemon is registered in %s and started by the system domain, HFDesk never escalates privileges itself", action, launchDaemonsDir)
 		if err.Error() != want {
 			t.Errorf("requireElevatedFor() = %q, want %q", err, want)
 		}
@@ -1530,6 +1530,8 @@ func TestLaunchdSystemInstallRefusesAMissingServiceAccount(t *testing.T) {
 		"UserHome",
 		"UniqueID",
 		"a free numeric id",
+		"template command",
+		"is a placeholder: replace it",
 		"HFDesk never creates accounts itself",
 	} {
 		if !strings.Contains(message, want) {
@@ -3419,7 +3421,7 @@ func TestLaunchdMachineWideLifecycleNeedsAnElevatedShell(t *testing.T) {
 			if err == nil {
 				t.Fatal("requireElevatedFor() = nil, want the refusal of a shell that is not elevated")
 			}
-			want := fmt.Sprintf("service: %s in the system scope requires an elevated shell: the LaunchDaemon is registered in %s and started by the system domain, HFDesk never escalates privileges itself", action, launchDaemonsDir)
+			want := fmt.Sprintf("service: %s in the system scope requires an elevated shell: run the command from an elevated shell, the LaunchDaemon is registered in %s and started by the system domain, HFDesk never escalates privileges itself", action, launchDaemonsDir)
 			if err.Error() != want {
 				t.Errorf("requireElevatedFor() = %q, want %q", err, want)
 			}
@@ -4949,6 +4951,11 @@ func TestLaunchdRefusesAnUnknownRunningFactOverALoadedJobWithoutAFile(t *testing
 		if strings.Contains(err.Error(), " or ") {
 			t.Errorf("Install() = %q, want one action instead of an alternative", err)
 		}
+		// A3: the composite wrappers serve no second route beside the
+		// refusal's own named action.
+		if strings.Contains(err.Error(), "to read the current state of the service") {
+			t.Errorf("Install() = %q, appends the state command beside the refusal's own action", err)
+		}
 	}
 	// The refused attempt guesses nothing: the loaded job is neither
 	// unloaded nor started, the disabled flag is untouched and the
@@ -5157,6 +5164,9 @@ func TestLaunchdStopDrainsAnUnknownRunningFact(t *testing.T) {
 			launchd.shutdownBudget().String(),
 			"graceful shutdown",
 			"unloaded anyway",
+			// The timeout report carries the one action: reading the
+			// state of the service shows what the instance did.
+			`run "hfdesk service status"`,
 		} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("Stop() = %q, want a message that mentions %q", err, want)
