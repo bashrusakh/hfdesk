@@ -82,6 +82,52 @@ func useFakeManager(t *testing.T, mgr service.Manager) {
 	previousHold := holdServiceMutation
 	holdServiceMutation = func(string) (func(), error) { return func() {}, nil }
 	t.Cleanup(func() { holdServiceMutation = previousHold })
+
+	// The probe reports no holder: without a holder the discriminator never
+	// reads the state file, so a test that wants a classification sets the
+	// probe itself. The real probe would create the object of this session,
+	// which the desktop package's tests of the same machine own.
+	previousProbe := probeServiceMutation
+	probeServiceMutation = func(string) (func(), bool, error) { return func() {}, false, nil }
+	t.Cleanup(func() { probeServiceMutation = previousProbe })
+}
+
+// useSingletonProbe classifies the singleton probe of the command family for
+// the duration of the test: preExisting tells the discriminator that another
+// process of the session held the object when the mutation began.
+func useSingletonProbe(t *testing.T, preExisting bool) {
+	t.Helper()
+	previous := probeServiceMutation
+	probeServiceMutation = func(string) (func(), bool, error) { return func() {}, preExisting, nil }
+	t.Cleanup(func() { probeServiceMutation = previous })
+}
+
+// useTemporaryConfigDir points the per-user configuration directory at a
+// temporary directory for the duration of the test: the discriminator reads
+// the published desktop state through the desktop package's own path, and
+// the test decides that path instead of the real configuration directory of
+// the user that runs it.
+func useTemporaryConfigDir(t *testing.T) {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	t.Setenv("HOME", root)
+	t.Setenv("AppData", root)
+	t.Setenv("LOCALAPPDATA", root)
+}
+
+// writePublishedDesktopState publishes a desktop state in the temporary
+// configuration directory of the test.
+func writePublishedDesktopState(t *testing.T) {
+	t.Helper()
+	useTemporaryConfigDir(t)
+	state := filepath.Join(server.AppConfigDir(), "desktop-state.json")
+	if err := os.MkdirAll(filepath.Dir(state), 0o755); err != nil {
+		t.Fatalf("create the temporary configuration directory: %v", err)
+	}
+	if err := os.WriteFile(state, []byte(`{"url":"http://127.0.0.1:1","pid":1}`), 0o600); err != nil {
+		t.Fatalf("publish the desktop state: %v", err)
+	}
 }
 
 // platformFactsByName holds the facts of the platforms of the service
@@ -3215,5 +3261,122 @@ func TestServiceReadAndStopPathsNeverHoldTheSingleton(t *testing.T) {
 	}
 	if record.acquired != 0 {
 		t.Errorf("the hold was acquired %d times by read and stop paths, want none", record.acquired)
+	}
+}
+
+// untouchedServiceManager fails the test when a mutation runs at all: it
+// backs the refusal beside a serving desktop, where the command must end
+// before the service is touched.
+type untouchedServiceManager struct {
+	fakeManager
+	t *testing.T
+}
+
+func (m *untouchedServiceManager) Install(context.Context, service.InstallOptions) (service.InstallOptions, error) {
+	m.t.Fatal("the installation touched the service although a desktop instance serves the address")
+	return service.InstallOptions{}, nil
+}
+
+func (m *untouchedServiceManager) Start(context.Context) error {
+	m.t.Fatal("the start touched the service although a desktop instance serves the address")
+	return nil
+}
+
+func (m *untouchedServiceManager) Restart(context.Context) error {
+	m.t.Fatal("the restart touched the service although a desktop instance serves the address")
+	return nil
+}
+
+// TestServiceMutationRefusesWhenADesktopInstanceServes proves the CLI side
+// of the boundary for every command that starts or restarts the service: a
+// mutation whose probe found a singleton holder while a desktop state is
+// published refuses with the unchanged state, the cause and one next action,
+// and the service is never touched. Without the check the command would
+// start the service beside the desktop that serves the same address.
+func TestServiceMutationRefusesWhenADesktopInstanceServes(t *testing.T) {
+	program := temporaryServiceProgram(t)
+
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"install", []string{"install", "--system", "--executable", program}},
+		{"start", []string{"start"}},
+		{"restart", []string{"restart"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useFakeManager(t, &untouchedServiceManager{
+				fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+				t:           t,
+			})
+			useSingletonProbe(t, true)
+			writePublishedDesktopState(t)
+
+			var stdout, stderr bytes.Buffer
+			code := runServiceCommand(tc.args, &stdout, &stderr)
+			if code != serviceFailureExitCode {
+				t.Fatalf("the refused command must exit with %d, got %d:\n%s", serviceFailureExitCode, code, stderr.String())
+			}
+			for _, want := range []string{
+				"nothing was changed",
+				"serves its local server",
+				"notification-area icon",
+				"run the command again",
+			} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("the refusal does not mention %q:\n%s", want, stderr.String())
+				}
+			}
+			if strings.Contains(stderr.String(), "hfdesk service status") {
+				t.Errorf("the refusal carries a second next action next to the quit of the desktop:\n%s", stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("a refused command must not report a result:\n%s", stdout.String())
+			}
+		})
+	}
+}
+
+// TestServiceMutationProceedsWhenNoDesktopInstanceServes proves the other
+// sides of the same discriminator: a probe that found no holder means the
+// published state outlived a crashed desktop and the command proceeds, and
+// a holder without a published state — the gate's launch, which never
+// publishes one — proceeds exactly as today. A discriminator that checked
+// only one of the two facts would refuse one of these commands.
+func TestServiceMutationProceedsWhenNoDesktopInstanceServes(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		preExisting bool
+		state       bool
+	}{
+		{name: "a stale state file of a crashed desktop", preExisting: false, state: true},
+		{name: "a gate launch that published no state", preExisting: true, state: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := &holdObservingManager{
+				fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+			}
+			useFakeManager(t, manager)
+			record := useRecordedHold(t)
+			manager.hold = record
+			useSingletonProbe(t, tc.preExisting)
+			if tc.state {
+				writePublishedDesktopState(t)
+			} else {
+				useTemporaryConfigDir(t)
+			}
+
+			var stdout, stderr bytes.Buffer
+			if code := runServiceCommand([]string{"start"}, &stdout, &stderr); code != 0 {
+				t.Fatalf("the command must exit with 0, got %d:\n%s", code, stderr.String())
+			}
+			if !manager.observed["start"] {
+				t.Errorf("the start did not run, observations: %v", manager.observed)
+			}
+			if record.acquired != 1 || record.released != 1 {
+				t.Errorf("the hold was acquired %d times and released %d times, want one of each",
+					record.acquired, record.released)
+			}
+		})
 	}
 }

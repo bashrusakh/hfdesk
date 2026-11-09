@@ -307,6 +307,12 @@ The **machine-wide scope** needs an **elevated shell** for `start`, `stop` and
 [Privileged operations](#privileged-operations)). The user scope needs no
 elevation: the instance belongs to the user who runs the command.
 
+On Windows, `install`, `start` and `restart` also refuse — before the
+service is touched — while a desktop instance of HFDesk serves its address:
+the service would fight that desktop for the address. The refusal changes
+nothing and names the one step that ends it: quit HFDesk from its
+notification-area icon and repeat the command.
+
 **Uninstall never deletes user data.** It removes the registration and nothing
 else: not the models, not the cache, not the config file, not the jobs or the
 history, not the logs. Removing the state of an instance is a separate,

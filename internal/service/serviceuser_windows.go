@@ -185,6 +185,46 @@ func holdDesktopSingleton(name string) (func(), error) {
 	}, nil
 }
 
+// ProbeDesktopSingleton reports whether the per-session desktop singleton
+// object already existed when this process first touched it — the evidence
+// that another HFDesk process of this session held the object at that
+// moment.
+//
+// The probe opens or creates the object and keeps it through the returned
+// release, so the object never disappears between the probe and a hold taken
+// right after it, and no desktop launch can slip in while the caller decides.
+// Callers that run a service mutation release the probe together with their
+// hold.
+//
+// The result fails closed: whenever the probe cannot prove that the object
+// did not pre-exist — an access denial, an unnameable object, any failed
+// open — it reports preExisting together with the error, so a caller never
+// mistakes an unproven freshness for proof that no desktop of this session
+// is alive.
+func ProbeDesktopSingleton(name string) (release func(), preExisting bool, err error) {
+	resolved, err := resolveDesktopSingletonName(name)
+	if err != nil {
+		return nil, true, fmt.Errorf("service: %w", err)
+	}
+	namePtr, err := desktopSingletonObjectPointer(resolved)
+	if err != nil {
+		return nil, true, fmt.Errorf("service: %w", err)
+	}
+	handle, preExisting, err := openDesktopSingletonForMutation(resolved, namePtr)
+	if handle != 0 {
+		release = func() {
+			if handle != 0 {
+				_ = windows.CloseHandle(handle)
+				handle = 0
+			}
+		}
+	}
+	if err != nil {
+		return release, true, err
+	}
+	return release, preExisting, nil
+}
+
 // desktopSingletonObjectSecurity returns the security attributes of the
 // per-session desktop singleton object.
 //

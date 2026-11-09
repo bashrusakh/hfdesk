@@ -2904,3 +2904,94 @@ func TestServiceHelperInstallSignalsReadyAfterAPassedPreflight(t *testing.T) {
 		t.Fatalf("the helper showed %v, want the report of the installation", *messages)
 	}
 }
+
+// TestServiceHelperRefusesAStartBesideAServingDesktop proves the helper side
+// of the boundary: a start whose probe around its hold found a singleton
+// holder while the session has a published state stops before the first
+// service step — only the reads of the state run — and reports the result,
+// the cause and the one next action, without a second command. The defect
+// this pins is a service started beside the desktop that already serves the
+// address; without the check the manager records the start.
+func TestServiceHelperRefusesAStartBesideAServingDesktop(t *testing.T) {
+	requireFreeSingleton(t)
+	useTemporaryStateDir(t)
+	if err := publishState(publishedStatePath(), "http://127.0.0.1:1"); err != nil {
+		t.Fatalf("publish the state of the desktop instance: %v", err)
+	}
+
+	// The desktop instance of this session keeps the singleton held, so the
+	// probe around the hold of the action finds the object alive.
+	lock, err := acquireInstanceLock()
+	if err != nil {
+		t.Fatalf("acquire the desktop singleton of this session: %v", err)
+	}
+
+	stopped := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
+	manager := &fakeServiceManager{statuses: []service.Status{stopped}}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	err = RunServiceAction(ServiceActionOptions{Action: "start"})
+	lock.Release()
+	if err == nil {
+		t.Fatal("the start ran although a desktop instance of this session serves the address")
+	}
+	for _, step := range manager.steps {
+		if step != "status" {
+			t.Fatalf("the helper touched the service before its refusal, steps: %v", manager.steps)
+		}
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the helper showed %d message boxes, want the refusal of the start", len(*messages))
+	}
+	if caption := serviceFailureCaption(serviceActionStart); (*messages)[0].caption != caption {
+		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
+	}
+	text := (*messages)[0].text
+	for _, want := range []string{
+		"could not start", "No service action was performed",
+		"serves its local server", "notification-area icon",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the report %q does not mention %q", text, want)
+		}
+	}
+	if strings.Contains(text, "hfdesk service status") {
+		t.Errorf("the report %q carries a second next action next to the quit of the desktop", text)
+	}
+	requireSingletonReleased(t)
+}
+
+// TestServiceHelperStartProceedsWhenNoDesktopHoldsTheSingleton proves the
+// preserved side of the same discriminator: a published state whose holder
+// is gone — the state file of a crashed desktop — meets a fresh probe and
+// never refuses the start, so a machine with a stale state file is not
+// blocked.
+func TestServiceHelperStartProceedsWhenNoDesktopHoldsTheSingleton(t *testing.T) {
+	requireFreeSingleton(t)
+	useTemporaryStateDir(t)
+	if err := publishState(publishedStatePath(), "http://127.0.0.1:1"); err != nil {
+		t.Fatalf("publish the stale state: %v", err)
+	}
+
+	stopped := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
+	running := runningServiceStatus(service.StateRunning, "127.0.0.1:18080")
+	manager := &fakeServiceManager{statuses: []service.Status{stopped, running}}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	if err := RunServiceAction(ServiceActionOptions{Action: "start"}); err != nil {
+		t.Fatalf("the start refused although no process of this session holds the singleton: %v", err)
+	}
+	if manager.starts != 1 {
+		t.Errorf("the helper started the service %d times, want one start", manager.starts)
+	}
+	if len(*messages) != 1 || (*messages)[0].caption != serviceStartedCaption {
+		t.Fatalf("the helper showed %v, want the report of the started service", *messages)
+	}
+	requireSingletonReleased(t)
+}

@@ -91,6 +91,38 @@ func TestRemovePublishedState(t *testing.T) {
 	}
 }
 
+// TestLiveServingDesktopNeedsBothFacts proves the discriminator of a
+// service mutation beside a desktop instance: the mutation is refused only
+// when the desktop published its state AND another process of the session
+// held the singleton when the caller probed. A state file that outlived a
+// crashed desktop meets a probe that found no holder and must not refuse;
+// a holder without a published state — the service gate's launch, which
+// never publishes one — must not refuse either.
+func TestLiveServingDesktopNeedsBothFacts(t *testing.T) {
+	previous := publishedStatePresent
+	t.Cleanup(func() { publishedStatePresent = previous })
+
+	for _, tc := range []struct {
+		name         string
+		preExisting  bool
+		statePresent bool
+		wantServing  bool
+	}{
+		{name: "a live serving desktop", preExisting: true, statePresent: true, wantServing: true},
+		{name: "a stale state file of a crashed desktop", preExisting: false, statePresent: true, wantServing: false},
+		{name: "a launch that never published a state", preExisting: true, statePresent: false, wantServing: false},
+		{name: "nothing at all", preExisting: false, statePresent: false, wantServing: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			publishedStatePresent = func() bool { return tc.statePresent }
+			if got := LiveServingDesktop(tc.preExisting); got != tc.wantServing {
+				t.Errorf("LiveServingDesktop(preExisting=%t) = %t, want %t",
+					tc.preExisting, got, tc.wantServing)
+			}
+		})
+	}
+}
+
 // TestServerReachableAnswersForALiveServer proves that a running instance is
 // recognized by its health endpoint.
 func TestServerReachableAnswersForALiveServer(t *testing.T) {

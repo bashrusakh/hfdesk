@@ -84,6 +84,13 @@ func RunServiceAction(o ServiceActionOptions) error {
 		return err
 	}
 	var handover *helperHandover
+	// singletonPreExisting carries whether the desktop singleton already
+	// existed when this action held it: together with the published state
+	// it tells the action whether a desktop instance of this session is
+	// alive and serving (see LiveServingDesktop). A handover leaves it
+	// false: its authorization already proved that the original desktop
+	// exited and removed its published state.
+	var singletonPreExisting bool
 	if o.WaitPID > 0 {
 		handover, err = prepareHelperHandover(o)
 		if err != nil {
@@ -121,15 +128,40 @@ func RunServiceAction(o ServiceActionOptions) error {
 		// it before the final notice, and the deferred close covers every
 		// other return. A hold that cannot be established refuses the
 		// action before anything is touched.
+		//
+		// The probe runs before the hold and keeps its own handle, so the
+		// object never disappears between the two and the action learns
+		// whether a desktop of this session held it — the liveness half of
+		// the check beside a serving desktop. A failed probe is classified
+		// fail-closed; the hold stays the authority on whether the action
+		// may run at all.
+		probeRelease, probeExisting, probeErr := ProbeDesktopSingleton(o.InstanceMutex)
+		if probeErr != nil {
+			probeExisting = true
+			desktopLog.Warn("the desktop singleton probe failed during the service action",
+				"action", string(action), "error", probeErr)
+		}
 		release, holdErr := holdServiceSingleton(o.InstanceMutex)
 		if holdErr != nil {
+			if probeRelease != nil {
+				probeRelease()
+			}
 			(&serviceActionReporter{action: action}).singletonHoldRefused(holdErr)
 			return holdErr
 		}
-		handover = &helperHandover{hold: release}
+		singletonPreExisting = probeExisting
+		handover = &helperHandover{hold: func() {
+			if release != nil {
+				release()
+			}
+			if probeRelease != nil {
+				probeRelease()
+			}
+		}}
 		defer handover.close()
 	}
-	return runServiceAction(action, o.Version, &serviceActionReporter{action: action, handover: handover})
+	return runServiceAction(action, o.Version,
+		&serviceActionReporter{action: action, handover: handover, singletonPreExisting: singletonPreExisting})
 }
 
 // holdServiceSingleton holds the per-session desktop singleton for a service
@@ -227,6 +259,12 @@ func installWindowsService(reporter *serviceActionReporter, version string) erro
 		return err
 	}
 
+	// The installation starts the first instance: a desktop instance that
+	// already serves the address ends the action here, before any step.
+	if LiveServingDesktop(reporter.singletonPreExisting) {
+		return reporter.servingDesktopRefused()
+	}
+
 	result, err := service.InstallAndStart(ctx, manager, opts)
 	if err != nil {
 		var startErr *service.InstallStartError
@@ -282,6 +320,14 @@ func updateWindowsService(reporter *serviceActionReporter, version string) error
 		return reporter.notInstalled()
 	}
 	wasRunning := serviceStatusRunning(before)
+
+	// The installation over a running registration stops and restarts the
+	// instance beside whatever serves the address now: a desktop instance
+	// of this session that already serves it ends the action here, before
+	// the first step.
+	if LiveServingDesktop(reporter.singletonPreExisting) {
+		return reporter.servingDesktopRefused()
+	}
 
 	installed, err := manager.Install(ctx, opts)
 	if err != nil {
@@ -345,6 +391,12 @@ func startWindowsService(reporter *serviceActionReporter) error {
 	}
 	if before.State == service.StateNotInstalled {
 		return reporter.notInstalled()
+	}
+	// The start moves the service out of its stopped state onto the
+	// address: a desktop instance of this session that already serves it
+	// ends the action here, before the start.
+	if LiveServingDesktop(reporter.singletonPreExisting) {
+		return reporter.servingDesktopRefused()
 	}
 	if err := manager.Start(ctx); err != nil {
 		reporter.failure(err, before.Executable)
@@ -475,6 +527,12 @@ func serviceWebAddress(status service.Status) string {
 type serviceActionReporter struct {
 	action   serviceAction
 	handover *helperHandover
+	// singletonPreExisting is whether the desktop singleton already existed
+	// when this action held it: with the published state it decides whether
+	// a desktop instance of this session is alive and serving (see
+	// LiveServingDesktop), and a handover action leaves it false because
+	// its authorization already proved the desktop exited.
+	singletonPreExisting bool
 }
 
 func (r *serviceActionReporter) message(caption, text string, icon uint32) {
@@ -492,6 +550,31 @@ func (r *serviceActionReporter) failure(err error, program string) {
 	}
 	desktopLog.Error("the service action failed", "action", string(r.action), "error", err, "program", program)
 	r.message(serviceFailureCaption(r.action), serviceActionFailureText(r.action, err, program), windows.MB_ICONERROR)
+}
+
+// servingDesktopRefused reports a mutation that stopped before its first
+// service step because a desktop instance of this session serves the
+// address: nothing was stopped, started or registered. The report names the
+// one step that ends the refusal — the published state of the desktop
+// disappears when it quits, and the repeat of the action then proceeds.
+func (r *serviceActionReporter) servingDesktopRefused() error {
+	desktopLog.Error("the service action refused beside a serving desktop instance",
+		"action", string(r.action))
+	r.message(serviceFailureCaption(r.action),
+		serviceServingDesktopRefusedText(r.action), windows.MB_ICONERROR)
+	return errors.New("a running HFDesk desktop instance of this session serves its local server: no service action was performed")
+}
+
+// serviceServingDesktopRefusedText returns the report of a mutation that
+// refused beside a serving desktop instance: the result (no service action
+// was performed), the cause (the desktop serves its local server) and the
+// one next action (quit the desktop, which ends the cause). The report
+// carries no second command: reading the state of the service would not end
+// the refusal.
+func serviceServingDesktopRefusedText(action serviceAction) string {
+	return serviceActionFailureHeadline(action) + "\n\n" +
+		"No service action was performed: a running HFDesk desktop instance of this session serves its local server.\n\n" +
+		"Quit HFDesk from the notification-area icon and perform the action again."
 }
 
 func (r *serviceActionReporter) handoverFailure(err error) {

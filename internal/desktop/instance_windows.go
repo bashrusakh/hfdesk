@@ -103,6 +103,15 @@ func instanceLockStartupText(err error) string {
 	return fmt.Sprintf("HFDesk could not create its single instance lock.\n\n%v", err)
 }
 
+// probeDesktopSingleton binds the state layer's singleton probe to the
+// service layer's probe on Windows, where the object exists: one
+// implementation owns the object's name, descriptor and access fallback
+// with the hold beside it, so the probe and the hold can never name or
+// secure different objects.
+func init() {
+	probeDesktopSingleton = service.ProbeDesktopSingleton
+}
+
 // currentUserSID returns the security identifier of the user of the process.
 func currentUserSID() (string, error) {
 	// The pseudo token of the current process needs no closing.

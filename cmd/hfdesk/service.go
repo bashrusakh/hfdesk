@@ -19,6 +19,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/bashrusakh/hfdesk/internal/desktop"
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/internal/service"
 )
@@ -138,6 +139,13 @@ var newServiceManager = service.New
 // the same machine could see.
 var holdServiceMutation = service.HoldDesktopSingleton
 
+// probeServiceMutation probes the per-session desktop singleton around the
+// hold, to learn whether the object already existed when the mutation began.
+//
+// The variable is the seam of the tests for the same reason the hold is
+// one: a test classifies a hold without creating the object of its session.
+var probeServiceMutation = desktop.ProbeDesktopSingleton
+
 // serviceStatusNextAction is the next action of a refusal that changed
 // nothing: the command that reads the current state of the instance. The
 // subcommand belongs to this very command family, so the refusal names a
@@ -159,22 +167,55 @@ func holdRefusalNextAction(err error) string {
 
 // beginServiceMutationHold takes the hold that keeps a relaunch of the
 // desktop app out of the window of a mutation that starts or restarts the
-// service, or refuses the command before it changes anything.
+// service, or refuses the command before it changes anything, and reports
+// whether the singleton object already existed when the hold began.
+//
+// The probe runs first and keeps its own handle: the object then never
+// disappears between the probe and the hold, so "did not pre-exist" really
+// proves that no desktop of this session was alive when the window opened,
+// and no launch can slip in while the mutation runs. A probe that fails is
+// classified fail-closed — it did not rule out a live holder — while the
+// hold below stays the authority on whether the mutation may run at all.
 //
 // The hold is taken before the first change and released when the command
-// ends, so the whole mutation — including a rollback and the restart of a
-// running instance — runs with the singleton held. A hold that cannot be
-// established fails closed: the command refuses with the reason instead of
-// moving a service a relaunch could then bind.
-func beginServiceMutationHold() (release func(), err error) {
+// ends (together with the probe handle), so the whole mutation — including a
+// rollback and the restart of a running instance — runs with the singleton
+// held. A hold that cannot be established fails closed: the command refuses
+// with the reason instead of moving a service a relaunch could then bind.
+func beginServiceMutationHold() (release func(), singletonPreExisting bool, err error) {
+	probeRelease, preExisting, probeErr := probeServiceMutation("")
+	if probeErr != nil {
+		preExisting = true
+	}
 	holdRelease, err := holdServiceMutation("")
 	if err != nil {
-		return nil, fmt.Errorf("the per-session desktop singleton must be held before a service mutation and could not be held, so nothing was changed: %w%s", err, holdRefusalNextAction(err))
+		if probeRelease != nil {
+			probeRelease()
+		}
+		return nil, false, fmt.Errorf("the per-session desktop singleton must be held before a service mutation and could not be held, so nothing was changed: %w%s", err, holdRefusalNextAction(err))
 	}
 	if holdRelease == nil {
-		return nil, errors.New("the per-session desktop singleton hold returned no release, so nothing was changed" + holdRefusalNextAction(nil))
+		if probeRelease != nil {
+			probeRelease()
+		}
+		return nil, false, errors.New("the per-session desktop singleton hold returned no release, so nothing was changed" + holdRefusalNextAction(nil))
 	}
-	return holdRelease, nil
+	return func() {
+		holdRelease()
+		if probeRelease != nil {
+			probeRelease()
+		}
+	}, preExisting, nil
+}
+
+// servingDesktopRefusal is the refusal of a mutation that is about to start
+// or restart the service while a desktop instance of this session serves
+// the address: the service would fight the desktop for it. The refusal
+// happens before the first service step, so it reports the unchanged state,
+// the cause, and the one step that ends it: quitting the desktop removes its
+// published state, and the repeat of the command then proceeds.
+func servingDesktopRefusal() error {
+	return errors.New("a running HFDesk desktop instance of this session serves its local server, so nothing was changed: quit HFDesk from the notification-area icon and run the command again")
 }
 
 // versionLikeSegment matches a "digit.digit" segment of a file name.
@@ -792,11 +833,17 @@ func serviceInstall(args []string, stdout io.Writer) error {
 	// The registration write may stop and restart a running instance, so
 	// the desktop singleton of this session is held across the whole
 	// mutation and released when the command ends.
-	holdRelease, err := beginServiceMutationHold()
+	holdRelease, singletonPreExisting, err := beginServiceMutationHold()
 	if err != nil {
 		return err
 	}
 	defer holdRelease()
+	// The command is about to start or restart the service: a desktop
+	// instance of this session that already serves the address ends the
+	// command here, before the first service step.
+	if desktop.LiveServingDesktop(singletonPreExisting) {
+		return servingDesktopRefusal()
+	}
 
 	effective, err := mgr.Install(ctx, opts)
 	if err != nil {
@@ -1191,11 +1238,17 @@ func serviceStart(args []string, stdout io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	holdRelease, err := beginServiceMutationHold()
+	holdRelease, singletonPreExisting, err := beginServiceMutationHold()
 	if err != nil {
 		return err
 	}
 	defer holdRelease()
+	// The command is about to start or restart the service: a desktop
+	// instance of this session that already serves the address ends the
+	// command here, before the first service step.
+	if desktop.LiveServingDesktop(singletonPreExisting) {
+		return servingDesktopRefusal()
+	}
 
 	if err := mgr.Start(ctx); err != nil {
 		return err
@@ -1240,11 +1293,17 @@ func serviceRestart(args []string, stdout io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	holdRelease, err := beginServiceMutationHold()
+	holdRelease, singletonPreExisting, err := beginServiceMutationHold()
 	if err != nil {
 		return err
 	}
 	defer holdRelease()
+	// The command is about to start or restart the service: a desktop
+	// instance of this session that already serves the address ends the
+	// command here, before the first service step.
+	if desktop.LiveServingDesktop(singletonPreExisting) {
+		return servingDesktopRefusal()
+	}
 
 	if err := mgr.Restart(ctx); err != nil {
 		return err

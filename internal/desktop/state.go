@@ -93,6 +93,52 @@ func removePublishedState(path string) {
 	_ = os.Remove(path)
 }
 
+// probeDesktopSingleton probes the per-session desktop singleton object of
+// this session. The variable is the platform seam: Windows binds it to the
+// service layer's probe in instance_windows.go, and a platform without the
+// desktop host has no object, so nobody can hold one and the probe reports
+// that the object did not pre-exist.
+var probeDesktopSingleton = func(string) (func(), bool, error) { return nil, false, nil }
+
+// ProbeDesktopSingleton reports whether the per-session desktop singleton
+// object already existed when this process first touched it, through the
+// probe of the platform (the service layer's probe on Windows), and returns
+// a release that keeps the object alive until the caller ends it.
+//
+// A service mutation probes before it holds: together with the published
+// state, the result tells whether a desktop instance of this session is
+// alive (see LiveServingDesktop).
+func ProbeDesktopSingleton(name string) (release func(), preExisting bool, err error) {
+	return probeDesktopSingleton(name)
+}
+
+// publishedStatePresent reports whether a desktop instance published its
+// state.
+//
+// The variable is the seam of the tests: a test drives both sides of
+// LiveServingDesktop without writing into the configuration directory of
+// the user that runs it.
+var publishedStatePresent = func() bool {
+	_, ok := readPublishedState(publishedStatePath())
+	return ok
+}
+
+// LiveServingDesktop reports whether a desktop instance of this session is
+// alive and serving: it published its state — only a started server
+// publishes one, the shutdown removes it — and another process of this
+// session held the singleton when the caller probed it around its hold.
+//
+// singletonPreExisting is the caller's ProbeDesktopSingleton result. The
+// kernel object dies with the processes that hold it, so the two facts
+// together decide both directions: a state file that outlived a crashed
+// desktop meets a probe that found no holder and never turns into a
+// refusal, while a launch that never started its server (the service gate,
+// an unreadable registration) published no state and never turns into one
+// either.
+func LiveServingDesktop(singletonPreExisting bool) bool {
+	return singletonPreExisting && publishedStatePresent()
+}
+
 // publishedURL returns the URL of the running instance, or an empty string
 // when no instance published one.
 func publishedURL() string {
