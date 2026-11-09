@@ -698,12 +698,14 @@ confirm.
   unknown enablement is never decided into an enable.
 - The property list holds the label, the program arguments and the environment
   of the instance — no credential.
-- The **macOS CI job** is narrowed to the service package: the launchd
-  manager and the property list rendering are darwin-only code, so the job
-  runs `go test ./internal/service` (plus the build and the vet of the whole
+- The **macOS CI job** is narrowed to the service package and the command
+  layer: the launchd manager and the property list rendering are
+  darwin-only code, so the job runs `go test ./internal/service` and
+  `go test ./cmd/hfdesk` (plus the build and the vet of the whole
   module) on a macOS runner. The repository has never run its full suite on
-  macOS, so the job covers the darwin-only code only; widening it to the full
-  suite is a separate, deliberate step.
+  macOS, so the job covers the darwin-only code and the platform-independent
+  command layer, not the full suite; widening it to the full suite is a
+  separate, deliberate step.
 
 #### Future app-bundle packaging
 
