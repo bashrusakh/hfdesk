@@ -1133,18 +1133,26 @@ type launchdInstallPlan struct {
 // whether the attempt loaded the job and whether it took over the
 // registration of a job that was loaded already.
 //
-// The plan itself fails closed on a fact the supervisor does not report: an
-// output that names neither a state nor a process id leaves the running
-// state of the instance undetermined, and the installation refuses instead
-// of treating a possibly running instance as stopped — the stopped-instance
-// branch would unload a job that may run and leave the instance down.
+// An update over a loaded registration fails closed on a fact the supervisor
+// does not report: an output that names neither a state nor a process id
+// leaves the running state of the instance undetermined, and the update
+// refuses instead of treating a possibly running instance as stopped — the
+// stopped-instance branch would unload a job that may run and leave the
+// instance down. A first installation has no previous running state to give
+// back: whichever branch it takes, it ends with the property list it just
+// wrote loaded and its RunAtLoad deciding the start, so an unknown fact
+// cannot leave a stopped instance behind there and does not refuse the
+// installation.
 func (m *launchdManager) load(ctx context.Context, path string, plan launchdInstallPlan) (launchdLoadState, error) {
 	previous, err := m.supervisorState(ctx)
 	if err != nil {
 		return launchdLoadState{}, err
 	}
 	state := launchdLoadState{previous: previous, previousKnown: true}
-	if previous.loaded && !previous.runningKnown {
+	// The refusal belongs to the update over a loaded registration: there
+	// the unknown fact decides between the restart of a running instance
+	// and the unload of a stopped one, and the wrong guess loses it.
+	if !plan.firstInstall && previous.loaded && !previous.runningKnown {
 		return state, fmt.Errorf("service: the installation was refused: the supervisor reports neither a state nor a process id for %s, so whether the instance runs cannot be determined. Stop the instance with %q and run %q again",
 			m.target(), "hfdesk service stop", "hfdesk service install")
 	}
