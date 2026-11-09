@@ -3707,13 +3707,14 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 
 		cause := errors.New("service: bootstrap " + launchd.target() + ": exit status 1")
 		state := launchdLoadState{
-			previous:     launchdSupervisorState{loaded: true},
-			bootstrapped: true,
-			replaced:     true,
+			previous:      launchdSupervisorState{loaded: true},
+			previousKnown: true,
+			bootstrapped:  true,
+			replaced:      true,
 		}
-		err := launchd.rollback(context.Background(), backup, state, cause)
-		if !errors.Is(err, cause) {
-			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
+		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		if !errors.Is(rollbackErr, cause) {
+			t.Errorf("rollback() = %v, want the cause of the failed installation", rollbackErr)
 		}
 
 		// The property list is restored.
@@ -3737,8 +3738,8 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 		if !reflect.DeepEqual(fake.commands, want) {
 			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
 		}
-		if !strings.Contains(err.Error(), "(the registration was restored)") {
-			t.Errorf("rollback() = %v, want the outcome that names the restored registration", err)
+		if !strings.Contains(rollbackErr.Error(), "(the registration was restored)") {
+			t.Errorf("rollback() = %v, want the outcome that names the restored registration", rollbackErr)
 		}
 	})
 
@@ -3750,12 +3751,14 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 
 		cause := errors.New("service: bootstrap " + launchd.target() + ": exit status 1")
 		state := launchdLoadState{
-			previous:     launchdSupervisorState{loaded: true, disabled: true},
-			bootstrapped: true,
-			replaced:     true,
+			previous:      launchdSupervisorState{loaded: true, disabled: true},
+			previousKnown: true,
+			bootstrapped:  true,
+			replaced:      true,
 		}
-		if err := launchd.rollback(context.Background(), backup, state, cause); !errors.Is(err, cause) {
-			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
+		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		if !errors.Is(rollbackErr, cause) {
+			t.Errorf("rollback() = %v, want the cause of the failed installation", rollbackErr)
 		}
 
 		want := []string{
@@ -3767,6 +3770,9 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 		}
 		if !reflect.DeepEqual(fake.commands, want) {
 			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
+		}
+		if !strings.Contains(rollbackErr.Error(), "(the registration was restored)") {
+			t.Errorf("rollback() = %v, want the outcome that names the restored registration", rollbackErr)
 		}
 	})
 
@@ -3785,21 +3791,22 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 
 		cause := errors.New("service: bootstrap " + launchd.target() + ": exit status 1")
 		state := launchdLoadState{
-			previous:     launchdSupervisorState{loaded: true},
-			bootstrapped: true,
-			replaced:     true,
+			previous:      launchdSupervisorState{loaded: true},
+			previousKnown: true,
+			bootstrapped:  true,
+			replaced:      true,
 		}
-		err := launchd.rollback(context.Background(), backup, state, cause)
-		if !errors.Is(err, cause) {
-			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
+		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		if !errors.Is(rollbackErr, cause) {
+			t.Errorf("rollback() = %v, want the cause of the failed installation", rollbackErr)
 		}
-		if !strings.Contains(err.Error(), "could not be loaded") {
-			t.Errorf("rollback() = %v, want a message that names the failed restore of the registration", err)
+		if !strings.Contains(rollbackErr.Error(), "could not be loaded") {
+			t.Errorf("rollback() = %v, want a message that names the failed restore of the registration", rollbackErr)
 		}
 		// The rollback stopped at the failed step: it never claims a
 		// restoration it did not prove by reading the registration back.
-		if strings.Contains(err.Error(), "was restored") {
-			t.Errorf("rollback() = %v, want no restoration outcome for a rollback that failed", err)
+		if strings.Contains(rollbackErr.Error(), "was restored") {
+			t.Errorf("rollback() = %v, want no restoration outcome for a rollback that failed", rollbackErr)
 		}
 		// The property list is restored even then.
 		content, err := os.ReadFile(path)
@@ -3821,11 +3828,13 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 
 		cause := errors.New("service: bootstrap " + launchd.target() + ": exit status 1")
 		state := launchdLoadState{
-			previous:     launchdSupervisorState{loaded: false},
-			bootstrapped: true,
+			previous:      launchdSupervisorState{loaded: false},
+			previousKnown: true,
+			bootstrapped:  true,
 		}
-		if err := launchd.rollback(context.Background(), backup, state, cause); !errors.Is(err, cause) {
-			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
+		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		if !errors.Is(rollbackErr, cause) {
+			t.Errorf("rollback() = %v, want the cause of the failed installation", rollbackErr)
 		}
 
 		want := []string{
@@ -3835,6 +3844,9 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 		}
 		if !reflect.DeepEqual(fake.commands, want) {
 			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
+		}
+		if !strings.Contains(rollbackErr.Error(), "(the registration was restored)") {
+			t.Errorf("rollback() = %v, want the outcome that names the restored registration", rollbackErr)
 		}
 	})
 
@@ -3869,9 +3881,10 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 
 		cause := errors.New("service: bootstrap " + launchd.target() + ": exit status 1")
 		state := launchdLoadState{
-			previous:     launchdSupervisorState{loaded: true, running: true},
-			bootstrapped: true,
-			replaced:     true,
+			previous:      launchdSupervisorState{loaded: true, running: true},
+			previousKnown: true,
+			bootstrapped:  true,
+			replaced:      true,
 		}
 		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
 		if !errors.Is(rollbackErr, cause) {
