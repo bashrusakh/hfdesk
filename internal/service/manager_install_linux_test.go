@@ -1778,11 +1778,13 @@ func TestSystemdUpdateVerifiesThePreservedAndRequestedFields(t *testing.T) {
 // the incomplete answer skipped the check and rows 1 and 2 succeeded end to
 // end, and a symmetric "both answers must be present" rule refused row 3.
 func TestSystemdUpdateFailsClosedOnAnUnconfirmableSupplementaryGroupsSnapshot(t *testing.T) {
+	confirmedGroups := []string{"users", "video"}
 	cases := []struct {
-		name       string
-		snapshot   func(map[string]dbus.Variant)
-		omitAnswer bool
-		cause      string // empty: the update must succeed
+		name          string
+		snapshot      func(map[string]dbus.Variant)
+		omitAnswer    bool
+		confirmAnswer func(map[string]dbus.Variant)
+		cause         string // empty: the update must succeed
 	}{
 		{
 			name: "the snapshot expected groups the incomplete answer cannot confirm",
@@ -1790,17 +1792,26 @@ func TestSystemdUpdateFailsClosedOnAnUnconfirmableSupplementaryGroupsSnapshot(t 
 				properties["SupplementaryGroups"] = dbus.MakeVariant([]string{"operator"})
 			},
 			omitAnswer: true,
-			cause:      "systemd did not preserve the loaded supplementary groups",
+			cause:      "systemd did not confirm the loaded supplementary groups after the update",
 		},
 		{
 			name:       "the snapshot established an empty list the incomplete answer cannot confirm",
 			omitAnswer: true,
-			cause:      "systemd did not preserve the loaded supplementary groups",
+			cause:      "systemd did not confirm the loaded supplementary groups after the update",
 		},
 		{
 			name: "an absent snapshot optional stays absent",
 			snapshot: func(properties map[string]dbus.Variant) {
 				delete(properties, "SupplementaryGroups")
+			},
+		},
+		{
+			name: "the answer confirms the populated groups the snapshot established",
+			snapshot: func(properties map[string]dbus.Variant) {
+				properties["SupplementaryGroups"] = dbus.MakeVariant(confirmedGroups)
+			},
+			confirmAnswer: func(properties map[string]dbus.Variant) {
+				properties["SupplementaryGroups"] = dbus.MakeVariant(confirmedGroups)
 			},
 		},
 	}
@@ -1830,13 +1841,16 @@ func TestSystemdUpdateFailsClosedOnAnUnconfirmableSupplementaryGroupsSnapshot(t 
 			if tc.omitAnswer {
 				delete(answeredProperties, "SupplementaryGroups")
 			}
+			if tc.confirmAnswer != nil {
+				tc.confirmAnswer(answeredProperties)
+			}
 			setSystemdTypedPropertySequence(t, m, oldProperties, answeredProperties, oldProperties)
 			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 
 			_, err := m.Install(context.Background(), requested)
 			if tc.cause == "" {
 				if err != nil {
-					t.Fatalf("Install() = %v, want the absent snapshot optional to stay unchecked", err)
+					t.Fatalf("Install() = %v, want the verification to accept the answer that shows no drift", err)
 				}
 				content, readErr := os.ReadFile(unitPath)
 				if readErr != nil || string(content) == previousUnit || parseUnit(string(content)).Program != newExecutable {

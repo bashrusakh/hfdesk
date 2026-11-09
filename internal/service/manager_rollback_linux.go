@@ -44,6 +44,11 @@ func (m *systemdManager) verifyUpdatedUnit(ctx context.Context, opts InstallOpti
 	// The snapshot established the groups, so an answer after the write
 	// that cannot confirm them fails closed instead of passing as no drift.
 	if previous.loaded.supplementaryGroupsKnown && (!loaded.supplementaryGroupsKnown || !slices.Equal(loaded.supplementaryGroups, previous.loaded.supplementaryGroups)) {
+		// A missing answer cannot confirm the snapshot; only an answer
+		// that came back and disagrees is observed drift.
+		if !loaded.supplementaryGroupsKnown {
+			return errors.New("service: systemd did not confirm the loaded supplementary groups after the update")
+		}
 		return errors.New("service: systemd did not preserve the loaded supplementary groups")
 	}
 	if !opts.Explicit.StateDir && loaded.workingDirectory != previous.loaded.workingDirectory {
