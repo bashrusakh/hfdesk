@@ -16,29 +16,26 @@ import (
 	"slices"
 )
 
-// verifyUpdatedUnit checks the command and preserved launch settings after
-// daemon-reload and before a running instance can be restarted.
-func (m *systemdManager) verifyUpdatedUnit(ctx context.Context, opts InstallOptions, account *user.User, previous previousRegistration, unitContent string) error {
+// verifyUpdatedUnit checks the loaded configuration after daemon-reload and
+// before a running instance can be restarted (V1).
+//
+// ExecStart is the strict-owned field: what the supervisor loads must be the
+// canonical command that was just written, typed property by typed
+// property. Every other launch field is preserved: WorkingDirectory, User,
+// Group, the environment and the environment files must equal their
+// pre-update snapshot unless the matching request flag was named — an
+// administrator drop-in layer therefore survives the write byte for byte in
+// its effective value, while a named flag is held to the value it asked for.
+func (m *systemdManager) verifyUpdatedUnit(ctx context.Context, opts InstallOptions, account *user.User, previous previousRegistration, written canonicalUnit) error {
 	loaded, err := m.registrationUnitConfig(ctx)
 	if err != nil {
 		return fmt.Errorf("service: read the loaded configuration after daemon-reload: %w", err)
 	}
-	updatedUnit := parseUnit(unitContent)
-	if err := loadedMatchesUnit(loaded, updatedUnit); err != nil {
-		return errors.New("service: systemd did not load the requested executable and arguments; an override may own the effective command")
+	if err := loadedMatchesCanonicalCommand(loaded, written); err != nil {
+		return fmt.Errorf("service: systemd did not load the canonical command that was written; an override may own the effective ExecStart: %w", err)
 	}
 	if !previous.loadedKnown || !previous.loaded.loaded {
 		return nil
-	}
-	for flag, dynamic := range updatedUnit.DynamicRunArgs {
-		if !dynamic || systemdInstallFlagExplicit(opts, flag) {
-			continue
-		}
-		before := runArgValue(previous.loaded.execArgs[1:], "--"+flag)
-		after := runArgValue(loaded.execArgs[1:], "--"+flag)
-		if before != after {
-			return fmt.Errorf("service: systemd's typed --%s argument changed across the update", flag)
-		}
 	}
 	if !slices.Equal(loaded.environment, previous.loaded.environment) || !slices.Equal(loaded.environmentFiles, previous.loaded.environmentFiles) {
 		return errors.New("service: systemd did not preserve the loaded environment and environment files")
@@ -93,15 +90,11 @@ func (m *systemdManager) restorePreviousRegistration(ctx context.Context, previo
 	if _, err := m.runSystemctl(cleanup, "restart", unitName); err != nil {
 		return fmt.Errorf("the registration was restored, but the restart of the previous instance was refused: %w", err)
 	}
-	// The restored unit supplies its static Listen source, while the restored
-	// MainPID must still expose a live HFDesk service-run argv before readiness
-	// can be claimed, even when the old ExecStart path was unavailable.
-	sourceContent, ok := previous.sourceUnitContent()
-	if !ok {
-		return errors.New("the source fragment of the previous registration was not captured")
-	}
-	restored := parseUnit(string(sourceContent))
-	if _, err := m.verifyRunningExecutableWithListenSource(cleanup, restored.ExecStart, restored.listen(), "", restored.DynamicRunArgs["listen"]); err != nil {
+	// The restored canonical unit supplies its static Listen source, while
+	// the restored MainPID must still expose a live HFDesk service-run argv
+	// before readiness can be claimed, even when the old ExecStart path was
+	// unavailable.
+	if _, err := m.verifyRunningExecutableWithListenSource(cleanup, previous.facts.executable, previous.facts.listen, "", false); err != nil {
 		return fmt.Errorf("the registration was restored and the restart of the previous instance was issued, but the restart was not confirmed: %w", err)
 	}
 	return nil
@@ -178,11 +171,7 @@ func (m *systemdManager) rollbackUnit(ctx context.Context, previous previousRegi
 			if !loaded.loaded {
 				return errors.New("the restored unit remains unknown to systemd")
 			}
-			sourceContent, ok := previous.sourceUnitContent()
-			if !ok {
-				return errors.New("the source fragment of the previous unit was not captured")
-			}
-			if err := loadedMatchesUnit(loaded, parseUnit(string(sourceContent))); err != nil {
+			if err := loadedMatchesCanonicalCommand(loaded, previous.facts); err != nil {
 				return fmt.Errorf("the restored unit file is present but its command did not load: %w", err)
 			}
 		}

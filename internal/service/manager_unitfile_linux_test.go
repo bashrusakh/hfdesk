@@ -663,6 +663,12 @@ func TestSystemdRunFlagEditorTreatsOptionValueAsDistinctFromTerminator(t *testin
 	}
 }
 
+// TestSystemdInstallInsertsExplicitOptionBeforeTerminator checks that a
+// hand-written base file with a "--" terminator is refused as not the unit
+// HFDesk generates, before anything changes: the flag editor that inserted
+// an option into an arbitrary source is gone, and an update over a base
+// file HFDesk did not render is a detector-A refusal with the single next
+// action of the ownership contract.
 func TestSystemdInstallInsertsExplicitOptionBeforeTerminator(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	systemdTempInstallEnvironment(t)
@@ -671,10 +677,6 @@ func TestSystemdInstallInsertsExplicitOptionBeforeTerminator(t *testing.T) {
 	state := filepath.Join(root, "state")
 	logs := filepath.Join(root, "logs")
 	content := "[Service]\nExecStart=/bin/true service run --config " + config + " --state-dir " + state + " --log-dir " + logs + " --\nWorkingDirectory=" + root + "\n[Install]\nWantedBy=default.target\n"
-	baseline, err := ParseRunArgs(parseUnit(content).ExecArgs)
-	if err != nil {
-		t.Fatalf("baseline ParseRunArgs() = %v", err)
-	}
 
 	manager := &systemdManager{scope: ScopeUser}
 	path, err := manager.unitPath()
@@ -693,31 +695,30 @@ func TestSystemdInstallInsertsExplicitOptionBeforeTerminator(t *testing.T) {
 	requested := DefaultInstallOptions(ScopeUser, "/bin/true")
 	requested.Listen = "127.0.0.1:19222"
 	requested.Explicit.Listen = true
-	installed, err := manager.Install(context.Background(), requested)
-	if err != nil {
-		t.Fatalf("Install() = %v", err)
+	_, err = manager.Install(context.Background(), requested)
+	assertSingleDropInAction(t, err, path)
+	if !strings.Contains(err.Error(), "is not the unit HFDesk generates") {
+		t.Errorf("Install() = %q, want the cause to name the non-generated unit file", err)
 	}
-	stored, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
+
+	stored, readErr := os.ReadFile(path)
+	if readErr != nil || string(stored) != content {
+		t.Errorf("the refused update changed the unit (read error %v):\n%s", readErr, stored)
 	}
-	updatedArgs := parseUnit(string(stored)).ExecArgs
-	parsed, err := ParseRunArgs(updatedArgs)
-	if err != nil {
-		t.Fatalf("successful Install() wrote an invalid ParseRunArgs vector: %v\n%s", err, stored)
-	}
-	baseline.Listen = requested.Listen
-	if !reflect.DeepEqual(parsed, baseline) || installed.Listen != requested.Listen {
-		t.Errorf("installed options = %+v / returned listen %q, want %+v", parsed, installed.Listen, baseline)
-	}
-	if !strings.Contains(string(stored), "--log-dir "+logs+" --listen 127.0.0.1:19222 --\n") {
-		t.Errorf("explicit flag was not inserted before the true terminator:\n%s", stored)
-	}
-	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 0 {
-		t.Errorf("stopped service was restarted %d times", got)
+	calls := systemdSupervisorCalls(t, logPath)
+	for _, command := range [][]string{{"daemon-reload"}, {"enable", unitName}, {"restart", unitName}} {
+		if got := systemdSupervisorCallsTo(calls, command...); got != 0 {
+			t.Errorf("the refused update issued %q %d times: %v", strings.Join(command, " "), got, calls)
+		}
 	}
 }
 
+// TestSystemdExecutableUpdatePreservesInheritedStatePathAndIndependentWorkingDirectory
+// checks that a hand-written base file with a WorkingDirectory independent of
+// the state path is refused as not the unit HFDesk generates: an independent
+// working directory is an administrator layer that belongs in the drop-in,
+// not in the base file, so no update rewrites such a base file and the state
+// data behind the inherited path stays untouched.
 func TestSystemdExecutableUpdatePreservesInheritedStatePathAndIndependentWorkingDirectory(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	systemdTempInstallEnvironment(t)
@@ -738,13 +739,6 @@ func TestSystemdExecutableUpdatePreservesInheritedStatePathAndIndependentWorking
 	}
 	content := "[Service]\nExecStart=/bin/true service run --config \"" + config + "\" --state-dir \"" + state + "\" --log-dir \"" + logs + "\"\n" +
 		"WorkingDirectory=" + workingDirectory + "\nRestart=on-failure\n[Install]\nWantedBy=default.target\n"
-	baseline, err := ParseRunArgs(parseUnit(content).ExecArgs)
-	if err != nil || baseline.Paths.StateDir != state {
-		t.Fatalf("baseline app argv = %+v, %v; want trailing-space state %q", baseline, err, state)
-	}
-	if _, err := os.Stat(filepath.Join(root, "state")); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("trimmed state-path decoy exists before update: %v", err)
-	}
 
 	manager := &systemdManager{scope: ScopeUser}
 	unitPath, err := manager.unitPath()
@@ -760,33 +754,20 @@ func TestSystemdExecutableUpdatePreservesInheritedStatePathAndIndependentWorking
 	setSystemdTestPropertyReader(t, manager)
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 
-	installed, err := manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, "/bin/echo"))
-	if err != nil {
-		t.Fatalf("executable-only Install() rejected the inherited state path: %v", err)
+	_, err = manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, "/bin/echo"))
+	assertSingleDropInAction(t, err, unitPath)
+	if !strings.Contains(err.Error(), "is not the unit HFDesk generates") {
+		t.Errorf("Install() = %q, want the cause to name the non-generated unit file", err)
 	}
-	if installed.Paths.StateDir != state {
-		t.Fatalf("Install() state dir = %q, want the unchanged app path %q", installed.Paths.StateDir, state)
+	stored, readErr := os.ReadFile(unitPath)
+	if readErr != nil || string(stored) != content {
+		t.Errorf("the refused update changed the unit (read error %v):\n%s", readErr, stored)
 	}
-	stored, err := os.ReadFile(unitPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	updated := parseUnit(string(stored))
-	parsed, err := ParseRunArgs(updated.ExecArgs)
-	if err != nil || parsed.Paths.StateDir != state {
-		t.Fatalf("updated app argv = %+v, %v; want unchanged state %q", parsed, err, state)
-	}
-	if updated.WorkingDirectory != workingDirectory || !strings.Contains(string(stored), "WorkingDirectory="+workingDirectory+"\n") {
-		t.Fatalf("executable-only update changed independent WorkingDirectory %q:\n%s", workingDirectory, stored)
-	}
-	if after, err := os.ReadFile(dataPath); err != nil || !bytes.Equal(after, data) {
-		t.Errorf("state data changed: %q, %v", after, err)
-	}
-	if _, err := os.Stat(filepath.Join(root, "state")); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("update created the trimmed state-path decoy: %v", err)
+	if after, readErr := os.ReadFile(dataPath); readErr != nil || !bytes.Equal(after, data) {
+		t.Errorf("state data changed: %q, %v", after, readErr)
 	}
 	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 0 {
-		t.Errorf("stopped unit was restarted %d times", got)
+		t.Errorf("the refused update restarted the stopped unit %d times", got)
 	}
 }
 
@@ -1266,22 +1247,26 @@ func TestSystemdStoredUnloadedUpdateKeepsHexEscapedConfigPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	installed, err := manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, "/bin/true"))
-	if err != nil {
-		t.Fatalf("Install() = %v, want a stopped stored-unit update", err)
+	if _, err := manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, "/bin/true")); err == nil {
+		t.Fatal("Install() = nil, want the refusal of the hex-escaped base file")
+	} else {
+		assertSingleDropInAction(t, err, path)
+		if !strings.Contains(err.Error(), "is not the unit HFDesk generates") {
+			t.Errorf("Install() = %q, want the cause to name the non-generated unit file", err)
+		}
 	}
-	if installed.Paths.ConfigFile != config {
-		t.Errorf("Install() changed the unnamed config path: got %q, want %q", installed.Paths.ConfigFile, config)
+	updated, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
 	}
-	updated, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := parseUnit(string(updated)).paths().ConfigFile; got != config {
-		t.Errorf("updated unit config path = %q, want %q", got, config)
+	if string(updated) != content {
+		t.Errorf("the refused update changed the unit:\n%s", updated)
 	}
 	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 0 {
-		t.Errorf("stored but unloaded unit was restarted %d times", got)
+		t.Errorf("the refused update restarted the unit %d times", got)
+	}
+	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "daemon-reload"); got != 0 {
+		t.Errorf("the refused update reloaded the supervisor %d times", got)
 	}
 }
 
@@ -1508,10 +1493,13 @@ func TestSystemdInstallRefusesUnrewritableExecStartBeforeChangingTheUnit(t *test
 			if err == nil {
 				t.Fatal("Install() = nil, want the refusal of the shell-wrapped ExecStart")
 			}
-			for _, want := range []string{"ExecStart=", "/bin/sh -c", "not changed", newExecutable} {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("Install() = %q, want it to contain %q", err, want)
-				}
+			// Detector A subsumes the old rewrite refusal: an ExecStart=
+			// the renderer never wrote is a hand-edited base file, so the
+			// refusal states the non-generated unit and the single next
+			// action of the ownership contract.
+			assertSingleDropInAction(t, err, unitPath)
+			if !strings.Contains(err.Error(), "is not the unit HFDesk generates") {
+				t.Errorf("Install() = %q, want the cause to name the non-generated unit file", err)
 			}
 			content, readErr := os.ReadFile(unitPath)
 			if readErr != nil || string(content) != wrapped {
@@ -1528,14 +1516,12 @@ func TestSystemdInstallRefusesUnrewritableExecStartBeforeChangingTheUnit(t *test
 }
 
 // TestSystemdInstallRefusesAnUnverifiableRunningExecStartBeforeChangingTheUnit
-// checks the rule that an update which must verify a running start requires a
-// verifiable existing command: a hand-edited registration whose ExecStart=
-// cannot show the live process the canonical "service run" vector with its
-// required flags is refused before anything changes — no stop, no unit write,
-// no restart — while the stopped instance of the same command keeps updating.
-// The refusal names the found command, the canonical vector as the next
-// action, and states that neither the registration nor the running service
-// was touched.
+// checks that a hand-edited registration whose ExecStart= cannot show the
+// live process — the program alone or a run vector without the required
+// flags — is refused before anything changes, whether the instance runs or
+// is stopped: the case is subsumed by detector A, so the refusal names the
+// non-generated unit file and the single next action, and neither the
+// registration nor the running service is touched.
 func TestSystemdInstallRefusesAnUnverifiableRunningExecStartBeforeChangingTheUnit(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -1569,10 +1555,13 @@ func TestSystemdInstallRefusesAnUnverifiableRunningExecStartBeforeChangingTheUni
 			if err == nil {
 				t.Fatal("Install() = nil, want the refusal of the unverifiable running command")
 			}
-			for _, want := range []string{"was refused", "not changed", "not stopped", value, "service run", "--config", newExecutable} {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("Install() = %q, want it to contain %q", err, want)
-				}
+			// The unverifiable-command case is subsumed by detector A:
+			// a command without the canonical run vector is not the unit
+			// HFDesk generates, so the refusal fires before any stop or
+			// write and carries the one next action of the contract.
+			assertSingleDropInAction(t, err, unitPath)
+			if !strings.Contains(err.Error(), "is not the unit HFDesk generates") {
+				t.Errorf("Install() = %q, want the cause to name the non-generated unit file", err)
 			}
 			content, readErr := os.ReadFile(unitPath)
 			if readErr != nil || string(content) != edited {
@@ -1588,22 +1577,21 @@ func TestSystemdInstallRefusesAnUnverifiableRunningExecStartBeforeChangingTheUni
 	}
 }
 
-// TestSystemdInstallUpdatesAnUnverifiableCommandOfAStoppedInstance checks
-// the preserved side of the rule: a stopped instance has no start to verify,
-// so the same hand-edited commands keep updating exactly as before — the
-// program slot takes the new program, the run vector stays as it is, and
-// nothing is started.
-func TestSystemdInstallUpdatesAnUnverifiableCommandOfAStoppedInstance(t *testing.T) {
+// TestSystemdInstallRefusesAnUnverifiableCommandOfAStoppedInstance checks
+// that detector A does not spare the stopped instance: a hand-edited
+// command the restart verification could never prove — the program alone or
+// a run vector without the required flags — is refused before anything
+// changes instead of being rewritten, and the refusal carries the single
+// next action of the ownership contract.
+func TestSystemdInstallRefusesAnUnverifiableCommandOfAStoppedInstance(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		tail      string
-		wantExtra string
+		name string
+		tail string
 	}{
 		{name: "the program alone"},
 		{
-			name:      "a run vector without the required flags",
-			tail:      " service run --listen 127.0.0.1:19090",
-			wantExtra: " service run --listen 127.0.0.1:19090",
+			name: "a run vector without the required flags",
+			tail: " service run --listen 127.0.0.1:19090",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1622,21 +1610,22 @@ func TestSystemdInstallUpdatesAnUnverifiableCommandOfAStoppedInstance(t *testing
 			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 			t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
 
-			if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
-				t.Fatalf("Install() = %v, want the stopped update of an unverifiable command accepted", err)
+			_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+			if err == nil {
+				t.Fatal("Install() = nil, want the refusal of the unverifiable stopped command")
+			}
+			assertSingleDropInAction(t, err, unitPath)
+			if !strings.Contains(err.Error(), "is not the unit HFDesk generates") {
+				t.Errorf("Install() = %q, want the cause to name the non-generated unit file", err)
 			}
 			content, readErr := os.ReadFile(unitPath)
-			if readErr != nil {
-				t.Fatalf("read the updated unit: %v", readErr)
-			}
-			want := `ExecStart="` + newExecutable + `"` + tc.wantExtra
-			if !strings.Contains(string(content), want) {
-				t.Errorf("the updated unit does not hold %q:\n%s", want, content)
-			}
-			if strings.Contains(string(content), oldExecutable) {
-				t.Errorf("the updated unit still names the old program %q:\n%s", oldExecutable, content)
+			if readErr != nil || string(content) != edited {
+				t.Errorf("the refused update changed the unit: read err=%v\n%s", readErr, content)
 			}
 			calls := systemdSupervisorCalls(t, logPath)
+			if count := systemdSupervisorCallsTo(calls, "daemon-reload"); count != 0 {
+				t.Errorf("the refused update reloaded the supervisor %d times:\n%s", count, strings.Join(calls, "\n"))
+			}
 			for _, command := range []string{"restart", "start"} {
 				if count := systemdSupervisorCallsTo(calls, command, unitName); count != 0 {
 					t.Errorf("a stopped instance was %sed %d times:\n%s", command, count, strings.Join(calls, "\n"))
@@ -1646,12 +1635,14 @@ func TestSystemdInstallUpdatesAnUnverifiableCommandOfAStoppedInstance(t *testing
 	}
 }
 
-// TestSystemdInstallRepairsAnEnvWrappedExecStart checks the rewrite the
-// update promises for a recognized wrapper: the "env" prefix and its
-// arguments stay, the program slot takes the new program, the run arguments
-// and the other directives keep the registration's settings, and the stopped
-// instance is not started.
-func TestSystemdInstallRepairsAnEnvWrappedExecStart(t *testing.T) {
+// TestSystemdInstallRefusesAnEnvWrappedExecStart checks the D-6 rule: an
+// "env"-wrapped ExecStart= in the base file is a hand edit under detector A
+// and the update is refused before anything changes, instead of the old
+// repair that rewrote the program slot behind the wrapper. The refusal
+// states the non-generated unit and the one next action — move the
+// customization into the administrator drop-in — and the stopped instance
+// is never started.
+func TestSystemdInstallRefusesAnEnvWrappedExecStart(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	root := t.TempDir()
 	oldExecutable := systemdTestExecutable(t)
@@ -1668,35 +1659,22 @@ func TestSystemdInstallRepairsAnEnvWrappedExecStart(t *testing.T) {
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
 
-	if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
-		t.Fatalf("Install() = %v, want the preserved env-wrapped update", err)
+	_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of the env-wrapped base file")
 	}
-	content, err := os.ReadFile(unitPath)
-	if err != nil {
-		t.Fatalf("read the updated unit: %v", err)
+	assertSingleDropInAction(t, err, unitPath)
+	if !strings.Contains(err.Error(), "is not the unit HFDesk generates") {
+		t.Errorf("Install() = %q, want the cause to name the non-generated unit file", err)
 	}
-
-	// The promised rewrite: wrapper prefix kept, program slot replaced,
-	// every run argument behind it untouched.
-	want := `ExecStart=/usr/bin/env HF_HOME=/srv/hfdesk "` + newExecutable + `"` + tail
-	if !strings.Contains(string(content), want) {
-		t.Errorf("the updated unit does not hold the promised command %q:\n%s", want, content)
-	}
-	if strings.Contains(string(content), oldExecutable) {
-		t.Errorf("the updated unit still names the old program %q:\n%s", oldExecutable, content)
-	}
-	for _, kept := range []string{
-		"WorkingDirectory=" + previous.Paths.StateDir,
-		"Restart=on-failure",
-		"Environment=HOME=",
-		"--listen " + previous.Listen,
-		"--cache-dir " + previous.CacheDir,
-	} {
-		if !strings.Contains(string(content), kept) {
-			t.Errorf("the env-wrapped update lost %q:\n%s", kept, content)
-		}
+	content, readErr := os.ReadFile(unitPath)
+	if readErr != nil || string(content) != wrapped {
+		t.Errorf("the refused update changed the unit: read err=%v\n%s", readErr, content)
 	}
 	calls := systemdSupervisorCalls(t, logPath)
+	if count := systemdSupervisorCallsTo(calls, "daemon-reload"); count != 0 {
+		t.Errorf("the refused update reloaded the supervisor %d times:\n%s", count, strings.Join(calls, "\n"))
+	}
 	for _, command := range []string{"restart", "start"} {
 		if count := systemdSupervisorCallsTo(calls, command, unitName); count != 0 {
 			t.Errorf("a stopped instance was %sed %d times:\n%s", command, count, strings.Join(calls, "\n"))
@@ -1704,15 +1682,13 @@ func TestSystemdInstallRepairsAnEnvWrappedExecStart(t *testing.T) {
 	}
 }
 
-// TestSystemdUpdateOfARunningEnvWrappedExecStartPassesVerification checks
-// the verification a stopped instance never reaches: a running registration
-// whose command carries a recognized "env" wrapper is rewritten onto the new
-// program, restarted, and accepted. The supervisor reports the wrapper as the
-// path it executes, so the verification must compare the program slot of the
-// registered command — comparing the wrapper path would burn the wait, report
-// a failure and roll the update back although env really started the new
-// program.
-func TestSystemdUpdateOfARunningEnvWrappedExecStartPassesVerification(t *testing.T) {
+// TestSystemdUpdateOfARunningEnvWrappedExecStartRefusesBeforeTheRestart
+// checks the D-6 rule on the side a stopped instance never reaches: a
+// running registration whose base file carries an "env" wrapper is refused
+// by detector A before the running instance is stopped — no probe of the
+// instance, no restart, no write — and the wrapper stays exactly where the
+// administrator put it.
+func TestSystemdUpdateOfARunningEnvWrappedExecStartRefusesBeforeTheRestart(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	root := t.TempDir()
 	oldExecutable := systemdTestExecutable(t)
@@ -1749,33 +1725,28 @@ func TestSystemdUpdateOfARunningEnvWrappedExecStartPassesVerification(t *testing
 	t.Cleanup(func() { serviceInstallProbe = previousInstallProbe })
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
-	// The supervisor reports the loaded command of the rewrite: the
-	// wrapper path with the new program behind it.
-	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXEC_START", "/usr/bin/env HF_HOME=/srv/hfdesk "+newExecutable+tail)
 
-	if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
-		t.Fatalf("Install() = %v, want the running env-wrapped update accepted without rollback", err)
+	_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of the env-wrapped base file")
 	}
-	if !slices.Equal(probedListen, []string{previous.Listen}) {
-		t.Errorf("readiness probes = %v, want the registered address %q", probedListen, previous.Listen)
+	assertSingleDropInAction(t, err, unitPath)
+	if !strings.Contains(err.Error(), "is not the unit HFDesk generates") {
+		t.Errorf("Install() = %q, want the cause to name the non-generated unit file", err)
 	}
-
-	content, err := os.ReadFile(unitPath)
-	if err != nil {
-		t.Fatalf("read the updated unit: %v", err)
+	if len(probedListen) != 0 {
+		t.Errorf("the refused update probed the running instance at %v before it refused", probedListen)
 	}
-	want := `ExecStart=/usr/bin/env HF_HOME=/srv/hfdesk "` + newExecutable + `"` + tail
-	if !strings.Contains(string(content), want) {
-		t.Errorf("the updated unit does not hold the promised command %q:\n%s", want, content)
+	content, readErr := os.ReadFile(unitPath)
+	if readErr != nil || string(content) != wrapped {
+		t.Errorf("the refused update changed the unit: read err=%v\n%s", readErr, content)
 	}
-	if strings.Contains(string(content), oldExecutable) {
-		t.Errorf("the updated unit still names the old program %q:\n%s", oldExecutable, content)
-	}
-	// A failed verification would restore the previous registration and
-	// restart the previous instance: exactly one restart is the update.
 	calls := systemdSupervisorCalls(t, logPath)
-	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 1 {
-		t.Errorf("the unit was restarted %d times, want exactly once for the accepted update:\n%s", got, strings.Join(calls, "\n"))
+	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 0 {
+		t.Errorf("the refused update restarted the unit %d times:\n%s", got, strings.Join(calls, "\n"))
+	}
+	if got := systemdSupervisorCallsTo(calls, "stop", unitName); got != 0 {
+		t.Errorf("the refused update stopped the unit %d times:\n%s", got, strings.Join(calls, "\n"))
 	}
 }
 
@@ -1835,7 +1806,7 @@ WorkingDirectory=/srv/state
 		}
 	})
 
-	t.Run("an update reports the preserved registration", func(t *testing.T) {
+	t.Run("an update refuses the wrapped unit", func(t *testing.T) {
 		logPath := systemdRecordingSupervisor(t)
 		root := t.TempDir()
 		oldExecutable := systemdTestExecutable(t)
@@ -1852,14 +1823,14 @@ WorkingDirectory=/srv/state
 		t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 		t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
 
-		effective, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
-		if err != nil {
-			t.Fatalf("Install() = %v, want the update of the wrapped unit", err)
+		_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+		if err == nil {
+			t.Fatal("Install() = nil, want the detector-A refusal of the wrapped unit")
 		}
-		want := previous
-		want.Executable = newExecutable
-		if !reflect.DeepEqual(effective, want) {
-			t.Errorf("Install() returned\n%+v\nwant the preserved registration\n%+v", effective, want)
+		assertSingleDropInAction(t, err, unitPath)
+		content, readErr := os.ReadFile(unitPath)
+		if readErr != nil || string(content) != wrapped {
+			t.Errorf("the refused update changed the unit: read err=%v\n%s", readErr, content)
 		}
 		if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 0 {
 			t.Errorf("the stopped instance was restarted %d times", got)
@@ -1910,20 +1881,11 @@ func newSystemdLosslessUpdateFixture(t *testing.T) systemdLosslessUpdateFixture 
 	previous.HubDir = filepath.Join(previous.CacheDir, `hub "quoted"`)
 	previous.LocalDir = ""
 	manager, unitPath, previousUnit := systemdExistingInstallation(t, previous)
-
-	command := "ExecStart=" + systemdExecStart(previous)
-	withEmptyArgument := command + ` --local-dir ""`
-	previousUnit = strings.Replace(previousUnit, command, withEmptyArgument, 1)
-	environmentLine := `Environment=HFDSK_TEST_LABEL="value with spaces and \"quotes\""`
-	previousUnit = strings.Replace(previousUnit, "Environment=HOME=", environmentLine+"\nEnvironment=HOME=", 1)
-	previousUnit = strings.Replace(previousUnit, "\n\n[Install]", "\nEnvironmentFile=-/etc/hfdesk/service.env\n\n[Install]", 1)
-	loadedPath := os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")
-	for _, path := range []string{unitPath, loadedPath} {
-		if err := os.WriteFile(path, []byte(previousUnit), 0o644); err != nil {
-			t.Fatalf("write the independently-authored unit %q: %v", path, err)
-		}
-	}
-
+	// The base file stays the canonical rendering: settings beyond it — an
+	// extra environment line and an environment file — live in the
+	// supervisor-loaded layer the typed properties below report, so the
+	// fixture pins preservation across a canonical rewrite without a
+	// hand-edited base file.
 	home, err := unitHomeDir(previous)
 	if err != nil {
 		t.Fatalf("unitHomeDir() = %v", err)
@@ -1931,11 +1893,9 @@ func newSystemdLosslessUpdateFixture(t *testing.T) systemdLosslessUpdateFixture 
 	environment := []string{`HFDSK_TEST_LABEL=value with spaces and "quotes"`, "HOME=" + home}
 	environmentFiles := []systemdEnvironmentFile{{Path: "/etc/hfdesk/service.env", IgnoreErrors: true}}
 	oldArgv := append([]string{oldExecutable}, RunArgs(previous)...)
-	oldArgv = append(oldArgv, "--local-dir", "")
 	updated := previous
 	updated.Executable = newExecutable
 	newArgv := append([]string{newExecutable}, RunArgs(updated)...)
-	newArgv = append(newArgv, "--local-dir", "")
 	return systemdLosslessUpdateFixture{
 		logPath:       logPath,
 		manager:       manager,
@@ -2065,6 +2025,13 @@ func newSystemdDynamicPathFixture(t *testing.T) systemdDynamicPathFixture {
 	}
 }
 
+// TestSystemdUpdatePreservesDynamicNativeOperands checks the D-6 family on
+// dynamic operands: a base file whose operands carry specifiers or
+// environment references is not the unit HFDesk generates, so every update
+// over it — loaded or stored-but-unloaded, executable-only or with a named
+// flag — is refused before any change instead of preserving the source
+// expressions, and the file stays byte for byte as the administrator wrote
+// it.
 func TestSystemdUpdatePreservesDynamicNativeOperands(t *testing.T) {
 	for _, test := range []struct {
 		name     string
@@ -2094,45 +2061,17 @@ func TestSystemdUpdatePreservesDynamicNativeOperands(t *testing.T) {
 				requested.Paths.ConfigFile = fixture.explicitConfig
 				requested.Explicit.Config = true
 			}
-			installed, err := fixture.manager.Install(context.Background(), requested)
-			if err != nil {
-				t.Fatalf("Install() = %v, want the native dynamic operands to survive", err)
+			_, err := fixture.manager.Install(context.Background(), requested)
+			if err == nil {
+				t.Fatal("Install() = nil, want the refusal of the dynamic base file")
 			}
-			wantConfig := fixture.configSource
-			if test.explicit {
-				wantConfig = fixture.explicitConfig
+			assertSingleDropInAction(t, err, fixture.unitPath)
+			if !strings.Contains(err.Error(), "is not the unit HFDesk generates") {
+				t.Errorf("Install() = %q, want the cause to name the non-generated unit file", err)
 			}
-			if installed.Executable != fixture.newExecutable || installed.Paths.ConfigFile != wantConfig || installed.Paths.StateDir != fixture.stateSource || installed.Paths.LogDir != fixture.logDir || installed.CacheDir != fixture.cacheSource || installed.HubDir != fixture.hubSource || installed.LocalDir != fixture.localSource {
-				t.Errorf("Install() = %+v, want executable %q and source-preserved config/state/cache operands", installed, fixture.newExecutable)
-			}
-			updated, err := os.ReadFile(fixture.unitPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			text := string(updated)
-			for _, preserved := range []string{
-				"--state-dir=\"" + fixture.stateSource + "\"",
-				"--log-dir=" + fixture.logDir,
-				"--cache-dir=" + fixture.cacheSource,
-				"--hub-dir=" + fixture.hubSource,
-				"--local-dir=" + fixture.localSource,
-				"WorkingDirectory=%h",
-				"Environment=HF_CONFIG=\"config with spaces\"",
-				"Environment=HF_CACHE=\"" + filepath.Join(fixture.root, "cache with spaces") + "\"",
-				"Environment=HF_HUB=\"" + filepath.Join(fixture.root, "hub with spaces") + "\"",
-				"Environment=HF_LOCAL=\"" + filepath.Join(fixture.root, "models with spaces") + "\"",
-			} {
-				if !strings.Contains(text, preserved) {
-					t.Errorf("updated source lost unresupplied native operand/setting %q:\n%s", preserved, text)
-				}
-			}
-			if !test.explicit && !strings.Contains(text, "--config \""+fixture.configSource+"\"") {
-				t.Errorf("unmarked config expression was re-encoded or replaced:\n%s", text)
-			}
-			if test.explicit {
-				if strings.Contains(text, fixture.configSource) || !strings.Contains(text, systemdQuoteCommand(fixture.explicitConfig)) {
-					t.Errorf("explicit config resupply did not affect only the config operand:\n%s", text)
-				}
+			updated, readErr := os.ReadFile(fixture.unitPath)
+			if readErr != nil || string(updated) != fixture.sourceUnit {
+				t.Errorf("the refused update changed the unit (read error %v):\n%s", readErr, updated)
 			}
 			for _, unresolved := range []string{"${HF_CONFIG}", "${HF_CACHE}", "${HF_HUB}", "${HF_LOCAL}", "%h", "%n"} {
 				if _, err := os.Stat(filepath.Join(fixture.root, unresolved)); !errors.Is(err, fs.ErrNotExist) {
@@ -2140,16 +2079,18 @@ func TestSystemdUpdatePreservesDynamicNativeOperands(t *testing.T) {
 				}
 			}
 			if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, fixture.logPath), "restart", unitName); got != 0 {
-				t.Errorf("stopped/unloaded registration was restarted %d times", got)
+				t.Errorf("the refused update restarted the registration %d times", got)
 			}
 		})
 	}
 }
 
-// TestSystemdReinstallRefusesAShadowedLoadedCommand checks that a registration
-// whose effective loaded command differs from its unit file is not updated by
-// silently changing only the base file. The fake keeps the same executable and
-// listen address but gives the loaded command a different config and environment.
+// TestSystemdReinstallRefusesAShadowedLoadedCommand checks that a
+// registration whose effective loaded command differs from its unit file —
+// a drop-in owning the strict-owned ExecStart — is not updated by silently
+// changing only the base file (detector B). The refusal happens before any
+// mutation, names the DropInPaths the supervisor reports, and the base file
+// and the loaded override both stay exactly as they were.
 func TestSystemdReinstallRefusesAShadowedLoadedCommand(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	root := t.TempDir()
@@ -2183,6 +2124,7 @@ func TestSystemdReinstallRefusesAShadowedLoadedCommand(t *testing.T) {
 	}
 	loadedEnvironment := []string{"HF_HUB_CACHE=/operator/hub", "HOME=" + home}
 	loadedProperties := systemdTypedProperties(oldExecutable, loadedArgv, loadedEnvironment, previous.Paths.StateDir, "", "", nil)
+	loadedProperties["DropInPaths"] = dbus.MakeVariant([]string{unitDropInPath(unitPath)})
 	m.readServiceProperties = func(context.Context, string) (map[string]dbus.Variant, error) {
 		return loadedProperties, nil
 	}
@@ -2192,9 +2134,13 @@ func TestSystemdReinstallRefusesAShadowedLoadedCommand(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want refusal of the shadowed loaded command")
 	}
-	if !strings.Contains(err.Error(), "differs from its unit file") {
+	if !strings.Contains(err.Error(), "is not the command in its unit file") {
 		t.Errorf("Install() = %q, want an error that identifies the loaded command mismatch", err)
 	}
+	if !strings.Contains(err.Error(), unitDropInPath(unitPath)) {
+		t.Errorf("Install() = %q, want the refusal to name the DropInPaths the supervisor reported", err)
+	}
+	assertSingleDropInAction(t, err, unitPath)
 
 	content, readErr := os.ReadFile(unitPath)
 	if readErr != nil {

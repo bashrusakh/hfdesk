@@ -1604,18 +1604,23 @@ func TestSystemdDynamicListenUpdateUsesTheRunningProcessArgv(t *testing.T) {
 		t.Fatalf("runtime argv Listen = %q, want effective process address %q", runtimeOptions.Listen, listen)
 	}
 
-	if _, err := manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
-		t.Fatalf("Install() = %v, want the actual HFDesk process readiness probe to pass", err)
+	if _, err := manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err == nil {
+		t.Fatal("Install() = nil, want the detector-A refusal of the dynamic Listen source")
+	} else {
+		assertSingleDropInAction(t, err, unitPath)
+		if !strings.Contains(err.Error(), "is not the unit HFDesk generates") {
+			t.Errorf("Install() = %q, want the cause to name the non-generated unit file", err)
+		}
 	}
 	installed, err := os.ReadFile(unitPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(installed), "${HF_LISTEN}") || !strings.Contains(string(installed), "Environment=HF_LISTEN="+listen) {
-		t.Errorf("updated source did not preserve the dynamic Listen expression and Environment value:\n%s", installed)
+		t.Errorf("the refused update changed the dynamic Listen source:\n%s", installed)
 	}
-	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 1 {
-		t.Errorf("restart count = %d, want one update restart", got)
+	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 0 {
+		t.Errorf("restart count = %d, want no restart on a refusal", got)
 	}
 }
 

@@ -7,7 +7,6 @@ package service
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -791,6 +790,66 @@ func unitFileUnchanged(snapshot []byte, snapshotExists bool, current []byte, cur
 	return snapshotExists == currentExists && bytes.Equal(snapshot, current)
 }
 
+// canonicalUnitForInstall builds the canonical fact model of the unit an
+// installation writes: the merged options plus the HOME and the account
+// identity the installation already resolved, so the rendering resolves
+// nothing and stays byte deterministic.
+func canonicalUnitForInstall(opts InstallOptions, account *user.User) (canonicalUnit, error) {
+	home, err := unitHomeDir(opts)
+	if err != nil {
+		return canonicalUnit{}, err
+	}
+	u := canonicalUnit{
+		scope:      opts.Scope,
+		executable: opts.Executable,
+		paths:      opts.Paths,
+		listen:     opts.Listen,
+		cacheDir:   opts.CacheDir,
+		hubDir:     opts.HubDir,
+		localDir:   opts.LocalDir,
+		home:       home,
+	}
+	if opts.Scope != ScopeSystem {
+		return u, nil
+	}
+	name := serviceAccountName(opts)
+	if name == "" {
+		return canonicalUnit{}, errors.New("service: the machine-wide instance needs a service account")
+	}
+	u.user = name
+	if account != nil {
+		// The group of the unit is the primary group of the account,
+		// exactly as unitIdentity renders it; a group the machine does
+		// not know is left out instead of guessed.
+		if group, err := user.LookupGroupId(account.Gid); err == nil && group.Name != "" {
+			u.group = group.Name
+		}
+	}
+	return u, nil
+}
+
+// registrationOptions returns the installation options the canonical facts
+// register, so an update over an existing registration merges with what the
+// file really holds: every unmarked request field keeps the registered value.
+func (u canonicalUnit) registrationOptions() InstallOptions {
+	opts := u.installOptions()
+	// A user scope unit names no account: it runs as the user of the
+	// session, and an account of the request never applies to it.
+	if u.scope == ScopeSystem {
+		opts.ServiceUser = u.user
+	}
+	return opts
+}
+
+// unitChangedDuringUpdateRefusal states the result, the cause and the one
+// next action of the guard that protects the atomic write: the file moved
+// out from under the snapshot this update read, so the write is refused
+// instead of overwriting a change the update never saw.
+func unitChangedDuringUpdateRefusal(unitPath string) error {
+	return fmt.Errorf("service: the update was refused and the registration was not changed: the unit file %q changed while the update was running. Run %q again",
+		unitPath, "hfdesk service install")
+}
+
 type systemdDirectiveChange struct {
 	value  string
 	remove bool
@@ -899,11 +958,11 @@ func systemdExecStartValue(content string) (string, bool) {
 	return "", false
 }
 
-// validateSystemdExecStartUpdate refuses, before the installation changes
-// anything, an ExecStart= form that cannot be rewritten into the new
-// registration. updateSystemdExecStartSource applies the same rule when it
-// rewrites the line, so a registration is never left with a command the
-// merge corrupted.
+// validateSystemdExecStartUpdate reports an ExecStart= form the directive
+// editor cannot rewrite into the new program. The installation itself no
+// longer reaches the editor — detector A refuses every base file the
+// renderer did not write — so this rule now guards only the editor helpers
+// their grammar tests still exercise, until the editor is deleted.
 func validateSystemdExecStartUpdate(content, executable string) error {
 	value, ok := systemdExecStartValue(content)
 	if !ok {
@@ -1063,72 +1122,6 @@ func shownSystemdCommand(tokens []systemdWord) string {
 		shown = append(shown, token.source)
 	}
 	return strings.Join(shown, " ")
-}
-
-// systemdExecStartVerifiable reports whether the registered command can be
-// verified after a restart: the verification reads the argv of the live
-// process and accepts only what ParseRunArgs accepts, so the command must
-// carry the canonical "service run" vector with every flag of
-// requiredRunFlags — the same list the parser enforces. The program alone and
-// a run vector missing one of those flags can start, but can never be
-// verified. An unrecognized shape is refused by the rewrite rule before this
-// predicate runs.
-func systemdExecStartVerifiable(tokens []systemdWord) bool {
-	slot, ok := systemdExecStartSlot(tokens)
-	if !ok || len(tokens) <= 1 {
-		return false
-	}
-	// A recognized command of more than one word carries "service run"
-	// right behind the program slot, exactly as the runtime argv does.
-	args := make([]string, 0, len(tokens)-1-slot)
-	for _, token := range tokens[slot+1:] {
-		args = append(args, token.value)
-	}
-	parsed := parseRunArgValues(args)
-	for _, name := range requiredRunFlags {
-		if runOptionValue(parsed, name) == "" {
-			return false
-		}
-	}
-	return true
-}
-
-// systemdUnverifiableRunningRefusal reports a recognized ExecStart= command
-// whose start HFDesk cannot verify for the instance it finds running. Like
-// systemdExecStartRefusal the error states the result (nothing was changed,
-// nothing was stopped), the cause (the command it found, named in the
-// message) and the next action.
-func systemdUnverifiableRunningRefusal(tokens []systemdWord, executable string) error {
-	required := "--" + strings.Join(requiredRunFlags, " --")
-	return fmt.Errorf("service: the update was refused: the registration was not changed and the running service was not stopped. The existing ExecStart=%q does not carry \"service run\" with the required flags %s, so HFDesk cannot verify the start of this command. Set the ExecStart= line to start with the program %q followed by \"service run\" and the required flags %s (an \"env\" prefix before the program is kept) and run the update again",
-		shownSystemdCommand(tokens), required, executable, required)
-}
-
-// refuseUnverifiableRunningExecStart applies the rule that an update which
-// must verify a running start requires a verifiable existing command: a
-// restart of a command without the canonical run vector would be followed by
-// a verification that can only fail, and only after the working instance was
-// already restarted. The refusal happens before any mutation; a stopped
-// instance has no start to verify and keeps updating as before. The state is
-// asked of the supervisor only for a command the rule may refuse, so a
-// verifiable registration gains no new supervisor interaction.
-func (m *systemdManager) refuseUnverifiableRunningExecStart(ctx context.Context, content, executable string) error {
-	value, ok := systemdExecStartValue(content)
-	if !ok {
-		return nil
-	}
-	tokens := splitSystemdWordTokens(strings.TrimSpace(value))
-	if len(tokens) == 0 || systemdExecStartVerifiable(tokens) {
-		return nil
-	}
-	running, err := m.registrationRunning(ctx)
-	if err != nil {
-		return err
-	}
-	if !running {
-		return nil
-	}
-	return systemdUnverifiableRunningRefusal(tokens, executable)
 }
 
 func systemdSourceWord(source string) systemdWord {

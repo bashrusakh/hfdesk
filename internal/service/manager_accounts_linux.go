@@ -573,15 +573,11 @@ func systemdCreatedDirsSafeToRemove(previous previousRegistration, created map[s
 	if !previous.loadedKnown || !previous.loaded.loaded {
 		return false
 	}
-	sourceContent, sourceKnown := previous.sourceContent, previous.sourceKnown
-	if !sourceKnown && previous.existed {
-		sourceContent, sourceKnown = previous.content, true
-	}
-	if !sourceKnown || !previous.loaded.dropInPathsKnown || len(previous.loaded.dropInPaths) > 0 || systemdUnitHasEnvironmentFiles(sourceContent) || systemdUnitHasUnmodeledLaunchDirective(sourceContent) || len(previous.loaded.environmentFiles) > 0 {
+	if !previous.existed || !previous.loaded.dropInPathsKnown || len(previous.loaded.dropInPaths) > 0 || systemdUnitHasEnvironmentFiles(previous.content) || systemdUnitHasUnmodeledLaunchDirective(previous.content) || len(previous.loaded.environmentFiles) > 0 {
 		return false
 	}
 
-	unit := parseUnit(string(sourceContent))
+	unit := parseUnit(string(previous.content))
 	var referenced []string
 	for _, flag := range []string{"config", "state-dir", "log-dir", "cache-dir", "hub-dir", "local-dir"} {
 		if unit.DynamicRunArgs[flag] {

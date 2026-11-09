@@ -20,6 +20,12 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
+// TestSystemdVerifiedRollbackRetainsPathsReferencedByPreviousNativeDirective
+// checks that a verified rollback still refuses to remove directories the
+// prior registration may reference: the base file is canonical, and the
+// administrator layer a drop-in provides is exactly the uncertainty that
+// keeps the created candidate paths, so rollback restores the saved bytes,
+// proves the loaded configuration, and retains the directories.
 func TestSystemdVerifiedRollbackRetainsPathsReferencedByPreviousNativeDirective(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	systemdTempInstallEnvironment(t)
@@ -29,11 +35,18 @@ func TestSystemdVerifiedRollbackRetainsPathsReferencedByPreviousNativeDirective(
 	previous := systemdExistingOptions(t, oldExecutable, root)
 	manager, unitPath, previousUnit := systemdExistingInstallation(t, previous)
 	candidateState := filepath.Join(root, "candidate-state")
-	previousUnit = strings.Replace(previousUnit, "\n\n[Install]", "\nExecStartPre=/usr/bin/test -d "+candidateState+"\n\n[Install]", 1)
-	for _, path := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
-		if err := os.WriteFile(path, []byte(previousUnit), 0o644); err != nil {
-			t.Fatalf("write previous native unit %q: %v", path, err)
+	// The loaded configuration carries a drop-in layer beside the canonical
+	// base file: while the supervisor reports it, a verified rollback cannot
+	// prove the retained registration does not reference the created paths.
+	dropInPath := unitDropInPath(unitPath)
+	baseReader := manager.readServiceProperties
+	manager.readServiceProperties = func(ctx context.Context, name string) (map[string]dbus.Variant, error) {
+		properties, err := baseReader(ctx, name)
+		if err != nil {
+			return nil, err
 		}
+		properties["DropInPaths"] = dbus.MakeVariant([]string{dropInPath})
+		return properties, nil
 	}
 	for _, dir := range instanceDirs(previous) {
 		if err := os.MkdirAll(dir.path, 0o700); err != nil {
@@ -41,58 +54,56 @@ func TestSystemdVerifiedRollbackRetainsPathsReferencedByPreviousNativeDirective(
 		}
 	}
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
-	t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLE_FAIL", "1")
+	// The first reload of the write fails, so the registration goes through
+	// the verified rollback; a repeat installation never runs enable (D-2),
+	// so the reload is the failure this fixture drives.
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_DAEMON_RELOAD_FAIL_AT", "1")
 
 	requested := DefaultInstallOptions(ScopeUser, newExecutable)
 	requested.Paths.StateDir = candidateState
 	requested.Explicit.StateDir = true
 	if _, err := manager.Install(context.Background(), requested); err == nil {
-		t.Fatal("Install() = nil, want the enable failure and verified rollback")
+		t.Fatal("Install() = nil, want the reload failure and verified rollback")
 	}
 	if info, err := os.Stat(candidateState); err != nil || !info.IsDir() {
-		t.Errorf("the previous native ExecStartPre reference %q was removed after rollback: %v", candidateState, err)
+		t.Errorf("the candidate state directory %q was removed after rollback: %v", candidateState, err)
 	}
-	for _, path := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
-		content, err := os.ReadFile(path)
-		if err != nil || string(content) != previousUnit {
-			t.Errorf("rollback path %q (read error %v) = %q, want the prior unit", path, err, content)
-		}
+	content, err := os.ReadFile(unitPath)
+	if err != nil || string(content) != previousUnit {
+		t.Errorf("rollback path (read error %v) = %q, want the prior unit", err, content)
 	}
 	if calls := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); calls != 0 {
 		t.Errorf("stopped previous unit was restarted %d times", calls)
 	}
 }
 
+// TestSystemdDynamicLoadedMismatchRollsBackSource checks the detector-A
+// refusal of a dynamic base file end to end: an update over operands the
+// renderer never writes is refused before any mutation — the source stays
+// byte for byte, the typed configuration is never consulted for a write,
+// and the stopped unit is never restarted.
 func TestSystemdDynamicLoadedMismatchRollsBackSource(t *testing.T) {
 	fixture := newSystemdDynamicPathFixture(t)
-	changedState := filepath.Join(fixture.root, "different manager state")
-	changedArgv := []string{
-		fixture.newExecutable, "service", "run", "--config", fixture.configSource,
-		"--state-dir=" + changedState,
-		"--log-dir=" + filepath.Join(fixture.root, unitName, "logs"),
-		"--listen=" + fixture.listen, "--cache-dir=" + fixture.cacheSource,
-		"--hub-dir=" + fixture.hubSource, "--local-dir=" + fixture.localSource,
-	}
-	changed := systemdTypedProperties(fixture.newExecutable, changedArgv, []string{
-		"HF_CONFIG=config with spaces",
-		"HF_CACHE=" + filepath.Join(fixture.root, "cache with spaces"),
-		"HF_HUB=" + filepath.Join(fixture.root, "hub with spaces"),
-		"HF_LOCAL=" + filepath.Join(fixture.root, "models with spaces"),
-		"HOME=" + filepath.Join(fixture.root, "manager home"),
-	}, fixture.managerWorkingDir, "", "", []systemdEnvironmentFile{})
-	setSystemdTypedPropertySequence(t, fixture.manager, fixture.oldProperties, changed, fixture.oldProperties)
+	setSystemdTypedPropertySequence(t, fixture.manager, fixture.oldProperties, fixture.newProperties)
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 
 	_, err := fixture.manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, fixture.newExecutable))
-	if err == nil || !strings.Contains(err.Error(), "typed --state-dir argument changed across the update") {
-		t.Fatalf("Install() error = %v, want rejection of the changed manager-loaded dynamic path", err)
+	if err == nil {
+		t.Fatal("Install() = nil, want the detector-A refusal of the dynamic base file")
+	}
+	assertSingleDropInAction(t, err, fixture.unitPath)
+	if !strings.Contains(err.Error(), "is not the unit HFDesk generates") {
+		t.Errorf("Install() = %q, want the cause to name the non-generated unit file", err)
 	}
 	content, readErr := os.ReadFile(fixture.unitPath)
 	if readErr != nil || string(content) != fixture.sourceUnit {
-		t.Errorf("restored source (error %v) =\n%s\nwant original dynamic source\n%s", readErr, content, fixture.sourceUnit)
+		t.Errorf("source (error %v) =\n%s\nwant the untouched dynamic source\n%s", readErr, content, fixture.sourceUnit)
 	}
 	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, fixture.logPath), "restart", unitName); got != 0 {
-		t.Errorf("stopped unit was restarted %d times during rollback", got)
+		t.Errorf("stopped unit was restarted %d times during the refusal", got)
+	}
+	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, fixture.logPath), "daemon-reload"); got != 0 {
+		t.Errorf("the supervisor was reloaded %d times during the refusal", got)
 	}
 }
 
@@ -194,21 +205,30 @@ func TestSystemdFailedRestartRestoresThePreviousRegistration(t *testing.T) {
 	}
 }
 
+// TestSystemdRollbackReloadFailureDoesNotRestartOrClaimRecovery checks the
+// honest reporting of a rollback whose reload fails: the original
+// verification failure is preserved, the saved unit bytes are written back
+// to disk, and the error claims neither a restored loaded configuration nor
+// a restarted instance while the supervisor still holds the failed update.
 func TestSystemdRollbackReloadFailureDoesNotRestartOrClaimRecovery(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	root := t.TempDir()
 	executable := systemdTestExecutable(t)
 	previous := systemdExistingOptions(t, executable, root)
 	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
-	previousUnit = strings.Replace(previousUnit,
-		"Environment=HOME=",
-		"Environment=HF_HUB_CACHE=/registered/hub\nEnvironmentFile=-/etc/hfdesk/service.env\nEnvironment=HOME=", 1)
-	for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
-		if err := os.WriteFile(name, []byte(previousUnit), 0o644); err != nil {
-			t.Fatalf("write the previous unit %q: %v", name, err)
-		}
+	// The drop-in layer the supervisor loads carries an extra environment
+	// value and an environment file the base file does not; the snapshot
+	// below is what the update has to preserve.
+	home, err := unitHomeDir(previous)
+	if err != nil {
+		t.Fatalf("unitHomeDir() = %v", err)
 	}
+	oldEnvironment := []string{"HF_HUB_CACHE=/operator/hub", "HOME=" + home}
 	oldProperties := systemdTestPropertiesFromUnit(previousUnit)
+	oldProperties["Environment"] = dbus.MakeVariant(oldEnvironment)
+	// The snapshot of the running instance needs a MainPID; the restart
+	// proof never runs here because V1 fails first.
+	oldProperties["MainPID"] = dbus.MakeVariant(uint32(4242))
 	oldConfig, err := loadedConfigFromProperties(oldProperties)
 	if err != nil {
 		t.Fatalf("decode the previous typed manager properties: %v", err)
@@ -222,17 +242,13 @@ func TestSystemdRollbackReloadFailureDoesNotRestartOrClaimRecovery(t *testing.T)
 	updated := previous
 	updated.Paths.ConfigFile = requested.Paths.ConfigFile
 	updatedArgv := append([]string{executable}, RunArgs(updated)...)
-	updatedEnvironment := slices.Clone(oldConfig.environment)
-	for i, value := range updatedEnvironment {
-		if strings.HasPrefix(value, "HF_HUB_CACHE=") {
-			updatedEnvironment[i] = "HF_HUB_CACHE=/operator/new-hub"
-		}
-	}
+	updatedEnvironment := slices.Clone(oldEnvironment)
+	updatedEnvironment[0] = "HF_HUB_CACHE=/operator/new-hub"
 	updatedProperties := systemdTypedProperties(executable, updatedArgv, updatedEnvironment, oldConfig.workingDirectory, oldConfig.user, oldConfig.group, oldConfig.environmentFiles)
 	setSystemdTypedPropertySequence(t, m, oldProperties, updatedProperties)
 	_, err = m.Install(context.Background(), requested)
 	if err == nil {
-		t.Fatal("Install() = nil, want the typed environment mismatch and unconfirmed rollback")
+		t.Fatal("Install() = nil, want the environment mismatch and unconfirmed rollback")
 	}
 	for _, want := range []string{"did not preserve the loaded environment", "reload the restored unit"} {
 		if !strings.Contains(err.Error(), want) {
@@ -255,7 +271,7 @@ func TestSystemdRollbackReloadFailureDoesNotRestartOrClaimRecovery(t *testing.T)
 	}
 	loaded := parseUnit(string(loadedBytes))
 	if loaded.ExecStart != executable || loaded.listen() != previous.Listen || loaded.flagValue("--config") == previous.Paths.ConfigFile {
-		t.Errorf("the supervisor-loaded command/environment do not distinguish the failed update: %+v", loaded)
+		t.Errorf("the supervisor-loaded command does not distinguish the failed update: %+v", loaded)
 	}
 	loadedConfig, err := loadedConfigFromProperties(updatedProperties)
 	if err != nil {
@@ -345,6 +361,12 @@ func TestSystemdActiveUnitThatDoesNotServeIsAFailedUpdate(t *testing.T) {
 	}
 }
 
+// TestSystemdDynamicListenRollbackProbesTheRestoredProcessAddress checks
+// the detector-A refusal on the dynamic-listen fixture: an update over the
+// `${HF_LISTEN}` base file is refused before anything changes, so no
+// readiness probe of a candidate address runs, the dynamic source and its
+// EnvironmentFile stay as they are, and neither the update restart nor the
+// restore restart happens.
 func TestSystemdDynamicListenRollbackProbesTheRestoredProcessAddress(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	realProbe := serviceReadinessProbe
@@ -364,46 +386,33 @@ func TestSystemdDynamicListenRollbackProbesTheRestoredProcessAddress(t *testing.
 	previous := systemdExistingOptions(t, oldExecutable, root)
 	manager, unitPath, previousUnit := systemdExistingInstallation(t, previous)
 	oldListen := "127.0.0.1:" + strconv.Itoa(freePort(t))
-	newListen := "127.0.0.1:" + strconv.Itoa(freePort(t))
 	environmentFile := filepath.Join(root, "hfdesk.env")
 	if err := os.WriteFile(environmentFile, []byte("HF_LISTEN="+oldListen+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	dynamicPreviousUnit := systemdDynamicListenUnit(t, unitPath, previousUnit, previous.Listen, "EnvironmentFile="+environmentFile)
-	oldProcess := startSystemdRuntimeProcess(t, filepath.Join(root, "old-runtime"), oldListen, "old-version")
-	if err := os.WriteFile(environmentFile, []byte("HF_LISTEN="+newListen+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	newProcess := startSystemdRuntimeProcess(t, filepath.Join(root, "new-runtime"), newListen, "candidate-version")
-	restartCount := filepath.Join(root, "restart-count")
-	systemdRuntimePropertyReader(t, manager, oldProcess.Process.Pid, newProcess.Process.Pid, restartCount)
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
-	t.Setenv("HFDESK_TEST_SYSTEMCTL_RESTART_COUNT", restartCount)
-	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE_AFTER_SECOND_RESTART", oldExecutable)
 
 	requested := DefaultInstallOptions(ScopeUser, newExecutable)
 	requested.ExpectedVersion = "old-version"
-	if _, err := manager.Install(context.Background(), requested); err == nil {
-		t.Fatal("Install() = nil, want the candidate version mismatch and rollback")
-	} else if !strings.Contains(err.Error(), "does not run the expected version") {
-		t.Errorf("Install() = %v, want the candidate version mismatch", err)
+	_, err := manager.Install(context.Background(), requested)
+	if err == nil {
+		t.Fatal("Install() = nil, want the detector-A refusal of the dynamic base file")
 	}
-	if !slices.Equal(probed, []string{newListen, oldListen}) {
-		t.Errorf("readiness probes used addresses %v, want candidate %q followed by restored %q", probed, newListen, oldListen)
+	assertSingleDropInAction(t, err, unitPath)
+	if !strings.Contains(err.Error(), "is not the unit HFDesk generates") {
+		t.Errorf("Install() = %q, want the cause to name the non-generated unit file", err)
 	}
-	if versionMatches, err := probeServiceReadyForVersion(oldListen, "old-version"); err != nil || !versionMatches {
-		t.Errorf("restored old-version process probe = (%t, %v), want a verified old process", versionMatches, err)
+	if len(probed) != 0 {
+		t.Errorf("the refused update probed addresses %v; a refusal before the mutation probes nothing", probed)
 	}
-	content, err := os.ReadFile(unitPath)
-	if err != nil {
-		t.Fatal(err)
+	content, readErr := os.ReadFile(unitPath)
+	if readErr != nil || string(content) != dynamicPreviousUnit || !strings.Contains(string(content), "${HF_LISTEN}") {
+		t.Errorf("the refused update changed the dynamic source (error %v):\n%s\nwant:\n%s", readErr, content, dynamicPreviousUnit)
 	}
-	if string(content) != dynamicPreviousUnit || !strings.Contains(string(content), "${HF_LISTEN}") {
-		t.Errorf("rollback did not restore the original dynamic source:\n%s\nwant:\n%s", content, dynamicPreviousUnit)
-	}
-	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 2 {
-		t.Errorf("restart count = %d, want update and restore restarts", got)
+	if got := systemdSupervisorCallsTo(systemdSupervisorCalls(t, logPath), "restart", unitName); got != 0 {
+		t.Errorf("restart count = %d, want no restart on a refusal", got)
 	}
 }
 
@@ -420,6 +429,19 @@ func TestSystemdRestoreThatIsNotConfirmedIsNotReportedAsStartedAgain(t *testing.
 	previous := systemdExistingOptions(t, oldExecutable, root)
 
 	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	// The snapshot of the running instance needs a non-zero MainPID, and
+	// the process behind it is not observable: the update verification and
+	// the confirmation of the restore both fail on process evidence, which
+	// is exactly the honesty this test pins.
+	baseReader := m.readServiceProperties
+	m.readServiceProperties = func(ctx context.Context, name string) (map[string]dbus.Variant, error) {
+		properties, err := baseReader(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		properties["MainPID"] = dbus.MakeVariant(uint32(424242))
+		return properties, nil
+	}
 	// The unit runs before the installation, and the restart of the failure
 	// leaves it down: the supervisor accepts every restart, and
 	// `systemctl restart` returns as soon as the unit was forked, so its

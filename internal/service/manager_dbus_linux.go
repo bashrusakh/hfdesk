@@ -97,6 +97,19 @@ func (m *systemdManager) registrationUnitConfig(ctx context.Context) (systemdLoa
 	return loadedConfigFromProperties(properties)
 }
 
+// currentMainPID reads the MainPID the supervisor reports for the loaded
+// service. A running unit without a usable MainPID exposes no process the
+// restart proof could judge, so the caller refuses instead of guessing.
+func (m *systemdManager) currentMainPID(ctx context.Context) (uint32, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	properties, err := m.loadedServiceProperties(ctx, unitName)
+	if err != nil {
+		return 0, fmt.Errorf("read the running service process from systemd: %w", err)
+	}
+	return systemdMainPIDFromProperties(properties)
+}
+
 func (m *systemdManager) loadedServiceProperties(ctx context.Context, name string) (map[string]dbus.Variant, error) {
 	if m.readServiceProperties != nil {
 		return m.readServiceProperties(ctx, name)
@@ -297,6 +310,34 @@ func loadedMatchesUnit(loaded systemdLoadedConfig, unit parsedUnit) error {
 		}
 		if loaded.execArgs[i] != arg {
 			return errors.New("the effective ExecStart is not the command in the unit file")
+		}
+	}
+	return nil
+}
+
+// loadedMatchesCanonicalCommand holds the loaded command to the canonical
+// command of the unit that was written. ExecStart is the strict-owned field
+// of the ownership contract: the typed loaded vector must be exactly the
+// vector of the canonical command, with no loaded flags and no
+// ignore-errors entry, or the write did not become the effective
+// configuration.
+//
+// The expectation is the source word vector of the command the writer
+// emitted — the same projection parseUnit reports as ExecStartRaw, so the
+// escape forms the file carries (the doubled dollar sign of a literal
+// dollar sign, the doubled percent sign of a literal percent sign) are the
+// ones the supervisor stores before it spawns the process.
+func loadedMatchesCanonicalCommand(loaded systemdLoadedConfig, unit canonicalUnit) error {
+	expected := splitSystemdWords(systemdExecStart(unit.installOptions()))
+	if !loaded.loaded || len(loaded.execArgs) != len(expected) || loaded.ignoreErrors || len(loaded.execFlags) != 0 {
+		return errors.New("the effective ExecStart is not the canonical command of the unit")
+	}
+	if loaded.execPath != expected[0] {
+		return errors.New("the effective executable is not the canonical program of the unit")
+	}
+	for i, arg := range expected {
+		if loaded.execArgs[i] != arg {
+			return errors.New("the effective ExecStart is not the canonical command of the unit")
 		}
 	}
 	return nil
