@@ -811,62 +811,39 @@ func TestAnalyze_StalledTreePageFailsWithinPageFetchBudget(t *testing.T) {
 		treePageFetchTimeout = testBudget
 		defer func() { treePageFetchTimeout = oldBudget }()
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		type result struct {
-			info *RepoInfo
-			err  error
-		}
-		done := make(chan result, 1)
-		start := time.Now()
-		go func() {
-			info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).Analyze(ctx, "owner/repo", false)
-			done <- result{info, err}
-		}()
+		info, err := awaitBudgetedAnalysis(t, testBudget, metadataBudgetSlack, metadataBudgetWatchdogSlack,
+			"unbounded tree-page body read or a starved runner",
+			func(ctx context.Context) (*RepoInfo, error) {
+				return NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).
+					Analyze(ctx, "owner/repo", false)
+			})
 
-		// Deliberately asymmetric bounds: the asserted bound carries runner
-		// starvation headroom, while the watchdog fires well beyond it, where
-		// an unbounded read and a severely starved runner are honestly
-		// indistinguishable.
-		const (
-			slack         = 10 * time.Second // asserted-bound headroom (starvation tolerance)
-			watchdogSlack = 30 * time.Second // watchdog fires well beyond the asserted bound
-		)
-		select {
-		case res := <-done:
-			if res.info != nil || res.err == nil {
-				t.Fatalf("stalled tree page info=%v err=%v, want an analysis timeout failure and no partial result", res.info, res.err)
+		if info != nil || err == nil {
+			t.Fatalf("stalled tree page info=%v err=%v, want an analysis timeout failure and no partial result", info, err)
+		}
+		for _, want := range []string{
+			"tree page API timed out after 500ms",
+			`for "owner/repo"`,
+			"analysis needs this file list",
+			"check the endpoint, proxy, or network and retry",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("timeout error = %q, want it to contain %q", err, want)
 			}
-			if elapsed := time.Since(start); elapsed > testBudget+slack {
-				t.Errorf("analysis returned after %v, want within cap+slack %v", elapsed, testBudget+slack)
-			}
-			for _, want := range []string{
-				"tree page API timed out after 500ms",
-				`for "owner/repo"`,
-				"analysis needs this file list",
-				"check the endpoint, proxy, or network and retry",
-			} {
-				if !strings.Contains(res.err.Error(), want) {
-					t.Errorf("timeout error = %q, want it to contain %q", res.err, want)
-				}
-			}
-			if strings.Contains(res.err.Error(), "repository not found as model or dataset") {
-				t.Errorf("timeout error = %q; a budget expiry must not collapse into the namespace not-found classifier", res.err)
-			}
-			// The budget expiry stays a FAILURE for error classifiers and
-			// must never read as caller cancellation.
-			if !errors.Is(res.err, hubtree.ErrPageFetchTimeout) {
-				t.Errorf("timeout error %v does not match hubtree.ErrPageFetchTimeout", res.err)
-			}
-			if errors.Is(res.err, context.DeadlineExceeded) || errors.Is(res.err, context.Canceled) {
-				t.Errorf("timeout error %v must not classify as caller cancellation", res.err)
-			}
-			if got := treeReqs.Load(); got != 1 {
-				t.Errorf("tree requests = %d, want 1 (an expired page budget is terminal, with no retry or namespace probe)", got)
-			}
-		case <-time.After(testBudget + watchdogSlack):
-			cancel()
-			t.Fatalf("analysis did not complete within the watchdog (cap %v + slack %v): unbounded tree-page body read or a starved runner", testBudget, watchdogSlack)
+		}
+		if strings.Contains(err.Error(), "repository not found as model or dataset") {
+			t.Errorf("timeout error = %q; a budget expiry must not collapse into the namespace not-found classifier", err)
+		}
+		// The budget expiry stays a FAILURE for error classifiers and
+		// must never read as caller cancellation.
+		if !errors.Is(err, hubtree.ErrPageFetchTimeout) {
+			t.Errorf("timeout error %v does not match hubtree.ErrPageFetchTimeout", err)
+		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			t.Errorf("timeout error %v must not classify as caller cancellation", err)
+		}
+		if got := treeReqs.Load(); got != 1 {
+			t.Errorf("tree requests = %d, want 1 (an expired page budget is terminal, with no retry or namespace probe)", got)
 		}
 	})
 

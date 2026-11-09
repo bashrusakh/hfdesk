@@ -3,9 +3,8 @@
 
 package hfdownloader
 
-// The per-path metadata gate serializes intra-item record transitions. It never
-// establishes cross-process ownership; shared mutation requires the held
-// external item scope, and record age is never an ownership signal.
+// The per-path metadata gate serializes intra-item record transitions only; it never establishes cross-process
+// ownership, and record age is never an ownership signal — see doc.go for the full claim/scope protocol.
 
 import (
 	"context"

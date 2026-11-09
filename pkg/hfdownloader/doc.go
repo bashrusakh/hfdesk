@@ -804,6 +804,15 @@ mirror copies AND verifies it, so copy and verify always agree on the same set.
 staging-namespace error, because such content would be hidden by classification.
 Non-canonical names without a reserved shape remain accepted and visible.
 
+`FinalizeBlob` publishes a staged payload as the blob under that key's domain and
+the shared no-replace primitive, and it establishes the key's shape and the
+staging record's ownership proof. It does not establish payload completeness: no
+range layout, size or digest check runs before the placement, and with no
+staging record present the publish proceeds on the caller's assertion alone. A
+caller must therefore publish only a payload it knows to be complete. The
+downloaded routes verify before publishing; this exported surface exists for
+callers that produce the payload themselves.
+
 A blob alone is not a reachable requested path. Transfer and both blob-exists
 skip paths must create snapshot and enabled friendly entries; link failure
 returns `ErrCacheLinkUnreachable` (detectable with `errors.Is`) and emits no
@@ -845,9 +854,14 @@ Known limitations outside the downloader domain: a mirror file copy is still a
 non-atomic truncate-and-write performed under its entry admission, and it checks
 nothing itself beyond `io.Copy`'s error contract — the copied byte count is
 discarded, the explicit size comparison happens only in the opt-in verify pass,
-and that verification compares size rather than content hashes; and HF
-selected-GGUF deletion removes blob payloads under repository and friendly tree
-admission rather than each blob's domain. The mirror's symlink-leaf replacement
+and that verification compares size rather than content hashes. A failed or
+interrupted copy therefore leaves a partially written file at the destination's
+final blob path, and because a content-addressed blob's existence is the
+completion proof, a later download against that cache can take that partial file
+for a completed blob; the opt-in verify pass compares sizes and is the
+operator's guard against this. HF selected-GGUF deletion removes blob payloads
+under repository and friendly tree admission rather than each blob's domain.
+The mirror's symlink-leaf replacement
 takes entry admission and its directory creation takes the shared admitted
 directory-creation class (a directory that already exists needs no admission
 because nothing is mutated); the sync/rebuild path creates, replaces and

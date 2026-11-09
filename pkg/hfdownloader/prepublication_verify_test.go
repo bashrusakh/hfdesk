@@ -48,163 +48,212 @@ func corruptSameSize(full []byte) []byte {
 	return bad
 }
 
-// Both sha256 and etag must reject same-size known-digest corruption before
-// the single-path rename, leaving neither a destination nor cached payload.
-func TestDownloadSingle_KnownDigestProvenBeforePublish(t *testing.T) {
-	const size = 4_096
-	good := rangedTestPayload(size)
-	bad := corruptSameSize(good)
-	sha := singleTestSHA(good)
-
-	for _, mode := range []string{"sha256", "etag"} {
-		t.Run(mode+"/output mismatch is not published", func(t *testing.T) {
-			srv := prePublishHub(t, good, bad)
-			out := t.TempDir()
-			base, err := DestinationBase(out, "owner/model")
-			if err != nil {
-				t.Fatal(err)
-			}
-			cfg := Settings{
-				OutputDir:          out,
-				Endpoint:           srv.URL,
-				Concurrency:        1,
-				MaxActiveDownloads: 1,
-				MultipartThreshold: "1MB", // force the single-request path
-				Verify:             mode,
-				Retries:            0,
-				StallTimeout:       "0",
-			}
-			hashPassCount.Store(0)
-			err = Download(context.Background(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ProgressEvent) {})
-			if err == nil || !strings.Contains(err.Error(), "sha256 verify failed") {
-				t.Fatalf("Download error = %v, want a sha256 verification failure", err)
-			}
-			if got := hashPassCount.Load(); got != 1 {
-				t.Errorf("known-digest proof performed %d full-file passes; want exactly 1", got)
-			}
-			dst := filepath.Join(base, "model.bin")
-			if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
-				t.Errorf("corrupt bytes were published at %s (stat err=%v)", dst, serr)
-			}
-			if _, serr := os.Stat(dst + ".part"); !os.IsNotExist(serr) {
-				t.Errorf("unproven .part survived the verification failure, stat err=%v", serr)
-			}
-		})
-
-		t.Run(mode+"/output match publishes once", func(t *testing.T) {
-			srv := prePublishHub(t, good, good)
-			out := t.TempDir()
-			base, err := DestinationBase(out, "owner/model")
-			if err != nil {
-				t.Fatal(err)
-			}
-			cfg := Settings{
-				OutputDir:          out,
-				Endpoint:           srv.URL,
-				Concurrency:        1,
-				MaxActiveDownloads: 1,
-				MultipartThreshold: "1MB",
-				Verify:             mode,
-				Retries:            0,
-				StallTimeout:       "0",
-			}
-			hashPassCount.Store(0)
-			if err := Download(context.Background(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ProgressEvent) {}); err != nil {
-				t.Fatalf("Download: %v", err)
-			}
-			if got := hashPassCount.Load(); got != 1 {
-				t.Errorf("known-digest verification performed %d full-file passes; want exactly 1", got)
-			}
-			assertExactFile(t, filepath.Join(base, "model.bin"), good)
-		})
-	}
-
-	t.Run("sha256/cache mismatch leaves no tmp or blob", func(t *testing.T) {
-		srv := prePublishHub(t, good, bad)
-		cacheDir := t.TempDir()
-		cfg := Settings{
-			CacheDir:           cacheDir,
-			Endpoint:           srv.URL,
-			Concurrency:        1,
-			MaxActiveDownloads: 1,
-			MultipartThreshold: "1MB",
-			Verify:             "sha256",
-			Retries:            0,
-			StallTimeout:       "0",
-		}
-		hashPassCount.Store(0)
-		err := Download(context.Background(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ProgressEvent) {})
-		if err == nil || !strings.Contains(err.Error(), "sha256 verify failed") {
-			t.Fatalf("Download error = %v, want a sha256 verification failure", err)
-		}
-		blobsDir := filepath.Join(cacheDir, "hub", "models--owner--model", "blobs")
-		for _, name := range []string{sha, "tmp-" + sha, "tmp-" + sha + ".part"} {
-			if _, serr := os.Stat(filepath.Join(blobsDir, name)); !os.IsNotExist(serr) {
-				t.Errorf("%s survived the pre-publication verification failure, stat err=%v", name, serr)
-			}
-		}
-	})
+// prePublishCase selects the route, verify mode and destination of one
+// pre-publication proof row; check applies that row's distinct oracle.
+type prePublishCase struct {
+	name string
+	// size sets the payload; below-threshold sizes force the single-request
+	// route and larger ones the multipart route.
+	size int
+	// verify is the Settings.Verify mode under test.
+	verify string
+	// threshold forces the route: a high threshold keeps the single-request
+	// path, a low one the multipart path.
+	threshold string
+	// concurrency matches the route's transfer shape.
+	concurrency int
+	// corrupt serves same-size corrupt bytes instead of the declared content.
+	corrupt bool
+	// cache selects the content-addressed cache destination over local output.
+	cache bool
+	check func(t *testing.T, res prePublishResult)
 }
 
-// ETag mode must prove a known digest before publishing the ranged payload.
-// A mismatch must leave neither the content-addressed blob nor a tmp-<sha> restage.
-func TestDownloadMultipart_ETagKnownDigestProvenBeforePublish(t *testing.T) {
-	const size = 64 * 1024 // above the 1KB threshold → multipart
-	good := rangedTestPayload(size)
-	bad := corruptSameSize(good) // one wrong byte inside a non-first range
-	sha := singleTestSHA(good)
+// prePublishResult carries one row's Download outcome to its oracle.
+type prePublishResult struct {
+	err  error
+	good []byte
+	sha  string
+	// dst is the local-mode destination file; empty in cache mode.
+	dst string
+	// blobsDir is the cache-mode blobs directory; empty in output mode.
+	blobsDir string
+}
 
-	cfgFor := func(srv *httptest.Server, cacheDir string) Settings {
-		return Settings{
-			CacheDir:           cacheDir,
-			Endpoint:           srv.URL,
-			Concurrency:        4,
-			MaxActiveDownloads: 1,
-			MultipartThreshold: "1KB",
-			Verify:             "etag",
-			Retries:            0,
-			StallTimeout:       "0",
+// A known digest is proved BEFORE publication on every route and verify mode:
+// a same-size mismatch leaves neither a destination nor a blob nor restageable
+// staging state, and a matching payload publishes exactly once after exactly
+// one full-file proof pass.
+func TestDownloadKnownDigestProvenBeforePublish(t *testing.T) {
+	const (
+		singleSize    = 4_096
+		multipartSize = 64 * 1024 // above the 1KB threshold → multipart
+	)
+
+	// Both single-route verify modes share one oracle each: the original mode
+	// loop asserted the same thing for sha256 and etag.
+	outputMismatch := func(t *testing.T, res prePublishResult) {
+		if res.err == nil || !strings.Contains(res.err.Error(), "sha256 verify failed") {
+			t.Fatalf("Download error = %v, want a sha256 verification failure", res.err)
+		}
+		if got := hashPassCount.Load(); got != 1 {
+			t.Errorf("known-digest proof performed %d full-file passes; want exactly 1", got)
+		}
+		if _, serr := os.Stat(res.dst); !os.IsNotExist(serr) {
+			t.Errorf("corrupt bytes were published at %s (stat err=%v)", res.dst, serr)
+		}
+		if _, serr := os.Stat(res.dst + ".part"); !os.IsNotExist(serr) {
+			t.Errorf("unproven .part survived the verification failure, stat err=%v", serr)
 		}
 	}
-
-	t.Run("mismatch leaves no blob and discards staging", func(t *testing.T) {
-		srv := prePublishHub(t, good, bad)
-		cacheDir := t.TempDir()
-		hashPassCount.Store(0)
-		err := Download(context.Background(), Job{Repo: "owner/model", Revision: "main"}, cfgFor(srv, cacheDir), func(ProgressEvent) {})
-		if err == nil || !strings.Contains(err.Error(), "sha256 verify failed") {
-			t.Fatalf("Download error = %v, want a sha256 verification failure", err)
+	outputMatch := func(t *testing.T, res prePublishResult) {
+		if res.err != nil {
+			t.Fatalf("Download: %v", res.err)
 		}
 		if got := hashPassCount.Load(); got != 1 {
-			t.Errorf("etag known-digest proof performed %d full-file passes; want exactly 1", got)
+			t.Errorf("known-digest verification performed %d full-file passes; want exactly 1", got)
 		}
-		blobsDir := filepath.Join(cacheDir, "hub", "models--owner--model", "blobs")
-		for _, name := range []string{sha, "tmp-" + sha} {
-			if _, serr := os.Stat(filepath.Join(blobsDir, name)); !os.IsNotExist(serr) {
-				t.Errorf("%s was published despite the digest mismatch, stat err=%v", name, serr)
-			}
-		}
-		for _, name := range []string{sha + ".incomplete", sha + ".incomplete.meta"} {
-			if _, serr := os.Stat(filepath.Join(blobsDir, name)); !os.IsNotExist(serr) {
-				t.Errorf("untrustworthy staging %s survived the mismatch, stat err=%v", name, serr)
-			}
-		}
-	})
+		assertExactFile(t, res.dst, res.good)
+	}
 
-	t.Run("match publishes once", func(t *testing.T) {
-		srv := prePublishHub(t, good, good)
-		cacheDir := t.TempDir()
-		hashPassCount.Store(0)
-		if err := Download(context.Background(), Job{Repo: "owner/model", Revision: "main"}, cfgFor(srv, cacheDir), func(ProgressEvent) {}); err != nil {
-			t.Fatalf("Download: %v", err)
-		}
-		if got := hashPassCount.Load(); got != 1 {
-			t.Errorf("etag known-digest verification performed %d full-file passes; want exactly 1", got)
-		}
-		blob := filepath.Join(cacheDir, "hub", "models--owner--model", "blobs", sha)
-		assertExactFile(t, blob, good)
-		if _, serr := os.Stat(filepath.Join(filepath.Dir(blob), "tmp-"+sha)); !os.IsNotExist(serr) {
-			t.Errorf("a tmp-<sha> restage file exists, stat err=%v", serr)
-		}
-	})
+	cases := []prePublishCase{
+		{
+			name:        "single/sha256/output mismatch is not published",
+			size:        singleSize,
+			verify:      "sha256",
+			threshold:   "1MB", // force the single-request path
+			concurrency: 1,
+			corrupt:     true,
+			check:       outputMismatch,
+		},
+		{
+			name:        "single/sha256/output match publishes once",
+			size:        singleSize,
+			verify:      "sha256",
+			threshold:   "1MB",
+			concurrency: 1,
+			check:       outputMatch,
+		},
+		{
+			name:        "single/sha256/cache mismatch leaves no tmp or blob",
+			size:        singleSize,
+			verify:      "sha256",
+			threshold:   "1MB",
+			concurrency: 1,
+			corrupt:     true,
+			cache:       true,
+			check: func(t *testing.T, res prePublishResult) {
+				if res.err == nil || !strings.Contains(res.err.Error(), "sha256 verify failed") {
+					t.Fatalf("Download error = %v, want a sha256 verification failure", res.err)
+				}
+				for _, name := range []string{res.sha, "tmp-" + res.sha, "tmp-" + res.sha + ".part"} {
+					if _, serr := os.Stat(filepath.Join(res.blobsDir, name)); !os.IsNotExist(serr) {
+						t.Errorf("%s survived the pre-publication verification failure, stat err=%v", name, serr)
+					}
+				}
+			},
+		},
+		{
+			name:        "single/etag/output mismatch is not published",
+			size:        singleSize,
+			verify:      "etag",
+			threshold:   "1MB",
+			concurrency: 1,
+			corrupt:     true,
+			check:       outputMismatch,
+		},
+		{
+			name:        "single/etag/output match publishes once",
+			size:        singleSize,
+			verify:      "etag",
+			threshold:   "1MB",
+			concurrency: 1,
+			check:       outputMatch,
+		},
+		{
+			name:        "multipart/etag/mismatch leaves no blob and discards staging",
+			size:        multipartSize,
+			verify:      "etag",
+			threshold:   "1KB",
+			concurrency: 4,
+			corrupt:     true, // one wrong byte inside a non-first range
+			cache:       true,
+			check: func(t *testing.T, res prePublishResult) {
+				if res.err == nil || !strings.Contains(res.err.Error(), "sha256 verify failed") {
+					t.Fatalf("Download error = %v, want a sha256 verification failure", res.err)
+				}
+				if got := hashPassCount.Load(); got != 1 {
+					t.Errorf("etag known-digest proof performed %d full-file passes; want exactly 1", got)
+				}
+				for _, name := range []string{res.sha, "tmp-" + res.sha} {
+					if _, serr := os.Stat(filepath.Join(res.blobsDir, name)); !os.IsNotExist(serr) {
+						t.Errorf("%s was published despite the digest mismatch, stat err=%v", name, serr)
+					}
+				}
+				for _, name := range []string{res.sha + ".incomplete", res.sha + ".incomplete.meta"} {
+					if _, serr := os.Stat(filepath.Join(res.blobsDir, name)); !os.IsNotExist(serr) {
+						t.Errorf("untrustworthy staging %s survived the mismatch, stat err=%v", name, serr)
+					}
+				}
+			},
+		},
+		{
+			name:        "multipart/etag/match publishes once",
+			size:        multipartSize,
+			verify:      "etag",
+			threshold:   "1KB",
+			concurrency: 4,
+			cache:       true,
+			check: func(t *testing.T, res prePublishResult) {
+				if res.err != nil {
+					t.Fatalf("Download: %v", res.err)
+				}
+				if got := hashPassCount.Load(); got != 1 {
+					t.Errorf("etag known-digest verification performed %d full-file passes; want exactly 1", got)
+				}
+				assertExactFile(t, filepath.Join(res.blobsDir, res.sha), res.good)
+				if _, serr := os.Stat(filepath.Join(res.blobsDir, "tmp-"+res.sha)); !os.IsNotExist(serr) {
+					t.Errorf("a tmp-<sha> restage file exists, stat err=%v", serr)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			good := rangedTestPayload(tc.size)
+			served := good
+			if tc.corrupt {
+				served = corruptSameSize(good)
+			}
+			srv := prePublishHub(t, good, served)
+			cfg := Settings{
+				Endpoint:           srv.URL,
+				Concurrency:        tc.concurrency,
+				MaxActiveDownloads: 1,
+				MultipartThreshold: tc.threshold,
+				Verify:             tc.verify,
+				Retries:            0,
+				StallTimeout:       "0",
+			}
+			res := prePublishResult{good: good, sha: singleTestSHA(good)}
+			if tc.cache {
+				cacheDir := t.TempDir()
+				cfg.CacheDir = cacheDir
+				res.blobsDir = filepath.Join(cacheDir, "hub", "models--owner--model", "blobs")
+			} else {
+				out := t.TempDir()
+				base, err := DestinationBase(out, "owner/model")
+				if err != nil {
+					t.Fatal(err)
+				}
+				cfg.OutputDir = out
+				res.dst = filepath.Join(base, "model.bin")
+			}
+
+			hashPassCount.Store(0)
+			res.err = Download(context.Background(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ProgressEvent) {})
+			tc.check(t, res)
+		})
+	}
 }

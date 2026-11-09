@@ -464,41 +464,20 @@ func (a *Analyzer) fetchFileTree(ctx context.Context, repo string, isDataset boo
 
 // treePageFetchTimeout is the per-fetch TOTAL cap (dial + response headers +
 // one JSON page body) on every tree-page request the analyze flow issues
-// through the shared hubtree walker. The single source of the family value is
-// pkg/hfdownloader/client.go's metadataFetchTimeout: required Hub metadata
-// fetched from the same endpoints over the same transport windows is one
-// policy, so both packages carry the same 2-minute value — this mirror exists
-// only because that variable is unexported and pkg/smartdl must not gain a
-// production dependency on pkg/hfdownloader just to read one duration; change
-// the two together. The non-tree analyze fetches (refs, file content,
-// safetensors header reads, model info) carry the same value as
-// metadataFetchTimeout below, so this whole family changes together. The cap
-// is deliberately generous so slow-but-working
-// endpoints keep working: the transport HFDesk builds may already spend up to
-// 30s connecting and 60s awaiting response headers, so two minutes still
-// leaves at least ~30 seconds for the body read on the slowest endpoint that
-// satisfies those transport windows, while ending body waits that previously
-// had no bound of their own. It is a package variable (not a const) so tests
-// can lower it deterministically, mirroring hfdownloader's
-// metadataFetchTimeout.
+// through the shared hubtree walker. It carries the same value as
+// metadataFetchTimeout below and hfdownloader's metadataFetchTimeout — one
+// policy over the same transport windows; change the family together. See
+// pkg/hfdownloader/client.go's metadataFetchTimeout for the budget rationale
+// and the package-variable (test-tuning) rationale.
 var treePageFetchTimeout = 2 * time.Minute
 
 // metadataFetchTimeout is the per-fetch TOTAL cap (dial + response headers +
-// body) on every remaining analyze-flow Hub metadata fetch the analyzer
-// issues directly: the refs API, config/metadata file content (fetchFile and
-// its /resolve/ retry), safetensors ranged header reads, and the model-info
-// lineage lookup. It carries the same value as treePageFetchTimeout above and
-// pkg/hfdownloader/client.go's metadataFetchTimeout — one policy for metadata
-// fetched from the same endpoints over the same transport windows (up to 30s
-// dialing and 60s awaiting response headers), so change the whole family
-// together. The smaller payloads inside the family (the 10 MiB metadata size
-// cap, the 1 MiB safetensors header) need no separate value: each still
-// leaves at least ~30 seconds for its body after the slowest transport
-// windows, and the production analyze caller (one shared 60s per analysis)
-// is stricter than this cap, so the cap is defense in depth and the bound for
-// longer-deadline callers. A caller deadline still wins. It is a package
-// variable (not a const) so tests can lower it deterministically, mirroring
-// treePageFetchTimeout and hfdownloader's metadataFetchTimeout.
+// body) on the remaining analyze-flow Hub metadata fetches: the refs API,
+// fetchFile content and its /resolve/ retry, safetensors ranged header reads,
+// and the model-info lineage lookup. Same value and policy as
+// treePageFetchTimeout and hfdownloader's metadataFetchTimeout — change the
+// whole family together; a caller deadline still wins. Package variable (not
+// const) so tests can lower it; budget rationale in pkg/hfdownloader/client.go.
 var metadataFetchTimeout = 2 * time.Minute
 
 // walkTree walks the repository tree through the shared hubtree walker
@@ -507,10 +486,9 @@ var metadataFetchTimeout = 2 * time.Minute
 // and bounded Retry-After/RateLimit-aware retries of 429/5xx/network errors.
 // Each page request runs under the per-fetch analysis metadata cap
 // (treePageFetchTimeout: dial + response headers + JSON body); its expiry
-// fails every analyze-flow tree fetch with the actionable budget error below,
-// while retry waits between attempts and the request budget stay under their
-// own hubtree bounds on the caller's context, never charged to that
-// per-request deadline.
+// fails every analyze-flow tree fetch with the actionable budget error, while
+// retry waits and the request budget stay under their own hubtree bounds on
+// the caller's context.
 // When commitOut is non-nil and still empty, the resolved commit SHA is
 // captured from the X-Repo-Commit response header that HuggingFace returns
 // for the requested revision — from the first response that carries it, as
@@ -969,8 +947,7 @@ const maxSafeTensorHeaderSize = 1 << 20
 // prefers exact byte ranges, but can read the same bounded prefix from a
 // complete 200 response when the server ignores Range. Each ranged read runs
 // under the per-fetch metadata budget (metadataFetchTimeout); a cap expiry
-// surfaces as an ordinary probe failure for the caller's existing optional
-// handling, never as a cancellation.
+// surfaces as an ordinary optional probe failure, never as a cancellation.
 func (a *Analyzer) fetchSafetensorsHeader(ctx context.Context, repo, revision string, file FileInfo) ([]byte, error) {
 	reqURL := a.rawURL(repo, false, revision, file.Path)
 	if file.IsLFS {

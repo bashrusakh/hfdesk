@@ -3,9 +3,10 @@
 
 package hfdownloader
 
-// Tests that publication rejects an incomplete range layout or wrong-sized
-// payload, while still accepting a complete transfer. Cases seed state and
-// call publish directly, without network or timing.
+// Tests that publication refuses a foreign or missing claim, an incomplete
+// range layout or a physically short payload, while still accepting a
+// complete transfer. Cases seed state and call publish directly, without
+// network or timing.
 
 import (
 	"context"
@@ -25,324 +26,230 @@ func completeRangeLayout(size int64, n int) []RangeProgress {
 	return ranges
 }
 
-// Publish refuses missing/foreign claims under the held destination domain
-// and still accepts an owned claim with a complete layout.
-func TestStagingPublishRefusesForeignClaim(t *testing.T) {
-	payload := []byte("someone else's payload")
-	makeDownload := func(t *testing.T) (*stagingDownload, string, string) {
-		t.Helper()
-		dir := t.TempDir()
-		staging := filepath.Join(dir, "x.incomplete")
-		pub := filepath.Join(dir, "x.bin")
-		if err := os.WriteFile(staging, payload, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		domain := acquireTestDomain(t, pub)
-		d := &stagingDownload{
-			ctx:    context.Background(),
-			dst:    pub,
-			stg:    staging,
-			pub:    pub,
-			meta:   staging + ".meta",
-			it:     PlanItem{RelativePath: "x.bin", Size: int64(len(payload))},
-			ranges: completeRangeLayout(int64(len(payload)), 1),
-			domain: domain,
-		}
-		return d, staging, pub
-	}
-
-	t.Run("foreign record", func(t *testing.T) {
-		d, staging, pub := makeDownload(t)
-		foreign := IncompleteMeta{
-			PID:       os.Getpid(),
-			Instance:  "another-process-instance",
-			Host:      processHostname,
-			StartedAt: time.Now().UTC(),
-			Size:      int64(len("someone else's payload")),
-			Version:   stagingMetaVersion,
-			Repo:      "o/r",
-			Path:      "x.bin",
-			Ranges:    buildRangeLayout(int64(len("someone else's payload")), 1),
-		}
-		if err := writeStagingMeta(d.meta, &foreign); err != nil {
-			t.Fatal(err)
-		}
-		if err := d.publish(); !errors.Is(err, errStagingClaimLost) {
-			t.Fatalf("publish with a foreign record = %v, want errStagingClaimLost", err)
-		}
-		if _, err := os.Stat(staging); err != nil {
-			t.Errorf("publish moved a foreign staging file: %v", err)
-		}
-		if _, err := os.Stat(pub); !os.IsNotExist(err) {
-			t.Errorf("publish created the destination under a foreign record, stat err=%v", err)
-		}
-	})
-
-	t.Run("missing record", func(t *testing.T) {
-		d, staging, pub := makeDownload(t)
-		if err := d.publish(); !errors.Is(err, errStagingClaimLost) {
-			t.Fatalf("publish with a missing record = %v, want errStagingClaimLost", err)
-		}
-		if _, err := os.Stat(staging); err != nil {
-			t.Errorf("publish moved an unclaimed staging file: %v", err)
-		}
-		if _, err := os.Stat(pub); !os.IsNotExist(err) {
-			t.Errorf("publish created the destination without a claim, stat err=%v", err)
-		}
-	})
-
-	t.Run("owned record still publishes", func(t *testing.T) {
-		d, staging, pub := makeDownload(t)
-		ours := IncompleteMeta{
-			PID:       os.Getpid(),
-			Instance:  processInstanceToken,
-			Host:      processHostname,
-			StartedAt: time.Now().UTC(),
-			Size:      int64(len("someone else's payload")),
-			Version:   stagingMetaVersion,
-			Repo:      "o/r",
-			Path:      "x.bin",
-			Ranges:    completeRangeLayout(int64(len("someone else's payload")), 1),
-		}
-		if err := writeStagingMeta(d.meta, &ours); err != nil {
-			t.Fatal(err)
-		}
-		if err := d.publish(); err != nil {
-			t.Fatalf("publish of an owned record: %v", err)
-		}
-		if _, err := os.Stat(staging); !os.IsNotExist(err) {
-			t.Errorf("published staging file survived, stat err=%v", err)
-		}
-		if got, err := os.ReadFile(pub); err != nil || string(got) != "someone else's payload" {
-			t.Errorf("published payload = %q (err=%v)", got, err)
-		}
-	})
+// publishClaim describes the persisted claim of a fixture download. A zero
+// instance persists no claim record at all; a zero size and nil ranges reuse
+// the item's size and the live layout.
+type publishClaim struct {
+	instance string
+	size     int64
+	ranges   []RangeProgress
 }
 
-type publishLayoutCase struct {
+// makePublishDownload seeds stagingBytes in a fresh destination directory,
+// holds the destination domain, persists the described claim, and returns the
+// download with live as its in-memory layout. All publication-gate cases build
+// their fixture here instead of re-seeding the same download inline.
+func makePublishDownload(t *testing.T, stagingBytes []byte, size int64, live []RangeProgress, claim publishClaim) (*stagingDownload, string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "x.incomplete")
+	pub := filepath.Join(dir, "x.bin")
+	if err := os.WriteFile(staging, stagingBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d := &stagingDownload{
+		ctx:    context.Background(),
+		dst:    pub,
+		stg:    staging,
+		pub:    pub,
+		meta:   staging + ".meta",
+		it:     PlanItem{RelativePath: "x.bin", Size: size},
+		ranges: live,
+		domain: acquireTestDomain(t, pub),
+	}
+	if claim.instance != "" {
+		recordSize := claim.size
+		if recordSize == 0 {
+			recordSize = size
+		}
+		recordRanges := claim.ranges
+		if recordRanges == nil {
+			recordRanges = live
+		}
+		meta := IncompleteMeta{
+			PID:       os.Getpid(),
+			Instance:  claim.instance,
+			Host:      processHostname,
+			StartedAt: time.Now().UTC(),
+			Size:      recordSize,
+			Version:   stagingMetaVersion,
+			Repo:      "o/r",
+			Path:      "x.bin",
+			Ranges:    recordRanges,
+		}
+		if err := writeStagingMeta(d.meta, &meta); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return d, staging, pub
+}
+
+type publishGateCase struct {
 	name string
-	// live is the in-memory layout of the download.
+	// staging is the payload physically present at the staging path.
+	staging []byte
+	// size is the item's declared size.
+	size int64
+	// live is the download's in-memory range layout.
 	live []RangeProgress
-	// record is the persisted claim record's layout. A nil value reuses the
-	// live layout.
-	record []RangeProgress
-	// recordSize overrides the record's size field. Zero means "the item's
-	// size".
-	recordSize int64
+	// claim is the persisted claim; its zero value persists no record.
+	claim publishClaim
+	// want is the expected refusal error; nil expects a successful publication.
+	want error
+	// stagedLen, when non-zero, pins the refused payload's physical length.
+	stagedLen int
 }
 
-// Publication must reject incomplete live or persisted layouts. The payload is
-// full-sized so the physical-size guard cannot mask the layout check.
-func TestStagingPublishRefusesIncompleteLayout(t *testing.T) {
+// One table over every publication gate: the claim, layout and payload-size
+// refusals plus the positive control. Layout refusals use a full-sized payload
+// so the physical-size guard cannot mask the layout check; the short-payload
+// row carries complete live and persisted layouts so only the physical size
+// can refuse it.
+func TestStagingPublishEnforcesEveryPublicationGate(t *testing.T) {
 	const total = 4096
-	payload := make([]byte, total)
-	for i := range payload {
-		payload[i] = byte(i % 251)
+	fullPayload := make([]byte, total)
+	for i := range fullPayload {
+		fullPayload[i] = byte(i % 251)
 	}
+	shortPayload := make([]byte, total/8)
+	for i := range shortPayload {
+		shortPayload[i] = byte(i % 251)
+	}
+	claimPayload := []byte("someone else's payload")
+	claimSize := int64(len(claimPayload))
 
-	cases := []publishLayoutCase{
+	cases := []publishGateCase{
 		{
-			name: "a range that is not done",
+			name:    "foreign record",
+			staging: claimPayload,
+			size:    claimSize,
+			live:    completeRangeLayout(claimSize, 1),
+			claim: publishClaim{
+				instance: "another-process-instance",
+				ranges:   buildRangeLayout(claimSize, 1),
+			},
+			want: errStagingClaimLost,
+		},
+		{
+			name:    "missing record",
+			staging: claimPayload,
+			size:    claimSize,
+			live:    completeRangeLayout(claimSize, 1),
+			want:    errStagingClaimLost,
+		},
+		{
+			name:    "owned record still publishes",
+			staging: claimPayload,
+			size:    claimSize,
+			live:    completeRangeLayout(claimSize, 1),
+			claim:   publishClaim{instance: processInstanceToken},
+		},
+		{
+			name:    "a range that is not done",
+			staging: fullPayload,
+			size:    total,
 			live: []RangeProgress{
 				{Start: 0, End: total/2 - 1, Committed: total / 2, Done: true},
 				{Start: total / 2, End: total - 1, Committed: total/2 - 1},
 			},
+			claim: publishClaim{instance: processInstanceToken},
+			want:  errStagingLayoutIncomplete,
 		},
 		{
-			name: "a committed total below the expected size",
+			name:    "a committed total below the expected size",
+			staging: fullPayload,
+			size:    total,
 			live: []RangeProgress{
 				{Start: 0, End: total - 1, Committed: total / 2},
 			},
+			claim: publishClaim{instance: processInstanceToken},
+			want:  errStagingLayoutIncomplete,
 		},
 		{
-			name: "a persisted record that is not done",
-			live: completeRangeLayout(total, 1),
-			record: []RangeProgress{
-				{Start: 0, End: total/2 - 1, Committed: total / 2, Done: true},
-				{Start: total / 2, End: total - 1, Committed: total/2 - 1},
+			name:    "a persisted record that is not done",
+			staging: fullPayload,
+			size:    total,
+			live:    completeRangeLayout(total, 1),
+			claim: publishClaim{
+				instance: processInstanceToken,
+				ranges: []RangeProgress{
+					{Start: 0, End: total/2 - 1, Committed: total / 2, Done: true},
+					{Start: total / 2, End: total - 1, Committed: total/2 - 1},
+				},
 			},
+			want: errStagingLayoutIncomplete,
 		},
 		{
-			name:       "a persisted record that describes another size",
-			live:       completeRangeLayout(total, 1),
-			recordSize: total + 1,
+			name:    "a persisted record that describes another size",
+			staging: fullPayload,
+			size:    total,
+			live:    completeRangeLayout(total, 1),
+			claim:   publishClaim{instance: processInstanceToken, size: total + 1},
+			want:    errStagingLayoutIncomplete,
+		},
+		{
+			name:      "a physically short payload",
+			staging:   shortPayload,
+			size:      total,
+			live:      completeRangeLayout(total, 1),
+			claim:     publishClaim{instance: processInstanceToken},
+			want:      errStagingPayloadSize,
+			stagedLen: total / 8,
+		},
+		{
+			name:    "complete layout publishes",
+			staging: fullPayload,
+			size:    total,
+			live:    completeRangeLayout(total, 1),
+			claim:   publishClaim{instance: processInstanceToken},
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			staging := filepath.Join(dir, "x.incomplete")
-			pub := filepath.Join(dir, "x.bin")
-			if err := os.WriteFile(staging, payload, 0o644); err != nil {
-				t.Fatal(err)
-			}
-			domain := acquireTestDomain(t, pub)
-
-			record := tc.record
-			if record == nil {
-				record = tc.live
-			}
-			recordSize := tc.recordSize
-			if recordSize == 0 {
-				recordSize = total
-			}
-			meta := IncompleteMeta{
-				PID:       os.Getpid(),
-				Instance:  processInstanceToken,
-				Host:      processHostname,
-				StartedAt: time.Now().UTC(),
-				Size:      recordSize,
-				Version:   stagingMetaVersion,
-				Repo:      "o/r",
-				Path:      "x.bin",
-				Ranges:    record,
-			}
-			if err := writeStagingMeta(staging+".meta", &meta); err != nil {
-				t.Fatal(err)
-			}
-
-			d := &stagingDownload{
-				ctx:    context.Background(),
-				dst:    pub,
-				stg:    staging,
-				pub:    pub,
-				meta:   staging + ".meta",
-				it:     PlanItem{RelativePath: "x.bin", Size: total},
-				ranges: tc.live,
-				domain: domain,
-			}
+			d, staging, pub := makePublishDownload(t, tc.staging, tc.size, tc.live, tc.claim)
 
 			err := d.publish()
-			if !errors.Is(err, errStagingLayoutIncomplete) {
-				t.Fatalf("publish with an incomplete layout = %v, want errStagingLayoutIncomplete", err)
+			if tc.want != nil {
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("publish %s = %v, want %v", tc.name, err, tc.want)
+				}
+				if _, serr := os.Stat(pub); !os.IsNotExist(serr) {
+					t.Errorf("publish created the destination for %s, stat err=%v", tc.name, serr)
+				}
+				if _, serr := os.Stat(staging); serr != nil {
+					t.Errorf("the refused publish removed the staged payload (%s): %v", tc.name, serr)
+				}
+				if tc.stagedLen != 0 {
+					got, rerr := os.ReadFile(staging)
+					if rerr != nil {
+						t.Fatalf("read the refused staging payload: %v", rerr)
+					}
+					if len(got) != tc.stagedLen {
+						t.Errorf("staged payload = %d bytes, want %d", len(got), tc.stagedLen)
+					}
+				}
+				return
 			}
-			if _, serr := os.Stat(pub); !os.IsNotExist(serr) {
-				t.Errorf("publish created the destination from an incomplete layout, stat err=%v", serr)
+
+			if err != nil {
+				t.Fatalf("publish %s: %v", tc.name, err)
 			}
-			if _, serr := os.Stat(staging); serr != nil {
-				t.Errorf("the refused publish removed the staged payload: %v", serr)
+			if _, serr := os.Stat(staging); !os.IsNotExist(serr) {
+				t.Errorf("the published staging file survived (%s), stat err=%v", tc.name, serr)
+			}
+			got, rerr := os.ReadFile(pub)
+			if rerr != nil {
+				t.Fatalf("read published payload: %v", rerr)
+			}
+			if len(got) != len(tc.staging) {
+				t.Fatalf("published payload = %d bytes, want %d", len(got), len(tc.staging))
+			}
+			for i := range got {
+				if got[i] != tc.staging[i] {
+					t.Fatalf("published payload differs at byte %d", i)
+				}
 			}
 		})
-	}
-}
-
-// Even complete live and persisted layouts must not publish a physically short payload.
-func TestStagingPublishRefusesShortPayload(t *testing.T) {
-	const total = 4096
-	short := make([]byte, total/8)
-	for i := range short {
-		short[i] = byte(i % 251)
-	}
-
-	dir := t.TempDir()
-	staging := filepath.Join(dir, "x.incomplete")
-	pub := filepath.Join(dir, "x.bin")
-	if err := os.WriteFile(staging, short, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	domain := acquireTestDomain(t, pub)
-
-	// The record and the live layout both claim a COMPLETE transfer.
-	layout := completeRangeLayout(total, 1)
-	meta := IncompleteMeta{
-		PID:       os.Getpid(),
-		Instance:  processInstanceToken,
-		Host:      processHostname,
-		StartedAt: time.Now().UTC(),
-		Size:      total,
-		Version:   stagingMetaVersion,
-		Repo:      "o/r",
-		Path:      "x.bin",
-		Ranges:    layout,
-	}
-	if err := writeStagingMeta(staging+".meta", &meta); err != nil {
-		t.Fatal(err)
-	}
-
-	d := &stagingDownload{
-		ctx:    context.Background(),
-		dst:    pub,
-		stg:    staging,
-		pub:    pub,
-		meta:   staging + ".meta",
-		it:     PlanItem{RelativePath: "x.bin", Size: total},
-		ranges: layout,
-		domain: domain,
-	}
-	err := d.publish()
-	if !errors.Is(err, errStagingPayloadSize) {
-		t.Fatalf("publish of a physically short payload = %v, want errStagingPayloadSize", err)
-	}
-	if _, serr := os.Stat(pub); !os.IsNotExist(serr) {
-		t.Errorf("publish created the destination from a short payload, stat err=%v", serr)
-	}
-	got, serr := os.ReadFile(staging)
-	if serr != nil {
-		t.Fatalf("the refused publish removed the staged payload: %v", serr)
-	}
-	if len(got) != len(short) {
-		t.Errorf("staged payload = %d bytes, want %d", len(got), len(short))
-	}
-}
-
-// Positive control: complete live and persisted layouts over a full-sized payload still publish.
-func TestStagingPublishAcceptsCompleteLayout(t *testing.T) {
-	const total = 4096
-	payload := make([]byte, total)
-	for i := range payload {
-		payload[i] = byte(i % 251)
-	}
-	dir := t.TempDir()
-	staging := filepath.Join(dir, "x.incomplete")
-	pub := filepath.Join(dir, "x.bin")
-	if err := os.WriteFile(staging, payload, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	domain := acquireTestDomain(t, pub)
-
-	layout := completeRangeLayout(total, 1)
-	meta := IncompleteMeta{
-		PID:       os.Getpid(),
-		Instance:  processInstanceToken,
-		Host:      processHostname,
-		StartedAt: time.Now().UTC(),
-		Size:      total,
-		Version:   stagingMetaVersion,
-		Repo:      "o/r",
-		Path:      "x.bin",
-		Ranges:    layout,
-	}
-	if err := writeStagingMeta(staging+".meta", &meta); err != nil {
-		t.Fatal(err)
-	}
-
-	d := &stagingDownload{
-		ctx:    context.Background(),
-		dst:    pub,
-		stg:    staging,
-		pub:    pub,
-		meta:   staging + ".meta",
-		it:     PlanItem{RelativePath: "x.bin", Size: total},
-		ranges: layout,
-		domain: domain,
-	}
-	if err := d.publish(); err != nil {
-		t.Fatalf("publish of a complete layout: %v", err)
-	}
-	if _, serr := os.Stat(staging); !os.IsNotExist(serr) {
-		t.Errorf("the published staging file survived, stat err=%v", serr)
-	}
-	got, rerr := os.ReadFile(pub)
-	if rerr != nil {
-		t.Fatalf("read published payload: %v", rerr)
-	}
-	if len(got) != total {
-		t.Fatalf("published payload = %d bytes, want %d", len(got), total)
-	}
-	for i := range got {
-		if got[i] != payload[i] {
-			t.Fatalf("published payload differs at byte %d", i)
-		}
 	}
 }

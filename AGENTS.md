@@ -219,7 +219,10 @@ or job ownership behavior. This section is the agent-level summary; when it and
   not publish through this primitive: the mirror takes entry admission per
   copied destination file — the copy itself stays a non-atomic
   truncate-and-write checked only by `io.Copy`'s error contract, with the
-  explicit size comparison in the opt-in verify pass — tree admission per
+  explicit size comparison in the opt-in verify pass; an interrupted copy can
+  leave a partial file at the destination's final blob path, which a later
+  download can then take for a completed blob, and the opt-in verify pass
+  compares sizes and is the guard — tree admission per
   removed repository, entry admission for its symlink-leaf replacement and
   admitted directory creation for directories it creates; the sync/rebuild
   path creates, replaces and removes snapshot/friendly entries, prunes empty
@@ -228,6 +231,11 @@ or job ownership behavior. This section is the agent-level summary; when it and
   for HF locations and flat-realm entry admission over the member paths for
   local locations, rather than the blob domain. Neither performs
   domain-exclusive placement, so no publication guarantee extends to them.
+- Exported `FinalizeBlob` verifies the blob key's shape and ownership, not
+  payload completeness: no range layout, size or digest check runs before the
+  placement, and with no staging record present the publish proceeds on the
+  caller's assertion alone. The caller must publish only a payload it knows to
+  be complete; no product caller uses it.
 - JOB CONTRACT: success means every requested file is present AND reachable at
   its snapshot/friendly path. A file owned by another live writer is never a
   completed skip: wait bounded, re-check the content-addressed blob, otherwise

@@ -3,11 +3,7 @@
 
 package hfdownloader
 
-// Ownership waiters return their MaxActiveDownloads lease and reacquire it
-// before transfer; failed acquisition leaves it returned. Domain acquisition
-// signals both local and OS-lock waits; fast paths and multipart claims do not.
-// Distinct path/blob namespaces and one acquisition per destination prevent
-// self-conflict and slot/domain cycles; see doc.go for the complete protocol.
+// Ownership waiters return their lease before destination waits and reacquire it before transfer; see doc.go for the complete slot/domain protocol.
 
 import "context"
 
@@ -51,7 +47,6 @@ func newDownloadSlotLease(ctx context.Context, lim chan struct{}) *downloadSlotL
 	return &downloadSlotLease{lim: lim, ctx: ctx, held: true}
 }
 
-// release returns a currently held slot and is otherwise a no-op.
 func (l *downloadSlotLease) release() {
 	if l == nil || !l.held {
 		return

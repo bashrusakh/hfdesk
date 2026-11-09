@@ -3,11 +3,7 @@
 
 package hfdownloader
 
-// Ranged downloads write workers directly into one staging payload. Resume
-// records track committed ranges and are trusted only for a matching pinned
-// identity and valid framing. The external item scope fences claim,
-// transfer, proof, publication, and cleanup; only version-4 state resumes.
-// See doc.go for the complete ownership, resume, and publication contract.
+// Ranged downloads write one staging payload under the caller's held external item scope; only version-4, pinned, framing-valid state resumes. See doc.go for the complete ownership, resume, and publication contract.
 
 import (
 	"context"

@@ -3,12 +3,7 @@
 
 package hfdownloader
 
-// Single-request partials use a sidecar to bind bytes to repository, resolved
-// commit, path, and size; only matching pinned identities inherit bytes. The
-// sidecar separately records clean response framing, so an exactly-sized
-// partial without that proof must revalidate its final byte. It also records
-// the durable byte offset: resume inherits exactly that prefix and re-fetches
-// everything above it, never the stat-visible size.
+// See doc.go's resume section for the sidecar's identity, framing and durable-offset inheritance contract.
 
 import (
 	"encoding/json"
@@ -22,7 +17,6 @@ const singleIdentityVersion = 1
 
 // singleOpts carries single-route identity, framing and caller-held ownership.
 type singleOpts struct {
-	// Commit is the plan's resolved commit identity.
 	Commit string
 	// CommitPinned distinguishes an endpoint-resolved immutable commit from a
 	// requested-revision fallback, which cannot authorize inherited bytes.
@@ -42,10 +36,8 @@ type singlePartIdentity struct {
 	// Commit is the resolved commit the staged bytes belong to. It is empty
 	// for an unpinned identity.
 	Commit string `json:"commit,omitempty"`
-	// Path is the item's repository-relative path.
-	Path string `json:"path"`
-	// Size is the expected size of the object.
-	Size int64 `json:"size"`
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
 	// Pinned is required for reuse; unpinned records never authorize inherited bytes.
 	Pinned bool `json:"pinned"`
 	// FramingComplete is separate from identity: a matching pinned prefix may
@@ -128,7 +120,6 @@ func writeSinglePartIdentity(path string, id singlePartIdentity) error {
 	return os.Rename(tmpName, path)
 }
 
-// removeSinglePartIdentity removes the sidecar; a missing file is harmless.
 func removeSinglePartIdentity(path string) {
 	// lgtm[go/path-injection]
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {

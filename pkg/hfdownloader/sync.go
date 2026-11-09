@@ -235,7 +235,6 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions, hubRe
 			return nil
 		}
 
-		// Create or update entry under the entry's ownership scope.
 		_, statErr := os.Lstat(friendlyPath)
 		if err := createFriendlyEntryScoped(context.Background(), repoDir, commit, relPath, "", friendlyRealm); err != nil {
 			errs = append(errs, fmt.Errorf("create friendly entry for %s: %w", relPath, err))
@@ -413,9 +412,6 @@ func cleanOrphansInDir(dir string, friendlyRealm *ownershipRealm) (int, error) {
 		}
 
 		if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
-			// Broken symlink, remove it under its ownership scope. A live
-			// holder of the entry, or any other unlink failure, keeps the
-			// orphan in place for a later pass.
 			if err := removeCacheEntryScoped(context.Background(), friendlyRealm, path); err != nil {
 				return nil // Skip errors
 			}
@@ -435,11 +431,10 @@ func cleanOrphansInDir(dir string, friendlyRealm *ownershipRealm) (int, error) {
 	return removed, nil
 }
 
-// cleanEmptyDirs removes empty directories from bottom up (attempted in walk
-// order, as before). Each removal first takes tree admission for the
-// directory in friendlyRealm: a non-empty directory needs no admission
-// because its unlink would fail anyway, and a tree held by another
-// participant is left alone like a failed os.Remove.
+// cleanEmptyDirs removes empty directories bottom up. Each removal first takes
+// tree admission for the directory in friendlyRealm: a non-empty directory
+// needs no admission because its unlink would fail anyway, and a tree held by
+// another participant is left alone like a failed os.Remove.
 func cleanEmptyDirs(dir string, friendlyRealm *ownershipRealm) {
 	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || !info.IsDir() {

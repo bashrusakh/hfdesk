@@ -238,20 +238,14 @@ type RepoInfo struct {
 
 // metadataFetchTimeout is the per-fetch TOTAL cap (dial + response headers +
 // JSON body) on one REQUIRED planning metadata fetch when the planning
-// context carries no earlier deadline. The repo-info lookup and every
-// tree-page request (delivered through Walker.PageFetchTimeout) are one
-// policy: required planning data from the same endpoint over the same
-// transport windows, so one honest value bounds both. Its smartdl mirrors,
-// treePageFetchTimeout and metadataFetchTimeout in pkg/smartdl/analyzer.go,
-// must be changed together with this value. It is deliberately
-// generous so slow-but-working endpoints keep working: the transport may
-// already spend up to defaultDialTimeout (30s) connecting and
-// defaultResponseHeaderTimeout (60s) awaiting headers, so two minutes still
-// leaves at least ~30 seconds for the body read on the slowest endpoint that
-// satisfies those transport windows, while ending body waits that previously
-// had no bound of their own. It is a package variable (not a public API) so
-// tests can lower it deterministically, mirroring headForETagTimeout,
-// maxAttemptsPerRetry and socksHandshakeNanos.
+// context carries no earlier deadline: the repo-info lookup and every
+// tree-page request (via Walker.PageFetchTimeout) are one policy over the same
+// transport windows, so one honest value bounds both. Its smartdl mirrors —
+// treePageFetchTimeout and metadataFetchTimeout in pkg/smartdl/analyzer.go —
+// must change together with this value. It is generous relative to the 30s
+// dial / 60s header windows — two minutes still leaves ~30s for the body read
+// on the slowest endpoint satisfying them — so slow-but-working endpoints keep
+// working, and it is a package variable so tests can lower it deterministically.
 var metadataFetchTimeout = 2 * time.Minute
 
 // fetchRepoInfo fetches repository metadata including the commit SHA for a given revision.

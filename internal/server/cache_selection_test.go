@@ -5920,11 +5920,8 @@ func blockingPlanServer(t *testing.T, file string) (*httptest.Server, <-chan str
 		case strings.Contains(r.URL.Path, "/tree/"):
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprintf(w, `[{"type":"file","path":%q,"size":5}]`, file)
-		case (strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/")) && r.Header.Get("X-HFDesk-Addressing-Probe") == "1":
-			w.Header().Set("Content-Range", "bytes 0-0/5")
-			w.Header().Set("Content-Length", "1")
-			w.WriteHeader(http.StatusPartialContent)
-			_, _ = w.Write([]byte("d"))
+		case (strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/")) && r.Header.Get(addressingProbeHeader) == "1":
+			writeAddressingProbeResponse(w, 5, []byte("d"))
 		case strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/"):
 			select {
 			case started <- struct{}{}:

@@ -579,8 +579,7 @@ func mirrorSyncHubs(srcCache, dstCache, repoFilter string, dryRun, verify, delet
 
 	if dryRun {
 		// A dry run reports the planned work; a real run counts only the copies
-		// and removals that actually happened, so refused entries stay visible
-		// in errors instead of being reported as copied or deleted.
+		// and removals that actually happened.
 		for _, e := range toCopy {
 			result.CopiedSize += e.Size
 			result.Repos = append(result.Repos, e.Repo)
@@ -634,12 +633,10 @@ func mirrorSyncHubs(srcCache, dstCache, repoFilter string, dryRun, verify, delet
 	}
 	result.CopiedSizeHuman = humanSizeBytes(result.CopiedSize)
 
-	// Delete extra repos under their cache-owned tree admission so no
-	// participant sharing the destination loses a live writer's payload. A
-	// destination path that vanished between scan and delete is admitted by
-	// the shared re-verified-vanish rule and removed as a no-op, exactly like
-	// os.RemoveAll, so it counts as deleted (at its scan-time size) and never
-	// as an error.
+	// Delete extra repos under their cache-owned tree admission so no participant
+	// sharing the destination loses a live writer's payload (see removeMirrorExtraRepo
+	// for the re-verified-vanish rule). A vanished destination counts as deleted at
+	// its scan-time size, never as an error.
 	for _, e := range toDelete {
 		if err := removeMirrorExtraRepo(dstCache, e); err != nil {
 			result.Errors = append(result.Errors, err.Error())
@@ -806,7 +803,6 @@ func copyFileForMirror(src, dst string) error {
 	return out.Close()
 }
 
-// mirrorVerifyCoversEntry controls which copied entries are verified.
 var mirrorVerifyCoversEntry = func(rel string) bool { return true }
 
 // verifyRepoCache checks copied repository files, excluding staging in blobs/.

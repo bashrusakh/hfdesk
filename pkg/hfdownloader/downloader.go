@@ -145,14 +145,12 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		cfg.MaxActiveDownloads = runtime.GOMAXPROCS(0)
 	}
 
-	// Respect a caller's shared limiter; otherwise construct one from MaxSpeed.
 	if cfg.SpeedLimiter == nil {
 		if bps := ParseSize(cfg.MaxSpeed); bps > 0 {
 			cfg.SpeedLimiter = NewRateLimiter(bps)
 		}
 	}
 
-	// An explicit CacheDir wins; otherwise OutputDir selects flat mode.
 	useHFCache := cfg.CacheDir != "" || cfg.OutputDir == ""
 	var hfCache *HFCache
 	var repoDir *RepoDir
@@ -427,7 +425,6 @@ LOOP:
 			var skipCheck func() (bool, string, error)
 
 			if useHFCache {
-				// HF Cache mode: check blob existence
 				skipCheck = func() (bool, string, error) {
 					if it.SHA256 != "" {
 						status, _, err := repoDir.CheckBlob(it.SHA256)
@@ -1000,7 +997,6 @@ LOOP:
 
 	// For HF Cache mode: write ref file and ensure friendly directory exists
 	if useHFCache && repoDir != nil {
-		// Write refs/main (or the revision used)
 		ref := job.Revision
 		if ref == "" {
 			ref = "main"
@@ -1037,7 +1033,6 @@ LOOP:
 		}
 	}
 
-	// Write manifest file (hfd.yaml) if using HF cache (unless friendly view disabled)
 	if manifestBuilder != nil && repoDir != nil && friendlyView {
 		manifest := manifestBuilder.Build()
 		manifestPath := filepath.Join(repoDir.FriendlyPath(), ManifestFilename)
@@ -1852,7 +1847,6 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						if werr != nil {
 							return false, fmt.Errorf("persist single-part framing checkpoint %s: %w", sidecar, werr)
 						}
-						// Framing is complete; finalization checks any known size and required digest.
 						emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
 							Downloaded: countedUpTo, Total: it.Size})
 						return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)

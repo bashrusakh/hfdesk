@@ -3,9 +3,8 @@
 
 package hfdownloader
 
-// This classifier defines reserved staging shapes inside blobs/. Other names,
-// including non-canonical published names accepted by the storage API, remain
-// content. Keep the producer list in sync with the artifact patterns in doc.go.
+// This classifier defines the reserved staging shapes inside blobs/; every other name, including non-canonical
+// published names, remains content. Keep the producer list in sync with the artifact patterns in doc.go.
 
 import (
 	"runtime"
