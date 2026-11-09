@@ -288,9 +288,12 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	// anything is created: an output that names neither a state nor a
 	// process id leaves the running fact undetermined, and the refusal —
 	// whose repair is the stop followed by a new installation — must not
-	// follow a mutation. A job the supervisor does not hold satisfies the
-	// condition never, and the state read here travels into load, which
-	// acts on this snapshot.
+	// follow a mutation. The same rule covers a pending start: a loaded
+	// job in a state that names a start before any process exists would be
+	// read as not running by the plan, and the stopped-instance branch
+	// would boot that pending start out. A job the supervisor does not
+	// hold satisfies either condition never, and the state read here
+	// travels into load, which acts on this snapshot.
 	supervisor, err := m.supervisorState(ctx)
 	if err != nil {
 		return opts, err
@@ -298,6 +301,17 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	if supervisor.loaded && !supervisor.runningKnown {
 		return opts, fmt.Errorf("service: the installation was refused: the supervisor reports neither a state nor a process id for %s, so whether the instance runs cannot be determined. Stop the instance with %q and run %q again",
 			m.target(), "hfdesk service stop", "hfdesk service install")
+	}
+	if supervisor.pendingStartupState != "" {
+		// A PID-less pending state is a start the supervisor scheduled:
+		// the status path reports it as a start on the way, while the
+		// plan of the update reads "not running" — acting on that
+		// reading would boot out the pending start and leave the
+		// instance down. The refusal precedes every mutation, and the
+		// stop it names clears the state: the unloaded retry follows a
+		// registration no pending start is attached to.
+		return opts, fmt.Errorf("service: the installation was refused: the supervisor reports %s in state %q before any process of the job exists, so an update would cancel the pending start and leave the instance down. Stop the instance with %q and run %q again",
+			m.target(), supervisor.pendingStartupState, "hfdesk service stop", "hfdesk service install")
 	}
 	if supervisor.loaded && supervisor.runningKnown && supervisor.running && !backup.existed {
 		// Finding 5: a running job the supervisor holds without its
@@ -699,6 +713,19 @@ func (m *launchdManager) preflight(opts InstallOptions) error {
 		return fmt.Errorf("service: executable %q is not executable", opts.Executable)
 	}
 	return nil
+}
+
+// runningImageInfo resolves the file info of the running image itself.
+//
+// macOS has no equivalent of the procfs magic link, and a path cannot
+// substitute for it: the kernel allows a running image to be replaced under
+// its path, so a stat of the module path can describe the replacement while
+// this process still executes the old bytes. The platform therefore
+// reports no file info at all and the caller withholds the version claim —
+// uncertainty stays visible in an empty expectation instead of naming a
+// program the claim cannot prove.
+func runningImageInfo() (os.FileInfo, error) {
+	return nil, errors.New("service: the running image cannot be identified on this platform")
 }
 
 // requireElevated rejects a machine-wide operation that needs an elevated
@@ -1275,9 +1302,14 @@ type launchdInstallPlan struct {
 // leaves the running state of the instance undetermined, and the update
 // refuses instead of treating a possibly running instance as stopped — the
 // stopped-instance branch would unload a job that may run and leave the
-// instance down. Only a job the supervisor holds can report that unknown
+// instance down. The same rule covers a pending start: a loaded job whose
+// state names a start before any process of it exists ("waiting", "spawn
+// scheduled") would be read as not running by that branch as well, which
+// would boot the scheduled start out — the update refuses instead, and the
+// stop it names clears the state. Both refusals live in Install, before
+// anything is written. Only a job the supervisor holds can report either
 // fact: a job it does not hold has no previous running state to give back,
-// so a genuine first installation never reaches this refusal — whichever
+// so a genuine first installation never reaches a refusal — whichever
 // branch it takes, it ends with the property list it just wrote and its
 // RunAtLoad deciding the start.
 func (m *launchdManager) load(ctx context.Context, path string, plan launchdInstallPlan, previous launchdSupervisorState) (launchdLoadState, error) {
@@ -1399,6 +1431,15 @@ type launchdSupervisorState struct {
 	// undetermined, and a plan that would act on it fails closed instead
 	// of reading "not running" from a missing field.
 	runningKnown bool
+	// pendingStartupState is the state of a loaded job whose start the
+	// supervisor has scheduled but whose process does not exist yet
+	// ("waiting", "spawn scheduled"), empty for every other state. The
+	// status of such a job is a start on the way (parseLaunchdPrint maps
+	// it to StateStarting), while the running check reads it as not
+	// running — an update that acted on that reading would boot the
+	// pending start out and leave the instance down, so the fact travels
+	// to the refusal before any mutation.
+	pendingStartupState string
 	// disabled reports whether the job is disabled in the override
 	// database of launchd.
 	disabled bool
@@ -1428,6 +1469,7 @@ func (m *launchdManager) supervisorState(ctx context.Context) (launchdSupervisor
 		jobState, _, pid := launchdPrintFields(output)
 		state.running = launchdJobRunning(jobState, pid)
 		state.runningKnown = jobState != "" || pid > 0
+		state.pendingStartupState = launchdPendingStartupState(jobState, pid)
 	}
 	return state, nil
 }
@@ -2437,8 +2479,18 @@ func (r plistRegistration) executable() string {
 }
 
 // argumentValue returns the value of a flag of the argument vector.
+//
+// Both registered forms carry the same setting: the paired words
+// ("--listen", "127.0.0.1:9090") and the equals form a hand-edited or
+// foreign property list may carry ("--listen=127.0.0.1:9090"). The first
+// occurrence of the flag decides, whichever form it uses, so a reinstall
+// reads the setting instead of silently dropping it. An equals form keeps
+// everything after the first "=" as the value.
 func (r plistRegistration) argumentValue(flag string) string {
 	for i, arg := range r.ProgramArguments {
+		if value, ok := strings.CutPrefix(arg, flag+"="); ok {
+			return value
+		}
 		if arg == flag && i+1 < len(r.ProgramArguments) {
 			return r.ProgramArguments[i+1]
 		}
@@ -2635,6 +2687,38 @@ func launchdJobRunning(state string, pid int) bool {
 		return true
 	}
 	return pid > 0 && launchdProcessAlive(pid)
+}
+
+// launchdPendingStartupStates are the states a loaded job reports while
+// the supervisor has scheduled its start and no process of it exists yet.
+//
+// The vocabulary is the evidenced one of "launchctl print": a job with
+// RunAtLoad sits in one of these states between the load and the spawn of
+// its process. launchdJobRunning reads such a state as not running (no
+// process id), while the status path reads it as a start on the way
+// (parseLaunchdPrint maps "waiting" to StateStarting) — the two readings
+// must not be resolved by guessing here: the caller refuses the update.
+var launchdPendingStartupStates = []string{"waiting", "spawn scheduled"}
+
+// launchdPendingStartupState reports the pending-startup state of a loaded
+// job, or the empty string when the job is not waiting for its first spawn.
+//
+// Only the PID-less answer counts: a process id — of a live or a dead
+// process — means the job already spawned, and the established running and
+// stopped rules decide for it unchanged. Every other state keeps those
+// rules as well. The returned name is the state the supervisor reported, so
+// a refusal can quote the fact it read.
+func launchdPendingStartupState(state string, pid int) string {
+	if pid > 0 {
+		return ""
+	}
+	reported := strings.TrimSpace(state)
+	for _, pending := range launchdPendingStartupStates {
+		if strings.EqualFold(reported, pending) {
+			return reported
+		}
+	}
+	return ""
 }
 
 // launchdProcessAlive reports whether the process with the given id exists.

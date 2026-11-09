@@ -816,7 +816,10 @@ func TestSCMRegistrationOptionsRecoversTheRegistration(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := scmRegistrationOptions(scmCommandLine(tc.opts), ScopeSystem)
+			got, parsed := scmRegistrationOptions(scmCommandLine(tc.opts), ScopeSystem)
+			if !parsed {
+				t.Error("scmRegistrationOptions() reported a readable command line as unreadable")
+			}
 			if !reflect.DeepEqual(got, tc.opts) {
 				t.Errorf("scmRegistrationOptions() =\n%+v\nwant\n%+v", got, tc.opts)
 			}
@@ -834,14 +837,20 @@ func TestSCMRegistrationOptionsRecoversTheRegistration(t *testing.T) {
 }
 
 // TestSCMRegistrationOptionsOfAnUnreadableCommandLineNameNothing checks that a
-// registration without a readable command line records no setting.
+// registration without a readable command line records no setting AND reports
+// that its command line was not parsed: presence alone must not turn the
+// empty result into a merge source.
 //
 // An installation is the way a damaged registration is repaired, so the
-// recovery never fails: the options are empty, and the merge falls back to the
-// defaults of the request.
+// recovery never fails: the options are empty and parsed is false, and the
+// merge then keeps the defaults of the request instead of copying empty
+// values over them.
 func TestSCMRegistrationOptionsOfAnUnreadableCommandLineNameNothing(t *testing.T) {
 	for _, commandLine := range []string{"", "   "} {
-		got := scmRegistrationOptions(commandLine, ScopeSystem)
+		got, parsed := scmRegistrationOptions(commandLine, ScopeSystem)
+		if parsed {
+			t.Errorf("scmRegistrationOptions(%q) reported the unreadable command line as parsed", commandLine)
+		}
 		want := InstallOptions{Scope: ScopeSystem}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("scmRegistrationOptions(%q) =\n%+v\nwant\n%+v", commandLine, got, want)
@@ -849,11 +858,97 @@ func TestSCMRegistrationOptionsOfAnUnreadableCommandLineNameNothing(t *testing.T
 	}
 }
 
+// TestSCMRegistrationParsedFlagDecidesTheMergeSource pins the three states
+// of the merge contract at the seam the installation wires together: the
+// install passes previous.parsed as existingPresent, so an unreadable
+// command line lets the request's defaults stand, a parsed registration
+// without an optional directory preserves that absence, and a parsed value
+// is preserved as it is.
+func TestSCMRegistrationParsedFlagDecidesTheMergeSource(t *testing.T) {
+	requested := InstallOptions{
+		Scope:      ScopeSystem,
+		Executable: filepath.Join("C:\\New\\HFDesk", "hfdesk.exe"),
+		Listen:     DefaultListen,
+		CacheDir:   filepath.Join("C:\\ProgramData", "HFDesk", "cache"),
+		HubDir:     filepath.Join("C:\\ProgramData", "HFDesk", "cache", "hub"),
+	}
+
+	// Unreadable: present but not parsed — the request's defaults survive,
+	// including the optional cache layout the empty result would clear.
+	unreadable, parsed := scmRegistrationOptions("   ", ScopeSystem)
+	if parsed {
+		t.Fatal("scmRegistrationOptions(\"   \") reported the command line as parsed")
+	}
+	if merged := mergeInstallOptions(requested, unreadable, parsed); !reflect.DeepEqual(merged, requested) {
+		t.Errorf("the merge of an unreadable registration =\n%+v\nwant the request defaults\n%+v", merged, requested)
+	}
+
+	// Parsed with an absent optional: the absence is a setting of its own
+	// and survives the merge.
+	registered := scmTestOptions()
+	registered.CacheDir = ""
+	registered.HubDir = ""
+	registered.LocalDir = ""
+	parsedAbsent, parsedOK := scmRegistrationOptions(scmCommandLine(registered), ScopeSystem)
+	if !parsedOK {
+		t.Fatal("scmRegistrationOptions() reported a readable command line as unreadable")
+	}
+	merged := mergeInstallOptions(requested, parsedAbsent, parsedOK)
+	if merged.CacheDir != "" || merged.HubDir != "" || merged.LocalDir != "" {
+		t.Errorf("the merge of a parsed-absent registration = %+v, want the preserved absence of the cache layout", merged)
+	}
+
+	// Parsed with a value: the registered value wins over the request
+	// default that did not name the field.
+	registered.CacheDir = filepath.Join("C:\\Registered", "cache")
+	registered.HubDir = filepath.Join("C:\\Registered", "cache", "hub")
+	present, parsedValue := scmRegistrationOptions(scmCommandLine(registered), ScopeSystem)
+	if !parsedValue {
+		t.Fatal("scmRegistrationOptions() reported a readable command line as unreadable")
+	}
+	merged = mergeInstallOptions(requested, present, parsedValue)
+	if merged.CacheDir != registered.CacheDir || merged.HubDir != registered.HubDir {
+		t.Errorf("the merge of a parsed-present registration = %+v, want the registered cache layout %+v", merged, registered)
+	}
+}
+
+// TestSCMRegistrationFlagValueAcceptsBothArgumentForms pins that the SCM
+// registration reader recovers a setting from both forms a registered
+// argument vector may carry: the paired words of a canonical write and the
+// equals form of a foreign or hand-edited command line. A reader that only
+// matched the paired form would drop the equals-form setting on reinstall.
+func TestSCMRegistrationFlagValueAcceptsBothArgumentForms(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"the paired form", []string{"--listen", "127.0.0.1:9090", "--cache-dir", `C:\Cache`, "--local-dir", `C:\Models`}},
+		{"the equals form", []string{"--listen=127.0.0.1:9090", `--cache-dir=C:\Cache`, `--local-dir=C:\Models`}},
+		{"the mixed form", []string{"--listen=127.0.0.1:9090", "--cache-dir", `C:\Cache`, `--local-dir=C:\Models`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			registration := scmRegistration{args: tc.args}
+			if got := registration.listen(); got != "127.0.0.1:9090" {
+				t.Errorf("listen() = %q, want %q", got, "127.0.0.1:9090")
+			}
+			if got := registration.cacheDir(); got != `C:\Cache` {
+				t.Errorf("cacheDir() = %q, want %q", got, `C:\Cache`)
+			}
+			if got := registration.flagValue("--local-dir"); got != `C:\Models` {
+				t.Errorf("--local-dir = %q, want %q", got, `C:\Models`)
+			}
+		})
+	}
+}
+
 func TestSCMRegistrationOptionsDefaultsListenForAParseableBrokenRegistration(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing", "hfdesk.exe")
 	commandLine := syscall.EscapeArg(missing)
 
-	options := scmRegistrationOptions(commandLine, ScopeSystem)
+	options, parsed := scmRegistrationOptions(commandLine, ScopeSystem)
+	if !parsed {
+		t.Fatal("scmRegistrationOptions() reported a readable command line as unreadable")
+	}
 	if options.Executable != missing || options.Listen != DefaultListen {
 		t.Fatalf("scmRegistrationOptions() = %+v, want the readable program and parser-default listen %q", options, DefaultListen)
 	}
@@ -878,7 +973,10 @@ func TestSCMReinstallKeepsTheRegistrationOfTheInstance(t *testing.T) {
 	registered.Executable = filepath.Join("C:\\Old\\HFDesk", "hfdesk.exe")
 	registered.Listen = "127.0.0.1:9090"
 
-	existing := scmRegistrationOptions(scmCommandLine(registered), ScopeSystem)
+	existing, parsed := scmRegistrationOptions(scmCommandLine(registered), ScopeSystem)
+	if !parsed {
+		t.Fatal("scmRegistrationOptions() reported a readable command line as unreadable")
+	}
 
 	// A request that names nothing but the new program: the defaults of the
 	// scope apply only where the registration has no value of its own.
@@ -916,7 +1014,10 @@ func TestSCMReinstallKeepsTheRegistrationOfTheInstance(t *testing.T) {
 // named itself wins over the registration of the instance.
 func TestSCMReinstallHonoursTheExplicitFields(t *testing.T) {
 	registered := scmTestOptions()
-	existing := scmRegistrationOptions(scmCommandLine(registered), ScopeSystem)
+	existing, parsed := scmRegistrationOptions(scmCommandLine(registered), ScopeSystem)
+	if !parsed {
+		t.Fatal("scmRegistrationOptions() reported a readable command line as unreadable")
+	}
 
 	requested := InstallOptions{
 		Scope:      ScopeSystem,

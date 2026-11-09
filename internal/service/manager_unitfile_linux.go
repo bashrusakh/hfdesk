@@ -966,11 +966,43 @@ func unitFileUnchanged(snapshot []byte, snapshotExists bool, current []byte, cur
 	return snapshotExists == currentExists && bytes.Equal(snapshot, current)
 }
 
+// unitWriteIdentity is the identity context of the write: the account the
+// installation resolved and the registration it replaces. It is the input
+// of canonicalUnitForInstall only, so the account directives the base unit
+// renders have exactly one owner.
+type unitWriteIdentity struct {
+	// account is the resolved account of the installation. It is nil for
+	// a user scope instance and when no identity is established.
+	account *user.User
+	// previous is the registration the write replaces: its facts carry
+	// the base User= and Group= the write must stay consistent with.
+	previous previousRegistration
+}
+
 // canonicalUnitForInstall builds the canonical fact model of the unit an
-// installation writes: the merged options plus the HOME and the account
-// identity the installation already resolved, so the rendering resolves
+// installation writes: the merged options plus the HOME and the identity
+// context the installation already resolved, so the rendering resolves
 // nothing and stays byte deterministic.
-func canonicalUnitForInstall(opts InstallOptions, account *user.User) (canonicalUnit, error) {
+//
+// The Group= of the written base unit follows the account of the WRITTEN
+// User=, with exactly one rule in this function (the render paths share it
+// through these facts):
+//
+//   - The request names --service-user: the written User= is that account,
+//     and its primary group is written — the established rule that the
+//     service identity changes only when the matching install flag is
+//     named.
+//   - No account is named and a registration is replaced: the written User=
+//     keeps the account of the base unit, so the previous base Group= is
+//     preserved exactly — including its absence. The resolved account of
+//     the installation may come from a User= drop-in the loaded
+//     configuration provides; its group describes that drop-in identity
+//     and must never reach the base unit, where it would pair with another
+//     User= and fail the loaded-identity verification after the write.
+//   - A first installation has no previous base group: the primary group
+//     of the resolved account is written, and an account that cannot be
+//     resolved leaves the group out instead of guessing it.
+func canonicalUnitForInstall(opts InstallOptions, identity *unitWriteIdentity) (canonicalUnit, error) {
 	home, err := unitHomeDir(opts)
 	if err != nil {
 		return canonicalUnit{}, err
@@ -993,15 +1025,36 @@ func canonicalUnitForInstall(opts InstallOptions, account *user.User) (canonical
 		return canonicalUnit{}, errors.New("service: the machine-wide instance needs a service account")
 	}
 	u.user = name
-	if account != nil {
-		// The group of the unit is the primary group of the account,
-		// exactly as unitIdentity renders it; a group the machine does
-		// not know is left out instead of guessed.
-		if group, err := user.LookupGroupId(account.Gid); err == nil && group.Name != "" {
-			u.group = group.Name
-		}
-	}
+	u.group = writtenServiceGroup(opts, identity)
 	return u, nil
+}
+
+// writtenServiceGroup is the one owner of the Group= the base unit of an
+// installation writes (canonicalUnitForInstall holds the rule's context).
+func writtenServiceGroup(opts InstallOptions, identity *unitWriteIdentity) string {
+	if identity == nil {
+		// No identity context: the unit names the account of the
+		// request and no group at all.
+		return ""
+	}
+	if identity.previous.existed && !opts.Explicit.ServiceUser {
+		// The written User= is the one the previous base unit carried,
+		// so its Group= is preserved byte for byte — the service
+		// identity changes only when the matching flag is named.
+		return identity.previous.facts.group
+	}
+	if identity.account == nil {
+		return ""
+	}
+	// The group of the unit is the primary group of the written account,
+	// never the name of the account itself, and a group the machine does
+	// not know is left out instead of guessed (unitIdentity documents the
+	// same rule for its named-account caller).
+	group, err := user.LookupGroupId(identity.account.Gid)
+	if err != nil || group.Name == "" {
+		return ""
+	}
+	return group.Name
 }
 
 // registrationOptions returns the installation options the canonical facts

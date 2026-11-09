@@ -325,8 +325,12 @@ func DefaultInstallOptions(scope Scope, executable string) InstallOptions {
 }
 
 // mergeInstallOptions returns the effective options of an installation over
-// an existing registration. existingPresent distinguishes the absence of an
-// optional value in a real registration from the zero value of a first install.
+// an existing registration. existingPresent distinguishes a registration
+// that was read AND parsed — the absence of an optional value in it is a
+// real, meaningful absence — from the zero value of a first install and
+// from a registration whose settings could not be read at all: only the
+// parsed registration is a merge source, so an unreadable one leaves the
+// defaults of the request standing (the documented repair path).
 //
 // A named field of the request wins. An unmarked required field keeps the
 // registration value when it has one and the request default otherwise;
@@ -364,6 +368,20 @@ func mergeInstallOptions(requested, existing InstallOptions, existingPresent boo
 		merged.ServiceUser = existing.ServiceUser
 	}
 	return merged
+}
+
+// RunningImageInfo resolves the file info of the running image the current
+// process executes. It is the identity side of a version claim: an
+// installation compares it with the registered file through os.SameFile
+// and stamps the build version only when the two are the same file.
+//
+// The platform files own the answer (the shared layer never branches on
+// the operating system): Linux reads the executed inode through procfs, a
+// host that cannot prove the identity reports an error, and the caller
+// withholds the claim — no version is ever stamped against a program the
+// platform could not identify.
+func RunningImageInfo() (os.FileInfo, error) {
+	return runningImageInfo()
 }
 
 // DefaultServiceUser returns the default account a machine-wide instance

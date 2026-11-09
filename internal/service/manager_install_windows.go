@@ -38,7 +38,11 @@ func (m *scmManager) install(ctx context.Context, opts InstallOptions, startFirs
 		return opts, Status{}, fmt.Errorf("service: %s is already registered; the first-install action will not change or start it%w", ServiceName, ErrAlreadyRegistered)
 	}
 	if previous.present {
-		opts = mergeInstallOptions(opts, previous.options, previous.present)
+		// Only a parsed registration is a merge source: an unreadable
+		// command line records no setting, so previous.parsed — not the
+		// mere presence of the registration — decides whether the
+		// registration's values replace the defaults of the request.
+		opts = mergeInstallOptions(opts, previous.options, previous.parsed)
 	}
 
 	if err := ValidateInstallOptions(opts); err != nil {
@@ -130,12 +134,49 @@ func (m *scmManager) install(ctx context.Context, opts InstallOptions, startFirs
 	return opts, registered.status, nil
 }
 
+// runningImageInfo resolves the file info of the running image itself.
+//
+// The identity comes from the module path of this process — the path the
+// kernel loaded the image from — opened as a file, with the identity read
+// from that open handle (volume and file index), so os.SameFile compares
+// the file behind the handle against the registered file instead of two
+// loose path walks. Windows keeps a running image locked at its path: the
+// bytes of an executing image cannot be written or replaced in place, so a
+// module path that still resolves to a file identical to the registered
+// file is that file. What this cannot see is an image that was renamed
+// away and had another file take its old path: the module path then
+// describes the file at the old path, not the bytes this process executes.
+// A path that no longer resolves reports an error instead, and the caller
+// withholds the version claim — the claim never guesses.
+func runningImageInfo() (os.FileInfo, error) {
+	path, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("service: the module path of the running image: %w", err)
+	}
+	image, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("service: open the running image %q: %w", path, err)
+	}
+	defer func() { _ = image.Close() }()
+	info, err := image.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("service: identify the running image %q: %w", path, err)
+	}
+	return info, nil
+}
+
 // previousSCMRegistration is the registration an installation replaces. It is
 // read before anything changes: the merge needs the settings the instance runs
 // with, a restart needs the process it ran in, and a failure needs it back.
 type previousSCMRegistration struct {
 	// present reports whether the instance was registered at all.
 	present bool
+	// parsed reports whether the command line of the registration could
+	// be read — the merge source of options. A registration that is
+	// present but unreadable records no setting, so the request's own
+	// defaults stand instead of being replaced by an empty result (the
+	// documented repair path of a damaged registration).
+	parsed bool
 	// options are the installation options the registration carries. They
 	// are the values a request that names nothing keeps.
 	options InstallOptions
@@ -168,27 +209,34 @@ func scmPreviousRegistration(scope Scope) (previousSCMRegistration, error) {
 	if !facts.present {
 		return previousSCMRegistration{}, nil
 	}
+	options, parsed := scmRegistrationOptions(facts.commandLine, scope)
 	return previousSCMRegistration{
 		present:   true,
-		options:   scmRegistrationOptions(facts.commandLine, scope),
+		parsed:    parsed,
+		options:   options,
 		running:   scmInstanceRan(facts.present, facts.state),
 		processID: facts.processID,
 	}, nil
 }
 
 // scmRegistrationOptions returns the installation options a registration
-// carries: the program of the command line, the bind address, the runtime paths
-// and the cache layout.
+// carries — the program of the command line, the bind address, the runtime
+// paths and the cache layout — and whether that command line could be read
+// at all.
 //
-// A command line that cannot be read records no setting, so the merge falls
-// back to the defaults of the request: an installation is the way a damaged
-// registration is repaired, so it never fails over one. No field is marked
-// explicit, and the account is not recorded: the instance runs as LocalService.
-func scmRegistrationOptions(commandLine string, scope Scope) InstallOptions {
+// A command line that cannot be read records no setting and reports
+// parsed=false, so the merge treats it as no merge source: the defaults of
+// the request stand, which is the documented repair path of a damaged
+// registration — an installation never fails over one. A readable command
+// line reports parsed=true even when it carries no optional directory: that
+// absence is a real setting of the registration and the merge preserves it.
+// No field is marked explicit, and the account is not recorded: the
+// instance runs as LocalService.
+func scmRegistrationOptions(commandLine string, scope Scope) (InstallOptions, bool) {
 	registration, err := parseSCMCommandLine(commandLine)
 	if err != nil {
 		log.Printf("service: the command line of the registration of %s cannot be read (%v), the request applies", ServiceName, err)
-		return InstallOptions{Scope: scope}
+		return InstallOptions{Scope: scope}, false
 	}
 	return InstallOptions{
 		Scope:      scope,
@@ -198,7 +246,7 @@ func scmRegistrationOptions(commandLine string, scope Scope) InstallOptions {
 		CacheDir:   registration.cacheDir(),
 		HubDir:     registration.flagValue("--hub-dir"),
 		LocalDir:   registration.flagValue("--local-dir"),
-	}
+	}, true
 }
 
 // register writes the registration of the instance and puts it into service.

@@ -199,6 +199,35 @@ func TestSystemdRenderUnitQuotesPathsWithSpaces(t *testing.T) {
 	}
 }
 
+// TestParsedUnitFlagValueAcceptsBothArgumentForms pins that the unit reader
+// recovers a run flag from both forms a registered ExecStart may carry: the
+// paired words of the canonical write and the equals form a hand-edited or
+// foreign unit may carry. A reader that only matched the paired form would
+// drop the equals-form setting from the status and the reinstall merge.
+func TestParsedUnitFlagValueAcceptsBothArgumentForms(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args string
+	}{
+		{"the paired form", `"/usr/bin/hfdesk" run --listen 127.0.0.1:9090 --cache-dir /srv/cache --local-dir /srv/models`},
+		{"the equals form", `"/usr/bin/hfdesk" run --listen=127.0.0.1:9090 --cache-dir=/srv/cache --local-dir=/srv/models`},
+		{"the mixed form", `"/usr/bin/hfdesk" run --listen=127.0.0.1:9090 --cache-dir /srv/cache --local-dir=/srv/models`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parsed := parseUnit("[Service]\nExecStart=" + tc.args + "\n")
+			if got := parsed.listen(); got != "127.0.0.1:9090" {
+				t.Errorf("listen() = %q, want %q", got, "127.0.0.1:9090")
+			}
+			if got := parsed.flagValue("--cache-dir"); got != "/srv/cache" {
+				t.Errorf("--cache-dir = %q, want %q", got, "/srv/cache")
+			}
+			if got := parsed.flagValue("--local-dir"); got != "/srv/models" {
+				t.Errorf("--local-dir = %q, want %q", got, "/srv/models")
+			}
+		})
+	}
+}
+
 // TestSystemdRenderUnitEscapesTheDollarSign checks that a path with a dollar
 // sign reaches the process as it was written.
 //

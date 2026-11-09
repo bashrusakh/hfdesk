@@ -14,6 +14,21 @@ import (
 	"strings"
 )
 
+// runningImageInfo resolves the file info of the running image itself.
+//
+// The identity is read from the procfs magic link /proc/self/exe: it stats
+// the inode the kernel loaded even when the path was replaced while this
+// process kept running. os.Executable cannot prove that identity — its
+// documented contract does not guarantee the path still points at the
+// started executable, and on Linux the standard library trims the
+// "(deleted)" suffix procfs appends to a replaced image — so two stats of
+// path names would both see the replacement and stamp the old compiled-in
+// version against a file that reports another one, which a verified start
+// would then reject as a mismatch.
+func runningImageInfo() (os.FileInfo, error) {
+	return os.Stat("/proc/self/exe")
+}
+
 // Install registers the service with the supervisor.
 //
 // The installation follows the canonical-unit ownership model. It validates
@@ -504,8 +519,12 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 	}
 
 	// The canonical facts of the write: the merged options plus the
-	// already-resolved HOME and account identity.
-	facts, err := canonicalUnitForInstall(opts, account)
+	// already-resolved HOME, the account identity and the registration
+	// the write replaces — the group of the written base unit follows the
+	// account of the written User= and never a drop-in identity the
+	// loaded configuration reports (canonicalUnitForInstall owns that
+	// rule).
+	facts, err := canonicalUnitForInstall(opts, &unitWriteIdentity{account: account, previous: previous})
 	if err != nil {
 		return result, err
 	}

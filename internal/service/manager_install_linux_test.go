@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -2345,4 +2346,94 @@ func TestSystemdInstallRefusesARunningUnitWithoutAMainPID(t *testing.T) {
 			t.Errorf("the refused installation called %q %d times:\n%s", strings.Join(command, " "), got, strings.Join(calls, "\n"))
 		}
 	}
+}
+
+// TestSystemdCanonicalUnitForInstallKeepsTheGroupOfTheWrittenUser pins the
+// one owner of the Group= of the written base unit: the group follows the
+// account of the WRITTEN User=, never an identity of the loaded
+// configuration.
+//
+//   - An update that names no --service-user writes the account the base
+//     unit already carries, so the previous base Group= is preserved
+//     exactly. The resolved account of such an update may come from a
+//     User= drop-in the loaded configuration provides — its primary group
+//     describes that drop-in identity, and writing it beside the base
+//     User= would pair two identities: after the write the loaded group
+//     changes, the loaded-identity verification fails and a pure
+//     executable switch rolls back.
+//   - An update that names --service-user writes that account's primary
+//     group: the service identity changes only when the matching install
+//     flag is named.
+//   - A first installation has no previous base group and writes the
+//     primary group of the resolved account.
+func TestSystemdCanonicalUnitForInstallKeepsTheGroupOfTheWrittenUser(t *testing.T) {
+	current, err := user.Current()
+	assertNoError(t, err, "user.Current(): %v", err)
+	currentGroup, err := user.LookupGroupId(current.Gid)
+	assertNoError(t, err, "the primary group of the current account: %v", err)
+	baseUser, baseGroup := "hfdesk-svc", "hfdesk-svc"
+	if currentGroup.Name == baseGroup {
+		t.Skipf("the primary group of the current account collides with the fixture account %q", baseGroup)
+	}
+	previous := previousRegistration{
+		existed: true,
+		facts:   canonicalUnit{scope: ScopeSystem, user: baseUser, group: baseGroup},
+	}
+
+	t.Run("an unnamed update preserves the previous base group", func(t *testing.T) {
+		opts := systemdTestOptions(t, ScopeSystem)
+		opts.ServiceUser = baseUser
+		// The resolved account of the installation: the loaded
+		// identity a User= drop-in provides — an account whose
+		// primary group differs from the written User=.
+		loadedIdentity := &user.User{
+			Username: "operator",
+			Uid:      "4294967294",
+			Gid:      current.Gid,
+		}
+
+		facts, factErr := canonicalUnitForInstall(opts, &unitWriteIdentity{account: loadedIdentity, previous: previous})
+		assertNoError(t, factErr, "canonicalUnitForInstall() = %v, want nil", factErr)
+		if facts.user != baseUser {
+			t.Errorf("the written User= = %q, want the base account %q", facts.user, baseUser)
+		}
+		if facts.group != baseGroup {
+			t.Errorf("the written Group= = %q, want the preserved base group %q (the resolved account's primary group is %q)",
+				facts.group, baseGroup, currentGroup.Name)
+		}
+		content, renderErr := renderCanonicalUnit(facts)
+		assertNoError(t, renderErr, "renderCanonicalUnit() = %v, want nil", renderErr)
+		if got := unitDirective(content, "Group"); got != baseGroup {
+			t.Errorf("Group= of the rendered base unit = %q, want %q", got, baseGroup)
+		}
+		if got := unitDirective(content, "User"); got != baseUser {
+			t.Errorf("User= of the rendered base unit = %q, want %q", got, baseUser)
+		}
+	})
+
+	t.Run("a named update writes the named account's group", func(t *testing.T) {
+		opts := systemdTestOptions(t, ScopeSystem)
+		opts.ServiceUser = current.Username
+		opts.Explicit.ServiceUser = true
+
+		facts, factErr := canonicalUnitForInstall(opts, &unitWriteIdentity{account: current, previous: previous})
+		assertNoError(t, factErr, "canonicalUnitForInstall() = %v, want nil", factErr)
+		if facts.user != current.Username {
+			t.Errorf("the written User= = %q, want the named account %q", facts.user, current.Username)
+		}
+		if facts.group != currentGroup.Name {
+			t.Errorf("the written Group= = %q, want the primary group %q of the named account", facts.group, currentGroup.Name)
+		}
+	})
+
+	t.Run("a first installation writes the account's primary group", func(t *testing.T) {
+		opts := systemdTestOptions(t, ScopeSystem)
+		opts.ServiceUser = current.Username
+
+		facts, factErr := canonicalUnitForInstall(opts, &unitWriteIdentity{account: current})
+		assertNoError(t, factErr, "canonicalUnitForInstall() = %v, want nil", factErr)
+		if facts.group != currentGroup.Name {
+			t.Errorf("the written Group= = %q, want the primary group %q of the account", facts.group, currentGroup.Name)
+		}
+	})
 }

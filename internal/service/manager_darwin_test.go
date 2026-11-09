@@ -3350,6 +3350,12 @@ type darwinFakeLaunchd struct {
 	// the running fact keeps hiding it for exitPolls answers, so the exit
 	// lands inside the wait of the stop instead of before it.
 	dying bool
+	// pendingState is the state a loaded job reports while the
+	// supervisor has scheduled its start and no process of it exists
+	// yet ("waiting", "spawn scheduled"): print reports the state with
+	// no process id, exactly as a launchd between the load and the
+	// spawn does. It applies to a job that does not run.
+	pendingState string
 	// exitPolls counts the unknown answers of that window down.
 	exitPolls int
 	// commands holds every command the manager issued, in order.
@@ -3472,6 +3478,9 @@ func (f *darwinFakeLaunchd) printOutput() string {
 	if f.running {
 		state = "running"
 		pid = f.pid
+	} else if f.pendingState != "" {
+		// A start the supervisor scheduled: the state with no process.
+		state = f.pendingState
 	}
 	return fmt.Sprintf("%s = {\n\tstate = %s\n\tpid = %d\n}", launchdLabel(), state, pid)
 }
@@ -4434,6 +4443,58 @@ func TestLaunchdRepeatInstallKeepsTheSettingsTheRequestDoesNotName(t *testing.T)
 	}
 	if fake.running {
 		t.Error("the update started the stopped instance")
+	}
+}
+
+// TestLaunchdRegistrationArgumentValueAcceptsBothArgumentForms pins that
+// the property-list reader recovers a registered setting from both forms a
+// ProgramArguments vector may carry: the paired words of the canonical
+// write and the equals form of a hand-edited or foreign property list. A
+// reader that only matched the paired form missed an equals-form
+// "--listen" on reinstall, so the merge dropped the bind address (and the
+// paths and cache layout) of the registration instead of keeping them.
+func TestLaunchdRegistrationArgumentValueAcceptsBothArgumentForms(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"the paired form", []string{"/usr/local/bin/hfdesk", "--listen", "127.0.0.1:9090", "--cache-dir", "/srv/cache", "--local-dir", "/srv/models"}},
+		{"the equals form", []string{"/usr/local/bin/hfdesk", "--listen=127.0.0.1:9090", "--cache-dir=/srv/cache", "--local-dir=/srv/models"}},
+		{"the mixed form", []string{"/usr/local/bin/hfdesk", "--listen=127.0.0.1:9090", "--cache-dir", "/srv/cache", "--local-dir=/srv/models"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			registration := plistRegistration{ProgramArguments: tc.args}
+			if got := registration.listen(); got != "127.0.0.1:9090" {
+				t.Errorf("listen() = %q, want %q", got, "127.0.0.1:9090")
+			}
+			if got := registration.cacheDir(); got != "/srv/cache" {
+				t.Errorf("cacheDir() = %q, want %q", got, "/srv/cache")
+			}
+			if got := registration.argumentValue("--local-dir"); got != "/srv/models" {
+				t.Errorf("--local-dir = %q, want %q", got, "/srv/models")
+			}
+			// The reinstall merge reads the same reader: the settings
+			// the request does not name are the registered ones.
+			opts := registration.registrationOptions(ScopeUser)
+			if opts.Listen != "127.0.0.1:9090" || opts.CacheDir != "/srv/cache" || opts.LocalDir != "/srv/models" {
+				t.Errorf("registrationOptions() = %+v, want the registered listen/cache/local settings", opts)
+			}
+		})
+	}
+
+	// The first occurrence of a flag decides, whichever form it uses, and
+	// an equals value keeps everything after the first "=".
+	registration := plistRegistration{ProgramArguments: []string{
+		"/usr/local/bin/hfdesk",
+		"--listen", "127.0.0.1:9090",
+		"--listen=127.0.0.1:9999",
+		"--cache-dir=/srv/a=b",
+	}}
+	if got := registration.listen(); got != "127.0.0.1:9090" {
+		t.Errorf("listen() = %q, want the first occurrence %q", got, "127.0.0.1:9090")
+	}
+	if got := registration.cacheDir(); got != "/srv/a=b" {
+		t.Errorf("cacheDir() = %q, want the value after the first \"=\"", got)
 	}
 }
 
@@ -5509,6 +5570,153 @@ func TestLaunchdRefusesAnUpdateThatCannotTellWhetherTheInstanceRuns(t *testing.T
 		assertNoError(t, err, "read the registration: %v", err)
 		if !bytes.Equal(after, before) {
 			t.Errorf("the refused installation left the registration %q, want %q", after, before)
+		}
+	})
+}
+
+// TestLaunchdRefusesAnUpdateWhileTheSupervisorSchedulesTheStart checks the
+// second fail-closed state of an update over a loaded registration: a job
+// whose start the supervisor has scheduled and whose process does not exist
+// yet ("waiting", "spawn scheduled").
+//
+// The status path reports such a job as a start on the way
+// (parseLaunchdPrint maps "waiting" to StateStarting, and runningState
+// counts that as running), while the plan of an update reads it as not
+// running — acting on that reading would boot the pending start out through
+// the stopped-instance branch and leave the instance down. The update
+// therefore refuses before any mutation, quoting the state it read and
+// naming the stop that clears the pending start, exactly like the refusal
+// of an undetermined running fact above.
+//
+// The two contrast cases keep the neighbouring states on record with the
+// same harness: a known-stopped job still takes the stopped-instance
+// branch and a known-running job still restarts — only the PID-less
+// pending states refuse.
+func TestLaunchdRefusesAnUpdateWhileTheSupervisorSchedulesTheStart(t *testing.T) {
+	ctx := context.Background()
+
+	// changedOptions returns a request whose property list differs from
+	// the registration of the test, so the update takes the branch it
+	// would take over a stopped or running instance.
+	changedOptions := func(t *testing.T, root string) InstallOptions {
+		t.Helper()
+		opts := darwinTempInstallOptions(t, root)
+		opts.Listen = "127.0.0.1:9911"
+		opts.Explicit.Listen = true
+		return opts
+	}
+
+	for _, pendingState := range []string{"waiting", "spawn scheduled"} {
+		t.Run("the pending state "+pendingState+" refuses before the supervisor is touched", func(t *testing.T) {
+			launchd := darwinStatusManager(t)
+			fake := &darwinFakeLaunchd{loaded: true, pendingState: pendingState}
+			launchd.run = fake.run
+			root := t.TempDir()
+			darwinWriteRegistrationWithRunAtLoad(t, launchd, darwinTempInstallOptions(t, root), true)
+			before, err := os.ReadFile(launchd.plistPath())
+			assertNoError(t, err, "read the registration: %v", err)
+
+			fake.commands = nil
+			if _, err := launchd.Install(ctx, changedOptions(t, root)); err == nil {
+				t.Fatal("Install() = nil, want the refusal of a pending start")
+			} else {
+				assertNames(t, err.Error(), "Install()", []string{
+					"the installation was refused",
+					"pending start",
+					"state \"" + pendingState + "\"",
+					`Stop the instance with "hfdesk service stop"`,
+					`run "hfdesk service install" again`,
+				})
+				// The refusal precedes every mutation: no rollback
+				// ran, so the report carries no restoration suffix.
+				if strings.Contains(err.Error(), "(the registration was restored)") {
+					t.Errorf("Install() = %q, claims a rollback for a refusal that precedes every write", err)
+				}
+				assertNamesWithout(t, err.Error(), "Install()", nil, []string{
+					" or ",
+				})
+			}
+
+			// The refusal leaves the supervisor and the registration
+			// exactly as they were: the state read is the only
+			// command the attempt issued, the pending job stays
+			// loaded, and the property list was never rewritten.
+			if want := []string{"print " + launchd.target(), "print-disabled " + launchd.domain()}; !reflect.DeepEqual(fake.commands, want) {
+				t.Errorf("the commands of the manager =\n%v\nwant the state read and nothing else\n%v", fake.commands, want)
+			}
+			for _, command := range fake.commands {
+				if strings.HasPrefix(command, "bootout ") || strings.HasPrefix(command, "bootstrap ") ||
+					strings.HasPrefix(command, "kickstart ") || strings.HasPrefix(command, "kill ") ||
+					command == "enable "+launchd.target() || command == "disable "+launchd.target() {
+					t.Errorf("the refused installation issued the mutating command %q: %v", command, fake.commands)
+				}
+			}
+			if !fake.loaded {
+				t.Error("the refused installation unloaded the pending registration")
+			}
+			if fake.running {
+				t.Error("the refused installation started the pending registration")
+			}
+			if fake.disabled {
+				t.Error("the refused installation changed the disabled flag")
+			}
+			after, err := os.ReadFile(launchd.plistPath())
+			assertNoError(t, err, "read the registration: %v", err)
+			if !bytes.Equal(after, before) {
+				t.Errorf("the refused installation left the registration %q, want %q", after, before)
+			}
+		})
+	}
+
+	t.Run("a known-stopped job still takes the stopped-instance branch", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{loaded: true}
+		launchd.run = fake.run
+		root := t.TempDir()
+		darwinWriteRegistrationWithRunAtLoad(t, launchd, darwinTempInstallOptions(t, root), false)
+
+		fake.commands = nil
+		if _, err := launchd.Install(ctx, changedOptions(t, root)); err != nil {
+			t.Fatalf("Install() over a stopped instance: %v", err)
+		}
+		unloaded := false
+		for _, command := range fake.commands {
+			if command == "bootout "+launchd.target() {
+				unloaded = true
+			}
+		}
+		if !unloaded {
+			t.Errorf("the commands of the manager = %v, want the unload of the stale registration", fake.commands)
+		}
+		if fake.loaded {
+			t.Error("the stale registration is still loaded after the update")
+		}
+	})
+
+	t.Run("a known-running job still restarts", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{loaded: true, running: true, pid: darwinFakePID}
+		launchd.run = fake.run
+		root := t.TempDir()
+		darwinWriteRegistrationWithRunAtLoad(t, launchd, darwinTempInstallOptions(t, root), true)
+
+		fake.commands = nil
+		if _, err := launchd.Install(ctx, changedOptions(t, root)); err != nil {
+			t.Fatalf("Install() over a running instance: %v", err)
+		}
+		// The update really touched the supervisor: the stop of the
+		// old instance ran its signal before the start of the new one.
+		signalled := false
+		for _, command := range fake.commands {
+			if command == "kill SIGTERM "+launchd.target() {
+				signalled = true
+			}
+		}
+		if !signalled {
+			t.Errorf("the commands of the manager = %v, want the stop of the running instance", fake.commands)
+		}
+		if !fake.running {
+			t.Error("the updated instance is not running after the restart")
 		}
 	})
 }
