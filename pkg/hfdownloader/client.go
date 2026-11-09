@@ -241,7 +241,9 @@ type RepoInfo struct {
 // context carries no earlier deadline. The repo-info lookup and every
 // tree-page request (delivered through Walker.PageFetchTimeout) are one
 // policy: required planning data from the same endpoint over the same
-// transport windows, so one honest value bounds both. It is deliberately
+// transport windows, so one honest value bounds both. Its smartdl mirror,
+// treePageFetchTimeout in pkg/smartdl/analyzer.go, must be changed together
+// with this value. It is deliberately
 // generous so slow-but-working endpoints keep working: the transport may
 // already spend up to defaultDialTimeout (30s) connecting and
 // defaultResponseHeaderTimeout (60s) awaiting headers, so two minutes still

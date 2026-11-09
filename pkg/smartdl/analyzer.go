@@ -437,23 +437,49 @@ func (a *Analyzer) fetchFileTree(ctx context.Context, repo string, isDataset boo
 	return files, commit, err
 }
 
+// treePageFetchTimeout is the per-fetch TOTAL cap (dial + response headers +
+// one JSON page body) on every tree-page request the analyze flow issues
+// through the shared hubtree walker. The single source of the family value is
+// pkg/hfdownloader/client.go's metadataFetchTimeout: required Hub metadata
+// fetched from the same endpoints over the same transport windows is one
+// policy, so both packages carry the same 2-minute value — this mirror exists
+// only because that variable is unexported and pkg/smartdl must not gain a
+// production dependency on pkg/hfdownloader just to read one duration; change
+// the two together. The cap is deliberately generous so slow-but-working
+// endpoints keep working: the transport HFDesk builds may already spend up to
+// 30s connecting and 60s awaiting response headers, so two minutes still
+// leaves at least ~30 seconds for the body read on the slowest endpoint that
+// satisfies those transport windows, while ending body waits that previously
+// had no bound of their own. It is a package variable (not a const) so tests
+// can lower it deterministically, mirroring hfdownloader's
+// metadataFetchTimeout.
+var treePageFetchTimeout = 2 * time.Minute
+
 // walkTree walks the repository tree through the shared hubtree walker
 // (issue #96): recursive=true with Link rel="next" pagination, per-directory
 // fallback for mirrors that ignore recursive, bounded malformed listings,
 // and bounded Retry-After/RateLimit-aware retries of 429/5xx/network errors.
+// Each page request runs under the per-fetch analysis metadata cap
+// (treePageFetchTimeout: dial + response headers + JSON body); its expiry
+// fails every analyze-flow tree fetch with the actionable budget error below,
+// while retry waits between attempts and the request budget stay under their
+// own hubtree bounds on the caller's context, never charged to that
+// per-request deadline.
 // When commitOut is non-nil and still empty, the resolved commit SHA is
 // captured from the X-Repo-Commit response header that HuggingFace returns
 // for the requested revision — from the first response that carries it, as
 // before. Terminal statuses fail immediately with the historical error
-// messages below.
+// messages below; expiry of the per-page budget fails with the actionable
+// timeout error naming the budget.
 func (a *Analyzer) walkTree(ctx context.Context, repo string, isDataset bool, revision, prefix string, commitOut *string, fn func(hfTreeNode) error) error {
 	w := &hubtree.Walker{
 		TreeURL: func(p string) string {
 			return a.treeURL(repo, isDataset, revision, p)
 		},
-		Token:     a.token,
-		UserAgent: "hfdownloader/3",
-		Client:    a.client,
+		Token:            a.token,
+		UserAgent:        "hfdownloader/3",
+		Client:           a.client,
+		PageFetchTimeout: treePageFetchTimeout,
 		StatusErr: func(resp *http.Response) error {
 			// The walker closes the body before calling this mapper, so only
 			// the status and headers are available for the diagnostic.
@@ -482,9 +508,27 @@ func (a *Analyzer) walkTree(ctx context.Context, repo string, isDataset bool, re
 			}
 		},
 	}
-	return w.Walk(ctx, prefix, func(n hubtree.Node) error {
+	if err := w.Walk(ctx, prefix, func(n hubtree.Node) error {
 		return fn(toTreeNode(n))
-	})
+	}); err != nil {
+		if errors.Is(err, hubtree.ErrPageFetchTimeout) {
+			return shapeTreePageTimeout(repo, err)
+		}
+		return err
+	}
+	return nil
+}
+
+// shapeTreePageTimeout reports an expired per-page budget as the analysis
+// failure it is: required file-list data did not arrive, so the result must
+// never look complete. The message mirrors pkg/hfdownloader's planning
+// tree-page timeout (what timed out, for which repo, and the remedy), but
+// wraps with %w instead of %v: hubtree carries the underlying context expiry
+// as text only, so preserving the chain keeps classifiers seeing
+// hubtree.ErrPageFetchTimeout as a FAILURE while errors.Is never reports
+// context.DeadlineExceeded or context.Canceled for an internal budget expiry.
+func shapeTreePageTimeout(repo string, err error) error {
+	return fmt.Errorf("tree page API timed out after %s for %q: analysis needs this file list and the endpoint did not respond in time; check the endpoint, proxy, or network and retry (last error: %w)", treePageFetchTimeout, repo, err)
 }
 
 // toTreeNode converts a shared hubtree node to the analyzer's node type

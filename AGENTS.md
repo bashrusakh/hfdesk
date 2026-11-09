@@ -301,6 +301,19 @@ or job ownership behavior. This section is the agent-level summary; when it and
 
 - `pkg/smartdl` should classify repositories and selectable files without
   starting downloads.
+- The analyze flow's tree-page fetches run under the same 2-minute per-fetch
+  metadata cap family as planning (`treePageFetchTimeout` in `pkg/smartdl`,
+  delivered through `hubtree.Walker.PageFetchTimeout`): one TOTAL bound per
+  request attempt over dial + response headers + the JSON page body, with
+  retry waits and the request budget excluded. A caller deadline still wins.
+  Cap expiry fails the analysis with an actionable timeout naming the budget
+  and the remedy — never a silently partial result for the required
+  file-list walks, which always fail loudly, while the three optional
+  enrichment walks (post-success dataset namespace probe, mmproj discovery,
+  EXL size pass) keep their pre-existing optional-failure semantics and may
+  be skipped on expiry — and stays a failure
+  matching `hubtree.ErrPageFetchTimeout`, never a caller cancellation
+  (`errors.Is(context.DeadlineExceeded|Canceled)` is always false for it).
 - Recommended download output should remain a structured request body, not a
   shell command string contract.
 - Exact matching and filter behavior must remain predictable for GGUF quants,
