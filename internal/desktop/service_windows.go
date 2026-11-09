@@ -301,6 +301,34 @@ func installServiceFromTray(instanceMutex string) *desktopHandover {
 		return nil
 	}
 
+	// The registration is read again before the handover begins: this very
+	// launch may have chosen the desktop mode for an existing service, or a
+	// registration appeared since. Handing a first-install helper a
+	// registration it must refuse would cost the desktop its server for
+	// nothing, so the choice every launch with a registration gets is
+	// offered here instead and no handover starts.
+	recheckCtx, recheckCancel := context.WithTimeout(context.Background(), serviceStatusTimeout)
+	status, err := serviceGateStatus(recheckCtx)
+	recheckCancel()
+	if err != nil {
+		if errors.Is(err, errServiceGatePending) {
+			desktopLog.Info("the service state settled into a transition before the installation handover: nothing was handed over",
+				"state", string(status.State))
+			showMessage(serviceGatePendingCaption,
+				serviceGatePendingText(status.State), windows.MB_ICONINFORMATION)
+			return nil
+		}
+		desktopLog.Error("the service registration could not be read again before the installation handover: nothing was handed over",
+			"error", err)
+		showMessage(serviceGateUnreadableCaption,
+			serviceGateUnreadableText(err), windows.MB_ICONERROR)
+		return nil
+	}
+	if status.State != service.StateNotInstalled {
+		offerRegisteredServiceFromTray(status, instanceMutex)
+		return nil
+	}
+
 	handover, err := launchServiceHandover(serviceActionInstall, os.Getpid(), instanceMutex)
 	if err != nil {
 		reportServiceLaunchFailure(serviceActionInstall, err)
@@ -310,6 +338,56 @@ func installServiceFromTray(instanceMutex string) *desktopHandover {
 	desktopLog.Info("the elevated service installation is running",
 		"helperPID", handover.helper.pid, "console", console)
 	return handover
+}
+
+// offerRegisteredServiceFromTray asks the choice of the service gate for a
+// registration that exists at the installation step and performs the answer
+// beside the running desktop.
+//
+// The dialog is the gate's dialog: the question and its buttons are the ones
+// every launch with a registration sees, so the vocabulary cannot drift
+// apart. No answer starts a handover — this host keeps running: the desktop
+// mode and Cancel change nothing, the browser action opens the URL of the
+// registration, and the start and the update go to the elevated helper the
+// way the gate launches them, where the helper's own guards report a
+// mutation the serving desktop does not allow and the update of a positively
+// stopped registration rewrites the registration without starting anything.
+func offerRegisteredServiceFromTray(status service.Status, instanceMutex string) {
+	desktopLog.Info("the Windows service is registered already: the tray offers the actions of an existing service instead of an installation",
+		"state", string(status.State),
+		"running", status.Running)
+	prompt := serviceChoicePrompt{
+		State:   status.State,
+		Running: status.Running,
+		Listen:  status.Listen,
+		DataDir: status.Paths.StateDir,
+		Detail:  status.Detail,
+	}
+	if url, err := serviceURL(status.Listen); err == nil {
+		prompt.URL = url
+	}
+	switch showServiceChoice(prompt) {
+	case serviceChoiceOpen:
+		url, err := serviceURL(status.Listen)
+		if err != nil {
+			reportBrowserFailure(status.Listen, err)
+			return
+		}
+		if err := openBrowser(url); err != nil {
+			reportBrowserFailure(url, err)
+		}
+	case serviceChoiceStart:
+		if _, err := launchServiceHelper(serviceActionStart, 0, instanceMutex); err != nil {
+			reportServiceLaunchFailure(serviceActionStart, err)
+		}
+	case serviceChoiceUpdate:
+		if _, err := launchServiceHelper(serviceActionUpdate, 0, instanceMutex); err != nil {
+			reportServiceLaunchFailure(serviceActionUpdate, err)
+		}
+	default:
+		desktopLog.Info("the tray changed nothing for the registered service",
+			"state", string(status.State))
+	}
 }
 
 // serviceDataDir returns the data directory the service owns.

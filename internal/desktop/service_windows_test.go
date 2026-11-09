@@ -1308,6 +1308,129 @@ func TestTrayServiceInstallIgnoresAClickWhileAnActionRuns(t *testing.T) {
 // The update re-registers the service from the folder of the helper and keeps
 // the running state it had. It never starts a stopped service, so the helper
 // starts nothing itself and the service reports the stopped state afterwards.
+// TestTrayServiceInstallOffersTheRegisteredServiceInsteadOfAHandover checks
+// both sides of the registration re-read at the installation step.
+//
+// A registration that exists when the handover would begin — this launch
+// chose the desktop mode for it, or it appeared meanwhile — must not cost
+// the running desktop its server: the tray offers the choice every launch
+// with a registration gets, no handover starts, and the answers change
+// nothing beside the running host (the helper's own guards report a
+// mutation the serving desktop does not allow). A machine without a
+// registration keeps the clean installation flow, and a state that cannot
+// be read hands nothing over and says so with the established notice.
+func TestTrayServiceInstallOffersTheRegisteredServiceInsteadOfAHandover(t *testing.T) {
+	fixture := func(t *testing.T, choice serviceChoice) (*[]shownMessage, *[]elevatedLaunch, *[]elevatedLaunch, *serviceChoicePrompt) {
+		t.Helper()
+		freshServiceInstallGuard(t)
+		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+			return runningServiceStatus(service.StateStopped, "127.0.0.1:18080"), nil
+		})
+		replaceSeam(t, &confirmServiceInstall, func(string) bool { return true })
+		replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+			return `C:\portable\hfdesk.exe`, nil
+		})
+		prompt := &serviceChoicePrompt{}
+		replaceSeam(t, &showServiceChoice, func(p serviceChoicePrompt) serviceChoice {
+			*prompt = p
+			return choice
+		})
+		var helperLaunches []elevatedLaunch
+		replaceSeam(t, &launchElevatedProcess, func(elevatedLaunch) (*elevatedProcess, error) {
+			helperLaunches = append(helperLaunches, elevatedLaunch{})
+			return nil, errors.New("a handover must not start for a registered service")
+		})
+		var helperStarts []elevatedLaunch
+		replaceSeam(t, &launchElevated, func(l elevatedLaunch) (uint32, error) {
+			helperStarts = append(helperStarts, l)
+			return 4242, nil
+		})
+		messages := recordMessages(t)
+		return messages, &helperLaunches, &helperStarts, prompt
+	}
+
+	t.Run("the desktop mode keeps the host running", func(t *testing.T) {
+		messages, handovers, starts, prompt := fixture(t, serviceChoiceDesktop)
+
+		if handover := installServiceFromTray(`Local\HFDesk.Test.10`); handover != nil {
+			handover.close()
+			t.Fatal("the tray action handed a registered service over to the installation helper")
+		}
+		if len(*handovers) != 0 || len(*starts) != 0 {
+			t.Errorf("the tray action launched helpers %v and %v, want none for the desktop answer", *handovers, *starts)
+		}
+		if prompt.State != service.StateStopped || prompt.Listen != "127.0.0.1:18080" {
+			t.Errorf("the offered prompt = %+v, want the registered stopped service", *prompt)
+		}
+		if len(*messages) != 0 {
+			t.Errorf("the tray action showed %v, want the dialog alone", *messages)
+		}
+	})
+
+	t.Run("the update asks the helper without a handover", func(t *testing.T) {
+		messages, handovers, starts, _ := fixture(t, serviceChoiceUpdate)
+
+		if handover := installServiceFromTray(`Local\HFDesk.Test.11`); handover != nil {
+			handover.close()
+			t.Fatal("the tray action committed a handover for the update of a registered service")
+		}
+		if len(*handovers) != 0 {
+			t.Errorf("the tray action started %d installation handovers, want none", len(*handovers))
+		}
+		if len(*starts) != 1 {
+			t.Fatalf("the tray action launched %d helpers, want one update", len(*starts))
+		}
+		if (*starts)[0].Action != serviceActionUpdate || (*starts)[0].WaitPID != 0 {
+			t.Errorf("the helper = %+v, want the gate's update launch with no wait", (*starts)[0])
+		}
+		if (*starts)[0].InstanceMutex != `Local\HFDesk.Test.11` {
+			t.Errorf("the helper singleton = %q, want this desktop's object", (*starts)[0].InstanceMutex)
+		}
+		if len(*messages) != 0 {
+			t.Errorf("the tray action showed %v, want the helper to report the outcome", *messages)
+		}
+	})
+
+	t.Run("an unreadable registration hands nothing over", func(t *testing.T) {
+		freshServiceInstallGuard(t)
+		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+			return service.Status{}, errors.New("the service control manager is gone")
+		})
+		replaceSeam(t, &confirmServiceInstall, func(string) bool { return true })
+		replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+			return `C:\portable\hfdesk.exe`, nil
+		})
+		offered := false
+		replaceSeam(t, &showServiceChoice, func(serviceChoicePrompt) serviceChoice {
+			offered = true
+			return serviceChoiceCancel
+		})
+		var handovers []elevatedLaunch
+		replaceSeam(t, &launchElevatedProcess, func(elevatedLaunch) (*elevatedProcess, error) {
+			handovers = append(handovers, elevatedLaunch{})
+			return nil, errors.New("a handover must not start on an unreadable state")
+		})
+		messages := recordMessages(t)
+
+		if handover := installServiceFromTray(`Local\HFDesk.Test.12`); handover != nil {
+			handover.close()
+			t.Fatal("the tray action handed an unreadable state over to the helper")
+		}
+		if offered {
+			t.Error("the choice of an existing service was offered over an unreadable state")
+		}
+		if len(handovers) != 0 {
+			t.Errorf("the tray action started %d handovers over an unreadable state, want none", len(handovers))
+		}
+		if len(*messages) != 1 {
+			t.Fatalf("the tray action showed %d messages, want the one unreadable-state notice", len(*messages))
+		}
+		if (*messages)[0].caption != serviceGateUnreadableCaption {
+			t.Errorf("the caption %q, want %q", (*messages)[0].caption, serviceGateUnreadableCaption)
+		}
+	})
+}
+
 func TestServiceHelperUpdateNeverStartsAStoppedService(t *testing.T) {
 	replaceSeam(t, &serviceVerifyBudget, 100*time.Millisecond)
 	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
@@ -1846,6 +1969,12 @@ func TestServiceHelperRequiresBothSuccessfulShutdownAndDesktopExit(t *testing.T)
 		t.Fatalf("the helper returned after success but before the desktop exited: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
+	// The helper acknowledges the authorization it received while it is
+	// still waiting for the desktop exit: the acknowledgment proves the
+	// acceptance of the signal, not the liveness of the process.
+	if result, err := windows.WaitForSingleObject(handover.confirmed, 0); err != nil || result != windows.WAIT_OBJECT_0 {
+		t.Fatalf("the helper did not acknowledge the received authorization: result=%#x err=%v", result, err)
+	}
 	if err := windows.SetEvent(handover.parent); err != nil {
 		t.Fatalf("signal desktop exit: %v", err)
 	}
@@ -1881,6 +2010,9 @@ func TestServiceHelperRejectsDesktopExitWithoutSuccessfulShutdown(t *testing.T) 
 	}
 	if err := <-done; err == nil {
 		t.Fatal("the installation succeeded although the desktop supplied no successful-shutdown signal")
+	}
+	if result, err := windows.WaitForSingleObject(handover.confirmed, 0); err != nil || result != uint32(windows.WAIT_TIMEOUT) {
+		t.Errorf("a rejected authorization was acknowledged: result=%#x err=%v", result, err)
 	}
 	if len(manager.steps) != 0 {
 		t.Errorf("the helper touched the service before authorization: %v", manager.steps)

@@ -17,8 +17,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// serviceWaitBudget bounds the helper-ready handshake and the wait for the
-// successful-completion evidence. It is a variable so tests can shorten it.
+// serviceWaitBudget bounds the helper-ready handshake, the wait for the
+// successful-completion evidence, and the desktop's wait for the helper's
+// acknowledgment of that authorization. It is a variable so tests can shorten
+// it.
 var serviceWaitBudget = 60 * time.Second
 
 // serviceParentExitBudget bounds the subsequent wait for the original desktop

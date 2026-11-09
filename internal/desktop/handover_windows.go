@@ -24,11 +24,13 @@ const handoverEventAccess = windows.SYNCHRONIZE | windows.EVENT_MODIFY_STATE
 const handoverEventPrefix = `Local\HFDesk.ServiceHandover.`
 
 type handoverEvents struct {
-	readyName   string
-	successName string
-	ready       windows.Handle
-	success     windows.Handle
-	closeOnce   sync.Once
+	readyName     string
+	successName   string
+	confirmedName string
+	ready         windows.Handle
+	success       windows.Handle
+	confirmed     windows.Handle
+	closeOnce     sync.Once
 }
 
 type desktopHandover struct {
@@ -67,7 +69,7 @@ func newHandoverEvents() (*handoverEvents, error) {
 		return nil, fmt.Errorf("desktop: create a unique service handover name: %w", err)
 	}
 	base := handoverEventPrefix + hex.EncodeToString(nonce[:])
-	readyName, successName := base+".Ready", base+".Success"
+	readyName, successName, confirmedName := base+".Ready", base+".Success", base+".Confirmed"
 	readyAttrs, readyDescriptor, err := restrictedObjectSecurityFor(
 		windows.SYNCHRONIZE, windows.EVENT_MODIFY_STATE, handoverEventAccess)
 	if err != nil {
@@ -90,9 +92,25 @@ func newHandoverEvents() (*handoverEvents, error) {
 		_ = windows.CloseHandle(ready)
 		return nil, err
 	}
+	// The confirmation carries the rights of the ready event: the desktop
+	// waits on it and the elevated helper sets it.
+	confirmedAttrs, confirmedDescriptor, err := restrictedObjectSecurityFor(
+		windows.SYNCHRONIZE, windows.EVENT_MODIFY_STATE, handoverEventAccess)
+	if err != nil {
+		_ = windows.CloseHandle(success)
+		_ = windows.CloseHandle(ready)
+		return nil, fmt.Errorf("desktop: secure the service handover confirmation event: %w", err)
+	}
+	confirmed, err := createHandoverEvent(confirmedName, confirmedAttrs)
+	runtime.KeepAlive(confirmedDescriptor)
+	if err != nil {
+		_ = windows.CloseHandle(success)
+		_ = windows.CloseHandle(ready)
+		return nil, err
+	}
 	return &handoverEvents{
-		readyName: readyName, successName: successName,
-		ready: ready, success: success,
+		readyName: readyName, successName: successName, confirmedName: confirmedName,
+		ready: ready, success: success, confirmed: confirmed,
 	}, nil
 }
 
@@ -155,6 +173,10 @@ func (h *handoverEvents) close() {
 			_ = windows.CloseHandle(h.success)
 			h.success = 0
 		}
+		if h.confirmed != 0 {
+			_ = windows.CloseHandle(h.confirmed)
+			h.confirmed = 0
+		}
 	})
 }
 
@@ -194,7 +216,13 @@ func waitForHelperReady(helper, ready windows.Handle, budget time.Duration) erro
 // waitForHandoverAuthorization requires both evidences inside two independent
 // bounded machine windows, so waiting for completion can never zero the exit
 // window and no user reading time sits on this path.
-func waitForHandoverAuthorization(parent, success windows.Handle, successBudget, parentExitBudget time.Duration) error {
+//
+// Every acceptance path acknowledges the authorization on the confirmation
+// event before it accepts — a path that cannot acknowledge refuses — and
+// verifies that the success signal still stands: it is the live authorization
+// this helper installs from, and the desktop withdraws it before it exits
+// with a handover it gave up on.
+func waitForHandoverAuthorization(parent, success, confirmed windows.Handle, successBudget, parentExitBudget time.Duration) error {
 	result, err := windows.WaitForMultipleObjects(
 		[]windows.Handle{parent, success}, false, waitMilliseconds(successBudget))
 	if err != nil {
@@ -202,6 +230,11 @@ func waitForHandoverAuthorization(parent, success windows.Handle, successBudget,
 	}
 	switch result {
 	case windows.WAIT_OBJECT_0:
+		// The desktop exited first, so its withdrawal — had it given up
+		// on this handover — has already landed. The authorization must
+		// therefore be found still standing here, and this acceptance
+		// acknowledges it like every other; an absent signal — never
+		// sent, or withdrawn — takes the honest refusal instead.
 		state, err := windows.WaitForSingleObject(success, 0)
 		if err != nil {
 			return fmt.Errorf("desktop: read the service handover result: %w", err)
@@ -209,9 +242,22 @@ func waitForHandoverAuthorization(parent, success windows.Handle, successBudget,
 		if state != windows.WAIT_OBJECT_0 {
 			return errors.New("desktop: the desktop exited without confirming successful graceful completion")
 		}
+		if err := windows.SetEvent(confirmed); err != nil {
+			return fmt.Errorf("desktop: acknowledge the received installation authorization: %w", err)
+		}
 		return nil
 	case windows.WAIT_OBJECT_0 + 1:
-		// Completion is confirmed; the exit evidence gets its own window.
+		// Completion is confirmed; the helper acknowledges the
+		// authorization before the exit evidence gets its own window: the
+		// desktop waits for this signal and never treats an authorization
+		// it sent as one that was received. The desktop no longer waits
+		// on this acknowledgment in the parent-exit branch above: that
+		// branch re-reads the standing success signal instead, because a
+		// desktop that accepted keeps the signal standing through its
+		// exit, while a desktop that gave up withdraws it before exiting.
+		if err := windows.SetEvent(confirmed); err != nil {
+			return fmt.Errorf("desktop: acknowledge the received installation authorization: %w", err)
+		}
 	case uint32(windows.WAIT_TIMEOUT):
 		return fmt.Errorf("desktop: successful shutdown was not confirmed within %s", successBudget)
 	default:
@@ -224,6 +270,18 @@ func waitForHandoverAuthorization(parent, success windows.Handle, successBudget,
 	}
 	switch result {
 	case windows.WAIT_OBJECT_0:
+		// The handshake closes here: the desktop's withdrawal — had its
+		// acknowledgment arrived after the desktop already gave up —
+		// precedes that exit, so this read decides whether the
+		// authorization is still live. A withdrawn signal is refused
+		// with the outcome it has: the installation was not started.
+		state, err := windows.WaitForSingleObject(success, 0)
+		if err != nil {
+			return fmt.Errorf("desktop: read the service handover result: %w", err)
+		}
+		if state != windows.WAIT_OBJECT_0 {
+			return errors.New("desktop: the desktop exited with the installation authorization withdrawn; the installation was not started")
+		}
 		return nil
 	case uint32(windows.WAIT_TIMEOUT):
 		return fmt.Errorf("desktop: the original desktop process did not exit within %s after successful shutdown", parentExitBudget)
@@ -243,7 +301,24 @@ func waitMilliseconds(budget time.Duration) uint32 {
 	return uint32(milliseconds)
 }
 
-func authorizeHandoverCompletion(waitForCompletion func() error, helper windows.Handle, success windows.Handle) error {
+// authorizeHandoverCompletion joins the completion evidence with the
+// acknowledgment of the helper.
+//
+// A helper process that is still alive is not a helper that still waits for
+// the authorization: the wait of the helper ends with its own budget and a
+// helper that gave up waiting moves to reporting its failure. The
+// authorization is therefore only settled when the helper acknowledges the
+// success signal on the confirmation event inside the budget. An
+// authorization that is not acknowledged is reported as what it is — the
+// installation was not started — and never as a handover that proceeded.
+//
+// The success signal is the live authorization the helper installs from, so a
+// give-up withdraws it before the report and before this desktop exits: a
+// helper that reaches its wait later, or that acknowledges in between, finds
+// the withdrawal instead of a signal it could install from, which is what
+// makes the reported outcome true in every interleaving. An accepted
+// authorization keeps the signal standing.
+func authorizeHandoverCompletion(waitForCompletion func() error, helper, success, confirmed windows.Handle) error {
 	if err := waitForCompletion(); err != nil {
 		return err
 	}
@@ -254,10 +329,44 @@ func authorizeHandoverCompletion(waitForCompletion func() error, helper windows.
 	if result != uint32(windows.WAIT_TIMEOUT) {
 		return fmt.Errorf("desktop: the service helper exited before graceful completion was confirmed (wait result %#x)", result)
 	}
+	if confirmed == 0 {
+		return errors.New("desktop: the service helper confirmation event is unavailable; the installation was not started")
+	}
 	if err := windows.SetEvent(success); err != nil {
 		return fmt.Errorf("desktop: signal successful graceful completion to the service helper: %w", err)
 	}
-	return nil
+	result, err = windows.WaitForMultipleObjects(
+		[]windows.Handle{helper, confirmed}, false, waitMilliseconds(serviceWaitBudget))
+	if err != nil {
+		return withdrawHandoverAuthorization(success,
+			fmt.Errorf("desktop: wait for the service helper confirmation: %w", err))
+	}
+	switch result {
+	case windows.WAIT_OBJECT_0:
+		return withdrawHandoverAuthorization(success,
+			errors.New("desktop: the service helper exited before it confirmed the installation authorization; the installation was not started"))
+	case windows.WAIT_OBJECT_0 + 1:
+		return nil
+	case uint32(windows.WAIT_TIMEOUT):
+		return withdrawHandoverAuthorization(success,
+			fmt.Errorf("desktop: the service helper did not confirm the installation authorization within %s; the installation was not started", serviceWaitBudget))
+	default:
+		return withdrawHandoverAuthorization(success,
+			fmt.Errorf("desktop: waiting for the service helper confirmation ended with result %#x; the installation was not started", result))
+	}
+}
+
+// withdrawHandoverAuthorization unsignals the success event of a handover the
+// desktop gave up on, and returns the failure it withdraws it for. The
+// withdrawal happens before the failure is reported and therefore before this
+// desktop exits, so a helper that observes the exit observes the withdrawal
+// as well; a withdrawal the operating system refuses is appended to the
+// failure instead of hiding it.
+func withdrawHandoverAuthorization(success windows.Handle, failure error) error {
+	if err := windows.ResetEvent(success); err != nil {
+		return fmt.Errorf("%w (the installation authorization could not be withdrawn: %v)", failure, err)
+	}
+	return failure
 }
 
 // completeHandoverWithNotice shows the native waiting state and then joins the
@@ -269,7 +378,7 @@ func completeHandoverWithNotice(handover *desktopHandover, waitForCompletion fun
 		"HFDesk is shutting down and finishing its graceful save before the service can start.\n\n"+
 			"The service starts only if the server and its saved state both complete successfully.",
 		windows.MB_ICONINFORMATION)
-	return authorizeHandoverCompletion(waitForCompletion, handover.helper.handle, handover.events.success)
+	return authorizeHandoverCompletion(waitForCompletion, handover.helper.handle, handover.events.success, handover.events.confirmed)
 }
 
 func stopDesktopServer(shutdown func(), coordinator *desktopShutdownCoordinator) {
@@ -285,7 +394,12 @@ type helperHandover struct {
 	parent  windows.Handle
 	ready   windows.Handle
 	success windows.Handle
-	mutex   windows.Handle
+	// confirmed is the event the helper sets to acknowledge the received
+	// authorization: the desktop waits for it before it treats the
+	// handover as accepted, so an authorization a helper no longer waits
+	// for can never look like one that was received.
+	confirmed windows.Handle
+	mutex     windows.Handle
 	// hold releases the singleton of the service layer for an action that
 	// has no desktop handover wait: the gate's update and start, and a
 	// hand-typed helper command line. It outlives the authorization
@@ -314,7 +428,20 @@ func openHelperHandover(o ServiceActionOptions) (*helperHandover, error) {
 		h.close()
 		return nil, err
 	}
-	if h.success, err = openNamedEvent(o.SuccessEvent, windows.SYNCHRONIZE); err != nil {
+	successName := strings.TrimSpace(o.SuccessEvent)
+	base := strings.TrimSuffix(successName, ".Success")
+	if base == successName {
+		h.close()
+		return nil, fmt.Errorf("desktop: the success event %q does not name the handover pair", successName)
+	}
+	if h.success, err = openNamedEvent(successName, windows.SYNCHRONIZE); err != nil {
+		h.close()
+		return nil, err
+	}
+	// The confirmation is derived from the pair the desktop passed: the
+	// third signal travels with the established event names and adds no
+	// new handover argument.
+	if h.confirmed, err = openNamedEvent(base+".Confirmed", windows.EVENT_MODIFY_STATE); err != nil {
 		h.close()
 		return nil, err
 	}
@@ -367,10 +494,10 @@ func (h *helperHandover) signalReady() error {
 }
 
 func (h *helperHandover) waitForAuthorization(successBudget, parentExitBudget time.Duration) error {
-	if h == nil || h.parent == 0 || h.success == 0 {
+	if h == nil || h.parent == 0 || h.success == 0 || h.confirmed == 0 {
 		return errors.New("desktop: the service handover authorization handles are unavailable")
 	}
-	return waitForHandoverAuthorization(h.parent, h.success, successBudget, parentExitBudget)
+	return waitForHandoverAuthorization(h.parent, h.success, h.confirmed, successBudget, parentExitBudget)
 }
 
 func (h *helperHandover) releaseSingleton() {
@@ -396,7 +523,7 @@ func (h *helperHandover) releaseAuthorizationHandles() {
 	if h == nil {
 		return
 	}
-	for _, handle := range []*windows.Handle{&h.parent, &h.ready, &h.success} {
+	for _, handle := range []*windows.Handle{&h.parent, &h.ready, &h.success, &h.confirmed} {
 		if *handle != 0 {
 			_ = windows.CloseHandle(*handle)
 			*handle = 0
