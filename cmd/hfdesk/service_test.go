@@ -2881,10 +2881,11 @@ func expectedRunningImageStamp(version string) string {
 // an error instead of a file that may describe a replacement, which is the
 // fail-closed side of the claim.
 //
-// The test sits before TestExpectedInstallVersionFollowsTheRunningImage on
-// purpose: that replacement dance unlinks the executed image from its path
-// for the rest of the process (a running image cannot be put back), so any
-// path-based identity check after it reads the replacement by design.
+// The test is independent of the order the tests run in (-count and
+// -shuffle both keep it green): the replacement dance of
+// TestExpectedInstallVersionFollowsTheRunningImage puts the original file
+// identity back at the path it renames away, so a path-based identity check
+// after it still compares the file the kernel executes.
 func TestRunningImageInfoIdentifiesTheRunningExecutable(t *testing.T) {
 	exe, err := os.Executable()
 	assertNoError(t, err, "os.Executable() = %v", err)
@@ -2912,11 +2913,15 @@ func TestRunningImageInfoIdentifiesTheRunningExecutable(t *testing.T) {
 // while the image keeps running carries no claim, and the untouched
 // registration keeps its claim.
 //
-// The replacement is a rename over the running test binary, which is how an
-// update lands a new file at an old path: the executed inode loses its name
-// and the path holds another file, while the compiled-in Version still
-// describes the old image. A claim stamped for the replacement would make a
-// verified start of the healthy new program fail as a version mismatch.
+// The replacement renames the running test binary out of its path and puts
+// another file at that path, which is how an update lands a new file at an
+// old path: the executed inode loses its name and the path holds another
+// file, while the compiled-in Version still describes the old image. A claim
+// stamped for the replacement would make a verified start of the healthy new
+// program fail as a version mismatch. The original file identity is renamed
+// back at the end, so the process-wide state the test leaves behind is the
+// state it found: any later identity check in this process compares the file
+// the kernel still executes.
 func TestExpectedInstallVersionFollowsTheRunningImage(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("the replacement scenario is identified through /proc/self/exe, which this host does not have")
@@ -2936,20 +2941,23 @@ func TestExpectedInstallVersionFollowsTheRunningImage(t *testing.T) {
 	if err := os.WriteFile(replacement, []byte("a different program image\n"), 0o755); err != nil {
 		t.Fatalf("write the replacement file: %v", err)
 	}
-	// The backup is an identical copy for the rest of the run: the
-	// replacement below unlinks the executed inode, which is exactly how an
-	// update lands a new file at a path a running program keeps using.
-	original, err := os.ReadFile(exe)
-	assertNoError(t, err, "read the running image %q: %v", exe, err)
-	if err := os.WriteFile(backup, original, 0o755); err != nil {
-		t.Fatalf("write the backup file: %v", err)
+	// The executed image is renamed OUT of its path — which is exactly how
+	// an update lands a new file at a path a running program keeps using —
+	// and its original file identity is renamed back at the end. A copy
+	// instead would install a new inode at the path, so every identity
+	// check after this test in the same process would compare that copy
+	// against the file the kernel still executes and fail for the wrong
+	// reason; the rename keeps the restored path the very file the process
+	// executes.
+	if err := os.Rename(exe, backup); err != nil {
+		t.Skipf("the running image cannot be replaced on this host: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = os.Rename(backup, exe)
 		_ = os.Remove(replacement)
 	})
 	if err := os.Rename(replacement, exe); err != nil {
-		t.Skipf("the running image cannot be replaced on this host: %v", err)
+		t.Fatalf("put the replacement at the registered path %q: %v", exe, err)
 	}
 	if got := expectedInstallVersion(exe); got != "" {
 		t.Errorf("expectedInstallVersion() = %q for a replaced registered file, want no version claim", got)
