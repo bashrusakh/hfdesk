@@ -125,7 +125,12 @@ func writePublishedDesktopState(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(state), 0o755); err != nil {
 		t.Fatalf("create the temporary configuration directory: %v", err)
 	}
-	err := os.WriteFile(state, []byte(`{"url":"http://127.0.0.1:1","pid":1}`), 0o600)
+	// The claim names the process that published it: the process of this
+	// test run, which is alive on every platform. A fixed id such as 1
+	// lives on Linux (it is init) but does not exist on Windows, where the
+	// claim would be stale under the liveness model and the live-claim
+	// side of the guard would never fire.
+	err := os.WriteFile(state, []byte(fmt.Sprintf(`{"url":"http://127.0.0.1:1","pid":%d}`, os.Getpid())), 0o600)
 	assertNoError(t, err, "publish the desktop state: %v", err)
 }
 
@@ -2857,12 +2862,49 @@ func TestServiceInstallPassesTheVersionOfTheRunningProgram(t *testing.T) {
 
 // expectedRunningImageStamp is the version claim an installation of the
 // running release build stamps on this host: the identity of the running
-// image is provable through procfs on Linux and is not provable elsewhere.
+// image is provable through procfs on Linux and through the module path
+// plus the file identity of an open handle on Windows, and is not provable
+// elsewhere — a path cannot prove the image on a host that allows a
+// running image to be replaced under it.
 func expectedRunningImageStamp(version string) string {
-	if runtime.GOOS == "linux" {
+	if runtime.GOOS == "linux" || runtime.GOOS == "windows" {
 		return version
 	}
 	return ""
+}
+
+// TestRunningImageInfoIdentifiesTheRunningExecutable proves the platform
+// identity the version claim is built on, on the host that runs the test:
+// a platform with a proof reports the file behind the running image — the
+// same file os.Executable names, compared through os.SameFile, so a path
+// spelling difference does not matter — and a platform without one reports
+// an error instead of a file that may describe a replacement, which is the
+// fail-closed side of the claim.
+//
+// The test sits before TestExpectedInstallVersionFollowsTheRunningImage on
+// purpose: that replacement dance unlinks the executed image from its path
+// for the rest of the process (a running image cannot be put back), so any
+// path-based identity check after it reads the replacement by design.
+func TestRunningImageInfoIdentifiesTheRunningExecutable(t *testing.T) {
+	exe, err := os.Executable()
+	assertNoError(t, err, "os.Executable() = %v", err)
+	registered, err := os.Stat(exe)
+	assertNoError(t, err, "os.Stat(%q) = %v", exe, err)
+
+	info, imageErr := service.RunningImageInfo()
+	switch runtime.GOOS {
+	case "linux", "windows":
+		if imageErr != nil {
+			t.Fatalf("service.RunningImageInfo() = %v, want the file info of the running image on this host", imageErr)
+		}
+		if !os.SameFile(registered, info) {
+			t.Errorf("service.RunningImageInfo() = %v, want the same file as the running executable %q", info, exe)
+		}
+	default:
+		if imageErr == nil {
+			t.Errorf("service.RunningImageInfo() = %v, want a failure on a host that cannot prove the running image", info)
+		}
+	}
 }
 
 // TestExpectedInstallVersionFollowsTheRunningImage proves the version claim
@@ -2877,7 +2919,7 @@ func expectedRunningImageStamp(version string) string {
 // verified start of the healthy new program fail as a version mismatch.
 func TestExpectedInstallVersionFollowsTheRunningImage(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skip("the running image is identified through /proc/self/exe, which this host does not have")
+		t.Skip("the replacement scenario is identified through /proc/self/exe, which this host does not have")
 	}
 	previousVersion := Version
 	Version = "1.2.3"
