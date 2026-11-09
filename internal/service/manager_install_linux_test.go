@@ -1649,7 +1649,7 @@ func TestSystemdFirstInstallRefusesADropInThatOwnsTheCommand(t *testing.T) {
 		t.Fatal("Install() = nil, want the refusal of the drop-in that owns the command")
 	}
 	for _, want := range []string{
-		"the installation was refused and the registration was not changed",
+		"the update was refused and the registration was not changed",
 		dropIn,
 		`Remove the "ExecStart=" override from "` + dropIn + `"`,
 		"reload the unit files with \"systemctl --user daemon-reload\"",
@@ -1771,6 +1771,72 @@ func TestSystemdFirstInstallVerifiesTheLoadedCommand(t *testing.T) {
 		t.Errorf("the failed verification enabled the unit %d times, want none:\n%s", got, strings.Join(calls, "\n"))
 	}
 	_ = logPath
+}
+
+// TestSystemdPreWriteScanRefusesTheDropInOverrideOnAnUpdate pins the
+// unconditional pre-write scan: an existing canonical unit file the
+// supervisor never loaded (LoadState=not-found) reaches neither detector B's
+// loaded read nor — before this fix — the first-install-only scan, so the
+// drop-in's ExecStart= override was caught only after the write. The scan
+// now refuses before any change: the unit file keeps its bytes, no instance
+// directory exists and the supervisor was asked for the mask and nothing
+// else, with the established removal action.
+func TestSystemdPreWriteScanRefusesTheDropInOverrideOnAnUpdate(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	root := t.TempDir()
+	oldExecutable := systemdTestExecutable(t)
+	newExecutable := systemdTestExecutable(t)
+	previous := systemdExistingOptions(t, oldExecutable, root)
+	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
+	// The drop-in carries the directive HFDesk owns.
+	dropIn := unitDropInPath(unitPath)
+	if err := os.MkdirAll(filepath.Dir(dropIn), 0o755); err != nil {
+		t.Fatalf("create the drop-in directory: %v", err)
+	}
+	if err := os.WriteFile(dropIn, []byte("[Service]\nExecStart="+newExecutable+" --owned-by-the-drop-in\n"), 0o644); err != nil {
+		t.Fatalf("write the drop-in: %v", err)
+	}
+	// The unit file exists but was never loaded: the fake reports
+	// LoadState=not-found without the loaded-executable flag, so
+	// detector B's loaded read would find nothing to refuse on.
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", "")
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+
+	_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+	if err == nil {
+		t.Fatal("Install() = nil, want the pre-write refusal of the drop-in that owns the command")
+	}
+	for _, want := range []string{
+		"the update was refused and the registration was not changed",
+		`the drop-in "` + dropIn + `" carries an ExecStart= override`,
+		`Remove the "ExecStart=" override from "` + dropIn + `"`,
+		"reload the unit files with \"systemctl --user daemon-reload\"",
+		`run "hfdesk service install" again`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Install() = %q, want a message that mentions %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), " or ") {
+		t.Errorf("Install() = %q, offers an alternative instead of one action", err)
+	}
+	// Before any change: the unit file kept its bytes, no directory of
+	// the instance exists, and the supervisor saw the mask read and
+	// nothing else — no write, no reload, no enable.
+	if content, readErr := os.ReadFile(unitPath); readErr != nil || string(content) != previousUnit {
+		t.Errorf("the refused update changed the unit file (error %v):\n%s\nwant\n%s", readErr, content, previousUnit)
+	}
+	for _, dir := range instanceDirs(previous) {
+		if _, statErr := os.Stat(dir.path); !errors.Is(statErr, fs.ErrNotExist) {
+			t.Errorf("the refused update created the %s %q: %v", dir.name, dir.path, statErr)
+		}
+	}
+	for _, call := range systemdSupervisorCalls(t, logPath) {
+		if got := strings.TrimPrefix(call, "--user "); got != "is-enabled "+unitName {
+			t.Errorf("the refused update called the supervisor with unexpected command %q: %s", call,
+				strings.Join(systemdSupervisorCalls(t, logPath), "\n"))
+		}
+	}
 }
 
 // TestSystemdInstallHandlesTheHandEditedBaseFileOnBothSides pins both sides

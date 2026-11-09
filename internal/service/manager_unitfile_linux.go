@@ -764,18 +764,19 @@ func handEditedUnitRefusal(unitPath string, reason error, scope Scope) error {
 		unitPath, reason, unitDropInPath(unitPath), unitPath, scopeSupervisorHint(scope)+" daemon-reload", "hfdesk service install")
 }
 
-// firstInstallExecStartOverride refuses a first installation over a
-// drop-in directory that already carries an ExecStart= directive: after
-// the write systemd composes the drop-in over the canonical unit, so the
-// command of the registration would come from the drop-in and not from
-// the install flags. The one action is the established removal of the
-// override, the reload that makes the supervisor read the files again and
-// the retry; a file that cannot be read proves nothing and is left to the
-// loaded-command verification after the write. A directory that cannot be
-// read — permission-denied on an existing one included — refuses with the
-// access as its cause instead of passing for an empty one, so the promise
-// to refuse before it writes anything holds in that state as well.
-func firstInstallExecStartOverride(unitPath string, scope Scope) error {
+// preWriteExecStartOverride refuses an installation over a drop-in
+// directory that already carries an ExecStart= directive, on a first
+// installation and on an update alike: after the write systemd composes
+// the drop-in over the canonical unit, so the command of the registration
+// would come from the drop-in and not from the install flags. The one
+// action is the established removal of the override, the reload that
+// makes the supervisor read the files again and the retry; a file that
+// cannot be read proves nothing and is left to the loaded-command
+// verification after the write. A directory that cannot be read —
+// permission-denied on an existing one included — refuses with the access
+// as its cause instead of passing for an empty one, so the promise to
+// refuse before it writes anything holds in that state as well.
+func preWriteExecStartOverride(unitPath string, scope Scope) error {
 	dir := filepath.Dir(unitDropInPath(unitPath))
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -786,7 +787,7 @@ func firstInstallExecStartOverride(unitPath string, scope Scope) error {
 		// An unread directory could hold the override: the scan cannot
 		// prove its absence, and the verification after the write would
 		// only reach it with a mutation and a rollback behind it.
-		return fmt.Errorf("service: the installation was refused and the registration was not changed: the drop-in directory %q cannot be read: %v. Restore this user's read access to the directory — HFDesk never changes it — and run %q again",
+		return fmt.Errorf("service: the update was refused and the registration was not changed: the drop-in directory %q cannot be read: %v. Restore this user's read access to the directory — HFDesk never changes it — and run %q again",
 			dir, err, "hfdesk service install")
 	}
 	for _, entry := range entries {
@@ -799,7 +800,7 @@ func firstInstallExecStartOverride(unitPath string, scope Scope) error {
 			continue
 		}
 		if dropInHoldsExecStart(content) {
-			return fmt.Errorf("service: the installation was refused and the registration was not changed: the drop-in %q carries an %s override, which would own the command of the registration HFDesk writes. Remove the %q override from %q, reload the unit files with %q, and run %q again",
+			return fmt.Errorf("service: the update was refused and the registration was not changed: the drop-in %q carries an %s override, which would own the command of the registration HFDesk writes. Remove the %q override from %q, reload the unit files with %q, and run %q again",
 				path, "ExecStart=", "ExecStart=", path, scopeSupervisorHint(scope)+" daemon-reload", "hfdesk service install")
 		}
 	}

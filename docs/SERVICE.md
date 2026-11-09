@@ -959,7 +959,9 @@ sudo dscl . -create /Users/_hfdesk UniqueID <a free numeric id>
 ```
 
 Creating the account needs **administrative rights**: the commands above are
-run by an administrator, before the installation. HFDesk never creates an
+run by an administrator, before the installation. The `<a free numeric id>`
+placeholder is not a runnable value: choose a numeric id that is not in use
+and substitute it before running the third command. HFDesk never creates an
 account itself and never asks for a password.
 
 **Only the three directories of the instance are granted to the account:** the

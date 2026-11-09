@@ -1778,8 +1778,11 @@ func TestSystemdReinstallRefusesAShadowedLoadedCommand(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want refusal of the shadowed loaded command")
 	}
-	if !strings.Contains(err.Error(), "is not the command in its unit file") {
-		t.Errorf("Install() = %q, want an error that identifies the loaded command mismatch", err)
+	// The pre-write scan names the drop-in that carries the override —
+	// the same state the loaded command mismatch reported before the
+	// scan became unconditional — with the established removal action.
+	if !strings.Contains(err.Error(), "carries an ExecStart= override") {
+		t.Errorf("Install() = %q, want an error that identifies the drop-in that owns the command", err)
 	}
 	if !strings.Contains(err.Error(), unitDropInPath(unitPath)) {
 		t.Errorf("Install() = %q, want the refusal to name the DropInPaths the supervisor reported", err)
@@ -2152,16 +2155,16 @@ func TestSystemdReadCanonicalUnitRejectsNonCanonicalShapes(t *testing.T) {
 	}
 }
 
-// TestFirstInstallExecStartOverrideClassifiesTheDirectory pins both sides
+// TestPreWriteExecStartOverrideClassifiesTheDirectory pins both sides
 // of the pre-write scan's directory read: an absent directory proves that
 // no drop-in exists and refuses nothing, while any other read error — a
 // permission-denied on an existing directory included — refuses before
 // anything is written instead of being read as an empty directory.
-func TestFirstInstallExecStartOverrideClassifiesTheDirectory(t *testing.T) {
+func TestPreWriteExecStartOverrideClassifiesTheDirectory(t *testing.T) {
 	t.Run("a missing directory proves nothing and refuses nothing", func(t *testing.T) {
 		unitPath := filepath.Join(t.TempDir(), unitName)
-		if err := firstInstallExecStartOverride(unitPath, ScopeUser); err != nil {
-			t.Errorf("firstInstallExecStartOverride() = %v, want nil for a missing drop-in directory", err)
+		if err := preWriteExecStartOverride(unitPath, ScopeUser); err != nil {
+			t.Errorf("preWriteExecStartOverride() = %v, want nil for a missing drop-in directory", err)
 		}
 	})
 
@@ -2179,12 +2182,12 @@ func TestFirstInstallExecStartOverrideClassifiesTheDirectory(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
 
-		err := firstInstallExecStartOverride(unitPath, ScopeUser)
+		err := preWriteExecStartOverride(unitPath, ScopeUser)
 		if err == nil {
-			t.Fatal("firstInstallExecStartOverride() = nil, want the refusal of the unreadable drop-in directory")
+			t.Fatal("preWriteExecStartOverride() = nil, want the refusal of the unreadable drop-in directory")
 		}
 		for _, want := range []string{
-			"the installation was refused and the registration was not changed",
+			"the update was refused and the registration was not changed",
 			dir,
 			"cannot be read",
 			"Restore this user's read access to the directory",

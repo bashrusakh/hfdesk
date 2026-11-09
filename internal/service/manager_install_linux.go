@@ -106,15 +106,15 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 		return opts, m.maskedUnitRefusal(enablement.maskedRuntime)
 	}
 	// A drop-in that already carries the ExecStart= directive HFDesk owns
-	// would own the command of a first registration after the write — the
-	// last drop-in wins over the canonical unit — so the ownership of
-	// ExecStart= holds before every installation writes anything: the
-	// scan of the drop-in directory refuses here, before the loaded read
-	// and before any directory or file of the instance exists.
-	if !existed {
-		if refusal := firstInstallExecStartOverride(path, m.scope); refusal != nil {
-			return opts, refusal
-		}
+	// would own the command of the registration after the write — the
+	// last drop-in wins over the canonical unit — so the scan runs
+	// before EVERY write, first installation or update alike: an
+	// existing unit file the supervisor never loaded would otherwise
+	// reach detector B's loaded read as not-found, slip past it and be
+	// caught only by the verification after the write — with a mutation
+	// and a rollback behind it instead of the refusal before any change.
+	if refusal := preWriteExecStartOverride(path, m.scope); refusal != nil {
+		return opts, refusal
 	}
 
 	// The loaded registration of a first installation is read before the
@@ -585,10 +585,10 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 	}
 	if err != nil {
 		if restoreErr := m.restorePreviousRegistration(ctx, previous); restoreErr != nil {
-			return result, fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration could not be put back into service: %v); %s", err, restoreErr, statusReadHint)
+			return result, AppendActionErrorIfUnnamed(fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration could not be put back into service: %v)", err, restoreErr), statusReadHint)
 		}
 		result.createdDirsSafeToRemove = systemdCreatedDirsSafeToRemove(previous, created)
-		return result, fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration was restored and the previous instance was started again); %s", err, statusReadHint)
+		return result, AppendActionErrorIfUnnamed(fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration was restored and the previous instance was started again)", err), statusReadHint)
 	}
 	result.versionVerified = verified
 	return result, nil
