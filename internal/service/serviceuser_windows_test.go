@@ -118,8 +118,10 @@ func TestHoldDesktopSingletonFailsWhenTheSessionCannotBeNamed(t *testing.T) {
 
 // TestHoldDesktopSingletonReportsAnIdentityThatCannotAccessTheObject proves
 // the refusal of an object another Windows identity owns: the hold refuses
-// before any mutation, classifies the access denial, and names the step that
-// ends it instead of reporting a generic failure.
+// before any mutation — with no release handle at all — classifies the
+// access denial, and names the step that ends it instead of reporting a
+// generic failure. The fixture denies this identity even the limited
+// read-control open, so the fallback of the hold cannot take it either.
 func TestHoldDesktopSingletonReportsAnIdentityThatCannotAccessTheObject(t *testing.T) {
 	const name = `Local\HFDesk.Test.ServiceDeny.1`
 	createDeniedMutex(t, name)
@@ -128,6 +130,9 @@ func TestHoldDesktopSingletonReportsAnIdentityThatCannotAccessTheObject(t *testi
 	if err == nil {
 		release()
 		t.Fatal("the hold took an object its identity cannot access")
+	}
+	if release != nil {
+		t.Error("the refusal returned a release: a caller could end a hold it never took, so nothing may be held before the mutation")
 	}
 	if !errors.Is(err, ErrSingletonAccessDenied) {
 		t.Errorf("the refusal %v is not classified as ErrSingletonAccessDenied", err)
@@ -158,6 +163,11 @@ func TestHoldDesktopSingletonHoldsAnObjectOfAnotherIdentityThroughReadControl(t 
 		t.Fatalf("read the user of the process: %v", err)
 	}
 	fixture := createReadControlMutex(t, name, sid)
+	defer func() {
+		if fixture != 0 {
+			_ = windows.CloseHandle(fixture)
+		}
+	}()
 
 	release, err := HoldDesktopSingleton(name)
 	if err != nil {
@@ -169,7 +179,10 @@ func TestHoldDesktopSingletonHoldsAnObjectOfAnotherIdentityThroughReadControl(t 
 
 	// The creator of the object is gone: only the hold keeps it alive, so
 	// the probe below proves that the limited handle really is a hold.
-	_ = windows.CloseHandle(fixture)
+	if fixture != 0 {
+		_ = windows.CloseHandle(fixture)
+		fixture = 0
+	}
 
 	namePtr, err := windows.UTF16PtrFromString(name)
 	if err != nil {
@@ -198,9 +211,9 @@ func TestHoldDesktopSingletonHoldsAnObjectOfAnotherIdentityThroughReadControl(t 
 // createReadControlMutex creates a named mutex whose descriptor grants this
 // identity read control only: the shape a singleton of this session has for
 // a hold that requested full mutex access — the request is denied, while the
-// limited access of the descriptor still opens the object. The fixture
-// handle is closed when the test ends unless the test closes it earlier, and
-// the object dies with its last handle.
+// limited access of the descriptor still opens the object. The caller owns
+// the returned handle: closing it early proves that only the hold keeps the
+// object alive, and the object dies with its last handle.
 func createReadControlMutex(t *testing.T, name, sid string) windows.Handle {
 	t.Helper()
 	descriptor, err := windows.SecurityDescriptorFromString(
@@ -227,20 +240,22 @@ func createReadControlMutex(t *testing.T, name, sid string) windows.Handle {
 		_ = windows.CloseHandle(handle)
 		t.Fatal("the fixture object already exists: the test would deny a real object")
 	}
-	t.Cleanup(func() { _ = windows.CloseHandle(handle) })
 	return handle
 }
 
 // createDeniedMutex creates a named mutex whose descriptor grants the object
-// to SYSTEM only: the identity of the test has no access to it, which is the
-// shape a singleton another Windows identity created has for this one — the
-// object cannot be opened even with the limited read-control access, so the
-// hold refuses with ErrSingletonAccessDenied. The fixture handle is closed
+// to SYSTEM only and denies this identity — the owner of the object — its
+// owner rights: the access check grants the owner of an object READ_CONTROL
+// implicitly unless the descriptor carries an owner-rights entry, so without
+// that entry this very test identity could open the object through the
+// read-control fallback of the hold and the fixture could not model an
+// identity that cannot access it at all. The fixture handle is closed
 // when the test ends, and the object dies with its last handle.
 func createDeniedMutex(t *testing.T, name string) {
 	t.Helper()
 	descriptor, err := windows.SecurityDescriptorFromString(
-		fmt.Sprintf("D:P(A;;0x%08X;;;SY)", uint32(windows.MUTEX_ALL_ACCESS)))
+		fmt.Sprintf("D:P(D;;0x%08X;;;S-1-3-4)(A;;0x%08X;;;S-1-3-4)(A;;0x%08X;;;SY)",
+			uint32(windows.READ_CONTROL), uint32(windows.SYNCHRONIZE), uint32(windows.MUTEX_ALL_ACCESS)))
 	if err != nil {
 		t.Fatalf("build the denying descriptor: %v", err)
 	}
