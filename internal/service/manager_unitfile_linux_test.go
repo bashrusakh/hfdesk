@@ -2241,6 +2241,16 @@ func TestSystemdDropInSearchDirsCoversTheReportedUnitPaths(t *testing.T) {
 			"/run/systemd/user/" + name,
 			"/usr/local/lib/systemd/user/" + name,
 			"/usr/lib/systemd/user/" + name,
+			// The control/attached/transient/generator trees of the
+			// --user unit-paths output: the control tree beside the
+			// unit's own directory, the runtime trees beside the
+			// session systemd/user directory.
+			filepath.Dir(filepath.Dir(unitPath)) + "/user.control/" + name,
+			filepath.Dir(userScopeRuntimeSystemdDir()) + "/user.control/" + name,
+			filepath.Dir(userScopeRuntimeSystemdDir()) + "/transient/" + name,
+			filepath.Dir(userScopeRuntimeSystemdDir()) + "/generator.early/" + name,
+			filepath.Dir(userScopeRuntimeSystemdDir()) + "/generator/" + name,
+			filepath.Dir(userScopeRuntimeSystemdDir()) + "/generator.late/" + name,
 		}
 		// The XDG data directories resolve by environment, the way
 		// systemd resolves them: the home directory of the user or
@@ -2273,17 +2283,34 @@ func TestSystemdDropInSearchDirsCoversTheReportedUnitPaths(t *testing.T) {
 			"/run/systemd/system/" + name,
 			"/usr/local/lib/systemd/system/" + name,
 			"/usr/lib/systemd/system/" + name,
+			// The control/attached/transient/generator trees of the
+			// unit-paths output.
+			"/etc/systemd/system.control/" + name,
+			"/run/systemd/system.control/" + name,
+			"/etc/systemd/system.attached/" + name,
+			"/run/systemd/system.attached/" + name,
+			"/run/systemd/transient/" + name,
+			"/run/systemd/generator.early/" + name,
+			"/run/systemd/generator/" + name,
+			"/run/systemd/generator.late/" + name,
 		})
 	})
 }
 
 // TestDropInHoldsExecStartParsesTheSystemdAssignmentGrammar pins the
 // directive grammar against systemd's own parsing: `ExecStart =/bin/true`
-// and `ExecStart  =  /bin/true` are the ExecStart setting (verified with
-// `systemd-analyze verify`), so a drop-in that writes the directive with
-// whitespace around the "=" still owns the command — while commented lines
-// and other keys never do. The perturbation is the space: the previous
-// literal-prefix match missed every spaced row.
+// and `ExecStart  =  /bin/true` are the ExecStart setting inside
+// [Service] (verified with `systemd-analyze verify`), so a drop-in that
+// writes the directive with whitespace around the "=" still owns the
+// command — while commented lines and other keys never do. The SECTION
+// rule comes from the same tool: `ExecStart=` under [Unit] or [Install]
+// reports `Unknown key 'ExecStart' in section […], ignoring.`, a bare line
+// reports `Assignment outside of section. Ignoring.` and `[service]`
+// reports `Unknown section 'service'. Ignoring.` — an assignment systemd
+// ignores never owns the command, so only an exact [Service] counts. The
+// perturbations are the space (the previous literal-prefix match missed
+// every spaced row) and the section (the previous scanner counted every
+// key regardless of the section around it).
 func TestDropInHoldsExecStartParsesTheSystemdAssignmentGrammar(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -2291,21 +2318,138 @@ func TestDropInHoldsExecStartParsesTheSystemdAssignmentGrammar(t *testing.T) {
 		want    bool
 	}{
 		{name: "the plain form", content: "[Service]\nExecStart=/bin/true\n", want: true},
-		{name: "space before the equals", content: "ExecStart =/bin/true\n", want: true},
-		{name: "spaces on both sides", content: "ExecStart  =  /bin/true\n", want: true},
-		{name: "indented with a trailing comment", content: "  ExecStart = /bin/true ; the operator's note\n", want: true},
+		{name: "space before the equals", content: "[Service]\nExecStart =/bin/true\n", want: true},
+		{name: "spaces on both sides", content: "[Service]\nExecStart  =  /bin/true\n", want: true},
+		{name: "indented with a trailing comment", content: "[Service]\n  ExecStart = /bin/true ; the operator's note\n", want: true},
 		{name: "after another directive", content: "[Service]\nEnvironment=HF_HUB_CACHE=/x\n\tExecStart = \"/path with spaces\"\n", want: true},
-		{name: "a commented directive", content: ";ExecStart=/bin/false\n", want: false},
-		{name: "a hash-commented directive", content: "  #ExecStart=/bin/false\n", want: false},
-		{name: "a longer key that starts with the name", content: "ExecStartX=/bin/false\n", want: false},
-		{name: "the name inside another value", content: "Environment=ExecStart=/bin/false\n", want: false},
-		{name: "a line without an assignment", content: "plain prose about ExecStart\n", want: false},
+		{name: "a commented directive", content: "[Service]\n;ExecStart=/bin/false\n", want: false},
+		{name: "a hash-commented directive", content: "[Service]\n  #ExecStart=/bin/false\n", want: false},
+		{name: "a longer key that starts with the name", content: "[Service]\nExecStartX=/bin/false\n", want: false},
+		{name: "the name inside another value", content: "[Service]\nEnvironment=ExecStart=/bin/false\n", want: false},
+		{name: "a line without an assignment", content: "[Service]\nplain prose about ExecStart\n", want: false},
+		// The section rule: an assignment systemd ignores never owns
+		// the command (each form verified with `systemd-analyze
+		// verify`), while a later [Service] section counts again.
+		{name: "an ExecStart only under [Unit]", content: "[Unit]\nDescription=x\nExecStart=/bin/false\n", want: false},
+		{name: "an ExecStart only under [Install]", content: "[Install]\nWantedBy=default.target\nExecStart=/bin/false\n", want: false},
+		{name: "an ExecStart outside of any section", content: "ExecStart=/bin/true\n", want: false},
+		{name: "a lowercase section is not the service section", content: "[service]\nExecStart=/bin/true\n", want: false},
+		{name: "the service section after another section", content: "[Unit]\nDescription=x\nExecStart=/bin/false\n[Service]\nExecStart=/bin/true\n", want: true},
+		{name: "a service assignment before a trailing install section", content: "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=default.target\nExecStart=/bin/false\n", want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := dropInHoldsExecStart([]byte(tc.content)); got != tc.want {
 				t.Errorf("dropInHoldsExecStart(%q) = %v, want %v", tc.content, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestSystemdDropInSearchDirsCoversTheUnitPathOverride pins the
+// $SYSTEMD_UNIT_PATH entries: the variable overrides the unit load path
+// (systemd.unit(5)), so its entries participate in the search like the
+// static trees — and the static trees stay listed as the superset, because
+// a trailing ":" appends the usual path and the running supervisor's
+// environment is what decides the real path.
+func TestSystemdDropInSearchDirsCoversTheUnitPathOverride(t *testing.T) {
+	envRoot := t.TempDir()
+	t.Setenv("SYSTEMD_UNIT_PATH", envRoot)
+
+	unitPath := filepath.Join("/tmp", "somewhere", unitName)
+	name := unitName + ".d"
+	got := systemdDropInSearchDirs(unitPath, ScopeUser)
+	have := make(map[string]bool, len(got))
+	for _, dir := range got {
+		have[dir] = true
+	}
+	if !have[envRoot+"/"+name] {
+		t.Errorf("the drop-in search dirs =\n%v\ndo not cover the $SYSTEMD_UNIT_PATH entry %q", got, envRoot+"/"+name)
+	}
+	if !have["/etc/systemd/user/"+name] {
+		t.Errorf("the drop-in search dirs =\n%v\nlost the static trees beside the $SYSTEMD_UNIT_PATH override", got)
+	}
+}
+
+// TestPreWriteScanRefusesACarrierInTheUnitPathOverride drives the refusal
+// through a REAL seam: a drop-in carrying ExecStart= in a
+// $SYSTEMD_UNIT_PATH entry is refused before any write with the file
+// named — the env entry is scanned like a static tree (the other real
+// directories of the scan are read-only for this test and may contribute
+// further carriers; the assertion only requires the env carrier to be
+// named, so the test stays robust to their presence).
+func TestPreWriteScanRefusesACarrierInTheUnitPathOverride(t *testing.T) {
+	envRoot := t.TempDir()
+	t.Setenv("SYSTEMD_UNIT_PATH", envRoot)
+
+	unitPath := filepath.Join(t.TempDir(), unitName)
+	envDir := filepath.Join(envRoot, unitName+".d")
+	if err := os.MkdirAll(envDir, 0o755); err != nil {
+		t.Fatalf("create the env drop-in directory: %v", err)
+	}
+	carrier := filepath.Join(envDir, "override.conf")
+	if err := os.WriteFile(carrier, []byte("[Service]\nExecStart  =  /bin/false --from-the-env-entry\n"), 0o644); err != nil {
+		t.Fatalf("write the carrier: %v", err)
+	}
+
+	err := preWriteExecStartOverride(unitPath, ScopeUser)
+	if err == nil {
+		t.Fatal("preWriteExecStartOverride() = nil, want the refusal of the env entry's carrier")
+	}
+	for _, want := range []string{
+		"the update was refused and the registration was not changed",
+		carrier,
+		`Remove the "ExecStart=" override from "` + carrier + `"`,
+		`run "hfdesk service install" again`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal %q does not mention %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), " or ") {
+		t.Errorf("the refusal %q offers an alternative instead of one action", err)
+	}
+}
+
+// TestPreWriteScanRefusesACarrierInAGeneratorTree pins the transient and
+// generator trees of the unit-paths output: a drop-in sitting in a
+// generator directory takes part in the merge like any other, so a carrier
+// there is refused before any write with the file named. The seam supplies
+// the generator-shaped drop-in directory; the per-directory and message
+// rules are the ones every other tree shares.
+func TestPreWriteScanRefusesACarrierInAGeneratorTree(t *testing.T) {
+	previousDirs := systemdDropInSearchDirs
+	t.Cleanup(func() { systemdDropInSearchDirs = previousDirs })
+
+	unitPath := filepath.Join(t.TempDir(), unitName)
+	ownDir := filepath.Dir(unitDropInPath(unitPath))
+	generatorDropIn := filepath.Join(t.TempDir(), "generator.late", unitName+".d")
+	if err := os.MkdirAll(generatorDropIn, 0o755); err != nil {
+		t.Fatalf("create the generator drop-in directory: %v", err)
+	}
+	carrier := filepath.Join(generatorDropIn, "local.conf")
+	if err := os.WriteFile(carrier, []byte("[Service]\nExecStart=/bin/false --from-a-generator-tree\n"), 0o644); err != nil {
+		t.Fatalf("write the carrier: %v", err)
+	}
+	systemdDropInSearchDirs = func(string, Scope) []string {
+		return []string{ownDir, generatorDropIn}
+	}
+
+	err := preWriteExecStartOverride(unitPath, ScopeUser)
+	if err == nil {
+		t.Fatal("preWriteExecStartOverride() = nil, want the refusal of the generator tree's carrier")
+	}
+	for _, want := range []string{
+		"the update was refused and the registration was not changed",
+		carrier,
+		`Remove the "ExecStart=" override from "` + carrier + `"`,
+		`run "hfdesk service install" again`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal %q does not mention %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), " or ") {
+		t.Errorf("the refusal %q offers an alternative instead of one action", err)
 	}
 }
 
@@ -2327,7 +2471,7 @@ func TestPreWriteScanCoversTheDropInSearchPath(t *testing.T) {
 
 	t.Run("an override in another search-path directory refuses", func(t *testing.T) {
 		otherFile := filepath.Join(otherDir, "local.conf")
-		if err := os.WriteFile(otherFile, []byte("ExecStart  =  /bin/false --other-dir\n"), 0o644); err != nil {
+		if err := os.WriteFile(otherFile, []byte("[Service]\nExecStart  =  /bin/false --other-dir\n"), 0o644); err != nil {
 			t.Fatalf("write the drop-in: %v", err)
 		}
 		err := preWriteExecStartOverride(unitPath, ScopeUser)
@@ -2354,7 +2498,7 @@ func TestPreWriteScanCoversTheDropInSearchPath(t *testing.T) {
 			t.Fatalf("create the own drop-in directory: %v", err)
 		}
 		ownFile := unitDropInPath(unitPath)
-		if err := os.WriteFile(ownFile, []byte("ExecStart=/bin/true\n"), 0o644); err != nil {
+		if err := os.WriteFile(ownFile, []byte("[Service]\nExecStart=/bin/true\n"), 0o644); err != nil {
 			t.Fatalf("write the own drop-in: %v", err)
 		}
 		err := preWriteExecStartOverride(unitPath, ScopeUser)

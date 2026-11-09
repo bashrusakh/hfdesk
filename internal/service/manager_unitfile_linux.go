@@ -778,40 +778,77 @@ func handEditedUnitRefusal(unitPath string, reason error, scope Scope) error {
 }
 
 // systemdDropInSearchDirs lists the drop-in directories systemd merges for
-// the unit of the scope — the unit's own directory first, then every
-// directory of the scope's unit search path that can hold a drop-in, the
-// enumeration the systemd of the machine reports (`systemd-analyze
-// unit-paths` and `systemd-analyze --user unit-paths`): the system scope
-// searches /etc, /run and the two lib directories, and the user scope
-// searches /etc, the session runtime directory, /run/systemd/user, the XDG
-// data directories and the two lib directories — a drop-in in any of them
-// takes part in the merge (systemd.unit(5): /etc outweighs /run, which
-// outweighs /usr/lib). The scan names every override file instead of
-// claiming an effective order, so the message stays true whichever file
-// wins the merge. A home-derived data directory is listed only where the
-// home resolves; an unresolvable home refuses the installation before any
-// write elsewhere. Tests redirect this seam to temporary directories.
+// the unit of the scope: the unit's own drop-in directory first, then the
+// <unit>.d subdirectory of every tree of the scope's static unit search
+// path — the full output of `systemd-analyze unit-paths` /
+// `systemd-analyze --user unit-paths` on this machine: the
+// control/attached/transient/generator.early/generator/generator.late
+// trees beside the /etc, /run and lib trees (systemd.unit(5), the load
+// path tables) — plus the entries of $SYSTEMD_UNIT_PATH when that
+// variable is set. The variable overrides the unit load path
+// (systemd.unit(5): a trailing ":" appends the usual path, which is
+// listed above in every case, so appending its entries keeps the list a
+// superset under either shape; verified against `systemd-analyze
+// unit-paths` with the variable set — its output is exactly the entries).
+// Transient and generator trees normally belong to systemd's own writers,
+// yet a drop-in sitting in one takes part in the merge like any other, so
+// they are scanned as well. The list is a static superset — the
+// environment of the running supervisor decides the real path — and the
+// scan names every carrier file instead of claiming an effective order;
+// every directory keeps the per-directory rule (missing proves nothing,
+// unreadable refuses). A home-derived data directory is listed only where
+// the home resolves; an unresolvable home refuses the installation before
+// any write elsewhere. Tests redirect this seam to temporary directories.
 var systemdDropInSearchDirs = func(unitPath string, scope Scope) []string {
 	name := filepath.Base(unitPath) + ".d"
 	own := filepath.Dir(unitDropInPath(unitPath))
 	dirs := []string{own}
 	if scope == ScopeSystem {
 		dirs = append(dirs,
+			"/etc/systemd/system.control/"+name,
+			"/run/systemd/system.control/"+name,
+			"/run/systemd/transient/"+name,
+			"/run/systemd/generator.early/"+name,
 			"/etc/systemd/system/"+name,
+			"/etc/systemd/system.attached/"+name,
 			"/run/systemd/system/"+name,
+			"/run/systemd/system.attached/"+name,
+			"/run/systemd/generator/"+name,
+			"/usr/local/lib/systemd/system/"+name,
 			"/usr/lib/systemd/system/"+name,
-			"/usr/local/lib/systemd/system/"+name)
+			"/run/systemd/generator.late/"+name)
 	} else {
+		// The control tree of the scope is the sibling of the unit's
+		// own directory; the runtime trees are the siblings of the
+		// session directory systemd/user.
+		runtimeSystemd := filepath.Dir(userScopeRuntimeSystemdDir())
 		dirs = append(dirs,
+			filepath.Dir(filepath.Dir(unitPath))+"/user.control/"+name,
+			runtimeSystemd+"/user.control/"+name,
+			runtimeSystemd+"/transient/"+name,
+			runtimeSystemd+"/generator.early/"+name,
 			"/etc/systemd/user/"+name,
 			userScopeRuntimeSystemdDir()+"/"+name,
-			"/run/systemd/user/"+name)
+			"/run/systemd/user/"+name,
+			runtimeSystemd+"/generator/"+name)
 		for _, dataDir := range userScopeDataSystemdDirs() {
 			dirs = append(dirs, dataDir+"/systemd/user/"+name)
 		}
 		dirs = append(dirs,
 			"/usr/local/lib/systemd/user/"+name,
-			"/usr/lib/systemd/user/"+name)
+			"/usr/lib/systemd/user/"+name,
+			runtimeSystemd+"/generator.late/"+name)
+	}
+	// The entries of $SYSTEMD_UNIT_PATH participate in the unit search
+	// path of a process that carries the variable; they are appended
+	// (deduplicated by the scan) so a drop-in in an overridden entry is
+	// refused before any write like a drop-in in a static tree.
+	if envPath := os.Getenv("SYSTEMD_UNIT_PATH"); envPath != "" {
+		for _, dir := range filepath.SplitList(envPath) {
+			if dir != "" {
+				dirs = append(dirs, filepath.Join(dir, name))
+			}
+		}
 	}
 	return dirs
 }
