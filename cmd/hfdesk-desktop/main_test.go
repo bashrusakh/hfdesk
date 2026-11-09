@@ -14,12 +14,14 @@ func TestParseServiceHelperCommandSeparatesHostAndHelperArguments(t *testing.T) 
 		"--handover-ready-event", `Local\ready`,
 		"--handover-success-event", `Local\success`,
 		"--instance-mutex", `Local\HFDesk.Desktop.sid.1`,
+		"--desktop-state", `C:\Users\First Last\AppData\Roaming\hfdesk\desktop-state.json`,
 	})
 	if err != nil || !handled {
 		t.Fatalf("parse helper arguments returned handled=%t, err=%v", handled, err)
 	}
 	if helper.Action != "install" || helper.WaitPID != 4321 || helper.ReadyEvent != `Local\ready` ||
-		helper.SuccessEvent != `Local\success` || helper.InstanceMutex != `Local\HFDesk.Desktop.sid.1` {
+		helper.SuccessEvent != `Local\success` || helper.InstanceMutex != `Local\HFDesk.Desktop.sid.1` ||
+		helper.DesktopState != `C:\Users\First Last\AppData\Roaming\hfdesk\desktop-state.json` {
 		t.Errorf("parsed helper options = %+v", helper)
 	}
 

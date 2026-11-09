@@ -20,7 +20,8 @@ import (
 var publishState = service.PublishState
 
 // publishServingState publishes the effective URL of a desktop host whose
-// server already runs, and it fails closed in both directions.
+// server already runs — it completes the claim the launch published before
+// it opened its start window — and it fails closed in both directions.
 //
 // The mutation guard of this session decides whether a desktop serves from
 // the published state next to the singleton probe (service.LiveServingDesktop),
@@ -45,7 +46,9 @@ func publishServingState(path, url string, stop func()) error {
 const reachabilityTimeout = 2 * time.Second
 
 // publishedURL returns the URL of the running instance, or an empty string
-// when no instance published one.
+// when no instance published one — and also when the claim it reads belongs
+// to a launch that passed the service gate but has not bound its address
+// yet: such a claim carries no URL until the server knows it.
 //
 // The published state itself is owned by the service layer beside the
 // singleton hold and probe that classify a service mutation: the desktop

@@ -330,9 +330,20 @@ cannot claim its own instance degrades honestly instead of hiding: after this
 release it never reports readiness from a foreign answer, so the collision
 surfaces as a **failed start** — the instance never reports running, its bind
 failure is written to the Windows Event Log of the service — the command
-changes nothing, and the desktop that holds the address keeps serving. A
-desktop host that cannot publish its own state stops serving instead, so a
-serving desktop is never invisible to the guard.
+changes nothing, and the desktop that holds the address keeps serving.
+
+The published state is a **claim of a live launch**: it carries the process
+id of the desktop that wrote it, it is published **before** the launch opens
+the window in which it binds the address — so a desktop that is about to
+serve is already visible to the guard — and it counts only while that
+process runs, so the file a crashed desktop left behind refuses nothing. An
+elevation answered by another administrator carries the state path of the
+**originating** desktop beside the singleton name, so the approving
+account's own (always empty) claim directory can never hide a serving
+desktop. A desktop host that cannot publish its claim stops serving instead,
+so a serving desktop is never invisible to the guard. A stale claim whose
+process id was reused by a live process reads as live; the resulting
+refusal is transient and clears itself.
 
 **Uninstall never deletes user data.** It removes the registration and nothing
 else: not the models, not the cache, not the config file, not the jobs or the

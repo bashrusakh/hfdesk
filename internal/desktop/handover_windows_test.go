@@ -543,7 +543,12 @@ func TestHandoverNoticeDoesNotHoldCompletionAuthorization(t *testing.T) {
 	})
 
 	completionGate := make(chan struct{})
-	waitForCompletion := func() error { <-completionGate; return nil }
+	entered := make(chan struct{})
+	waitForCompletion := func() error {
+		close(entered)
+		<-completionGate
+		return nil
+	}
 	done := make(chan error, 1)
 	go func() { done <- completeHandoverWithNotice(handover, waitForCompletion) }()
 
@@ -551,6 +556,16 @@ func TestHandoverNoticeDoesNotHoldCompletionAuthorization(t *testing.T) {
 	case <-noticeOpen:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the native waiting notice never appeared")
+	}
+	// The notice runs on a goroutine of its own, so its appearance proves
+	// nothing about the handover goroutine itself: the incompleteness below
+	// is only meaningful once that goroutine positively reached the
+	// completion join. Without this entry signal the nonblocking read could
+	// run before the join and pass vacuously.
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the handover never reached the completion wait")
 	}
 	select {
 	case err := <-done:

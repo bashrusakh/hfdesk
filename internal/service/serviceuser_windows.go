@@ -70,6 +70,31 @@ func processUserSID() (string, error) {
 	return user.User.Sid.String(), nil
 }
 
+// init replaces the liveness check of the shared file with the check of
+// Windows: signal 0 is not supported here, while os.FindProcess OPENS the
+// process on Windows, so a successful open is the proof that the claim's
+// process still runs. An access denial means the process exists but this
+// token may not open it: an unverifiable claim stays live and fails closed,
+// while a pid the operating system does not know is the stale claim of a
+// desktop that is gone.
+func init() {
+	claimProcessAlive = claimProcessAliveByOpenProcess
+}
+
+// claimProcessAliveByOpenProcess is the liveness check of a published claim
+// on Windows.
+func claimProcessAliveByOpenProcess(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return errors.Is(err, windows.ERROR_ACCESS_DENIED)
+	}
+	_ = process.Release()
+	return true
+}
+
 // resolveDesktopSingletonName returns the object name to operate on: the
 // given name, or the name of the session of this process for an unnamed
 // caller.

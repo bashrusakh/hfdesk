@@ -78,6 +78,16 @@ type ServiceActionOptions struct {
 	// helper. It is reported to the user, so the message names the release
 	// the service was installed from.
 	Version string
+
+	// DesktopState is the path of the published claim of the desktop that
+	// launches this helper. It travels beside InstanceMutex: an elevation
+	// answered by another administrator runs in the approving account's
+	// configuration directory, and without this path the guard of the
+	// action would read that directory — which never holds the claim of
+	// the desktop that asked for the mutation — and be blind to a serving
+	// desktop of the originating user. Empty keeps the claim directory of
+	// the helper's own session.
+	DesktopState string
 }
 
 // parseServiceAction converts the value of the helper flag into an action.

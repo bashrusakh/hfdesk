@@ -349,9 +349,19 @@ func installServiceFromTray(instanceMutex string) *desktopHandover {
 // apart. No answer starts a handover — this host keeps running: the desktop
 // mode and Cancel change nothing, the browser action opens the URL of the
 // registration, and the start and the update go to the elevated helper the
-// way the gate launches them, where the helper's own guards report a
-// mutation the serving desktop does not allow and the update of a positively
-// stopped registration rewrites the registration without starting anything.
+// way the gate launches them, where the helper's own guards stay
+// authoritative.
+//
+// The invariant at this surface is that no answer asks for elevation for a
+// mutation that is already decided against: a start beside this serving
+// desktop, and an update that is not a pure rewrite of a positively
+// confirmed stopped registration, are refused HERE with the helper's own
+// report — result, cause and the one action that ends it — instead of
+// costing the user a user account control prompt for that same refusal.
+// The decision reuses the guard of the helper itself (the singleton probe
+// beside the live published claim), so the two surfaces can never disagree
+// about which mutations the serving desktop allows; the helper decides
+// again, authoritatively, when the elevation actually happens.
 func offerRegisteredServiceFromTray(status service.Status, instanceMutex string) {
 	desktopLog.Info("the Windows service is registered already: the tray offers the actions of an existing service instead of an installation",
 		"state", string(status.State),
@@ -377,10 +387,30 @@ func offerRegisteredServiceFromTray(status service.Status, instanceMutex string)
 			reportBrowserFailure(url, err)
 		}
 	case serviceChoiceStart:
+		// This host runs the address a started service would take, so the
+		// guard of the helper refuses every start beside it: the answer is
+		// reported here instead of being sent through elevation to its own
+		// refusal.
+		if servingDesktopRefusesMutation(instanceMutex) {
+			reportServingDesktopRefusal(serviceActionStart)
+			return
+		}
 		if _, err := launchServiceHelper(serviceActionStart, 0, instanceMutex); err != nil {
 			reportServiceLaunchFailure(serviceActionStart, err)
 		}
 	case serviceChoiceUpdate:
+		// Only the update of a positively confirmed stopped registration
+		// (the same standard the gate's dialog and the helper use) is a
+		// pure rewrite that can succeed beside this desktop; every other
+		// state restarts the instance and is refused beside the desktop
+		// that serves the address. Both answers are decided with the guard
+		// of the helper, so a doomed update never reaches the elevation.
+		if !servicePromptStopped(prompt) {
+			if servingDesktopRefusesMutation(instanceMutex) {
+				reportServingDesktopRefusal(serviceActionUpdate)
+				return
+			}
+		}
 		if _, err := launchServiceHelper(serviceActionUpdate, 0, instanceMutex); err != nil {
 			reportServiceLaunchFailure(serviceActionUpdate, err)
 		}
@@ -388,6 +418,40 @@ func offerRegisteredServiceFromTray(status service.Status, instanceMutex string)
 		desktopLog.Info("the tray changed nothing for the registered service",
 			"state", string(status.State))
 	}
+}
+
+// servingDesktopRefusesMutation reports whether the guard of the elevated
+// helper would refuse a mutation beside the desktop that runs this tray:
+// the same two facts the helper decides from — another process of this
+// session held the singleton when it was probed around its hold, and the
+// published claim it reads is live.
+//
+// A probe that fails is classified fail-closed, exactly like the helper and
+// the command family: an unproven freshness is never proof that no desktop
+// of this session is alive.
+func servingDesktopRefusesMutation(instanceMutex string) bool {
+	release, preExisting, err := service.ProbeDesktopSingleton(instanceMutex)
+	if release != nil {
+		defer release()
+	}
+	if err != nil {
+		preExisting = true
+		desktopLog.Warn("the desktop singleton probe failed beside the tray",
+			"error", err)
+	}
+	return service.LiveServingDesktop(preExisting)
+}
+
+// reportServingDesktopRefusal shows the refusal of a mutation the serving
+// desktop of this session does not allow — the very report the elevated
+// helper shows, with the result, the cause and the one action that ends it.
+// The tray shows it directly so a mutation whose refusal is already known
+// never costs the user an elevation prompt.
+func reportServingDesktopRefusal(action serviceAction) {
+	desktopLog.Error("the tray did not ask for elevation beside a serving desktop instance",
+		"action", string(action))
+	showMessage(serviceFailureCaption(action),
+		serviceServingDesktopRefusedText(action), windows.MB_ICONERROR)
 }
 
 // serviceDataDir returns the data directory the service owns.
@@ -430,6 +494,8 @@ func desktopExecutable() (string, error) {
 //
 // instanceMutex is handed to an update or a start, which hold that desktop
 // singleton through their mutation; every other action carries no wait state.
+// The claim path of this desktop travels with it, so the guard of the action
+// reads this desktop's claim under any approving account.
 func launchServiceHelper(action serviceAction, waitPID int, instanceMutex string) (uint32, error) {
 	executable, err := desktopExecutable()
 	if err != nil {
@@ -440,6 +506,7 @@ func launchServiceHelper(action serviceAction, waitPID int, instanceMutex string
 		Action:        action,
 		WaitPID:       waitPID,
 		InstanceMutex: instanceMutex,
+		DesktopState:  service.PublishedStatePath(),
 	})
 	if err != nil {
 		return 0, err
@@ -476,6 +543,7 @@ func launchServiceHandover(action serviceAction, waitPID int, instanceMutex stri
 		ReadyEvent:    events.readyName,
 		SuccessEvent:  events.successName,
 		InstanceMutex: instanceMutex,
+		DesktopState:  service.PublishedStatePath(),
 	})
 	if err != nil {
 		if helper != nil {

@@ -23,15 +23,18 @@
 // host starts the very same executable with the hidden flags
 //
 //	--service-action install --wait-pid N --handover-ready-event NAME
-//	  --handover-success-event NAME --instance-mutex NAME
-//	--service-action update|start [--instance-mutex NAME]
+//	  --handover-success-event NAME --instance-mutex NAME [--desktop-state PATH]
+//	--service-action update|start [--instance-mutex NAME] [--desktop-state PATH]
 //
 // and the helper performs the action, reports it in a native message box and
 // ends without a server, a tray icon or a window. An update or a start holds
 // the per-session desktop singleton through its mutation: the gate passes the
 // lock of its own launch with --instance-mutex, and a command line without
 // the flag holds the object of the helper's own session, which it computes
-// itself. The flags are private to the
+// itself. The state path of the launching desktop travels beside that lock
+// with --desktop-state, so the mutation guard reads the claim of the
+// ORIGINATING desktop even when another administrator approves the
+// elevation. The flags are private to the
 // desktop executable: they are not part of the options of the hfdesk command,
 // and they are not documented in its usage.
 package main
@@ -148,8 +151,8 @@ func parseHostOptions(args []string) (app.Options, string, error) {
 }
 
 const serviceHelperUsage = "Usage: hfdesk-desktop --service-action install --wait-pid N " +
-	"--handover-ready-event NAME --handover-success-event NAME --instance-mutex NAME\n" +
-	"       hfdesk-desktop --service-action update|start [--instance-mutex NAME]"
+	"--handover-ready-event NAME --handover-success-event NAME --instance-mutex NAME [--desktop-state PATH]\n" +
+	"       hfdesk-desktop --service-action update|start [--instance-mutex NAME] [--desktop-state PATH]"
 
 func parseServiceHelperCommand(args []string) (desktop.ServiceActionOptions, bool, error) {
 	var helper desktop.ServiceActionOptions
@@ -161,6 +164,7 @@ func parseServiceHelperCommand(args []string) (desktop.ServiceActionOptions, boo
 	flags.StringVar(&helper.ReadyEvent, "handover-ready-event", "", "the per-attempt helper-ready event")
 	flags.StringVar(&helper.SuccessEvent, "handover-success-event", "", "the per-attempt graceful-completion event")
 	flags.StringVar(&helper.InstanceMutex, "instance-mutex", "", "the existing per-session desktop singleton")
+	flags.StringVar(&helper.DesktopState, "desktop-state", "", "the published state file of the launching desktop")
 	err := flags.Parse(args)
 	if !hasServiceHelperArgument(args) {
 		return desktop.ServiceActionOptions{}, false, nil
@@ -193,6 +197,7 @@ func hasServiceHelperArgument(args []string) bool {
 			"--handover-ready-event", "-handover-ready-event",
 			"--handover-success-event", "-handover-success-event",
 			"--instance-mutex", "-instance-mutex",
+			"--desktop-state", "-desktop-state",
 		} {
 			if arg == name || strings.HasPrefix(arg, name+"=") {
 				return true

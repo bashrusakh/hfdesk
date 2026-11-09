@@ -87,12 +87,17 @@ func RunServiceAction(o ServiceActionOptions) error {
 	}
 	var handover *helperHandover
 	// singletonPreExisting carries whether the desktop singleton already
-	// existed when this action held it: together with the published state
-	// it tells the action whether a desktop instance of this session is
-	// alive and serving (see LiveServingDesktop). A handover leaves it
+	// existed when this action held it: together with the live published
+	// claim it tells the action whether a desktop instance of this session
+	// is alive and serving (see LiveServingDesktop). A handover leaves it
 	// false: its authorization already proved that the original desktop
 	// exited and removed its published state.
 	var singletonPreExisting bool
+	// The claim path of the desktop that launched this helper travels
+	// beside the singleton name, so the guard below reads the ORIGINATING
+	// desktop's claim — never the (always empty) claim directory of an
+	// administrator who only approved the elevation.
+	usePublishedStatePath(o.DesktopState)
 	if o.WaitPID > 0 {
 		handover, err = prepareHelperHandover(o)
 		if err != nil {
@@ -174,6 +179,14 @@ func RunServiceAction(o ServiceActionOptions) error {
 // the mutation, not run it unprotected.
 var holdServiceSingleton = service.HoldDesktopSingleton
 
+// usePublishedStatePath points the mutation guard of the service layer at
+// the claim of the desktop that launched this helper (see
+// service.UsePublishedStatePath).
+//
+// It is a package level variable so the tests can observe that every helper
+// invocation applies the path it was launched with.
+var usePublishedStatePath = service.UsePublishedStatePath
+
 // preflightServiceProgram checks the console program of this folder with the
 // image preflight the installation runs, before the ready signal; the
 // installation keeps its own copy for a file that changes after this point.
@@ -192,6 +205,14 @@ func preflightServiceProgram() error {
 func validateServiceHandoverOptions(action serviceAction, o ServiceActionOptions) error {
 	if o.WaitPID < 0 || uint64(o.WaitPID) > uint64(^uint32(0)) {
 		return errors.New("desktop: the original desktop process id is outside the Windows process-id range")
+	}
+	// The claim path decides which desktop's state the guard reads, so a
+	// path it cannot locate is refused before the mutation instead of
+	// silently leaving the guard on the claim directory of this process —
+	// under another approving administrator that directory is the wrong
+	// user's and always empty, the blind direction of the guard.
+	if path := strings.TrimSpace(o.DesktopState); path != "" && !filepath.IsAbs(path) {
+		return errors.New("desktop: the desktop state path must be an absolute path")
 	}
 	hasNames := strings.TrimSpace(o.ReadyEvent) != "" || strings.TrimSpace(o.SuccessEvent) != "" ||
 		strings.TrimSpace(o.InstanceMutex) != ""
@@ -535,8 +556,8 @@ type serviceActionReporter struct {
 	action   serviceAction
 	handover *helperHandover
 	// singletonPreExisting is whether the desktop singleton already existed
-	// when this action held it: with the published state it decides whether
-	// a desktop instance of this session is alive and serving (see
+	// when this action held it: with the live published claim it decides
+	// whether a desktop instance of this session is alive and serving (see
 	// LiveServingDesktop), and a handover action leaves it false because
 	// its authorization already proved the desktop exited.
 	singletonPreExisting bool

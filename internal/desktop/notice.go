@@ -74,6 +74,18 @@ func publishStateStartupText(err error) string {
 		"Make sure the configuration directory is writable and start HFDesk again.", err)
 }
 
+// publishClaimStartupText returns the report of a launch that could not
+// publish the claim of its own startup and therefore ended before any
+// server existed. The mutation guard of the session reads that claim beside
+// the singleton probe, so a launch it cannot see must not serve; the report
+// states the result, the cause and the same one next action as every other
+// startup failure.
+func publishClaimStartupText(err error) string {
+	return fmt.Sprintf("HFDesk is not serving.\n\n"+
+		"The desktop host could not publish the claim of this launch:\n\n%v\n\n"+
+		"Make sure the configuration directory is writable and start HFDesk again.", err)
+}
+
 // browserOpenFailedText returns the text of the notice of a failed browser
 // launch.
 //

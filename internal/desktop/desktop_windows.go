@@ -209,9 +209,25 @@ func run(o Options, logPath string) (err error) {
 	// registration and never starts the service. It runs after the logging
 	// pipeline (its records are the support material of the launch) and before
 	// app.New, the first step that can create a server. A launch that ends
-	// here publishes no state.
+	// here publishes no claim.
 	if !serviceGate(lock.name) {
 		return nil
+	}
+
+	// From here this launch can bind the address, so it publishes its claim
+	// BEFORE that window opens: the mutation guard of this session
+	// (service.LiveServingDesktop) reads the claim beside the singleton
+	// probe, and a launch that stayed invisible until its server answered
+	// would let `hfdesk service install/start/restart` take the address
+	// while it is about to bind the same one. The claim carries the PID of
+	// this launch and no URL yet — the effective URL is published below,
+	// once the server knows the address it really bound. A claim that
+	// cannot be published ends the launch here, before any server exists:
+	// a launch the guard cannot see must not serve.
+	defer service.RemovePublishedState(statePath)
+	if err := publishState(statePath, ""); err != nil {
+		reportStartupFailure("HFDesk could not start", publishClaimStartupText(err), logPath)
+		return fmt.Errorf("desktop: publish the startup claim to %s: %w", statePath, err)
 	}
 
 	application, err := app.New(o.App, o.Version)
@@ -317,13 +333,15 @@ func run(o Options, logPath string) (err error) {
 
 	url := application.URL()
 
-	// The effective URL is published, so a second launch can open the web
-	// UI of this instance. A host that cannot publish it must not serve:
-	// the mutation guard of this session reads the published state, so a
-	// serving desktop without one would let a service mutation start the
-	// service beside it. The failure stops the server through the graceful
-	// path, reports it like every other startup failure and ends the launch.
-	defer service.RemovePublishedState(statePath)
+	// The effective URL replaces the empty claim of the starting window, so
+	// a second launch can open the web UI of this instance. A host that
+	// cannot refresh its claim must not keep serving: the mutation guard of
+	// this session reads the claim next to the singleton probe, so a serving
+	// desktop without one would let `hfdesk service install/start/restart`
+	// start the service beside it. The failure stops the server through the
+	// graceful path, reports it like every other startup failure and ends
+	// the launch; the claim itself is removed by the defer above on every
+	// path out of this function.
 	if err := publishServingState(statePath, url, func() {
 		stopDesktopServer(shutdown, &shutdownCoordinator)
 	}); err != nil {

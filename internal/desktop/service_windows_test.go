@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -996,6 +997,10 @@ func TestTrayServiceInstallLaunchesTheHelperAfterTheConfirmation(t *testing.T) {
 	if launches[0].InstanceMutex != `Local\HFDesk.Test.1` {
 		t.Errorf("the helper was given singleton %q, want the existing object", launches[0].InstanceMutex)
 	}
+	if launches[0].DesktopState != service.PublishedStatePath() {
+		t.Errorf("the helper state path = %q, want the claim path of this desktop %q",
+			launches[0].DesktopState, service.PublishedStatePath())
+	}
 	if len(*messages) != 0 {
 		t.Errorf("the tray action showed %v, want the helper to report the outcome", *messages)
 	}
@@ -1377,6 +1382,10 @@ func TestTrayServiceInstallOffersTheRegisteredServiceInsteadOfAHandover(t *testi
 		}
 		if (*starts)[0].InstanceMutex != `Local\HFDesk.Test.11` {
 			t.Errorf("the helper singleton = %q, want this desktop's object", (*starts)[0].InstanceMutex)
+		}
+		if (*starts)[0].DesktopState != service.PublishedStatePath() {
+			t.Errorf("the helper state path = %q, want the claim path of this desktop %q",
+				(*starts)[0].DesktopState, service.PublishedStatePath())
 		}
 		if len(*messages) != 0 {
 			t.Errorf("the tray action showed %v, want the helper to report the outcome", *messages)
@@ -2179,7 +2188,10 @@ func TestServiceHelperRejectsIncompleteInstallHandover(t *testing.T) {
 }
 
 // TestServiceHelperArgumentsNameTheActionAndHandover proves that the helper
-// receives the event names and existing singleton identity of one handover.
+// receives the event names and existing singleton identity of one handover,
+// and that the claim path of the launching desktop travels beside them —
+// quoted when the profile path contains a space, so it arrives as ONE flag
+// value instead of ending at the first space.
 func TestServiceHelperArgumentsNameTheActionAndHandover(t *testing.T) {
 	install := serviceHelperArguments(elevatedLaunch{
 		Action: serviceActionInstall, WaitPID: 4321,
@@ -2198,6 +2210,20 @@ func TestServiceHelperArgumentsNameTheActionAndHandover(t *testing.T) {
 	})
 	if want := `--service-action update --instance-mutex Local\HFDesk.Desktop.sid.1`; updateWithMutex != want {
 		t.Errorf("the arguments are %q, want %q", updateWithMutex, want)
+	}
+	updateWithState := serviceHelperArguments(elevatedLaunch{
+		Action: serviceActionUpdate, InstanceMutex: `Local\HFDesk.Desktop.sid.1`,
+		DesktopState: `C:\portable\hfdesk\desktop-state.json`,
+	})
+	if want := `--service-action update --instance-mutex Local\HFDesk.Desktop.sid.1 ` +
+		`--desktop-state C:\portable\hfdesk\desktop-state.json`; updateWithState != want {
+		t.Errorf("the arguments are %q, want %q", updateWithState, want)
+	}
+	spacedState := serviceHelperArguments(elevatedLaunch{
+		Action: serviceActionStart, DesktopState: `C:\Users\First Last\AppData\Roaming\hfdesk\desktop-state.json`,
+	})
+	if want := `--service-action start --desktop-state "C:\Users\First Last\AppData\Roaming\hfdesk\desktop-state.json"`; spacedState != want {
+		t.Errorf("the arguments are %q, want the state path quoted as one value: %q", spacedState, want)
 	}
 }
 
@@ -2275,6 +2301,9 @@ func TestServiceHelperSingletonArgumentRules(t *testing.T) {
 			ServiceActionOptions{Action: "update", InstanceMutex: `Local\m`}},
 		{"start carries the singleton alone", serviceActionStart,
 			ServiceActionOptions{Action: "start", InstanceMutex: `Local\m`}},
+		{"update carries the launching desktop's claim path", serviceActionUpdate,
+			ServiceActionOptions{Action: "update", InstanceMutex: `Local\m`,
+				DesktopState: `C:\portable\hfdesk\desktop-state.json`}},
 	} {
 		if err := validateServiceHandoverOptions(tc.action, tc.o); err != nil {
 			t.Errorf("%s was rejected: %v", tc.name, err)
@@ -2293,6 +2322,13 @@ func TestServiceHelperSingletonArgumentRules(t *testing.T) {
 			ServiceActionOptions{Action: "install", InstanceMutex: `Local\m`}},
 		{"install without a handover", serviceActionInstall,
 			ServiceActionOptions{Action: "install"}},
+		// A claim path the guard cannot locate is refused before the
+		// mutation instead of silently leaving the guard on the claim
+		// directory of this process — under another approving administrator
+		// that is the blind direction.
+		{"start with a relative claim path", serviceActionStart,
+			ServiceActionOptions{Action: "start", InstanceMutex: `Local\m`,
+				DesktopState: `desktop-state.json`}},
 	} {
 		if err := validateServiceHandoverOptions(tc.action, tc.o); err == nil {
 			t.Errorf("%s was accepted, want the refusal of incomplete handover arguments", tc.name)
@@ -2610,10 +2646,10 @@ func TestServiceHelperProceedsWhenTheSingletonGrantsOnlyReadControl(t *testing.T
 		return `C:\portable\hfdesk.exe`, nil
 	})
 	// The probe of the hold finds the fixture object, so the only other
-	// fact of the serving-desktop check would have to come from the
-	// published state: no desktop runs in this test, and that state must
+	// fact of the serving-desktop check would have to come from the live
+	// published claim: no desktop runs in this test, and that claim must
 	// not be read from the configuration directory of the user.
-	replaceSeam(t, &service.PublishedStatePresent, func() bool { return false })
+	replaceSeam(t, &service.PublishedStateLive, func() bool { return false })
 	stopped := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
 	manager := &readControlObservingManager{fakeServiceManager: &fakeServiceManager{
 		statuses: []service.Status{stopped, stopped},
@@ -3275,4 +3311,274 @@ func TestServiceHelperStartProceedsWhenNoDesktopHoldsTheSingleton(t *testing.T) 
 		t.Fatalf("the helper showed %v, want the report of the started service", *messages)
 	}
 	requireSingletonReleased(t)
+}
+
+// TestServiceHelperStartFromTheGateDoesNotRefuseOverAStaleClaim proves the
+// gate's own Start dialog never self-refuses: the singleton the probe finds
+// is the gate's own launch holding the window of this very mutation, while
+// the claim beside it belongs to a desktop that crashed earlier — its
+// process is gone, so the claim counts as absent and the start proceeds.
+//
+// The defect this pins: a guard that only asked whether a file exists
+// refused the mutation the gate itself launched, telling the user to quit a
+// tray app that no longer runs (finding 17 colliding with finding 7's
+// caveat). Perturbation: only the PID inside the claim file changes.
+func TestServiceHelperStartFromTheGateDoesNotRefuseOverAStaleClaim(t *testing.T) {
+	requireFreeSingleton(t)
+	useTemporaryStateDir(t)
+
+	// The stale claim of a desktop that crashed: its process is gone.
+	t.Cleanup(func() { service.UsePublishedStatePath("") })
+	claimDir := filepath.Dir(service.PublishedStatePath())
+	if err := os.MkdirAll(claimDir, 0o755); err != nil {
+		t.Fatalf("create the claim directory: %v", err)
+	}
+	stale := `{"url":"http://127.0.0.1:18080","pid":` +
+		fmt.Sprint(exitedProcessPID(t)) + `}`
+	if err := os.WriteFile(service.PublishedStatePath(), []byte(stale), 0o600); err != nil {
+		t.Fatalf("write the stale claim: %v", err)
+	}
+
+	// The gate's own launch holds the singleton of this launch through the
+	// helper, so the probe around the hold reports the holder fact.
+	lock, err := acquireInstanceLock()
+	assertNoError(t, err, "acquire the desktop singleton of this session: %v", err)
+
+	stopped := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
+	running := runningServiceStatus(service.StateRunning, "127.0.0.1:18080")
+	manager := &fakeServiceManager{statuses: []service.Status{stopped, running}}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	err = RunServiceAction(ServiceActionOptions{
+		Action:       "start",
+		DesktopState: service.PublishedStatePath(),
+	})
+	lock.Release()
+	assertNoError(t, err, "the gate's own start refused over the stale claim of a crashed desktop: %v", err)
+	if manager.starts != 1 {
+		t.Errorf("the helper started the service %d times, want one start beside a stale claim", manager.starts)
+	}
+	if len(*messages) != 1 || (*messages)[0].caption != serviceStartedCaption {
+		t.Fatalf("the helper showed %v, want the report of the started service", *messages)
+	}
+	requireSingletonReleased(t)
+}
+
+// TestServiceHelperReadsTheClaimOfTheDesktopThatLaunchedIt proves the
+// foreign-user direction at the helper level: the claim path travels with
+// the elevation, and the guard decides on the ORIGINATING desktop's claim.
+//
+// Perturbation: only DesktopState changes between the subtests. With the
+// carried path — the claim of a launch that passed the gate but has not
+// bound its address yet (no url), whose process runs — the start refuses
+// before the first service step. Without it the guard falls back to this
+// process's own claim directory, which under another approving
+// administrator holds no claim at all: the mutation then runs beside the
+// serving desktop, the blind direction of finding 23.
+func TestServiceHelperReadsTheClaimOfTheDesktopThatLaunchedIt(t *testing.T) {
+	t.Run("the carried claim path refuses the start", func(t *testing.T) {
+		requireFreeSingleton(t)
+		useTemporaryStateDir(t)
+		t.Cleanup(func() { service.UsePublishedStatePath("") })
+
+		// The claim of the originating desktop: no url yet, and the
+		// process that published it — this test — lives.
+		originating := filepath.Join(t.TempDir(), "desktop-state.json")
+		if err := service.PublishState(originating, ""); err != nil {
+			t.Fatalf("publish the claim of the originating desktop: %v", err)
+		}
+		lock, err := acquireInstanceLock()
+		assertNoError(t, err, "acquire the desktop singleton of this session: %v", err)
+
+		stopped := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
+		manager := &fakeServiceManager{statuses: []service.Status{stopped}}
+		replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+			return manager, nil
+		})
+		messages := recordMessages(t)
+
+		err = RunServiceAction(ServiceActionOptions{Action: "start", DesktopState: originating})
+		lock.Release()
+		if err == nil {
+			t.Fatal("the start ran although the claim of the originating desktop is live")
+		}
+		for _, step := range manager.steps {
+			if step != "status" {
+				t.Fatalf("the helper touched the service before its refusal, steps: %v", manager.steps)
+			}
+		}
+		if len(*messages) != 1 || (*messages)[0].caption != serviceFailureCaption(serviceActionStart) {
+			t.Fatalf("the helper showed %v, want the refusal of the start", *messages)
+		}
+		assertNames(t, (*messages)[0].text, "the report", []string{
+			"No service action was performed", "serves its local server", "notification-area icon",
+		})
+		requireSingletonReleased(t)
+	})
+
+	t.Run("without the carried path the guard reads its own empty directory", func(t *testing.T) {
+		requireFreeSingleton(t)
+		useTemporaryStateDir(t)
+		t.Cleanup(func() { service.UsePublishedStatePath("") })
+
+		// The claim directory of this process — the approving account's
+		// under an over-the-shoulder elevation — holds no claim.
+		lock, err := acquireInstanceLock()
+		assertNoError(t, err, "acquire the desktop singleton of this session: %v", err)
+
+		stopped := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
+		running := runningServiceStatus(service.StateRunning, "127.0.0.1:18080")
+		manager := &fakeServiceManager{statuses: []service.Status{stopped, running}}
+		replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+			return manager, nil
+		})
+		messages := recordMessages(t)
+
+		err = RunServiceAction(ServiceActionOptions{Action: "start"})
+		lock.Release()
+		assertNoError(t, err, "the start without a claim path failed: %v", err)
+		if manager.starts != 1 {
+			t.Errorf("the helper started the service %d times, want one start beside the empty claim directory", manager.starts)
+		}
+		if len(*messages) != 1 || (*messages)[0].caption != serviceStartedCaption {
+			t.Fatalf("the helper showed %v, want the report of the started service", *messages)
+		}
+		requireSingletonReleased(t)
+	})
+}
+
+// exitedProcessPID returns the process id of a process that ran and ended:
+// the claim of a desktop that crashed names such a pid. The helper process
+// is this test binary with no test to run, so it exits immediately on every
+// platform that builds this file.
+func exitedProcessPID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run the helper process to its exit: %v", err)
+	}
+	return cmd.Process.Pid
+}
+
+// TestTrayServiceInstallDoesNotAskForElevationTheGuardWouldRefuse proves
+// the invariant of the tray offering (finding 19): no answer asks for
+// elevation for a mutation that is already decided against. The dialog
+// keeps the gate's vocabulary; a start beside this serving desktop and an
+// update that is not a pure rewrite of a positively confirmed stopped
+// registration are reported here with the helper's own refusal — result,
+// cause and the one action that ends it — and no user account control
+// prompt is spent on them. The guard of the helper stays authoritative: it
+// decides again when an answer that passed this check reaches the
+// elevation.
+//
+// Perturbation: the published claim of this desktop. With a live claim the
+// guard refuses before the elevation; without one it has no second fact
+// and the launch reaches the helper, which reports the outcome itself.
+func TestTrayServiceInstallDoesNotAskForElevationTheGuardWouldRefuse(t *testing.T) {
+	fixture := func(t *testing.T, state service.Status, choice serviceChoice, claim bool) (*[]shownMessage, *[]elevatedLaunch) {
+		t.Helper()
+		useTemporaryStateDir(t)
+		freshServiceInstallGuard(t)
+		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) { return state, nil })
+		replaceSeam(t, &confirmServiceInstall, func(string) bool { return true })
+		replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+			return `C:\portable\hfdesk.exe`, nil
+		})
+		replaceSeam(t, &showServiceChoice, func(serviceChoicePrompt) serviceChoice { return choice })
+		var launches []elevatedLaunch
+		replaceSeam(t, &launchElevated, func(l elevatedLaunch) (uint32, error) {
+			launches = append(launches, l)
+			return 4242, nil
+		})
+		if claim {
+			if err := service.PublishState(service.PublishedStatePath(), "http://127.0.0.1:18080"); err != nil {
+				t.Fatalf("publish the claim of this desktop: %v", err)
+			}
+		}
+		return recordMessages(t), &launches
+	}
+	// holdSessionSingleton gives the probe beside the guard the holder
+	// fact: this desktop holds its own singleton, exactly as the helper's
+	// probe around its hold would find it.
+	holdSessionSingleton := func(t *testing.T, name string) func() {
+		t.Helper()
+		release, err := service.HoldDesktopSingleton(name)
+		assertNoError(t, err, "hold the desktop singleton %q: %v", name, err)
+		return release
+	}
+
+	t.Run("a start beside this serving desktop is reported without elevation", func(t *testing.T) {
+		messages, launches := fixture(t,
+			runningServiceStatus(service.StateStopped, "127.0.0.1:18080"), serviceChoiceStart, true)
+		name := `Local\HFDesk.Test.TrayNoUac.Start`
+		release := holdSessionSingleton(t, name)
+
+		if handover := installServiceFromTray(name); handover != nil {
+			handover.close()
+			t.Fatal("the tray handed a registered service over to the installation helper")
+		}
+		release()
+
+		if len(*launches) != 0 {
+			t.Errorf("the tray launched %d helpers, want none: the elevation would only buy this refusal", len(*launches))
+		}
+		if len(*messages) != 1 {
+			t.Fatalf("the tray showed %d message boxes, want the refusal alone: %v", len(*messages), *messages)
+		}
+		if (*messages)[0].caption != serviceFailureCaption(serviceActionStart) {
+			t.Errorf("the caption is %q, want %q", (*messages)[0].caption, serviceFailureCaption(serviceActionStart))
+		}
+		assertNames(t, (*messages)[0].text, "the report", []string{
+			"No service action was performed", "serves its local server", "notification-area icon",
+		})
+	})
+
+	t.Run("the same start reaches the helper when no claim says this desktop serves", func(t *testing.T) {
+		messages, launches := fixture(t,
+			runningServiceStatus(service.StateStopped, "127.0.0.1:18080"), serviceChoiceStart, false)
+		name := `Local\HFDesk.Test.TrayNoUac.StartNoClaim`
+		release := holdSessionSingleton(t, name)
+
+		if handover := installServiceFromTray(name); handover != nil {
+			handover.close()
+			t.Fatal("the tray handed a registered service over to the installation helper")
+		}
+		release()
+
+		if len(*launches) != 1 || (*launches)[0].Action != serviceActionStart {
+			t.Fatalf("the tray launched %v, want the one start the guard allowed", *launches)
+		}
+		if len(*messages) != 0 {
+			t.Errorf("the tray showed %v, want the helper to report the outcome", *messages)
+		}
+	})
+
+	t.Run("an update that is not a pure rewrite is reported without elevation", func(t *testing.T) {
+		messages, launches := fixture(t,
+			runningServiceStatus(service.StateRunning, "127.0.0.1:18080"), serviceChoiceUpdate, true)
+		name := `Local\HFDesk.Test.TrayNoUac.Update`
+		release := holdSessionSingleton(t, name)
+
+		if handover := installServiceFromTray(name); handover != nil {
+			handover.close()
+			t.Fatal("the tray handed a registered service over to the installation helper")
+		}
+		release()
+
+		if len(*launches) != 0 {
+			t.Errorf("the tray launched %d helpers, want none: a restart beside this desktop is refused", len(*launches))
+		}
+		if len(*messages) != 1 {
+			t.Fatalf("the tray showed %d message boxes, want the refusal alone: %v", len(*messages), *messages)
+		}
+		if (*messages)[0].caption != serviceFailureCaption(serviceActionUpdate) {
+			t.Errorf("the caption is %q, want %q", (*messages)[0].caption, serviceFailureCaption(serviceActionUpdate))
+		}
+		assertNames(t, (*messages)[0].text, "the report", []string{
+			"No service action was performed", "serves its local server", "notification-area icon",
+		})
+	})
 }

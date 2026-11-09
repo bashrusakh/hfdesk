@@ -44,6 +44,11 @@ type elevatedLaunch struct {
 	SuccessEvent string
 	// InstanceMutex names the existing desktop singleton object to hold.
 	InstanceMutex string
+	// DesktopState is the path of the published claim of the desktop that
+	// launches the helper; it travels beside InstanceMutex so the guard of
+	// the action reads the ORIGINATING desktop's claim even when another
+	// administrator approves the elevation.
+	DesktopState string
 }
 
 // launchElevated starts the service helper with administrator rights.
@@ -196,7 +201,10 @@ func shellExecuteElevatedProcess(l elevatedLaunch) (*elevatedProcess, error) {
 // its handover. An update or start from the service gate carries the singleton
 // identity alone: its mutation moves the service after the launching desktop
 // ended, so the helper holds the singleton across that window without waiting
-// for an exit. Every other command carries no wait state.
+// for an exit. Every other command carries no wait state. The state path of
+// the launching desktop travels beside the singleton identity in every form,
+// so the helper's guard reads the claim of the ORIGINATING desktop under any
+// approving account.
 func serviceHelperArguments(l elevatedLaunch) string {
 	args := []string{"--service-action", string(l.Action)}
 	switch {
@@ -209,5 +217,26 @@ func serviceHelperArguments(l elevatedLaunch) string {
 	case strings.TrimSpace(l.InstanceMutex) != "":
 		args = append(args, "--instance-mutex", l.InstanceMutex)
 	}
+	if path := strings.TrimSpace(l.DesktopState); path != "" {
+		args = append(args, "--desktop-state", quoteHelperArgument(path))
+	}
 	return strings.Join(args, " ")
+}
+
+// quoteHelperArgument wraps a helper argument value that may contain spaces
+// in the double quotes of the Windows command line, so the helper receives
+// it as ONE flag value. The state path of a user profile usually contains a
+// space ("C:\Users\First Last\..."); an unquoted value would end at the
+// first space, and the helper's fail-closed parse would reject the whole
+// invocation as unconsumed arguments instead of reading the claim.
+//
+// A quoted value is only needed where a value can contain a space: the
+// fixed names of the handover never do, so their established command line
+// stays byte for byte what it was. A Windows file name cannot contain a
+// double quote, so the quoting cannot collide with the value itself.
+func quoteHelperArgument(value string) string {
+	if !strings.ContainsAny(value, " \t") {
+		return value
+	}
+	return `"` + value + `"`
 }

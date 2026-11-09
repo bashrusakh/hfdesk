@@ -122,3 +122,22 @@ func TestPublishStateStartupTextStatesTheResultTheCauseAndOneAction(t *testing.T
 		t.Errorf("the number of next actions = %d, want exactly 1: %q", got, text)
 	}
 }
+
+// TestPublishClaimStartupTextStatesTheResultTheCauseAndOneAction proves the
+// report of a launch that could not publish the claim of its startup is
+// honest in the same shape: nothing is served, the cause is named with the
+// error, and exactly one next action is asked for. The claim is the fact
+// the mutation guard reads, so this launch must not serve without it.
+func TestPublishClaimStartupTextStatesTheResultTheCauseAndOneAction(t *testing.T) {
+	text := publishClaimStartupText(errors.New(
+		"desktop: publish the startup claim to /tmp/desktop-state.json: the state directory is read-only"))
+
+	assertNames(t, text, "text", []string{
+		"HFDesk is not serving",
+		"could not publish the claim of this launch",
+		"the state directory is read-only",
+	})
+	if got := strings.Count(text, "start HFDesk again"); got != 1 {
+		t.Errorf("the number of next actions = %d, want exactly 1: %q", got, text)
+	}
+}
