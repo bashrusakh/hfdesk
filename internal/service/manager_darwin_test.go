@@ -1238,6 +1238,10 @@ func TestLaunchdMachineWideUninstallNeedsAnElevatedShell(t *testing.T) {
 func TestLaunchdUninstallOfAnAbsentRegistrationIsACleanSuccess(t *testing.T) {
 	t.Run("the machine-wide scope of an absent registration", func(t *testing.T) {
 		launchd := &launchdManager{scope: ScopeSystem, uid: "501", home: "/Users/somebody"}
+		// The manager asks the supervisor when the property list is
+		// absent; the fake answers the probe (nothing loaded) so the
+		// test never reaches a real supervisor.
+		launchd.run = (&darwinFakeLaunchd{}).run
 		path := launchd.plistPath()
 		if _, err := os.Stat(path); err == nil {
 			// The machine has a machine-wide registration: the test must
@@ -1267,6 +1271,9 @@ func TestLaunchdUninstallOfAnAbsentRegistrationIsACleanSuccess(t *testing.T) {
 
 	t.Run("the user scope of an absent registration", func(t *testing.T) {
 		launchd := &launchdManager{scope: ScopeUser, uid: "501", home: t.TempDir()}
+		// The probe of the supervisor is answered by the fake (see
+		// above), so the test never reaches a real supervisor.
+		launchd.run = (&darwinFakeLaunchd{}).run
 
 		if err := launchd.Uninstall(context.Background()); err != nil {
 			t.Errorf("Uninstall() = %v, want nil for an absent registration", err)
@@ -2152,15 +2159,25 @@ func TestLaunchdRefusesANamedDirTheAccountCannotWrite(t *testing.T) {
 	if strings.Contains(message, "-R") {
 		t.Errorf("checkNamedDirs() = %q, want a message without a recursive ownership command", message)
 	}
-	// The guidance is the ownership of the directory itself and the group
-	// that owns it.
+	// The guidance is the ownership of the directory itself, never the
+	// tree inside it: one route, the same one the Linux installation
+	// names, with no second route beside it.
 	for _, want := range []string{
 		"chown " + account.Name + " " + cache,
-		"member of the group that owns the directory",
-		"group access is preferable to changing the owner",
+		"never the tree inside it",
+		"then install again",
 	} {
 		if !strings.Contains(message, want) {
 			t.Errorf("checkNamedDirs() = %q, want a message that mentions %q", message, want)
+		}
+	}
+	for _, unwanted := range []string{
+		"member of the group that owns the directory",
+		"group access is preferable",
+		" or ",
+	} {
+		if strings.Contains(message, unwanted) {
+			t.Errorf("checkNamedDirs() = %q, must not name the removed route %q", message, unwanted)
 		}
 	}
 }
@@ -3006,6 +3023,12 @@ func darwinStripXMLEntities(value string) string {
 // variable HFDESK_TEST_MARKER_DIR when that variable names a directory, so
 // a test can make a directory of the instance hold data before the
 // installation fails.
+// darwinFakeSupervisor returns a launchctl replacement whose answers are
+// controlled by HFDESK_TEST_SUPERVISOR. Under "ok" the supervisor answers
+// every command except `print`: a machine with nothing loaded fails that
+// call the way launchctl fails for an unloaded label, so a first
+// installation classifies as what it is instead of as a loaded job with an
+// undetermined running fact.
 func darwinFakeSupervisor(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
@@ -3015,6 +3038,10 @@ if [ -n "$HFDESK_TEST_MARKER_DIR" ]; then
 	: > "$HFDESK_TEST_MARKER_DIR/marker" || exit 1
 fi
 if [ "$HFDESK_TEST_SUPERVISOR" = "ok" ]; then
+	if [ "$1" = "print" ]; then
+		echo "Could not find service" >&2
+		exit 1
+	fi
 	exit 0
 fi
 echo "the fake supervisor refuses the command" >&2
@@ -3295,6 +3322,12 @@ func TestLaunchdSuccessfulInstallKeepsItsDirectories(t *testing.T) {
 func TestLaunchdLifecycleOfAnAbsentRegistration(t *testing.T) {
 	t.Run("the user scope", func(t *testing.T) {
 		launchd := &launchdManager{scope: ScopeUser, uid: strconv.Itoa(os.Getuid()), home: t.TempDir()}
+		// The manager asks the supervisor when the property list is
+		// absent (a job it holds is an existing registration), so the
+		// test answers through a fake: the probe never reaches a real
+		// supervisor and reports nothing loaded, the state this test
+		// describes.
+		launchd.run = (&darwinFakeLaunchd{}).run
 		path := launchd.plistPath()
 		if _, err := os.Stat(path); err == nil {
 			t.Fatalf("the registration %q exists, the test needs an instance that is not registered", path)
@@ -3327,6 +3360,9 @@ func TestLaunchdLifecycleOfAnAbsentRegistration(t *testing.T) {
 
 	t.Run("the machine-wide scope", func(t *testing.T) {
 		launchd := &launchdManager{scope: ScopeSystem, uid: "0", home: t.TempDir()}
+		// The probe of the supervisor (see the user scope above) is
+		// answered by the fake and never reaches a real one.
+		launchd.run = (&darwinFakeLaunchd{}).run
 		path := launchd.plistPath()
 		if _, err := os.Stat(path); err == nil {
 			t.Skipf("the machine has a registration at %q: the test does not touch it", path)
@@ -3462,6 +3498,13 @@ type darwinFakeLaunchd struct {
 	// coming up: bootstrap and kickstart succeed, but the instance never
 	// runs, the way a registration whose program fails to start behaves.
 	startIgnored bool
+	// dying marks the window between the signal of a stop and the exit
+	// the supervisor then observes: while it lasts, a fixture that hides
+	// the running fact keeps hiding it for exitPolls answers, so the exit
+	// lands inside the wait of the stop instead of before it.
+	dying bool
+	// exitPolls counts the unknown answers of that window down.
+	exitPolls int
 	// commands holds every command the manager issued, in order.
 	commands []string
 	// failures maps the first word of a command to the error the fake
@@ -3492,8 +3535,16 @@ func (f *darwinFakeLaunchd) run(ctx context.Context, args ...string) (string, er
 		return "", nil
 	case "kill":
 		if !f.keepRunning {
-			f.running = false
-			f.pid = 0
+			if f.withoutRunningFact && f.running {
+				// The exit lands inside the wait of the stop: one
+				// more answer without the running fact, then the
+				// instance is seen gone.
+				f.dying = true
+				f.exitPolls = 1
+			} else {
+				f.running = false
+				f.pid = 0
+			}
 		}
 		return "", nil
 	case "bootout":
@@ -3528,10 +3579,22 @@ func (f *darwinFakeLaunchd) run(ctx context.Context, args ...string) (string, er
 
 // printOutput renders the output of "launchctl print" for the fake job.
 func (f *darwinFakeLaunchd) printOutput() string {
-	if f.withoutRunningFact {
+	if f.withoutRunningFact && f.running {
 		// The block of the job without the fields the manager reads
-		// for the running fact: neither a state nor a process id.
-		return fmt.Sprintf("%s = {\n\tactive count = 0\n}", launchdLabel())
+		// for the running fact: neither a state nor a process id. A
+		// dying fixture answers this way until its window is over, and
+		// the supervisor then reports the instance gone.
+		if f.dying && f.exitPolls > 0 {
+			f.exitPolls--
+			return fmt.Sprintf("%s = {\n\tactive count = 0\n}", launchdLabel())
+		}
+		if f.dying {
+			f.dying = false
+			f.running = false
+			f.pid = 0
+		} else {
+			return fmt.Sprintf("%s = {\n\tactive count = 0\n}", launchdLabel())
+		}
 	}
 	state := "not running"
 	pid := 0
@@ -4458,6 +4521,345 @@ func TestLaunchdRepeatInstallKeepsTheDisabledFlag(t *testing.T) {
 	if fake.running {
 		t.Error("the repeat installation started the stopped instance")
 	}
+}
+
+// TestLaunchdInstallOverALoadedJobWithoutAFileStaysStopped pins the
+// classification of a job launchd already holds without a property list: it
+// is an existing registration, so the repeat-install rules apply — the
+// attempt never bootstraps the job (which would auto-start it through
+// RunAtLoad), never runs enable, and the stopped instance stays stopped.
+// The request still applies: the property list is written.
+//
+// A first installation over this fixture used to classify as new: it
+// bootstrapped the loaded job into service and cleared the disabled flag.
+// This test denies both.
+func TestLaunchdInstallOverALoadedJobWithoutAFileStaysStopped(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{loaded: true, disabled: true}
+	launchd.run = fake.run
+	ctx := context.Background()
+
+	// No property list exists: only the supervisor holds the job.
+	if _, err := os.Stat(launchd.plistPath()); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the fixture starts with a property list: %v", err)
+	}
+	program := darwinTempInstallOptions(t, t.TempDir())
+
+	fake.commands = nil
+	if _, err := launchd.Install(ctx, program); err != nil {
+		t.Fatalf("Install() over a loaded job without a property list: %v", err)
+	}
+	want := []string{
+		"print " + launchd.target(),
+		"print-disabled " + launchd.domain(),
+		"bootout " + launchd.target(),
+	}
+	if !reflect.DeepEqual(fake.commands, want) {
+		t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
+	}
+	if fake.running {
+		t.Error("the repeat installation started the stopped instance")
+	}
+	if fake.loaded {
+		t.Error("the stale registration is still loaded after the update")
+	}
+	if !fake.disabled {
+		t.Error("the repeat installation cleared the disabled flag of the override database")
+	}
+	// The request applied: the property list this installation wrote is
+	// there, and a later explicit start loads it.
+	registration := darwinReadRegistration(t, launchd)
+	if registration.executable() != program.Executable {
+		t.Errorf("the executable = %q, want the request %q", registration.executable(), program.Executable)
+	}
+}
+
+// TestLaunchdRefusesAnUnknownRunningFactOverALoadedJobWithoutAFile pins the
+// fail-closed refusal for the same classification — a job launchd holds
+// without a property list whose running fact the supervisor does not report
+// is an update over a loaded registration, so the unknown fact refuses the
+// attempt instead of guessing that the possibly running instance is stopped
+// and unloading it — and proves the repair end to end: the named action
+// `hfdesk service stop` really boots that job out, and the retry installs.
+func TestLaunchdRefusesAnUnknownRunningFactOverALoadedJobWithoutAFile(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{
+		loaded:             true,
+		running:            true,
+		pid:                darwinFakePID,
+		disabled:           true,
+		withoutRunningFact: true,
+	}
+	launchd.run = fake.run
+	ctx := context.Background()
+	program := darwinTempInstallOptions(t, t.TempDir())
+
+	fake.commands = nil
+	if _, err := launchd.Install(ctx, program); err == nil {
+		t.Fatal("Install() = nil, want the refusal of an undetermined running fact")
+	} else {
+		for _, want := range []string{
+			"the installation was refused",
+			"neither a state nor a process id",
+			`Stop the instance with "hfdesk service stop"`,
+			`run "hfdesk service install" again`,
+			"(the registration was restored)",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("Install() = %q, want a message that mentions %q", err, want)
+			}
+		}
+		if strings.Contains(err.Error(), " or ") {
+			t.Errorf("Install() = %q, want one action instead of an alternative", err)
+		}
+	}
+	// The refused attempt guesses nothing: the loaded job is neither
+	// unloaded nor started, the disabled flag is untouched and the
+	// property list the attempt wrote is removed again.
+	for _, command := range fake.commands {
+		if strings.HasPrefix(command, "bootout ") || strings.HasPrefix(command, "bootstrap ") ||
+			strings.HasPrefix(command, "kickstart ") || strings.HasPrefix(command, "kill ") ||
+			command == "enable "+launchd.target() {
+			t.Errorf("the refused installation issued the mutating command %q: %v", command, fake.commands)
+		}
+	}
+	if !fake.loaded || !fake.running {
+		t.Errorf("the refused installation stopped the running registration (loaded %v, running %v)", fake.loaded, fake.running)
+	}
+	if !fake.disabled {
+		t.Error("the refused installation changed the disabled flag")
+	}
+	if _, err := os.Stat(launchd.plistPath()); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the refused installation left a property list behind: %v", err)
+	}
+
+	// Simulated retry: the named action clears this state. Stop boots the
+	// job the supervisor holds without a property list out — before the
+	// lifecycle classification it returned a plain success and left the job
+	// loaded, so the retry refused again — and the retry after it
+	// installs as the message promises.
+	fake.commands = nil
+	if err := launchd.Stop(ctx); err != nil {
+		t.Fatalf("the named action Stop() = %v, want the loaded job unloaded", err)
+	}
+	if fake.loaded {
+		t.Errorf("Stop() left the loaded job behind: commands %v", fake.commands)
+	}
+
+	fake.commands = nil
+	if _, err := launchd.Install(ctx, program); err != nil {
+		t.Fatalf("the retry after the named action = %v, want the successful installation", err)
+	}
+	if _, err := os.Stat(launchd.plistPath()); err != nil {
+		t.Errorf("the retried installation wrote no property list: %v", err)
+	}
+	// Nothing is held any more: the retry is a genuine first
+	// installation, which registers with RunAtLoad and starts the job —
+	// the established first-installation behavior.
+	if !fake.running || !fake.loaded {
+		t.Errorf("the retried first installation left the job loaded=%t running=%t, want it registered and started",
+			fake.loaded, fake.running)
+	}
+}
+
+// TestLaunchdStopOverALoadedJobWithoutAFile pins both sides of the stop of a
+// registration that exists only in the supervisor: a job launchd holds is
+// stopped — signalled, waited for and booted out, with the commands the
+// normal stop issues — while a job launchd does not hold keeps the clean
+// success of an absent registration and is never signalled or unloaded.
+//
+// Before the lifecycle classification the loaded side returned a plain
+// success without touching the supervisor, which hid a possibly running
+// instance.
+func TestLaunchdStopOverALoadedJobWithoutAFile(t *testing.T) {
+	t.Run("the loaded job is stopped", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{loaded: true, running: true, pid: darwinFakePID}
+		launchd.run = fake.run
+
+		fake.commands = nil
+		if err := launchd.Stop(context.Background()); err != nil {
+			t.Fatalf("Stop() over a loaded job without a property list: %v", err)
+		}
+		want := []string{
+			"print " + launchd.target(),
+			"print " + launchd.target(),
+			"kill SIGTERM " + launchd.target(),
+			"print " + launchd.target(),
+			"bootout " + launchd.target(),
+		}
+		if !reflect.DeepEqual(fake.commands, want) {
+			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
+		}
+		if fake.loaded || fake.running {
+			t.Errorf("the stopped job is loaded=%t running=%t, want it unloaded", fake.loaded, fake.running)
+		}
+	})
+
+	t.Run("a job the supervisor does not hold keeps the clean success", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{}
+		launchd.run = fake.run
+
+		fake.commands = nil
+		if err := launchd.Stop(context.Background()); err != nil {
+			t.Fatalf("Stop() without a registration: %v, want the clean success", err)
+		}
+		// The probe of the supervisor is the only call: nothing is
+		// signalled, nothing is unloaded.
+		if want := []string{"print " + launchd.target()}; !reflect.DeepEqual(fake.commands, want) {
+			t.Errorf("the commands of the manager = %v, want the probe only %v", fake.commands, want)
+		}
+	})
+}
+
+// TestLaunchdUninstallOverALoadedJobWithoutAFile pins both sides of the
+// uninstall of a registration that exists only in the supervisor: the held
+// job is booted out (and the property list is removed when one is there),
+// while a job the supervisor does not hold keeps today's clean success and
+// is never unloaded.
+func TestLaunchdUninstallOverALoadedJobWithoutAFile(t *testing.T) {
+	t.Run("the loaded job is removed", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{loaded: true, running: true, pid: darwinFakePID}
+		launchd.run = fake.run
+
+		fake.commands = nil
+		if err := launchd.Uninstall(context.Background()); err != nil {
+			t.Fatalf("Uninstall() over a loaded job without a property list: %v", err)
+		}
+		want := []string{
+			"print " + launchd.target(),
+			"bootout " + launchd.target(),
+		}
+		if !reflect.DeepEqual(fake.commands, want) {
+			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
+		}
+		if fake.loaded {
+			t.Errorf("the removed job is still loaded: commands %v", fake.commands)
+		}
+		if _, err := os.Stat(launchd.plistPath()); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the uninstall wrote a property list: %v", err)
+		}
+	})
+
+	t.Run("a job the supervisor does not hold keeps the clean success", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{}
+		launchd.run = fake.run
+
+		fake.commands = nil
+		if err := launchd.Uninstall(context.Background()); err != nil {
+			t.Fatalf("Uninstall() without a registration: %v, want the clean success", err)
+		}
+		if want := []string{"print " + launchd.target()}; !reflect.DeepEqual(fake.commands, want) {
+			t.Errorf("the commands of the manager = %v, want the probe only %v", fake.commands, want)
+		}
+	})
+}
+
+// TestLaunchdStopDrainsAnUnknownRunningFact pins the shutdown contract of
+// Stop against the unknown running fact: SIGTERM is followed by the bounded
+// wait — the drain the contract promises — instead of an instant unload that
+// a plain success would report.
+//
+//   - An instance whose exit the supervisor observes during the wait is
+//     drained before the unload: the exact command list carries the second
+//     wait answer the blind-wait produces. Before the fix the unknown fact
+//     returned immediately, the list lost that answer and the test fails.
+//   - An instance whose fact never becomes readable runs into the budget and
+//     is reported with the honest overrun message while still unloaded.
+//     Before the fix the stop claimed success.
+//   - A KNOWN not-running instance keeps the fast path: one wait answer and
+//     no blind polls, pinned by the exact command list.
+func TestLaunchdStopDrainsAnUnknownRunningFact(t *testing.T) {
+	t.Run("an instance that exits during the wait is drained before the unload", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{
+			loaded: true, running: true, pid: darwinFakePID,
+			withoutRunningFact: true,
+		}
+		launchd.run = fake.run
+
+		fake.commands = nil
+		if err := launchd.Stop(context.Background()); err != nil {
+			t.Fatalf("Stop() over an instance with an unknown running fact: %v", err)
+		}
+		want := []string{
+			"print " + launchd.target(),
+			"print " + launchd.target(),
+			"kill SIGTERM " + launchd.target(),
+			"print " + launchd.target(),
+			"print " + launchd.target(),
+			"bootout " + launchd.target(),
+		}
+		if !reflect.DeepEqual(fake.commands, want) {
+			t.Errorf("the commands of the manager =\n%v\nwant (the wait polls until the exit is observed)\n%v",
+				fake.commands, want)
+		}
+		if fake.loaded {
+			t.Errorf("the drained job is still loaded: commands %v", fake.commands)
+		}
+	})
+
+	t.Run("an instance that never answers is reported when the budget runs out", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{
+			loaded: true, running: true, pid: darwinFakePID,
+			withoutRunningFact: true, keepRunning: true,
+		}
+		launchd.run = fake.run
+		launchd.stopBudget = 250 * time.Millisecond
+
+		fake.commands = nil
+		err := launchd.Stop(context.Background())
+		if err == nil {
+			t.Fatal("Stop() = nil, want the report of the overrun budget for an unproven shutdown")
+		}
+		for _, want := range []string{
+			launchd.shutdownBudget().String(),
+			"graceful shutdown",
+			"unloaded anyway",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("Stop() = %q, want a message that mentions %q", err, want)
+			}
+		}
+		// The stop polled the budget out before it unloaded the job:
+		// probe, body, kill, at least three wait answers, bootout last.
+		if len(fake.commands) < 6 {
+			t.Errorf("the commands of the manager = %v, want the wait to poll the budget out", fake.commands)
+		}
+		if got := fake.commands[len(fake.commands)-1]; got != "bootout "+launchd.target() {
+			t.Errorf("the last command = %q, want the unload after the budget", got)
+		}
+		if fake.loaded {
+			t.Errorf("the reported job is still loaded: commands %v", fake.commands)
+		}
+	})
+
+	t.Run("a known not-running instance keeps the fast path", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{loaded: true}
+		launchd.run = fake.run
+
+		fake.commands = nil
+		if err := launchd.Stop(context.Background()); err != nil {
+			t.Fatalf("Stop() over a known not-running instance: %v", err)
+		}
+		// One wait answer, no blind polls: the known fact decides
+		// immediately.
+		want := []string{
+			"print " + launchd.target(),
+			"print " + launchd.target(),
+			"kill SIGTERM " + launchd.target(),
+			"print " + launchd.target(),
+			"bootout " + launchd.target(),
+		}
+		if !reflect.DeepEqual(fake.commands, want) {
+			t.Errorf("the commands of the manager =\n%v\nwant the fast path\n%v", fake.commands, want)
+		}
+	})
 }
 
 // TestLaunchdRefusesAnUpdateThatCannotTellWhetherTheInstanceRuns checks

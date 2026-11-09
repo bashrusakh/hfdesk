@@ -216,8 +216,9 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	// The registration of a repeat installation is read before anything is
 	// created: its settings are the merge source, its autostart key is the
 	// value the write keeps, and its bytes are what a failed attempt
-	// restores. There is no registration: this is a first installation and
-	// the request decides everything.
+	// restores. There is no property list: the request decides every
+	// setting — whether the supervisor already holds the job is decided in
+	// load(), from the state it reports.
 	path := m.plistPath()
 	backup, err := backupPlist(path)
 	if err != nil {
@@ -303,8 +304,10 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 // The directories of the instance are already created when the function is
 // called, backup holds the property list an update replaces (it did not exist
 // for a first installation) and runAtLoad is the autostart value the write
-// carries: the found value of a repeat installation, the default of a first
-// one. The property list is the canonical rendering of the merged options —
+// carries: the found value of a repeat installation whose property list
+// could be read, and the default otherwise — a first installation, or a
+// repeat over a property list that is missing or unreadable. The property
+// list is the canonical rendering of the merged options —
 // HFDesk owns the file it writes, so a failed registration is rolled back
 // from the exact bytes in backup: the property list is restored and the
 // directories the installation created are removed by the caller, so a failed
@@ -348,17 +351,29 @@ func (m *launchdManager) register(ctx context.Context, opts InstallOptions, acco
 // A machine-wide uninstallation needs an elevated shell: the LaunchDaemon is
 // registered in /Library/LaunchDaemons and it is unloaded from the system
 // domain, and both belong to the machine. The check runs after the existence
-// of the registration, so a registration that is not there stays a clean
-// success in every shell. A user scope instance belongs to the user who
+// of the registration, so a registration that is not there and a job the
+// supervisor does not hold stay a clean success in every shell, while a job
+// the supervisor holds without its property list is removed like any other
+// registration. A user scope instance belongs to the user who
 // installed it and needs no elevation.
 func (m *launchdManager) Uninstall(ctx context.Context) error {
 	path := m.plistPath()
 	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			// There is no registration: the uninstall is already done.
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("service: read the registration %q: %w", path, err)
+		}
+		// A job the supervisor holds is an existing registration even
+		// without its property list: it is unloaded below like every
+		// other registration, and a plain success here would leave it
+		// loaded. Only a job the supervisor does not hold is already
+		// uninstalled.
+		loaded, _, stateErr := m.printState(ctx)
+		if stateErr != nil {
+			return stateErr
+		}
+		if !loaded {
 			return nil
 		}
-		return fmt.Errorf("service: read the registration %q: %w", path, err)
 	}
 
 	// The elevation requirement is checked before the job is unloaded and
@@ -435,17 +450,29 @@ func (m *launchdManager) Start(ctx context.Context) error {
 // A machine-wide instance needs an elevated shell: the LaunchDaemon is
 // unloaded from the system domain, and the system domain belongs to the
 // machine. The check runs after the existence of the registration, so a
-// registration that is not there stays a clean success in every shell. A
+// registration that is not there and a job the supervisor does not hold
+// stay a clean success in every shell, while a job the supervisor holds
+// without its property list is stopped like any other registration. A
 // user scope instance belongs to the user who installs it and needs no
 // elevation.
 func (m *launchdManager) Stop(ctx context.Context) error {
 	path := m.plistPath()
 	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			// The instance is not registered, so it does not run either.
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("service: read the registration %q: %w", path, err)
+		}
+		// A job the supervisor holds is an existing registration even
+		// without its property list: stopping it is what this command
+		// means, and a plain success here would hide a possibly
+		// running instance. Only a job the supervisor does not hold
+		// keeps the clean success of an absent registration.
+		loaded, _, stateErr := m.printState(ctx)
+		if stateErr != nil {
+			return stateErr
+		}
+		if !loaded {
 			return nil
 		}
-		return fmt.Errorf("service: read the registration %q: %w", path, err)
 	}
 
 	if err := m.requireElevated("a stop"); err != nil {
@@ -1024,10 +1051,9 @@ func (m *launchdManager) grantInstanceDirs(opts InstallOptions, account *service
 // tree: a model or a cache tree belongs to whoever put it there.
 //
 // The refusal names the directory, the account and the access that is
-// missing. It never recommends a recursive ownership change of such a tree:
-// the access is granted to the directory itself or through the group that
-// owns it, and for a tree that holds a lot of data the group is preferable
-// to a new owner.
+// missing. It never recommends a recursive ownership change of such a
+// tree: the access is granted to the directory itself, never to the tree
+// inside it.
 func (m *launchdManager) checkNamedDirs(opts InstallOptions, account *serviceAccount) error {
 	if account == nil {
 		// A user scope instance runs as the user who installs it: it can
@@ -1063,7 +1089,7 @@ func (m *launchdManager) checkNamedDirs(opts InstallOptions, account *serviceAcc
 			return fmt.Errorf("service: the %s %q of the machine-wide instance cannot be used: %w", dir.name, dir.path, err)
 		}
 		if !ok {
-			return fmt.Errorf("service: the service account %q has no write access to the %s %q: grant it access to that directory (for example %q) or make it a member of the group that owns the directory; for a tree that holds a lot of data, granting group access is preferable to changing the owner, and install again",
+			return fmt.Errorf("service: the service account %q has no write access to the %s %q: give the directory itself to the account (never the tree inside it) with %q, then install again",
 				account.Name, dir.name, dir.path, "chown "+account.Name+" "+dir.path)
 		}
 	}
@@ -1107,7 +1133,9 @@ type launchdInstallPlan struct {
 //
 //   - A first installation registers the job: the property list it writes
 //     carries RunAtLoad, so launchd starts the instance — exactly what every
-//     first installation did before.
+//     first installation did before. A first installation is a machine where
+//     neither a property list nor a loaded job exists: a job launchd already
+//     holds is an existing registration even without its file.
 //   - An instance that ran before the installation is stopped the way a stop
 //     stops it and started again the way a start starts it: the graceful
 //     shutdown of the old instance completes before the new registration is
@@ -1115,7 +1143,8 @@ type launchdInstallPlan struct {
 //     a binary replaced in place keeps the same registration bytes, and the
 //     new program still has to be the one that runs.
 //   - A repeat installation over a loaded job that does not run unloads the
-//     stale registration and does not load the file again: the stopped
+//     stale registration and does not load the file again — also when no
+//     property list existed and the job was loaded without one: the stopped
 //     instance stays stopped, and a later start loads the property list this
 //     installation wrote, never the registration the supervisor held before.
 //   - A repeat installation over a job that is not loaded writes the property
@@ -1138,24 +1167,33 @@ type launchdInstallPlan struct {
 // leaves the running state of the instance undetermined, and the update
 // refuses instead of treating a possibly running instance as stopped — the
 // stopped-instance branch would unload a job that may run and leave the
-// instance down. A first installation has no previous running state to give
-// back: whichever branch it takes, it ends with the property list it just
-// wrote loaded and its RunAtLoad deciding the start, so an unknown fact
-// cannot leave a stopped instance behind there and does not refuse the
-// installation.
+// instance down. Only a job the supervisor holds can report that unknown
+// fact: a job it does not hold has no previous running state to give back,
+// so a genuine first installation never reaches this refusal — whichever
+// branch it takes, it ends with the property list it just wrote and its
+// RunAtLoad deciding the start.
 func (m *launchdManager) load(ctx context.Context, path string, plan launchdInstallPlan) (launchdLoadState, error) {
 	previous, err := m.supervisorState(ctx)
 	if err != nil {
 		return launchdLoadState{}, err
 	}
 	state := launchdLoadState{previous: previous, previousKnown: true}
-	// The refusal belongs to the update over a loaded registration: there
-	// the unknown fact decides between the restart of a running instance
-	// and the unload of a stopped one, and the wrong guess loses it.
-	if !plan.firstInstall && previous.loaded && !previous.runningKnown {
+	// A job already loaded in the supervisor is an existing registration
+	// even when no property list exists: the unknown running fact decides
+	// between the restart of a running instance and the unload of a stopped
+	// one, and the wrong guess loses it — so the refusal covers this case
+	// exactly like every other update over a loaded registration. An
+	// unloaded job satisfies neither condition and never refuses here.
+	if previous.loaded && !previous.runningKnown {
 		return state, fmt.Errorf("service: the installation was refused: the supervisor reports neither a state nor a process id for %s, so whether the instance runs cannot be determined. Stop the instance with %q and run %q again",
 			m.target(), "hfdesk service stop", "hfdesk service install")
 	}
+	// A first registration is a first installation without a job the
+	// supervisor already holds: only that state may bootstrap the job and
+	// run enable. Everything else follows the repeat-install rules, so a
+	// stopped instance is never started and no autostart decision of an
+	// administrator is overwritten.
+	firstRegistration := plan.firstInstall && !previous.loaded
 
 	switch {
 	case previous.running:
@@ -1173,16 +1211,7 @@ func (m *launchdManager) load(ctx context.Context, path string, plan launchdInst
 			return state, err
 		}
 		state.bootstrapped = true
-	case plan.firstInstall:
-		if previous.loaded {
-			// A job that is loaded although there is no property
-			// list is registered again from the file that exists
-			// now.
-			if _, err := m.launchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
-				return state, fmt.Errorf("service: bootout %s: %w", m.target(), err)
-			}
-			state.replaced = true
-		}
+	case firstRegistration:
 		if _, err := m.launchctl(ctx, "bootstrap", m.domain(), path); err != nil {
 			return state, fmt.Errorf("service: bootstrap %s: %w", m.target(), err)
 		}
@@ -1193,18 +1222,21 @@ func (m *launchdManager) load(ctx context.Context, path string, plan launchdInst
 		// supervisor and does not load the file again: the stopped
 		// instance stays stopped, and a later start loads the
 		// property list this installation wrote — never the
-		// registration the supervisor held before it.
+		// registration the supervisor held before. This is also the
+		// branch of a job that was loaded without a property list, so
+		// such a job is never bootstrapped into an auto-start here.
 		if _, err := m.launchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
 			return state, fmt.Errorf("service: bootout %s: %w", m.target(), err)
 		}
 		state.replaced = true
 	}
 
-	// A first installation enables the job it registered: that is the only
-	// installation that runs enable, so the flag is cleared for the job the
-	// first installation loads and never for a job a repeat installation
-	// found, and clearing the flag never starts anything by itself.
-	if plan.firstInstall {
+	// The first registration enables the job it registered: that is the
+	// only installation that runs enable, so the flag is cleared for a job
+	// the supervisor did not hold yet and never for a job it already held —
+	// an administrator's `launchctl disable` survives every update — and
+	// clearing the flag never starts anything by itself.
+	if firstRegistration {
 		if _, err := m.launchctl(ctx, "enable", m.target()); err != nil {
 			return state, fmt.Errorf("service: enable %s: %w", m.target(), err)
 		}
@@ -1375,6 +1407,11 @@ func (m *launchdManager) printState(ctx context.Context) (bool, string, error) {
 // caller forever. The bound is the shared budget of the service layer, and
 // an instance that is still there when the budget is over is reported: the
 // caller has to know that the orderly shutdown did not happen.
+//
+// An output that carries neither a state nor a process id leaves the running
+// fact unknown: the shutdown is neither proven complete nor disproven, so
+// the wait honors the budget in that state instead of returning a success
+// the caller would read as a drained instance.
 func (m *launchdManager) waitForExit(ctx context.Context, pid int) error {
 	budget := m.shutdownBudget()
 	deadline := time.Now().Add(budget)
@@ -1388,16 +1425,18 @@ func (m *launchdManager) waitForExit(ctx context.Context, pid int) error {
 			return nil
 		}
 		state, _, current := launchdPrintFields(output)
-		if !launchdJobRunning(state, current) {
+		runningKnown := state != "" || current > 0
+		if runningKnown && !launchdJobRunning(state, current) {
 			return nil
 		}
-		if pid > 0 && current != pid {
+		if runningKnown && pid > 0 && current != pid {
 			// The process was replaced: the old one is gone.
 			return nil
 		}
 		if time.Now().After(deadline) {
-			// The instance is still there: the shutdown did not
-			// happen in an orderly way.
+			// The instance is still there — or its running fact never
+			// became readable —: the shutdown did not happen in an
+			// orderly way.
 			return &stopTimeoutError{budget: budget}
 		}
 		select {
