@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -186,6 +188,76 @@ func TestHoldDesktopSingletonHoldsAnObjectOfAnotherIdentityThroughReadControl(t 
 		t.Fatal("the singleton object survived the release: a later launch would be refused as already running")
 	} else if !errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
 		t.Fatalf("read the singleton after the release: %v", err)
+	}
+}
+
+// TestClaimProcessAliveByOpenProcessTellsExitedFromRunning pins the three
+// answers of the Windows liveness check: a running process is alive, a
+// process that exited while an open handle still references its object is
+// NOT alive — the counterexample a plain process open gets wrong, because
+// the elevated helper holds such a handle of the original desktop through
+// the whole handover — and an access denial stays fail-closed as live.
+func TestClaimProcessAliveByOpenProcessTellsExitedFromRunning(t *testing.T) {
+	// A running process: this very process.
+	if !claimProcessAliveByOpenProcess(os.Getpid()) {
+		t.Error("the current process is reported not alive")
+	}
+
+	// An exited process whose object an open handle keeps referenced: the
+	// child is opened for synchronization while it runs, killed, and
+	// reaped — the held handle keeps the object alive, exactly like the
+	// helper's handle of the original desktop, so a fresh open of the pid
+	// still succeeds and only the wait on the signaled object tells that
+	// the process exited.
+	child := exec.Command("ping", "-n", "60", "127.0.0.1")
+	if err := child.Start(); err != nil {
+		t.Fatalf("start the child process: %v", err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill() })
+	var held windows.Handle
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && held == 0 {
+		handle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(child.Process.Pid))
+		if err == nil {
+			held = handle
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if held == 0 {
+		t.Fatalf("open the running child process %d for synchronization", child.Process.Pid)
+	}
+	defer func() { _ = windows.CloseHandle(held) }()
+	if err := child.Process.Kill(); err != nil {
+		t.Fatalf("kill the child process: %v", err)
+	}
+	_ = child.Wait()
+	if claimProcessAliveByOpenProcess(child.Process.Pid) {
+		t.Error("an exited process whose object is still referenced is reported alive: the stale claim of its desktop would refuse a mutation")
+	}
+
+	// A pid the operating system does not know is the stale claim of a
+	// desktop that is gone.
+	if claimProcessAliveByOpenProcess(0xFFFFFFF0) {
+		t.Error("a pid the operating system does not know is reported alive")
+	}
+
+	// An access denial stays fail-closed: the process exists but this
+	// token may not open it, so the unverifiable claim stays live.
+	previous := openClaimProcess
+	t.Cleanup(func() { openClaimProcess = previous })
+	openClaimProcess = func(uint32, bool, uint32) (windows.Handle, error) {
+		return 0, windows.ERROR_ACCESS_DENIED
+	}
+	if !claimProcessAliveByOpenProcess(os.Getpid()) {
+		t.Error("an access-denied open is reported not alive: an unverifiable claim must fail closed as live")
+	}
+	// Any other open failure is a pid the operating system does not know.
+	openClaimProcess = func(uint32, bool, uint32) (windows.Handle, error) {
+		return 0, windows.ERROR_INVALID_PARAMETER
+	}
+	if claimProcessAliveByOpenProcess(os.Getpid()) {
+		t.Error("an open failure that is not an access denial is reported alive")
 	}
 }
 

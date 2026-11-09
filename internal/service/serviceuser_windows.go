@@ -71,15 +71,24 @@ func processUserSID() (string, error) {
 }
 
 // init replaces the liveness check of the shared file with the check of
-// Windows: signal 0 is not supported here, while os.FindProcess OPENS the
-// process on Windows, so a successful open is the proof that the claim's
-// process still runs. An access denial means the process exists but this
-// token may not open it: an unverifiable claim stays live and fails closed,
-// while a pid the operating system does not know is the stale claim of a
-// desktop that is gone.
+// Windows: signal 0 is not supported here, while a raw process open alone
+// proves only that a process OBJECT exists — an exited process whose object
+// any open handle still references (the elevated helper holds one of the
+// original desktop through the handover) still opens. The check therefore
+// opens the process for synchronization and waits on it with a zero budget:
+// a signaled object is an exited process (stale claim), a timeout is a
+// running one. An access denial means the process exists but this token may
+// not open it: an unverifiable claim stays live and fails closed, while a
+// pid the operating system does not know is the stale claim of a desktop
+// that is gone.
 func init() {
 	claimProcessAlive = claimProcessAliveByOpenProcess
 }
+
+// openClaimProcess opens a process for the liveness check. It is a variable
+// so a test can drive the access-denied answer without depending on the
+// discretionary ACL of a real process; it is a zero-behavior indirection.
+var openClaimProcess = windows.OpenProcess
 
 // claimProcessAliveByOpenProcess is the liveness check of a published claim
 // on Windows.
@@ -87,12 +96,25 @@ func claimProcessAliveByOpenProcess(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	process, err := os.FindProcess(pid)
+	handle, err := openClaimProcess(windows.SYNCHRONIZE, false, uint32(pid))
 	if err != nil {
+		// Fail closed: an access denial means the process exists but
+		// this token may not open it, so the claim stays live. Every
+		// other error is a pid the operating system does not know —
+		// the stale claim of a desktop that is gone.
 		return errors.Is(err, windows.ERROR_ACCESS_DENIED)
 	}
-	_ = process.Release()
-	return true
+	defer func() { _ = windows.CloseHandle(handle) }()
+	// A zero-budget wait tells exited from running: WAIT_OBJECT_0 means
+	// the process object is signaled — the process exited while any open
+	// handle kept the object referenced — and WAIT_TIMEOUT means the
+	// process still runs. An answer the wait cannot produce leaves the
+	// claim live, the fail-closed direction of the guard.
+	result, err := windows.WaitForSingleObject(handle, 0)
+	if err != nil {
+		return true
+	}
+	return result != uint32(windows.WAIT_OBJECT_0)
 }
 
 // resolveDesktopSingletonName returns the object name to operate on: the
