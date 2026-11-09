@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HFDesk &mdash; Runtime</title>
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="icon" type="image/svg+xml" href="icon.svg">
+  <style>
+    /* ============================================
+       Runtime view - page layout only.
+
+       Every value below comes from the HFDesk design tokens of
+       css/style.css (colors, radii, spacing, typography). The view reuses
+       the existing components - .btn, .badge, .search-select, .search-input,
+       .status-indicator, .connection-status, .checkbox-label, .job-chip,
+       .config-chip, .empty-state, .toast - and adds no second theme.
+       ============================================ */
+
+    [hidden] { display: none !important; }
+
+    .runtime-shell {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      height: 100dvh;
+      overflow: hidden;
+      background: var(--color-bg);
+    }
+
+    /* ── Header ─────────────────────────────── */
+
+    .runtime-header {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px 20px;
+      padding: 14px 20px;
+      background: var(--color-bg-secondary);
+      border-bottom: 1px solid var(--color-border);
+      flex-shrink: 0;
+    }
+
+    .runtime-header-status {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px 18px;
+      min-width: 0;
+    }
+
+    .runtime-version {
+      font-size: 12px;
+      color: var(--color-text-muted);
+    }
+
+    .runtime-header-actions {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-left: auto;
+    }
+
+    .runtime-note {
+      font-size: 11px;
+      color: var(--color-text-muted);
+      max-width: 260px;
+    }
+
+    .runtime-status-indicator.is-error {
+      background: var(--color-error);
+      animation: none;
+    }
+
+    /* ── Error banner ───────────────────────── */
+
+    .runtime-error {
+      display: flex;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 6px 10px;
+      padding: 10px 20px;
+      background: rgba(239, 68, 68, 0.08);
+      border-bottom: 1px solid rgba(239, 68, 68, 0.3);
+      color: var(--color-text-secondary);
+      font-size: 13px;
+    }
+
+    .runtime-error strong {
+      color: var(--color-error);
+    }
+
+    /* ── Status strip ───────────────────────── */
+
+    .runtime-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 32px;
+      padding: 12px 20px;
+      background: var(--color-bg-secondary);
+      border-bottom: 1px solid var(--color-border);
+      flex-shrink: 0;
+    }
+
+    .runtime-stat {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      min-width: 0;
+    }
+
+    .runtime-stat-label {
+      font-size: 11px;
+      color: var(--color-text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .runtime-stat-value {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      font-size: 13px;
+      color: var(--color-text);
+    }
+
+    .runtime-url {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--color-text-secondary);
+      overflow-wrap: anywhere;
+    }
+
+    /* ── Log panel ──────────────────────────── */
+
+    .runtime-log-panel {
+      display: flex;
+      flex-direction: column;
+      flex: 1 1 auto;
+      min-height: 0;
+      background: var(--color-bg);
+    }
+
+    .runtime-log-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--color-border);
+      flex-shrink: 0;
+    }
+
+    .runtime-toolbar-group {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .runtime-toolbar-label {
+      font-size: 12px;
+      color: var(--color-text-secondary);
+    }
+
+    .runtime-search {
+      flex: 1 1 220px;
+      max-width: 320px;
+    }
+
+    .runtime-log-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 6px 16px;
+      padding: 8px 20px;
+      border-bottom: 1px solid var(--color-border);
+      font-size: 11px;
+      color: var(--color-text-muted);
+      flex-shrink: 0;
+    }
+
+    .runtime-log-view {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      background: var(--color-bg-secondary);
+    }
+
+    .runtime-log-head,
+    .runtime-log-row {
+      display: grid;
+      grid-template-columns: 74px 66px 108px minmax(0, 1fr) minmax(0, 0.9fr);
+      grid-template-areas: "time level component message attrs";
+      gap: 2px 12px;
+      align-items: baseline;
+      padding: 6px 20px;
+    }
+
+    .runtime-log-head {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: var(--color-bg-tertiary);
+      border-bottom: 1px solid var(--color-border);
+      font-size: 11px;
+      color: var(--color-text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .runtime-log-row {
+      border-bottom: 1px solid var(--color-border);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      line-height: 1.55;
+      color: var(--color-text-secondary);
+    }
+
+    .runtime-log-row:hover {
+      background: var(--color-surface-hover);
+    }
+
+    .runtime-time {
+      grid-area: time;
+      color: var(--color-text-muted);
+      white-space: nowrap;
+    }
+
+    .runtime-level {
+      grid-area: level;
+      justify-self: start;
+    }
+
+    .runtime-component {
+      grid-area: component;
+      color: var(--color-primary-hover);
+      overflow-wrap: anywhere;
+    }
+
+    .runtime-message {
+      grid-area: message;
+      color: var(--color-text);
+      overflow-wrap: anywhere;
+    }
+
+    .runtime-attrs {
+      grid-area: attrs;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px 6px;
+      min-width: 0;
+    }
+
+    /* The error level has no modifier in the design system: it uses the
+       same idiom as .badge-warning, with the error token. */
+    .runtime-level-error {
+      background: rgba(239, 68, 68, 0.2);
+      color: var(--color-error);
+    }
+
+    /* ── Screen reader only announcements ───── */
+
+    .runtime-live-region {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      clip-path: inset(50%);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    /* ── Narrow window ──────────────────────── */
+
+    @media (max-width: 720px) {
+      .runtime-header,
+      .runtime-strip,
+      .runtime-log-toolbar,
+      .runtime-log-meta {
+        padding-left: 14px;
+        padding-right: 14px;
+      }
+
+      .runtime-header-actions {
+        margin-left: 0;
+      }
+
+      /* The rows stack in a narrow window, so the column names would not
+         line up with anything. */
+      .runtime-log-head {
+        display: none;
+      }
+
+      .runtime-log-row {
+        grid-template-columns: 64px 58px minmax(0, 1fr);
+        grid-template-areas:
+          "time level component"
+          "message message message"
+          "attrs attrs attrs";
+        padding-left: 14px;
+        padding-right: 14px;
+      }
+    }
+
+    @media (max-height: 520px) {
+      .runtime-header { padding-top: 8px; padding-bottom: 8px; }
+      .runtime-strip { padding-top: 8px; padding-bottom: 8px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="runtime-shell">
+
+    <header class="runtime-header">
+      <div class="logo">
+        <img class="logo-icon" src="icon.svg" alt="" aria-hidden="true">
+        <span class="logo-text">HFDesk</span>
+      </div>
+
+      <div class="runtime-header-status">
+        <span class="connection-status">
+          <span class="status-indicator" id="statusDot"></span>
+          <span id="statusLabel">Starting&hellip;</span>
+        </span>
+        <span class="runtime-version" id="versionLabel">Version &mdash;</span>
+      </div>
+
+      <div class="runtime-header-actions">
+        <span class="runtime-note" id="openUiNote" hidden></span>
+        <button class="btn btn-primary btn-sm" id="openUiButton" type="button">Open HFDesk</button>
+      </div>
+    </header>
+
+    <div class="runtime-error" id="errorBanner" role="status" hidden>
+      <strong id="errorTitle">Cannot reach the HFDesk server</strong>
+      <span id="errorText"></span>
+    </div>
+
+    <section class="runtime-strip" aria-label="Runtime status">
+      <div class="runtime-stat">
+        <span class="runtime-stat-label">Server</span>
+        <span class="runtime-stat-value"><code class="runtime-url" id="serverUrl">&mdash;</code></span>
+      </div>
+      <div class="runtime-stat">
+        <span class="runtime-stat-label">Active jobs</span>
+        <span class="runtime-stat-value">
+          <span id="activeJobs">&mdash;</span>
+          <span class="badge badge-warning" id="queuedJobs" hidden>0 queued</span>
+        </span>
+      </div>
+      <div class="runtime-stat">
+        <span class="runtime-stat-label">Log file</span>
+        <span class="runtime-stat-value">
+          <span class="config-chip"><code id="logFile">&mdash;</code></span>
+        </span>
+      </div>
+    </section>
+
+    <section class="runtime-log-panel">
+      <div class="runtime-log-toolbar">
+        <div class="runtime-toolbar-group">
+          <label class="runtime-toolbar-label" for="levelFilter">Level</label>
+          <select class="search-select" id="levelFilter">
+            <option value="all">All levels</option>
+            <option value="debug">Debug</option>
+            <option value="info">Info</option>
+            <option value="warn">Warn</option>
+            <option value="error">Error</option>
+          </select>
+          <div class="search-input-wrap runtime-search">
+            <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18" aria-hidden="true">
+              <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+            </svg>
+            <input class="search-input" id="searchInput" type="text" placeholder="Search logs&hellip;" autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+
+        <div class="runtime-toolbar-group">
+          <label class="checkbox-label checkbox-label-sm" for="followToggle">
+            <input type="checkbox" id="followToggle" checked>
+            <span>Follow</span>
+          </label>
+          <button class="btn btn-secondary btn-sm" id="copyButton" type="button"
+                  title="Copy the rows that are currently visible to the clipboard">Copy</button>
+          <button class="btn btn-outline btn-sm" id="clearButton" type="button"
+                  title="Clear the rows shown in this window. Nothing is deleted on disk and the server log is not affected.">Clear view</button>
+          <button class="btn btn-secondary btn-sm" id="openLogsButton" type="button"
+                  title="Open the folder of the active log file" disabled>Open log folder</button>
+        </div>
+      </div>
+
+      <div class="runtime-log-meta">
+        <span class="connection-status">
+          <span class="status-indicator" id="streamDot"></span>
+          <span id="streamLabel">Connecting&hellip;</span>
+        </span>
+        <span id="recordCount">0 records</span>
+      </div>
+
+      <div class="runtime-log-view" id="logView" role="log" aria-live="off" tabindex="0">
+        <div class="runtime-log-head" aria-hidden="true">
+          <span class="runtime-time">Time</span>
+          <span class="runtime-level">Level</span>
+          <span class="runtime-component">Component</span>
+          <span class="runtime-message">Message</span>
+          <span class="runtime-attrs">Attributes</span>
+        </div>
+        <div class="runtime-log-body" id="logBody"></div>
+        <div class="empty-state" id="emptyState" hidden>
+          <h3 id="emptyTitle">No log records yet</h3>
+          <p id="emptyText">The runtime log appears here as the server writes it.</p>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <div class="runtime-live-region" id="liveRegion" role="status" aria-live="polite"></div>
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script src="js/runtime.js"></script>
+</body>
+</html>

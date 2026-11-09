@@ -1,0 +1,90 @@
+# Todo
+
+## Текущее состояние
+
+Снимок статуса публикации от 2026-10-10; фактическое текущее состояние PR определяется GitHub.
+
+- [x] Кодовый кандидат `353011b887ab783faff0041a5c07740aedc1f94a` (tree
+  `55dec4f3336334fb1c37c684e25f8f4f51c7c0ca`, base `origin/main`
+  `cd5da39f4e3fc0d9d6355fff4d0fb5fdfc653f4b`) добавляет producer-shaped preflight refusal для
+  неполных data/metadata targets, подтверждённого `tmp-download` namespace и производных part/
+  metadata/bare-verified temporary файлов, а также независимых `<blob-key>.tmp-…` atomic-copy stages.
+  Проверена также согласованная нормализация окон offsets/tail checks. Подтверждённая mixed-группа,
+  включая намеренно завершённые коллизии выбранных keys, отклоняется до попытки unlink; storage
+  creation не меняется, ordinary keys вне producer-shape и unrelated stages сохраняют поведение.
+  Независимый tester PASS: 232 fixture cases, 0 failures/skips, плюс live fresh HTTP causal-helper,
+  сохранность bytes/metadata/refs/modes/link identity при 409, producer collider + safe refusal,
+  ordinary 200/different refs/real permission 207/local leaf-only. Fixtures локальные и используют
+  production code, не внешний HF service или полный GUI. Fresh full Go normal/race/vet/build,
+  Node harness, read-only gofmt/diffcheck и Windows server/HF cross-build прошли на Go 1.26.7, не
+  Go 1.25. Whole-review PASS (28/28), interactions retraced; managed OCR не запускался. См. `plan.md`
+  §10 за evidence boundaries.
+- [x] После исходного HEAD `a8311c8495946cf4b965d0afc7b636e952ff31b4` добавлена узкая защита: выбранные HF snapshot targets с суффиксами `.incomplete` / `.incomplete.meta` отклоняются до unlink; тесты покрывают mixed composition, Windows-aware case semantics и HTTP 409 без изменения данных. Локальные focused helper/HTTP suites, `go test ./...`, affected-package race, vet/build и diffcheck прошли; Windows — только cross-build, не native run. Новое независимое review и финальная проверка кандидата ожидают родительскую сессию; свежий scanner result не заявляется.
+- [x] Локальное и HF-удаление выбранной GGUF-группы реализовано; UI даёт выбрать место/группу и подтверждает область удаления во всех сохранённых версиях выбранного HF-репозитория в выбранном месте. Shared payload остаётся, если нужен другой сохранённой версии/группе.
+- [x] Свежие независимые review целого diff (28/28, PASS) и проверка кандидата прошли на кодовом HEAD `59d070f7b197803cd7ab0d7fc8fea21d546f55f5` и базе `50813f00554628b4146512b898ab10f7c6662efe`; подробности и границы evidence — в `plan.md` §10. Эти результаты не относятся к последующему документационному commit.
+- [x] После интеграционного теста исправлены две подтверждённые ошибки: валидация назначения HF до admission и сохранение snapshot/blob, если unlink выбранной friendly-ссылки завершился ошибкой. Проверки пустого плана используют валидное HF-назначение.
+- [x] Исправленный кодовый кандидат прошёл независимую проверку: `go test ./...`, `go test ./... -race`, `go vet ./...`, build, Node-проверки и сценарии назначения/копирования; проверено отсутствие изменений вне ожидаемой области в сценариях до/после. Это не исчерпывающая проверка всех interleavings или форматов.
+- [x] Обычным merge включить свежий `origin/main` `50813f00554628b4146512b898ab10f7c6662efe` в ту же ветку PR #111; merge `112b809550e9da165115d6fba311712e6d1f9e57` сохраняет upstream-коммиты и исходную историю PR.
+- [x] Добавить server integration regression для реальной пагинации Hub → полного плана job → защиты выбранного snapshot до передачи; `go test ./...`, `go test ./... -race`, `go vet ./...`, build и `git diff --check` прошли на кандидате `2a56d25` поверх base `50813f00554628b4146512b898ab10f7c6662efe`.
+- [ ] Текущий локальный кандидат включает согласованные исправления тестовых temp-roots и этого статуса. PR #111 был переведён в Draft для ремонта; последующая публикация кандидата, проверка remote checks, Ready и условный merge принадлежат родительской сессии. Свежие remote checks для будущей публикации ещё не подтверждены; старые CodeQL alerts не объявляются разрешёнными, подавленными или прошедшими. Этот датированный локальный снимок не заменяет актуальное состояние GitHub.
+- [x] Проверить сообщение о P1: `runJob` передаёт `AppendFilterSubdir: false` независимо от request flag. HTTP download с флагом `true` записал в фактический непрефиксированный target; DELETE этого target получил 409, DELETE гипотетического prefixed target — 200. Последний не был путём записи. Заявленный P1 для проверенного server flow не подтверждён; игнорирование флага остаётся отдельным follow-up, а не новой acceptance-функцией.
+- [ ] Нативная Windows/SMB-проверка остаётся отдельным follow-up; здесь она не выполнялась. Также не выполнялись свежий browser/mobile прогон, исчерпывающие interleaving-сценарии, проверка всех форматов и текущий CodeQL.
+
+Следующие пункты описывают исторические Package-этапы, а не текущую готовность. Их старые статусы намеренно сохранены как запись промежуточных состояний; для актуального результата см. раздел выше и `plan.md`.
+
+## Исторический tracker Packages 1, 2A, 2B, GGUF filter correction, 3A и 3B backend
+
+- [x] Удалить общую root/namespace/effect-инфраструктуру из продуктовых read paths; вернуть ограниченный код к поведению `origin/main`, включая Windows dedup identity.
+- [x] Package 1: сохранить legacy DELETE-validator/friendly-cleanup и проверки main; не добавлять UI, quant API или quant-delete реализацию.
+- [x] Проверить `go test ./internal/server ./pkg/hfdownloader`, `go test ./...` и `git diff --check`.
+- [x] Package 2A: добавить read-only API списка конкретных мест и GGUF-групп, с выбором текущей локации и сохранением named HF snapshot versions; correction фиксирует полное filename identity, split template, link-only/HF warnings, typed local model lookup и регрессионные fixtures.
+- [x] Package 2B: UI-выбор места/группы в Details реализован как read-only; кнопка destructive Delete остаётся disabled.
+- [x] Package 3A: локальный `DELETE /api/cache-selection` удаляет только свежеподтверждённые GGUF members; старый whole-repository DELETE не переиспользован, HF write остаётся unsupported.
+- [x] Исправить фильтр GGUF: несовпавший GGUF исключается и при отсутствии совпавшей GGUF в дереве; проверены обычный и LFS Q4/Q5.
+- [x] Package 3A: writer exclusion для matching queued/new/active downloads и фактических rebuild/legacy-delete/mirror destination writes; matching queued jobs требуют ручной отмены, Q5 без совпадения не блокирует выбранный Q4.
+- [x] Package 3B backend: selected HF snapshot/friendly entry deletion, shared-blob preservation, exact fresh confirmation, and HF repository/friendly writer reservation; focused pkg/server tests pass.
+- [x] Parent-owned: verify current UI's HF-specific confirmation copy and browser flow now that backend advertises HF delete capability; perform integration review and review of whole candidate. Review and candidate verification passed; see `plan.md` §10.
+- [ ] Parent-owned follow-up: native Windows/SMB verification. Not run; not a blocker for the completed local review/verification record.
+
+Ниже сохранён исторический tracker предыдущего R/S/state/inventory-подхода. Его пункты и блокирующие статусы не описывают текущую цель; см. `plan.md`.
+
+- [ ] Complete facts-only R on `feature/storage-root-ownership` from `0c876f38`.
+  - [x] Preserve all pre-split WIP on local archive A `a9931836` (not an R
+    ancestor; never push/cherry-pick wholesale).
+  - [x] Remove destructive authorizers, deletion consumers and safety assertions
+    from the R working tree; restore the legacy delete source block to `b4644b7`.
+  - [x] Reconstruct bounded namespace/root/owned-entry facts and common read-side
+    integration; retain logical IDs/roles, unknown Local type and error states.
+  - [x] Replace native Linux positive permission check with real bind-region
+    observation; keep isolation check and case-private fixture. Preserve the
+    valid relative-route fixture for Windows.
+  - [x] Run focused downloader/server tests; both pass on Linux Go 1.26.7.
+  - [x] Run focused packages, `go test ./...`, `go test ./... -race`,
+    `go vet ./...`, `go build ./cmd/hfdesk`, Windows test cross-builds and the
+    existing Windows selector locally. All passed on Linux Go 1.26.7; cross-build
+    and selector runs are not native Windows evidence.
+  - [x] Attempt required-native `TestNativeMount*`; worker-marker negative case
+    passed, but positive subprocess launch failed `operation not permitted` before
+    namespace setup. No native mount/Go 1.25 pass is claimed.
+  - [x] Scope the Windows R selector to facts only; retain the two legacy DELETE
+    safety tests in source and exclude them from this facts-stage check.
+  - [ ] Current candidate integrates fresh `origin/main` `8d3f982` and pins the
+    required-native Linux job to Go 1.25; rerun native Linux/Windows CI after
+    authorized publication. Prior remote run is stale; native Windows remains pending.
+  - [x] Historical source commit `4bcf7f9` was reviewed as requiring changes;
+    archive A is not its ancestor. That review is not approval of corrected R.
+  - [x] Commit corrected source/test/CI bytes and status snapshot as
+    `ff66636`; the completed candidate and status records remain below 5,000
+    additions plus deletions.
+  - [ ] Parent refreshes verification, reviews complete corrected R and rescope
+    of owned Draft #111. Publication and Ready remain unauthorized.
+- [ ] Build Safety S from reviewed R, selectively recover only bounded guards,
+  destructive integration and safety tests from A, implement E and close F7.
+- [ ] Start coordination/state work only after both root-stage foundations are
+  reviewed and F7 is closed.
+- [ ] Future inventory/delete engine; then API/UI/docs.
+
+F7 remains blocking. No S/E implementation, PR update, push, Ready, merge or
+publication is part of this task. A is intentionally retained locally for parent
+handoff; its cleanup is not authorized before all unique components are accounted
+for.

@@ -1,0 +1,866 @@
+// Copyright 2025
+// SPDX-License-Identifier: Apache-2.0
+
+package server
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
+)
+
+// --- Mirror Target Management ---
+
+// MirrorTargetRequest is the request body for adding a mirror target.
+type MirrorTargetRequest struct {
+	Name        string `json:"name"`
+	Path        string `json:"path"`
+	Description string `json:"description,omitempty"`
+}
+
+// handleMirrorTargetsList returns all configured mirror targets.
+func (s *Server) handleMirrorTargetsList(w http.ResponseWriter, r *http.Request) {
+	cfg, err := hfdownloader.LoadTargets(TargetsFilePath())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to load targets", err.Error())
+		return
+	}
+
+	// Convert to sorted list
+	type targetInfo struct {
+		Name        string `json:"name"`
+		Path        string `json:"path"`
+		Description string `json:"description,omitempty"`
+		Exists      bool   `json:"exists"`
+	}
+
+	var targets []targetInfo
+	for name, t := range cfg.Targets {
+		// Check if path exists
+		_, err := os.Stat(t.Path)
+		targets = append(targets, targetInfo{
+			Name:        name,
+			Path:        t.Path,
+			Description: t.Description,
+			Exists:      err == nil,
+		})
+	}
+
+	// Sort by name
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].Name < targets[j].Name
+	})
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"targets": targets,
+		"count":   len(targets),
+	})
+}
+
+// handleMirrorTargetAdd adds a new mirror target.
+func (s *Server) handleMirrorTargetAdd(w http.ResponseWriter, r *http.Request) {
+	var req MirrorTargetRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "Missing required field: name", "")
+		return
+	}
+	if req.Path == "" {
+		writeError(w, http.StatusBadRequest, "Missing required field: path", "")
+		return
+	}
+
+	// Validate name (alphanumeric, dash, underscore only)
+	if !isValidTargetName(req.Name) {
+		writeError(w, http.StatusBadRequest, "Invalid target name", "Use only letters, numbers, dashes, and underscores")
+		return
+	}
+
+	// Resolve to absolute path
+	absPath, err := filepath.Abs(req.Path)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid path", err.Error())
+		return
+	}
+
+	cfg, err := hfdownloader.LoadTargets(TargetsFilePath())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to load targets", err.Error())
+		return
+	}
+
+	cfg.Add(req.Name, absPath, req.Description)
+
+	if err := saveMirrorTargets(cfg); err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to save targets", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"message": fmt.Sprintf("Added target %q", req.Name),
+		"target": map[string]string{
+			"name":        req.Name,
+			"path":        absPath,
+			"description": req.Description,
+		},
+	})
+}
+
+// handleMirrorTargetRemove removes a mirror target.
+func (s *Server) handleMirrorTargetRemove(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "Missing target name", "")
+		return
+	}
+
+	cfg, err := hfdownloader.LoadTargets(TargetsFilePath())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to load targets", err.Error())
+		return
+	}
+
+	if !cfg.Remove(name) {
+		writeError(w, http.StatusNotFound, "Target not found", name)
+		return
+	}
+
+	if err := saveMirrorTargets(cfg); err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to save targets", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"message": fmt.Sprintf("Removed target %q", name),
+	})
+}
+
+// --- Mirror Operations ---
+
+// MirrorDiffRequest is the request body for diff operation.
+type MirrorDiffRequest struct {
+	Target     string `json:"target"`     // Target name or path
+	RepoFilter string `json:"repoFilter"` // Optional filter by repo name
+}
+
+// MirrorDiffEntry represents a difference between source and target.
+type MirrorDiffEntry struct {
+	Repo       string `json:"repo"`
+	Type       string `json:"type"`
+	Status     string `json:"status"` // "missing", "outdated", "extra"
+	LocalSize  int64  `json:"localSize,omitempty"`
+	RemoteSize int64  `json:"remoteSize,omitempty"`
+	SizeHuman  string `json:"sizeHuman,omitempty"`
+}
+
+// handleMirrorDiff compares local cache with a target.
+func (s *Server) handleMirrorDiff(w http.ResponseWriter, r *http.Request) {
+	var req MirrorDiffRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+
+	if req.Target == "" {
+		writeError(w, http.StatusBadRequest, "Missing required field: target", "")
+		return
+	}
+
+	// Resolve target path
+	targetsCfg, err := hfdownloader.LoadTargets(TargetsFilePath())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to load targets", err.Error())
+		return
+	}
+	targetPath := targetsCfg.ResolvePath(req.Target)
+
+	// Local cache
+	cfg := s.snapshotConfig()
+	cacheDir := cfg.cacheRoot()
+
+	// Scan both caches
+	localEntries, err := scanHubForMirror(cfg.cache().HubDir())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to scan local cache", err.Error())
+		return
+	}
+
+	targetEntries, err := scanCacheForMirror(targetPath)
+	if err != nil {
+		// Target might not exist yet
+		targetEntries = nil
+	}
+
+	// Build maps
+	localMap := make(map[string]mirrorEntry)
+	for _, e := range localEntries {
+		if req.RepoFilter == "" || strings.Contains(strings.ToLower(e.Repo), strings.ToLower(req.RepoFilter)) {
+			localMap[e.Repo] = e
+		}
+	}
+
+	targetMap := make(map[string]mirrorEntry)
+	for _, e := range targetEntries {
+		if req.RepoFilter == "" || strings.Contains(strings.ToLower(e.Repo), strings.ToLower(req.RepoFilter)) {
+			targetMap[e.Repo] = e
+		}
+	}
+
+	// Calculate diff
+	var diffs []MirrorDiffEntry
+
+	// Missing in target (exists locally but not in target)
+	for repo, local := range localMap {
+		if _, ok := targetMap[repo]; !ok {
+			diffs = append(diffs, MirrorDiffEntry{
+				Repo:      repo,
+				Type:      local.Type,
+				Status:    "missing",
+				LocalSize: local.Size,
+				SizeHuman: humanSizeBytes(local.Size),
+			})
+		}
+	}
+
+	// Extra in target (not in local)
+	for repo, remote := range targetMap {
+		if _, ok := localMap[repo]; !ok {
+			diffs = append(diffs, MirrorDiffEntry{
+				Repo:       repo,
+				Type:       remote.Type,
+				Status:     "extra",
+				RemoteSize: remote.Size,
+				SizeHuman:  humanSizeBytes(remote.Size),
+			})
+		}
+	}
+
+	// Outdated (different commits)
+	for repo, local := range localMap {
+		if remote, ok := targetMap[repo]; ok {
+			if local.Commit != remote.Commit && local.Commit != "" && remote.Commit != "" {
+				diffs = append(diffs, MirrorDiffEntry{
+					Repo:       repo,
+					Type:       local.Type,
+					Status:     "outdated",
+					LocalSize:  local.Size,
+					RemoteSize: remote.Size,
+					SizeHuman:  humanSizeBytes(local.Size),
+				})
+			}
+		}
+	}
+
+	// Sort by status, then repo
+	sort.Slice(diffs, func(i, j int) bool {
+		if diffs[i].Status != diffs[j].Status {
+			return diffs[i].Status < diffs[j].Status
+		}
+		return diffs[i].Repo < diffs[j].Repo
+	})
+
+	// Calculate summary
+	var missingSize, extraSize int64
+	var missingCount, extraCount, outdatedCount int
+	for _, d := range diffs {
+		switch d.Status {
+		case "missing":
+			missingSize += d.LocalSize
+			missingCount++
+		case "extra":
+			extraSize += d.RemoteSize
+			extraCount++
+		case "outdated":
+			outdatedCount++
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"diffs":           diffs,
+		"localPath":       cacheDir,
+		"effectiveHubDir": cfg.cache().HubDir(),
+		"hubDirSource":    cfg.hubDirSource(),
+		"targetPath":      targetPath,
+		"summary": map[string]any{
+			"missing":          missingCount,
+			"missingSizeHuman": humanSizeBytes(missingSize),
+			"extra":            extraCount,
+			"extraSizeHuman":   humanSizeBytes(extraSize),
+			"outdated":         outdatedCount,
+			"inSync":           len(diffs) == 0,
+		},
+	})
+}
+
+// MirrorSyncRequest is the request body for push/pull operations.
+type MirrorSyncRequest struct {
+	Target      string `json:"target"`      // Target name or path
+	RepoFilter  string `json:"repoFilter"`  // Optional filter by repo name
+	DryRun      bool   `json:"dryRun"`      // Show what would be done without doing it
+	Verify      bool   `json:"verify"`      // Verify integrity after copy
+	DeleteExtra bool   `json:"deleteExtra"` // Delete repos in destination not in source
+	Force       bool   `json:"force"`       // Re-copy incomplete/outdated repos
+}
+
+// handleMirrorPush pushes local repos to target.
+func (s *Server) handleMirrorPush(w http.ResponseWriter, r *http.Request) {
+	var req MirrorSyncRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+
+	if req.Target == "" {
+		writeError(w, http.StatusBadRequest, "Missing required field: target", "")
+		return
+	}
+
+	// Resolve target path
+	targetsCfg, err := hfdownloader.LoadTargets(TargetsFilePath())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to load targets", err.Error())
+		return
+	}
+	targetPath := targetsCfg.ResolvePath(req.Target)
+
+	// Local cache
+	cfg := s.snapshotConfig()
+	destination := filepath.Join(targetPath, "hub")
+	var release func()
+	if !req.DryRun {
+		var ok bool
+		release, ok = s.jobs.beginCacheMutation(destination)
+		if !ok {
+			writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+			return
+		}
+		defer release()
+	}
+	result, err := mirrorSyncHubs(cfg.cache().HubDir(), destination, req.RepoFilter, req.DryRun, req.Verify, req.DeleteExtra, req.Force)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Mirror sync failed", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+// handleMirrorPull pulls repos from target to local.
+func (s *Server) handleMirrorPull(w http.ResponseWriter, r *http.Request) {
+	var req MirrorSyncRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+
+	if req.Target == "" {
+		writeError(w, http.StatusBadRequest, "Missing required field: target", "")
+		return
+	}
+
+	// Resolve target path
+	targetsCfg, err := hfdownloader.LoadTargets(TargetsFilePath())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to load targets", err.Error())
+		return
+	}
+	targetPath := targetsCfg.ResolvePath(req.Target)
+
+	// Local cache
+	cfg := s.snapshotConfig()
+	// Pull is push in reverse (target -> local)
+	destination := cfg.cache().HubDir()
+	var release func()
+	if !req.DryRun {
+		var ok bool
+		release, ok = s.jobs.beginCacheMutation(destination)
+		if !ok {
+			writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+			return
+		}
+		defer release()
+	}
+	result, err := mirrorSyncHubs(filepath.Join(targetPath, "hub"), destination, req.RepoFilter, req.DryRun, req.Verify, req.DeleteExtra, req.Force)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Mirror sync failed", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+// --- Helper types and functions ---
+
+// saveMirrorTargets writes the mirror targets into the state directory.
+//
+// The downloader package creates the parent directory of the targets file
+// with its own mode, so the server creates the state directory with the mode
+// it owns before the file is written: the mode of the directory must not
+// depend on which code path created it.
+func saveMirrorTargets(cfg *hfdownloader.TargetsConfig) error {
+	targetsFile := TargetsFilePath()
+	if err := os.MkdirAll(filepath.Dir(targetsFile), serverDirMode()); err != nil {
+		return err
+	}
+	return cfg.Save(targetsFile)
+}
+
+type mirrorEntry struct {
+	Type   string
+	Repo   string
+	Commit string
+	Size   int64
+	Path   string
+}
+
+// scanCacheForMirror scans the cache directory for mirror operations.
+func scanCacheForMirror(cacheDir string) ([]mirrorEntry, error) {
+	return scanHubForMirror(filepath.Join(cacheDir, "hub"))
+}
+
+func scanHubForMirror(hubDir string) ([]mirrorEntry, error) {
+	var entries []mirrorEntry
+	if _, err := os.Stat(hubDir); os.IsNotExist(err) {
+		return entries, nil
+	}
+
+	items, err := os.ReadDir(hubDir)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, item := range items {
+		if !item.IsDir() {
+			continue
+		}
+
+		name := item.Name()
+		var repoType string
+		var repoName string
+
+		if strings.HasPrefix(name, "models--") {
+			repoType = "model"
+			repoName = strings.TrimPrefix(name, "models--")
+		} else if strings.HasPrefix(name, "datasets--") {
+			repoType = "dataset"
+			repoName = strings.TrimPrefix(name, "datasets--")
+		} else {
+			continue
+		}
+
+		// Convert owner--repo to owner/repo
+		repoName = strings.Replace(repoName, "--", "/", 1)
+		if !hfdownloader.IsValidModelName(repoName) {
+			continue
+		}
+
+		// Get size by walking blobs directory
+		blobsDir := filepath.Join(hubDir, name, "blobs")
+		var totalSize int64
+		filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
+			if err == nil && !info.IsDir() {
+				totalSize += info.Size()
+			}
+			return nil
+		})
+
+		// Try to read commit from refs/main
+		var commit string
+		refPath := filepath.Join(hubDir, name, "refs", "main")
+		if data, err := os.ReadFile(refPath); err == nil {
+			commit = strings.TrimSpace(string(data))
+		}
+
+		entries = append(entries, mirrorEntry{
+			Type:   repoType,
+			Repo:   repoName,
+			Commit: commit,
+			Size:   totalSize,
+			Path:   filepath.Join(hubDir, name),
+		})
+	}
+
+	return entries, nil
+}
+
+// MirrorSyncResult represents the result of a sync operation.
+type MirrorSyncResult struct {
+	Success          bool     `json:"success"`
+	DryRun           bool     `json:"dryRun"`
+	Copied           int      `json:"copied"`
+	CopiedSize       int64    `json:"copiedSize"`
+	CopiedSizeHuman  string   `json:"copiedSizeHuman"`
+	Deleted          int      `json:"deleted"`
+	DeletedSize      int64    `json:"deletedSize"`
+	DeletedSizeHuman string   `json:"deletedSizeHuman"`
+	Repos            []string `json:"repos,omitempty"`
+	Errors           []string `json:"errors,omitempty"`
+	Message          string   `json:"message"`
+}
+
+// mirrorSyncHubs receives exact independently trusted Hub roots. Remote target
+// roots are explicitly joined by callers and never resolved using local ENV.
+func mirrorSyncHubs(srcCache, dstCache, repoFilter string, dryRun, verify, deleteExtra, force bool) (*MirrorSyncResult, error) {
+	result := &MirrorSyncResult{
+		Success: true,
+		DryRun:  dryRun,
+	}
+
+	// Scan source
+	srcEntries, err := scanHubForMirror(srcCache)
+	if err != nil {
+		return nil, fmt.Errorf("scan source: %w", err)
+	}
+
+	// Scan destination
+	dstEntries, err := scanHubForMirror(dstCache)
+	if err != nil {
+		// Destination might not exist yet
+		dstEntries = nil
+	}
+
+	srcMap := make(map[string]mirrorEntry)
+	for _, e := range srcEntries {
+		srcMap[e.Repo] = e
+	}
+
+	dstMap := make(map[string]mirrorEntry)
+	for _, e := range dstEntries {
+		dstMap[e.Repo] = e
+	}
+
+	// Find repos to copy
+	var toCopy []mirrorEntry
+	for _, e := range srcEntries {
+		if repoFilter != "" && !strings.Contains(strings.ToLower(e.Repo), strings.ToLower(repoFilter)) {
+			continue
+		}
+
+		if _, ok := dstMap[e.Repo]; !ok {
+			// Missing in destination
+			toCopy = append(toCopy, e)
+		} else if force {
+			// Check if destination needs update
+			dstPath, err := mirrorRepoDestination(e.Path, srcCache, dstCache)
+			if err != nil {
+				return nil, err
+			}
+			if needsUpdate, _ := compareRepoIntegrity(e.Path, dstPath); needsUpdate {
+				toCopy = append(toCopy, e)
+			}
+		}
+	}
+
+	// Find repos to delete
+	var toDelete []mirrorEntry
+	if deleteExtra {
+		for _, e := range dstEntries {
+			if repoFilter != "" && !strings.Contains(strings.ToLower(e.Repo), strings.ToLower(repoFilter)) {
+				continue
+			}
+			if _, ok := srcMap[e.Repo]; !ok {
+				toDelete = append(toDelete, e)
+			}
+		}
+	}
+
+	// Calculate sizes
+	for _, e := range toCopy {
+		result.CopiedSize += e.Size
+		result.Repos = append(result.Repos, e.Repo)
+	}
+	for _, e := range toDelete {
+		result.DeletedSize += e.Size
+	}
+
+	result.Copied = len(toCopy)
+	result.Deleted = len(toDelete)
+	result.CopiedSizeHuman = humanSizeBytes(result.CopiedSize)
+	result.DeletedSizeHuman = humanSizeBytes(result.DeletedSize)
+
+	if dryRun {
+		result.Message = fmt.Sprintf("Would copy %d repos (%s)", len(toCopy), result.CopiedSizeHuman)
+		if len(toDelete) > 0 {
+			result.Message += fmt.Sprintf(", delete %d repos (%s)", len(toDelete), result.DeletedSizeHuman)
+		}
+		return result, nil
+	}
+
+	if len(toCopy) == 0 && len(toDelete) == 0 {
+		result.Message = "Nothing to do - destination is in sync"
+		return result, nil
+	}
+
+	// Copy each repo
+	for _, e := range toCopy {
+		if err := copyRepoCache(e.Path, srcCache, dstCache); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("copy %s: %v", e.Repo, err))
+			result.Success = false
+		}
+
+		if verify {
+			if err := verifyRepoCache(e.Path, srcCache, dstCache); err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("verify %s: %v", e.Repo, err))
+				result.Success = false
+			}
+		}
+	}
+
+	// Delete extra repos
+	for _, e := range toDelete {
+		if err := mirrorNoSymlinkPath(dstCache, e.Path); err != nil {
+			result.Errors = append(result.Errors, err.Error())
+			result.Success = false
+			continue
+		}
+		if err := os.RemoveAll(e.Path); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", e.Repo, err))
+			result.Success = false
+		}
+	}
+
+	result.Message = fmt.Sprintf("Copied %d repos (%s)", len(toCopy), result.CopiedSizeHuman)
+	if len(toDelete) > 0 {
+		result.Message += fmt.Sprintf(", deleted %d repos (%s)", len(toDelete), result.DeletedSizeHuman)
+	}
+
+	return result, nil
+}
+
+// copyRepoCache copies a repo from source to destination cache.
+func copyRepoCache(repoPath, srcCache, dstCache string) error {
+	dstPath, err := mirrorRepoDestination(repoPath, srcCache, dstCache)
+	if err != nil {
+		return err
+	}
+
+	// Create destination directory
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+		return err
+	}
+
+	return filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		rel, err := filepath.Rel(repoPath, path)
+		if err != nil {
+			return err
+		}
+
+		dst := filepath.Join(dstPath, rel)
+		// Existing destination directory links must never redirect writes
+		// outside the selected repository/Hub. Snapshot leaf links are replaced
+		// below, but their parents must be real directories.
+		if err := mirrorNoSymlinkPath(dstCache, filepath.Dir(dst)); err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			if err := mirrorNoSymlinkPath(dstCache, dst); err != nil {
+				return err
+			}
+			return os.MkdirAll(dst, info.Mode())
+		}
+
+		// Check if it's a symlink
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			// Reject absolute symlinks — they would point outside the cache.
+			if filepath.IsAbs(link) {
+				return fmt.Errorf("refusing absolute symlink %s -> %s", path, link)
+			}
+			// Reject symlinks whose resolved target escapes the source repo root.
+			resolved := filepath.Join(filepath.Dir(path), link)
+			if !hfdownloader.PathInside(repoPath, resolved) {
+				return fmt.Errorf("refusing escaping symlink %s -> %s (resolves outside repo)", path, link)
+			}
+			os.Remove(dst)
+			return os.Symlink(link, dst)
+		}
+
+		// Copy file
+		if err := mirrorNoSymlinkPath(dstCache, dst); err != nil {
+			return err
+		}
+		return copyFileForMirror(path, dst)
+	})
+}
+
+// copyFileForMirror copies a single file using streaming I/O to avoid
+// loading the entire file into memory (model files can be tens of GB).
+func copyFileForMirror(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
+	if err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// verifyRepoCache verifies that a copied repo matches the source.
+func verifyRepoCache(repoPath, srcCache, dstCache string) error {
+	dstPath, err := mirrorRepoDestination(repoPath, srcCache, dstCache)
+	if err != nil {
+		return err
+	}
+
+	blobsDir := filepath.Join(repoPath, "blobs")
+
+	return filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		rel, err := filepath.Rel(repoPath, path)
+		if err != nil {
+			return err
+		}
+
+		dstFile := filepath.Join(dstPath, rel)
+		if err := mirrorNoSymlinkPath(srcCache, path); err != nil {
+			return err
+		}
+		if err := mirrorNoSymlinkPath(dstCache, dstFile); err != nil {
+			return err
+		}
+		dstInfo, err := os.Stat(dstFile)
+		if err != nil {
+			return fmt.Errorf("missing blob %s: %w", rel, err)
+		}
+
+		if dstInfo.Size() != info.Size() {
+			return fmt.Errorf("size mismatch for %s: src=%d dst=%d", rel, info.Size(), dstInfo.Size())
+		}
+
+		return nil
+	})
+}
+
+// Mapping is relative to the exact Hub, never its parent or the friendly root.
+func mirrorRepoDestination(repoPath, srcHub, dstHub string) (string, error) {
+	rel, err := filepath.Rel(srcHub, repoPath)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return "", fmt.Errorf("repository outside source Hub: %s", repoPath)
+	}
+	if err := mirrorNoSymlinkPath(srcHub, repoPath); err != nil {
+		return "", err
+	}
+	dst, err := hfdownloader.SafeJoin(dstHub, rel)
+	if err != nil {
+		return "", err
+	}
+	if err := mirrorNoSymlinkPath(dstHub, dst); err != nil {
+		return "", err
+	}
+	return dst, nil
+}
+
+// The explicitly selected Hub itself may be a trusted filesystem mount/link;
+// descendants may not redirect copy/delete/verification to another root.
+func mirrorNoSymlinkPath(hub, path string) error {
+	rel, err := filepath.Rel(hub, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("path outside selected Hub: %s", path)
+	}
+	if rel == "." {
+		return nil
+	}
+	current := hub
+	for _, component := range strings.Split(rel, string(filepath.Separator)) {
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing symlinked mirror path: %s", current)
+		}
+	}
+	return nil
+}
+
+// compareRepoIntegrity compares source and destination repos.
+func compareRepoIntegrity(srcPath, dstPath string) (needsUpdate bool, reason string) {
+	if _, err := os.Stat(dstPath); os.IsNotExist(err) {
+		return true, "missing"
+	}
+
+	// Check if destination has same blob count
+	srcBlobs := countBlobs(srcPath)
+	dstBlobs := countBlobs(dstPath)
+
+	if srcBlobs > dstBlobs {
+		return true, "incomplete"
+	}
+
+	return false, ""
+}
+
+// countBlobs returns the number of regular files under a repo's blobs
+// directory. Used for mirror diffs where the blob count is a cheap
+// proxy for size.
+func countBlobs(repoPath string) int {
+	blobsDir := filepath.Join(repoPath, "blobs")
+	count := 0
+	filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			count++
+		}
+		return nil
+	})
+	return count
+}
+
+// isValidTargetName checks if a target name contains only safe characters.
+func isValidTargetName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			r == '-' || r == '_') {
+			return false
+		}
+	}
+	return true
+}

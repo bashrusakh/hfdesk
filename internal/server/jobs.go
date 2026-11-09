@@ -1,0 +1,1964 @@
+// Copyright 2025
+// SPDX-License-Identifier: Apache-2.0
+
+package server
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/bashrusakh/hfdesk/internal/logging"
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
+)
+
+// jobsLog is the logger of the job manager subsystem. It resolves the current
+// default logger on every call, so records reach whichever pipeline the
+// application installed.
+var jobsLog = logging.NewComponentLogger("jobs")
+
+// JobStatus represents the state of a download job.
+type JobStatus string
+
+const (
+	JobStatusQueued    JobStatus = "queued"
+	JobStatusRunning   JobStatus = "running"
+	JobStatusPaused    JobStatus = "paused"
+	JobStatusCompleted JobStatus = "completed"
+	JobStatusFailed    JobStatus = "failed"
+	JobStatusCancelled JobStatus = "cancelled"
+)
+
+// Job represents a download job.
+type Job struct {
+	ID                 string            `json:"id"`
+	Repo               string            `json:"repo"`
+	Revision           string            `json:"revision"`
+	IsDataset          bool              `json:"isDataset,omitempty"`
+	Filters            []string          `json:"filters,omitempty"`
+	Excludes           []string          `json:"excludes,omitempty"`
+	OutputDir          string            `json:"outputDir"`
+	HubDir             string            `json:"hubDir,omitempty"` // Exact frozen Hub; OutputDir remains the friendly/app root.
+	DestinationWarning string            `json:"destinationWarning,omitempty"`
+	LocalDir           string            `json:"localDir,omitempty"`      // Effective local-dir for this job (per-request or server-global)
+	LocalRepo          string            `json:"localRepo,omitempty"`     // Override destination folder name (used for upstream mmproj)
+	BranchVariant      bool              `json:"branchVariant,omitempty"` // Whole EXL branch selected by revision
+	Flat               bool              `json:"flat,omitempty"`          // Save real files (flat mode) instead of HF cache layout
+	ExactMatch         bool              `json:"exactMatch,omitempty"`    // Match filters by whole name segment, not substring
+	Status             JobStatus         `json:"status"`
+	Phase              string            `json:"phase,omitempty"` // sub-state while running, e.g. "finalizing"
+	Progress           JobProgress       `json:"progress"`
+	Error              string            `json:"error,omitempty"`
+	CreatedAt          time.Time         `json:"createdAt"`
+	StartedAt          *time.Time        `json:"startedAt,omitempty"`
+	EndedAt            *time.Time        `json:"endedAt,omitempty"`
+	Files              []JobFileProgress `json:"files,omitempty"`
+
+	// RouteKey is the download route key requested at creation (internal/audit
+	// only). The resolved destination lives in LocalDir; this field is never a
+	// path and must not be re-resolved at run time.
+	RouteKey string `json:"routeKey,omitempty"`
+
+	cancel     context.CancelFunc `json:"-"`
+	generation int                `json:"-"` // Tracks which runJob instance is current
+	starting   bool               `json:"-"` // Dispatched to a runJob goroutine but not yet Running (scheduler gate)
+
+	// resumeFloor is the monotonic floor on Progress.DownloadedBytes
+	// during the recovery window that starts when ResumeJob re-queues a
+	// paused job. While set, applyJobProgress only updates
+	// DownloadedBytes when the freshly summed total exceeds the current
+	// value, and clears the floor once the sum catches up. This keeps
+	// the UI from dropping while the partial sum is dominated by files
+	// the downloader has not yet processed, and is then released so a
+	// genuine rollback (e.g. downloadSingle's 200 fallback truncating
+	// the .part file) is reflected in real time. 0 means no floor.
+	resumeFloor int64 `json:"-"`
+
+	// Speed is a moving average over a short window of bytes actually
+	// transferred this run (see the file_progress handler), so the reading is
+	// steady and resuming a partial repo doesn't count already-present bytes.
+	speedSamples []speedSample `json:"-"`
+	// speedRunStart is when this run's first speed sample was taken; the
+	// whole-run average rate measured from it anchors the ETA estimate.
+	speedRunStart time.Time `json:"-"`
+
+	// partialFilesPtr is a pointer to the per-job in-flight file
+	// tracker map. Every read and write of the pointer, and every
+	// mutation of the pointed-to map, happens under the per-job
+	// partialFilesMu: runJob swaps in a fresh map at the start of a
+	// run, OnPartialFile mutates that map, cleanupPausedJobPartFiles
+	// nils the pointer, and cloneJobLocked holds the mutex across its
+	// shallow struct copy and the deep copy of the map. The pointer
+	// indirection still matters because cloneJobLocked's whole-struct
+	// copy reads the pointer word; that read must happen under
+	// partialFilesMu too, or it races runJob's swap (github issue
+	// #77).
+	//
+	// partialFilesMu is a *sync.Mutex (not a value) so that
+	// cloneJobLocked's shallow copy reads a single pointer word
+	// instead of the mutex's internal state, which the runtime
+	// mutates with atomics. Copying the mutex's internal state
+	// concurrently with a Lock/Unlock would race with those
+	// atomics; copying the pointer does not.
+	partialFilesPtr *map[string]struct{}
+	partialFilesMu  *sync.Mutex `json:"-"`
+}
+
+// speedSample is one (time, cumulative-transferred-bytes) point in a job's
+// speed window.
+type speedSample struct {
+	t     time.Time
+	bytes int64
+}
+
+// JobProgress holds aggregate progress info.
+type JobProgress struct {
+	TotalFiles      int   `json:"totalFiles"`
+	CompletedFiles  int   `json:"completedFiles"`
+	TotalBytes      int64 `json:"totalBytes"`
+	DownloadedBytes int64 `json:"downloadedBytes"`
+	BytesPerSecond  int64 `json:"bytesPerSecond"`
+	// EtaSeconds is the server-computed remaining-time estimate; 0 means
+	// unknown. It is anchored to the whole-run average rate rather than the
+	// displayed speed, because remaining/currentSpeed multiplies any speed
+	// wobble by the bytes left and makes the ETA jump.
+	EtaSeconds int64 `json:"etaSeconds"`
+}
+
+// JobFileProgress holds per-file progress.
+type JobFileProgress struct {
+	Path       string `json:"path"`
+	TotalBytes int64  `json:"totalBytes"`
+	Downloaded int64  `json:"downloaded"`
+	Status     string `json:"status"` // pending, active, complete, skipped, error
+
+	progressed     bool  `json:"-"` // saw a real file_progress event for this file
+	baseDownloaded int64 `json:"-"` // bytes already on disk at first progress (resume position), excluded from speed
+}
+
+// JobManager manages download jobs.
+type JobManager struct {
+	mu                sync.RWMutex
+	saveMu            sync.Locker
+	jobs              map[string]*Job
+	config            Config
+	statePath         string
+	persistStateFile  func(string, []*Job) error
+	loadStateFile     func(string) ([]*Job, error)
+	fenced            bool
+	stopping          bool
+	persistenceClosed bool
+	opWG              sync.WaitGroup
+	closeOnce         sync.Once
+	closeDone         chan struct{}
+	closeErr          error
+	listeners         []chan *Job
+	listenerMu        sync.RWMutex
+	wsHub             *WSHub
+	wsCoalescer       *jobCoalescer
+	// speedLimiter is the process-wide token bucket shared by every running
+	// job so the configured cap limits total bandwidth, not per-job. Always
+	// non-nil; a 0 limit means unlimited.
+	speedLimiter *hfdownloader.RateLimiter
+	// runWG tracks in-flight runJob goroutines so shutdown paths (and
+	// tests) can wait for every download to actually unwind — not just
+	// for Status to flip to Cancelled. Without this a t.TempDir cleanup
+	// can race a still-in-flight mkdir inside the downloader and fail
+	// with "directory not empty".
+	runWG sync.WaitGroup
+	// runActivities outlive visible job state and retain each run's immutable
+	// destination/plan until its downloader call has actually returned.
+	runActivities        map[uint64]*jobWriteActivity
+	deleteReservations   map[uint64][]frozenMutationPath
+	hfRepoReservations   map[uint64][]frozenMutationPath
+	mutationScopes       map[uint64][]frozenMutationPath
+	mutationScopeKinds   map[uint64]writeScopeKind
+	nextWriteID          uint64
+	writeDecisionEpoch   uint64
+	writeDecisionChanged chan struct{}
+	writeInventory       func(string) (writableNamespaceInventory, bool)
+	dispatchPending      bool
+	dispatchRunning      bool
+}
+
+// wsBroadcastMinGap is the minimum interval between consecutive WebSocket
+// broadcasts for the same job. Progress events arriving inside this window
+// are coalesced — only the latest job state is flushed when the window
+// elapses. Terminal status changes (completed, failed, cancelled, paused)
+// bypass this gate and are sent immediately. See github issue #62.
+const wsBroadcastMinGap = 250 * time.Millisecond
+
+var errJobManagerStopping = errors.New("job manager is stopping")
+var errJobManagerPersistenceClosed = errors.New("job manager persistence is closed")
+
+func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
+	return newJobManagerWithStatePath(cfg.captureCacheEnvironment(), wsHub, JobsStatePath())
+}
+
+func newJobManagerWithStatePath(cfg Config, wsHub *WSHub, statePath string) *JobManager {
+	cfg = cfg.captureCacheEnvironment()
+	m := &JobManager{
+		saveMu:               &sync.Mutex{},
+		jobs:                 make(map[string]*Job),
+		runActivities:        make(map[uint64]*jobWriteActivity),
+		deleteReservations:   make(map[uint64][]frozenMutationPath),
+		hfRepoReservations:   make(map[uint64][]frozenMutationPath),
+		mutationScopes:       make(map[uint64][]frozenMutationPath),
+		mutationScopeKinds:   make(map[uint64]writeScopeKind),
+		writeDecisionChanged: make(chan struct{}),
+		config:               cfg,
+		statePath:            statePath,
+		persistStateFile:     saveJobsState,
+		loadStateFile:        loadJobsState,
+		closeDone:            make(chan struct{}),
+		wsHub:                wsHub,
+		speedLimiter:         hfdownloader.NewRateLimiter(hfdownloader.ParseSize(cfg.MaxSpeed)),
+	}
+	if wsHub != nil {
+		m.wsCoalescer = newJobCoalescer(wsBroadcastMinGap, func(j *Job) {
+			wsHub.BroadcastJob(j)
+		})
+	}
+	return m
+}
+
+// LoadState restores jobs from jobs_state.json. Call once after NewJobManager,
+// before accepting requests. Errors are non-fatal (logged but not returned).
+func (m *JobManager) LoadState() {
+	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return
+	}
+	m.opWG.Add(1)
+	m.mu.Unlock()
+	defer m.opWG.Done()
+
+	jobs, err := m.loadStateFile(m.statePath)
+	if err != nil {
+		jobsLog.Warn("could not load jobs state", "error", err)
+		return
+	}
+	if len(jobs) == 0 {
+		return
+	}
+	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return
+	}
+	legacyResolved := false
+	for _, j := range jobs {
+		j.cancel = nil
+		if j.LocalDir == "" && j.HubDir == "" {
+			cache := m.config.cacheForRoot(j.OutputDir)
+			j.OutputDir, j.HubDir = cache.Root, cache.HubDir()
+			j.DestinationWarning = "Legacy job: historical Hub directory is unknown; destination resolved once from recorded app root and startup environment. No files were moved."
+			jobsLog.Warn("job destination warning", "job_id", j.ID, "detail", j.DestinationWarning)
+			legacyResolved = true
+		}
+		// Ensure no zombie running/queued jobs survive a restart
+		if j.Status == JobStatusRunning || j.Status == JobStatusQueued {
+			j.Status = JobStatusPaused
+		}
+		// Allocate the in-flight tracker mutex. It isn't serialized
+		// to JSON (json:"-") so it comes back nil after a round trip;
+		// without this, cloneJobLocked would panic when listing or
+		// cloning a restored job. The tracker map itself stays nil
+		// — restored jobs have no live downloader goroutine that
+		// would populate it.
+		if j.partialFilesMu == nil {
+			j.partialFilesMu = &sync.Mutex{}
+		}
+		m.jobs[j.ID] = j
+	}
+	m.mu.Unlock()
+	if legacyResolved {
+		m.saveStateAndLog()
+	}
+	jobsLog.Info("restored jobs from state file", "count", len(jobs))
+}
+
+// saveState serializes snapshot creation and commit so an older snapshot
+// cannot overwrite a newer one. It must not be called while m.mu is held.
+func (m *JobManager) saveState() error {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+	if m.persistenceClosed {
+		return errJobManagerPersistenceClosed
+	}
+
+	m.mu.RLock()
+	snapshot := make([]*Job, 0, len(m.jobs))
+	for _, j := range m.jobs {
+		snapshot = append(snapshot, m.cloneJobLocked(j))
+	}
+	m.mu.RUnlock()
+
+	return m.persistStateFile(m.statePath, snapshot)
+}
+
+// Quiesce fences scheduling while allowing already-admitted mutations to finish.
+func (m *JobManager) Quiesce() {
+	m.mu.Lock()
+	m.quiesceLocked()
+	m.mu.Unlock()
+}
+
+func (m *JobManager) quiesceLocked() {
+	m.fenced = true
+	m.signalWriteDecisionLocked()
+}
+
+// Close rejects new mutations, drains accepted operations and runners, then
+// commits a fresh final state snapshot. A caller timeout does not stop the
+// close coordinator; subsequent calls can wait for the same result.
+func (m *JobManager) Close(ctx context.Context) error {
+	m.closeOnce.Do(func() {
+		m.mu.Lock()
+		m.fenced = true
+		m.stopping = true
+		m.signalWriteDecisionLocked()
+		var cancels []context.CancelFunc
+		var snapshots []*Job
+		for _, job := range m.jobs {
+			if job.Status != JobStatusRunning {
+				continue
+			}
+			job.Status = JobStatusPaused
+			if job.cancel != nil {
+				cancels = append(cancels, job.cancel)
+			}
+			snapshots = append(snapshots, m.cloneJobLocked(job))
+		}
+		m.mu.Unlock()
+
+		for _, cancel := range cancels {
+			cancel()
+		}
+		for _, snapshot := range snapshots {
+			m.notifyListeners(snapshot)
+		}
+		go m.finishClose()
+	})
+
+	select {
+	case <-m.closeDone:
+		return m.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *JobManager) finishClose() {
+	m.opWG.Wait()
+	m.runWG.Wait()
+
+	m.saveMu.Lock()
+	m.mu.RLock()
+	snapshot := make([]*Job, 0, len(m.jobs))
+	for _, job := range m.jobs {
+		snapshot = append(snapshot, m.cloneJobLocked(job))
+	}
+	m.mu.RUnlock()
+	err := m.persistStateFile(m.statePath, snapshot)
+	m.persistenceClosed = true
+	m.saveMu.Unlock()
+
+	m.closeErr = err
+	close(m.closeDone)
+}
+
+func (m *JobManager) saveStateAndLog() {
+	if err := m.saveState(); err != nil {
+		jobsLog.Warn("could not save jobs state", "error", err)
+	}
+}
+
+func generateID() string {
+	b := make([]byte, 6)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// cloneJobLocked returns a fully-independent copy of a Job. Must be called
+// while m.mu is held (any lock, read or write) so the fields being copied
+// are stable. The returned *Job can be safely handed to JSON encoders or
+// WebSocket broadcasters without racing against runJob's in-place mutations
+// of the live Job stored in m.jobs. Slice fields are deep-copied so that
+// subsequent mutations of the live job's slices can't leak through a shared
+// backing array.
+//
+// The in-flight partial-file tracker is held via partialFilesPtr, a pointer
+// that runJob reassigns (and cleanupPausedJobPartFiles nils) under the
+// per-job partialFilesMu alone — not under m.mu. This function therefore
+// holds partialFilesMu across both the shallow struct copy, whose read of
+// partialFilesPtr would otherwise race those writers (github issue #77),
+// and the deep copy of the pointed-to map. The downloader can keep mutating
+// the live map concurrently; the clone gets an independent snapshot.
+func (m *JobManager) cloneJobLocked(j *Job) *Job {
+	if j == nil {
+		return nil
+	}
+
+	// Acquire the per-job tracker mutex before the whole-struct copy:
+	// `clone := *j` below reads partialFilesPtr, whose writers (runJob's
+	// reset, cleanupPausedJobPartFiles' clear) hold only partialFilesMu.
+	// partialFilesMu can be nil for jobs constructed in tests via
+	// &Job{...} without going through CreateJob; in that case there is
+	// no tracker and no writer to synchronize with.
+	locked := j.partialFilesMu != nil
+	if locked {
+		j.partialFilesMu.Lock()
+	}
+
+	clone := *j
+	clone.cancel = nil
+	clone.partialFilesPtr = nil
+	// clone.partialFilesMu still points at the live job's mutex.
+	// Normal snapshot consumers do not need it; internal cleanup paths
+	// may acquire it to protect the cloned tracker.
+
+	// Deep-copy the in-flight tracker while partialFilesMu is still held
+	// so the snapshot is atomic with respect to writers.
+	if j.partialFilesPtr != nil {
+		cloneMap := make(map[string]struct{}, len(*j.partialFilesPtr))
+		for dst := range *j.partialFilesPtr {
+			cloneMap[dst] = struct{}{}
+		}
+		clone.partialFilesPtr = &cloneMap
+	}
+
+	if locked {
+		j.partialFilesMu.Unlock()
+	}
+
+	if j.Filters != nil {
+		clone.Filters = append([]string(nil), j.Filters...)
+	}
+	if j.Excludes != nil {
+		clone.Excludes = append([]string(nil), j.Excludes...)
+	}
+	if j.Files != nil {
+		clone.Files = append([]JobFileProgress(nil), j.Files...)
+	}
+	if j.StartedAt != nil {
+		t := *j.StartedAt
+		clone.StartedAt = &t
+	}
+	if j.EndedAt != nil {
+		t := *j.EndedAt
+		clone.EndedAt = &t
+	}
+	return &clone
+}
+
+// stringSlicesEqual reports whether two string slices contain the same
+// elements regardless of order.
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, s := range a {
+		seen[s]++
+	}
+	for _, s := range b {
+		seen[s]--
+		if seen[s] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// CreateJob creates a new download job, or returns the existing one when
+// repo, revision, dataset, destination and filters match an active job.
+// Different filters on the same repo (e.g. Q4_K_M vs mmproj-f16) create
+// independent jobs.
+//
+// The destination is resolved from the current settings at creation and
+// frozen on the job: later settings changes never move an existing job's
+// destination. Destination identity is the frozen OutputDir plus LocalRepo
+// and ExactMatch, so the same repo requested with a different frozen
+// destination, destination folder override, or matching mode creates a new
+// job.
+func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
+	reservationRetries := 0
+resolveRequest:
+	revision := req.Revision
+	if revision == "" {
+		revision = "main"
+	}
+
+	// Snapshot config under the lock so a concurrent settings update can't race
+	// these reads (UpdateConfig replaces m.config under the write lock).
+	cfg := m.snapshotConfig()
+
+	routeKey, effectiveLocalDir, outputDir, err := resolveDownloadDestination(cfg, req)
+	if err != nil {
+		return nil, false, err
+	}
+	flat := effectiveLocalDir != ""
+	hubDir := ""
+	if flat {
+		// Persist physical local destinations too: a restart from another
+		// launch directory must not reinterpret a previously relative path.
+		effectiveLocalDir, err = filepath.Abs(effectiveLocalDir)
+		if err != nil {
+			return nil, false, err
+		}
+		outputDir = effectiveLocalDir
+	} else {
+		cache := cfg.cache()
+		outputDir, hubDir = cache.Root, cache.HubDir()
+	}
+
+	// The requested destination identity for dedup purposes: the frozen
+	// output root (flat local dir when set, cache root otherwise), compared
+	// with pathIdentityKey so platform case/clean semantics match how the
+	// rest of the server compares configured paths.
+	reqDestKey := pathIdentityKey(outputDir)
+
+	// Check for existing active job with identical parameters.
+	// Deduplication is filter-aware: only match when filters and excludes
+	// are also identical, so the user can download a quantization and a
+	// vision encoder (mmproj) for the same repo at the same time.
+	//
+	// Destination identity uses the frozen OutputDir (not LocalDir):
+	// LocalDir changes meaning whenever the settings/routes change between
+	// two creations — two cache-mode jobs created under different cache
+	// roots are different destinations, and two jobs created under equal
+	// LocalDir strings but frozen into different output roots must not be
+	// collapsed when a settings change alters the effective path in
+	// between. LocalRepo and ExactMatch are part of the identity too: the
+	// former redirects where the files land (cache folder ID / subfolder),
+	// the latter selects which files match, so two requests differing in
+	// either are different downloads even when the rest matches.
+	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return nil, false, errJobManagerStopping
+	}
+	for _, existing := range m.jobs {
+		if existing.Repo == req.Repo &&
+			existing.Revision == revision &&
+			existing.IsDataset == req.Dataset &&
+			pathIdentityKey(existing.OutputDir) == reqDestKey &&
+			existing.Flat == flat &&
+			pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) &&
+			existing.LocalRepo == req.LocalRepo &&
+			existing.BranchVariant == req.BranchVariant &&
+			existing.ExactMatch == req.ExactMatch &&
+			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
+			stringSlicesEqual(existing.Filters, req.Filters) &&
+			stringSlicesEqual(existing.Excludes, req.Excludes) {
+			snapshot := m.cloneJobLocked(existing)
+			m.mu.Unlock()
+			return snapshot, true, nil
+		}
+	}
+
+	job := &Job{
+		ID:            generateID(),
+		Repo:          req.Repo,
+		Revision:      revision,
+		IsDataset:     req.Dataset,
+		Filters:       req.Filters,
+		Excludes:      req.Excludes,
+		OutputDir:     outputDir,
+		HubDir:        hubDir,
+		LocalDir:      effectiveLocalDir,
+		LocalRepo:     req.LocalRepo,
+		BranchVariant: req.BranchVariant,
+		Flat:          flat,
+		ExactMatch:    req.ExactMatch,
+		RouteKey:      routeKey,
+		Status:        JobStatusQueued,
+		CreatedAt:     time.Now(),
+		Progress:      JobProgress{},
+		// partialFilesMu is allocated at job creation so cloneJobLocked
+		// can read it without a nil check; the tracker map is left
+		// nil until runJob wires it.
+		partialFilesMu: &sync.Mutex{},
+	}
+	// Validate the exact frozen output base using the same pure constructor as
+	// the downloader before any reservation check can inspect filesystem state.
+	if jobDestinationBase(job) == "" {
+		m.mu.Unlock()
+		return nil, false, fmt.Errorf("%w: repository folder escapes its configured root", errInvalidDestination)
+	}
+	for _, scopes := range m.hfRepoReservations {
+		if hfReservationConflictsJob(scopes, job) {
+			m.mu.Unlock()
+			return nil, false, errSelectionWriterBusy
+		}
+	}
+	if len(m.deleteReservations) != 0 {
+		start := m.captureWriteDecisionLocked()
+		jobPointers := make(map[string]*Job, len(m.jobs))
+		for id, existing := range m.jobs {
+			jobPointers[id] = existing
+		}
+		// The candidate is immutable for this attempt and participates in the
+		// same deduplicated namespace inventory as existing queued/starting jobs.
+		candidate := decisionJob(job)
+		inventorySnapshot := start
+		inventorySnapshot.jobs = append(append([]writeDecisionJob(nil), start.jobs...), candidate)
+		inventory := m.writeInventory
+		if inventory == nil {
+			inventory = inventoryWritableNamespace
+		}
+		m.opWG.Add(1)
+		a := &cacheWriteAttempt{manager: m, start: start, evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), descriptors: make(map[string]writeDecisionJob), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventory}
+		var targets []string
+		for _, paths := range start.deletes {
+			targets = append(targets, frozenPhysicalPaths(paths)...)
+		}
+		m.mu.Unlock()
+
+		a.CollectSnapshot(inventorySnapshot)
+		for _, target := range targets {
+			probe, probeErr := captureWriteIdentityProbe(target, false)
+			if probeErr != nil {
+				a.failed["create-target"] = true
+				break
+			}
+			a.targets[filepath.Clean(target)] = probe
+		}
+		blocked := a.failed["create-target"] || hfReservationsBlockSnapshot(start, job) || a.HasActiveBroadMutationFor(candidate, nil)
+		for _, target := range targets {
+			if a.MayWriteDescriptor(candidate, []string{target}) {
+				blocked = true
+				break
+			}
+		}
+		probesOK := !a.failed["create-target"] && a.RevalidateProbes(targets)
+		m.mu.Lock()
+		if m.stopping {
+			a.Close()
+			m.mu.Unlock()
+			return nil, false, errJobManagerStopping
+		}
+		// Re-run dedup while still holding the commit lock even when the
+		// inventory snapshot changed; an equal concurrent admission wins.
+		for _, existing := range m.jobs {
+			if existing.Repo == req.Repo && existing.Revision == revision && existing.IsDataset == req.Dataset &&
+				pathIdentityKey(existing.OutputDir) == reqDestKey && existing.Flat == flat &&
+				pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) && existing.LocalRepo == req.LocalRepo &&
+				existing.BranchVariant == req.BranchVariant &&
+				existing.ExactMatch == req.ExactMatch && (existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
+				stringSlicesEqual(existing.Filters, req.Filters) && stringSlicesEqual(existing.Excludes, req.Excludes) {
+				a.Close()
+				snapshot := m.cloneJobLocked(existing)
+				m.mu.Unlock()
+				return snapshot, true, nil
+			}
+		}
+		unchanged := probesOK && reflect.DeepEqual(start, m.captureWriteDecisionLocked()) && reflect.DeepEqual(cfg, m.config)
+		if unchanged {
+			for id, existing := range jobPointers {
+				if m.jobs[id] != existing {
+					unchanged = false
+					break
+				}
+			}
+		}
+		a.Close()
+		if !unchanged {
+			m.mu.Unlock()
+			reservationRetries++
+			if reservationRetries < 3 {
+				goto resolveRequest
+			}
+			return nil, false, errSelectionWriterBusy
+		}
+		if blocked {
+			m.mu.Unlock()
+			return nil, false, errSelectionWriterBusy
+		}
+		m.opWG.Add(1)
+		m.jobs[job.ID] = job
+		m.signalWriteDecisionLocked()
+		m.dispatchLocked()
+		snapshot := m.cloneJobLocked(job)
+		m.mu.Unlock()
+		m.notifyListeners(snapshot)
+		m.opWG.Done()
+		return snapshot, false, nil
+	}
+
+	m.opWG.Add(1)
+	defer m.opWG.Done()
+	m.jobs[job.ID] = job
+	m.signalWriteDecisionLocked()
+	// Queue the job and let the scheduler start it only if we're under the
+	// max-active limit; otherwise it waits as 'queued'.
+	m.dispatchLocked()
+	snapshot := m.cloneJobLocked(job)
+	m.mu.Unlock()
+	m.notifyListeners(snapshot)
+
+	return snapshot, false, nil
+}
+
+// GetJob retrieves a snapshot of a job by ID. The returned pointer is a
+// standalone copy; the caller can read its fields without racing against
+// the runJob goroutine that owns the live version in m.jobs.
+func (m *JobManager) GetJob(id string) (*Job, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	job, ok := m.jobs[id]
+	if !ok {
+		return nil, false
+	}
+	return m.cloneJobLocked(job), true
+}
+
+// ListJobs returns snapshots of all jobs. Each returned *Job is an
+// independent copy — safe to JSON-encode or hand to the WebSocket hub
+// without holding any lock.
+func (m *JobManager) ListJobs() []*Job {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	jobs := make([]*Job, 0, len(m.jobs))
+	for _, job := range m.jobs {
+		jobs = append(jobs, m.cloneJobLocked(job))
+	}
+	return jobs
+}
+
+// CancelJob cancels a running or queued job.
+func (m *JobManager) CancelJob(id string) bool {
+	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return false
+	}
+	job, ok := m.jobs[id]
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+
+	if job.Status != JobStatusQueued && job.Status != JobStatusRunning && job.Status != JobStatusPaused {
+		m.mu.Unlock()
+		return false
+	}
+	m.opWG.Add(1)
+	defer m.opWG.Done()
+
+	wasPaused := job.Status == JobStatusPaused
+
+	if job.cancel != nil {
+		job.cancel()
+	}
+	job.Status = JobStatusCancelled
+	m.signalWriteDecisionLocked()
+	now := time.Now()
+	job.EndedAt = &now
+	snapshot := m.cloneJobLocked(job)
+	m.mu.Unlock()
+
+	// If the job was paused, the download goroutine has already exited and
+	// won't run its cleanup callback. Clean up partial .part files here so
+	// pause → cancel does not leak disk space. Direct-cancel jobs are
+	// already handled by the in-flight callback in runJob.
+	if wasPaused {
+		m.cleanupPausedJobPartFiles(job)
+	}
+
+	m.notifyListeners(snapshot)
+	m.saveStateAndLog()
+	return true
+}
+
+// PauseJob pauses a running job.
+func (m *JobManager) PauseJob(id string) bool {
+	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return false
+	}
+	job, ok := m.jobs[id]
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+
+	if job.Status != JobStatusRunning {
+		m.mu.Unlock()
+		return false
+	}
+	m.opWG.Add(1)
+	defer m.opWG.Done()
+
+	if job.cancel != nil {
+		job.cancel()
+	}
+	job.Status = JobStatusPaused
+	m.signalWriteDecisionLocked()
+	snapshot := m.cloneJobLocked(job)
+	m.mu.Unlock()
+
+	m.notifyListeners(snapshot)
+	m.saveStateAndLog()
+	return true
+}
+
+// ResumeJob resumes a paused job.
+func (m *JobManager) ResumeJob(id string) bool {
+	return m.restartJob(id, false)
+}
+
+// RetryJob restarts a failed or cancelled job using its original
+// parameters. The job keeps its ID but its progress is reset and it is
+// re-queued and run again. Already-downloaded files are skipped by the
+// downloader, so a retry resumes where it left off.
+func (m *JobManager) RetryJob(id string) bool {
+	return m.restartJob(id, true)
+}
+
+// restartJob admits a resume/retry transition. Selected-delete reservations
+// require filesystem inventory, so that evidence is gathered without m.mu and
+// committed only if the complete manager decision is still the one observed.
+func (m *JobManager) restartJob(id string, retry bool) bool {
+	const maxAttempts = 3
+	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return false
+	}
+	job, ok := m.jobs[id]
+	if !ok || !restartStatusAllowed(job.Status, retry) || jobDestinationBase(job) == "" {
+		m.mu.Unlock()
+		return false
+	}
+	// Register before unlocking: Close fences new work then drains this
+	// operation, including inventory collection and any revalidation retry.
+	m.opWG.Add(1)
+	m.mu.Unlock()
+	defer m.opWG.Done()
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		m.mu.Lock()
+		if m.stopping {
+			m.mu.Unlock()
+			return false
+		}
+		job, ok = m.jobs[id]
+		if !ok || !restartStatusAllowed(job.Status, retry) || jobDestinationBase(job) == "" {
+			m.mu.Unlock()
+			return false
+		}
+		if len(m.deleteReservations) == 0 {
+			if m.jobBlockedByDeleteLocked(job) {
+				m.mu.Unlock()
+				return false
+			}
+			snapshot := resetAndQueueRestartLocked(m, job, retry)
+			m.mu.Unlock()
+			m.notifyListeners(snapshot)
+			return true
+		}
+
+		start := m.captureWriteDecisionLocked()
+		pointers := make(map[string]*Job, len(m.jobs))
+		for jobID, existing := range m.jobs {
+			pointers[jobID] = existing
+		}
+		cfg := m.config
+		candidate := decisionJob(job)
+		// resetAndQueueRestartLocked retires the current generation, so the
+		// admitted retry will be queued under the next generation. Evaluate
+		// admission against that upcoming identity; otherwise a complete plan
+		// retained by the finished run could prove a negative for a destination
+		// this restart may write.
+		candidate.generation++
+		candidate.status = JobStatusQueued
+		candidate.starting = false
+		inventorySnapshot := start
+		inventorySnapshot.jobs = append(append([]writeDecisionJob(nil), start.jobs...), candidate)
+		targets := make([]string, 0)
+		for _, paths := range start.deletes {
+			targets = append(targets, frozenPhysicalPaths(paths)...)
+		}
+		inventory := m.writeInventory
+		if inventory == nil {
+			inventory = inventoryWritableNamespace
+		}
+		// The attempt owns a separate reference because cacheWriteAttempt.Close
+		// releases it on every success, rejection, and retry path.
+		m.opWG.Add(1)
+		m.mu.Unlock()
+
+		a := &cacheWriteAttempt{manager: m, start: start, evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), descriptors: make(map[string]writeDecisionJob), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventory}
+		a.CollectSnapshot(inventorySnapshot)
+		blocked := a.HasActiveBroadMutationFor(candidate, nil) || hfReservationsBlockSnapshot(start, job)
+		for _, target := range targets {
+			if a.MayWriteDescriptor(candidate, []string{target}) {
+				blocked = true
+			}
+		}
+		probesOK := a.RevalidateProbes(targets)
+
+		m.mu.Lock()
+		if m.stopping {
+			a.Close()
+			m.mu.Unlock()
+			return false
+		}
+		current, exists := m.jobs[id]
+		if !exists || !restartStatusAllowed(current.Status, retry) || jobDestinationBase(current) == "" {
+			a.Close()
+			m.mu.Unlock()
+			return false
+		}
+		if current != pointers[id] {
+			a.Close()
+			m.mu.Unlock()
+			continue // The same eligible job was replaced; inventory its new state.
+		}
+		unchanged := probesOK && reflect.DeepEqual(start, m.captureWriteDecisionLocked()) && reflect.DeepEqual(cfg, m.config)
+		if unchanged {
+			for jobID, pointer := range pointers {
+				if m.jobs[jobID] != pointer {
+					unchanged = false
+					break
+				}
+			}
+		}
+		a.Close()
+		if !unchanged {
+			m.mu.Unlock()
+			continue // A fresh attempt gets fresh reservation and filesystem evidence.
+		}
+		if blocked {
+			m.mu.Unlock()
+			return false
+		}
+		snapshot := resetAndQueueRestartLocked(m, current, retry)
+		m.mu.Unlock()
+		m.notifyListeners(snapshot)
+		return true
+	}
+	return false
+}
+
+func restartStatusAllowed(status JobStatus, retry bool) bool {
+	if retry {
+		return status == JobStatusFailed || status == JobStatusCancelled
+	}
+	return status == JobStatusPaused
+}
+
+func resetAndQueueRestartLocked(m *JobManager, job *Job, retry bool) *Job {
+	// Retire the finished run's identity before the job can be dispatched
+	// again. A run activity retains the generation claimed by the run it
+	// describes; leaving a retry/resume on that generation would let the
+	// finished run's known complete plan prove a negative for destinations
+	// the new run may still write. runJob advances again when it actually
+	// claims the new generation.
+	job.generation++
+	job.Status = JobStatusQueued
+	m.signalWriteDecisionLocked()
+	if retry {
+		job.Error = ""
+		job.EndedAt = nil
+		// Retry is a clean restart from zero; the downloader re-scans and
+		// reports all files, so there is no resume floor.
+		job.Progress = JobProgress{}
+		job.resumeFloor = 0
+	} else {
+		// Keep the visible byte estimate until the next run reports its
+		// on-disk progress while rebuilding file totals from a fresh scan.
+		oldBytes := job.Progress.DownloadedBytes
+		job.Progress = JobProgress{}
+		job.Progress.DownloadedBytes = oldBytes
+		job.resumeFloor = oldBytes
+	}
+	job.Files = nil
+	snapshot := m.cloneJobLocked(job)
+	m.dispatchLocked()
+	return snapshot
+}
+
+// DeleteJob removes a job from the list.
+func (m *JobManager) DeleteJob(id string) bool {
+	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return false
+	}
+
+	job, ok := m.jobs[id]
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+	m.opWG.Add(1)
+
+	if job.cancel != nil && (job.Status == JobStatusQueued || job.Status == JobStatusRunning) {
+		job.cancel()
+	}
+
+	delete(m.jobs, id)
+	m.signalWriteDecisionLocked()
+	m.mu.Unlock()
+	m.opWG.Done()
+	return true
+}
+
+// WaitAll blocks until every in-flight runJob goroutine has returned or
+// until timeout elapses. Returns true if all goroutines exited cleanly,
+// false on timeout. Primarily for tests and graceful shutdown — lets
+// callers observe actual goroutine exit rather than just Status==Cancelled,
+// which is set before the downloader's filesystem operations fully unwind.
+func (m *JobManager) WaitAll(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		m.runWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// DismissJobResult distinguishes the three possible outcomes of a dismiss
+// attempt so the HTTP layer can map them to appropriate status codes.
+type DismissJobResult int
+
+const (
+	// DismissJobOK means the job was in a terminal state and has been removed.
+	DismissJobOK DismissJobResult = iota
+	// DismissJobNotFound means no job with that ID exists.
+	DismissJobNotFound
+	// DismissJobStillActive means the job is queued or running; it must be
+	// cancelled first (or completed) before it can be dismissed.
+	DismissJobStillActive
+)
+
+// DismissJob removes a job from the manager if and only if it is in a
+// terminal state (completed, failed, cancelled, paused). Dismissal is the
+// user's way of hiding a finished job from the UI permanently, and the
+// guarantee that matters for github issue #68 is that the job does not
+// come back on the next page refresh — so the underlying storage drops it.
+// Dismissing a queued or running job is rejected so a stray click can't
+// wipe a live download.
+func (m *JobManager) DismissJob(id string) bool {
+	res, _ := m.DismissJobResult(id)
+	return res == DismissJobOK
+}
+
+// DismissJobResult is the richer variant of DismissJob that returns the
+// reason a dismissal failed, for use by the HTTP handler.
+func (m *JobManager) DismissJobResult(id string) (DismissJobResult, *Job) {
+	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return DismissJobNotFound, nil
+	}
+	job, ok := m.jobs[id]
+	if !ok {
+		m.mu.Unlock()
+		return DismissJobNotFound, nil
+	}
+	if !isTerminalJobStatus(job.Status) {
+		snapshot := m.cloneJobLocked(job)
+		m.mu.Unlock()
+		return DismissJobStillActive, snapshot
+	}
+	wasPaused := job.Status == JobStatusPaused
+	m.opWG.Add(1)
+	snapshot := m.cloneJobLocked(job)
+	delete(m.jobs, id)
+	m.signalWriteDecisionLocked()
+	m.mu.Unlock()
+	defer m.opWG.Done()
+
+	// A dismissed paused job is a pure data-loss event: the runJob goroutine
+	// has already exited, so no in-flight cleanup will run, and the user
+	// can't resume a job that's no longer in the map. Remove partial
+	// files now so they don't pile up across many dismissed jobs.
+	if wasPaused {
+		m.cleanupPausedJobPartFiles(snapshot)
+	}
+
+	return DismissJobOK, snapshot
+}
+
+// Subscribe adds a listener for job updates.
+func (m *JobManager) Subscribe() chan *Job {
+	ch := make(chan *Job, 100)
+	m.listenerMu.Lock()
+	m.listeners = append(m.listeners, ch)
+	m.listenerMu.Unlock()
+	return ch
+}
+
+// Unsubscribe removes a listener.
+func (m *JobManager) Unsubscribe(ch chan *Job) {
+	m.listenerMu.Lock()
+	defer m.listenerMu.Unlock()
+
+	for i, listener := range m.listeners {
+		if listener == ch {
+			m.listeners = append(m.listeners[:i], m.listeners[i+1:]...)
+			close(ch)
+			return
+		}
+	}
+}
+
+// notifyListeners forwards an already-snapshotted job update to channel
+// listeners and the WebSocket broadcast path. The caller MUST pass in a
+// snapshot (produced by cloneJobLocked while holding m.mu) — this function
+// does not take m.mu itself, so it is safe to call from sites that already
+// hold m.mu.Lock() (like CancelJob / PauseJob with a deferred unlock).
+func (m *JobManager) notifyListeners(snapshot *Job) {
+	// Notify channel listeners (tests and other internal subscribers see
+	// every raw update; only the WebSocket path is throttled).
+	m.listenerMu.RLock()
+	for _, ch := range m.listeners {
+		select {
+		case ch <- snapshot:
+		default:
+			// Listener is slow, skip
+		}
+	}
+	m.listenerMu.RUnlock()
+
+	// Broadcast to WebSocket clients through the per-job coalescer so the
+	// browser isn't asked to re-render at 5Hz × file-count.
+	if m.wsCoalescer != nil {
+		m.wsCoalescer.schedule(snapshot)
+	} else if m.wsHub != nil {
+		m.wsHub.BroadcastJob(snapshot)
+	}
+}
+
+// effectiveMaxActive returns the configured limit on how many download jobs
+// may run at once, with a sane fallback when the setting is unset.
+func (m *JobManager) effectiveMaxActive() int {
+	if m.config.MaxActive > 0 {
+		return m.config.MaxActive
+	}
+	return 3
+}
+
+// activeCounts returns how many jobs occupy an active slot and how many are
+// waiting in the queue.
+//
+// It uses the same notion of an active job as the dispatcher: a job that was
+// dispatched to a runner but is not marked running yet still occupies a slot,
+// so counting only the running status would under-report the load while a
+// download is starting up.
+func (m *JobManager) activeCounts() (running, queued int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, j := range m.jobs {
+		switch {
+		case j.Status == JobStatusRunning || j.starting:
+			running++
+		case j.Status == JobStatusQueued:
+			queued++
+		}
+	}
+	return running, queued
+}
+
+// dispatchLocked starts queued jobs (oldest first) until the number of
+// running-or-starting jobs reaches the max-active limit. It is the single
+// gate through which jobs become active, so the concurrent-download count
+// always respects the setting. Caller MUST hold m.mu.
+func (m *JobManager) dispatchLocked() {
+	if m.fenced {
+		return
+	}
+	limit := m.effectiveMaxActive()
+
+	active := 0
+	var queued []*Job
+	for _, j := range m.jobs {
+		if j.Status == JobStatusRunning || j.starting {
+			active++
+		} else if j.Status == JobStatusQueued {
+			queued = append(queued, j)
+		}
+	}
+	if active >= limit || len(queued) == 0 {
+		return
+	}
+	// Namespace inventories can walk large cache trees. Keep those walks off
+	// the manager lock while a selected-delete lease is present.
+	if len(m.deleteReservations) != 0 {
+		m.dispatchPending = true
+		if !m.dispatchRunning && !m.stopping {
+			m.dispatchRunning = true
+			m.opWG.Add(1)
+			go m.dispatchWithReservations()
+		} else if m.dispatchRunning {
+			// A request can arrive after the worker's final locked check but
+			// before it parks on the captured change channel.
+			m.signalWriteDecisionLocked()
+		}
+		return
+	}
+
+	// Oldest first, so downloads start in the order they were added.
+	sort.Slice(queued, func(a, b int) bool {
+		return queued[a].CreatedAt.Before(queued[b].CreatedAt)
+	})
+
+	for _, j := range queued {
+		if active >= limit {
+			break
+		}
+		// Restored legacy state can contain destinations that new requests
+		// reject. Do not inspect or dispatch such a job; keep FIFO ordering and
+		// leave its saved state available for explicit repair.
+		if jobDestinationBase(j) == "" {
+			break
+		}
+		// Preserve FIFO: a reservation can hold its matching oldest queued job,
+		// but the scheduler must not route around it to start a younger job.
+		if m.jobBlockedByDeleteLocked(j) {
+			break
+		}
+		j.starting = true
+		m.runWG.Add(1)
+		activityID := m.registerRunActivityLocked(j)
+		go m.runJob(j, activityID)
+		active++
+	}
+}
+
+// dispatchWithReservations serializes reservation-sensitive scheduler scans.
+// It claims only the oldest FIFO prefix after collecting evidence off-lock.
+func (m *JobManager) dispatchWithReservations() {
+	defer m.opWG.Done()
+	retries := 0
+	lastChance := false
+	for {
+		m.mu.Lock()
+		if m.stopping || m.fenced {
+			m.finishDispatchLocked()
+			m.mu.Unlock()
+			return
+		}
+		m.dispatchPending = false
+		change := m.writeDecisionChanged
+		jobPointers := make(map[string]*Job, len(m.jobs))
+		for id, job := range m.jobs {
+			jobPointers[id] = job
+		}
+		m.opWG.Add(1)
+		inventory := m.writeInventory
+		if inventory == nil {
+			inventory = inventoryWritableNamespace
+		}
+		a := &cacheWriteAttempt{manager: m, start: m.captureWriteDecisionLocked(), evidence: make(map[string]selectedWriteEvidence), failed: make(map[string]bool), descriptors: make(map[string]writeDecisionJob), probes: make(map[string]writeIdentityProbe), targets: make(map[string]writeIdentityProbe), inventory: inventory}
+		snapshot := a.start
+		var targets []string
+		for _, scopes := range snapshot.deletes {
+			targets = append(targets, frozenPhysicalPaths(scopes)...)
+		}
+		m.mu.Unlock()
+
+		a.CollectSnapshot(snapshot)
+		for _, target := range targets {
+			probe, err := captureWriteIdentityProbe(target, false)
+			if err != nil {
+				a.failed["dispatch-target"] = true
+				break
+			}
+			a.targets[filepath.Clean(target)] = probe
+		}
+		blocked := make(map[string]bool)
+		for _, job := range snapshot.jobs {
+			if job.status == JobStatusQueued {
+				if a.HasActiveBroadMutationFor(job, nil) {
+					blocked[job.id] = true
+					continue
+				}
+				for _, target := range targets {
+					if a.MayWriteDescriptor(job, []string{target}) {
+						blocked[job.id] = true
+						break
+					}
+				}
+			}
+		}
+		probesOK := !a.failed["dispatch-target"] && a.RevalidateProbes(targets)
+		select {
+		case <-change:
+			retries = 0
+			lastChance = false
+		default:
+		}
+		a.Close()
+
+		m.mu.Lock()
+		if m.stopping || m.fenced {
+			m.finishDispatchLocked()
+			m.mu.Unlock()
+			return
+		}
+		current := m.captureWriteDecisionLocked()
+		unchanged := probesOK && reflect.DeepEqual(snapshot, current)
+		if unchanged {
+			for _, descriptor := range snapshot.jobs {
+				if m.jobs[descriptor.id] != jobPointers[descriptor.id] {
+					unchanged = false
+					break
+				}
+			}
+		}
+		if unchanged && len(current.deletes) == 0 {
+			// The final selected-delete lease was released during collection.
+			// Return to the ordinary locked path, which also enforces HF leases.
+			m.finishDispatchLocked()
+			m.dispatchPending = false
+			m.dispatchLocked()
+			m.mu.Unlock()
+			return
+		}
+		if unchanged {
+			retries = 0
+			lastChance = false
+			// All requests observed before this locked snapshot are represented
+			// by the complete ordered queue captured above.
+			m.dispatchPending = false
+			limit := m.effectiveMaxActive()
+			active := 0
+			var queued []*Job
+			for _, j := range m.jobs {
+				if j.Status == JobStatusRunning || j.starting {
+					active++
+				} else if j.Status == JobStatusQueued {
+					queued = append(queued, j)
+				}
+			}
+			sort.Slice(queued, func(i, j int) bool { return queued[i].CreatedAt.Before(queued[j].CreatedAt) })
+			for _, j := range queued {
+				if active >= limit {
+					break
+				}
+				if jobDestinationBase(j) == "" || blocked[j.ID] || hfReservationsBlockSnapshot(current, j) {
+					break
+				}
+				j.starting = true
+				m.runWG.Add(1)
+				activityID := m.registerRunActivityLocked(j)
+				go m.runJob(j, activityID)
+				active++
+			}
+		}
+		if !unchanged && !m.stopping && !m.fenced {
+			m.dispatchPending = false
+			// A signaled transition was captured atomically with this snapshot;
+			// stale manager state or probe-only mismatch gets bounded retries.
+			retries++
+			if retries < 3 {
+				m.mu.Unlock()
+				continue
+			}
+			if !lastChance {
+				// One final scan from the newest state handles a burst of
+				// changes without allowing unbounded revalidation spinning.
+				lastChance = true
+				retries = 0
+				m.mu.Unlock()
+				continue
+			}
+			waitForChange := m.writeDecisionChanged
+			m.mu.Unlock()
+			<-waitForChange
+			retries = 0
+			lastChance = false
+			continue
+		}
+		m.finishDispatchLocked()
+		m.mu.Unlock()
+		return
+	}
+}
+
+func (m *JobManager) finishDispatchLocked() {
+	m.dispatchRunning = false
+	m.signalWriteDecisionLocked()
+}
+
+// enforceLimitLocked re-queues the most-recently-started running jobs when the
+// active count exceeds a lowered max-active limit, so reducing the setting
+// actually reduces the number of concurrent downloads. Older (more-progressed)
+// downloads are kept running; the rest go back to 'queued' and the dispatcher
+// restarts them automatically as slots free up. Caller MUST hold m.mu.
+func (m *JobManager) enforceLimitLocked() ([]context.CancelFunc, []*Job) {
+	limit := m.effectiveMaxActive()
+
+	var running []*Job
+	for _, j := range m.jobs {
+		if j.Status == JobStatusRunning {
+			running = append(running, j)
+		}
+	}
+	if len(running) <= limit {
+		return nil, nil
+	}
+
+	// Newest-started first, so the longest-running downloads keep going.
+	sort.Slice(running, func(a, b int) bool {
+		ta, tb := running[a].StartedAt, running[b].StartedAt
+		if ta == nil || tb == nil {
+			return false
+		}
+		return ta.After(*tb)
+	})
+
+	var cancels []context.CancelFunc
+	var snapshots []*Job
+	for i := 0; i < len(running)-limit; i++ {
+		j := running[i]
+		if j.cancel != nil {
+			cancels = append(cancels, j.cancel)
+		}
+		// Re-queue (not pause) so the dispatcher auto-starts it again once a
+		// slot frees. Bump the generation so the in-flight runJob recognizes
+		// it has been superseded and stops without marking a terminal status.
+		j.generation++
+		j.starting = false
+		j.Status = JobStatusQueued
+		snapshots = append(snapshots, m.cloneJobLocked(j))
+	}
+	return cancels, snapshots
+}
+
+// UpdateConfig replaces the manager's config (called when settings change),
+// re-queues any running jobs above a lowered max-active limit, then starts any
+// queued jobs that a raised limit now allows.
+func (m *JobManager) UpdateConfig(cfg Config) {
+	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		jobsLog.Warn("ignoring job manager config update while stopping")
+		return
+	}
+	// Startup storage ENV/defaults are immutable across config snapshots;
+	// preserve them so a settings update never re-reads ambient ENV.
+	cfg.cacheEnv = m.config.cacheEnv
+	m.opWG.Add(1)
+	m.config = cfg
+	m.bumpWriteDecisionLocked()
+	if m.speedLimiter != nil {
+		m.speedLimiter.SetLimit(hfdownloader.ParseSize(cfg.MaxSpeed))
+	}
+	cancels, snapshots := m.enforceLimitLocked()
+	m.dispatchLocked()
+	m.mu.Unlock()
+	defer m.opWG.Done()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	for _, snapshot := range snapshots {
+		m.notifyListeners(snapshot)
+	}
+}
+
+// snapshotConfig returns a copy of the manager's config taken under the read
+// lock. Job runners use this instead of touching m.config directly: a settings
+// update (UpdateConfig) replaces m.config under the write lock, so an unguarded
+// read from a runJob goroutine would be a data race. The copy shares the
+// *ProxyConfig pointer, which is safe because handleUpdateSettings replaces that
+// pointer (copy-on-write) rather than mutating its target.
+func (m *JobManager) snapshotConfig() Config {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.config
+}
+
+// speedWindow is how far back the windowed average looks. Progress at the
+// application level is bursty (part-file stats, chunked reads), so the window
+// must be long enough to average the bursts out, the way the OS smooths its
+// network-adapter graph.
+const speedWindow = 10 * time.Second
+
+// updateJobSpeed recomputes BytesPerSecond from the cumulative bytes
+// transferred this run (skipped/already-present bytes excluded). The rate is
+// averaged over a sliding speedWindow, then blended into the previous reading
+// with a mild EMA — the windowed average alone still jitters as old samples
+// fall off the window, and that jitter makes the displayed speed (and any ETA
+// derived from it) jump around. Samples are throttled to a few per second so
+// the window stays small. now is passed in for deterministic testing.
+func updateJobSpeed(job *Job, transferred int64, now time.Time) {
+	if n := len(job.speedSamples); n > 0 && now.Sub(job.speedSamples[n-1].t) < 400*time.Millisecond {
+		return
+	}
+	if len(job.speedSamples) == 0 {
+		job.speedRunStart = now
+	}
+	// Drop samples older than the window, then add the current one.
+	cutoff := now.Add(-speedWindow)
+	kept := make([]speedSample, 0, len(job.speedSamples)+1)
+	for _, s := range job.speedSamples {
+		if s.t.After(cutoff) {
+			kept = append(kept, s)
+		}
+	}
+	kept = append(kept, speedSample{t: now, bytes: transferred})
+	job.speedSamples = kept
+
+	oldest := kept[0]
+	span := now.Sub(oldest.t).Seconds()
+	if span >= 1.0 {
+		rate := float64(transferred-oldest.bytes) / span
+		if rate < 0 {
+			rate = 0
+		}
+		if prev := job.Progress.BytesPerSecond; prev > 0 {
+			rate = 0.7*float64(prev) + 0.3*rate
+		}
+		job.Progress.BytesPerSecond = int64(rate)
+	}
+	updateJobETA(job, transferred, now)
+}
+
+// updateJobETA recomputes EtaSeconds. The predictor is mostly the whole-run
+// average rate (transferred / elapsed) — for remaining-time estimation the
+// long-run average is far steadier than the displayed speed, the way curl and
+// rsync compute their ETAs — blended with a little of the current smoothed
+// speed so a genuine, lasting throughput change still pulls the estimate over.
+func updateJobETA(job *Job, transferred int64, now time.Time) {
+	remaining := job.Progress.TotalBytes - job.Progress.DownloadedBytes
+	elapsed := now.Sub(job.speedRunStart).Seconds()
+	if remaining <= 0 || elapsed < 1.0 || transferred <= 0 {
+		job.Progress.EtaSeconds = 0
+		return
+	}
+	runAvg := float64(transferred) / elapsed
+	predictor := 0.7*runAvg + 0.3*float64(job.Progress.BytesPerSecond)
+	if predictor <= 0 {
+		job.Progress.EtaSeconds = 0
+		return
+	}
+	job.Progress.EtaSeconds = int64(float64(remaining)/predictor + 0.5)
+}
+
+// applyJobProgress folds one downloader progress event into the job's
+// aggregate state. The caller must hold the manager lock. now feeds the
+// speed/ETA estimators and is passed in for deterministic testing.
+func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
+	switch evt.Event {
+	case "plan_item":
+		job.Progress.TotalFiles++
+		job.Progress.TotalBytes += evt.Total
+		job.Files = append(job.Files, JobFileProgress{
+			Path:       evt.Path,
+			TotalBytes: evt.Total,
+			Status:     "pending",
+		})
+
+	case "file_start":
+		for i := range job.Files {
+			if job.Files[i].Path == evt.Path {
+				job.Files[i].Status = "active"
+				break
+			}
+		}
+
+	case "file_progress":
+		for i := range job.Files {
+			if job.Files[i].Path == evt.Path {
+				if !job.Files[i].progressed {
+					// First real progress for this file: record the bytes
+					// already on disk (resume position) so they aren't
+					// counted toward the live transfer speed.
+					job.Files[i].progressed = true
+					job.Files[i].baseDownloaded = evt.Downloaded
+				}
+				job.Files[i].Downloaded = evt.Downloaded
+				break
+			}
+		}
+		// total drives the progress bar (includes skipped/already-present
+		// bytes); transferred drives the speed (only bytes moved this run).
+		// During the resume-recovery window (resumeFloor > 0) the running
+		// sum under-counts because plan_item has already added the full
+		// file list but only the one processed file has Downloaded > 0,
+		// which would clobber the value ResumeJob preserved. The
+		// monotonic guard keeps the preserved value on screen until the
+		// sum catches up, at which point the floor is released and a
+		// genuine rollback (e.g. downloadSingle's 200 fallback on a
+		// range request truncating the .part file) propagates immediately.
+		var total, transferred int64
+		for _, f := range job.Files {
+			total += f.Downloaded
+			if f.progressed {
+				transferred += f.Downloaded - f.baseDownloaded
+			}
+		}
+		if job.resumeFloor > 0 {
+			if total > job.Progress.DownloadedBytes {
+				job.Progress.DownloadedBytes = total
+			}
+			if total >= job.resumeFloor {
+				job.resumeFloor = 0
+			}
+		} else {
+			job.Progress.DownloadedBytes = total
+		}
+		updateJobSpeed(job, transferred, now)
+
+	case "file_finalizing":
+		// The file's bytes are all on disk; part assembly, hash verification
+		// and the cache store are running — minutes of local I/O for a large
+		// model, with no further file_progress events.
+		for i := range job.Files {
+			if job.Files[i].Path == evt.Path {
+				job.Files[i].Status = "finalizing"
+				break
+			}
+		}
+		// Once no file is left downloading, the whole job is in local
+		// post-processing: surface the phase and stop showing the stale
+		// speed/ETA from the last transfer window.
+		downloading := false
+		for _, f := range job.Files {
+			if f.Status == "active" || f.Status == "pending" {
+				downloading = true
+				break
+			}
+		}
+		if !downloading {
+			job.Phase = "finalizing"
+			job.Progress.BytesPerSecond = 0
+			job.Progress.EtaSeconds = 0
+		}
+
+	case "file_done":
+		for i := range job.Files {
+			if job.Files[i].Path == evt.Path {
+				job.Files[i].Status = "complete"
+				job.Files[i].Downloaded = job.Files[i].TotalBytes
+				break
+			}
+		}
+		job.Progress.CompletedFiles++
+		// Recalculate total downloaded (skipped/completed files included).
+		// Speed is intentionally not updated here: a skipped file emits only
+		// file_done, and counting its full size would spike the reading.
+		// Monotonic guard is scoped to the resume-recovery window — see
+		// file_progress for the rationale.
+		var total int64
+		for _, f := range job.Files {
+			total += f.Downloaded
+		}
+		if job.resumeFloor > 0 {
+			if total > job.Progress.DownloadedBytes {
+				job.Progress.DownloadedBytes = total
+			}
+			if total >= job.resumeFloor {
+				job.resumeFloor = 0
+			}
+		} else {
+			job.Progress.DownloadedBytes = total
+		}
+
+	case "finalizing":
+		// Download is done; post-processing (friendly view, manifest) runs.
+		job.Phase = "finalizing"
+		job.Progress.BytesPerSecond = 0
+		job.Progress.EtaSeconds = 0
+	}
+}
+
+func (m *JobManager) runJob(job *Job, activityID uint64) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		if activityID != 0 {
+			m.mu.Lock()
+			delete(m.runActivities, activityID)
+			m.bumpWriteDecisionLocked()
+			m.dispatchLocked()
+			m.mu.Unlock()
+		}
+		m.runWG.Done()
+	}()
+
+	m.mu.Lock()
+	if m.fenced {
+		job.starting = false
+		m.mu.Unlock()
+		return
+	}
+	job.cancel = cancel
+	job.generation++
+	myGeneration := job.generation // Track which generation we are
+	job.Status = JobStatusRunning
+	job.starting = false
+	m.signalWriteDecisionLocked()
+	job.Phase = ""
+	now := time.Now()
+	job.StartedAt = &now
+	// Reset the speed window so this run measures only its own throughput.
+	job.speedSamples = nil
+	startSnap := m.cloneJobLocked(job)
+	m.mu.Unlock()
+	m.notifyListeners(startSnap)
+
+	dlJob := hfdownloader.Job{
+		Repo:               job.Repo,
+		Revision:           job.Revision,
+		IsDataset:          job.IsDataset,
+		Filters:            job.Filters,
+		Excludes:           job.Excludes,
+		ExactMatch:         job.ExactMatch,
+		AppendFilterSubdir: false,
+		LocalRepo:          job.LocalRepo,
+		BranchVariant:      job.BranchVariant,
+	}
+
+	// Snapshot the manager config under the lock: a concurrent POST /api/settings
+	// (UpdateConfig) replaces m.config, so reading the fields directly here would
+	// be a data race.
+	cfg := m.snapshotConfig()
+
+	cache := jobCache(cfg, job)
+
+	settings := hfdownloader.Settings{
+		CacheDir:           cache.Root,
+		HubDir:             cache.HubDir(),
+		Concurrency:        cfg.Concurrency,
+		MaxActiveDownloads: cfg.MaxActive,
+		Token:              cfg.Token,
+		MultipartThreshold: cfg.MultipartThreshold,
+		Verify:             cfg.Verify,
+		Retries:            cfg.Retries,
+		StallTimeout:       cfg.StallTimeout,
+		Endpoint:           cfg.Endpoint,
+		Proxy:              cfg.Proxy,
+		MaxSpeed:           cfg.MaxSpeed,
+		SpeedLimiter:       m.speedLimiter,
+	}
+
+	// When the downloader's context is cancelled, check whether this was
+	// an explicit cancel (user clicked Cancel) vs a pause or limit-enforce.
+	// Only explicit cancels and deleted jobs should delete partial .part
+	// files; pauses and re-queues must preserve them for resume.
+	settings.CleanupPartialsOnCancel = func() bool {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		_, active := m.jobs[job.ID]
+		return job.Status == JobStatusCancelled || !active
+	}
+
+	// Reset the per-job in-flight file set for this run. The downloader
+	// calls this back from per-file goroutines to register every dst it
+	// touches and to deregister each one once the file is finalized.
+	// After Download() returns, the set contains exactly the dsts of
+	// files that are still partial on disk for this job — which is the
+	// set cleanupPausedJobPartFiles needs to remove precisely, without
+	// disturbing a concurrent job that is downloading into the same
+	// blobs directory or output subtree.
+	//
+	// We lock partialFilesMu (not m.mu) to swap the pointer, because
+	// the callback captures the same mutex and any concurrent
+	// allocate or finalize call from a still-running per-file
+	// goroutine is using the same lock. The pointer indirection
+	// (partialFilesPtr) lets cloneJobLocked snapshot the pointer
+	// under partialFilesMu and then deep-copy the pointed-to map
+	// under the same lock, while the downloader callback can
+	// continue to mutate the same map through the pointer.
+	//
+	// partialFilesMu is allocated in CreateJob and in the
+	// state-restore path, so by the time runJob runs the pointer
+	// is stable — we don't write it here. The callback (and the
+	// cleanupPausedJobPartFiles path) treat a nil pointer as
+	// "stale, ignore", so a race where the cleanup runs after
+	// runJob has finished is benign.
+	newMap := make(map[string]struct{})
+	job.partialFilesMu.Lock()
+	job.partialFilesPtr = &newMap
+	job.partialFilesMu.Unlock()
+	settings.OnPartialFile = func(dst string, finalize bool) {
+		job.partialFilesMu.Lock()
+		defer job.partialFilesMu.Unlock()
+		if job.partialFilesPtr == nil {
+			// Defensive: if a stale callback fires after the pointer
+			// was cleared (e.g. cleanupPausedJobPartFiles nilled it,
+			// or a goroutine that started before this run's reset
+			// finishes its allocate/finalize call), ignore it.
+			return
+		}
+		if finalize {
+			delete(*job.partialFilesPtr, dst)
+		} else {
+			(*job.partialFilesPtr)[dst] = struct{}{}
+		}
+	}
+
+	// Local mode: write real files into job.LocalDir instead of the HF cache
+	// layout. job.LocalDir is already resolved (per-request or server-global).
+	// Clearing CacheDir forces flat-file output.
+	if job.LocalDir != "" {
+		settings.OutputDir = job.LocalDir
+		settings.CacheDir = ""
+		settings.HubDir = ""
+	}
+	settings.OnPlanComplete = func(plan hfdownloader.Plan) {
+		paths, complete := jobPlannedWriteEntries(job, plan)
+		planned, frozenComplete := plannedDestinationSet(paths)
+		complete = complete && frozenComplete
+		m.mu.Lock()
+		if activity := m.runActivities[activityID]; activity != nil {
+			activity.planned = planned
+			activity.planKnown = true
+			activity.planComplete = complete
+			m.signalWriteDecisionLocked()
+		}
+		m.mu.Unlock()
+	}
+
+	// Progress callback - NOTE: must not hold lock when calling notifyListeners
+	progressFunc := func(evt hfdownloader.ProgressEvent) {
+		m.mu.Lock()
+		applyJobProgress(job, evt, time.Now())
+		progressSnap := m.cloneJobLocked(job)
+		m.mu.Unlock() // Unlock BEFORE notifying to avoid deadlock
+		m.notifyListeners(progressSnap)
+	}
+
+	err := hfdownloader.Run(ctx, dlJob, settings, progressFunc)
+
+	m.mu.Lock()
+	// Don't update status if:
+	// 1. Job was paused (user intentionally stopped it)
+	// 2. We're a stale goroutine (a newer runJob has started)
+	if job.Status == JobStatusPaused || job.generation != myGeneration {
+		// A paused job has freed its slot, so let the next queued job start.
+		// On a generation mismatch a newer runJob owns the slot — don't.
+		if job.generation == myGeneration {
+			m.dispatchLocked()
+		}
+		m.mu.Unlock()
+		return
+	}
+	endTime := time.Now()
+	job.EndedAt = &endTime
+	if ctx.Err() != nil {
+		job.Status = JobStatusCancelled
+	} else if err != nil {
+		job.Status = JobStatusFailed
+		job.Error = err.Error()
+	} else {
+		job.Status = JobStatusCompleted
+	}
+	m.signalWriteDecisionLocked()
+	endSnap := m.cloneJobLocked(job)
+	// This job finished and freed a slot; start the next queued job.
+	m.dispatchLocked()
+	m.mu.Unlock()
+
+	m.notifyListeners(endSnap)
+
+	// Persist state and record completed/failed jobs in history
+	m.saveStateAndLog()
+	if endSnap.Status == JobStatusCompleted || endSnap.Status == JobStatusFailed {
+		go func() {
+			if err := AppendHistory(endSnap); err != nil {
+				jobsLog.Warn("could not append history", "error", err, "job_id", endSnap.ID)
+			}
+		}()
+	}
+}
+
+// cleanupPausedJobPartFiles removes partial .part files for a job whose
+// runJob goroutine has already exited (paused jobs whose downloader
+// goroutine returned without doing cleanup). The downloader's in-flight
+// cleanup callback cannot reach these files because the goroutine is
+// gone, so the server performs the cleanup itself using the same path
+// resolution the downloader would have used.
+//
+// Used by CancelJob (pause → cancel) and DismissJobResult (pause →
+// dismiss). All errors are best-effort: missing directories and per-file
+// removal failures are logged and skipped inside CleanupJobPartFiles.
+//
+// dsts comes from the per-job in-flight tracker populated by
+// Settings.OnPartialFile during the most recent runJob. If the
+// tracker is empty (e.g. the run was short and the downloader
+// never got to register any dsts, or every dst was finalized
+// successfully), cleanup is a no-op.
+func (m *JobManager) cleanupPausedJobPartFiles(job *Job) {
+	dsts := m.snapshotPartialFiles(job)
+	// Clear the tracker before deleting the files so a stale callback
+	// (one that fires from a goroutine that was still mid-call when we
+	// snapshotted) cannot add the dst back to the map after we've
+	// already decided to delete it. The downloader guard inside the
+	// callback treats a nil pointer as "stale, ignore". nil
+	// partialFilesMu (e.g. for jobs constructed in tests without
+	// going through CreateJob) is a no-op.
+	if job.partialFilesMu != nil {
+		job.partialFilesMu.Lock()
+		job.partialFilesPtr = nil
+		job.partialFilesMu.Unlock()
+	}
+	if len(dsts) == 0 {
+		return
+	}
+	cfg := m.snapshotConfig()
+	cache := jobCache(cfg, job)
+	settings := hfdownloader.Settings{
+		CacheDir: cache.Root,
+		HubDir:   cache.HubDir(),
+	}
+	if job.LocalDir != "" {
+		settings.OutputDir = job.LocalDir
+		settings.CacheDir = ""
+		settings.HubDir = ""
+	}
+	endObservedMutation := m.beginObservedMutation(dsts)
+	defer endObservedMutation()
+	if err := hfdownloader.CleanupJobPartFiles(settings, dsts); err != nil {
+		jobsLog.Warn("cleanup part files for paused job", "job_id", job.ID, "error", err)
+	}
+}
+
+// snapshotPartialFiles returns a stable copy of the job's in-flight
+// dst set under the per-job mutex. Callers (cleanupPausedJobPartFiles)
+// use this to capture the set at the moment of cancel/dismiss, so the
+// downloader can keep mutating the set on a future resume without
+// racing the cleanup.
+func (m *JobManager) snapshotPartialFiles(job *Job) []string {
+	if job.partialFilesMu == nil {
+		return nil
+	}
+	job.partialFilesMu.Lock()
+	defer job.partialFilesMu.Unlock()
+	if job.partialFilesPtr == nil {
+		return nil
+	}
+	if len(*job.partialFilesPtr) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(*job.partialFilesPtr))
+	for dst := range *job.partialFilesPtr {
+		out = append(out, dst)
+	}
+	return out
+}

@@ -1,0 +1,40 @@
+name: Issue Triage
+
+# Thin caller shim intentionally trusting bashrusakh/.github@main. Central updates
+# (including model/endpoint changes) apply automatically; this is not an immutable pin.
+# Provision TRIAGE_API_KEY for the central provider; forward only this named secret.
+# The contract is read from THIS repository, never from the master: the master resolves this
+# repository's default-branch head, fetches the contract_files below from it, and fails
+# closed before the agent starts when a listed file is missing.
+# The permissions are the union the called workflow's jobs require; issues:write and
+# pull-requests:write are the write scopes (actions:read/contents:read cover the rest).
+# Inert until merged: issues-triggered workflows only run from the default branch.
+on:
+  issues:
+    types: [opened, reopened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Informational issue number for a manual run."
+        required: false
+        type: string
+      aw_context:
+        description: "Agent caller context (used internally by Agentic Workflows): {\"item_type\":\"issue\",\"item_number\":N} selects the issue for a manual run."
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  triage:
+    uses: bashrusakh/.github/.github/workflows/triage-issue.lock.yml@main
+    secrets:
+      TRIAGE_API_KEY: ${{ secrets.TRIAGE_API_KEY }}
+    with:
+      contract_files: ".github/triage-policy.md AGENTS.md CONTRIBUTING.md"
+      issue_number: ${{ github.event.inputs.issue_number }}
+      aw_context: ${{ github.event.inputs.aw_context }}

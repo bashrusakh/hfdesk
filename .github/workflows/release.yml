@@ -1,0 +1,252 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: Create release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Get version
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          RELEASE_DATA=$(bash .github/scripts/release-version.sh version "$TAG")
+          mapfile -t RELEASE_VERSION <<< "$RELEASE_DATA"
+          VERSION=${RELEASE_VERSION[0]}
+          PRERELEASE=${RELEASE_VERSION[1]}
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
+
+      - name: Extract release notes
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          bash .github/scripts/release-version.sh notes "$VERSION" CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            printf 'See CHANGELOG.md for release notes.\n' > release-notes.md
+          fi
+
+      - name: Create GitHub release
+        # v3.0.3 (efb35369e0ad2afab669f228072c1b0d510eae64)
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          make_latest: ${{ steps.version.outputs.prerelease == 'true' && 'false' || '' }}
+
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    needs: create-release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            ext: ""
+          - os: linux
+            arch: arm64
+            ext: ""
+          - os: darwin
+            arch: amd64
+            ext: ""
+          - os: darwin
+            arch: arm64
+            ext: ""
+          - os: windows
+            arch: amd64
+            ext: ".exe"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+
+      - name: Get version
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Install rsrc (Windows only)
+        if: ${{ matrix.os == 'windows' }}
+        run: go install github.com/akavel/rsrc@v0.10.2
+
+      # The icon is generated once and embedded into both Windows binaries.
+      # Every package needs its own resource file: the linker picks up the
+      # .syso file of the package it builds, so the desktop host cannot
+      # borrow the resource of the console host.
+      - name: Generate Windows icon resources (Windows only)
+        if: ${{ matrix.os == 'windows' }}
+        run: |
+          go run ./cmd/hfdesk/genico.go
+          rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk/resource_windows_amd64.syso
+          rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk-desktop/resource_windows_amd64.syso
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.version }}" \
+            -o hfdesk_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }} \
+            ./cmd/hfdesk
+
+      # The desktop host is the second Windows binary. It is built with the
+      # GUI subsystem, so it never opens a console window: the subsystem is a
+      # property of the produced file, and the CI check reads it out of the
+      # PE header of the artifact.
+      - name: Build desktop binary (Windows only)
+        if: ${{ matrix.os == 'windows' }}
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.version }} -H=windowsgui" \
+            -o hfdesk-desktop_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }} \
+            ./cmd/hfdesk-desktop
+
+      - name: Cleanup Windows resources (Windows only)
+        if: ${{ matrix.os == 'windows' }}
+        run: |
+          rm -f cmd/hfdesk/resource_windows_amd64.syso cmd/hfdesk/hfdesk.ico
+          rm -f cmd/hfdesk-desktop/resource_windows_amd64.syso
+
+      - name: Upload raw binary
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: hfdesk_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }}
+          make_latest: ${{ needs.create-release.outputs.prerelease == 'true' && 'false' || '' }}
+
+      - name: Upload desktop binary
+        if: ${{ matrix.os == 'windows' }}
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: hfdesk-desktop_${{ matrix.os }}_${{ matrix.arch }}_${{ steps.version.outputs.tag }}${{ matrix.ext }}
+          make_latest: ${{ needs.create-release.outputs.prerelease == 'true' && 'false' || '' }}
+
+  linux-desktop:
+    name: Build Linux RPM
+    runs-on: ubuntu-latest
+    needs: [create-release, build]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Get version
+        id: version
+        env:
+          TAG: ${{ needs.create-release.outputs.tag }}
+        run: |
+          RELEASE_DATA=$(bash .github/scripts/release-version.sh version "$TAG")
+          mapfile -t RELEASE_VERSION <<< "$RELEASE_DATA"
+          VERSION=${RELEASE_VERSION[0]}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          RPM_VERSION=${RELEASE_VERSION[2]}
+          echo "rpm_version=$RPM_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Install rpmbuild
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq rpm
+
+      - name: Stage sources
+        env:
+          TAG: ${{ needs.create-release.outputs.tag }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/rpm-sources
+          # Download linux amd64 binary from release assets
+          gh release download "$TAG" \
+            -p "hfdesk_linux_amd64_*" \
+            -D /tmp/rpm-sources \
+            -R "$REPO"
+          # Rename to the exact Source0 name expected by the spec
+          mv /tmp/rpm-sources/hfdesk_linux_amd64_* /tmp/rpm-sources/hfdesk_linux_amd64
+          # Copy packaging files
+          cp packaging/rpm/hfdesk.desktop /tmp/rpm-sources/
+          cp packaging/rpm/hfdesk.svg /tmp/rpm-sources/
+          cp LICENSE /tmp/rpm-sources/
+          cp README.md /tmp/rpm-sources/
+          ls -la /tmp/rpm-sources/
+
+      - name: Build RPM
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          RPM_VERSION: ${{ steps.version.outputs.rpm_version }}
+        run: |
+          rpmbuild -ba packaging/rpm/hfdesk.spec \
+            --define "_sourcedir /tmp/rpm-sources" \
+            --define "_rpmdir /tmp/rpm-output" \
+            --define "_srcrpmdir /tmp/rpm-output" \
+            --define "appversion ${VERSION}" \
+            --define "hfdesk_rpm_version ${RPM_VERSION}"
+
+      - name: Upload RPM
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: /tmp/rpm-output/**/*.rpm
+          make_latest: ${{ needs.create-release.outputs.prerelease == 'true' && 'false' || '' }}
+
+  checksums:
+    name: Generate checksums
+    runs-on: ubuntu-latest
+    needs: [create-release, build, linux-desktop]
+    steps:
+      - name: Download release assets
+        env:
+          TAG: ${{ needs.create-release.outputs.tag }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release-files
+          gh release download "$TAG" -D release-files -R "$REPO"
+
+      - name: Generate checksums
+        run: |
+          cd release-files
+          # Remove any previously published checksums.txt to avoid self-referential hashes
+          rm -f checksums.txt
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Upload checksums
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: release-files/checksums.txt
+          make_latest: ${{ needs.create-release.outputs.prerelease == 'true' && 'false' || '' }}

@@ -1,0 +1,556 @@
+// Copyright 2026
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build windows
+
+package desktop
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bashrusakh/hfdesk/internal/app"
+)
+
+// shutdownTimeout bounds the wait for the graceful shutdown of the
+// application.
+const shutdownTimeout = 30 * time.Second
+
+// portReleaseTimeout bounds the wait for the port of the stopped server to
+// be released.
+const portReleaseTimeout = 5 * time.Second
+
+// TestInstanceLockDetectsASecondAcquisition proves that the single instance
+// lock of the desktop host behaves the way the second desktop launch relies
+// on: the first acquisition succeeds and reports that no instance is
+// running, and a second acquisition in the same session is detected as
+// "already running".
+//
+// The lock is a named kernel object, so the second acquisition finds the
+// object the first one created. Nothing of the lock path opens a window or
+// shows a message box, so the test runs on a CI agent.
+func TestInstanceLockDetectsASecondAcquisition(t *testing.T) {
+	first, err := acquireInstanceLock()
+	if err != nil {
+		t.Fatalf("acquire the single instance lock: %v", err)
+	}
+	defer first.Release()
+
+	if first.Exists() {
+		t.Fatal("the first acquisition reports an instance that is already running")
+	}
+
+	second, err := acquireInstanceLock()
+	if err != nil {
+		t.Fatalf("acquire the single instance lock a second time: %v", err)
+	}
+	defer second.Release()
+
+	if !second.Exists() {
+		t.Fatal("the second acquisition does not report the running instance")
+	}
+}
+
+// TestDesktopServerLifecycle proves that the desktop host drives the shared
+// application layer the way it drives it at runtime: the server starts on an
+// OS-assigned port, the runtime endpoint reports the state of the running
+// server, and the graceful shutdown of the cancelled context stops the
+// server and releases the port.
+//
+// The test stays on the loopback interface and finishes in a moment.
+//
+// Not covered here: the notification area icon, the WebView2 window and the
+// interaction with them. They need an interactive Windows session, which a
+// CI agent does not provide, and the desktop host reports their problems in
+// a native message box that would block the agent.
+func TestDesktopServerLifecycle(t *testing.T) {
+	useTemporaryStateDir(t)
+
+	// The desktop host installs the same pipeline: the file sink is always
+	// on, the console sink is off because a GUI process has no console.
+	logFile := filepath.Join(t.TempDir(), "hfdesk.log")
+	previous := slog.Default()
+	pipeline, err := app.SetupLogging(app.LogOptions{
+		Level:    "info",
+		Console:  false,
+		FilePath: logFile,
+	})
+	if err != nil {
+		t.Fatalf("install the logging pipeline: %v", err)
+	}
+	defer func() {
+		pipeline.Close()
+		// The pipeline is the process wide default logger, so the logger
+		// the other tests of the package expect is put back.
+		slog.SetDefault(previous)
+	}()
+
+	// A record of its own makes the log cursor of the runtime status
+	// deterministic: the cursor is at least the sequence number of this
+	// record, whatever the server logged in the meantime.
+	slog.Info("the desktop smoke test started")
+
+	const version = "1.2.3-desktop-test"
+	application, err := app.New(app.Options{Port: 0}, version)
+	if err != nil {
+		t.Fatalf("create the application: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := application.Start(ctx); err != nil {
+		t.Fatalf("start the application: %v", err)
+	}
+
+	url := application.URL()
+	if !strings.HasPrefix(url, "http://127.0.0.1:") {
+		t.Fatalf("url = %q, want a loopback url", url)
+	}
+	port := portOfURL(t, url)
+
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
+
+	status := readRuntimeStatus(t, client, url)
+	if status.Version != version {
+		t.Errorf("version = %q, want %q", status.Version, version)
+	}
+	if status.Status != "ok" {
+		t.Errorf("status = %q, want %q", status.Status, "ok")
+	}
+	if status.URL != url {
+		t.Errorf("url = %q, want %q", status.URL, url)
+	}
+	if !strings.HasSuffix(status.Address, ":"+strconv.Itoa(port)) {
+		t.Errorf("address = %q, want the address of the port %d", status.Address, port)
+	}
+	if status.ActiveJobs.Running != 0 || status.ActiveJobs.Queued != 0 {
+		t.Errorf("active jobs = %+v, want no active job", status.ActiveJobs)
+	}
+	if status.LogCursor == 0 {
+		t.Error("log cursor = 0, want the cursor of the emitted records")
+	}
+	if status.LogFile != logFile {
+		t.Errorf("log file = %q, want %q", status.LogFile, logFile)
+	}
+
+	// The graceful shutdown: the cancelled context stops the server, and
+	// the application waits for it.
+	cancel()
+	if err := waitForShutdown(t, application); err != nil {
+		t.Fatalf("the graceful shutdown failed: %v", err)
+	}
+
+	// The server stopped serving.
+	response, err := client.Get(url + "/api/health")
+	if err == nil {
+		response.Body.Close()
+		t.Fatal("the server still answers after the graceful shutdown")
+	}
+
+	// The port is released, so another instance can take it.
+	listener, err := listenAgain(port)
+	if err != nil {
+		t.Fatalf("the port %d was not released: %v", port, err)
+	}
+	listener.Close()
+}
+
+// TestStopServerStopsTheRunningServer proves that the graceful stop of the
+// desktop host really stops a running server.
+//
+// The panic handler of the host and the failure path of the tray both use
+// that stop, and the invariant of the host is that the process never ends
+// with a running server that was not stopped through the graceful path.
+//
+// The test stays on the loopback interface and finishes in a moment.
+func TestStopServerStopsTheRunningServer(t *testing.T) {
+	useTemporaryStateDir(t)
+
+	application, err := app.New(app.Options{Port: 0}, "1.2.3-desktop-test")
+	if err != nil {
+		t.Fatalf("create the application: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := application.Start(ctx); err != nil {
+		t.Fatalf("start the application: %v", err)
+	}
+
+	url := application.URL()
+
+	// The shutdown of the host. It exists before the server starts, so
+	// every path that ends the host while the server runs can stop it.
+	var shutdownOnce sync.Once
+	shutdown := func() {
+		shutdownOnce.Do(func() {
+			cancel()
+			if err := application.Wait(); err != nil {
+				t.Errorf("the server did not stop cleanly: %v", err)
+			}
+		})
+	}
+
+	stopServer(shutdown)
+
+	// The server stopped serving.
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
+	response, err := client.Get(url + "/api/health")
+	if err == nil {
+		response.Body.Close()
+		t.Fatal("the server still answers after the graceful stop")
+	}
+}
+
+// endOfHostTimeout bounds the wait for the end of the host.
+const endOfHostTimeout = 5 * time.Second
+
+// trayReadyWait is the pause that proves that the end of the host waits
+// for the notification area host.
+//
+// The wait is short: it only has to be long enough for a quit that does
+// not wait to show itself.
+const trayReadyWait = 100 * time.Millisecond
+
+// TestSignalEndsTheWholeHost proves that a signal ends the desktop host
+// as one unit: the server is stopped through the graceful path and the
+// message loop of the tray ends afterwards, so the host never keeps
+// running with a stopped server.
+//
+// The test drives the end of the host the way the signal handler drives
+// it: the signal context is cancelled and the quit path runs.
+//
+// Not covered here: the notification area icon and the WebView2 window.
+// They need an interactive Windows session, and the test only needs the
+// order of the two steps of the end.
+func TestSignalEndsTheWholeHost(t *testing.T) {
+	// The signal context of the host and the ready callback of the tray.
+	signalCtx, stopSignal := context.WithCancel(context.Background())
+	defer stopSignal()
+	ready := make(chan struct{})
+
+	var mu sync.Mutex
+	var steps []string
+
+	shutdown := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		steps = append(steps, "shutdown")
+	}
+	endTray := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		steps = append(steps, "tray")
+	}
+
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		endHostOnSignal(signalCtx, func() {
+			endHost(shutdown, ready, endTray)
+		})
+	}()
+
+	// The signal arrives.
+	stopSignal()
+
+	// The end of the message loop waits for the notification area host:
+	// the tray library reaches the host only when its window exists, so
+	// a quit that ends the loop before that would be lost.
+	select {
+	case <-ended:
+		t.Fatal("the host ended before the notification area host was ready")
+	case <-time.After(trayReadyWait):
+	}
+
+	close(ready)
+
+	select {
+	case <-ended:
+	case <-time.After(endOfHostTimeout):
+		t.Fatal("the signal did not end the host")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(steps) != 2 || steps[0] != "shutdown" || steps[1] != "tray" {
+		t.Fatalf("the steps of the end of the host = %v, want the server stopped before the tray loop ends", steps)
+	}
+}
+
+// TestStartupFailureIsRecordedInTheLogFile proves that a failure of the
+// startup reaches the log file.
+//
+// The desktop host has no console, so the log file is the only place where
+// the failure survives the process. The pipeline is closed when the host
+// ends, and a closed file sink drops the records that are emitted
+// afterwards, so the record of the failure has to be written before the
+// close.
+//
+// The test drives the end of the host, not the whole startup: the startup
+// itself shows a message box for every failure, and a message box would
+// block an agent without an interactive window station.
+func TestStartupFailureIsRecordedInTheLogFile(t *testing.T) {
+	useTemporaryStateDir(t)
+
+	logFile := filepath.Join(t.TempDir(), "hfdesk.log")
+	previous := slog.Default()
+	pipeline, err := app.SetupLogging(app.LogOptions{
+		Level:    "info",
+		Console:  false,
+		FilePath: logFile,
+	})
+	if err != nil {
+		t.Fatalf("install the logging pipeline: %v", err)
+	}
+	defer func() {
+		// The pipeline is the process wide default logger, so the logger
+		// the other tests of the package expect is put back.
+		slog.SetDefault(previous)
+	}()
+
+	closePipelineWithFailure(pipeline, errors.New("the local server could not be started"), nil)
+
+	logged, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("read the log file: %v", err)
+	}
+	if !strings.Contains(string(logged), "the local server could not be started") {
+		t.Fatalf("the log file does not contain the failure: %q", logged)
+	}
+}
+
+// runtimeStatus is the part of the runtime status the smoke test reads.
+type runtimeStatus struct {
+	Version    string `json:"version"`
+	Status     string `json:"status"`
+	URL        string `json:"url"`
+	Address    string `json:"address"`
+	ActiveJobs struct {
+		Running int `json:"running"`
+		Queued  int `json:"queued"`
+	} `json:"activeJobs"`
+	LogCursor uint64 `json:"logCursor"`
+	LogFile   string `json:"logFile"`
+}
+
+// readRuntimeStatus reads the runtime status of the running server.
+func readRuntimeStatus(t *testing.T, client *http.Client, url string) runtimeStatus {
+	t.Helper()
+
+	response, err := client.Get(url + "/api/runtime")
+	if err != nil {
+		t.Fatalf("read the runtime status: %v", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("runtime status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+
+	var status runtimeStatus
+	if err := json.NewDecoder(response.Body).Decode(&status); err != nil {
+		t.Fatalf("decode the runtime status: %v", err)
+	}
+	return status
+}
+
+// waitForShutdown waits for the application to stop and returns the error of
+// the shutdown.
+func waitForShutdown(t *testing.T, application *app.App) error {
+	t.Helper()
+
+	done := make(chan error, 1)
+	go func() { done <- application.Wait() }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(shutdownTimeout):
+		t.Fatal("the application did not stop after the context was cancelled")
+		return nil
+	}
+}
+
+// listenAgain binds the port of the stopped server again, so the test can
+// prove that the graceful shutdown released it.
+//
+// Windows reuses a recently used address by default, so the bind succeeds
+// right after the shutdown. The small retry budget covers the moment
+// between the close of the listener and the release of the port.
+func listenAgain(port int) (net.Listener, error) {
+	address := net.JoinHostPort("0.0.0.0", strconv.Itoa(port))
+
+	deadline := time.Now().Add(portReleaseTimeout)
+	for {
+		listener, err := net.Listen("tcp", address)
+		if err == nil {
+			return listener, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, err
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// portOfURL returns the port of a browser-safe URL of the server.
+func portOfURL(t *testing.T, url string) int {
+	t.Helper()
+
+	_, portText, err := net.SplitHostPort(strings.TrimPrefix(url, "http://"))
+	if err != nil {
+		t.Fatalf("url %q carries no port: %v", url, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("url %q carries no port: %v", url, err)
+	}
+	if port <= 0 {
+		t.Fatalf("url = %q, want a bound port", url)
+	}
+	return port
+}
+
+// stateDirCleanupTimeout bounds the wait for the removal of a temporary
+// state directory.
+//
+// The WebView2 runtime keeps its user data in the per user configuration
+// directory, and its browser process is a process of its own: it can hold
+// the files of that data for a moment after the window was closed. The
+// removal of the directory is retried within this budget, so the browser
+// process can release the files, and a directory that stays locked is left
+// behind instead of failing the test.
+const stateDirCleanupTimeout = 10 * time.Second
+
+// stateDirCleanupInterval is the pause between two attempts of the removal
+// of a temporary state directory.
+const stateDirCleanupInterval = 100 * time.Millisecond
+
+// useTemporaryStateDir points the per user configuration directory of the
+// platform at a temporary directory and moves the working directory, so the
+// test never reads or writes the state of the real installation.
+//
+// The directories are not the temporary directories of the test framework:
+// the framework removes its own directories strictly and reports a failure
+// of the test when that fails, and the browser process of the WebView2
+// runtime can still hold the files of its user data when the test ends. The
+// directories are removed on a best effort basis instead.
+//
+// The removal is registered before the window of the test is created, and
+// the cleanups of the test framework run in the reverse order of their
+// registration: the window is closed first, the directories are removed
+// afterwards.
+func useTemporaryStateDir(t *testing.T) {
+	t.Helper()
+
+	root := temporaryStateDir(t, "hfdesk-state")
+	t.Setenv("AppData", root)
+	t.Setenv("LOCALAPPDATA", root)
+	t.Chdir(temporaryStateDir(t, "hfdesk-work"))
+}
+
+// temporaryStateDir creates a temporary directory for the state of a test
+// and removes it on a best effort basis when the test ends.
+//
+// The directory lives outside of the temporary directory of the test
+// framework, because the framework removes its own directories strictly.
+func temporaryStateDir(t *testing.T, pattern string) string {
+	t.Helper()
+
+	dir, err := os.MkdirTemp("", pattern+"-*")
+	if err != nil {
+		t.Fatalf("create the temporary %s directory: %v", pattern, err)
+	}
+
+	t.Cleanup(func() {
+		// A directory that stays locked is left behind: a file that a
+		// child process still holds is not a failure of the test.
+		if err := removeStateDir(dir, stateDirCleanupTimeout); err != nil {
+			t.Logf("the temporary %s directory %s was left behind: %v", pattern, dir, err)
+		}
+	})
+	return dir
+}
+
+// removeStateDir removes the directory and its content.
+//
+// The removal is retried within the budget, so a child process that still
+// holds a file of the directory can release it. The error of the last
+// attempt is returned, so the caller can report the leftover.
+func removeStateDir(dir string, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
+	for {
+		err := os.RemoveAll(dir)
+		if err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(stateDirCleanupInterval)
+	}
+}
+
+// TestStateDirCleanupLeavesALockedDirectoryBehind proves that the cleanup
+// of a temporary state directory does not fail the test over a file that
+// another handle still holds.
+//
+// The browser process of the WebView2 runtime holds the files of its user
+// data for a moment after the window was closed, and Windows does not
+// allow the removal of a file that another handle still holds. The cleanup
+// has to leave the directory behind in that case instead of failing the
+// test, and it has to remove the directory once the file is released.
+func TestStateDirCleanupLeavesALockedDirectoryBehind(t *testing.T) {
+	// The budget of the probe is short: the file is held for the whole
+	// test, so no amount of waiting releases it.
+	const probeBudget = 200 * time.Millisecond
+
+	dir, err := os.MkdirTemp("", "hfdesk-locked-*")
+	if err != nil {
+		t.Fatalf("create the temporary directory: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	// A file that is held open for the whole test.
+	locked, err := os.OpenFile(filepath.Join(dir, "locked.pma"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("create the locked file: %v", err)
+	}
+	defer locked.Close()
+
+	// The cleanup of the state directory does not fail over the file
+	// that is still held.
+	if err := removeStateDir(dir, probeBudget); err == nil {
+		t.Skip("the platform removed the file that was still open: the locked directory is not covered here")
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("the locked directory is gone: %v", err)
+	}
+
+	// The file is released, so the directory can be removed.
+	_ = locked.Close()
+	if err := removeStateDir(dir, probeBudget); err != nil {
+		t.Fatalf("the directory was not removed after the file was released: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("the directory is still there after the removal: %v", err)
+	}
+}

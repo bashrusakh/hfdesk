@@ -1,0 +1,418 @@
+// Copyright 2025
+// SPDX-License-Identifier: Apache-2.0
+
+package server
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestJobManager_CreateJob(t *testing.T) {
+	testCacheDir := t.TempDir()
+
+	cfg := Config{
+		CacheDir:    testCacheDir,
+		Concurrency: 2,
+		MaxActive:   1,
+	}
+	hub := NewWSHub()
+	go hub.Run()
+
+	mgr := newTestJobManager(t, cfg, hub)
+
+	// Each CreateJob here spawns a runJob goroutine that tries to download
+	// from a non-existent HF repo. The downloader creates subdirectories
+	// under testCacheDir via EnsureDirs before any HTTP call returns, so
+	// a naive t.TempDir cleanup races those mkdirs and fails with
+	// "directory not empty". Cancel all jobs then block on WaitAll until
+	// every runJob goroutine has actually exited its stack frame — not
+	// just until Status flipped to Cancelled.
+	t.Cleanup(func() {
+		for _, j := range mgr.ListJobs() {
+			mgr.CancelJob(j.ID)
+		}
+		mgr.WaitAll(5 * time.Second)
+		os.RemoveAll(testCacheDir)
+	})
+
+	t.Run("creates model job with HF cache output", func(t *testing.T) {
+		req := DownloadRequest{
+			Repo:     "test/model",
+			Revision: "main",
+			Dataset:  false,
+		}
+
+		job, wasExisting, err := mgr.CreateJob(req)
+		if err != nil {
+			t.Fatalf("CreateJob failed: %v", err)
+		}
+		if wasExisting {
+			t.Error("Expected new job, got existing")
+		}
+		if job.OutputDir != testCacheDir {
+			t.Errorf("Expected output %s, got %s", testCacheDir, job.OutputDir)
+		}
+		if job.IsDataset {
+			t.Error("Expected model, got dataset")
+		}
+	})
+
+	t.Run("creates dataset job with HF cache output", func(t *testing.T) {
+		req := DownloadRequest{
+			Repo:    "test/dataset",
+			Dataset: true,
+		}
+
+		job, _, err := mgr.CreateJob(req)
+		if err != nil {
+			t.Fatalf("CreateJob failed: %v", err)
+		}
+		// Both models and datasets use same cache dir in v3
+		if job.OutputDir != testCacheDir {
+			t.Errorf("Expected output %s, got %s", testCacheDir, job.OutputDir)
+		}
+		if !job.IsDataset {
+			t.Error("Expected dataset, got model")
+		}
+	})
+
+	t.Run("defaults revision to main", func(t *testing.T) {
+		req := DownloadRequest{
+			Repo: "test/no-revision",
+		}
+
+		job, _, _ := mgr.CreateJob(req)
+		if job.Revision != "main" {
+			t.Errorf("Expected revision main, got %s", job.Revision)
+		}
+	})
+}
+
+func TestJobManager_Deduplication(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Cleanup(func() {
+		time.Sleep(100 * time.Millisecond)
+		os.RemoveAll(cacheDir)
+	})
+
+	cfg := Config{
+		CacheDir: cacheDir,
+	}
+	hub := NewWSHub()
+	go hub.Run()
+
+	mgr := newTestJobManager(t, cfg, hub)
+
+	// Create first job
+	req := DownloadRequest{
+		Repo:     "dedup/test",
+		Revision: "main",
+	}
+
+	job1, wasExisting1, _ := mgr.CreateJob(req)
+	if wasExisting1 {
+		t.Error("First job should not be existing")
+	}
+
+	// Try to create same job again
+	job2, wasExisting2, _ := mgr.CreateJob(req)
+	if !wasExisting2 {
+		t.Error("Second job should be detected as existing")
+	}
+	if job1.ID != job2.ID {
+		t.Errorf("Expected same job ID, got %s vs %s", job1.ID, job2.ID)
+	}
+}
+
+func TestJobManager_DifferentFiltersNotDeduplicated(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Cleanup(func() {
+		time.Sleep(100 * time.Millisecond)
+		os.RemoveAll(cacheDir)
+	})
+
+	cfg := Config{
+		CacheDir: cacheDir,
+	}
+	hub := NewWSHub()
+	go hub.Run()
+
+	mgr := newTestJobManager(t, cfg, hub)
+
+	// Create first job with filter q4_k_m
+	job1, _, _ := mgr.CreateJob(DownloadRequest{
+		Repo:     "filter/test",
+		Revision: "main",
+		Filters:  []string{"q4_k_m"},
+	})
+
+	// Different filter (mmproj-f16) — should NOT be deduped
+	job2, wasExisting, _ := mgr.CreateJob(DownloadRequest{
+		Repo:     "filter/test",
+		Revision: "main",
+		Filters:  []string{"mmproj-f16"},
+	})
+	if wasExisting {
+		t.Error("Different filters (q4_k_m vs mmproj-f16) should create different jobs")
+	}
+	if job1.ID == job2.ID {
+		t.Error("Different filters should have different IDs")
+	}
+
+	// Same filter (q4_k_m) — should BE deduped
+	job3, wasExisting3, _ := mgr.CreateJob(DownloadRequest{
+		Repo:     "filter/test",
+		Revision: "main",
+		Filters:  []string{"q4_k_m"},
+	})
+	if !wasExisting3 {
+		t.Error("Same filters should be deduped")
+	}
+	if job1.ID != job3.ID {
+		t.Errorf("Same filters should return same job, got %s vs %s", job1.ID, job3.ID)
+	}
+}
+
+func TestJobManager_DifferentRevisionsNotDeduplicated(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Cleanup(func() {
+		time.Sleep(100 * time.Millisecond)
+		os.RemoveAll(cacheDir)
+	})
+
+	cfg := Config{
+		CacheDir: cacheDir,
+	}
+	hub := NewWSHub()
+	go hub.Run()
+
+	mgr := newTestJobManager(t, cfg, hub)
+
+	job1, _, _ := mgr.CreateJob(DownloadRequest{
+		Repo:     "revision/test",
+		Revision: "v1",
+	})
+
+	job2, wasExisting, _ := mgr.CreateJob(DownloadRequest{
+		Repo:     "revision/test",
+		Revision: "v2",
+	})
+
+	if wasExisting {
+		t.Error("Different revisions should create different jobs")
+	}
+	if job1.ID == job2.ID {
+		t.Error("Different revisions should have different IDs")
+	}
+}
+
+func TestJobManager_ModelVsDatasetNotDeduplicated(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Cleanup(func() {
+		time.Sleep(100 * time.Millisecond) // Let goroutines finish
+		os.RemoveAll(cacheDir)
+	})
+
+	cfg := Config{
+		CacheDir: cacheDir,
+	}
+	hub := NewWSHub()
+	go hub.Run()
+
+	mgr := newTestJobManager(t, cfg, hub)
+
+	job1, _, _ := mgr.CreateJob(DownloadRequest{
+		Repo:    "type/test",
+		Dataset: false,
+	})
+
+	job2, wasExisting, _ := mgr.CreateJob(DownloadRequest{
+		Repo:    "type/test",
+		Dataset: true,
+	})
+
+	if wasExisting {
+		t.Error("Model and dataset with same repo should be different jobs")
+	}
+	if job1.ID == job2.ID {
+		t.Error("Model and dataset should have different IDs")
+	}
+}
+
+func TestJobManager_GetJob(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Cleanup(func() {
+		time.Sleep(100 * time.Millisecond)
+		os.RemoveAll(cacheDir)
+	})
+
+	cfg := Config{CacheDir: cacheDir}
+	hub := NewWSHub()
+	go hub.Run()
+	mgr := newTestJobManager(t, cfg, hub)
+
+	job, _, _ := mgr.CreateJob(DownloadRequest{Repo: "get/test"})
+
+	t.Run("returns existing job", func(t *testing.T) {
+		found, ok := mgr.GetJob(job.ID)
+		if !ok {
+			t.Error("Expected to find job")
+		}
+		if found.ID != job.ID {
+			t.Error("Wrong job returned")
+		}
+	})
+
+	t.Run("returns false for missing job", func(t *testing.T) {
+		_, ok := mgr.GetJob("nonexistent")
+		if ok {
+			t.Error("Should not find nonexistent job")
+		}
+	})
+}
+
+func TestJobManager_ListJobs(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Cleanup(func() {
+		time.Sleep(100 * time.Millisecond) // Let goroutines finish
+		os.RemoveAll(cacheDir)
+	})
+
+	cfg := Config{CacheDir: cacheDir}
+	hub := NewWSHub()
+	go hub.Run()
+	mgr := newTestJobManager(t, cfg, hub)
+
+	// Create multiple jobs with unique repos
+	mgr.CreateJob(DownloadRequest{Repo: "list/test1"})
+	mgr.CreateJob(DownloadRequest{Repo: "list/test2"})
+	mgr.CreateJob(DownloadRequest{Repo: "list/test3"})
+
+	jobs := mgr.ListJobs()
+	if len(jobs) < 3 {
+		t.Errorf("Expected at least 3 jobs, got %d", len(jobs))
+	}
+}
+
+func TestJobManager_CancelJob(t *testing.T) {
+	// Stand-in hub endpoint that hangs every request until the job's context
+	// is cancelled. Hitting the real huggingface.co here made the test flaky:
+	// on fast CI runners the fake repo was rejected within the startup sleep,
+	// so the job was already failed (terminal) by the time it was cancelled.
+	stall := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer stall.Close()
+
+	cfg := Config{CacheDir: t.TempDir(), Endpoint: stall.URL}
+	hub := NewWSHub()
+	go hub.Run()
+	mgr := newTestJobManager(t, cfg, hub)
+	t.Cleanup(func() { mgr.WaitAll(5 * time.Second) })
+
+	job, _, _ := mgr.CreateJob(DownloadRequest{Repo: "cancel/test"})
+
+	// Wait until the job is actually running (dispatch is asynchronous).
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if j, _ := mgr.GetJob(job.ID); j != nil && j.Status == JobStatusRunning {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("job never reached running status")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Run("cancels running job", func(t *testing.T) {
+		ok := mgr.CancelJob(job.ID)
+		if !ok {
+			t.Error("Cancel should succeed")
+		}
+
+		found, _ := mgr.GetJob(job.ID)
+		if found.Status != JobStatusCancelled {
+			t.Errorf("Expected cancelled status, got %s", found.Status)
+		}
+	})
+
+	t.Run("returns false for nonexistent job", func(t *testing.T) {
+		ok := mgr.CancelJob("nonexistent")
+		if ok {
+			t.Error("Cancel should fail for nonexistent job")
+		}
+	})
+}
+
+// TestLifecyclePersistenceIsSynchronous pins the root cause behind the
+// legacy-restore flake. The original flake came from fire-and-forget
+// `go m.saveState()` writers spawned at job lifecycle boundaries: a writer
+// could resolve AppConfigDir() after another test changed the environment and
+// overwrite its freshly seeded jobs_state.json. main replaced that model with
+// a synchronous, serialized save through a fixed state path. This test proves
+// the lifecycle write is committed before CancelJob returns, so no state writer
+// can still be in flight afterwards.
+func TestLifecyclePersistenceIsSynchronous(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "jobs_state.json")
+	mgr := newJobManagerWithStatePath(Config{CacheDir: t.TempDir()}, nil, statePath)
+	registerTestJobManagerCleanup(t, mgr)
+
+	mgr.jobs["j1"] = &Job{
+		ID:             "j1",
+		Repo:           "owner/model",
+		Revision:       "main",
+		OutputDir:      t.TempDir(),
+		Status:         JobStatusPaused,
+		partialFilesMu: &sync.Mutex{},
+	}
+	if !mgr.CancelJob("j1") {
+		t.Fatal("CancelJob of a paused job failed")
+	}
+
+	// No WaitAll and no polling: the committed snapshot must already be on disk
+	// the moment CancelJob returns. Under the old async writer this read would
+	// race the goroutine that produced the cancellation.
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("state not committed synchronously by CancelJob: %v", err)
+	}
+	var sf jobsStateFile
+	if err := json.Unmarshal(data, &sf); err != nil {
+		t.Fatalf("decode committed state: %v", err)
+	}
+	var found bool
+	for _, j := range sf.Jobs {
+		if j.ID == "j1" {
+			found = true
+			if j.Status != JobStatusCancelled {
+				t.Fatalf("persisted status = %s, want cancelled", j.Status)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("cancelled job j1 not present in the committed state")
+	}
+}
+
+func TestJobStatus_Values(t *testing.T) {
+	statuses := []JobStatus{
+		JobStatusQueued,
+		JobStatusRunning,
+		JobStatusCompleted,
+		JobStatusFailed,
+		JobStatusCancelled,
+	}
+
+	for _, s := range statuses {
+		if s == "" {
+			t.Error("Status should not be empty")
+		}
+	}
+}

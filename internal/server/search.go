@@ -1,0 +1,326 @@
+// Copyright 2025
+// SPDX-License-Identifier: Apache-2.0
+
+package server
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/bashrusakh/hfdesk/internal/logging"
+	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
+)
+
+// searchLog is the logger of the search subsystem. It resolves the current
+// default logger on every call, so records reach whichever pipeline the
+// application installed.
+var searchLog = logging.NewComponentLogger("search")
+
+// SearchResult is one model returned by /api/search.
+type SearchResult struct {
+	ID            string    `json:"id"`
+	Author        string    `json:"author,omitempty"`
+	Downloads     int64     `json:"downloads"`
+	Likes         int       `json:"likes"`
+	TrendingScore float64   `json:"trendingScore,omitempty"`
+	Private       bool      `json:"private,omitempty"`
+	Gated         bool      `json:"gated,omitempty"`
+	PipelineTag   string    `json:"pipelineTag,omitempty"`
+	LibraryName   string    `json:"libraryName,omitempty"`
+	Tags          []string  `json:"tags,omitempty"`
+	LastModified  time.Time `json:"lastModified,omitempty"`
+	CreatedAt     time.Time `json:"createdAt,omitempty"`
+	Cached        bool      `json:"cached,omitempty"`
+	CacheSource   string    `json:"cacheSource,omitempty"`
+	CacheStatus   string    `json:"cacheStatus,omitempty"`
+}
+
+// SearchResponse wraps a list of results and metadata.
+type SearchResponse struct {
+	Results []SearchResult `json:"results"`
+	Total   int            `json:"total"`
+	Query   string         `json:"query,omitempty"`
+}
+
+// hfAPIModel is the raw shape returned by huggingface.co/api/models.
+type hfAPIModel struct {
+	ID            string    `json:"id"`
+	Author        string    `json:"author"`
+	Downloads     int64     `json:"downloads"`
+	Likes         int       `json:"likes"`
+	TrendingScore float64   `json:"trendingScore"`
+	Private       bool      `json:"private"`
+	Gated         any       `json:"gated"` // bool or string ("auto","manual")
+	PipelineTag   string    `json:"pipeline_tag"`
+	LibraryName   string    `json:"library_name"`
+	Tags          []string  `json:"tags"`
+	LastModified  time.Time `json:"lastModified"`
+	CreatedAt     time.Time `json:"createdAt"`
+}
+
+// handleSearch proxies model search to the HuggingFace Hub API.
+//
+// Query parameters:
+//
+//	q        – free-text search
+//	sort     – downloads | likes | lastModified | trendingScore (default: downloads)
+//	limit    – max results (default 20, max 100)
+//	filter   – comma-separated tag filters forwarded to HF (e.g. "gguf,text-generation")
+//	datasets – "true" to search datasets instead of models
+func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	query := strings.TrimSpace(q.Get("q"))
+	sort := q.Get("sort")
+	if sort == "" {
+		sort = "downloads"
+	}
+	limitStr := q.Get("limit")
+	limit := 20
+	if n, err := strconv.Atoi(limitStr); err == nil && n > 0 {
+		if n > 100 {
+			n = 100
+		}
+		limit = n
+	}
+	filterParam := q.Get("filter")
+	isDataset := strings.EqualFold(q.Get("datasets"), "true")
+
+	// Build HF API URL
+	cfg := s.snapshotConfig()
+	endpoint := cfg.Endpoint
+	if endpoint == "" {
+		endpoint = "https://huggingface.co"
+	}
+	endpoint = strings.TrimRight(endpoint, "/")
+
+	apiPath := "/api/models"
+	if isDataset {
+		apiPath = "/api/datasets"
+	}
+
+	params := url.Values{}
+	if query != "" {
+		params.Set("search", query)
+	}
+	params.Set("sort", sort)
+	params.Set("direction", "-1")
+	params.Set("limit", strconv.Itoa(limit))
+	if filterParam != "" {
+		// HF supports multiple filter params; we join with comma for a single param
+		params.Set("filter", filterParam)
+	}
+
+	hfURL := fmt.Sprintf("%s%s?%s", endpoint, apiPath, params.Encode())
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, hfURL, nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to build upstream request", err.Error())
+		return
+	}
+	if cfg.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	}
+	req.Header.Set("User-Agent", "hfdesk/1")
+
+	httpClient, err := hfdownloader.BuildHTTPClient(cfg.Proxy)
+	if err != nil {
+		// The proxy URL can carry the proxy credentials, so only the reason
+		// of the failure reaches the log record.
+		searchLog.Info("invalid proxy config", "error", hfdownloader.ProxyErrorReason(err))
+		writeError(w, http.StatusInternalServerError, "Invalid proxy configuration", err.Error())
+		return
+	}
+	httpClient.Timeout = 20 * time.Second
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		searchLog.Info("upstream error", "error", err)
+		writeError(w, http.StatusBadGateway, "Upstream request failed", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20)) // 4 MiB cap
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "Failed to read upstream response", err.Error())
+		return
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+		return
+	}
+
+	var raw []hfAPIModel
+	if err := json.Unmarshal(body, &raw); err != nil {
+		writeError(w, http.StatusBadGateway, "Failed to parse upstream response", err.Error())
+		return
+	}
+
+	cacheDir := cfg.cacheRoot()
+
+	results := make([]SearchResult, 0, len(raw))
+	for _, m := range raw {
+		gated := false
+		switch v := m.Gated.(type) {
+		case bool:
+			gated = v
+		case string:
+			gated = v != "" && v != "false"
+		}
+		result := SearchResult{
+			ID:            m.ID,
+			Author:        m.Author,
+			Downloads:     m.Downloads,
+			Likes:         m.Likes,
+			TrendingScore: m.TrendingScore,
+			Private:       m.Private,
+			Gated:         gated,
+			PipelineTag:   m.PipelineTag,
+			LibraryName:   m.LibraryName,
+			Tags:          m.Tags,
+			LastModified:  m.LastModified,
+			CreatedAt:     m.CreatedAt,
+		}
+		if localRepo, localErr := findLocalCachedRepo(cacheDir, cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes, m.ID, isDataset); localErr == nil {
+			result.Cached = true
+			result.CacheSource = localRepo.Source
+			result.CacheStatus = localRepo.DownloadStatus
+		} else if hfdownloader.IsValidModelName(m.ID) {
+			repoType := hfdownloader.RepoTypeModel
+			if isDataset {
+				repoType = hfdownloader.RepoTypeDataset
+			}
+			rd, err := cfg.cache().Repo(m.ID, repoType)
+			if err == nil && hubRepoHasContent(rd) {
+				result.Cached, result.CacheSource, result.CacheStatus = true, "HF cache", "unknown"
+			}
+		}
+		results = append(results, result)
+	}
+
+	writeJSON(w, http.StatusOK, SearchResponse{
+		Results: results,
+		Total:   len(results),
+		Query:   query,
+	})
+}
+
+// handleDiskFree returns free/total disk space for a given path.
+// The path is always derived from server configuration — the "path" query
+// param is accepted for UI compatibility but is validated against configured
+// directories to prevent arbitrary filesystem stat via the API.
+func (s *Server) handleDiskFree(w http.ResponseWriter, r *http.Request) {
+	cfg := s.snapshotConfig().captureCacheEnvironment()
+
+	// Build the ordered list of configured candidate paths.
+	routed := routeDirs(cfg.DownloadRoutes)
+	configured := []string{cfg.LocalDir, cfg.cache().HubDir(), cfg.cacheRoot(), cfg.cacheEnv.defaultRoot, RunDir()}
+	configured = append(configured, routed...)
+
+	// If the caller provides an explicit path, only honour it when it matches
+	// one of the configured directories (prevents arbitrary fs-stat via the API).
+	var path string
+	if requested := r.URL.Query().Get("path"); requested != "" {
+		for _, c := range configured {
+			if c != "" && pathIdentityKey(requested) == pathIdentityKey(c) {
+				path = c
+				// Legacy clients pass cacheDir (R); cache capacity is measured
+				// at H, not the possibly unrelated friendly-view filesystem.
+				localPath := cfg.LocalDir != "" && pathIdentityKey(requested) == pathIdentityKey(cfg.LocalDir)
+				for _, dir := range routed {
+					if pathIdentityKey(requested) == pathIdentityKey(dir) {
+						localPath = true
+						break
+					}
+				}
+				if pathIdentityKey(c) == pathIdentityKey(cfg.cacheRoot()) && !localPath {
+					path = cfg.cache().HubDir()
+				}
+				break
+			}
+		}
+		if path == "" {
+			writeError(w, http.StatusBadRequest, "Invalid path", "path must be one of the configured directories")
+			return
+		}
+	} else {
+		// No explicit path: fall back to the first non-empty configured directory.
+		for _, c := range configured {
+			if c != "" {
+				path = c
+				break
+			}
+		}
+	}
+	writeDiskFree(w, path, cfg)
+}
+
+// handleDownloadDiskFree previews the same destination as CreateJob without
+// creating directories, contacting the Hub, or starting a job. Explicit
+// localDir has the same semantics as on POST /api/download; GET retains its
+// configured-path allowlist for filesystem browsing.
+func (s *Server) handleDownloadDiskFree(w http.ResponseWriter, r *http.Request) {
+	var req DownloadRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+	cfg := s.snapshotConfig()
+	_, localDir, path, err := resolveDownloadDestination(cfg, req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
+		return
+	}
+	if localDir == "" {
+		path = cfg.cache().HubDir()
+	} else {
+		path, err = filepath.Abs(path)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to resolve destination", err.Error())
+			return
+		}
+	}
+	writeDiskFree(w, path, cfg)
+}
+
+func writeDiskFree(w http.ResponseWriter, path string, cfg Config) {
+	free, total, err := diskFreeBytes(path)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Could not stat disk", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path":            path,
+		"free":            free,
+		"total":           total,
+		"cacheDir":        cfg.cacheRoot(),
+		"effectiveHubDir": cfg.cache().HubDir(),
+		"hubDirSource":    cfg.hubDirSource(),
+	})
+}
+
+// handleHistory returns entries from download_history.json.
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	entries, err := LoadHistory()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to load history", err.Error())
+		return
+	}
+	if entries == nil {
+		entries = []HistoryEntry{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"entries": entries,
+		"total":   len(entries),
+	})
+}

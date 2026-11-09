@@ -1,0 +1,986 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HFDesk</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="icon" type="image/svg+xml" href="icon.svg">
+  <link rel="alternate icon" href="icon.svg">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="apple-touch-icon" sizes="120x120" href="apple-touch-icon-120x120.png">
+  <link rel="apple-touch-icon" sizes="152x152" href="apple-touch-icon-152x152.png">
+  <link rel="apple-touch-icon" sizes="167x167" href="apple-touch-icon-167x167.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon-180x180.png">
+</head>
+<body>
+  <div class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="logo">
+          <img class="logo-icon" src="icon.svg" alt="" aria-hidden="true">
+          <span class="logo-text">HFDesk</span>
+        </div>
+      </div>
+
+      <nav class="nav">
+        <a href="#" class="nav-item active" data-page="models">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+          </svg>
+          <span>Models</span>
+        </a>
+        <a href="#" class="nav-item" data-page="jobs">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+          </svg>
+          <span>Active Jobs</span>
+          <span class="nav-badge" id="jobsBadge" style="display:none">0</span>
+        </a>
+        <a href="#" class="nav-item" data-page="cache">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+          </svg>
+          <span>Local Cache</span>
+        </a>
+        <a href="#" class="nav-item" data-page="mirror">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/>
+            <polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/>
+            <line x1="4" y1="4" x2="9" y2="9"/>
+          </svg>
+          <span>Mirror</span>
+        </a>
+        <a href="#" class="nav-item" data-page="history">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+          </svg>
+          <span>History</span>
+        </a>
+        <a href="#" class="nav-item" data-page="settings">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+          <span>Settings</span>
+        </a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="connection-status" id="connectionStatus">
+          <span class="status-indicator"></span>
+          <span class="status-text">Connecting...</span>
+        </div>
+        <div class="version" id="appVersion"></div>
+      </div>
+      <div class="sidebar-resize-handle" id="sidebarResizeHandle"></div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main">
+      <!-- Models Page (unified Search + Analyze + Download) -->
+      <section class="page active" id="page-models">
+        <div class="models-split">
+
+          <!-- ── Left: search + compact list ── -->
+          <div class="models-list-panel">
+            <div class="models-list-header">
+              <div class="models-search-wrap">
+                <svg class="models-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                  <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+                </svg>
+                <input id="analyzeInput" class="models-search-input" type="text"
+                       placeholder="Search or paste repo ID…"
+                       autocomplete="off" spellcheck="false">
+                <span id="modelsSpinner" class="models-spinner" style="display:none">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14" class="spin">
+                    <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+                  </svg>
+                </span>
+                <button id="modelsSearchClear" class="models-search-clear" type="button"
+                        title="Clear" aria-label="Clear search" hidden>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" width="14" height="14">
+                    <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+                  </svg>
+                </button>
+              </div>
+              <div class="models-filter-row">
+                <select id="modelsSortSelect" class="models-select">
+                  <option value="downloads">↓ Downloads</option>
+                  <option value="likes">♥ Likes</option>
+                  <option value="trendingScore">🔥 Trending</option>
+                  <option value="lastModified">🕐 Updated</option>
+                </select>
+                <select id="modelsTypeSelect" class="models-select">
+                  <option value="">All types</option>
+                  <option value="text-generation">Text Generation</option>
+                  <option value="text-to-image">Text to Image</option>
+                  <option value="image-to-text">Image to Text</option>
+                  <option value="automatic-speech-recognition">Speech</option>
+                  <option value="text-to-speech">TTS</option>
+                  <option value="sentence-similarity">Embeddings</option>
+                </select>
+                <label class="checkbox-label checkbox-label-sm" title="Filter to GGUF models only"><input type="checkbox" id="modelsGguf"><span>GGUF</span></label>
+                <label class="checkbox-label checkbox-label-sm" title="Search datasets instead of models"><input type="checkbox" id="modelsDatasets"><span>DS</span></label>
+              </div>
+              <div class="models-storage-strip">
+                <div id="storageModeBadge" class="storage-mode-badge" hidden></div>
+                <div id="diskFreeIndicator" class="disk-free-indicator" hidden></div>
+              </div>
+            </div>
+            <div id="modelsResultList" class="models-result-list">
+              <div class="models-list-hint">Search above or enter a repo ID</div>
+            </div>
+          </div>
+
+          <!-- ── Right: detail / analyze panel ── -->
+          <div class="models-list-resize-handle" id="modelsListResizeHandle" aria-hidden="true"></div>
+          <div class="models-detail-panel">
+            <!-- Detail header (shown when model selected) -->
+            <div id="modelsDetailHeader" class="models-detail-header" style="display:none">
+              <div class="models-detail-title-wrap">
+                <div class="models-history-controls">
+                  <button id="modelsDetailBack" class="btn btn-ghost btn-xs models-history-btn" title="Back" aria-label="Back in Model Details history" disabled>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14" aria-hidden="true">
+                      <path d="M19 12H5"/><polyline points="12 19 5 12 12 5"/>
+                    </svg>
+                  </button>
+                  <button id="modelsDetailForward" class="btn btn-ghost btn-xs models-history-btn" title="Forward" aria-label="Forward in Model Details history" disabled>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14" aria-hidden="true">
+                      <path d="M5 12h14"/><polyline points="12 5 19 12 12 19"/>
+                    </svg>
+                  </button>
+                </div>
+                <span class="models-detail-repo" id="modelsDetailRepo"></span>
+              </div>
+              <div class="models-detail-header-right">
+                <a id="modelsDetailHFLink" href="#" target="_blank" rel="noopener" class="btn btn-secondary btn-xs" hidden>HF Hub ↗</a>
+                <button id="analyzeBtn" class="btn btn-ghost btn-xs models-reanalyze-btn" title="Refresh selected model" aria-label="Refresh selected model">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                    <polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-4.87"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- Detail tabs: shown only while a repository analysis is displayed -->
+            <div id="modelsDetailTabs" class="models-detail-tabs" role="tablist" aria-label="Model details" hidden>
+              <button type="button" id="modelsTabOverview" class="models-detail-tab is-active" role="tab"
+                      aria-selected="true" aria-controls="modelsOverviewPanel" tabindex="0">Overview</button>
+              <button type="button" id="modelsTabCommunity" class="models-detail-tab" role="tab"
+                      aria-selected="false" aria-controls="modelsCommunityPanel" tabindex="-1">Community</button>
+            </div>
+
+            <!-- Persistent polite live region for Community load announcements -->
+            <div id="communityLiveRegion" class="community-live-region" role="status"
+                 aria-live="polite" aria-atomic="true"></div>
+
+            <!-- Scroll arrows: contextual top/bottom -->
+            <button class="scroll-arrow scroll-arrow-up" id="scrollArrowUp" title="Scroll to top" aria-label="Scroll to top"
+                    tabindex="-1" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="18" height="18" aria-hidden="true"><polyline points="18 15 12 9 6 15"/></svg>
+            </button>
+            <button class="scroll-arrow scroll-arrow-down" id="scrollArrowDown" title="Scroll to bottom" aria-label="Scroll to bottom"
+                    tabindex="-1" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="18" height="18" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
+
+            <!-- Analysis result area -->
+            <div id="analyzeResult" class="models-analyze-result">
+              <div id="modelsOverviewPanel" class="models-detail-view" role="tabpanel"
+                   aria-labelledby="modelsTabOverview" tabindex="0">
+                <!-- Initial empty state -->
+                <div class="empty-state">
+                  <div class="empty-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+                      <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                      <polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/>
+                    </svg>
+                  </div>
+                  <h3>Select or search a model</h3>
+                  <p>Search HuggingFace Hub on the left, or paste a repo ID and press Enter</p>
+                  <div class="example-repos">
+                    <span class="example-label">GGUF:</span>
+                    <button class="example-btn" data-repo="TheBloke/Mistral-7B-Instruct-v0.2-GGUF">Mistral-7B-GGUF</button>
+                    <button class="example-btn" data-repo="bartowski/Qwen2.5-7B-Instruct-GGUF">Qwen2.5-7B-GGUF</button>
+                  </div>
+                  <div class="example-repos">
+                    <span class="example-label">Diffusers:</span>
+                    <button class="example-btn" data-repo="stabilityai/stable-diffusion-xl-base-1.0">SDXL-base</button>
+                    <button class="example-btn" data-repo="runwayml/stable-diffusion-v1-5">SD-v1.5</button>
+                  </div>
+                  <div class="example-repos">
+                    <span class="example-label">LoRA/GPTQ:</span>
+                    <button class="example-btn" data-repo="predibase/glue_stsb">LoRA-adapter</button>
+                    <button class="example-btn" data-repo="TheBloke/Llama-2-7B-Chat-GPTQ">Llama-2-GPTQ</button>
+                  </div>
+                  <div class="example-repos">
+                    <span class="example-label">Datasets:</span>
+                    <button class="example-btn" data-repo="HuggingFaceFW/fineweb-edu" data-type="dataset">FineWeb-Edu</button>
+                    <button class="example-btn" data-repo="OpenAssistant/oasst1" data-type="dataset">OpenAssistant</button>
+                  </div>
+                </div>
+              </div>
+              <div id="modelsCommunityPanel" class="models-detail-view" role="tabpanel"
+                   aria-labelledby="modelsTabCommunity" tabindex="0" hidden></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- (legacy stubs for Analyze / Download pages — kept for JS compat, hidden) -->
+      <section class="page" id="page-analyze" style="display:none"></section>
+      <section class="page" id="page-download" style="display:none">
+        <!-- hidden form fields for backward-compat with startWizardDownload -->
+        <input type="hidden" id="modelRepo"><input type="hidden" id="datasetRepo">
+      </section>
+      <section class="page" id="page-search" style="display:none"></section>
+
+      <!-- Jobs Page -->
+      <section class="page" id="page-jobs">
+        <header class="page-header">
+          <div>
+            <h1>Active Jobs</h1>
+            <p class="page-subtitle"><span class="live-dot"></span> Monitor your downloads in real-time</p>
+          </div>
+        </header>
+
+        <div class="speed-bar" id="speedBar" title="Total download speed cap across all jobs. Applies instantly.">
+          <span class="speed-label">Speed limit</span>
+          <div class="speed-presets" id="speedPresetsJobs">
+            <button type="button" class="speed-btn" data-mbit="5">5</button>
+            <button type="button" class="speed-btn" data-mbit="15">15</button>
+            <button type="button" class="speed-btn" data-mbit="25">25</button>
+            <button type="button" class="speed-btn" data-mbit="50">50</button>
+            <button type="button" class="speed-btn" data-mbit="0">&infin;</button>
+          </div>
+          <div class="speed-divider"></div>
+          <div class="speed-input">
+            <input type="text" inputmode="decimal" id="maxSpeedJobs" placeholder="&infin;">
+            <span class="speed-unit">Mbit/s</span>
+          </div>
+          <span class="speed-current">Current: <strong id="speedGaugeText">0.0 Mbit/s</strong></span>
+        </div>
+
+        <div id="jobsList" class="jobs-list">
+          <div class="empty-state">
+            <div class="empty-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+              </svg>
+            </div>
+            <h3>No Active Downloads</h3>
+            <p>Start a download from the Download page to see progress here.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Cache Page -->
+      <section class="page" id="page-cache">
+        <header class="page-header">
+          <div>
+            <h1>Local Cache</h1>
+            <p class="page-subtitle">Browse models and datasets stored locally</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-outline" id="rebuildCacheBtn" title="Regenerate friendly view symlinks from hub cache">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <path d="M19.73 14.87A8 8 0 1 1 12 4"/>
+                <path d="M12 4V1l4 4-4 4V4"/>
+              </svg>
+              Rebuild
+            </button>
+            <button class="btn btn-secondary" id="refreshCacheBtn">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+              </svg>
+              Refresh
+            </button>
+          </div>
+        </header>
+
+        <!-- Stats Cards -->
+        <div id="cacheStats" class="cache-stats">
+          <div class="stat-card">
+            <div class="stat-icon stat-icon-models">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statModels">-</div>
+              <div class="stat-label">Models</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon stat-icon-datasets">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statDatasets">-</div>
+              <div class="stat-label">Datasets</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon stat-icon-size">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+                <line x1="12" y1="22.08" x2="12" y2="12"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statSize">-</div>
+              <div class="stat-label">Total Size</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon stat-icon-files">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
+                <polyline points="13 2 13 9 20 9"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statFiles">-</div>
+              <div class="stat-label">Files</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Toolbar -->
+        <div class="cache-toolbar">
+          <div class="cache-search">
+            <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+              <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+            </svg>
+            <input type="text" id="cacheSearch" placeholder="Search repositories..." autocomplete="off">
+          </div>
+          <div class="cache-filters">
+            <button class="filter-btn active" data-filter="all">All</button>
+            <button class="filter-btn" data-filter="model">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+              </svg>
+              Models
+            </button>
+            <button class="filter-btn" data-filter="dataset">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+              </svg>
+              Datasets
+            </button>
+          </div>
+          <div class="cache-sort">
+            <label for="cacheSort">Sort:</label>
+            <select id="cacheSort">
+              <option value="name">Name</option>
+              <option value="size">Size</option>
+              <option value="date">Date</option>
+            </select>
+          </div>
+          <div class="cache-view-toggle">
+            <button class="view-btn" data-view="grid" title="Grid view">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+                <rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
+              </svg>
+            </button>
+            <button class="view-btn active" data-view="list" title="List view">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/>
+                <line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/>
+                <line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Repository List -->
+        <div id="cacheList" class="cache-list cache-grid-view">
+          <div class="loading-state">
+            <div class="spinner"></div>
+            <p>Loading cache...</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Mirror Page -->
+      <section class="page" id="page-mirror">
+        <header class="page-header">
+          <div>
+            <h1>Mirror</h1>
+            <p class="page-subtitle">Sync your HuggingFace cache between locations</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-secondary" id="refreshMirrorBtn" title="Refresh targets and status">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+              </svg>
+              Refresh
+            </button>
+            <button class="btn btn-primary" id="addTargetBtn">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+              </svg>
+              Add Target
+            </button>
+          </div>
+        </header>
+
+        <div class="page-content">
+        <!-- Stats Cards -->
+        <div id="mirrorStats" class="mirror-stats">
+          <div class="stat-card">
+            <div class="stat-icon stat-icon-targets">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/>
+                <polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statTargets">-</div>
+              <div class="stat-label">Targets</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon stat-icon-online">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                <polyline points="22 4 12 14.01 9 11.01"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statOnline">-</div>
+              <div class="stat-label">Online</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon stat-icon-local">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+                <line x1="12" y1="22.08" x2="12" y2="12"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statLocalSize">-</div>
+              <div class="stat-label">Local Cache</div>
+            </div>
+          </div>
+          <div class="stat-card stat-card-status" id="syncStatusCard">
+            <div class="stat-icon stat-icon-sync">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <div class="stat-value" id="statSyncStatus">-</div>
+              <div class="stat-label">Sync Status</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Targets Section -->
+        <div class="mirror-section">
+          <div class="mirror-section-header">
+            <h2>Mirror Targets</h2>
+            <p class="mirror-section-subtitle">Destinations for syncing your cache (NAS, USB, office server)</p>
+          </div>
+          <div id="targetsList" class="targets-grid">
+            <div class="loading-state">
+              <div class="spinner"></div>
+              <p>Loading targets...</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Sync Control Panel -->
+        <div class="mirror-section">
+          <div class="mirror-section-header">
+            <h2>Sync Control</h2>
+            <p class="mirror-section-subtitle">Compare and synchronize cache with selected target</p>
+          </div>
+          <div class="sync-control-panel">
+            <div class="sync-control-row">
+              <div class="sync-target-select">
+                <label for="syncTarget">Target</label>
+                <select id="syncTarget">
+                  <option value="">Select a target...</option>
+                </select>
+              </div>
+              <div class="sync-filter-input">
+                <label for="syncFilter">Filter repos (optional)</label>
+                <div class="input-with-icon">
+                  <svg class="input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                    <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+                  </svg>
+                  <input type="text" id="syncFilter" placeholder="e.g., Llama, GGUF, meta-llama/">
+                </div>
+              </div>
+            </div>
+            <div class="sync-options-row">
+              <label class="sync-option">
+                <input type="checkbox" id="syncVerify">
+                <span class="sync-option-check"></span>
+                <span class="sync-option-label">
+                  <strong>Verify</strong>
+                  <small>Check integrity after copy</small>
+                </span>
+              </label>
+              <label class="sync-option">
+                <input type="checkbox" id="syncForce">
+                <span class="sync-option-check"></span>
+                <span class="sync-option-label">
+                  <strong>Force</strong>
+                  <small>Re-copy all files</small>
+                </span>
+              </label>
+              <label class="sync-option sync-option-danger">
+                <input type="checkbox" id="syncDelete">
+                <span class="sync-option-check"></span>
+                <span class="sync-option-label">
+                  <strong>Delete extra</strong>
+                  <small>Remove files not in source</small>
+                </span>
+              </label>
+            </div>
+            <div class="sync-actions-row">
+              <button class="btn btn-outline btn-lg" id="mirrorDiffBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                  <circle cx="12" cy="12" r="10"/>
+                  <line x1="12" y1="8" x2="12" y2="12"/>
+                  <line x1="12" y1="16" x2="12.01" y2="16"/>
+                </svg>
+                Compare
+              </button>
+              <button class="btn btn-primary btn-lg" id="mirrorPushBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                  <line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>
+                </svg>
+                Push to Target
+              </button>
+              <button class="btn btn-secondary btn-lg" id="mirrorPullBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                  <line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/>
+                </svg>
+                Pull from Target
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Diff Results Section -->
+        <div class="mirror-section" id="mirrorDiffSection" style="display: none;">
+          <div class="mirror-section-header">
+            <h2>Comparison Results</h2>
+            <div class="diff-header-actions">
+              <div class="diff-summary-badges" id="diffSummary"></div>
+            </div>
+          </div>
+          <!-- Diff Toolbar -->
+          <div class="diff-toolbar">
+            <div class="diff-search">
+              <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+              </svg>
+              <input type="text" id="diffSearch" placeholder="Search repositories..." autocomplete="off">
+            </div>
+            <div class="diff-filters">
+              <button class="filter-btn active" data-diff-filter="all">All</button>
+              <button class="filter-btn" data-diff-filter="missing">
+                <span class="filter-dot filter-dot-warning"></span>
+                To Push
+              </button>
+              <button class="filter-btn" data-diff-filter="extra">
+                <span class="filter-dot filter-dot-info"></span>
+                Extra
+              </button>
+              <button class="filter-btn" data-diff-filter="outdated">
+                <span class="filter-dot filter-dot-muted"></span>
+                Outdated
+              </button>
+            </div>
+          </div>
+          <div id="diffResults" class="diff-results"></div>
+        </div>
+        </div><!-- end page-content -->
+      </section>
+
+      <!-- Search Page -->
+      <section class="page" id="page-search">
+        <header class="page-header">
+          <div>
+            <h1>Search</h1>
+            <p class="page-subtitle">Discover models and datasets on HuggingFace Hub</p>
+          </div>
+        </header>
+        <div class="search-controls">
+          <div class="search-input-wrap">
+            <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+              <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+            </svg>
+            <input id="searchInput" class="search-input" type="text" placeholder="Search models and datasets…" autocomplete="off">
+            <span class="search-spinner" id="searchSpinner" style="display:none">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" class="spin"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+            </span>
+          </div>
+          <select id="searchSort" class="search-select">
+            <option value="downloads">Most Downloaded</option>
+            <option value="likes">Most Liked</option>
+            <option value="trendingScore">Trending</option>
+            <option value="lastModified">Recently Updated</option>
+          </select>
+          <select id="searchType" class="search-select">
+            <option value="">All types</option>
+            <option value="text-generation">Text Generation</option>
+            <option value="text-to-image">Text to Image</option>
+            <option value="image-to-text">Image to Text</option>
+            <option value="automatic-speech-recognition">Speech Recognition</option>
+            <option value="text-to-speech">Text to Speech</option>
+            <option value="image-classification">Image Classification</option>
+            <option value="object-detection">Object Detection</option>
+            <option value="sentence-similarity">Sentence Similarity</option>
+            <option value="fill-mask">Fill Mask</option>
+            <option value="translation">Translation</option>
+          </select>
+          <label class="search-toggle">
+            <input type="checkbox" id="searchGGUF"> GGUF only
+          </label>
+          <label class="search-toggle">
+            <input type="checkbox" id="searchDatasets"> Datasets
+          </label>
+        </div>
+        <div id="searchResults" class="search-results">
+          <div class="empty-state">
+            <div class="empty-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+                <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+              </svg>
+            </div>
+            <h3>Search HuggingFace Hub</h3>
+            <p>Type a model name, author, or keyword above.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- History Page -->
+      <section class="page" id="page-history">
+        <header class="page-header">
+          <div>
+            <h1>Download History</h1>
+            <p class="page-subtitle">Previously completed and failed downloads</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-secondary btn-sm" onclick="loadHistory()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                <polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-4.87"/>
+              </svg>
+              Refresh
+            </button>
+          </div>
+        </header>
+        <div id="historyList">
+          <div class="empty-state">
+            <div class="empty-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+                <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+              </svg>
+            </div>
+            <h3>No History Yet</h3>
+            <p>Completed downloads will appear here.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Settings Page -->
+      <section class="page" id="page-settings">
+        <header class="page-header">
+          <div>
+            <h1 id="settingsPageTitle" tabindex="-1">Settings</h1>
+            <p class="page-subtitle">Configure your download preferences</p>
+            <p class="page-config-path" id="settingsConfigPath"></p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-ghost btn-sm" id="resetSettingsBtn">Reset defaults</button>
+            <button class="btn btn-primary" id="saveSettingsBtn">Save Settings</button>
+          </div>
+        </header>
+
+        <div class="settings-body">
+          <div class="settings-layout">
+            <div class="card settings-card">
+              <div class="card-header">
+                <svg class="card-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                </svg>
+                <h3>Storage</h3>
+              </div>
+              <div class="card-body settings-rows">
+                <div class="settings-row">
+                  <label for="downloadLayout" title="Choose cache-compatible or LM Studio-style folders.">Download layout</label>
+                  <div class="settings-control settings-control-sm">
+                    <select id="downloadLayout">
+                      <option value="cache">HF cache</option>
+                      <option value="local">Local folders</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="settings-row settings-row-top" id="hubDirGroup">
+                  <label for="effectiveHubDirInput" title="The actual HuggingFace cache folder used for downloads. Read-only; set by the server environment.">Actual HF Hub cache</label>
+                  <div class="settings-control">
+                    <input type="text" id="effectiveHubDirInput" class="path-input hub-dir-input" readonly spellcheck="false" placeholder="Unavailable" aria-readonly="true" aria-describedby="hubDirHint">
+                    <p class="form-hint" id="hubDirHint"></p>
+                  </div>
+                </div>
+                <div class="settings-row" id="cacheDirGroup">
+                  <label for="cacheDirInput" title="App / friendly cache root. Used for the friendly model views; without HF_HUB_CACHE the Hub cache is this root plus 'hub'.">Friendly cache folder</label>
+                  <div class="settings-control">
+                    <input type="text" id="cacheDirInput" class="path-input" placeholder="Default HuggingFace cache" spellcheck="false">
+                  </div>
+                </div>
+                <div class="settings-row" id="localDirGroup">
+                  <label for="localDirInput" title="Files go to owner/model folders.">Local download folder</label>
+                  <div class="settings-control">
+                    <input type="text" id="localDirInput" class="path-input" placeholder="D:\Models" spellcheck="false">
+                  </div>
+                </div>
+                <div class="settings-row settings-row-top">
+                  <label for="localScanDirs" title="One folder per line. Matching Hub results are marked as local.">Local model folders</label>
+                  <div class="settings-control">
+                    <textarea id="localScanDirs" rows="2" class="path-input" placeholder="D:\Models&#10;I:\LM Studio\models" spellcheck="false"></textarea>
+                  </div>
+                </div>
+                <div id="typeFoldersGroup" class="settings-rows">
+                  <div class="settings-row settings-row-top">
+                    <label>Type folders</label>
+                    <div class="settings-control">
+                      <p class="form-hint" style="margin-top:0">Optional. Send downloads for a model type to its own folder. Leave a field empty to use the current default. Paths are folders on the server.</p>
+                    </div>
+                  </div>
+                  <div class="settings-row">
+                    <label for="routeLlmGguf" title="Folder for GGUF quantized models.">GGUF models</label>
+                    <div class="settings-control">
+                      <input type="text" id="routeLlmGguf" class="path-input" placeholder="/mnt/nvme/models/LLM/GGUF" spellcheck="false">
+                    </div>
+                  </div>
+                  <div class="settings-row">
+                    <label for="routeLlmSafetensors" title="Folder for Transformers safetensors/bin models.">Safetensors / LLM</label>
+                    <div class="settings-control">
+                      <input type="text" id="routeLlmSafetensors" class="path-input" placeholder="/mnt/nvme/models/LLM/Safetensors" spellcheck="false">
+                    </div>
+                  </div>
+                  <div class="settings-row">
+                    <label for="routeAudio" title="Folder for audio models (ASR, TTS).">Audio</label>
+                    <div class="settings-control">
+                      <input type="text" id="routeAudio" class="path-input" placeholder="/mnt/nvme/models/Audio" spellcheck="false">
+                    </div>
+                  </div>
+                  <div class="settings-row">
+                    <label for="routeDiffusion" title="Folder for diffusion pipelines and adapters.">Diffusion</label>
+                    <div class="settings-control">
+                      <input type="text" id="routeDiffusion" class="path-input" placeholder="/mnt/nvme/models/Diffusion" spellcheck="false">
+                    </div>
+                  </div>
+                  <div class="settings-row">
+                    <label for="routeEmbedding" title="Folder for feature-extraction / embedding models.">Embedding</label>
+                    <div class="settings-control">
+                      <input type="text" id="routeEmbedding" class="path-input" placeholder="/mnt/nvme/models/Embedding" spellcheck="false">
+                    </div>
+                  </div>
+                  <div class="settings-row">
+                    <label for="routePresetRoot" title="Fills the fields above with standard subfolders. Nothing is created on disk until you save.">Preset root</label>
+                    <div class="settings-control" style="display:flex; gap:8px; align-items:center">
+                      <input type="text" id="routePresetRoot" class="path-input" placeholder="/mnt/nvme/models" spellcheck="false">
+                      <button type="button" class="btn btn-secondary btn-sm" id="fillRoutePresetBtn" style="flex-shrink:0">Fill type folders</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card settings-card">
+              <div class="card-header">
+                <svg class="card-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                  <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+                </svg>
+                <h3>Transfer</h3>
+              </div>
+              <div class="card-body settings-rows">
+                <div class="settings-row">
+                  <label for="connections">Connections per file</label>
+                  <div class="settings-control settings-control-xs">
+                    <div class="stepper-control">
+                      <button class="stepper-btn" data-action="decrease" aria-label="Decrease connections per file" aria-controls="connections">−</button>
+                      <input type="number" id="connections" value="8" min="1" max="32" data-default="8">
+                      <button class="stepper-btn" data-action="increase" aria-label="Increase connections per file" aria-controls="connections">+</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <label for="maxActive">Concurrent downloads</label>
+                  <div class="settings-control settings-control-xs">
+                    <div class="stepper-control">
+                      <button class="stepper-btn" data-action="decrease" aria-label="Decrease concurrent downloads" aria-controls="maxActive">−</button>
+                      <input type="number" id="maxActive" value="3" min="1" max="10" data-default="3">
+                      <button class="stepper-btn" data-action="increase" aria-label="Increase concurrent downloads" aria-controls="maxActive">+</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <label for="maxSpeed" title="Total download speed cap across all files and connections. Pick a preset or type a value. Empty = unlimited.">Max speed</label>
+                  <div class="settings-control speed-control">
+                    <div class="speed-presets" id="speedPresets">
+                      <button type="button" class="speed-btn" data-mbit="5">5</button>
+                      <button type="button" class="speed-btn" data-mbit="15">15</button>
+                      <button type="button" class="speed-btn" data-mbit="25">25</button>
+                      <button type="button" class="speed-btn" data-mbit="50">50</button>
+                      <button type="button" class="speed-btn" data-mbit="0">Unlim</button>
+                    </div>
+                    <div class="speed-field">
+                      <input type="number" id="maxSpeed" min="0" step="0.5" placeholder="unlimited">
+                      <span class="speed-unit">Mbit/s</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <label for="retries">Retry attempts</label>
+                  <div class="settings-control settings-control-xs">
+                    <div class="stepper-control">
+                      <button class="stepper-btn" data-action="decrease" aria-label="Decrease retry attempts" aria-controls="retries">−</button>
+                      <input type="number" id="retries" value="4" min="0" max="20" data-default="4">
+                      <button class="stepper-btn" data-action="increase" aria-label="Increase retry attempts" aria-controls="retries">+</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <label for="verify" title="SHA-256 is slower but verifies file integrity.">Verification mode</label>
+                  <div class="settings-control settings-control-md">
+                    <select id="verify">
+                      <option value="size">Size only</option>
+                      <option value="sha256">SHA-256</option>
+                      <option value="none">None</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card settings-card settings-card-wide">
+              <div class="card-header">
+                <svg class="card-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                  <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
+                </svg>
+                <h3>Hub Access</h3>
+              </div>
+              <div class="card-body settings-rows">
+                <div class="settings-row">
+                  <label for="endpoint" title="Use a mirror endpoint when needed.">HuggingFace Endpoint</label>
+                  <div class="settings-control">
+                    <input type="text" id="endpoint" placeholder="https://huggingface.co" spellcheck="false">
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <label for="hfToken" title="Required for private repositories and gated models.">HuggingFace Token</label>
+                  <div class="settings-control">
+                    <div class="input-with-toggle">
+                      <input type="password" id="hfToken" placeholder="hf_xxxxxxxxxx" aria-describedby="hfTokenHelp">
+                      <button type="button" class="toggle-visibility" data-target="hfToken" aria-label="Show or hide token">
+                        <svg class="icon-show" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+                        </svg>
+                        <svg class="icon-hide" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" style="display:none">
+                          <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+                          <line x1="1" y1="1" x2="23" y2="23"/>
+                        </svg>
+                      </button>
+                    </div>
+                    <div class="form-hint" id="hfTokenHelp">Leave unchanged to keep the token. Type a replacement or delete the displayed token to clear it, then Save. Startup overrides can restore the token after restart.</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card settings-card settings-card-wide">
+              <div class="card-header">
+                <svg class="card-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+                  <circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+                </svg>
+                <h3>Proxy</h3>
+              </div>
+              <div class="card-body settings-rows">
+                <div class="settings-row">
+                  <label for="proxyUrl" title="HTTP, HTTPS, or SOCKS5 proxy. Leave empty for direct connection or environment proxy.">Proxy URL</label>
+                  <div class="settings-control">
+                    <input type="text" id="proxyUrl" class="path-input" placeholder="http://proxy:8080 or socks5://proxy:1080" spellcheck="false">
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <label>Credentials</label>
+                  <div class="settings-control settings-pair-control">
+                    <input type="text" id="proxyUsername" placeholder="Username (optional)" spellcheck="false">
+                    <div class="input-with-toggle">
+                      <input type="password" id="proxyPassword" placeholder="(optional)" spellcheck="false">
+                      <button type="button" class="toggle-visibility" data-target="proxyPassword">
+                        <svg class="icon-show" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+                        </svg>
+                        <svg class="icon-hide" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" style="display:none">
+                          <path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/>
+                          <line x1="1" y1="1" x2="23" y2="23"/>
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <label for="proxyNoProxy" title="Comma-separated hosts, domains, or CIDR ranges to bypass.">No Proxy</label>
+                  <div class="settings-control">
+                    <input type="text" id="proxyNoProxy" class="path-input" placeholder="localhost,.internal.com,10.0.0.0/8" spellcheck="false">
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <span class="settings-label-spacer"></span>
+                  <div class="settings-control">
+                    <label class="checkbox-label">
+                      <input type="checkbox" id="proxyNoEnvProxy">
+                      <span>Ignore <code>HTTP_PROXY</code> / <code>HTTPS_PROXY</code> environment variables</span>
+                    </label>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Toast Container -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- Modal -->
+  <div class="modal-backdrop" id="modalBackdrop">
+    <div class="modal" id="modal">
+      <div class="modal-header">
+        <h3 id="modalTitle">Preview</h3>
+        <button class="modal-close" id="modalClose" aria-label="Close dialog">&times;</button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-footer" id="modalFooter"></div>
+    </div>
+  </div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>

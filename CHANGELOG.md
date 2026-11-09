@@ -1,0 +1,302 @@
+# Changelog
+
+## [Unreleased]
+
+### Added
+
+- Analyze and download EXL2/EXL3 bitrate branch quantizations (for example `4.00bpw` or `4_25`) as whole-branch variants: Model Details lists each branch with its BPW/head bits and recommends one, `POST /api/download` accepts `branchVariant: true` with the branch `revision`, and the downloader stores each `branchVariant` download without writing the shared friendly view, using HF cache blobs plus per-commit snapshots (or, in local mode, an app-owned reserved space `<root>/.hfdesk-branch-variants/<owner>/<repo>/` that holds the branch payload, its completion records and the transient staging area of a transfer, outside the ordinary repository tree, so a repository's own files are never replaced by a branch download). A generic revision download of the same branch remains an ordinary download and keeps the existing friendly-view behavior. `GET /api/cache/{owner}/{repo}?branchVariant=true&revision=...` reports a variant as downloaded only when its completed manifest and every expected file are present (#100).
+
+- Add a service mode: `hfdesk service install|uninstall|start|stop|restart|status` registers HFDesk with the native supervisor of the platform (systemd on Linux, launchd on macOS, the Windows Service Control Manager on Windows). The supervisor owns the lifecycle and HFDesk stays a headless foreground process, the instance resolves deterministic runtime paths of its scope (its own config file, state root and log directory), and it binds loopback by default; exposing it to the network needs an explicit `--listen`. Credentials stay in the service-owned config file and are never written into a supervisor registration (#142).
+
+- A second Windows artifact, `hfdesk-desktop_windows_amd64_v1.3.0.exe`, is now built and published next to the console binary: it is a GUI program without a console window that runs the same HFDesk server in-process behind a notification-area icon and a small Runtime / Logs window showing the server status, the active job count and the live log records. A left click on the icon opens that window, the tray menu offers Open HFDesk, Runtime / Logs and Quit HFDesk (a graceful shutdown), and the host is single-instance per user and session: a second launch detects the running instance and opens the web UI of it. The Runtime / Logs window needs the Microsoft Edge WebView2 Evergreen runtime, and a missing runtime produces an actionable message while the server and the tray keep working. The desktop binary is a separate download and the console binary is unchanged (#141).
+- A structured logging pipeline with the new `--log-file` and `--log-level` options: every record carries a level, a timestamp, the component that produced it and structured attributes, the console sink writes to standard error so redirecting standard output keeps working, and the file sink rotates. The desktop host always writes a log file, because a GUI program has no console, and it lands in `<user cache dir>/HFDesk/logs/hfdesk.log` unless `--log-file` names another path (#141).
+- Local-only runtime and log endpoints: `GET /api/runtime` reports the version, the status, the URL, the active job counts, the run id of the server and the log cursor, `GET /api/runtime/logs` returns a bounded page of the retained records, `GET /api/runtime/logs/stream` streams them as Server-Sent Events, and `POST /api/runtime/open-logs` and `POST /api/runtime/open-ui` open the log folder and the web UI of the running instance. They take no path and no URL from the caller, and three rules keep them local: the peer address has to be a loopback address, an `Origin` header of another site is rejected, and the `Host` header has to name the local machine, so a name of another site that is pointed at `127.0.0.1` cannot read the runtime data of the local machine. A request that breaks a rule is rejected with `403` and never reaches the handler (#141).
+- The requests of the runtime endpoints are written to the log at `debug` level and not at `info` level, so the polling of the Runtime / Logs window (every four seconds) does not fill the bounded log history that the window exists to show. Every other request keeps the `info` level, including a request that answers with an error (#141).
+
+- Add a read-only Community feature for repository Discussions and Pull Requests: `GET /api/community/{owner}/{repo}` lists both types with paging and type/status filters, while `?num=N` returns a thread with sanitized comments and human-readable event summaries. The Model Details view now has Overview and Community tabs; the read-only Community tab is lazy-loaded, lists Discussions and Pull Requests, opens a thread with comments and events, and supports model and dataset repositories. The proxy uses the configured endpoint, proxy, and HF token without exposing the token to the browser (#136).
+- Report gated Hugging Face repositories as a dedicated access state instead of a partial analysis: the API returns HTTP 403 with error code `gated_repo`, the repository type, an accept link for the configured endpoint, and boolean-only token state, and the Model Details view shows configured-token and repository-agreement guidance without exposing the token.
+- Model Details now opens README, lineage, and related-download repository links in-place, with Back/Forward history across models, datasets, and revisions (#135).
+
+### Changed
+
+- A Transformers repository whose `config.json` carries a nested `quantization_config` object is now reported with the same `quantized` projection as a repository that has a root `quantization_config.json`: `GET /api/analyze` fills the projection for it instead of leaving it empty, which is also how the quant method of an EXL branch is discovered (#100).
+- `hfdownloader.PlanRepo` and `hfdownloader.Download` now reject a path-shaped filter combined with `AppendFilterSubdir` (typed `ErrAppendFilterSubdirPathFilter`) before any network or plan work: only single-component group/token filters can name a destination subdirectory. Path filters remain valid with `AppendFilterSubdir` disabled.
+- README rendering and Hugging Face repository-link classification now have a single Go implementation: the bundled UI renders the server-sanitized `html` from `GET /api/readme` and no longer carries a client Markdown renderer or duplicate URL classifier (#135, #147).
+- Remote repository tree paths must now use their canonical spelling: a raw path whose `path.Clean` form differs (for example a `./` segment, duplicate slash, or trailing slash) fails planning with a non-canonical-path error instead of being normalized, so two spellings of one remote file cannot both be planned and race to write a single cache entry.
+
+### Fixed
+
+- A proxy URL without a host leaked its password: a proxy URL of the shape `http://user:password` is read by a parser as the host `user` with the port `password`, and the parse failure of that URL quotes the port, so the reason of a proxy configuration failure carried the proxy password into the log records and into the error response of `GET /api/search`, which is not served to loopback clients only. The reason of a proxy failure now names the cause of the failure without quoting any part of the URL that could be a credential, and the human readable proxy description drops the userinfo of the URL and the separately configured credentials as well. A normal proxy URL still reports its host and its port, so a misconfiguration stays visible (#141).
+- Cache selection now exposes a downloaded mmproj companion as its own deletable group instead of dropping it from the selectable model: `GET /api/cache-selection` reports a group `kind` of `llm` or `vision_encoder`, a companion group carries an `mmproj-` group id and no model-quantization label, and the Model Details view renders a distinct "Vision encoder" badge with its own Delete action. The delete confirmation names the vision-encoder role in both the local and the HF case and never claims the selected artifact class remains. Deleting a companion removes only that companion, deleting an LLM group never removes a companion, coexisting F16/BF16/F32 companions stay independently selectable and deletable, and the existing writer, snapshot, and identity-pinning protections still apply (#138).
+- The artifact-role rule for multimodal projector companions now has a single owner in `pkg/smartdl` (`IsMMProjFile`, the previously unexported helper), which the download picker, the cache metadata, and the cache-selection model all use. The rule is a case-insensitive "mmproj" match anywhere in the file's basename, so a dot-separated companion (`model.mmproj-f16.gguf`) and a name that merely starts with "mmproj" (`mmprojector-f16.gguf`) are both companions. `GET /api/cache/{owner}/{repo}` therefore reports a dot-separated companion under `hasMMProj`/`mmprojFiles` instead of listing it as an `F16` quantization, and a repository whose only companion is dot-separated now also reports the `vision` capability; the cache selection reports a companion as a `vision_encoder` group instead of a model quantization (#138).
+- `GET /api/analyze` now supports an explicit `type=model|dataset` selector, so a repository that exists as both namespaces resolves without repeating the type-selection prompt (#135). `type` takes precedence over the legacy `dataset` parameter, and `type=model` combined with `dataset=true` is rejected as a conflict. The legacy `dataset` parameter keeps its pre-#135 behavior: only `dataset=true` forces the dataset namespace, while `dataset=false` still auto-detects.
+- The Model Details `HF Hub ↗` action now uses the endpoint reported by `GET /api/health` when settings have not loaded or the settings fetch failed, and stays hidden rather than guessing `huggingface.co`; health now reports the normalized effective `endpoint` (#135).
+- Filtered plan/download scans no longer succeed when no non-excluded path directly matches and no recognized dataset membership selects data: `POST /api/plan` now returns `400` with error code `no_filter_match` instead of a metadata-only plan, while empty repositories without filters still plan successfully.
+
+## [1.3.0-beta.1] - 2026-10-15
+
+Beta release; see Beta limitations and compatibility below.
+
+### Added
+
+- Select a cache location and GGUF group for deletion in the cache UI; see partial-failure details when deletion is incomplete (#111, #125).
+- Route downloads into optional per-type folders (LLM/GGUF, LLM/Safetensors, LLM, Audio, Diffusion, Embedding) via opt-in type routes (#62)
+- `HF_TOKEN` environment variable support: the token is now resolved as `--token` flag, then `HF_TOKEN` env, then the config file token (#72)
+- Docker: `PUID`/`PGID`/`UMASK` environment variables let NAS/homelab users run the container as their own UID/GID and control the file creation mask (#61)
+- Docker: arbitrary-UID support — `docker run --user 568:568` and Kubernetes `securityContext.runAsUser`/`fsGroup` now work without the image user or an `/etc/passwd` entry (#61)
+- Embed the HFDesk icon in Windows binaries and add Linux desktop integration (#54, #56)
+- Add custom stepper controls for numeric settings (#58)
+
+### Changed
+
+- Correct misleading `HF_TOKEN` documentation in the library `Settings` docs to state that the hfdesk server reads the env var, while library callers pass the token explicitly (#72)
+- Docker: by default, writable application state (settings, jobs, history, HF cache, local models) is consolidated under a single `/data` root, so one volume persists it; `HOME=/data`, `XDG_CONFIG_HOME=/data/.config`, `HF_HOME=/data/.cache/huggingface`, and `WORKDIR /data` (#61)
+- Docker: the container starts as root only to apply PUID/PGID, then drops privileges; the app process runs non-root (default UID/GID 1000) unless `PUID=0`/`PGID=0` is set explicitly (#61)
+- Docker: runtime UID/GID selection is numeric only and never modifies `/etc/passwd` or `/etc/group`, including account collisions; non-root startup supports a read-only root filesystem with all capabilities dropped and no-new-privileges when `/data` is writable (#71)
+- Docker: the image no longer creates a named user/group or accepts `UID`/`GID` build arguments; the runtime identity is configured numerically via `PUID`/`PGID` (root drop) or `--user` (non-root), and the entrypoint's default identity remains `1000:1000`
+- Upgrade `golang.org/x/net` to v0.55.0 to close reachable govulncheck findings in `x/net/html`; the minimum build toolchain is now Go 1.25 (#101)
+- Preserve existing Hugging Face error messages while using actual HTTP status for namespace detection: HTTP 401/404 responses can trigger model/dataset fallback, HTTP 403 remains terminal, and transport failures retain their diagnostics even when their message contains status-like words (#125)
+
+### Fixed
+
+- Keep GGUF quant selections matched-only when README filenames contain the selected quant token, without treating README metadata as a second payload format; dataset split filters now use inferred file membership and fail clearly when relevant membership is ambiguous (#124).
+- Read quantization metadata from Git-LFS-backed config files instead of silently losing it to pointer stubs, show quantization information for quantization-only repositories, and distinguish proven uniform precision, observed width variation, and unknown/incomplete precision in the quantized panel; also show `Not quantized: …` for excluded modules (#123).
+- Analyze and plan/download previews honor the configured proxy and report proxy construction failures rather than falling back to direct planning requests (#104).
+- Read analyzer metadata completely within the 10 MiB cap, recover completed leading quantization fields from oversized configs, and report unrecoverable overflow/read failures; root Transformers weights take precedence over ONNX exports while specialized model detection is preserved (#105).
+- Recover stalled downloads and bound transport waits with deadlines; retry `429` and all `5xx`, fail non-retryable file responses without retrying, and keep optional verification metadata failures non-fatal (#97)
+- Keep exact `HF_HUB_CACHE` storage consistent across downloads, cache operations, mirror, rebuild scripts, cleanup, and disk previews; freeze complete job destinations across restart and expose raw app-root/effective Hub metadata without persisting inherited defaults (#76)
+- Preserve active and stored Hugging Face credentials during ordinary settings updates; persist token changes only for explicit set/clear requests, including concurrent updates and retries after persistence warnings (#74).
+- Treat redacted token display values as preserve-only and avoid exposing complete short tokens in settings responses (#74).
+- Save config files with owner-only Unix permissions and preserve the previous file when persistence fails (#74).
+- Docker: the README example mounted the host cache to `/root/.cache/huggingface` while the image used `/home/hfdesk/.cache/huggingface`, so the Hugging Face cache was never persisted. Existing users must update their volume mount to `/data` (#61)
+- Contain download destination and cache paths at their join boundaries, require canonical SHA-256 for remote hash values, honor `Retry-After` on size HEAD requests, and report stalled transfers as an explicit stall error instead of `context canceled` (#117)
+- List repository trees recursively with `Link` pagination and bounded, context-cancellable retries, so repositories with more than 1,000 entries per directory are analyzed and planned completely instead of silently truncated; exceeding the request budget fails loudly rather than returning a truncated result, mirrors that ignore `recursive` or reject unknown query params keep working, and synchronous results have time to reach the client within the existing handler budget (#96)
+- Place HF cache snapshot and friendly-view entries with a symlink to hardlink to copy fallback instead of skipping them where symlinks are unavailable (e.g. Windows without Developer Mode), so downloads always leave usable `snapshots/<commit>` entries and a friendly view; rebuild/`Sync` now recreates missing snapshot entries from the offline download manifest, one clear notice per root names the fallback in use, and selected-GGUF deletion handles hardlink/copy entries like their symlink counterparts (#99)
+- Selected-GGUF deletion is durable across rebuild when tombstones are successfully recorded in the repository download manifest (`deleted`); if recording fails, the error is reported while deletion proceeds, so rebuild/repair may recreate those names. Recorded tombstones prevent recreation even when a retained payload (shared entry, retained alias, or failed blob unlink) keeps their content available; refused deletions record nothing (#99)
+- Restore quant status after cache deletion (#59)
+- Keep job-state persistence ordered and atomic (#80)
+- Inject build version into Docker images and use the release tag as the artifact version source (#64, #69)
+
+### Beta limitations and compatibility
+
+- Docker now keeps writable application state under `/data` by default. Existing deployments should move their persisted volume to `/data` to retain settings, jobs/history, HF cache, and local models. Existing files in a mounted directory may retain their prior ownership; changing `PUID`/`PGID` does not recursively chown existing data (#61).
+- Building from source requires Go 1.25 or newer (#101).
+- Selected local deletion is specifically GGUF-group deletion, not general local-model or all-format deletion (issue #63 remains incomplete). The documented selected-delete platforms are Linux, Windows, and macOS; native Windows/macOS verification was unavailable. On Darwin, a process crash can leave a temporary private pin directory, and HFDesk does not automatically clean such orphans. Arbitrary external filesystem changes are not excluded atomically between final identity check and unlink.
+
+## [1.2.2] - 2026-06-29
+
+### Fixed
+
+- Tighten README sanitizer allowlist to only allow safe HTML tags and attributes, fixing CodeQL alerts and preventing XSS via malformed README markdown (#52)
+- Resolve README image assets through LFS URLs for gated/private repositories, fixing broken images in model cards for gated repos (#51)
+
+### Changed
+
+- Refine HFDesk icon and add Apple touch icons for better home screen/PWA experience (#53)
+
+## [1.2.1] - 2026-06-27
+
+### Fixed
+
+- Delete stale `.part` files when a paused job is cancelled or dismissed, preventing disk leak from the pause → cancel and pause → dismiss sequences (#49)
+- Scope partial-file cleanup to per-job in-flight files so a pause → cancel / pause → dismiss never touches a concurrent job's partials in the same repo (e.g. model + mmproj downloaded in parallel)
+
+## [1.2.0] - 2026-06-26
+
+### Added
+
+- Download deduplication is now case-insensitive: files differing only by case are merged in the plan to prevent duplicate jobs (#46)
+- Speed bar with live usage gauge on the Downloads tab: shows current transfer throughput and cap utilization (#43)
+- Active Jobs page redesigned — Clean Monitor layout with Compact Strip for finished, paused, and cancelled jobs
+- Speed presets: 5, 15, 25, 50 MB/s, and unlimited
+
+### Fixed
+
+- Preserve `DownloadedBytes` on job resume so progress does not drop back to zero after a pause, retry, or server restart (#42)
+- Align speed bar with the combined redesign layout; fix pause freeze that stopped live speed updates
+- Constrain speed bar max-width to prevent overflow on narrow viewports
+- Match speed bar width to downloads section via shared `.jobs-page` container; fix overlap with app footer, white input background, and hidden spinner elements
+- Speed bar now uses variable width matching the downloads section, removing the previous fixed max-width
+- Delete stale `.part` files on explicit download cancel (#47)
+
+### Security
+
+- Fix CodeQL P0-P5 alerts across the codebase; path-safety hardening in `pkg/hfdownloader` (#45)
+
+## [1.1.0] - 2026-06-26
+
+### Added
+
+- Download speed limit feature with configurable cap
+- Inline speed cap display on Downloads tab
+
+### Fixed
+
+- Pre-existing concurrency bugs in Server.config and RateLimiter
+- MTP (Multi-Token Prediction) variants are now treated as separate GGUF quantizations
+
+### Changed
+
+- Upgraded GitHub Actions to Node.js 24 compatible versions
+- Updated workflow actions (checkout v7, upload-artifact v7)
+- Added .graymatter to .gitignore
+
+## [1.0.14] - 2026-06-18
+
+### Fixed
+
+- MTP (Multi-Token Prediction) companion GGUF files without a recognized quantization token are now filtered out of quantization lists. Files starting with `mtp-` (e.g. `mtp-gemma-4-26B-A4B-it.gguf`) are excluded unless they carry a proper quant label (e.g. `-BF16-MTP.gguf`), which still appear as selectable options.
+
+## [1.0.13] - 2026-06-15
+
+### Added
+
+- Upstream mmproj discovery: when a GGUF repo has no local multimodal projector files, hfdesk now traverses the HF model card `base_model` chain (up to two hops) and checks the `{owner}/{name}-GGUF` sibling repo at each level. If found, the mmproj files are listed in the Vision Encoder section with a note showing the source repo (e.g. `Multimodal projector · upstream: unsloth/Qwen3.5-9B-GGUF`). The download button targets the upstream repo automatically.
+- Model lineage tree in the GGUF Information panel. When a repo declares a `base_model` in its HF card, the provenance chain is shown as an indented tree (base model → finetune → quantized → this), matching the style of the HF model card. Built from the HF `/api/models` metadata; only shown when at least one ancestor is known.
+
+### Changed
+
+- Vision Encoder items now appear under a "Vision Encoder" section heading in the quantization list (previously fell back to the raw `vision_encoder` string).
+
+### Fixed
+
+- `isMMProjFile` now detects the mradermacher naming convention (`model.mmproj-f16.gguf`, `model.mmproj-Q8_0.gguf`) where the `mmproj` token is dot-separated rather than a leading prefix. Previously these files were misclassified as LLM quantizations (e.g. `F16`, `Q8_0`) and polluted the quant picker.
+- Upstream mmproj downloads are now stored under the current model's folder instead of the upstream repo's own folder, so the on-disk cache layout matches the model selected in the UI. Previously a click on an upstream multimodal projector entry (one discovered on a base model's `-GGUF` sibling) saved the file under the upstream repo id and split the local layout between two owners.
+
+## [1.0.12] - 2026-06-14
+
+### Changed
+
+- Pipeline tag text is no longer shown as a badge on model list rows; the full pipeline is still visible in the model detail panel. GGUF and local-cache badges are unchanged. This removes a source of visual noise and inconsistent truncation (e.g. "feature extracti" cut off at 16 characters).
+- README links in the model description now underline on hover, making them easier to discover as interactive without adding visual weight at rest.
+- Improved contrast of model detail tag chips (e.g. `pytorch`, `safetensors`) by raising the text color from muted to secondary.
+
+### Fixed
+
+- Multipart downloads discard stale part files when the file size, concurrency, or chunk layout changes, preventing silent corruption from incompatible resume data.
+
+## [1.0.11] - 2026-06-12
+
+### Changed
+
+- Model detail panel now uses a single scroll instead of two nested scrolls (quantization list + README preview). Section headers stick to the top while scrolling. Contextual floating arrows appear: down-arrow at the bottom when scrolled to top, up-arrow at the top when scrolled down, both arrows visible in the middle.
+- README screenshots were refreshed to match the current UI, including the model detail view with quantizations and the README description visible together.
+
+## [1.0.10] - 2026-06-12
+
+### Added
+
+- Repository names in Active Jobs are now clickable and jump straight back to model analysis.
+
+### Changed
+
+- Redesigned the Settings page layout with proper scrolling, clearer section grouping, and a sticky save action.
+- Refined the dark theme typography and text hierarchy, increased model row readability, and widened the analysis panel.
+
+### Fixed
+
+- Download deduplication is now filter-aware, so downloading a quant and its `mmproj` companion creates separate jobs instead of silently collapsing into one.
+- Newly created queued jobs are broadcast to the UI immediately, so they appear in Active Jobs without waiting for a later state change.
+- The refresh action now reloads the selected model reliably, and the Hugging Face Hub button lives in the model detail header.
+- GGUF detection now recognizes more quant names correctly, handles `BF16` files properly, and filters out `*imatrix.gguf` companion files from quant lists.
+
+## [1.0.9] - 2026-06-11
+
+### Fixed
+
+- Download speed reading is steadier: averaged over a longer window with EMA smoothing instead of a raw 4-second window.
+- ETA no longer bounces by minutes: it is computed server-side from the whole-run average rate and displayed with coarse units (seconds only show under two minutes).
+- The finalizing status now covers the per-file post-download work — part assembly, SHA-256 verification, and the cache store — which is where a large download actually spends its "stuck at 100%" time. Previously the status only appeared for the final manifest/friendly-view step and never appeared at all in local-folder mode.
+
+## [1.0.8] - 2026-06-06
+
+### Added
+
+- Retry button on failed and cancelled downloads to restart them with their original settings.
+- Full README renderer: server-side sanitized Markdown with GitHub-Flavored tables and code, relative image/link rewriting, an authenticated image proxy for gated repos, and lazy-loaded images.
+- "Open on Hugging Face Hub" button in the model detail panel.
+- Finalizing status on the job card while post-download processing (friendly view, manifest) runs, so a finished download no longer looks stuck at 100%.
+
+### Changed
+
+- Active Jobs now sorts by date added (newest first); completed downloads move to History automatically, while failed, cancelled, and paused jobs stay visible.
+- Compact download rows and hide the redundant `main` revision label.
+- Model analysis panel now shows the Description (README) below the quantizations list.
+- Local cache page now defaults to the list view.
+- Web UI version is read from the build automatically (no hardcoded number to edit each release).
+
+### Fixed
+
+- Pause button no longer goes missing after a download starts; it now appears when a queued job begins running.
+- Quantization download buttons are disabled while that quant's download is active or queued, instead of letting it be started again.
+- Download speed reading is smoothed so it no longer jumps around.
+- `max-active` now limits concurrent download jobs: jobs above the limit queue and start as slots free, and lowering the limit re-queues the most-recently-started excess downloads so they auto-resume as slots free.
+- Download speed now reflects current transfer throughput over a short window; resuming a partial download no longer shows an inflated speed from already-downloaded bytes.
+- tools/reasoning capability badges now also show for cached models, detected from the repo name and tags.
+- GGUF downloads now fetch only the selected quant's files (plus any mmproj companion) instead of also pulling the repo's config/tokenizer JSON, `README`, `.gitattributes`, and `fp16/` transformers metadata. Non-GGUF downloads (e.g. safetensors) still include their required config files.
+
+## [1.0.7] - 2026-06-05
+
+### Fixed
+
+- GitHub Release descriptions now use the matching section from `CHANGELOG.md`.
+
+## [1.0.6] - 2026-06-05
+
+### Fixed
+
+- Recognize APEX GGUF quantization profiles (`APEX_*`, `APEX_I_*`) instead of showing them as `Unknown`.
+- Keep exact download matching working for hyphenated APEX profile filenames.
+
+## [1.0.5] - 2026-06-05
+
+### Removed
+
+- Removed the obsolete multi-select download toolbar from analyzed model results.
+
+## [1.0.4] - 2026-06-05
+
+### Fixed
+
+- Recognize `MXFP4_MOE` GGUF files instead of showing them as `Unknown`.
+- Sort GGUF quantization choices from least-compressed/largest to most-compressed/smallest.
+
+## [1.0.3] - 2026-06-05
+
+### Fixed
+
+- Release packaging now runs on pushed `v*` tags, so new binaries include the latest UI fixes.
+
+## [1.0.2] - 2026-06-05
+
+### Added
+
+- Default download layout setting: choose HF cache layout or local `owner/model` folders for LM Studio-style storage.
+- Extra local model folders in Settings for scan-only cache discovery.
+- Local cache rows now show downloaded GGUF quantization types.
+- Sticky `Download selected` action above selectable quantization lists.
+
+### Fixed
+
+- Removed the duplicate read-only HuggingFace cache directory field from Settings.
+- Fixed Storage card overflow when Local files layout is selected.
+- Preserved `UD_` quantization labels such as `UD_Q3_K_XL`.
+- Improved model search clear button visibility and default model-list column width.
+
+## [1.0.1] - 2026-06-04
+
+### Fixed
+
+- **Data race in WebSocket hub** (`internal/server/websocket.go`): `WSHub.Run()` was calling
+  `delete(h.clients, client)` while holding an `RLock`. Since `ClientCount()` also acquires
+  `RLock`, both could run concurrently, resulting in a concurrent map write + read (data race).
+  Fixed by upgrading the broadcast case to a full write lock (`Lock`/`Unlock`).
+
+- **OOM when mirroring large files** (`internal/server/mirror.go`): `copyFileForMirror` used
+  `os.ReadFile` to read the entire source file into memory before writing it. For multi-GB model
+  files this would exhaust RAM and crash the process. Replaced with streaming `io.Copy`.
+
+- **Search ignores proxy config** (`internal/server/search.go`): `handleSearch` was creating a
+  plain `&http.Client{}`, bypassing any proxy configured via `--proxy` or the settings API.
+  Fixed by using `hfdownloader.BuildHTTPClient(s.config.Proxy)` so search requests honor the
+  same proxy settings as downloads.

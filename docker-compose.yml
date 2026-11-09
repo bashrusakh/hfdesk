@@ -1,0 +1,24 @@
+# Example docker-compose.yml for HFDesk.
+#
+# By default, writable application state lives under the single /data volume.
+# Set PUID/PGID to your host user so downloaded models are owned by you (find
+# them with `id -u` / `id -g`).
+#
+# For private/gated models, the Hugging Face token is resolved as the `--token`
+# flag, then the `HF_TOKEN` environment variable, then the config file token.
+# Uncomment HF_TOKEN below (or pass `--token` / use the settings UI/API).
+# That state persists under /data.
+services:
+  hfdesk:
+    image: ghcr.io/bashrusakh/hfdesk:latest
+    container_name: hfdesk
+    ports:
+      - "8080:8080"
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      UMASK: "022"
+      # HF_TOKEN: "hf_xxx"
+    volumes:
+      - ./hfdesk-data:/data
+    restart: unless-stopped

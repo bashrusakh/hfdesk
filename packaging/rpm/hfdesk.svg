@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="hfill" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+  <!-- H letterform -->
+  <g transform="translate(112,96)">
+    <rect x="0" y="0" width="88" height="320" rx="20" fill="url(#hfill)"/>
+    <rect x="200" y="0" width="88" height="320" rx="20" fill="url(#hfill)"/>
+    <rect x="0" y="120" width="288" height="80" rx="18" fill="url(#hfill)"/>
+  </g>
+</svg>

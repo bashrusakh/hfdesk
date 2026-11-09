@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <!-- Primary gradient: Indigo -> Violet -->
+    <linearGradient id="primary" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+
+    <!-- Surface gradient: matches app dark theme -->
+    <linearGradient id="surface" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e1e2a"/>
+      <stop offset="100%" stop-color="#12121a"/>
+    </linearGradient>
+
+    <!-- Subtle glow for depth -->
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="6" result="blur"/>
+      <feOffset dx="0" dy="2" result="offsetBlur"/>
+      <feMerge>
+        <feMergeNode in="offsetBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background rounded square -->
+  <rect width="512" height="512" rx="108" fill="url(#surface)"/>
+
+  <!-- Subtle border -->
+  <rect x="5" y="5" width="502" height="502" rx="103" fill="none" stroke="#2a2a3a" stroke-width="4" opacity="0.6"/>
+
+  <!-- H letterform with glow -->
+  <g filter="url(#glow)">
+    <!-- Left vertical bar -->
+    <rect x="112" y="96" width="88" height="320" rx="20" fill="url(#primary)"/>
+    
+    <!-- Right vertical bar -->
+    <rect x="312" y="96" width="88" height="320" rx="20" fill="url(#primary)"/>
+    
+    <!-- Horizontal bridge (overlaps pillars for seamless join) -->
+    <rect x="112" y="216" width="288" height="80" rx="18" fill="url(#primary)"/>
+  </g>
+</svg>

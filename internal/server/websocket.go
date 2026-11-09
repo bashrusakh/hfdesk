@@ -1,0 +1,289 @@
+// Copyright 2025
+// SPDX-License-Identifier: Apache-2.0
+
+package server
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"sync"
+	"time"
+
+	"github.com/bashrusakh/hfdesk/internal/logging"
+	"github.com/gorilla/websocket"
+)
+
+// websocketLog is the logger of the WebSocket hub. It resolves the current
+// default logger on every call, so records reach whichever pipeline the
+// application installed.
+var websocketLog = logging.NewComponentLogger("websocket")
+
+// isAllowedWSOrigin decides whether a WebSocket upgrade request may proceed.
+// Browsers attach an Origin header to cross-site WebSocket handshakes but —
+// unlike fetch/XHR — they do NOT enforce the CORS response on the connection,
+// so the server itself must reject disallowed origins or any web page the user
+// visits could open a socket to a locally-bound server and stream job state
+// (cross-site WebSocket hijacking). Policy:
+//   - No Origin header (native clients such as curl/websocat): allow.
+//   - Same-origin (Origin host == request host): allow.
+//   - Otherwise: allow only if the origin is in AllowedOrigins (or it is "*").
+//
+// With no AllowedOrigins configured this is default-deny for cross-origin, the
+// safe expectation for a tool bound to localhost/0.0.0.0. Note this is stricter
+// than corsMiddleware on purpose: CORS is browser-enforced for XHR, WS is not.
+func (s *Server) isAllowedWSOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// Non-browser client; no Origin to forge or hijack.
+		return true
+	}
+	if u, err := url.Parse(origin); err == nil && u.Host != "" && u.Host == r.Host {
+		return true
+	}
+	cfg := s.snapshotConfig()
+	for _, o := range cfg.AllowedOrigins {
+		if o == "*" || o == origin {
+			return true
+		}
+	}
+	return false
+}
+
+// WSMessage represents a message sent over WebSocket.
+type WSMessage struct {
+	Type string `json:"type"`
+	Data any    `json:"data"`
+}
+
+// WSClient represents a connected WebSocket client.
+type WSClient struct {
+	conn   *websocket.Conn
+	send   chan []byte
+	hub    *WSHub
+	closed bool
+	mu     sync.Mutex
+}
+
+// WSHub manages WebSocket clients and broadcasts.
+type WSHub struct {
+	clients    map[*WSClient]bool
+	broadcast  chan []byte
+	register   chan *WSClient
+	unregister chan *WSClient
+	mu         sync.RWMutex
+}
+
+// NewWSHub creates a new WebSocket hub.
+func NewWSHub() *WSHub {
+	return &WSHub{
+		clients:    make(map[*WSClient]bool),
+		broadcast:  make(chan []byte, 256),
+		register:   make(chan *WSClient),
+		unregister: make(chan *WSClient),
+	}
+}
+
+// Run starts the hub's main loop.
+func (h *WSHub) Run() {
+	for {
+		select {
+		case client := <-h.register:
+			h.mu.Lock()
+			h.clients[client] = true
+			h.mu.Unlock()
+			websocketLog.Info("client connected", "clients", len(h.clients))
+
+		case client := <-h.unregister:
+			h.mu.Lock()
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				close(client.send)
+			}
+			h.mu.Unlock()
+			websocketLog.Info("client disconnected", "clients", len(h.clients))
+
+		case message := <-h.broadcast:
+			h.mu.Lock()
+			for client := range h.clients {
+				select {
+				case client.send <- message:
+				default:
+					// Client's buffer is full, disconnect
+					close(client.send)
+					delete(h.clients, client)
+				}
+			}
+			h.mu.Unlock()
+		}
+	}
+}
+
+// Broadcast sends a message to all connected clients.
+func (h *WSHub) Broadcast(msgType string, data any) {
+	msg := WSMessage{
+		Type: msgType,
+		Data: data,
+	}
+
+	jsonData, err := json.Marshal(msg)
+	if err != nil {
+		websocketLog.Info("failed to marshal message", "error", err)
+		return
+	}
+
+	select {
+	case h.broadcast <- jsonData:
+	default:
+		websocketLog.Info("broadcast channel full, dropping message")
+	}
+}
+
+// BroadcastJob sends a job update to all clients.
+func (h *WSHub) BroadcastJob(job *Job) {
+	h.Broadcast("job_update", job)
+}
+
+// BroadcastEvent sends a progress event to all clients.
+func (h *WSHub) BroadcastEvent(event any) {
+	h.Broadcast("event", event)
+}
+
+// ClientCount returns the number of connected clients.
+func (h *WSHub) ClientCount() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.clients)
+}
+
+// handleWebSocket handles WebSocket connections.
+func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin:     s.isAllowedWSOrigin,
+	}
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		websocketLog.Info("upgrade failed", "error", err)
+		return
+	}
+
+	client := &WSClient{
+		conn: conn,
+		send: make(chan []byte, 256),
+		hub:  s.wsHub,
+	}
+
+	s.wsHub.register <- client
+
+	// Start read/write pumps
+	go client.writePump()
+	go client.readPump()
+
+	// Send initial state
+	s.sendInitialState(client)
+}
+
+// sendInitialState sends current job state to newly connected client.
+func (s *Server) sendInitialState(client *WSClient) {
+	jobs := s.jobs.ListJobs()
+
+	msg := WSMessage{
+		Type: "init",
+		Data: map[string]any{
+			"jobs":    jobs,
+			"version": "1.0.1",
+		},
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if !client.closed {
+		select {
+		case client.send <- data:
+		default:
+		}
+	}
+}
+
+// writePump pumps messages from the hub to the WebSocket connection.
+func (c *WSClient) writePump() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
+
+	for {
+		select {
+		case message, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if !ok {
+				// Hub closed the channel
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			// Every frame must carry exactly one JSON message. The frontend
+			// parses each frame with JSON.parse(event.data), so joining several
+			// messages into one frame makes it throw and drops the whole frame
+			// (including terminal job states).
+			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				return
+			}
+
+			// Drain any queued messages, still one WebSocket text frame each,
+			// so a burst does not force a syscall per select iteration.
+			n := len(c.send)
+			for i := 0; i < n; i++ {
+				c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := c.conn.WriteMessage(websocket.TextMessage, <-c.send); err != nil {
+					return
+				}
+			}
+
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// readPump pumps messages from the WebSocket connection to the hub.
+func (c *WSClient) readPump() {
+	defer func() {
+		c.mu.Lock()
+		c.closed = true
+		c.mu.Unlock()
+		c.hub.unregister <- c
+		c.conn.Close()
+	}()
+
+	c.conn.SetReadLimit(512 * 1024) // 512KB
+	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	for {
+		_, message, err := c.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				websocketLog.Info("read error", "error", err)
+			}
+			break
+		}
+
+		// Handle incoming messages (for future use)
+		_ = message
+	}
+}

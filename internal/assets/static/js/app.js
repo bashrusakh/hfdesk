@@ -1,0 +1,6554 @@
+/**
+ * HFDesk - Modern Web UI
+ */
+
+(function() {
+  'use strict';
+
+  // =========================================
+  // State
+  // =========================================
+
+  const state = {
+    jobs: new Map(),
+    settings: {},
+    // serverEndpoint is the effective configured HF endpoint last reported by
+    // /api/health at startup or by a successful /api/settings load. It covers
+    // the window before /api/settings resolves (or when that fetch fails), and
+    // settings overwrite it so a changed or default endpoint never goes stale.
+    serverEndpoint: '',
+    // settingsEndpointResolved records that a successful /api/settings load
+    // supplied the endpoint preference, including the empty default. Once set,
+    // settings remain authoritative and a late /api/health response must not
+    // replace the remembered endpoint with its stale startup snapshot.
+    settingsEndpointResolved: false,
+    wsConnected: false,
+    ws: null,
+    currentPage: 'analyze',
+    speedLimitLoaded: false,
+    // settingsLoadFailed is set only when the Settings metadata fetch fails.
+    // It gates saving so a failed/uninitialized load cannot POST empty values
+    // over the stored preferences. It stays false on a normal (including
+    // no-fetch) form so existing direct save paths keep working.
+    settingsLoadFailed: false,
+    // rawCacheDirAvailable is true only when the server returned the additive
+    // configuredCacheDir field. When false (older server), the form falls back
+    // to the legacy effective cacheDir for display and only submits cacheDir
+    // if the user actually changed it, so an unrelated save can never erase or
+    // materialize the stored preference.
+    rawCacheDirAvailable: false,
+    // loadedCacheDir snapshots the populated friendly-root field so the
+    // old-server fallback can tell an intentional edit from a pass-through.
+    loadedCacheDir: ''
+  };
+
+  // =========================================
+  // DOM Elements
+  // =========================================
+
+  const $ = (sel) => document.querySelector(sel);
+  const $$ = (sel) => document.querySelectorAll(sel);
+  const isFilePreview = () => window.location.protocol === 'file:';
+
+  // =========================================
+  // Download route labels
+  // =========================================
+  //
+  // The server owns a closed set of internal route keys. The user must never
+  // see those keys, so the dashboard maps each label to its key in this single
+  // fixed table. Field ids
+  // and labels are the only route-facing surface; keys are sent to the API but
+  // never rendered into the DOM.
+  const ROUTE_LABELS = [
+    { key: 'llm/gguf',        label: 'GGUF models',       fieldId: 'routeLlmGguf',        preset: ['LLM', 'GGUF'] },
+    { key: 'llm/safetensors', label: 'Safetensors / LLM', fieldId: 'routeLlmSafetensors', preset: ['LLM', 'Safetensors'] },
+    { key: 'audio',           label: 'Audio',             fieldId: 'routeAudio',          preset: ['Audio'] },
+    { key: 'diffusion',       label: 'Diffusion',         fieldId: 'routeDiffusion',      preset: ['Diffusion'] },
+    { key: 'embedding',       label: 'Embedding',         fieldId: 'routeEmbedding',      preset: ['Embedding'] }
+  ];
+
+  // getConfiguredRouteOptions returns the labeled options for routes that have
+  // a non-empty destination configured, including the server's llm parent
+  // fallback. These are semantic selectors, not client-resolved paths.
+  function getConfiguredRouteOptions() {
+    const routes = state.settings?.downloadRoutes || {};
+    return ROUTE_LABELS
+      .filter(r => String(routes[r.key] || '').trim() !== ''
+        || (r.key.startsWith('llm/') && String(routes.llm || '').trim() !== ''))
+      .map(r => ({ key: r.key, label: r.label }));
+  }
+
+  // routeKeyForAnalysis derives the internal route key from an existing
+  // /api/analyze result. Returns '' when no route applies; selectors can also
+  // resolve through a configured parent on the server.
+  function routeKeyForAnalysis(analysis) {
+    if (!analysis || analysis.is_dataset) return '';
+    switch (analysis.type) {
+      case 'gguf':
+        return 'llm/gguf';
+      case 'transformers':
+        return analysis.transformers?.task === 'feature-extraction'
+          ? 'embedding'
+          : 'llm/safetensors';
+      case 'gptq':
+      case 'awq':
+        return 'llm/safetensors';
+      case 'diffusers':
+        return 'diffusion';
+      case 'audio':
+        return 'audio';
+      default:
+        return '';
+    }
+  }
+
+  // _routeSelectKeys records the exact key list each rendered select was built
+  // from, keyed by element id. Keys stay out of the DOM, but routeSelectValue
+  // compares identity so a reconfigured route set of the same size can never
+  // make a selected index resolve to a different key.
+  const _routeSelectKeys = new Map();
+
+  // renderRouteSelect builds a labeled destination <select>. Option values are
+  // indexes into the fixed option list, never raw keys, so keys stay out of the
+  // rendered markup. An empty selection means "Default (server setting)".
+  function renderRouteSelect(id, { className = '', style = '', ariaLabel = '' } = {}) {
+    const opts = getConfiguredRouteOptions();
+    const prefill = routeKeyForAnalysis(currentAnalysis);
+    const selIdx = opts.findIndex(o => o.key === prefill);
+    _routeSelectKeys.set(id, opts.map(o => o.key));
+    const rows = opts.map((o, i) =>
+      `<option value="${i}"${i === selIdx ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
+    ).join('');
+    const cls = className ? ` class="${escapeHtml(className)}"` : '';
+    const styleAttr = style ? ` style="${escapeHtml(style)}"` : '';
+    const aria = ariaLabel ? ` aria-label="${escapeHtml(ariaLabel)}"` : '';
+    // data-option-count records how many configured routes this select was
+    // built from. routeSelectValue refuses to interpret an index if the live
+    // count drifted, so a changed route set can never map to the wrong key.
+    return `<select id="${escapeHtml(id)}"${cls}${styleAttr}${aria} data-option-count="${opts.length}">
+      <option value="-1"${selIdx < 0 ? ' selected' : ''}>Default (server setting)</option>
+      ${rows}
+    </select>`;
+  }
+
+  // routeSelectValue maps the selected index back to a configured key, or ''
+  // for the default option / an absent or stale select.
+  function routeSelectValue(id) {
+    const el = $(`#${id}`);
+    if (!el) return '';
+    const idx = parseInt(el.value, 10);
+    if (!Number.isInteger(idx) || idx < 0) return '';
+    const opts = getConfiguredRouteOptions();
+    const rendered = parseInt(el.dataset.optionCount, 10);
+    if (opts.length !== rendered) return '';
+    // Key-identity guard: the index is only meaningful if the key list is the
+    // same one the select was rendered from (not merely the same length).
+    const renderedKeys = _routeSelectKeys.get(id);
+    if (!renderedKeys || renderedKeys.length !== opts.length
+        || renderedKeys.some((k, i) => k !== opts[i].key)) return '';
+    return idx < opts.length ? opts[idx].key : '';
+  }
+
+  // =========================================
+  // Navigation
+  // =========================================
+
+  function initNavigation() {
+    $$('.nav-item').forEach(item => {
+      item.addEventListener('click', (e) => {
+        e.preventDefault();
+        const page = item.dataset.page;
+        navigateTo(page);
+      });
+    });
+  }
+
+  function getInitialPage() {
+    const allowed = new Set(['models', 'jobs', 'cache', 'mirror', 'history', 'settings']);
+    const params = new URLSearchParams(window.location.search);
+    const page = params.get('page') || window.location.hash.replace(/^#/, '');
+    return allowed.has(page) ? page : 'models';
+  }
+
+  function navigateTo(page) {
+    // Update nav
+    $$('.nav-item').forEach(n => n.classList.remove('active'));
+    $(`.nav-item[data-page="${page}"]`)?.classList.add('active');
+
+    // Update page
+    $$('.page').forEach(p => p.classList.remove('active'));
+    $(`#page-${page}`)?.classList.add('active');
+
+    state.currentPage = page;
+
+    // Load page data
+    if (isFilePreview()) {
+      if (page === 'cache') loadCache();
+      if (page === 'mirror') loadMirrorTargets();
+    } else {
+      if (page === 'cache') loadCache();
+      if (page === 'jobs') loadJobs();
+      if (page === 'settings') loadSettings();
+      if (page === 'mirror') loadMirrorTargets();
+      if (page === 'models') { loadModelsSearch(); loadStorageModeBadge(); loadDiskFreeIndicator(); }
+      if (page === 'history') loadHistory();
+    }
+  }
+
+  // Page navigation is local to this closure. Rendered guidance that needs to
+  // send the user to Settings (for example the gated-repository state) uses
+  // this small global bridge instead of embedding a navigation call in HTML.
+  window.openSettingsPage = function() {
+    navigateTo('settings');
+    const tokenInput = $('#hfToken');
+    if (tokenInput && !tokenInput.disabled) {
+      tokenInput.focus();
+      return;
+    }
+    const heading = $('#settingsPageTitle');
+    if (heading) heading.focus();
+  };
+
+  // =========================================
+  // WebSocket
+  // =========================================
+
+  function initWebSocket() {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/api/ws`;
+
+    try {
+      state.ws = new WebSocket(wsUrl);
+
+      state.ws.onopen = () => {
+        state.wsConnected = true;
+        updateConnectionStatus(true);
+      };
+
+      state.ws.onclose = () => {
+        state.wsConnected = false;
+        updateConnectionStatus(false);
+        // Reconnect after 3 seconds
+        setTimeout(initWebSocket, 3000);
+      };
+
+      state.ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          handleWSMessage(msg);
+        } catch (e) {
+          console.error('WS parse error:', e);
+        }
+      };
+
+      state.ws.onerror = (error) => {
+        console.error('WS error:', error);
+      };
+    } catch (e) {
+      console.error('WS connection failed:', e);
+      setTimeout(initWebSocket, 3000);
+    }
+  }
+
+  function updateConnectionStatus(connected) {
+    const indicator = $('.status-indicator');
+    const text = $('.status-text');
+
+    if (connected) {
+      indicator?.classList.add('connected');
+      if (text) text.textContent = 'Connected';
+    } else {
+      indicator?.classList.remove('connected');
+      if (text) text.textContent = 'Reconnecting...';
+    }
+  }
+
+  // Jobs scheduled to be auto-moved into History so we don't double-schedule.
+  const completedRemovalTimers = new Set();
+
+  // When a download finishes successfully, move it out of Active Jobs into
+  // History after a short delay (long enough to see it reach 100%). Only
+  // completed jobs are auto-removed — failed/cancelled/paused stay visible
+  // so unfinished work never disappears unexpectedly. The job is already
+  // recorded in History server-side; we dismiss it so it doesn't linger.
+  function scheduleCompletedRemoval(job) {
+    if (!job || job.status !== 'completed' || completedRemovalTimers.has(job.id)) return;
+    completedRemovalTimers.add(job.id);
+    setTimeout(async () => {
+      completedRemovalTimers.delete(job.id);
+      const current = state.jobs.get(job.id);
+      if (!current || current.status !== 'completed') return;
+      try {
+        await api('POST', `/jobs/${job.id}/dismiss`);
+      } catch (e) { /* already removed server-side; ignore */ }
+      state.jobs.delete(job.id);
+      if (state.currentPage === 'jobs') renderJobs();
+      updateJobsBadge();
+      if (state.currentPage === 'history') loadHistory();
+    }, 4000);
+  }
+
+  function handleWSMessage(msg) {
+    if (msg.type === 'init') {
+      // Initial state with all jobs
+      const jobs = msg.data?.jobs || [];
+      state.jobs.clear();
+      jobs.forEach(job => {
+        state.jobs.set(job.id, job);
+        scheduleCompletedRemoval(job);
+      });
+      updateJobsBadge();
+      if (state.currentPage === 'jobs') {
+        renderJobs();
+      }
+      // Reconnects and re-renders can arrive while an analysis is open. Re-read
+      // cache presence once on the initial snapshot so a job that finished
+      // while the socket was down cannot leave a stale queued/running chip.
+      if (currentAnalysis?.repo) {
+        scheduleLiveAnalysisReconcile({ syncCache: true });
+      }
+    } else if (msg.type === 'job_update') {
+      // Job update - data contains the full job object
+      const job = msg.data;
+      if (job && job.id) {
+        state.jobs.set(job.id, job);
+        updateJobsBadge();
+        if (state.currentPage === 'jobs') {
+          renderJobs();
+        }
+        scheduleCompletedRemoval(job);
+        if (jobMatchesAnalysis(job, currentAnalysis)) {
+          scheduleLiveAnalysisReconcile({ syncCache: job.status === 'completed' });
+        }
+      }
+    }
+  }
+
+  function updateJobsBadge() {
+    const activeCount = Array.from(state.jobs.values())
+      .filter(j => j.status === 'running' || j.status === 'queued' || j.status === 'paused').length;
+
+    const badge = $('#jobsBadge');
+    if (badge) {
+      if (activeCount > 0) {
+        badge.textContent = activeCount;
+        badge.style.display = 'block';
+      } else {
+        badge.style.display = 'none';
+      }
+    }
+  }
+
+  // =========================================
+  // API Helpers
+  // =========================================
+
+  async function api(method, path, body = null) {
+    const opts = {
+      method,
+      headers: { 'Content-Type': 'application/json' }
+    };
+    if (body) opts.body = JSON.stringify(body);
+
+    const res = await fetch(`/api${path}`, opts);
+    const data = await res.json();
+
+    if (!res.ok) {
+      const message = data.error_detail?.message || data.error || 'API error';
+      const error = new Error(message);
+      error.details = data.error_detail?.details || data.details || '';
+      error.code = data.error_detail?.code || '';
+      error.payload = data;
+      throw error;
+    }
+    return data;
+  }
+
+  // Every download entry point previews its actual request through the server's
+  // destination owner. Do not resolve folder paths separately in the browser.
+  async function checkDownloadDiskSpace(body, warn = false) {
+    let df;
+    try {
+      df = await api('POST', '/diskfree', body);
+    } catch (_) {
+      // Disk-stat failures remain non-fatal, as before. Download validation is
+      // still authoritative and will reject invalid selectors itself.
+      return true;
+    }
+    if (df.free < 100 * 1024 * 1024) {
+      showToast(`Not enough disk space: ${formatBytes(df.free)} free`, 'error');
+      return false;
+    }
+    if (warn && df.free < 2 * 1024 * 1024 * 1024) {
+      showToast(`Low disk space warning: ${formatBytes(df.free)} free on ${df.path}`, 'warning');
+    }
+    return true;
+  }
+
+  // =========================================
+  // Analyze Page
+  // =========================================
+
+  function initAnalyzePage() {
+    const input = $('#analyzeInput');
+    const btn = $('#analyzeBtn');
+
+    // Enter key
+    input?.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') analyzeRepo();
+    });
+
+    // Button click
+    btn?.addEventListener('click', analyzeRepo);
+
+    // Example buttons
+    $$('.example-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (input) input.value = btn.dataset.repo;
+        // Pass 'dataset' type if specified on button
+        const forceType = btn.dataset.type || null;
+        analyzeRepo(forceType);
+      });
+    });
+  }
+
+// Store current analysis for wizard
+let currentAnalysis = null;
+let currentGatedState = null;
+let hasShownRevisionPicker = false; // Track if we've shown picker for this repo
+// The initial picker refines the pending navigation entry. A picker reopened
+// from a rendered analysis is a view transition that keeps the current stop.
+let revisionPickerNavigationMode = 'replace';
+// Cancel hook for the initial (pending) revision picker only. hideModal runs
+// it, while selection and any other modal clear it, so closing an unrelated
+// dialog can never roll back or render a pending navigation.
+let revisionPickerCancelHandler = null;
+// The navigation request (and repository) that owns the open revision picker.
+// A selection only applies while this identity is still current; a newer
+// repository transition dismisses and disarms the picker so stale buttons
+// cannot save the old repository or navigation mode over the new stop.
+let revisionPickerRequestId = null;
+let revisionPickerRepo = null;
+let currentSelectedRepo = null;
+// Explicit type of the selected repo. null means the type is not known yet
+// (auto-detect), so a header refresh must not force model or dataset.
+let currentSelectedType = null;
+let currentSelectedIsDataset = false;
+let currentSelectedBranch = 'main';
+let analyzeRequestId = 0;
+// Set just before a gated-card Retry so the loading state and its eventual
+// result can receive focus without changing analyzeRepo's public signature.
+let retryFocusPending = false;
+
+// Detail tabs and Community are local UI state only. Do not mirror them into
+// the URL/history: a page refresh intentionally returns to the empty state.
+const DETAIL_TAB_ORDER = ['overview', 'community'];
+const COMMUNITY_TYPE_VALUES = ['all', 'discussion', 'pull_request'];
+let detailActiveTab = 'overview';
+const detailScrollPositions = { overview: 0, list: 0, thread: 0 };
+
+// Community state is scoped to one repository + dataset flag. Re-analyzing the
+// same repo keeps it; a different repo (or dataset type) resets it.
+const communityState = {
+  repo: '',
+  isDataset: false,
+  listLoaded: false,
+  entries: [],
+  page: 0,
+  hasMore: false,
+  count: 0,
+  type: 'all',
+  listLoading: false,
+  listError: '',
+  view: 'list',
+  threadNum: 0,
+  thread: null,
+  threadLoading: false,
+  threadError: '',
+  listRequestId: 0,
+  threadRequestId: 0
+};
+
+// Set by an action that will replace its own focused control (Load more or a
+// Retry button), then consumed by renderCommunityPanel() once the request ends.
+let communityFocusIntent = null;
+
+let repoHistory = [];
+let repoHistoryIndex = -1;
+
+// The endpoint is server-owned configuration. The Hub header action uses it
+// rather than assuming huggingface.co.
+// Settings are authoritative when loaded; /api/health supplies the same
+// server-normalized endpoint at startup. When neither has arrived yet, return
+// an empty string so callers can hide endpoint-dependent UI instead of
+// rendering a guessed default that may point at the wrong Hub.
+function configuredHfEndpointURL() {
+  const configured = String(state.settings?.endpoint || '').trim();
+  const health = String(state.serverEndpoint || '').trim();
+  const raw = configured || health;
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    return `${u.origin}${u.pathname.replace(/\/+$/, '')}`;
+  } catch (_) {
+    return raw.replace(/\/+$/, '');
+  }
+}
+
+// rememberSettingsEndpoint records the endpoint from a successful settings
+// response. Settings are authoritative: a custom endpoint replaces the startup
+// /api/health value, and the default (empty) preference records the public Hub.
+// That keeps the remembered value from going stale after a settings change and
+// makes the default endpoint known even when health failed or returned none.
+// The resolved flag also stops a late health response from restoring a startup
+// custom endpoint after settings have already supplied the default.
+function rememberSettingsEndpoint(settings) {
+  const configured = String(settings?.endpoint || '').trim();
+  state.serverEndpoint = configured || 'https://huggingface.co';
+  state.settingsEndpointResolved = true;
+}
+
+function syncModelsDetailHeader(repoId, isDataset = false, branch = 'main', typeKnown = true) {
+  const header = $('#modelsDetailHeader');
+  const repoLabel = $('#modelsDetailRepo');
+  const hfLink = $('#modelsDetailHFLink');
+
+  if (header) header.style.display = '';
+  if (repoLabel && repoId) repoLabel.textContent = repoId;
+  if (!hfLink || !repoId) return;
+  if (!typeKnown) {
+    // An auto-detect transition knows the repository but not yet whether it is
+    // a model or dataset. Hide the action instead of guessing a model URL or
+    // leaving the previous view's link on screen.
+    hfLink.hidden = true;
+    hfLink.removeAttribute('href');
+    return;
+  }
+  const endpoint = configuredHfEndpointURL();
+  if (!endpoint) {
+    // The configured endpoint is not known yet (settings failed or are still
+    // loading). Hide the action and clear any stale href rather than guessing
+    // huggingface.co, which would be wrong for a custom mirror. loadAppVersion
+    // and loadStorageModeBadge re-sync once an endpoint arrives.
+    hfLink.hidden = true;
+    hfLink.removeAttribute('href');
+    return;
+  }
+  hfLink.href = `${endpoint}/${isDataset ? 'datasets/' : ''}${repoId}`;
+  hfLink.hidden = false;
+}
+
+// Re-sync the Model Details header from the current selection state. Endpoint
+// loads (settings/health) and other late callbacks must use this instead of
+// reading the view they were started for, so an in-flight navigation to a new
+// repository never reverts the header to the previous one.
+function syncSelectedModelHeader() {
+  if (!currentSelectedRepo) return;
+  syncModelsDetailHeader(
+    currentSelectedRepo,
+    currentSelectedIsDataset,
+    currentSelectedBranch,
+    currentSelectedType !== null
+  );
+}
+
+// =========================================
+// Detail tabs + read-only Community view
+// =========================================
+
+function normalizeCommunityRepo(repo) {
+  return String(repo || '').trim();
+}
+
+function sameCommunityRepo(a, b) {
+  const left = normalizeCommunityRepo(a).toLowerCase();
+  const right = normalizeCommunityRepo(b).toLowerCase();
+  return left !== '' && left === right;
+}
+
+function communityInt(value) {
+  const n = Number(value);
+  return Number.isSafeInteger(n) ? n : 0;
+}
+
+function detailViewKey() {
+  if (detailActiveTab === 'community') {
+    return communityState.view === 'thread' ? 'thread' : 'list';
+  }
+  return 'overview';
+}
+
+function saveDetailScrollPosition() {
+  const scroller = $('#analyzeResult');
+  if (!scroller) return;
+  detailScrollPositions[detailViewKey()] = scroller.scrollTop;
+}
+
+function restoreDetailScrollPosition() {
+  const scroller = $('#analyzeResult');
+  if (!scroller) return;
+  scroller.scrollTop = detailScrollPositions[detailViewKey()] || 0;
+  updateScrollArrows();
+}
+
+function renderDetailTabs(visible) {
+  const tablist = $('#modelsDetailTabs');
+  if (tablist && typeof visible === 'boolean') tablist.hidden = !visible;
+  const tabsVisible = !!tablist && !tablist.hidden;
+
+  const overviewTab = $('#modelsTabOverview');
+  const communityTab = $('#modelsTabCommunity');
+  const setTabState = (tab, name) => {
+    if (!tab) return;
+    const selected = detailActiveTab === name;
+    tab.classList.toggle('is-active', selected);
+    tab.setAttribute('aria-selected', selected ? 'true' : 'false');
+    tab.tabIndex = selected ? 0 : -1;
+  };
+  setTabState(overviewTab, 'overview');
+  setTabState(communityTab, 'community');
+
+  const setPanelState = (panel, tabId, active) => {
+    if (!panel) return;
+    panel.hidden = !active;
+    if (tabsVisible) {
+      panel.setAttribute('role', 'tabpanel');
+      panel.setAttribute('aria-labelledby', tabId);
+      panel.tabIndex = 0;
+    } else {
+      panel.removeAttribute('role');
+      panel.removeAttribute('aria-labelledby');
+      panel.removeAttribute('tabindex');
+    }
+  };
+  setPanelState($('#modelsOverviewPanel'), 'modelsTabOverview', detailActiveTab === 'overview');
+  setPanelState($('#modelsCommunityPanel'), 'modelsTabCommunity', detailActiveTab === 'community');
+}
+
+function activateDetailTab(name) {
+  const next = name === 'community' ? 'community' : 'overview';
+  if (detailActiveTab === next) {
+    if (next === 'community') ensureCommunityList();
+    return;
+  }
+
+  saveDetailScrollPosition();
+  detailActiveTab = next;
+  renderDetailTabs();
+  if (next === 'community') ensureCommunityList();
+  restoreDetailScrollPosition();
+  updateScrollArrows();
+}
+
+function initDetailTabs() {
+  const tablist = $('#modelsDetailTabs');
+  if (!tablist) return;
+
+  const overviewTab = $('#modelsTabOverview');
+  const communityTab = $('#modelsTabCommunity');
+  overviewTab?.addEventListener('click', () => activateDetailTab('overview'));
+  communityTab?.addEventListener('click', () => activateDetailTab('community'));
+
+  tablist.addEventListener('keydown', (event) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    const focused = event.target.closest('[role="tab"]');
+    if (!focused) return;
+
+    let index = DETAIL_TAB_ORDER.indexOf(focused.id === 'modelsTabCommunity' ? 'community' : 'overview');
+    if (index < 0) return;
+    event.preventDefault();
+
+    if (event.key === 'ArrowRight') index = (index + 1) % DETAIL_TAB_ORDER.length;
+    else if (event.key === 'ArrowLeft') index = (index + DETAIL_TAB_ORDER.length - 1) % DETAIL_TAB_ORDER.length;
+    else if (event.key === 'Home') index = 0;
+    else index = DETAIL_TAB_ORDER.length - 1;
+
+    const next = DETAIL_TAB_ORDER[index];
+    activateDetailTab(next);
+    $(next === 'community' ? '#modelsTabCommunity' : '#modelsTabOverview')?.focus();
+  });
+
+  renderDetailTabs(false);
+}
+
+function prepareDetailForAnalysis(repo, isDataset = false) {
+  saveDetailScrollPosition();
+  detailActiveTab = 'overview';
+  detailScrollPositions.overview = 0;
+
+  const nextRepo = normalizeCommunityRepo(repo);
+  if (!communityState.repo) {
+    communityState.repo = nextRepo;
+    communityState.isDataset = !!isDataset;
+  } else if (!sameCommunityRepo(communityState.repo, nextRepo)) {
+    resetCommunityState(nextRepo, !!isDataset);
+  } else if (isDataset && !communityState.isDataset) {
+    resetCommunityState(nextRepo, true);
+  }
+
+  renderDetailTabs(false);
+  const scroller = $('#analyzeResult');
+  if (scroller) scroller.scrollTop = 0;
+  updateScrollArrows();
+}
+
+function resetCommunityState(repo = '', isDataset = false) {
+  communityFocusIntent = null;
+  communityState.listRequestId += 1;
+  communityState.threadRequestId += 1;
+  communityState.repo = normalizeCommunityRepo(repo);
+  communityState.isDataset = !!isDataset;
+  communityState.listLoaded = false;
+  communityState.entries = [];
+  communityState.page = 0;
+  communityState.hasMore = false;
+  communityState.count = 0;
+  communityState.type = 'all';
+  communityState.listLoading = false;
+  communityState.listError = '';
+  communityState.view = 'list';
+  communityState.threadNum = 0;
+  communityState.thread = null;
+  communityState.threadLoading = false;
+  communityState.threadError = '';
+  detailScrollPositions.list = 0;
+  detailScrollPositions.thread = 0;
+  const panel = $('#modelsCommunityPanel');
+  if (panel) panel.innerHTML = '';
+}
+
+function ensureCommunityScope(repo, isDataset) {
+  const nextRepo = normalizeCommunityRepo(repo);
+  const nextDataset = !!isDataset;
+  if (sameCommunityRepo(communityState.repo, nextRepo) && communityState.isDataset === nextDataset) {
+    return;
+  }
+  resetCommunityState(nextRepo, nextDataset);
+}
+
+function communityAPIPath(repo, isDataset, num, page, type) {
+  const repoPath = normalizeCommunityRepo(repo).split('/').map(encodeURIComponent).join('/');
+  const params = new URLSearchParams();
+  if (isDataset) params.set('dataset', 'true');
+  if (num != null) {
+    params.set('num', String(num));
+  } else {
+    params.set('page', String(page));
+    params.set('type', type);
+  }
+  return `/community/${repoPath}?${params.toString()}`;
+}
+
+function announceCommunity(message) {
+  const region = document.getElementById('communityLiveRegion');
+  if (!region || !message) return;
+  region.textContent = message;
+}
+
+function communityListNoun(count) {
+  if (communityState.type === 'discussion') return count === 1 ? 'discussion' : 'discussions';
+  if (communityState.type === 'pull_request') return count === 1 ? 'pull request' : 'pull requests';
+  return count === 1 ? 'thread' : 'threads';
+}
+
+function communityEmptyLabel() {
+  if (communityState.type === 'discussion') return 'No discussions found.';
+  if (communityState.type === 'pull_request') return 'No pull requests found.';
+  return 'No discussions or pull requests found.';
+}
+
+function announceCommunityList(phase, added) {
+  if (!communityState.entries.length) {
+    announceCommunity(communityEmptyLabel());
+    return;
+  }
+  const count = communityState.count;
+  if (phase === 'append' || phase === 'appendRetry') {
+    const addedCount = added > 0 ? added : 0;
+    announceCommunity(`Loaded ${addedCount} more ${communityListNoun(addedCount)}.`);
+    return;
+  }
+  const noun = communityListNoun(count);
+  if (phase === 'filter') {
+    announceCommunity(`Filter results: ${count} ${noun}.`);
+    return;
+  }
+  announceCommunity(`Community loaded: ${count} ${noun}.`);
+}
+
+async function loadCommunityList(page = 0, phase = '') {
+  const repo = communityState.repo;
+  if (!repo) return;
+
+  const isDataset = communityState.isDataset;
+  const type = communityState.type;
+  const append = page > 0 && communityState.listLoaded;
+  const loadPhase = append ? 'append' : (phase || 'initial');
+  const beforeCount = communityState.entries.length;
+  const targetPage = append ? page : 0;
+  const requestId = ++communityState.listRequestId;
+
+  if (!append) {
+    communityState.entries = [];
+    communityState.page = 0;
+    communityState.hasMore = false;
+    communityState.count = 0;
+    communityState.listLoaded = false;
+    detailScrollPositions.list = 0;
+    const scroller = $('#analyzeResult');
+    if (scroller) scroller.scrollTop = 0;
+  }
+  communityState.listLoading = true;
+  communityState.listError = '';
+  renderCommunityPanel();
+  updateScrollArrows();
+
+  try {
+    const data = await api('GET', communityAPIPath(repo, isDataset, null, targetPage, type));
+    if (requestId !== communityState.listRequestId) return;
+    if (!sameCommunityRepo(communityState.repo, repo)
+        || communityState.isDataset !== isDataset
+        || communityState.type !== type) return;
+
+    const items = Array.isArray(data.discussions) ? data.discussions : [];
+    if (append) {
+      const seen = new Set(communityState.entries.map(item => communityInt(item?.num)));
+      for (const item of items) {
+        const num = communityInt(item?.num);
+        if (num > 0 && seen.has(num)) continue;
+        if (num > 0) seen.add(num);
+        communityState.entries.push(item);
+      }
+    } else {
+      communityState.entries = items;
+    }
+
+    const responsePage = Number(data.page);
+    communityState.page = Number.isSafeInteger(responsePage) && responsePage >= 0 ? responsePage : targetPage;
+    const responseCount = Number(data.count);
+    communityState.count = Number.isSafeInteger(responseCount) && responseCount >= 0
+      ? responseCount
+      : communityState.entries.length;
+    communityState.hasMore = data.has_more === true;
+    communityState.listLoaded = true;
+    communityState.listLoading = false;
+    communityState.listError = '';
+    announceCommunityList(loadPhase, communityState.entries.length - beforeCount);
+  } catch (e) {
+    if (requestId !== communityState.listRequestId) return;
+    if (!sameCommunityRepo(communityState.repo, repo)
+        || communityState.isDataset !== isDataset
+        || communityState.type !== type) return;
+    communityState.listLoading = false;
+    communityState.listError = e?.message || 'Failed to load community';
+    if (!append) communityState.listLoaded = false;
+  }
+
+  renderCommunityPanel();
+  updateScrollArrows();
+}
+
+function ensureCommunityList() {
+  if (!communityState.repo) {
+    renderCommunityPanel();
+    return;
+  }
+  if (communityState.listLoaded || communityState.listLoading || communityState.listError) {
+    renderCommunityPanel();
+    return;
+  }
+  loadCommunityList(0, 'initial');
+}
+
+function loadMoreCommunity() {
+  if (!communityState.listLoaded || communityState.listLoading || !communityState.hasMore) return;
+  communityFocusIntent = { kind: 'append', before: communityState.entries.length };
+  loadCommunityList(communityState.page + 1, 'append');
+}
+
+function retryCommunityLoadMore() {
+  if (!communityState.listLoaded || communityState.listLoading || !communityState.hasMore) return;
+  communityFocusIntent = { kind: 'appendRetry', before: communityState.entries.length };
+  loadCommunityList(communityState.page + 1, 'appendRetry');
+}
+
+function setCommunityType(value) {
+  const type = COMMUNITY_TYPE_VALUES.includes(value) ? value : 'all';
+  if (type === communityState.type && (communityState.listLoaded || communityState.listLoading)) return;
+
+  communityFocusIntent = null;
+  communityState.type = type;
+  communityState.listRequestId += 1;
+  communityState.threadRequestId += 1;
+  communityState.listLoaded = false;
+  communityState.entries = [];
+  communityState.page = 0;
+  communityState.hasMore = false;
+  communityState.count = 0;
+  communityState.listError = '';
+  communityState.listLoading = false;
+  communityState.view = 'list';
+  communityState.threadNum = 0;
+  communityState.thread = null;
+  communityState.threadLoading = false;
+  communityState.threadError = '';
+  detailActiveTab = 'community';
+  detailScrollPositions.list = 0;
+  renderDetailTabs();
+  loadCommunityList(0, 'filter');
+}
+
+function retryCommunityList() {
+  if (communityState.listLoading) return;
+  communityFocusIntent = { kind: 'listRetry' };
+  loadCommunityList(0, 'retry');
+}
+
+async function openCommunityThread(num) {
+  const threadNum = communityInt(num);
+  if (!communityState.repo || threadNum <= 0) return;
+
+  saveDetailScrollPosition();
+  communityFocusIntent = null;
+  detailActiveTab = 'community';
+  communityState.view = 'thread';
+  communityState.threadNum = threadNum;
+  communityState.thread = null;
+  communityState.threadLoading = true;
+  communityState.threadError = '';
+  detailScrollPositions.thread = 0;
+
+  const requestId = ++communityState.threadRequestId;
+  const repo = communityState.repo;
+  const isDataset = communityState.isDataset;
+  renderDetailTabs();
+  renderCommunityPanel();
+  restoreDetailScrollPosition();
+  $('#communityBackBtn')?.focus({ preventScroll: true });
+  updateScrollArrows();
+
+  try {
+    const data = await api('GET', communityAPIPath(repo, isDataset, threadNum));
+    if (requestId !== communityState.threadRequestId) return;
+    if (!sameCommunityRepo(communityState.repo, repo)
+        || communityState.isDataset !== isDataset
+        || communityState.threadNum !== threadNum) return;
+
+    communityState.thread = data && typeof data === 'object' ? data : null;
+    communityState.threadLoading = false;
+    communityState.threadError = communityState.thread ? '' : 'Empty community response';
+  } catch (e) {
+    if (requestId !== communityState.threadRequestId) return;
+    if (!sameCommunityRepo(communityState.repo, repo)
+        || communityState.isDataset !== isDataset
+        || communityState.threadNum !== threadNum) return;
+    communityState.threadLoading = false;
+    communityState.threadError = e?.message || 'Failed to load thread';
+  }
+
+  renderCommunityPanel();
+  updateScrollArrows();
+
+  if (communityState.threadError) {
+    $('#communityThreadRetryBtn')?.focus();
+  } else if (communityState.thread) {
+    const title = String(communityState.thread.title || '').trim() || '(untitled)';
+    announceCommunity(`Thread loaded: ${title}.`);
+    $('#communityThreadTitle')?.focus();
+  }
+}
+
+function closeCommunityThread() {
+  if (communityState.view !== 'thread') return;
+
+  saveDetailScrollPosition();
+  communityFocusIntent = null;
+  const threadNum = communityState.threadNum;
+  communityState.threadRequestId += 1;
+  communityState.view = 'list';
+  communityState.threadNum = 0;
+  communityState.thread = null;
+  communityState.threadLoading = false;
+  communityState.threadError = '';
+  detailActiveTab = 'community';
+
+  renderDetailTabs();
+  renderCommunityPanel();
+  restoreDetailScrollPosition();
+  updateScrollArrows();
+
+  if (threadNum > 0) {
+    $('#modelsCommunityPanel')?.querySelector(`[data-community-num="${threadNum}"]`)?.focus();
+  }
+}
+
+function retryCommunityThread() {
+  if (communityState.threadNum > 0) openCommunityThread(communityState.threadNum);
+}
+
+function communityStatusText(status) {
+  const text = String(status || '').trim().toLowerCase();
+  if (!text) return 'unknown';
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function communityStatusClass(status) {
+  const text = String(status || '').trim().toLowerCase();
+  return ['open', 'closed', 'merged', 'draft'].includes(text) ? text : 'unknown';
+}
+
+function communityTime(value) {
+  if (!value) return '';
+  const text = String(value);
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) return '';
+  return formatRelativeDate(text);
+}
+
+function communityCommentText(entry) {
+  if (entry?.num_comments == null) return '';
+  const count = Number(entry.num_comments);
+  if (!Number.isSafeInteger(count) || count < 0) return '';
+  return count === 1 ? '1 comment' : `${count} comments`;
+}
+
+function communityStatusBadge(status) {
+  const key = communityStatusClass(status);
+  return `<span class="community-badge community-status-${key}">${escapeHtml(communityStatusText(status))}</span>`;
+}
+
+function communityTypeBadge(isPullRequest) {
+  return `<span class="community-badge${isPullRequest ? ' community-badge-pr' : ''}">${isPullRequest ? 'Pull Request' : 'Discussion'}</span>`;
+}
+
+function renderCommunityRow(entry) {
+  const num = communityInt(entry?.num);
+  const title = String(entry?.title || '').trim() || '(untitled)';
+  const author = String(entry?.author || '').trim() || 'deleted';
+  const created = communityTime(entry?.created_at);
+  const comments = communityCommentText(entry);
+  const isPullRequest = !!(entry && entry.is_pull_request);
+  const numText = num > 0 ? `#${num}` : `#${escapeHtml(String(entry?.num ?? '?'))}`;
+  const rowOpen = num > 0
+    ? `<button type="button" class="community-row" data-community-num="${num}" onclick="openCommunityThread(${num})">`
+    : '<button type="button" class="community-row community-row-static" disabled>';
+
+  return `${rowOpen}
+    <span class="community-row-main">
+      <span class="community-row-title">${escapeHtml(title)}</span>
+      <span class="community-row-meta">
+        <span class="community-row-num">${numText}</span>
+        ${communityTypeBadge(isPullRequest)}
+        ${communityStatusBadge(entry?.status)}
+        <span>by ${escapeHtml(author)}</span>
+        ${created ? `<span>${escapeHtml(created)}</span>` : ''}
+        ${comments ? `<span>${escapeHtml(comments)}</span>` : ''}
+      </span>
+    </span>
+    <span class="community-row-chevron" aria-hidden="true">›</span>
+  </button>`;
+}
+
+function renderCommunityListView() {
+  const entries = communityState.entries;
+  const hasEntries = entries.length > 0;
+
+  let countLabel = 'Discussions & pull requests';
+  if (communityState.listLoaded) {
+    countLabel = `${communityState.count} ${communityListNoun(communityState.count)}`;
+  }
+
+  const typeOptions = [
+    ['all', 'All'],
+    ['discussion', 'Discussions'],
+    ['pull_request', 'Pull requests']
+  ].map(([value, label]) => (
+    `<option value="${value}"${communityState.type === value ? ' selected' : ''}>${label}</option>`
+  )).join('');
+
+  let content = '';
+  if (communityState.listLoading && !hasEntries) {
+    content = `<div class="community-loading" role="status">
+      <span class="spinner-sm" aria-hidden="true"></span><span>Loading community…</span>
+    </div>`;
+  } else if (communityState.listError && !hasEntries) {
+    content = `<div class="community-error" role="alert">
+      <strong>Couldn't load community.</strong>
+      <div>${escapeHtml(communityState.listError)}</div>
+      <button type="button" id="communityRetryBtn" class="btn btn-secondary btn-xs" onclick="retryCommunityList()">Retry</button>
+    </div>`;
+  } else if (!hasEntries) {
+    content = `<div class="community-empty">${communityEmptyLabel()}</div>`;
+  } else {
+    content = `<div class="community-list">${entries.map(renderCommunityRow).join('')}</div>`;
+    if (communityState.listError) {
+      content += `<div class="community-error community-inline-error" role="alert">
+        <strong>Couldn't load more.</strong>
+        <div>${escapeHtml(communityState.listError)}</div>
+        <button type="button" id="communityLoadMoreRetryBtn" class="btn btn-secondary btn-xs" onclick="retryCommunityLoadMore()">Retry</button>
+      </div>`;
+    }
+    if (communityState.listLoading) {
+      content += `<div class="community-load-more">
+        <button type="button" class="btn btn-secondary btn-xs" id="communityLoadMoreBtn" disabled>Loading…</button>
+      </div>`;
+    } else if (communityState.hasMore) {
+      content += `<div class="community-load-more">
+        <button type="button" class="btn btn-secondary btn-xs" id="communityLoadMoreBtn" onclick="loadMoreCommunity()">Load more</button>
+      </div>`;
+    } else if (communityState.listLoaded) {
+      content += '<div class="community-list-end">End of list</div>';
+    }
+  }
+
+  return `<div class="community-view">
+    <div class="community-toolbar">
+      <div class="community-summary">${escapeHtml(countLabel)}</div>
+      <label class="community-filter" for="communityTypeFilter">
+        <span>Type</span>
+        <select id="communityTypeFilter" class="community-select" onchange="setCommunityType(this.value)">
+          ${typeOptions}
+        </select>
+      </label>
+    </div>
+    ${content}
+  </div>`;
+}
+
+function renderCommunityEvent(event) {
+  if (!event || typeof event !== 'object') return '';
+
+  const type = String(event.type || '').toLowerCase();
+  const author = String(event.author || '').trim() || 'deleted';
+  const time = communityTime(event.created_at);
+
+  if (type === 'comment') {
+    const body = typeof event.body_html === 'string' ? event.body_html : '';
+    const flags = [];
+    if (event.edited === true) flags.push('<span class="community-event-flag">edited</span>');
+    if (event.hidden === true) flags.push('<span class="community-event-flag community-event-flag-hidden">hidden</span>');
+
+    return `<article class="community-event community-event-comment">
+      <div class="community-event-head">
+        <span class="community-event-author">${escapeHtml(author)}</span>
+        ${time ? `<span>${escapeHtml(time)}</span>` : ''}
+        ${flags.join('')}
+      </div>
+      <div class="community-event-body readme-preview">${body}</div>
+    </article>`;
+  }
+
+  const summary = String(event.summary || '').trim()
+    || String(event.type || '').trim()
+    || 'Event';
+  return `<div class="community-event community-event-system">
+    <span class="community-event-system-summary">${escapeHtml(summary)}</span>
+    <span>${escapeHtml(author)}${time ? ` · ${escapeHtml(time)}` : ''}</span>
+  </div>`;
+}
+
+function renderCommunityThreadView() {
+  const back = `<button type="button" id="communityBackBtn" class="btn btn-ghost btn-xs community-back" onclick="closeCommunityThread()">← Community</button>`;
+
+  if (communityState.threadLoading) {
+    return `<div class="community-view">
+      ${back}
+      <div class="community-loading" role="status">
+        <span class="spinner-sm" aria-hidden="true"></span><span>Loading thread…</span>
+      </div>
+    </div>`;
+  }
+
+  if (communityState.threadError) {
+    return `<div class="community-view">
+      ${back}
+      <div class="community-error" role="alert">
+        <strong>Couldn't load this thread.</strong>
+        <div>${escapeHtml(communityState.threadError)}</div>
+        <button type="button" id="communityThreadRetryBtn" class="btn btn-secondary btn-xs" onclick="retryCommunityThread()">Retry</button>
+      </div>
+    </div>`;
+  }
+
+  const thread = communityState.thread;
+  if (!thread) {
+    return `<div class="community-view">
+      ${back}
+      <div class="community-empty">Thread unavailable.</div>
+    </div>`;
+  }
+
+  const num = communityInt(thread.num);
+  const title = String(thread.title || '').trim() || '(untitled)';
+  const author = String(thread.author || '').trim() || 'deleted';
+  const created = communityTime(thread.created_at);
+  const isPullRequest = !!thread.is_pull_request;
+  const events = Array.isArray(thread.events) ? thread.events : [];
+  const eventsHtml = events.length
+    ? `<div class="community-events">${events.map(renderCommunityEvent).join('')}</div>`
+    : '<div class="community-empty">No events in this thread.</div>';
+
+  return `<div class="community-view">
+    ${back}
+    <header class="community-thread-header">
+      <h3 id="communityThreadTitle" class="community-thread-title" tabindex="-1">${escapeHtml(title)}</h3>
+      <div class="community-thread-meta">
+        ${num > 0 ? `<span class="community-row-num">#${num}</span>` : ''}
+        ${communityTypeBadge(isPullRequest)}
+        ${communityStatusBadge(thread.status)}
+        <span>by ${escapeHtml(author)}</span>
+        ${created ? `<span>${escapeHtml(created)}</span>` : ''}
+      </div>
+    </header>
+    ${eventsHtml}
+  </div>`;
+}
+
+function renderCommunityPanel() {
+  const panel = $('#modelsCommunityPanel');
+  if (!panel) return;
+
+  const focused = document.activeElement;
+  let focusId = '';
+  let focusNum = '';
+  if (focused && panel.contains(focused)) {
+    focusId = focused.id || '';
+    focusNum = focused.getAttribute('data-community-num') || '';
+  }
+
+  panel.innerHTML = communityState.view === 'thread'
+    ? renderCommunityThreadView()
+    : renderCommunityListView();
+
+  // Restore focus that was lost because the action replaced its own control.
+  if (communityFocusIntent) {
+    const intent = communityFocusIntent;
+    if (communityState.view === 'list' && communityState.listLoading) {
+      // The pressed control is gone during loading; keep focus in the list
+      // rather than dropping it onto <body>.
+      const rows = panel.querySelectorAll('.community-row');
+      if (rows.length) rows[rows.length - 1].focus();
+      else panel.focus();
+      return;
+    }
+    if (communityState.view === 'list' && communityState.listError) {
+      const retryId = (intent.kind === 'append' || intent.kind === 'appendRetry')
+        ? 'communityLoadMoreRetryBtn'
+        : 'communityRetryBtn';
+      const retry = document.getElementById(retryId);
+      communityFocusIntent = null;
+      if (retry && panel.contains(retry)) {
+        retry.focus();
+        return;
+      }
+      panel.focus();
+      return;
+    }
+    if (communityState.view === 'list' && communityState.listLoaded) {
+      if (intent.kind === 'append' || intent.kind === 'appendRetry') {
+        const rows = panel.querySelectorAll('.community-row');
+        const firstNewRow = rows[intent.before];
+        communityFocusIntent = null;
+        if (firstNewRow && !firstNewRow.disabled) {
+          firstNewRow.focus();
+          return;
+        }
+        const loadMore = document.getElementById('communityLoadMoreBtn');
+        if (loadMore && panel.contains(loadMore) && !loadMore.disabled) {
+          loadMore.focus();
+          return;
+        }
+        if (rows.length) {
+          rows[rows.length - 1].focus();
+          return;
+        }
+        panel.focus();
+        return;
+      }
+      if (intent.kind === 'listRetry') {
+        const firstRow = panel.querySelector('.community-row:not([disabled])');
+        communityFocusIntent = null;
+        if (firstRow) firstRow.focus();
+        else panel.focus();
+        return;
+      }
+    }
+  }
+
+  if (focusId) {
+    const byId = document.getElementById(focusId);
+    if (byId && panel.contains(byId)) {
+      byId.focus();
+      return;
+    }
+  }
+  if (focusNum) {
+    panel.querySelector(`[data-community-num="${focusNum}"]`)?.focus();
+  }
+}
+
+window.loadMoreCommunity = loadMoreCommunity;
+window.retryCommunityLoadMore = retryCommunityLoadMore;
+window.setCommunityType = setCommunityType;
+window.retryCommunityList = retryCommunityList;
+window.openCommunityThread = openCommunityThread;
+window.closeCommunityThread = closeCommunityThread;
+window.retryCommunityThread = retryCommunityThread;
+
+function normalizeRepoType(repoType) {
+  return repoType === 'dataset' ? 'dataset' : repoType === 'model' ? 'model' : null;
+}
+
+function makeRepoHistoryEntry(repo, repoType, revision) {
+  return {
+    repo: String(repo || '').trim(),
+    repoType: normalizeRepoType(repoType),
+    revision: revision ? String(revision) : null
+  };
+}
+
+function effectiveRepoRevision(revision) {
+  return revision || 'main';
+}
+
+function sameRepoHistoryEntry(a, b) {
+  return !!a && !!b && a.repo === b.repo && a.repoType === b.repoType
+    && effectiveRepoRevision(a.revision) === effectiveRepoRevision(b.revision);
+}
+
+function currentRepoHistoryEntry() {
+  return repoHistoryIndex >= 0 ? repoHistory[repoHistoryIndex] : null;
+}
+
+function syncRepoHistoryButtons() {
+  const back = $('#modelsDetailBack');
+  const forward = $('#modelsDetailForward');
+  if (back) back.disabled = repoHistoryIndex <= 0;
+  if (forward) forward.disabled = repoHistoryIndex < 0 || repoHistoryIndex >= repoHistory.length - 1;
+}
+
+function pushRepoHistoryEntry(entry) {
+  if (repoHistoryIndex >= 0 && sameRepoHistoryEntry(repoHistory[repoHistoryIndex], entry)) {
+    syncRepoHistoryButtons();
+    return;
+  }
+  repoHistory = repoHistory.slice(0, repoHistoryIndex + 1);
+  repoHistory.push(entry);
+  repoHistoryIndex = repoHistory.length - 1;
+  syncRepoHistoryButtons();
+}
+
+function replaceRepoHistoryEntry(entry) {
+  if (repoHistoryIndex < 0) {
+    repoHistory = [entry];
+    repoHistoryIndex = 0;
+  } else {
+    repoHistory[repoHistoryIndex] = entry;
+  }
+  syncRepoHistoryButtons();
+}
+
+// The single Model Details repository transition. All internal entry points
+// (README/lineage links, Related Downloads, search rows, jobs, examples, the
+// analyze field, refresh, type/revision resolution, and back/forward) converge
+// here for both loading and history semantics.
+function openRepositoryInDetails(repo, repoType = null, revision = null, navigationMode = 'push') {
+  const entry = makeRepoHistoryEntry(repo, repoType, revision);
+  if (!entry.repo) {
+    showToast('Please enter a repository', 'error');
+    return;
+  }
+
+  if (navigationMode === 'push') {
+    const current = currentRepoHistoryEntry();
+    const sameRepo = current && current.repo === entry.repo
+      && (!entry.repoType || !current.repoType || entry.repoType === current.repoType);
+    // Dedupe may compare against the current view, but a caller that omitted
+    // the type (the Analyze field) must keep auto-detection. Copying the
+    // current view's type here would send an explicit type parameter for a
+    // same-name repo and skip the server's model/dataset selection flow.
+    if (sameRepo && effectiveRepoRevision(entry.revision) === effectiveRepoRevision(current.revision)) {
+      // Same repository view (including a root link while the default view is
+      // already shown): refine the current entry instead of adding a
+      // duplicate stop. A README root link carries no revision but does carry
+      // an explicit type, so keep the current resolved revision to refresh
+      // that view instead of starting an unresolved navigation that reopens
+      // the revision picker. An untyped caller (the Analyze field) still keeps
+      // its pending auto-detect entry.
+      if (!entry.revision && entry.repoType && current.revision) entry.revision = current.revision;
+      replaceRepoHistoryEntry(entry);
+    } else {
+      // A different revision of the same repository is a view transition.
+      // Pushing keeps the previous stop, so navigating from a non-default
+      // revision back to the repository root cannot erase that revision.
+      pushRepoHistoryEntry(entry);
+    }
+  } else if (navigationMode === 'replace') {
+    replaceRepoHistoryEntry(entry);
+  }
+
+  return loadRepositoryDetails(entry);
+}
+
+function traverseRepoHistory(delta) {
+  const next = repoHistoryIndex + delta;
+  if (next < 0 || next >= repoHistory.length) return;
+  repoHistoryIndex = next;
+  syncRepoHistoryButtons();
+  const entry = repoHistory[next];
+  return openRepositoryInDetails(entry.repo, entry.repoType, entry.revision, 'traverse');
+}
+
+// Backward-compatible direct analysis entry point. It still goes through the
+// same history/navigation owner, but callers that have a precise transition
+// (refresh, type/revision resolution) use openRepositoryInDetails directly.
+async function analyzeRepo(forceType = null, revision = null, repoOverride = null) {
+  const input = $('#analyzeInput');
+  const repo = (repoOverride || input?.value || '').trim();
+  if (!repo) {
+    showToast('Please enter a repository', 'error');
+    return;
+  }
+  return openRepositoryInDetails(repo, forceType, revision, 'push');
+}
+
+async function loadRepositoryDetails(entry) {
+  // Render into the Overview tab panel, not the shared #analyzeResult
+  // container: the Community panel is its sibling and must survive navigation.
+  const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
+  if (!resultDiv) return;
+
+  // A new repository transition supersedes a revision picker opened by the
+  // previous navigation. Close it and disarm its handlers without running the
+  // pending-picker cancel hook; the new navigation owns the view now.
+  dismissRevisionPickerForNavigation();
+
+  const repo = entry.repo;
+  const revision = entry.revision;
+  const isDataset = entry.repoType === 'dataset';
+  // The history entry is the explicit type chosen for this navigation. An
+  // auto-detect entry has no type, so refresh must not force a stale choice.
+  currentSelectedType = entry.repoType || null;
+  // Selection state belongs to the transition, not to its result. Point it at
+  // the target before the request so an in-flight or failed navigation never
+  // leaves the previous repository's identity on screen. An untyped entry
+  // keeps its Hub action hidden until analysis resolves the namespace.
+  currentSelectedRepo = repo;
+  currentSelectedIsDataset = isDataset;
+  currentSelectedBranch = revision || 'main';
+  syncSelectedModelHeader();
+
+  const focusAfterRetry = retryFocusPending;
+  retryFocusPending = false;
+  const requestId = ++analyzeRequestId;
+
+  // A new request supersedes any rendered gated guidance. Retry and refresh
+  // read the previous state before calling this function.
+  currentGatedState = null;
+
+  // Reset revision picker flag when analyzing a new repo
+  if (!revision) {
+    hasShownRevisionPicker = false;
+  }
+
+  // A new analysis always starts on Overview. Hide the tabs until the
+  // repository analysis is actually displayed, and drop another repository's
+  // Community state before any request for it can render.
+  prepareDetailForAnalysis(repo, isDataset);
+
+  // Show loading — build with DOM methods to avoid XSS via repo/revision values
+  {
+    const loadingDiv = document.createElement('div');
+    loadingDiv.className = 'loading-state';
+    loadingDiv.id = 'analyzeLoadingStatus';
+    loadingDiv.setAttribute('role', 'status');
+    loadingDiv.setAttribute('aria-live', 'polite');
+    loadingDiv.setAttribute('tabindex', '-1');
+    const spinner = document.createElement('div');
+    spinner.className = 'spinner';
+    const p = document.createElement('p');
+    p.textContent = `Analyzing ${repo}${revision && revision !== 'main' ? ` (${revision})` : ''}...`;
+    loadingDiv.appendChild(spinner);
+    loadingDiv.appendChild(p);
+    resultDiv.innerHTML = '';
+    resultDiv.appendChild(loadingDiv);
+    if (focusAfterRetry) loadingDiv.focus();
+  }
+
+  try {
+    // Explicit history entries select the namespace with type. An
+    // auto-detect entry (the Analyze field or an unresolved navigation) sends
+    // neither type nor the legacy dataset parameter.
+    let queryParams = [];
+    if (entry.repoType) queryParams.push(`type=${entry.repoType === 'dataset' ? 'dataset' : 'model'}`);
+    if (revision) queryParams.push(`revision=${encodeURIComponent(revision)}`);
+    const queryString = queryParams.length > 0 ? `?${queryParams.join('&')}` : '';
+
+    const data = await api('GET', `/analyze/${repo}${queryString}`);
+
+    if (requestId !== analyzeRequestId) return;
+    currentGatedState = null;
+
+    // Check if we need user to select model vs dataset
+    if (data.needsSelection) {
+      // The repo exists as both, so the type is unknown until the user picks
+      // one. Point selection/header state at this repo and drop the previous
+      // analysis so refresh auto-detects instead of forcing its type.
+      const selectionRepo = data.repo || repo;
+      currentSelectedType = null;
+      currentSelectedRepo = selectionRepo || null;
+      currentSelectedIsDataset = false;
+      currentSelectedBranch = revision || 'main';
+      currentAnalysis = null;
+      syncSelectedModelHeader();
+      renderTypeSelection(data);
+      if (focusAfterRetry) resultDiv.querySelector('button')?.focus();
+      return;
+    }
+
+    // Check if there are multiple refs and we haven't shown the picker yet
+    if (data.refs && data.refs.length > 1 && !hasShownRevisionPicker && !revision) {
+      hasShownRevisionPicker = true;
+      currentAnalysis = data;
+      currentSelectedRepo = data.repo;
+      currentSelectedBranch = revision || 'main';
+      currentSelectedType = data.is_dataset ? 'dataset' : 'model';
+      currentSelectedIsDataset = !!data.is_dataset;
+      syncModelsDetailHeader(data.repo, data.is_dataset, currentSelectedBranch);
+      showRevisionPicker(data);
+      if (focusAfterRetry) {
+        const firstRef = $('#modalBody .ref-btn');
+        (firstRef || $('#modalClose'))?.focus();
+      }
+      return;
+    }
+
+    // Reconcile live job state before the cache check. Job state contributes
+    // running/queued for artifacts; cache presence (and a 404) is the final
+    // authority for artifact 'done' status. Job completion does not prove the
+    // artifact is cached: a file can be skipped while another process is still
+    // downloading it.
+    refreshDlStatusFromJobs(data.repo, data.selectable_items, !!data.is_dataset);
+    await syncLocalAnalysisStatus(data);
+    if (requestId !== analyzeRequestId) return;
+    // Restore completed legacy token statuses after the cache check, matching
+    // the previous behavior for non-artifact rows. Artifact keys stay owned by
+    // cache presence, so a 404 or missing file still clears their done state.
+    refreshDlStatusFromJobs(data.repo, data.selectable_items, !!data.is_dataset);
+
+    currentAnalysis = data;
+    currentSelectedRepo = data.repo;
+    currentSelectedType = data.is_dataset ? 'dataset' : 'model';
+    currentSelectedIsDataset = !!data.is_dataset;
+    currentSelectedBranch = data.branch || revision || 'main';
+    const resolvedEntry = makeRepoHistoryEntry(
+      data.repo,
+      data.is_dataset ? 'dataset' : 'model',
+      currentSelectedBranch
+    );
+    replaceRepoHistoryEntry(resolvedEntry);
+    syncModelsDetailHeader(data.repo, data.is_dataset, currentSelectedBranch);
+    renderAnalysisResult(data);
+    // A job event can arrive after the cache fetch above but before
+    // currentAnalysis points at this repository. handleWSMessage compares
+    // against the previous analysis and cannot schedule it, so reconcile once
+    // now that the new analysis is committed and rendered.
+    reconcileAnalysisAfterLoad();
+    if (focusAfterRetry) {
+      const tabs = $('#modelsDetailTabs');
+      if (tabs && !tabs.hidden) $('#modelsTabOverview')?.focus();
+      else resultDiv.focus();
+    }
+  } catch (e) {
+    if (requestId !== analyzeRequestId) return;
+    detailActiveTab = 'overview';
+    renderDetailTabs(false);
+    currentGatedState = null;
+
+    if (e.code === 'gated_repo' || e.payload?.gated === true) {
+      renderGatedRepo(e.payload || {}, repo, isDataset, revision, e.details);
+      if (focusAfterRetry) document.getElementById('gatedRepoTitle')?.focus();
+      updateScrollArrows();
+      return;
+    }
+
+    resultDiv.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon" style="color: var(--color-error);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+            <circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>
+          </svg>
+        </div>
+        <h3 id="analysisErrorTitle" tabindex="-1">Analysis Failed</h3>
+        <p>${escapeHtml(e.message)}</p>
+      </div>
+    `;
+    if (focusAfterRetry) document.getElementById('analysisErrorTitle')?.focus();
+    updateScrollArrows();
+  }
+}
+
+  function safeGatedAcceptURL(value) {
+    try {
+      const url = new URL(String(value || ''));
+      return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function renderGatedRepo(payload, fallbackRepo, fallbackIsDataset, revision = null, fallbackDetails = '') {
+    const repo = String(payload.repo || fallbackRepo || '').trim();
+    const isDataset = payload.repo_type
+      ? payload.repo_type === 'dataset'
+      : !!fallbackIsDataset;
+    const details = String(payload.details || fallbackDetails || '').trim();
+    const acceptURL = safeGatedAcceptURL(payload.accept_url);
+    const hasToken = payload.has_token === true;
+
+    // A gated response is an access state, not an analysis result. Drop the
+    // previous analysis so stale options/download actions cannot target it.
+    currentAnalysis = null;
+    currentSelectedRepo = repo || null;
+    currentSelectedType = isDataset ? 'dataset' : 'model';
+    currentSelectedIsDataset = isDataset;
+    currentSelectedBranch = revision || 'main';
+    currentGatedState = { repo, isDataset, revision: revision || null };
+    if (repo) syncModelsDetailHeader(repo, isDataset, currentSelectedBranch);
+
+    const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
+    if (!resultDiv) return;
+
+    const tokenNote = hasToken
+      ? 'Token configured; repository access not granted.'
+      : 'No Hugging Face token configured.';
+    const tokenClass = hasToken ? 'gated-token-note' : 'gated-token-note is-warning';
+    const settingsClass = hasToken ? 'btn btn-secondary' : 'btn btn-warning';
+    const acceptAction = acceptURL
+      ? '<a id="gatedAcceptLink" class="btn btn-primary" href="#" target="_blank" rel="noopener">Open on Hugging Face ↗</a>'
+      : '';
+
+    resultDiv.innerHTML = `
+      <div class="empty-state gated-state" role="alert" aria-atomic="true" aria-labelledby="gatedRepoTitle">
+        <div class="empty-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+            <rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>
+          </svg>
+        </div>
+        <h3 id="gatedRepoTitle" tabindex="-1">Gated repository</h3>
+        ${repo ? `<p class="gated-repo-id">${escapeHtml(repo)}</p>` : ''}
+        ${details ? `<p class="gated-details">${escapeHtml(details)}</p>` : ''}
+        <p class="${tokenClass}">${escapeHtml(tokenNote)}</p>
+        <div class="gated-actions">
+          ${acceptAction}
+          <button type="button" id="gatedSettingsBtn" class="${settingsClass}">Open Settings</button>
+          <button type="button" id="gatedRetryBtn" class="btn btn-ghost">Retry analysis</button>
+        </div>
+      </div>
+    `;
+
+    const acceptLink = $('#gatedAcceptLink');
+    if (acceptLink && acceptURL) acceptLink.href = acceptURL;
+
+    $('#gatedSettingsBtn')?.addEventListener('click', () => {
+      if (typeof window.openSettingsPage === 'function') window.openSettingsPage();
+    });
+
+    $('#gatedRetryBtn')?.addEventListener('click', () => {
+      const gated = currentGatedState;
+      if (!gated?.repo) return;
+      retryFocusPending = true;
+      analyzeRepo(gated.isDataset ? 'dataset' : 'model', gated.revision, gated.repo);
+    });
+  }
+
+  // A new navigation supersedes any picker from the previous one. Dismiss it
+  // without invoking its cancel hook: the old pending stop must not be rendered
+  // or rolled back while the new transition is taking over.
+  function dismissRevisionPickerForNavigation() {
+    if (revisionPickerRequestId === null) return;
+    revisionPickerRequestId = null;
+    revisionPickerRepo = null;
+    revisionPickerNavigationMode = 'replace';
+    revisionPickerCancelHandler = null;
+    const backdrop = $('#modalBackdrop');
+    if (backdrop?.classList.contains('active')) backdrop.classList.remove('active');
+  }
+
+  // Show revision picker when multiple refs exist. Initial navigation shows the
+  // picker for a pending entry; the analysis header reopens it for a rendered
+  // view that must remain in history.
+  function showRevisionPicker(data, navigationMode = 'replace') {
+    revisionPickerNavigationMode = navigationMode;
+    // The initial picker refines the pending entry that navigation already
+    // pushed/replaced. A picker reopened from a rendered analysis is a view
+    // transition, so closing it must not touch that rendered view.
+    const requestId = analyzeRequestId;
+    const cancelOnClose = navigationMode !== 'push';
+    const branches = data.refs.filter(r => r.type === 'branch');
+    const tags = data.refs.filter(r => r.type === 'tag');
+    const revisionAttrs = (revision) =>
+      `data-revision="${escapeHtmlAttribute(revision)}" data-dataset="${data.is_dataset}" data-repo="${escapeHtmlAttribute(data.repo)}"`;
+    const revisionClick = `onclick="selectRevision(this.dataset.revision, this.dataset.dataset === 'true', this.dataset.repo)"`;
+
+    let branchesHtml = '';
+    if (branches.length > 0) {
+      branchesHtml = `
+        <div class="ref-group">
+          <h5>Branches</h5>
+          <div class="ref-list">
+            ${branches.map(b => `
+              <button class="ref-btn ${b.name === 'main' ? 'ref-default' : ''}" ${revisionAttrs(b.name)} ${revisionClick}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                  <line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>
+                </svg>
+                ${escapeHtml(b.name)}
+                ${b.name === 'main' ? '<span class="ref-badge">default</span>' : ''}
+              </button>
+            `).join('')}
+          </div>
+        </div>
+      `;
+    }
+
+    let tagsHtml = '';
+    if (tags.length > 0) {
+      tagsHtml = `
+        <div class="ref-group">
+          <h5>Tags</h5>
+          <div class="ref-list">
+            ${tags.slice(0, 10).map(t => `
+              <button class="ref-btn" ${revisionAttrs(t.name)} ${revisionClick}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                  <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/>
+                </svg>
+                ${escapeHtml(t.name)}
+              </button>
+            `).join('')}
+            ${tags.length > 10 ? `<div class="ref-more">... and ${tags.length - 10} more tags</div>` : ''}
+          </div>
+        </div>
+      `;
+    }
+
+    showModal('Select Revision', `
+      ${renderAnalysisWarnings(data, { showRetry: false })}
+      <p style="margin-bottom: 16px; color: var(--color-text-secondary);">
+        This repository has multiple versions. Select which one to analyze:
+      </p>
+      ${branchesHtml}
+      ${tagsHtml}
+      <div class="form-actions" style="margin-top: 20px;">
+        <button class="btn btn-ghost" ${revisionAttrs('main')} onclick="selectRevision(this.dataset.revision, this.dataset.dataset === 'true', this.dataset.repo)">Use default (main)</button>
+      </div>
+    `);
+    // showModal clears picker identity; bind this picker to the navigation
+    // request that opened it so a stale button cannot act after a new one.
+    revisionPickerRequestId = requestId;
+    revisionPickerRepo = String(data.repo || '');
+    // Arm the cancel hook only for the initial pending picker.
+    revisionPickerCancelHandler = cancelOnClose
+      ? () => cancelPendingRevisionPicker(data, requestId)
+      : null;
+  }
+
+  // Closing the initial picker must not leave the pane on its loading spinner.
+  // Keep the pending history stop explicit instead: the header and selection
+  // state identify the repository, the pane prompts for a revision, and the
+  // prompt can reopen the same picker under the same 'replace' navigation.
+  function cancelPendingRevisionPicker(data, requestId) {
+    if (requestId !== analyzeRequestId || !data?.repo) return;
+    const repoType = data.is_dataset ? 'dataset' : 'model';
+    const entry = currentRepoHistoryEntry();
+    if (!entry || entry.repo !== data.repo || entry.revision) return;
+    if (entry.repoType && entry.repoType !== repoType) return;
+
+    replaceRepoHistoryEntry(makeRepoHistoryEntry(data.repo, repoType, null));
+    currentAnalysis = data;
+    currentSelectedRepo = data.repo;
+    currentSelectedType = repoType;
+    currentSelectedIsDataset = !!data.is_dataset;
+    // No revision is selected while the picker is pending.
+    currentSelectedBranch = null;
+    syncModelsDetailHeader(data.repo, !!data.is_dataset, null);
+    detailActiveTab = 'overview';
+    renderDetailTabs(false);
+
+    const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
+    if (resultDiv) {
+      const typeLabel = data.is_dataset ? 'dataset' : 'model';
+      resultDiv.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+              <line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>
+            </svg>
+          </div>
+          <h3 id="revisionPendingTitle" tabindex="-1">Select a revision</h3>
+          <p>${escapeHtml(data.repo)} has multiple versions. No revision is selected for this ${typeLabel} yet.</p>
+          <button type="button" class="btn btn-primary" onclick="reopenRevisionPicker()">Choose revision</button>
+        </div>
+      `;
+    }
+    updateScrollArrows();
+  }
+
+  // Reopen the initial picker from its explicit pending prompt.
+  window.reopenRevisionPicker = function() {
+    const data = currentAnalysis;
+    if (!data?.refs || data.refs.length <= 1) return;
+    revisionPickerNavigationMode = 'replace';
+    showRevisionPicker(data, 'replace');
+  };
+
+  // Pending picker selections refine the entry created by the initial
+  // navigation. Picker selections made from a rendered analysis push a new
+  // stop so the previous revision remains reachable with Back.
+  window.selectRevision = function(revision, isDataset, repoOverride = null) {
+    // A picker button belongs to the navigation that opened it. Ignore it once
+    // another navigation superseded that identity or the picker was closed, so
+    // the old repository/revision cannot overwrite the newer history stop.
+    if (revisionPickerRequestId === null || revisionPickerRequestId !== analyzeRequestId) return;
+    if (revisionPickerRepo && repoOverride && repoOverride !== revisionPickerRepo) return;
+    // Selection is not cancellation: disarm the pending-picker hook first.
+    const navigationMode = revisionPickerNavigationMode;
+    const pickerRepo = revisionPickerRepo;
+    revisionPickerCancelHandler = null;
+    hideModal();
+    const repo = repoOverride || pickerRepo || currentAnalysis?.repo || currentSelectedRepo || null;
+    revisionPickerNavigationMode = 'replace';
+    openRepositoryInDetails(repo, isDataset === true || isDataset === 'true' ? 'dataset' : 'model', revision, navigationMode);
+  };
+
+  window.selectAnalysisType = function(repoType, repoOverride = null) {
+    const repo = repoOverride || currentAnalysis?.repo || currentSelectedRepo || null;
+    const revision = repoHistoryIndex >= 0 ? repoHistory[repoHistoryIndex]?.revision || null : null;
+    openRepositoryInDetails(repo, repoType, revision, 'replace');
+  };
+
+  // Show revision picker from analysis result (user clicked "change")
+  window.showRevisionPickerFromAnalysis = function() {
+    if (currentAnalysis && currentAnalysis.refs) {
+      hasShownRevisionPicker = false; // Allow showing picker again
+      showRevisionPicker(currentAnalysis, 'push');
+    }
+  };
+
+  // Render type selection when both model and dataset exist
+  function renderTypeSelection(data) {
+    const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
+    resultDiv.innerHTML = `
+      <div class="analysis-card">
+        <div class="analysis-header">
+          <div class="analysis-repo">${escapeHtml(data.repo)}</div>
+          <span class="analysis-type" style="background: var(--color-warning);">Selection Required</span>
+        </div>
+        <div class="analysis-body">
+          <div class="analysis-section">
+            <h4>${escapeHtml(data.message)}</h4>
+            <div style="display: flex; gap: 16px; margin-top: 20px;">
+              <button class="btn btn-primary" data-repo="${escapeHtmlAttribute(data.repo)}" onclick="selectAnalysisType('model', this.dataset.repo)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" style="margin-right: 8px;">
+                  <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                </svg>
+                Analyze as Model
+              </button>
+              <button class="btn btn-secondary" data-repo="${escapeHtmlAttribute(data.repo)}" onclick="selectAnalysisType('dataset', this.dataset.repo)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" style="margin-right: 8px;">
+                  <ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+                </svg>
+                Analyze as Dataset
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // Make analyzeRepo available globally for legacy/direct entry points.
+  window.analyzeRepo = analyzeRepo;
+
+  async function syncLocalAnalysisStatus(data) {
+    if (!data?.repo || !data.selectable_items?.length) return;
+    const isDataset = !!data.is_dataset;
+    try {
+      const map = getDlStatus(data.repo, isDataset);
+      let changed = false;
+
+      // Branch-variant rows are whole-revision downloads. Their presence is a
+      // qualified lookup keyed by the revision, not the ordinary file list of
+      // the repository. The server searches the default destination and every
+      // configured route; the stored status is per revision.
+      const isBranchItem = item => item?.branch_variant === true && !!item?.revision;
+      const ordinaryItems = data.selectable_items.filter(item => !isBranchItem(item));
+      const branchItems = data.selectable_items.filter(isBranchItem);
+
+      if (ordinaryItems.length) {
+        // /api/cache/<repo> without a type prefers the model namespace. A repo
+        // that exists as both model and dataset must be looked up in the
+        // namespace the open analysis actually represents.
+        const repoType = isDataset ? 'dataset' : 'model';
+        const resp = await fetch(`/api/cache/${data.repo}?type=${repoType}`);
+
+        if (resp.status === 404) {
+          ordinaryItems.forEach(item => {
+            const key = selectableStatusKey(item);
+            if (!key || map[key] !== 'done') return;
+            delete map[key];
+            changed = true;
+          });
+        } else {
+          if (!resp.ok) throw new Error(`cache lookup failed: ${resp.status}`);
+
+          const cached = await resp.json();
+          const cachedFiles = new Set((cached.files || []).map(f => normalizeRepoPath(f.name)));
+
+          ordinaryItems.forEach(item => {
+            const key = selectableStatusKey(item);
+            const files = (item.files || []).map(normalizeRepoPath).filter(Boolean);
+            if (!key || !files.length) return;
+
+            const isPresent = files.every(f => cachedFiles.has(f));
+            const isActive = map[key] === 'running' || map[key] === 'queued';
+            if (isPresent) {
+              if (map[key] !== 'done' && !isActive) {
+                map[key] = 'done';
+                changed = true;
+              }
+            } else if (map[key] === 'done') {
+              delete map[key];
+              changed = true;
+            }
+          });
+        }
+      }
+
+      for (const item of branchItems) {
+        const key = selectableStatusKey(item);
+        if (!key) continue;
+        const params = new URLSearchParams({ branchVariant: 'true', revision: item.revision });
+        const resp = await fetch(`/api/cache/${data.repo}?${params.toString()}`);
+        let downloaded = false;
+        if (resp.ok) {
+          const presence = await resp.json();
+          downloaded = presence?.downloaded === true;
+        }
+        const isActive = map[key] === 'running' || map[key] === 'queued';
+        if (downloaded) {
+          if (map[key] !== 'done' && !isActive) {
+            map[key] = 'done';
+            changed = true;
+          }
+        } else if (map[key] === 'done') {
+          delete map[key];
+          changed = true;
+        }
+      }
+
+      if (changed) saveDlStatus(data.repo, isDataset, map);
+    } catch {
+      // Cache lookup is best-effort; remote analysis should still render. Cache
+      // presence is nevertheless the only authority for artifact and branch
+      // 'done', so a transient lookup/parse failure must not leave a stale
+      // downloaded artifact hiding its Download button. Legacy non-artifact
+      // token statuses keep their last-known-good value.
+      const map = getDlStatus(data.repo, isDataset);
+      let changed = false;
+      data.selectable_items.forEach(item => {
+        const key = selectableStatusKey(item);
+        if ((!String(key).startsWith('artifact:') && !String(key).startsWith('branchVariant:')) || map[key] !== 'done') return;
+        delete map[key];
+        changed = true;
+      });
+      if (changed) saveDlStatus(data.repo, isDataset, map);
+    }
+  }
+
+  function normalizeRepoPath(path) {
+    return String(path || '').replace(/\\/g, '/').toLowerCase();
+  }
+
+  const ANALYSIS_WARNING_CAUSE_LABELS = {
+    header_unavailable: 'Safetensors header unavailable',
+    header_uninterpretable: 'Safetensors header could not be interpreted',
+    probe_timeout: 'Header probe timed out',
+    probe_limit: 'Header probe limit reached',
+    weight_role_unrecognized: 'Unrecognized model-weight file role'
+  };
+
+  // Render only the bounded EXL branch-discovery warning. Messages and causes
+  // are server-owned, non-secret strings; escape both before injecting them.
+  function renderAnalysisWarnings(data, { showRetry = true } = {}) {
+    const warnings = (Array.isArray(data?.analysis_warnings) ? data.analysis_warnings : [])
+      .filter(w => w?.code === 'exl_branch_discovery_incomplete');
+    if (!warnings.length) return '';
+
+    const causes = [];
+    warnings.forEach(w => (Array.isArray(w.causes) ? w.causes : []).forEach(cause => {
+      if (cause && !causes.includes(cause)) causes.push(cause);
+    }));
+    const causeLabels = causes.map(cause => {
+      const label = ANALYSIS_WARNING_CAUSE_LABELS[cause] || cause;
+      return `<span class="analysis-warning-cause" data-cause="${escapeHtmlAttribute(cause)}" title="${escapeHtmlAttribute(cause)}">${escapeHtml(label)}</span>`;
+    }).join(' · ');
+    const retry = showRetry && warnings.some(w => w.retryable === true)
+      ? '<button type="button" class="btn btn-ghost analysis-warning-retry" data-analysis-warning-retry>Retry analysis</button>'
+      : '';
+
+    return `<div class="analysis-warning" role="status">
+      ${warnings.map(w => `<div class="analysis-warning-message">${escapeHtml(w.message || '')}</div>`).join('')}
+      ${causeLabels ? `<div class="analysis-warning-causes">${causeLabels}</div>` : ''}
+      ${retry}
+    </div>`;
+  }
+
+  // Bind after the rendered DOM exists. A retry re-runs only the analysis that
+  // is still current; no request identity or queued retry state is introduced.
+  function bindAnalysisWarningRetry(data) {
+    const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
+    const button = resultDiv?.querySelector?.('[data-analysis-warning-retry]');
+    if (!button) return;
+    button.addEventListener('click', () => {
+      if (currentAnalysis !== data) return;
+      analyzeRepo(data.is_dataset ? 'dataset' : 'model', data.branch || null, data.repo);
+    });
+  }
+
+  function selectableStatusKey(item) {
+    if (item?.branch_variant === true && item?.revision) {
+      // Branch status is per analyzed repository and revision. It deliberately
+      // does not depend on currentAnalysis or the route select: the load path
+      // reconciles status before currentAnalysis is assigned and before the
+      // route select is rendered.
+      return 'branchVariant:' + item.revision;
+    }
+    const files = Array.isArray(item?.files) ? item.files : [];
+    if (files.length && ['quantization', 'vision_encoder'].includes(item.category)) {
+      return `artifact:${JSON.stringify(files.map(normalizeRepoPath))}`;
+    }
+    return item?.filter_value || item?.id || '';
+  }
+
+  function artifactRequestPaths(files) {
+    return files.map(path => {
+      const normalized = String(path || '').replace(/\\/g, '/');
+      return normalized && !normalized.includes('/') ? `./${normalized}` : normalized;
+    });
+  }
+
+  // Jobs normalize root-level selectors to "./name" while selectable items
+  // carry repository-relative paths. Strip that root prefix on both sides so
+  // a filter and the file it selects compare in the same path space.
+  function normalizeArtifactPath(path) {
+    return normalizeRepoPath(String(path || '').replace(/^\.\//, ''));
+  }
+
+  function artifactJobPaths(filters) {
+    if (!Array.isArray(filters) || !filters.length) return [];
+    return filters.map(normalizeArtifactPath);
+  }
+
+  function renderAnalysisResult(data) {
+    const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
+    if (!resultDiv) return;
+
+    // The response's dataset flag is authoritative for the Community scope.
+    ensureCommunityScope(data.repo, !!data.is_dataset);
+
+    const filesHtml = data.files?.slice(0, 20).map(f => `
+      <div class="analysis-file">
+        <span class="analysis-file-name">${escapeHtml(f.path || f.name)}</span>
+        <span class="analysis-file-size">${f.size_human || formatBytes(f.size)}</span>
+      </div>
+    `).join('') || '';
+
+    const moreFiles = (data.files?.length || 0) > 20
+      ? `<div class="analysis-file" style="justify-content: center; color: var(--color-text-muted);">
+           ... and ${data.files.length - 20} more files
+         </div>`
+      : '';
+
+    // Build type-specific info
+    let typeInfoHtml = '';
+
+    if (data.transformers) {
+      const t = data.transformers;
+      typeInfoHtml = `
+        <div class="analysis-section">
+          <h4>Model Configuration</h4>
+          <div class="analysis-grid">
+            ${t.architecture ? `<div class="analysis-stat"><div class="analysis-stat-label">Architecture</div><div class="analysis-stat-value">${escapeHtml(t.architecture)}</div></div>` : ''}
+            ${t.estimated_parameters ? `<div class="analysis-stat"><div class="analysis-stat-label">Parameters</div><div class="analysis-stat-value">~${escapeHtml(t.estimated_parameters)}</div></div>` : ''}
+            ${t.hidden_size ? `<div class="analysis-stat"><div class="analysis-stat-label">Hidden Size</div><div class="analysis-stat-value">${t.hidden_size}</div></div>` : ''}
+            ${t.num_hidden_layers ? `<div class="analysis-stat"><div class="analysis-stat-label">Layers</div><div class="analysis-stat-value">${t.num_hidden_layers}</div></div>` : ''}
+            ${t.context_length ? `<div class="analysis-stat"><div class="analysis-stat-label">Context Length</div><div class="analysis-stat-value">${t.context_length.toLocaleString()} tokens</div></div>` : ''}
+            ${t.precision ? `<div class="analysis-stat"><div class="analysis-stat-label">Precision</div><div class="analysis-stat-value">${escapeHtml(t.precision)}</div></div>` : ''}
+          </div>
+        </div>
+      `;
+    }
+
+    if (data.gguf) {
+      const g = data.gguf;
+
+      // Model lineage tree — Option B (indented tree, like HF card).
+      // Only rendered when there are at least 2 nodes (i.e. chain has a parent).
+      let chainHtml = '';
+      if (g.model_chain && g.model_chain.length > 1) {
+        const nodeHtml = g.model_chain.map((node, i) => {
+          const isCurrent = !!node.is_current;
+          const isRoot    = i === 0;
+          const indent    = i * 14;
+          const connector = i > 0 ? `<span style="color:var(--color-text-muted);font-size:11px;opacity:.6;flex-shrink:0">└─</span>` : '';
+          const icon      = isCurrent ? '◉' : isRoot ? '◈' : '⚙';
+          const relLabel  = isCurrent
+            ? (node.relation ? node.relation + ' · this' : 'this')
+            : isRoot
+              ? 'base model'
+              : (node.relation || '');
+          const nameStyle = isCurrent
+            ? 'font-size:11px;font-family:var(--font-mono);color:var(--color-text);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;max-width:100%'
+            : 'font-size:11px;font-family:var(--font-mono);color:var(--color-text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;max-width:100%';
+          const linkNameStyle = nameStyle + ';background:none;border:0;padding:0;color:var(--color-primary);cursor:pointer;text-align:left';
+          const tagStyle = isCurrent
+            ? 'font-size:10px;color:var(--color-info);flex-shrink:0;margin-left:2px'
+            : 'font-size:10px;color:var(--color-text-muted);flex-shrink:0;margin-left:2px';
+          const nameHtml = isCurrent
+            ? `<span style="${nameStyle}">${escapeHtml(node.repo)}</span>`
+            : `<button type="button" class="lineage-repo-link" style="${linkNameStyle}" data-repo="${escapeHtmlAttribute(node.repo)}" title="${escapeHtmlAttribute(node.repo)}" onclick="analyzeRelatedRepo(this.dataset.repo)">${escapeHtml(node.repo)}</button>`;
+          return `<div style="display:flex;align-items:center;gap:5px;padding:2px 0;padding-left:${indent}px">
+            ${connector}
+            <span style="font-size:11px;opacity:.7;flex-shrink:0">${icon}</span>
+            ${nameHtml}
+            ${relLabel ? `<span style="${tagStyle}">${escapeHtml(relLabel)}</span>` : ''}
+          </div>`;
+        }).join('');
+        chainHtml = `
+          <div style="margin-top:12px">
+            <div class="analysis-stat-label" style="margin-bottom:6px">Model lineage</div>
+            ${nodeHtml}
+          </div>`;
+      }
+
+      typeInfoHtml = `
+        <div class="analysis-section">
+          <h4>GGUF Information</h4>
+          <div class="analysis-grid">
+            ${g.model_name ? `<div class="analysis-stat"><div class="analysis-stat-label">Model</div><div class="analysis-stat-value">${escapeHtml(g.model_name)}</div></div>` : ''}
+            ${g.parameter_count ? `<div class="analysis-stat"><div class="analysis-stat-label">Parameters</div><div class="analysis-stat-value">${escapeHtml(g.parameter_count)}</div></div>` : ''}
+          </div>
+          ${chainHtml}
+        </div>
+      `;
+    }
+
+    if (data.diffusers) {
+      const d = data.diffusers;
+      typeInfoHtml = `
+        <div class="analysis-section">
+          <h4>Diffusers Pipeline</h4>
+          <div class="analysis-grid">
+            ${d.pipeline_type ? `<div class="analysis-stat"><div class="analysis-stat-label">Pipeline</div><div class="analysis-stat-value">${escapeHtml(d.pipeline_type)}</div></div>` : ''}
+            ${d.diffusers_version ? `<div class="analysis-stat"><div class="analysis-stat-label">Version</div><div class="analysis-stat-value">${escapeHtml(d.diffusers_version)}</div></div>` : ''}
+            ${d.variants?.length ? `<div class="analysis-stat"><div class="analysis-stat-label">Variants</div><div class="analysis-stat-value">${d.variants.join(', ')}</div></div>` : ''}
+          </div>
+        </div>
+      `;
+    }
+
+    if (data.dataset) {
+      const ds = data.dataset;
+      typeInfoHtml = `
+        <div class="analysis-section">
+          <h4>Dataset Information</h4>
+          <div class="analysis-grid">
+            ${ds.primary_format ? `<div class="analysis-stat"><div class="analysis-stat-label">Format</div><div class="analysis-stat-value">${escapeHtml(ds.primary_format)}</div></div>` : ''}
+            ${ds.configs?.length ? `<div class="analysis-stat"><div class="analysis-stat-label">Configs</div><div class="analysis-stat-value">${ds.configs.join(', ')}</div></div>` : ''}
+          </div>
+        </div>
+      `;
+    }
+
+    if (data.lora) {
+      const l = data.lora;
+      typeInfoHtml = `
+        <div class="analysis-section">
+          <h4>LoRA Adapter Information</h4>
+          <div class="analysis-grid">
+            ${l.adapter_type ? `<div class="analysis-stat"><div class="analysis-stat-label">Adapter Type</div><div class="analysis-stat-value">${escapeHtml(l.adapter_type)}</div></div>` : ''}
+            ${l.rank ? `<div class="analysis-stat"><div class="analysis-stat-label">Rank (r)</div><div class="analysis-stat-value">${l.rank}</div></div>` : ''}
+            ${l.alpha ? `<div class="analysis-stat"><div class="analysis-stat-label">Alpha</div><div class="analysis-stat-value">${l.alpha}</div></div>` : ''}
+            ${l.base_model ? `<div class="analysis-stat"><div class="analysis-stat-label">Base Model</div><div class="analysis-stat-value">${escapeHtml(l.base_model)}</div></div>` : ''}
+          </div>
+        </div>
+      `;
+    }
+
+    if (data.quantized) {
+      const q = data.quantized;
+      // Precision must not be implied from a header field: `bits` is only a
+      // model-wide width when precision is uniform and the config was read
+      // completely. A partially read config leaves precision declarations past
+      // the metadata cut unknown, so present it as unverified instead of
+      // claiming uniform or mixed precision. Width rows show only declared
+      // widths: a 0 bound means the declaration was cut, not a 0-bit width.
+      const bitWidth = (n) => `${n}-bit`;
+      const expertWidth = (q.expert_bits_min || q.expert_bits_max)
+        ? (q.expert_bits_min && q.expert_bits_max && q.expert_bits_min !== q.expert_bits_max
+            ? `${q.expert_bits_min}–${q.expert_bits_max}-bit`
+            : bitWidth(q.expert_bits_min || q.expert_bits_max))
+        : '';
+      const widthRows = (expertWidth ? `<div class="analysis-stat"><div class="analysis-stat-label">Per-Expert Widths</div><div class="analysis-stat-value">${expertWidth}</div></div>` : '')
+        + (q.head_bits ? `<div class="analysis-stat"><div class="analysis-stat-label">Head Width</div><div class="analysis-stat-value">${bitWidth(q.head_bits)}</div></div>` : '');
+      let precisionRow = '';
+      if (q.mixed_precision) {
+        precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Precision</div><div class="analysis-stat-value">Mixed${q.config_partial ? ' (config partially read)' : ''}</div></div>`
+          + widthRows;
+      } else if (q.config_partial) {
+        precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Precision</div><div class="analysis-stat-value">Unverified — config partially read (10 MiB limit)</div></div>`
+          + widthRows;
+      } else if (q.bits) {
+        precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Bits</div><div class="analysis-stat-value">${q.bits}-bit</div></div>`;
+      } else {
+        precisionRow = `<div class="analysis-stat"><div class="analysis-stat-label">Precision</div><div class="analysis-stat-value">Unknown</div></div>`
+          + widthRows
+          + (q.bits_per_weight ? `<div class="analysis-stat"><div class="analysis-stat-label">Bits per Weight</div><div class="analysis-stat-value">${q.bits_per_weight}</div></div>` : '');
+      }
+      // Modules the config excludes from quantization (modules_to_not_convert)
+      // are an exception to the declared width above, not mixed precision.
+      // Show them in every precision state so `bits` is never read as a
+      // model-wide width. Rendered as escaped text only (never into an
+      // attribute): escapeHtml does not escape quotes.
+      const excludedModules = (q.excluded_modules || []).filter((m) => typeof m === 'string' && m);
+      const excludedText = excludedModules.slice(0, 4).join(', ')
+        + (excludedModules.length > 4 ? ` +${excludedModules.length - 4} more` : '');
+      const excludedRow = excludedModules.length
+        ? `<div class="analysis-stat"><div class="analysis-stat-label">Not quantized</div><div class="analysis-stat-value">${escapeHtml(excludedText)}</div></div>`
+        : '';
+      typeInfoHtml = `
+        <div class="analysis-section">
+          <h4>Quantized Model Information</h4>
+          <div class="analysis-grid">
+            ${q.method ? `<div class="analysis-stat"><div class="analysis-stat-label">Method</div><div class="analysis-stat-value">${escapeHtml(q.method.toUpperCase())}</div></div>` : ''}
+            ${precisionRow}${excludedRow}
+            ${q.group_size ? `<div class="analysis-stat"><div class="analysis-stat-label">Group Size</div><div class="analysis-stat-value">${q.group_size}</div></div>` : ''}
+            ${q.backends?.length ? `<div class="analysis-stat"><div class="analysis-stat-label">Backends</div><div class="analysis-stat-value">${q.backends.slice(0,3).join(', ')}</div></div>` : ''}
+          </div>
+        </div>
+      `;
+    }
+
+    // Build unified selectable items section (works for all types)
+    let selectableItemsHtml = '';
+    const hasSelectableItems = data.selectable_items && data.selectable_items.length > 0;
+    const analysisWarningsHtml = renderAnalysisWarnings(data);
+
+    if (hasSelectableItems) {
+      selectableItemsHtml = `
+        <div class="analysis-section">
+          ${renderSelectableItems(data.selectable_items, 'selectableItems')}
+        </div>
+      `;
+    }
+
+    // Build related downloads section (for LoRA base models, etc.)
+    const relatedDownloadsHtml = renderRelatedDownloads(data.related_downloads);
+    const readmeHtml = `
+      <div class="analysis-section readme-section" id="readmeSection" hidden>
+        <h4>Description</h4>
+        <div class="readme-preview" id="readmePreview"></div>
+      </div>
+    `;
+
+    // Build branch/revision display
+    const branchDisplay = data.branch && data.branch !== 'main'
+      ? `<span class="analysis-branch" title="Revision: ${escapeHtmlAttribute(data.branch)}">
+           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+             <line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>
+           </svg>
+           ${escapeHtml(data.branch)}
+         </span>`
+      : '';
+
+    // Show "Change" link if multiple refs available
+    const changeRevisionLink = data.refs && data.refs.length > 1
+      ? `<button class="btn-link" onclick="showRevisionPickerFromAnalysis()">change</button>`
+      : '';
+
+    // For non-GGUF/non-selectable models: show a simple file list with download buttons
+    const nonSelectableFilesHtml = !hasSelectableItems && data.files?.length
+      ? renderNonSelectableFiles(data)
+      : '';
+
+    resultDiv.innerHTML = `
+      <div class="analysis-card">
+        <div class="analysis-header">
+          <div class="analysis-repo">${escapeHtml(data.repo)}${branchDisplay}${changeRevisionLink}</div>
+          <span class="analysis-type">${escapeHtml(data.type_description || data.type)}</span>
+          <div class="analysis-meta">
+            <span>${data.file_count} files</span>
+            <span>${data.total_size_human}</span>
+          </div>
+        </div>
+        <div class="analysis-body">
+          ${analysisWarningsHtml}
+          ${typeInfoHtml}
+          ${selectableItemsHtml}
+          ${relatedDownloadsHtml}
+          ${nonSelectableFilesHtml}
+          ${readmeHtml}
+        </div>
+        <div class="analysis-actions-wrapper">
+          <div class="analysis-actions">
+            <button class="btn btn-ghost" onclick="clearAnalysis()">Clear</button>
+            ${!hasSelectableItems ? `
+            <button class="btn btn-ghost" onclick="showAdvancedOptions()">Options</button>
+            <button class="btn btn-primary" onclick="startWizardDownload('${escapeHtml(data.repo)}', ${data.is_dataset})">
+              Download All
+            </button>` : ''}
+          </div>
+        </div>
+      </div>
+    `;
+
+    detailActiveTab = 'overview';
+    detailScrollPositions.overview = 0;
+    const scroller = $('#analyzeResult');
+    if (scroller) scroller.scrollTop = 0;
+    renderDetailTabs(true);
+    updateScrollArrows();
+    loadReadmePreview(data);
+    bindAnalysisWarningRetry(data);
+  }
+
+  let _scrollArrowUp = null;
+  let _scrollArrowDown = null;
+
+  function setScrollArrowVisibility(arrow, visible) {
+    if (!arrow) return;
+    arrow.classList.toggle('visible', visible);
+    arrow.tabIndex = visible ? 0 : -1;
+    if (visible) arrow.removeAttribute('aria-hidden');
+    else arrow.setAttribute('aria-hidden', 'true');
+  }
+
+  function updateScrollArrows() {
+    const scroller = $('#analyzeResult');
+    if (!_scrollArrowUp) _scrollArrowUp = $('#scrollArrowUp');
+    if (!_scrollArrowDown) _scrollArrowDown = $('#scrollArrowDown');
+    if (!scroller || !_scrollArrowUp || !_scrollArrowDown) return;
+
+    const top = scroller.scrollTop;
+    const maxScroll = scroller.scrollHeight - scroller.clientHeight;
+    const atTop = top < 20;
+    const atBottom = maxScroll <= 0 || top >= maxScroll - 20;
+
+    setScrollArrowVisibility(_scrollArrowUp, !atTop);
+    setScrollArrowVisibility(_scrollArrowDown, !atBottom);
+  }
+
+  let readmeRequestId = 0;
+
+  async function loadReadmePreview(data) {
+    const section = $('#readmeSection');
+    const preview = $('#readmePreview');
+    if (!section || !preview || !data?.repo) return;
+
+    const requestId = ++readmeRequestId;
+    const params = new URLSearchParams();
+    params.set('revision', data.branch || 'main');
+    if (data.is_dataset) params.set('dataset', 'true');
+
+    try {
+      const readme = await api('GET', `/readme/${encodeURI(data.repo)}?${params.toString()}`);
+      if (requestId !== readmeRequestId) return;
+      // The Go server owns README rendering, URL rewriting, sanitization and
+      // repository-link classification. The client only displays its HTML: a
+      // response without a string html field is a contract error, and raw
+      // markdown must never be injected as a fallback. An empty string is a
+      // valid server result and keeps the section hidden.
+      if (readme && typeof readme.html === 'string') {
+        preview.innerHTML = readme.html;
+      } else {
+        preview.innerHTML = '';
+      }
+      section.hidden = !preview.innerHTML.trim();
+    } catch (_) {
+      if (requestId !== readmeRequestId) return;
+      preview.innerHTML = '';
+      section.hidden = true;
+    }
+    updateScrollArrows();
+  }
+
+  function isValidReadmeRepo(repo) {
+    const parts = String(repo || '').split('/');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) return false;
+    return parts.every(part => part !== '.' && part !== '..' && !part.includes('\\') && !part.includes('\x00'));
+  }
+
+  function isValidReadmeRevision(revision) {
+    if (!revision || revision === '.' || revision === '..') return false;
+    if (revision.includes('\\') || revision.includes('\x00')) return false;
+    for (const ch of revision) {
+      if (ch.charCodeAt(0) < 0x20 || ch.charCodeAt(0) === 0x7f) return false;
+    }
+    return true;
+  }
+
+  function handleReadmePreviewClick(e) {
+    const target = e.target;
+    const link = target && target.closest ? target.closest('a[data-hf-repo]') : null;
+    if (!link) return;
+    if (e.defaultPrevented || (e.button && e.button !== 0) || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+
+    const repo = link.getAttribute('data-hf-repo');
+    const revision = link.getAttribute('data-hf-repo-revision') || null;
+    if (!isValidReadmeRepo(repo) || (revision && !isValidReadmeRevision(revision))) return;
+    e.preventDefault();
+    const repoType = link.getAttribute('data-hf-repo-type') === 'dataset' ? 'dataset' : 'model';
+    openRepositoryInDetails(repo, repoType, revision, 'push');
+  }
+
+  // Clear analysis and reset to initial state
+  window.clearAnalysis = function() {
+    analyzeRequestId++;
+    readmeRequestId++;
+    currentAnalysis = null;
+    currentGatedState = null;
+    currentSelectedRepo = null;
+    currentSelectedType = null;
+    currentSelectedIsDataset = false;
+    repoHistory = [];
+    repoHistoryIndex = -1;
+    syncRepoHistoryButtons();
+    setScrollArrowVisibility(_scrollArrowUp, false);
+    setScrollArrowVisibility(_scrollArrowDown, false);
+    currentSelectedBranch = 'main';
+    const header = $('#modelsDetailHeader');
+    const hfLink = $('#modelsDetailHFLink');
+    if (header) header.style.display = 'none';
+    if (hfLink) hfLink.hidden = true;
+    advancedOptions = { filter: '', exclude: '' };
+    const input = $('#analyzeInput');
+    if (input) input.value = '';
+    _syncModelsSearchClear();
+
+    detailActiveTab = 'overview';
+    detailScrollPositions.overview = 0;
+    resetCommunityState('', false);
+    renderDetailTabs(false);
+
+    const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
+    if (resultDiv) {
+      resultDiv.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+              <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+              <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+              <line x1="12" y1="22.08" x2="12" y2="12"/>
+            </svg>
+          </div>
+          <h3>Analyze Model or Dataset</h3>
+          <p>Enter a HuggingFace model or dataset ID - we'll auto-detect the type and show files, size, and download options.</p>
+          <div class="example-repos">
+            <span class="example-label">GGUF:</span>
+            <button class="example-btn" data-repo="TheBloke/Mistral-7B-Instruct-v0.2-GGUF">Mistral-7B-GGUF</button>
+            <button class="example-btn" data-repo="bartowski/Qwen2.5-7B-Instruct-GGUF">Qwen2.5-7B-GGUF</button>
+          </div>
+          <div class="example-repos">
+            <span class="example-label">Diffusers:</span>
+            <button class="example-btn" data-repo="stabilityai/stable-diffusion-xl-base-1.0">SDXL-base</button>
+            <button class="example-btn" data-repo="runwayml/stable-diffusion-v1-5">SD-v1.5</button>
+          </div>
+          <div class="example-repos">
+            <span class="example-label">LoRA/GPTQ:</span>
+            <button class="example-btn" data-repo="predibase/glue_stsb">LoRA-adapter</button>
+            <button class="example-btn" data-repo="TheBloke/Llama-2-7B-Chat-GPTQ">Llama-2-GPTQ</button>
+          </div>
+          <div class="example-repos">
+            <span class="example-label">Datasets:</span>
+            <button class="example-btn" data-repo="HuggingFaceFW/fineweb-edu" data-type="dataset">FineWeb-Edu</button>
+            <button class="example-btn" data-repo="OpenAssistant/oasst1" data-type="dataset">OpenAssistant</button>
+          </div>
+        </div>
+      `;
+      // Re-attach example button handlers
+      $$('.example-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          if (input) input.value = btn.dataset.repo;
+          const forceType = btn.dataset.type || null;
+          analyzeRepo(forceType);
+        });
+      });
+    }
+
+    const scroller = $('#analyzeResult');
+    if (scroller) scroller.scrollTop = 0;
+    updateScrollArrows();
+  };
+
+  // Store advanced options (filter/exclude only - revision comes from analysis)
+  let advancedOptions = {
+    filter: '',
+    exclude: ''
+  };
+
+  // Show advanced options modal
+  window.showAdvancedOptions = function() {
+    if (!currentAnalysis) return;
+
+    showModal('Advanced Options', `
+      <div class="form-group">
+        <label for="advFilter">File Filter (comma-separated)</label>
+        <input type="text" id="advFilter" value="${escapeHtml(advancedOptions.filter)}" placeholder="e.g., q4_k_m,q5_k_m">
+        <p class="form-hint">Only download files matching these patterns</p>
+      </div>
+      <div class="form-group">
+        <label for="advExclude">Exclude Filter (comma-separated)</label>
+        <input type="text" id="advExclude" value="${escapeHtml(advancedOptions.exclude)}" placeholder="e.g., fp16,bf16">
+        <p class="form-hint">Skip files matching these patterns</p>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-secondary" onclick="hideModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="applyAdvancedOptions()">Apply</button>
+      </div>
+    `);
+  };
+
+  // Apply advanced options and update command preview
+  window.applyAdvancedOptions = function() {
+    advancedOptions.filter = $('#advFilter')?.value || '';
+    advancedOptions.exclude = $('#advExclude')?.value || '';
+
+    hideModal();
+    showToast('Options applied', 'success');
+  };
+
+  // Start download from wizard with selected options
+  window.startWizardDownload = async function(repo, isDataset) {
+    const filters = advancedOptions.filter
+      ? advancedOptions.filter.split(',').map(s => s.trim()).filter(Boolean)
+      : [];
+
+    // Build excludes from advanced options
+    const excludes = advancedOptions.exclude
+      ? advancedOptions.exclude.split(',').map(s => s.trim()).filter(Boolean)
+      : [];
+
+    // Non-selectable types (e.g. audio) send the destination chosen in the
+    // file list's "Save to" select; '' keeps the previous behavior.
+    const routeKey = isDataset ? '' : routeSelectValue('nonSelectableRoute');
+
+    try {
+      const body = {
+        repo,
+        revision: currentAnalysis?.branch || 'main',
+        dataset: isDataset,
+        filters,
+        excludes,
+        // Manual filters name specific quant/file segments, so keep matching
+        // exact enough that q6_k does not also pull q6_k_xl.
+        exactMatch: filters.length > 0
+      };
+      if (routeKey) body.routeKey = routeKey;
+
+      if (!await checkDownloadDiskSpace(body)) return;
+      await api('POST', '/download', body);
+      showToast(`Download started: ${repo}`, 'success');
+      navigateTo('jobs');
+    } catch (e) {
+      showToast(`Failed: ${e.message}`, 'error');
+    }
+  };
+
+  // downloadFromAnalysis: show a simple download modal in the unified Models page
+  window.downloadFromAnalysis = function(repo, isDataset) {
+    const rev = currentAnalysis?.branch || 'main';
+    // Offer a labeled destination choice only when type folders are configured;
+    // otherwise the modal is exactly as before.
+    const routeOptions = getConfiguredRouteOptions();
+    const routeGroup = !isDataset && routeOptions.length ? `
+      <div class="form-group">
+        <label for="dlModalRoute">Save to</label>
+        ${renderRouteSelect('dlModalRoute')}
+        <p class="form-hint">Choose a configured type folder, or keep the server default.</p>
+      </div>` : '';
+    showModal('Download', `
+      <div class="form-group">
+        <label>Repository</label>
+        <div style="font-weight:600; padding: 6px 0;">${escapeHtml(repo)}</div>
+      </div>
+      ${routeGroup}
+      <div class="form-group">
+        <label for="dlModalLocalDir">Save to folder <span class="form-hint-inline">(optional)</span></label>
+        <input type="text" id="dlModalLocalDir" placeholder="leave blank for Settings default">
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-secondary" onclick="hideModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="confirmDirectDownload('${escapeHtml(repo)}', ${isDataset}, '${escapeHtml(rev)}')">
+          Download
+        </button>
+      </div>
+    `);
+  };
+
+  window.confirmDirectDownload = async function(repo, isDataset, revision) {
+    const localDir = $('#dlModalLocalDir')?.value?.trim() || '';
+    const routeKey = isDataset ? '' : routeSelectValue('dlModalRoute');
+    hideModal();
+    try {
+      const body = { repo, revision: revision || 'main', dataset: isDataset };
+      if (localDir) body.localDir = localDir;
+      if (routeKey) body.routeKey = routeKey;
+      if (!await checkDownloadDiskSpace(body)) return;
+      await api('POST', '/download', body);
+      showToast(`Download started: ${repo}`, 'success');
+      navigateTo('jobs');
+    } catch (e) {
+      showToast(`Failed: ${e.message}`, 'error');
+    }
+  };
+
+  // =========================================
+  // Download Page
+  // =========================================
+
+  function initDownloadPage() {
+    // Model form
+    $('#modelForm')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      await startDownload('model');
+    });
+
+    // Dataset form
+    $('#datasetForm')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      await startDownload('dataset');
+    });
+
+    // Preview buttons
+    $('#previewModelBtn')?.addEventListener('click', () => previewDownload('model'));
+    $('#previewDatasetBtn')?.addEventListener('click', () => previewDownload('dataset'));
+
+    // Show the server's storage mode and disk-free info
+    loadStorageModeBadge();
+    loadDiskFreeIndicator();
+  }
+
+  async function loadDiskFreeIndicator() {
+    const el = $('#diskFreeIndicator');
+    if (!el) return;
+    try {
+      const df = await fetch('/api/diskfree').then(r => r.json());
+      const free  = df.free  || 0;
+      const total = df.total || 0;
+      // freePct = free / total × 100 (how much is available)
+      const freePct = total ? Math.round(free / total * 100) : 0;
+      const cls = free < 2  * 1024 * 1024 * 1024
+        ? (free < 500 * 1024 * 1024 ? 'disk-free-danger' : 'disk-free-warn')
+        : 'disk-free-ok';
+      el.className = `disk-free-indicator ${cls}`;
+      // Show drive letter / path root for clarity
+      const drivePart = df.path ? ` (${df.path.replace(/^([A-Z]:\\?).*$/i,'$1').replace(/^(\/[^/]*).*$/,'$1')})` : '';
+      el.textContent = `Disk${drivePart}: ${formatBytes(free)} free · ${freePct}% of ${formatBytes(total)}`;
+      el.title = `Path: ${df.path || '?'} — ${formatBytes(free)} available of ${formatBytes(total)} total`;
+      el.hidden = false;
+    } catch (_) { el.hidden = true; }
+  }
+
+  async function loadStorageModeBadge() {
+    const badge = $('#storageModeBadge');
+    if (!badge) return;
+    try {
+      const s = await api('GET', '/settings');
+      // Keep the route map available to the download/quant modals, which can be
+      // opened from the Models page without visiting Settings first.
+      state.settings = s;
+      rememberSettingsEndpoint(s);
+      syncSelectedModelHeader();
+      if (s.storageMode === 'local') {
+        badge.textContent = `Storage: local files → ${s.localDir}`;
+        badge.title = 'Server started with --local-dir: downloads are saved as real files and scanned by the Cache browser.';
+        badge.classList.add('storage-mode-local');
+      } else {
+        // In cache mode the actual destination is the Hub path, which can
+        // differ from the friendly cache root (e.g. HF_HUB_CACHE). Show the
+        // real Hub destination, falling back to the legacy root for older
+        // servers that do not report it.
+        const hub = s.effectiveHubDir || s.cacheDir;
+        badge.textContent = `Storage: HF cache → ${hub}`;
+        badge.title = s.hubDirSource === 'HF_HUB_CACHE'
+          ? 'Downloads use the HuggingFace cache layout. Destination set by HF_HUB_CACHE in the server environment.'
+          : 'Downloads use the HuggingFace cache layout. The Cache browser also scans friendly and local model folders.';
+        badge.classList.remove('storage-mode-local');
+      }
+      badge.hidden = false;
+    } catch (e) {
+      badge.hidden = true;
+    }
+  }
+
+  async function startDownload(type) {
+    const isDataset = type === 'dataset';
+    const prefix = isDataset ? 'dataset' : 'model';
+
+    const repo = $(`#${prefix}Repo`)?.value.trim();
+    const revision = $(`#${prefix}Revision`)?.value.trim() || 'main';
+    const filter = $(`#${prefix}Filter`)?.value.trim();
+    const exclude = $(`#${prefix}Exclude`)?.value.trim();
+    const exactMatch = $(`#${prefix}Exact`)?.checked || false;
+    const localDir = $(`#${prefix}LocalDir`)?.value.trim() || '';
+
+    if (!repo) {
+      showToast('Please enter a repository', 'error');
+      return;
+    }
+
+    const body = {
+      repo,
+      revision,
+      dataset: isDataset,
+      filters: filter ? filter.split(',').map(s => s.trim()).filter(Boolean) : [],
+      excludes: exclude ? exclude.split(',').map(s => s.trim()).filter(Boolean) : [],
+      exactMatch,
+    };
+    if (localDir) body.localDir = localDir;
+
+    try {
+      if (!await checkDownloadDiskSpace(body, true)) return;
+      await api('POST', '/download', body);
+      showToast(`Download started: ${repo}`, 'success');
+      navigateTo('jobs');
+    } catch (e) {
+      showToast(`Failed: ${e.message}`, 'error');
+    }
+  }
+
+  async function previewDownload(type) {
+    const isDataset = type === 'dataset';
+    const prefix = isDataset ? 'dataset' : 'model';
+
+    const repo = $(`#${prefix}Repo`)?.value.trim();
+    if (!repo) {
+      showToast('Please enter a repository', 'error');
+      return;
+    }
+
+    const body = {
+      repo,
+      revision: $(`#${prefix}Revision`)?.value.trim() || 'main',
+      dataset: isDataset,
+      filters: ($(`#${prefix}Filter`)?.value || '').split(',').map(s => s.trim()).filter(Boolean),
+      excludes: ($(`#${prefix}Exclude`)?.value || '').split(',').map(s => s.trim()).filter(Boolean),
+      exactMatch: $(`#${prefix}Exact`)?.checked || false,
+      dryRun: true
+    };
+
+    try {
+      showModal('Preview', '<div class="loading-state"><div class="spinner"></div><p>Scanning repository...</p></div>');
+
+      const data = await api('POST', '/plan', body);
+
+      const filesHtml = data.files?.map(f => `
+        <div class="analysis-file">
+          <span class="analysis-file-name">${escapeHtml(f.path)}</span>
+          <span class="analysis-file-size">${formatBytes(f.size)}</span>
+        </div>
+      `).join('') || '<p>No files found</p>';
+
+      setModalContent(`
+        <p style="margin-bottom: 16px; color: var(--color-text-secondary);">
+          ${data.totalFiles} files, ${formatBytes(data.totalSize)} total
+        </p>
+        <div class="analysis-files" style="max-height: 400px;">
+          ${filesHtml}
+        </div>
+      `);
+    } catch (e) {
+      setModalContent(`<p style="color: var(--color-error);">${escapeHtml(e.message)}</p>`);
+    }
+  }
+
+  // =========================================
+  // Jobs Page
+  // =========================================
+
+  async function loadJobs() {
+    try {
+      const data = await api('GET', '/jobs');
+      state.jobs.clear();
+      (data.jobs || []).forEach(job => {
+        state.jobs.set(job.id, job);
+      });
+      renderJobs();
+      updateJobsBadge();
+      loadSpeedCap();
+    } catch (e) {
+      console.error('Failed to load jobs:', e);
+    }
+  }
+
+  // Per-job DOM element cache. renderJobs() used to rebuild innerHTML on
+  // every WebSocket progress event, which destroyed every element under
+  // the cursor ~4 times per second — hover states flickered, and buttons
+  // lost pointerdown/pointerup continuity mid-click. Now we keep stable
+  // elements keyed by job ID and only mutate the fields that actually
+  // changed. Buttons are only re-rendered when the status category
+  // transitions (e.g. running→paused), not on every progress tick.
+  const jobCardCache = new Map();
+
+  // statusCategory groups statuses that share the same action buttons so
+  // we only swap the buttons when the category changes (not on every
+  // progress tick). Each status with a distinct button set gets its own
+  // category: queued shows Cancel; running adds Pause; paused has
+  // Resume+Cancel; terminal states show Dismiss. queued and running must
+  // stay separate, otherwise the Pause button never appears when a job
+  // transitions queued -> running.
+  function statusCategory(status) {
+    if (status === 'running') return 'running';
+    if (status === 'queued') return 'queued';
+    if (status === 'paused') return 'paused';
+    if (status === 'completed' || status === 'failed' || status === 'cancelled') return 'done';
+    return status || 'unknown';
+  }
+
+  function actionButtonsHTML(job) {
+    const id = escapeHtml(job.id);
+    const status = job.status || 'queued';
+    if (status === 'running') {
+      return `
+          <button class="btn btn-sm btn-warning" onclick="pauseJob('${id}')">Pause</button>
+          <button class="btn btn-sm btn-danger" onclick="cancelJob('${id}')">Cancel</button>
+      `;
+    }
+    if (status === 'paused') {
+      return `
+          <button class="btn btn-sm btn-primary" onclick="resumeJob('${id}')">Resume</button>
+          <button class="btn btn-sm btn-danger" onclick="cancelJob('${id}')">Cancel</button>
+      `;
+    }
+    if (status === 'queued') {
+      return `<button class="btn btn-sm btn-danger" onclick="cancelJob('${id}')">Cancel</button>`;
+    }
+    // failed / cancelled jobs can be restarted.
+    if (status === 'failed' || status === 'cancelled') {
+      return `
+          <button class="btn btn-sm btn-primary" onclick="retryJob('${id}')">Retry</button>
+          <button class="btn btn-sm btn-secondary" onclick="dismissJob('${id}')">Dismiss</button>
+      `;
+    }
+    // completed
+    return `<button class="btn btn-sm btn-secondary" onclick="dismissJob('${id}')">Dismiss</button>`;
+  }
+
+  function getJobQuantLabel(job) {
+    const filters = Array.isArray(job.filters) ? job.filters : [];
+    const quant = filters.find(f => !/mmproj/i.test(f)) || '';
+    const mmproj = filters.find(f => /mmproj/i.test(f)) || '';
+    return {
+      quant: quant || (filters.length ? filters.join(', ') : ''),
+      mmproj
+    };
+  }
+
+  // formatDuration renders an ETA the way browser download managers do:
+  // the longer the estimate, the coarser the unit. Second-level precision is
+  // only meaningful (and only shown) under two minutes — beyond that it just
+  // exposes estimator noise as flicker.
+  function formatDuration(seconds) {
+    if (!Number.isFinite(seconds) || seconds <= 0) return 'ETA --';
+    const s = Math.max(1, Math.round(seconds));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    if (h > 0) return `ETA ${h}h ${m}m`;
+    if (m >= 2) return `ETA ${m}m`;
+    const sec = Math.max(5, Math.round(s / 5) * 5);
+    if (sec >= 60) {
+      const mm = Math.floor(sec / 60);
+      const ss = sec % 60;
+      return ss > 0 ? `ETA ${mm}m ${ss}s` : `ETA ${mm}m`;
+    }
+    return `ETA ${sec}s`;
+  }
+
+  function activeJobFile(job) {
+    const files = Array.isArray(job.files) ? job.files : [];
+    return files.find(f => f.status === 'active')
+        || files.find(f => f.status === 'finalizing')
+        || files.find(f => f.status === 'pending')
+        || files[files.length - 1]
+        || null;
+  }
+
+  function createJobCard(job) {
+    const el = document.createElement('div');
+    el.className = 'job-card';
+    el.dataset.jobId = job.id;
+    el.innerHTML = `
+        <div class="job-header">
+          <div>
+            <div class="job-repo"></div>
+            <div class="job-meta-line">
+              <span data-role="revision"></span>
+              <span data-role="quant" class="job-chip" style="display:none"></span>
+              <span data-role="mmproj" class="job-chip job-chip-vision" style="display:none">mmproj</span>
+            </div>
+          </div>
+          <div class="job-header-right">
+            <span class="job-status" data-role="status"></span>
+            <span class="job-actions" data-role="actions"></span>
+          </div>
+        </div>
+        <div class="job-progress">
+          <div class="progress-bar">
+            <div class="progress-fill" data-role="fill" style="width: 0%"></div>
+          </div>
+        </div>
+        <div class="job-stats">
+          <span data-role="pct">0.0%</span>
+          <span data-role="speed" style="display: none"></span>
+          <span data-role="eta" style="display: none"></span>
+          <span data-role="bytes"></span>
+          <span data-role="files"></span>
+        </div>
+        <div class="job-file-line" data-role="active-file" style="display:none"></div>
+        <div class="job-error" data-role="error" style="display: none"></div>
+    `;
+    // Static fields (set once, never changed by progress events).
+    const repoEl = el.querySelector('.job-repo');
+    repoEl.textContent = job.repo || '';
+    if (job.repo) {
+      repoEl.title = 'View model details';
+      repoEl.classList.add('job-repo-clickable');
+      repoEl.onclick = () => navigateToAnalyze(
+        job.repo,
+        job.isDataset ? 'dataset' : 'model',
+        job.revision || null
+      );
+    }
+    // Only show the revision when it isn't the default "main" branch —
+    // every download is from main, so labelling it adds noise and height.
+    const revEl = el.querySelector('[data-role="revision"]');
+    if (job.revision && job.revision !== 'main') {
+      revEl.textContent = '@ ' + job.revision;
+    } else {
+      revEl.textContent = '';
+      revEl.style.display = 'none';
+    }
+    return el;
+  }
+
+  // updateJobCard mutates an existing card in place. It reads textContent
+  // before writing so we avoid forcing the browser to recompute styles for
+  // values that didn't actually change — keeps the DOM stable for hover.
+  function updateJobCard(el, job) {
+    const p = job.progress || {};
+    const totalBytes = p.totalBytes || 0;
+    const downloadedBytes = p.downloadedBytes || 0;
+    const pct = totalBytes > 0 ? (downloadedBytes / totalBytes * 100) : 0;
+    const status = job.status || 'queued';
+    const speed = (status === 'running' && p.bytesPerSecond) || 0;
+    const jobLabels = getJobQuantLabel(job);
+
+    // Status badge. While running, a "finalizing" phase (post-download
+    // friendly-view/manifest work) is surfaced so the job doesn't look stuck
+    // at 100%.
+    const statusEl = el.querySelector('[data-role="status"]');
+    const displayStatus = (status === 'running' && job.phase === 'finalizing') ? 'finalizing' : status;
+    if (statusEl.textContent !== displayStatus) {
+      statusEl.textContent = displayStatus;
+      statusEl.className = 'job-status ' + displayStatus;
+    }
+
+    // Action buttons — only swap when the category changes, to avoid
+    // killing the button the user is about to click or is currently
+    // hovering. Within a single status category the DOM stays identical.
+    const newCat = statusCategory(status);
+    if (el.dataset.statusCategory !== newCat) {
+      el.dataset.statusCategory = newCat;
+      el.querySelector('[data-role="actions"]').innerHTML = actionButtonsHTML(job);
+    }
+
+    // Progress bar.
+    const fillEl = el.querySelector('[data-role="fill"]');
+    const nextWidth = pct + '%';
+    if (fillEl.style.width !== nextWidth) {
+      fillEl.style.width = nextWidth;
+    }
+
+    // Stats.
+    const pctText = pct.toFixed(1) + '%';
+    const pctEl = el.querySelector('[data-role="pct"]');
+    if (pctEl.textContent !== pctText) pctEl.textContent = pctText;
+
+    const speedEl = el.querySelector('[data-role="speed"]');
+    if (speed > 0) {
+      const speedText = formatBytes(speed) + '/s';
+      if (speedEl.textContent !== speedText) speedEl.textContent = speedText;
+      if (speedEl.style.display === 'none') speedEl.style.display = '';
+    } else {
+      if (speedEl.style.display !== 'none') speedEl.style.display = 'none';
+    }
+
+    const etaEl = el.querySelector('[data-role="eta"]');
+    const eta = p.etaSeconds || 0;
+    if (eta > 0 && totalBytes > downloadedBytes) {
+      // Progress frames arrive ~4x per second; rewriting the ETA on every
+      // frame makes the trailing seconds flicker. Refresh it at most once a
+      // second — well within how fast a remaining-time estimate can
+      // meaningfully change.
+      const now = Date.now();
+      const lastEta = Number(etaEl.dataset.lastUpdate || 0);
+      if (etaEl.style.display === 'none' || now - lastEta >= 1000) {
+        const etaText = formatDuration(eta);
+        if (etaEl.textContent !== etaText) etaEl.textContent = etaText;
+        etaEl.dataset.lastUpdate = String(now);
+      }
+      if (etaEl.style.display === 'none') etaEl.style.display = '';
+    } else if (etaEl.style.display !== 'none') {
+      etaEl.style.display = 'none';
+    }
+
+    const bytesText = formatBytes(downloadedBytes) + ' / ' + formatBytes(totalBytes);
+    const bytesEl = el.querySelector('[data-role="bytes"]');
+    if (bytesEl.textContent !== bytesText) bytesEl.textContent = bytesText;
+
+    const filesText = 'completed: ' + (p.completedFiles || 0) + ' / ' + (p.totalFiles || 0) + ' files';
+    const filesEl = el.querySelector('[data-role="files"]');
+    if (filesEl.textContent !== filesText) filesEl.textContent = filesText;
+
+    const quantEl = el.querySelector('[data-role="quant"]');
+    if (jobLabels.quant) {
+      if (quantEl.textContent !== jobLabels.quant) quantEl.textContent = jobLabels.quant;
+      if (quantEl.style.display === 'none') quantEl.style.display = '';
+    } else if (quantEl.style.display !== 'none') {
+      quantEl.style.display = 'none';
+    }
+
+    const mmprojEl = el.querySelector('[data-role="mmproj"]');
+    if (jobLabels.mmproj) {
+      mmprojEl.title = jobLabels.mmproj;
+      if (mmprojEl.style.display === 'none') mmprojEl.style.display = '';
+    } else if (mmprojEl.style.display !== 'none') {
+      mmprojEl.style.display = 'none';
+    }
+
+    // Collapse the meta line entirely when it has nothing to show (no
+    // non-default revision, no quant, no mmproj) so it adds no height.
+    const revVisible = el.querySelector('[data-role="revision"]').style.display !== 'none';
+    const metaVisible = revVisible || !!jobLabels.quant || !!jobLabels.mmproj;
+    const metaLine = el.querySelector('.job-meta-line');
+    metaLine.style.display = metaVisible ? '' : 'none';
+
+    const currentFile = activeJobFile(job);
+    const fileEl = el.querySelector('[data-role="active-file"]');
+    if (currentFile?.path) {
+      const fileText = `${currentFile.status || 'file'}: ${currentFile.path}`;
+      if (fileEl.textContent !== fileText) fileEl.textContent = fileText;
+      fileEl.title = currentFile.path;
+      if (fileEl.style.display === 'none') fileEl.style.display = '';
+    } else if (fileEl.style.display !== 'none') {
+      fileEl.style.display = 'none';
+      fileEl.textContent = '';
+      fileEl.title = '';
+    }
+
+    // Error.
+    const errorEl = el.querySelector('[data-role="error"]');
+    if (job.error) {
+      if (errorEl.textContent !== job.error) errorEl.textContent = job.error;
+      if (errorEl.style.display === 'none') errorEl.style.display = '';
+    } else if (errorEl.style.display !== 'none') {
+      errorEl.style.display = 'none';
+      errorEl.textContent = '';
+    }
+  }
+
+  function renderJobs() {
+    const container = $('#jobsList');
+    if (!container) return;
+
+    // Sort by date added, newest first. Fall back to id ordering when
+    // createdAt is missing or equal so the order stays stable.
+    const jobs = Array.from(state.jobs.values()).sort((a, b) => {
+      const ta = Date.parse(a.createdAt) || 0;
+      const tb = Date.parse(b.createdAt) || 0;
+      if (tb !== ta) return tb - ta;
+      return String(b.id).localeCompare(String(a.id));
+    });
+
+    if (jobs.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+            </svg>
+          </div>
+          <h3>No Active Downloads</h3>
+          <p>Start a download from the Download page to see progress here.</p>
+        </div>
+      `;
+      jobCardCache.clear();
+      return;
+    }
+
+    // If we're transitioning from the empty-state template back into
+    // the jobs view, clear the container and cache first.
+    if (container.querySelector('.empty-state')) {
+      container.innerHTML = '';
+      jobCardCache.clear();
+    }
+
+    const seen = new Set();
+    let prev = null;
+    for (const job of jobs) {
+      seen.add(job.id);
+      let el = jobCardCache.get(job.id);
+      if (!el) {
+        el = createJobCard(job);
+        jobCardCache.set(job.id, el);
+      }
+      updateJobCard(el, job);
+      // Keep the DOM in sorted order: place this card right after the
+      // previous one, but only touch the DOM when it is out of position.
+      const expectedNext = prev ? prev.nextSibling : container.firstChild;
+      if (el !== expectedNext) {
+        container.insertBefore(el, expectedNext);
+      }
+      prev = el;
+    }
+
+    // Remove stale cards for jobs that are no longer tracked (dismiss).
+    for (const [id, el] of jobCardCache) {
+      if (!seen.has(id)) {
+        el.remove();
+        jobCardCache.delete(id);
+      }
+    }
+
+    // Update aggregate speed gauge after jobs change
+    updateSpeedGauge();
+  }
+
+  // Cancel a running/queued job
+  window.cancelJob = async function(jobId) {
+    try {
+      await api('DELETE', `/jobs/${jobId}`);
+      showToast('Download cancelled', 'success');
+      // Update local state immediately
+      const job = state.jobs.get(jobId);
+      if (job) {
+        job.status = 'cancelled';
+        state.jobs.set(jobId, job);
+        renderJobs();
+        updateJobsBadge();
+      }
+    } catch (e) {
+      showToast(`Failed to cancel: ${e.message}`, 'error');
+    }
+  };
+
+  // Pause a running job
+  window.pauseJob = async function(jobId) {
+    try {
+      await api('POST', `/jobs/${jobId}/pause`);
+      showToast('Download paused', 'success');
+      const job = state.jobs.get(jobId);
+      if (job) {
+        job.status = 'paused';
+        state.jobs.set(jobId, job);
+        renderJobs();
+        updateJobsBadge();
+      }
+    } catch (e) {
+      showToast(`Failed to pause: ${e.message}`, 'error');
+    }
+  };
+
+  // Resume a paused job
+  window.resumeJob = async function(jobId) {
+    try {
+      await api('POST', `/jobs/${jobId}/resume`);
+      showToast('Download resumed', 'success');
+      const job = state.jobs.get(jobId);
+      if (job) {
+        job.status = 'queued';
+        state.jobs.set(jobId, job);
+        renderJobs();
+        updateJobsBadge();
+      }
+    } catch (e) {
+      showToast(`Failed to resume: ${e.message}`, 'error');
+    }
+  };
+
+  // Retry a failed or cancelled job. Server reuses the same job ID and
+  // restarts the download with the original parameters.
+  window.retryJob = async function(jobId) {
+    try {
+      await api('POST', `/jobs/${jobId}/retry`);
+      showToast('Download restarted', 'success');
+      const job = state.jobs.get(jobId);
+      if (job) {
+        job.status = 'queued';
+        job.error = '';
+        state.jobs.set(jobId, job);
+        renderJobs();
+        updateJobsBadge();
+      }
+    } catch (e) {
+      showToast(`Failed to retry: ${e.message}`, 'error');
+    }
+  };
+
+  // Dismiss (permanently remove) a completed/failed/cancelled/paused job.
+  // We call the server so the dismissal survives a page refresh (github #68).
+  window.dismissJob = async function(jobId) {
+    try {
+      await api('POST', `/jobs/${jobId}/dismiss`);
+      state.jobs.delete(jobId);
+      renderJobs();
+      updateJobsBadge();
+    } catch (e) {
+      showToast(`Failed to dismiss: ${e.message}`, 'error');
+    }
+  };
+
+  // =========================================
+  // Cache Page
+  // =========================================
+
+  let cacheData = { repos: [], stats: {}, cacheDir: '' };
+  let cacheFilter = 'all';
+  let cacheSort = 'name';
+  let cacheView = 'list';
+  let cacheSearch = '';
+
+  async function loadCache() {
+    const container = $('#cacheList');
+    const statsContainer = $('#cacheStats');
+    if (!container) return;
+
+    if (isFilePreview()) {
+      cacheData = { repos: [], stats: {}, cacheDir: '' };
+      updateCacheStats();
+      renderCacheList();
+      return;
+    }
+
+    container.innerHTML = `
+      <div class="loading-state">
+        <div class="spinner"></div>
+        <p>Loading cache...</p>
+      </div>
+    `;
+
+    try {
+      cacheData = await api('GET', '/cache');
+      updateCacheStats();
+      renderCacheList();
+    } catch (e) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <h3>Failed to Load Cache</h3>
+          <p>${escapeHtml(e.message)}</p>
+        </div>
+      `;
+    }
+  }
+
+  function updateCacheStats() {
+    const stats = cacheData.stats || {};
+    $('#statModels').textContent = stats.totalModels || 0;
+    $('#statDatasets').textContent = stats.totalDatasets || 0;
+    $('#statSize').textContent = stats.totalSizeHuman || '0 B';
+    $('#statFiles').textContent = stats.totalFiles || 0;
+  }
+
+  function capabilityIcon(kind, title) {
+    const icons = {
+      vision: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>`,
+      tools: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M14.7 6.3a4 4 0 0 0-5.1 5.1l-6.1 6.1a2.1 2.1 0 0 0 3 3l6.1-6.1a4 4 0 0 0 5.1-5.1l-2.5 2.5-2.8-2.8 2.3-2.7z"/></svg>`,
+      reasoning: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M12 3a5 5 0 0 0-5 5v1.5L5.5 11H7v3a3 3 0 0 0 3 3h1v3h5v-4.2A6 6 0 0 0 12 3z"/><path d="M10 8h.01M14 8h.01M11 12h3"/></svg>`
+    };
+    const labels = { vision: 'Vision', tools: 'Tools', reasoning: 'Reasoning' };
+    return `<span class="capability-icon capability-${kind}" title="${escapeHtml(title || labels[kind] || kind)}" aria-label="${escapeHtml(labels[kind] || kind)}">${icons[kind] || ''}</span>`;
+  }
+
+  function renderCapabilityIcons(capabilities, titles = {}) {
+    const ordered = ['vision', 'tools', 'reasoning'];
+    const set = new Set(capabilities || []);
+    const html = ordered
+      .filter(kind => set.has(kind))
+      .map(kind => capabilityIcon(kind, titles[kind]))
+      .join('');
+    return html ? `<span class="capability-icons">${html}</span>` : '';
+  }
+
+  function renderCacheList() {
+    const container = $('#cacheList');
+    if (!container) return;
+
+    let repos = [...(cacheData.repos || [])];
+
+    // Apply filter
+    if (cacheFilter !== 'all') {
+      repos = repos.filter(r => r.type === cacheFilter);
+    }
+
+    // Apply search
+    if (cacheSearch) {
+      const search = cacheSearch.toLowerCase();
+      repos = repos.filter(r =>
+        r.repo.toLowerCase().includes(search) ||
+        r.owner.toLowerCase().includes(search) ||
+        r.name.toLowerCase().includes(search)
+      );
+    }
+
+    // Apply sort
+    repos.sort((a, b) => {
+      switch (cacheSort) {
+        case 'size':
+          return b.size - a.size;
+        case 'date':
+          return (b.downloaded || '').localeCompare(a.downloaded || '');
+        default:
+          return a.repo.localeCompare(b.repo);
+      }
+    });
+
+    if (repos.length === 0) {
+      const message = cacheData.repos?.length === 0
+        ? 'No models or datasets downloaded yet.'
+        : 'No repositories match your filters.';
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+            </svg>
+          </div>
+          <h3>${cacheData.repos?.length === 0 ? 'Cache is Empty' : 'No Results'}</h3>
+          <p>${message}</p>
+          ${(() => {
+            // Show the actual Hub destination when the server reports it; fall
+            // back to the legacy friendly root for older servers. Never label
+            // the friendly root as the Hub path when they differ.
+            const dir = cacheData.effectiveHubDir || cacheData.cacheDir;
+            const label = cacheData.effectiveHubDir ? 'Hub cache' : 'Cache';
+            return dir ? `<p class="cache-dir-hint">${label}: ${escapeHtml(dir)}</p>` : '';
+          })()}
+        </div>
+      `;
+      return;
+    }
+
+    // Render based on view mode
+    container.className = `cache-list cache-${cacheView}-view`;
+
+    if (cacheView === 'grid') {
+      container.innerHTML = repos.map(repo => renderCacheCard(repo)).join('');
+    } else {
+      container.innerHTML = `
+        <div class="cache-table">
+          <div class="cache-table-header">
+            <div class="cache-col-type">Type</div>
+            <div class="cache-col-repo">Repository</div>
+            <div class="cache-col-source">Source</div>
+            <div class="cache-col-size">Size</div>
+            <div class="cache-col-files">Files</div>
+            <div class="cache-col-date">Downloaded</div>
+            <div class="cache-col-actions"></div>
+          </div>
+          ${repos.map(repo => renderCacheRow(repo)).join('')}
+        </div>
+      `;
+    }
+  }
+
+  function renderCacheCard(repo) {
+    const typeIcon = repo.type === 'model'
+      ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+           <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+         </svg>`
+      : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+           <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+           <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+         </svg>`;
+    const sourceBadge = repo.source
+      ? `<span class="cache-badge cache-source-badge">${escapeHtml(repo.source)}</span>`
+      : '';
+    // Merge server-provided capabilities (e.g. vision from an mmproj encoder)
+    // with ones detected from the repo name/tags so tools/reasoning badges
+    // also show for cached models.
+    const detectedCaps = detectSearchCapabilities({ id: repo.repo, tags: repo.tags });
+    const mergedCaps = Array.from(new Set([...(repo.capabilities || []), ...detectedCaps.capabilities]));
+    const capabilityIcons = renderCapabilityIcons(mergedCaps, {
+      vision: repo.hasMMProj ? 'Vision: mmproj encoder found' : detectedCaps.titles.vision,
+      tools: detectedCaps.titles.tools,
+      reasoning: detectedCaps.titles.reasoning
+    });
+
+    // Build status badge based on download status
+    let statusBadge = '';
+    if (repo.downloadStatus === 'complete') {
+      statusBadge = '<span class="cache-badge cache-badge-complete" title="Fully downloaded with HFDesk">Complete</span>';
+    } else if (repo.downloadStatus === 'filtered') {
+      const filterTitle = repo.manifest?.filters ? `Filtered download: ${repo.manifest.filters}` : 'Partial download (filters applied)';
+      statusBadge = `<span class="cache-badge cache-badge-filtered" title="${escapeHtml(filterTitle)}">Filtered</span>`;
+    } else if (repo.manifest) {
+      statusBadge = '<span class="cache-badge cache-badge-manifest" title="Has manifest file">Tracked</span>';
+    }
+    const quantSubtitle = renderCacheQuantSubtitle(repo);
+
+    return `
+      <div class="cache-card" onclick="showCacheDetails('${escapeHtml(repo.repo)}', '${escapeHtml(repo.type)}')">
+        <div class="cache-card-header">
+          <span class="cache-card-type cache-type-${repo.type}">
+            ${typeIcon}
+            ${repo.type}
+          </span>
+          <span class="cache-card-badges">${sourceBadge}${statusBadge}</span>
+        </div>
+        <div class="cache-card-body">
+          <div class="cache-card-owner">${escapeHtml(repo.owner)}</div>
+          <div class="cache-card-name">${escapeHtml(repo.name)}</div>
+          ${capabilityIcons}
+          ${quantSubtitle}
+        </div>
+        <div class="cache-card-meta">
+          <div class="cache-card-stat">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+              <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+              <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+              <line x1="12" y1="22.08" x2="12" y2="12"/>
+            </svg>
+            ${escapeHtml(repo.sizeHuman)}
+          </div>
+          <div class="cache-card-stat">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+              <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
+              <polyline points="13 2 13 9 20 9"/>
+            </svg>
+            ${repo.fileCount} files
+          </div>
+        </div>
+        <div class="cache-card-footer">
+          ${repo.commit ? `<code class="cache-commit" title="Commit: ${escapeHtml(repo.commit)}">${escapeHtml(repo.commit)}</code>` : ''}
+          ${repo.downloaded ? `<span class="cache-date">${escapeHtml(repo.downloaded)}</span>` : ''}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderCacheRow(repo) {
+    const typeIcon = repo.type === 'model'
+      ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+           <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+         </svg>`
+      : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+           <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+           <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+         </svg>`;
+    const sourceBadge = repo.source
+      ? `<span class="cache-badge cache-source-badge">${escapeHtml(repo.source)}</span>`
+      : '';
+    // Merge server-provided capabilities (e.g. vision from an mmproj encoder)
+    // with ones detected from the repo name/tags so tools/reasoning badges
+    // also show for cached models.
+    const detectedCaps = detectSearchCapabilities({ id: repo.repo, tags: repo.tags });
+    const mergedCaps = Array.from(new Set([...(repo.capabilities || []), ...detectedCaps.capabilities]));
+    const capabilityIcons = renderCapabilityIcons(mergedCaps, {
+      vision: repo.hasMMProj ? 'Vision: mmproj encoder found' : detectedCaps.titles.vision,
+      tools: detectedCaps.titles.tools,
+      reasoning: detectedCaps.titles.reasoning
+    });
+
+    // Build status badge
+    let statusBadge = '';
+    if (repo.downloadStatus === 'complete') {
+      statusBadge = '<span class="cache-badge cache-badge-complete">Complete</span>';
+    } else if (repo.downloadStatus === 'filtered') {
+      statusBadge = '<span class="cache-badge cache-badge-filtered">Filtered</span>';
+    } else if (repo.manifest) {
+      statusBadge = '<span class="cache-badge cache-badge-manifest">Tracked</span>';
+    }
+    const quantSubtitle = renderCacheQuantSubtitle(repo);
+
+    return `
+      <div class="cache-table-row" onclick="showCacheDetails('${escapeHtml(repo.repo)}', '${escapeHtml(repo.type)}')">
+        <div class="cache-col-type">
+          <span class="cache-type-badge cache-type-${repo.type}">
+            ${typeIcon}
+            ${repo.type}
+          </span>
+        </div>
+        <div class="cache-col-repo">
+          <span class="cache-repo-name">${escapeHtml(repo.repo)}</span>
+          ${capabilityIcons}
+          ${quantSubtitle}
+          ${statusBadge}
+        </div>
+        <div class="cache-col-source">${sourceBadge}</div>
+        <div class="cache-col-size">${escapeHtml(repo.sizeHuman)}</div>
+        <div class="cache-col-files">${repo.fileCount}</div>
+        <div class="cache-col-date">${escapeHtml(repo.downloaded || '-')}</div>
+        <div class="cache-col-actions">
+          <button class="btn btn-ghost btn-sm" onclick="event.stopPropagation(); showCacheDetails('${escapeHtml(repo.repo)}', '${escapeHtml(repo.type)}')" title="View details">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+              <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderCacheQuantSubtitle(repo) {
+    const quants = repo.quantizations || [];
+    if (!quants.length) return '';
+    const shown = quants.slice(0, 8).join(', ');
+    const more = quants.length > 8 ? ` +${quants.length - 8}` : '';
+    return `<div class="cache-quant-subtitle" title="${escapeHtml(quants.join(', '))}">${escapeHtml(shown + more)}</div>`;
+  }
+
+  let cacheDetailsRequest = 0;
+  let activeCacheDetailsContext = null;
+  let cacheDeleteConfirmationSequence = 0;
+  const pendingSelectedCacheDeletes = new Set();
+  window.showCacheDetails = async function(repo, type, preferredLocationID = '') {
+    const requestID = ++cacheDetailsRequest;
+    const context = { requestID, repo, type: type === 'dataset' ? 'dataset' : 'model', selectedLocationID: preferredLocationID };
+    activeCacheDetailsContext = context;
+    try {
+      showModal('Repository Details', '<div class="loading-state"><div class="spinner"></div></div>');
+      const requestedType = context.type;
+      const data = await api('GET', `/cache/${encodeURIComponent(repo)}?type=${encodeURIComponent(requestedType)}`);
+      if (!cacheDetailsContextIsCurrent(context)) return;
+
+      const typeIcon = data.type === 'model'
+        ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+             <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+           </svg>`
+        : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+             <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+             <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+           </svg>`;
+
+      // Build files table
+      const filesHtml = data.files?.length > 0
+        ? `<div class="cache-detail-files">
+             <h4>Files (${data.files.length})</h4>
+             <div class="cache-files-list">
+               ${data.files.map(f => `
+                 <div class="cache-file-row">
+                   <span class="cache-file-name" title="${escapeCacheDetailAttribute(f.name)}">
+                     ${f.isLfs ? '<span class="lfs-badge">LFS</span>' : ''}
+                     ${escapeHtml(f.name)}
+                   </span>
+                   <span class="cache-file-size">${escapeHtml(f.sizeHuman)}</span>
+                 </div>
+               `).join('')}
+             </div>
+           </div>`
+        : '';
+
+      // Build download status badge for detail view
+      let statusBadgeHtml = '';
+      if (data.downloadStatus === 'complete') {
+        statusBadgeHtml = '<span class="cache-badge cache-badge-complete">Complete</span>';
+      } else if (data.downloadStatus === 'filtered') {
+        statusBadgeHtml = '<span class="cache-badge cache-badge-filtered">Filtered</span>';
+      } else if (data.downloadStatus === 'unknown') {
+        statusBadgeHtml = '<span class="cache-badge cache-badge-unknown">External</span>';
+      }
+      const detailSourceBadge = data.source
+        ? `<span class="cache-badge cache-source-badge">${escapeHtml(data.source)}</span>`
+        : '';
+      const detailCapabilities = renderCapabilityIcons(data.capabilities, {
+        vision: data.hasMMProj ? 'Vision: mmproj encoder found' : 'Vision'
+      });
+
+      // Build manifest info
+      const manifestHtml = data.manifest
+        ? `<div class="cache-detail-section">
+             <h4>Download Info</h4>
+             <div class="cache-detail-grid">
+               <div class="cache-detail-item">
+                 <span class="cache-detail-label">Status</span>
+                 <span class="cache-detail-value">
+                   ${data.downloadStatus === 'complete' ? 'Complete download' : ''}
+                   ${data.downloadStatus === 'filtered' ? 'Filtered download' : ''}
+                   ${data.manifest.filters ? ` (${escapeHtml(data.manifest.filters)})` : ''}
+                 </span>
+               </div>
+               <div class="cache-detail-item">
+                 <span class="cache-detail-label">Downloaded</span>
+                 <span class="cache-detail-value">${escapeHtml(data.manifest.downloaded)}</span>
+               </div>
+               ${data.manifest.command ? `
+                 <div class="cache-detail-item cache-detail-full">
+                   <span class="cache-detail-label">Command</span>
+                   <code class="cache-detail-code">${escapeHtml(data.manifest.command)}</code>
+                 </div>
+               ` : ''}
+             </div>
+           </div>`
+        : (data.downloadStatus === 'unknown' ? `<div class="cache-detail-section">
+             <h4>Download Info</h4>
+             <div class="cache-detail-note">
+               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                 <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>
+               </svg>
+               <span>Downloaded by external tool or found in a local model folder.</span>
+             </div>
+           </div>` : '');
+
+      const mmprojHtml = data.mmprojFiles?.length
+        ? `<div class="cache-detail-section">
+             <h4>Vision Encoder</h4>
+             <div class="cache-files-list">
+               ${data.mmprojFiles.map(f => `
+                 <div class="cache-file-row">
+                   <span class="cache-file-name" title="${escapeCacheDetailAttribute(f)}">${escapeHtml(f)}</span>
+                 </div>
+               `).join('')}
+             </div>
+           </div>`
+        : '';
+
+      context.snapshotFiles = Array.isArray(data.files) ? data.files : [];
+      context.filesHTML = filesHtml || '<p class="cache-selection-readonly">No files were reported in this snapshot.</p>';
+      context.metadataHTML = `<details class="cache-detail-metadata"><summary>Repository metadata</summary>
+        ${data.commit ? `<div class="cache-detail-section"><h4>Commit</h4><code class="cache-path-value">${escapeHtml(data.commit)}</code></div>` : ''}
+        ${manifestHtml}${mmprojHtml}
+        <div class="cache-detail-section"><h4>Paths</h4><div class="cache-detail-paths">
+          <div class="cache-path-item"><span class="cache-path-label">${data.source === 'HF cache' || !data.source ? 'Cache (HF format)' : 'Local path'}</span><code class="cache-path-value">${escapeHtml(data.path)}</code></div>
+          ${data.friendlyPath ? `<div class="cache-path-item"><span class="cache-path-label">Friendly view</span><code class="cache-path-value">${escapeHtml(data.friendlyPath)}</code></div>` : ''}
+        </div></div></details>`;
+      setModalContent(`
+        <div class="cache-detail-modal">
+          <div class="cache-detail-header">
+            <span class="cache-detail-type cache-type-${requestedType}">
+              ${typeIcon}
+              ${escapeHtml(data.type)}
+            </span>
+            ${statusBadgeHtml}
+            ${detailSourceBadge}
+            ${detailCapabilities}
+            <div class="cache-detail-repo">
+              <span class="cache-detail-owner">${escapeHtml(data.owner)}/</span>
+              <span class="cache-detail-name">${escapeHtml(data.name)}</span>
+            </div>
+            <a href="https://huggingface.co/${data.type === 'dataset' ? 'datasets/' : ''}${encodeURI(data.repo)}" target="_blank" rel="noopener" class="btn btn-ghost btn-sm cache-detail-hf" aria-label="View on HuggingFace" title="View on HuggingFace">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+                <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
+              </svg>
+            </a>
+          </div>
+
+          <div class="cache-detail-stats">
+            <div class="cache-detail-stat">
+              <div class="cache-detail-stat-value">${escapeHtml(data.sizeHuman)}</div>
+              <div class="cache-detail-stat-label">Total Size</div>
+            </div>
+            <div class="cache-detail-stat">
+              <div class="cache-detail-stat-value">${data.fileCount}</div>
+              <div class="cache-detail-stat-label">Files</div>
+            </div>
+            <div class="cache-detail-stat">
+              <div class="cache-detail-stat-value">${escapeHtml(data.branch || 'main')}</div>
+              <div class="cache-detail-stat-label">Branch</div>
+            </div>
+          </div>
+
+          <section id="cacheSelectionSection" class="cache-detail-section">
+            <div class="cache-selection-sticky"><h4>${requestedType === 'model' ? 'GGUF groups' : 'Files'}</h4></div>
+            <div class="cache-detail-scroll" tabindex="0" aria-label="Repository files and metadata">${requestedType === 'model' ? '<p>Loading GGUF groups…</p>' : context.filesHTML}${context.metadataHTML}</div>
+          </section>
+
+          <div class="cache-detail-actions">
+          ${data.type === 'dataset' && (data.source === 'HF cache' || !data.source) ? `<button class="btn btn-danger" onclick="confirmDeleteCache(${escapeCacheDetailAttribute(JSON.stringify(data.repo))}, ${escapeCacheDetailAttribute(JSON.stringify(data.type))})">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
+              </svg>
+              Delete entire dataset cache
+            </button>` : data.type === 'model' && (data.source === 'HF cache' || !data.source) ? `<button class="btn btn-danger" onclick="confirmDeleteCache(${escapeCacheDetailAttribute(JSON.stringify(data.repo))}, ${escapeCacheDetailAttribute(JSON.stringify(data.type))})">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
+              </svg>
+              Delete entire model cache
+            </button>` : ''}
+            <button class="btn btn-ghost" onclick="hideModal()">Close</button>
+          </div>
+        </div>
+      `);
+      if (requestedType === 'model') {
+        const selection = await api('GET', `/cache-selection?repo=${encodeURIComponent(repo)}&type=model`);
+        if (!cacheDetailsContextIsCurrent(context)) return;
+        const preferred = preferredLocationID && selection.locations?.find(location => location.id === preferredLocationID);
+        const defaultLocation = preferredLocationID
+          ? preferred
+          : selection.locations?.find(location => location.path === data.path) || selection.locations?.[0];
+        renderCacheSelection(selection, defaultLocation?.id || preferredLocationID || '', context, '');
+      }
+    } catch (e) {
+      if (cacheDetailsContextIsCurrent(context)) {
+        const section = $('#cacheSelectionSection');
+        if (section) section.innerHTML = `<div class="cache-selection-sticky"><h4>GGUF groups</h4></div><div class="cache-detail-scroll" tabindex="0" aria-label="Repository files and metadata"><p class="cache-selection-warning">Unable to load GGUF selection: ${escapeHtml(e.message)}</p>${context.filesHTML || ''}${context.metadataHTML || ''}</div>`;
+        else setModalContent(`<p style="color: var(--color-error);">${escapeHtml(e.message)}</p>`);
+      }
+    }
+  };
+
+  function cacheDetailsModalIsCurrent() {
+    return $('#modalBackdrop')?.classList.contains('active')
+      && $('#modalTitle')?.textContent === 'Repository Details';
+  }
+
+  function cacheDetailsContextIsCurrent(context) {
+    return activeCacheDetailsContext === context
+      && context.requestID === cacheDetailsRequest
+      && cacheDetailsModalIsCurrent();
+  }
+
+  function selectedCacheDeleteKey(repo, locationID, groupID) {
+    return JSON.stringify([repo, locationID, groupID]);
+  }
+
+  // Text escaping alone does not protect quoted HTML attributes.
+  function escapeCacheDetailAttribute(value) {
+    return escapeHtml(String(value ?? '')).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function renderCacheSelection(selection, selectedLocationID, context, outcomeHTML = '') {
+    const { requestID, repo } = context;
+    const locations = selection.locations || [];
+    const location = locations.find(item => item.id === selectedLocationID);
+    const options = locations.map((item, index) =>
+      `<option value="${index}"${item.id === selectedLocationID ? ' selected' : ''}>${escapeHtml(item.source)} — ${escapeHtml(item.path)}</option>`
+    ).join('');
+    const groups = location?.groups || [];
+    const hasGroups = Boolean(location && groups.length);
+    const groupRows = groups.length ? groups.map((group, index) => {
+      const deleteKey = selectedCacheDeleteKey(repo, location.id, group.id);
+      const canDelete = location.canDelete === true && group.canDelete === true;
+      const disabledReason = location.canDelete !== true
+        ? location.deleteReason || location.warning || 'This location is not eligible for selected-file deletion.'
+        : group.canDelete !== true
+          ? group.warning || 'This GGUF group is not eligible for selected-file deletion.'
+          : '';
+      const pending = pendingSelectedCacheDeletes.has(deleteKey);
+      const distinctPaths = new Set((group.members || []).map(member => member.path)).size;
+      const savedVersions = new Set((group.members || []).flatMap(member => member.versions || [])).size;
+      const quantSuffix = group.quant ? ` · ${group.quant}` : '';
+      const displayLabel = quantSuffix && typeof group.label === 'string' && group.label.endsWith(quantSuffix) ? group.label.slice(0, -quantSuffix.length) : group.label;
+      // A vision encoder is a companion artifact, not a model quantization, so
+      // it gets its own badge instead of a quant label.
+      const kindBadge = group.kind === 'vision_encoder'
+        ? ' <span class="cache-badge cache-badge-vision-encoder" title="Multimodal vision encoder companion">Vision encoder</span>'
+        : (group.quant ? ` <span class="cache-badge">${escapeHtml(group.quant)}</span>` : '');
+      return `
+      <article class="cache-selection-group">
+        <div class="cache-selection-group-row">
+          <div class="cache-selection-group-info"><strong>${escapeHtml(displayLabel)}</strong>${kindBadge}<span class="cache-selection-counts">${distinctPaths} file${distinctPaths === 1 ? '' : 's'}${savedVersions ? ` · ${savedVersions} saved versions` : ''}</span></div>
+          <button class="btn btn-danger btn-sm cache-selection-delete" type="button" data-delete-group-index="${index}"${!canDelete || pending ? ' disabled' : ''} aria-describedby="cache-selection-help-${index}"${disabledReason ? ` title="${escapeCacheDetailAttribute(disabledReason)}"` : ''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg> Delete</button>
+        </div>
+        <details><summary>Show ${group.members?.length || 0} file record${group.members?.length === 1 ? '' : 's'}</summary>
+          <ul>${(group.members || []).map(member => `<li><code>${escapeHtml(member.path)}</code>${member.versions?.length ? ` <span>(${member.versions.map(escapeHtml).join(', ')})</span>` : ''}${member.linkOnly ? ` <span class="cache-selection-warning">Link only — ${escapeHtml(member.message || 'the weight file remains')}</span>` : ''}</li>`).join('')}</ul>
+        </details>
+        ${group.warning && group.warning !== disabledReason ? `<p class="cache-selection-warning">${escapeHtml(group.warning)}</p>` : ''}
+        <span id="cache-selection-help-${index}" class="cache-selection-readonly">${pending ? 'Deletion is in progress for this group.' : disabledReason ? escapeHtml(disabledReason) : 'Only this group will be removed.'}</span>
+      </article>`;
+    }).join('') : '<p>No GGUF groups were found in this location.</p>';
+    const snapshotFiles = Array.isArray(context.snapshotFiles) ? context.snapshotFiles : [];
+    const otherFiles = snapshotFiles.filter(file => !/\.gguf$/i.test(file?.name || ''));
+    const otherFilesHtml = !hasGroups || !otherFiles.length ? '' : `<details class="cache-selection-other"><summary>Other files (${otherFiles.length})</summary><p class="cache-selection-readonly">Config, tokenizer, and other non-GGUF files from the opening snapshot.</p><ul>${otherFiles.map(file => `<li>${file.isLfs ? '<span class="lfs-badge">LFS</span> ' : ''}<code>${escapeHtml(file.name)}</code>${file.sizeHuman ? ` <span>${escapeHtml(file.sizeHuman)}</span>` : ''}</li>`).join('')}</ul></details>`;
+    const host = $('#modalBody');
+    if (!host || !cacheDetailsContextIsCurrent(context)) return;
+    let section = $('#cacheSelectionSection');
+    if (!section) {
+      const cacheDetailHost = host.querySelector('.cache-detail-modal') || host;
+      const cacheDetailAnchor = cacheDetailHost.querySelector?.('.cache-detail-stats') || cacheDetailHost.querySelector?.('.cache-detail-header');
+      if (cacheDetailAnchor) cacheDetailAnchor.insertAdjacentHTML('afterend', '<section id="cacheSelectionSection" class="cache-detail-section"></section>');
+      else cacheDetailHost.insertAdjacentHTML('afterbegin', '<section id="cacheSelectionSection" class="cache-detail-section"></section>');
+      section = $('#cacheSelectionSection');
+    }
+    section.innerHTML = `
+      <div class="cache-selection-sticky">
+        <h4>GGUF groups</h4>
+        ${locations.length ? `<label for="cacheSelectionLocation">Storage location</label><select id="cacheSelectionLocation"${location ? ` title="${escapeCacheDetailAttribute(location.path)}"` : ''}>${selectedLocationID && !location ? '<option value="-1" selected>Choose a currently available location</option>' : ''}${options}</select>` : '<p>No selectable model locations are available.</p>'}
+        ${location?.warning ? `<p class="cache-selection-warning">${escapeHtml(location.warning)}</p>` : ''}
+      </div>
+      <div class="cache-detail-scroll" tabindex="0" aria-label="Repository files and metadata">
+      ${outcomeHTML}
+      ${selectedLocationID && !location ? '<p class="cache-selection-warning">The previously selected location is no longer available. No other location was selected automatically.</p>' : ''}
+      ${location ? `<div class="cache-selection-groups">${groupRows}</div>` : ''}
+      ${hasGroups ? otherFilesHtml : context.filesHTML || ''}
+      ${context.metadataHTML || ''}
+      </div>`;
+    context.selection = selection;
+    context.selectedLocationID = selectedLocationID;
+    section.querySelectorAll('.cache-selection-delete').forEach(button => button.addEventListener('click', () => {
+      const group = groups[Number(button.dataset.deleteGroupIndex)];
+      if (!group || !location || location.canDelete !== true || group.canDelete !== true || !cacheDetailsContextIsCurrent(context)) return;
+      const deleteKey = selectedCacheDeleteKey(repo, location.id, group.id);
+      if (pendingSelectedCacheDeletes.has(deleteKey)) return;
+      openSelectedCacheDeleteConfirmation({
+        context,
+        detailsHTML: $('#modalBody').innerHTML,
+        repo,
+        location: { id: location.id, source: location.source, path: location.path },
+        group: {
+          id: group.id,
+          label: group.label,
+          kind: group.kind,
+          hasSavedVersions: (group.members || []).some(member => member.versions?.length > 0),
+          members: (group.members || []).map(member => ({
+            path: member.path,
+            versions: [...(member.versions || [])],
+            size: member.size,
+            linkOnly: member.linkOnly === true,
+            message: member.message || ''
+          }))
+        }
+      });
+    }));
+    const select = $('#cacheSelectionLocation');
+    if (select) select.addEventListener('change', async () => {
+      const selectedIndex = Number(select.value);
+      const nextLocation = locations[selectedIndex];
+      if (!Number.isInteger(selectedIndex) || !nextLocation || !cacheDetailsContextIsCurrent(context)) return;
+      context.selectedLocationID = nextLocation.id;
+      select.disabled = true;
+      section.innerHTML = `<div class="cache-selection-sticky"><h4>GGUF groups</h4><p>Loading groups from ${escapeHtml(nextLocation.source)} location: <code>${escapeHtml(nextLocation.path)}</code></p></div><div class="cache-detail-scroll" aria-busy="true"></div>`;
+      const query = `/cache-selection?repo=${encodeURIComponent(repo)}&type=model&locationId=${encodeURIComponent(nextLocation.id)}`;
+      try {
+        const updated = await api('GET', query);
+        if (!cacheDetailsContextIsCurrent(context)) return;
+        const freshLocation = updated.locations?.find(item => item.id === nextLocation.id);
+        const refreshed = { ...selection, locations: locations.map(item => item.id === nextLocation.id && freshLocation ? freshLocation : item) };
+        renderCacheSelection(refreshed, nextLocation.id, context, outcomeHTML);
+      } catch (error) {
+        if (cacheDetailsContextIsCurrent(context)) {
+          const warning = $('#cacheSelectionSection');
+          if (warning) warning.innerHTML = `<div class="cache-selection-sticky"><h4>GGUF groups</h4></div><div class="cache-detail-scroll" tabindex="0" aria-label="Repository files and metadata"><p class="cache-selection-warning">Unable to load groups from ${escapeHtml(nextLocation.source)} location <code>${escapeHtml(nextLocation.path)}</code>: ${escapeHtml(error.message)}</p>${context.filesHTML || ''}${context.metadataHTML || ''}</div>`;
+        }
+      }
+    });
+  }
+
+  function openSelectedCacheDeleteConfirmation(context) {
+    if (!cacheDetailsContextIsCurrent(context.context)) return;
+    const { context: detailsContext, repo, location, group } = context;
+    const sequence = ++cacheDeleteConfirmationSequence;
+    const confirmationID = `cache-delete-confirm-${sequence}`;
+    const members = group.members.map(member => Object.freeze({
+      path: member.path,
+      versions: Object.freeze([...member.versions]),
+      size: member.size,
+      linkOnly: member.linkOnly,
+      message: member.message
+    }));
+    const versioned = members.some(member => member.versions.length > 0);
+    const filesByPath = new Map();
+    for (const member of members) {
+      let entry = filesByPath.get(member.path);
+      if (!entry) {
+        entry = { path: member.path, versions: new Set(), linkOnly: false };
+        filesByPath.set(member.path, entry);
+      }
+      member.versions.forEach(version => entry.versions.add(version));
+      entry.linkOnly = entry.linkOnly || member.linkOnly;
+    }
+    const fileEntries = Array.from(filesByPath.values());
+    const savedVersionCount = new Set(members.flatMap(member => member.versions)).size;
+    const linkOnly = members.some(member => member.linkOnly);
+    const files = fileEntries.map(entry => `<li><code>${escapeHtml(entry.path)}</code>${entry.versions.size ? `<span> — Saved versions (${entry.versions.size}): ${Array.from(entry.versions).map(escapeHtml).join(', ')}</span>` : ''}${entry.linkOnly ? '<strong> — Link only: this removes the link; the weight file remains.</strong>' : ''}</li>`).join('');
+    // A vision encoder is a companion artifact, not a model quantization, so
+    // the confirmation names its role and never claims the selected artifact
+    // class remains.
+    const isVisionEncoder = group.kind === 'vision_encoder';
+    // The dialog strings name the artifact role. The LLM wording is unchanged.
+    const confirmationTitle = isVisionEncoder ? 'Confirm vision encoder deletion' : 'Confirm GGUF group deletion';
+    const confirmButtonLabel = isVisionEncoder ? 'Delete selected vision encoder files' : 'Delete selected GGUF files';
+    const progressLabel = isVisionEncoder ? 'Deleting the selected vision encoder…' : 'Deleting the selected GGUF group…';
+    const groupLine = isVisionEncoder
+      ? `Vision encoder (mmproj companion): <strong>${escapeHtml(group.label)}</strong>`
+      : `GGUF group: <strong>${escapeHtml(group.label)}</strong>`;
+    const llmScopeStatement = versioned
+      ? 'This removes this GGUF group from all saved versions in this selected location. Other groups and other locations remain.'
+      : 'This removes only the selected GGUF group members. Other variants, companion files, metadata, directories, and other locations remain.';
+    const visionEncoderScopeStatement = versioned
+      ? 'This removes the selected vision encoder companion from all saved versions in this selected location. Other groups and other locations remain.'
+      : 'This removes only the selected vision encoder companion files. Other quantization groups, other companion files, metadata, directories, and other locations remain.';
+    const scopeStatement = isVisionEncoder ? visionEncoderScopeStatement : llmScopeStatement;
+    showModal(confirmationTitle, `
+      <div id="${confirmationID}" class="delete-confirm cache-selection-confirmation">
+        <p>Repository: <strong>${escapeHtml(repo)}</strong></p>
+        <p>Type: <strong>Model</strong></p>
+        <p>Storage location: <strong>${escapeHtml(location.source)}</strong><br><code>${escapeHtml(location.path)}</code></p>
+        <p>${groupLine}</p>
+        <p>${scopeStatement}</p>
+        ${linkOnly ? '<p class="cache-selection-warning">This group includes link-only entries. Removing a link does not remove its weight target.</p>' : ''}
+        <details open><summary>Files included (${fileEntries.length} distinct paths${versioned ? ` · ${savedVersionCount} saved versions` : ''})</summary><ul>${files}</ul></details>
+        <p id="cache-delete-progress" role="status"></p>
+        <div class="form-actions">
+          <button id="cache-delete-cancel-${sequence}" class="btn btn-ghost" type="button">Cancel</button>
+          <button id="cache-delete-confirm-button-${sequence}" class="btn btn-danger" type="button">${confirmButtonLabel}</button>
+        </div>
+      </div>`);
+    // The title is captured here so the guard keeps an exact comparison
+    // against the title this confirmation actually used, whatever role the
+    // selected group has.
+    const isCurrent = () => detailsContext === activeCacheDetailsContext
+      && detailsContext.requestID === cacheDetailsRequest
+      && $('#modalBackdrop')?.classList.contains('active')
+      && $('#modalTitle')?.textContent === confirmationTitle
+      && document.querySelector(`#${confirmationID}`);
+    $(`#cache-delete-cancel-${sequence}`)?.addEventListener('click', () => {
+      if (isCurrent()) return window.showCacheDetails(repo, 'model', location.id);
+    });
+    $(`#cache-delete-confirm-button-${sequence}`)?.addEventListener('click', async () => {
+      if (!isCurrent()) return;
+      const deleteKey = selectedCacheDeleteKey(repo, location.id, group.id);
+      if (pendingSelectedCacheDeletes.has(deleteKey)) return;
+      pendingSelectedCacheDeletes.add(deleteKey);
+      const confirmButton = $(`#cache-delete-confirm-button-${sequence}`);
+      const cancelButton = $(`#cache-delete-cancel-${sequence}`);
+      if (confirmButton) confirmButton.disabled = true;
+      if (cancelButton) cancelButton.disabled = true;
+      const progress = $('#cache-delete-progress');
+      if (progress) progress.textContent = progressLabel;
+      const requestBody = {
+        repo,
+        type: 'model',
+        locationId: location.id,
+        groupId: group.id,
+        members: members.map(member => ({ ...member, versions: [...member.versions] }))
+      };
+      await submitSelectedCacheDelete({
+        detailsContext,
+        detailsHTML: context.detailsHTML,
+        repo,
+        location,
+        group,
+        deleteKey,
+        requestBody,
+        isCurrent
+      });
+    });
+  }
+
+  // Outcome headings name the artifact role of the selected group. The LLM
+  // wording is unchanged.
+  const cacheDeleteOutcomeHeadings = {
+    llm: {
+      retained: 'Selected GGUF group entries removed; shared payloads were retained.',
+      success: 'Selected GGUF group removed.',
+      partial: 'Partial result while removing the selected GGUF group.',
+      error: 'The selected GGUF group was not confirmed as removed.'
+    },
+    vision_encoder: {
+      retained: 'Selected vision encoder entries removed; shared payloads were retained.',
+      success: 'Selected vision encoder removed.',
+      partial: 'Partial result while removing the selected vision encoder.',
+      error: 'The selected vision encoder was not confirmed as removed.'
+    }
+  };
+
+  function selectedCacheDeleteOutcomeHTML(outcome, context) {
+    const retainedPayloads = outcome.retainedPayloads || [];
+    const headings = context.group.kind === 'vision_encoder'
+      ? cacheDeleteOutcomeHeadings.vision_encoder
+      : cacheDeleteOutcomeHeadings.llm;
+    const title = outcome.kind === 'success' && retainedPayloads.length
+      ? headings.retained
+      : outcome.kind === 'success' ? headings.success
+      : outcome.kind === 'partial' ? headings.partial
+        : headings.error;
+    return `<div class="cache-selection-outcome ${outcome.kind === 'success' ? '' : 'cache-selection-warning'}" role="status">
+      <h4>${title}</h4>
+      <p>Repository ${escapeHtml(context.repo)} — ${escapeHtml(context.location.source)} location <code>${escapeHtml(context.location.path)}</code> — group ${escapeHtml(context.group.label)}.</p>
+      ${outcome.message ? `<p>${escapeHtml(outcome.message)}</p>` : ''}
+      ${outcome.removed?.length ? `<p>${context.group.hasSavedVersions ? 'Removed snapshot/link entries:' : 'Removed:'}</p><ul>${outcome.removed.map(path => `<li><code>${escapeHtml(path)}</code></li>`).join('')}</ul>` : ''}
+      ${outcome.remaining?.length ? `<p>Remaining:</p><ul>${outcome.remaining.map(path => `<li><code>${escapeHtml(path)}</code></li>`).join('')}</ul>` : ''}
+      ${outcome.errors?.length ? `<p>Errors:</p><ul>${outcome.errors.map(error => `<li>${escapeHtml(error)}</li>`).join('')}</ul>` : ''}
+      ${outcome.linkOnlyEntries?.length ? `<p>Links removed; weight targets remain:</p><ul>${outcome.linkOnlyEntries.map(path => `<li><code>${escapeHtml(path)}</code></li>`).join('')}</ul>` : ''}
+      ${retainedPayloads.length ? `<p>Shared weight payloads retained because other saved entries still reference them. No freed-space amount is implied.</p><ul>${retainedPayloads.map(path => `<li><code>${escapeHtml(path)}</code></li>`).join('')}</ul>` : ''}
+    </div>`;
+  }
+
+  function insertCacheDetailsFreshnessNotice() {
+    ($('#modalBody .cache-detail-scroll') || $('#cacheSelectionSection'))?.insertAdjacentHTML('afterbegin', '<p class="cache-selection-readonly">The repository totals and general file list are the snapshot from when Details opened; GGUF groups were refreshed for the selected locations.</p>');
+  }
+
+  async function submitSelectedCacheDelete(context) {
+    let outcome;
+    try {
+      const result = await api('DELETE', '/cache-selection', context.requestBody);
+      if (result?.repo !== context.repo || result?.groupId !== context.group.id
+        || typeof result.ok !== 'boolean' || !Array.isArray(result.removed) || !Array.isArray(result.remaining)) {
+        throw new Error('The server returned an unexpected result; refresh the selection to verify current files.');
+      }
+      outcome = {
+        kind: result.ok ? 'success' : 'partial',
+        message: result.message || '',
+        removed: result.removed,
+        remaining: result.remaining,
+        errors: result.errors || [],
+        linkOnlyEntries: result.linkOnlyEntries || [],
+        retainedPayloads: result.retainedPayloads || []
+      };
+    } catch (error) {
+      const details = typeof error.details === 'string' ? error.details.trim() : '';
+      const reason = details && details !== error.message
+        ? `${error.message}: ${details}`
+        : error.message;
+      outcome = {
+        kind: 'error',
+        message: `Could not confirm deletion for ${context.group.label} in ${context.location.path}: ${reason}. Refreshing current selection; no fallback deletion was attempted.`
+      };
+    }
+
+    pendingSelectedCacheDeletes.delete(context.deleteKey);
+    await loadCache();
+    if (!context.isCurrent()) {
+      const active = activeCacheDetailsContext;
+      if (active?.repo === context.repo && active.type === 'model' && cacheDetailsModalIsCurrent()) {
+        await window.showCacheDetails(active.repo, 'model', active.selectedLocationID || '');
+      }
+      return;
+    }
+
+    const notice = selectedCacheDeleteOutcomeHTML(outcome, context);
+    try {
+      const freshSelection = await api('GET', `/cache-selection?repo=${encodeURIComponent(context.repo)}&type=model`);
+      if (!context.isCurrent()) return;
+      $('#modalTitle').textContent = 'Repository Details';
+      setModalContent(context.detailsHTML);
+      renderCacheSelection(freshSelection, context.location.id, context.detailsContext, notice);
+      insertCacheDetailsFreshnessNotice();
+    } catch (error) {
+      if (!context.isCurrent()) return;
+      $('#modalTitle').textContent = 'Repository Details';
+      setModalContent(context.detailsHTML);
+      const section = $('#cacheSelectionSection');
+      if (section) section.innerHTML = `<div class="cache-selection-sticky"><h4>GGUF groups</h4></div><div class="cache-detail-scroll" tabindex="0" aria-label="Repository files and metadata">${notice}<p class="cache-selection-warning">Unable to refresh GGUF locations: ${escapeHtml(error.message)}. Close and reopen Details before another delete.</p>${context.detailsContext.filesHTML || ''}${context.detailsContext.metadataHTML || ''}</div>`;
+      insertCacheDetailsFreshnessNotice();
+    }
+  }
+
+  // Rebuild cache (regenerate friendly view symlinks)
+  async function rebuildCache() {
+    const btn = $('#rebuildCacheBtn');
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `
+        <div class="spinner" style="width: 18px; height: 18px;"></div>
+        Rebuilding...
+      `;
+    }
+
+    try {
+      const result = await api('POST', '/cache/rebuild', { clean: true });
+
+      // Show result modal
+      showModal('Rebuild Complete', `
+        <div class="rebuild-result">
+          <div class="rebuild-success">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="48" height="48">
+              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+              <polyline points="22 4 12 14.01 9 11.01"/>
+            </svg>
+          </div>
+          <p class="rebuild-message">${escapeHtml(result.message)}</p>
+          <div class="rebuild-stats">
+            <div class="rebuild-stat">
+              <span class="rebuild-stat-value">${result.reposScanned}</span>
+              <span class="rebuild-stat-label">Repos Scanned</span>
+            </div>
+            <div class="rebuild-stat">
+              <span class="rebuild-stat-value">${result.symlinksCreated}</span>
+              <span class="rebuild-stat-label">Links Created</span>
+            </div>
+            <div class="rebuild-stat">
+              <span class="rebuild-stat-value">${result.symlinksUpdated}</span>
+              <span class="rebuild-stat-label">Links Updated</span>
+            </div>
+            <div class="rebuild-stat">
+              <span class="rebuild-stat-value">${result.orphansRemoved || 0}</span>
+              <span class="rebuild-stat-label">Orphans Removed</span>
+            </div>
+          </div>
+          ${result.errors?.length > 0 ? `
+            <div class="rebuild-errors">
+              <h5>Errors:</h5>
+              <ul>${result.errors.map(e => `<li>${escapeHtml(e)}</li>`).join('')}</ul>
+            </div>
+          ` : ''}
+          <div class="form-actions" style="margin-top: 20px;">
+            <button class="btn btn-primary" onclick="hideModal()">Done</button>
+          </div>
+        </div>
+      `);
+
+      // Refresh cache list
+      loadCache();
+    } catch (e) {
+      showToast(`Rebuild failed: ${e.message}`, 'error');
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = `
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+            <path d="M19.73 14.87A8 8 0 1 1 12 4"/>
+            <path d="M12 4V1l4 4-4 4V4"/>
+          </svg>
+          Rebuild
+        `;
+      }
+    }
+  }
+
+  // Delete a cached repo with confirmation
+  window.confirmDeleteCache = function(repo, type) {
+    showModal('Delete from Cache', `
+      <div class="delete-confirm">
+        <div class="delete-warning">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="48" height="48">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+            <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+        </div>
+        <p class="delete-message">Are you sure you want to delete <strong>${escapeHtml(repo)}</strong> from the cache?</p>
+        <p class="delete-note">This will permanently remove all cached files for this ${type}. This action cannot be undone.</p>
+        <div class="form-actions" style="margin-top: 20px;">
+          <button class="btn btn-ghost" onclick="hideModal()">Cancel</button>
+          <button class="btn btn-danger" onclick="deleteCache('${escapeHtml(repo)}', '${escapeHtml(type)}')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+              <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            </svg>
+            Delete
+          </button>
+        </div>
+      </div>
+    `);
+  };
+
+  // Actually delete the cache
+  window.deleteCache = async function(repo, type) {
+    try {
+      const result = await api('DELETE', `/cache/${repo}?type=${type}`);
+      hideModal();
+      // The server can answer HTTP 200 with a structured partial-failure
+      // result: the Hub repository was removed but the friendly view could not
+      // be. Never claim a full deletion in that case; surface a concise reason
+      // from the reported errors and still refresh the list.
+      const errors = result && Array.isArray(result.errors) ? result.errors.filter(Boolean) : [];
+      const partial = (result && result.success === false) || errors.length > 0;
+      if (partial) {
+        const detail = errors.length ? `: ${String(errors[0]).slice(0, 200)}` : '';
+        const message = result && result.message
+          ? `${result.message}${detail}`
+          : `Cache entry for ${repo} was only partially removed${detail}`;
+        showToast(message, 'error');
+      } else {
+        showToast(`Deleted ${repo} from cache`, 'success');
+      }
+      loadCache(); // Refresh the list either way
+    } catch (e) {
+      showToast(`Failed to delete: ${e.message}`, 'error');
+    }
+  };
+
+  function initCachePage() {
+    // Refresh button
+    $('#refreshCacheBtn')?.addEventListener('click', loadCache);
+
+    // Rebuild button
+    $('#rebuildCacheBtn')?.addEventListener('click', rebuildCache);
+
+    // Search
+    const searchInput = $('#cacheSearch');
+    if (searchInput) {
+      let searchTimeout;
+      searchInput.addEventListener('input', () => {
+        clearTimeout(searchTimeout);
+        searchTimeout = setTimeout(() => {
+          cacheSearch = searchInput.value.trim();
+          renderCacheList();
+        }, 200);
+      });
+    }
+
+    // Filter buttons
+    $$('.cache-filters .filter-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        $$('.cache-filters .filter-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        cacheFilter = btn.dataset.filter;
+        renderCacheList();
+      });
+    });
+
+    // Sort dropdown
+    const sortSelect = $('#cacheSort');
+    if (sortSelect) {
+      sortSelect.addEventListener('change', () => {
+        cacheSort = sortSelect.value;
+        renderCacheList();
+      });
+    }
+
+    // View toggle
+    $$('.cache-view-toggle .view-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        $$('.cache-view-toggle .view-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        cacheView = btn.dataset.view;
+        renderCacheList();
+      });
+    });
+  }
+
+  // =========================================
+  // Settings Page
+  // =========================================
+
+  // The Max speed control is shown in megabits per second, but the backend
+  // stores a byte-rate string ("250KB"). These helpers convert between the two.
+  // 1 Mbit/s = 125000 bytes/s = 125 KB (decimal KB matches the server parser).
+  function parseHumanBytes(s) {
+    if (!s) return 0;
+    const m = String(s).trim().match(/^([\d.]+)\s*([KMGT]?i?B)?$/i);
+    if (!m) return 0;
+    const n = parseFloat(m[1]);
+    if (!isFinite(n)) return 0;
+    const u = (m[2] || 'B').toUpperCase();
+    const map = { B: 1, KB: 1e3, MB: 1e6, GB: 1e9, TB: 1e12,
+                  KIB: 1024, MIB: 1048576, GIB: 1073741824, TIB: 1099511627776 };
+    return n * (map[u] || 1);
+  }
+
+  function maxSpeedToMbit(s) {
+    const b = parseHumanBytes(s);
+    if (!b) return '';
+    return String(Math.round((b * 8 / 1e6) * 100) / 100); // 2 decimals
+  }
+
+  function mbitToMaxSpeedStr(mbit) {
+    const v = parseFloat(mbit);
+    if (!isFinite(v) || v <= 0) return ''; // empty = unlimited
+    // Floor at 1 KB/s so a positive Mbit value (e.g. 0.003) never rounds down
+    // to 0 KB on the wire — 0 KB is parsed by the server as "unlimited" and
+    // would silently disable the cap the user just set.
+    return Math.max(1, Math.round(v * 125)) + 'KB';
+  }
+
+  function syncPresetGroup(presetsSel, fieldSel) {
+    const raw = ($(fieldSel)?.value ?? '').toString().trim();
+    const v = raw === '' ? 0 : parseFloat(raw);
+    $$(presetsSel + ' .speed-btn').forEach(b => {
+      const pv = parseFloat(b.dataset.mbit);
+      b.classList.toggle('active', !isNaN(v) && pv === v);
+    });
+  }
+
+  function syncSpeedPresets() {
+    syncPresetGroup('#speedPresets', '#maxSpeed');
+  }
+
+  function bindSpeedPresets() {
+    const presets = document.getElementById('speedPresets');
+    if (!presets || presets.dataset.bound) return;
+    presets.dataset.bound = '1';
+    presets.querySelectorAll('.speed-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const mbit = parseFloat(btn.dataset.mbit) || 0;
+        $('#maxSpeed').value = mbit > 0 ? String(mbit) : '';
+        syncSpeedPresets();
+      });
+    });
+    const field = $('#maxSpeed');
+    if (field) field.addEventListener('input', syncSpeedPresets);
+  }
+
+  // updateSpeedGauge aggregates the speed of all running jobs and renders
+  // the current speed in the speed bar. Called from renderJobs and after
+  // any speed-limit change so the display always reflects live state.
+  function updateSpeedGauge() {
+    const gaugeText = document.getElementById('speedGaugeText');
+    if (!gaugeText) return;
+    if (!state.speedLimitLoaded) return;
+
+    // Sum bytesPerSecond from all running jobs
+    let totalBps = 0;
+    for (const job of state.jobs.values()) {
+      if (job.status === 'running') {
+        totalBps += (job.progress && job.progress.bytesPerSecond) || 0;
+      }
+    }
+
+    // Convert to Mbit/s (1 Mbit/s = 125000 bytes/s)
+    const totalMbit = totalBps / 125000;
+
+    // Get current limit from the field
+    const field = document.getElementById('maxSpeedJobs');
+    const limitMbit = field ? (parseFloat(field.value) || 0) : 0;
+
+    if (limitMbit > 0) {
+      gaugeText.textContent = totalMbit.toFixed(1) + ' / ' + limitMbit.toFixed(1) + ' Mbit/s';
+    } else {
+      gaugeText.textContent = totalMbit.toFixed(1) + ' Mbit/s';
+    }
+  }
+
+  // Downloads-tab speed cap: same presets, but applied live. Saving posts to
+  // /api/settings, which calls JobManager.UpdateConfig -> RateLimiter.SetLimit,
+  // so the new cap takes effect on in-flight downloads without a restart.
+  function bindJobsSpeed() {
+    const presets = document.getElementById('speedPresetsJobs');
+    if (!presets || presets.dataset.bound) return;
+    presets.dataset.bound = '1';
+    const apply = () => {
+      syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
+      applySpeedLimitLive($('#maxSpeedJobs')?.value);
+    };
+    presets.querySelectorAll('.speed-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const mbit = parseFloat(btn.dataset.mbit) || 0;
+        $('#maxSpeedJobs').value = mbit > 0 ? String(mbit) : '';
+        apply();
+      });
+    });
+    const field = $('#maxSpeedJobs');
+    if (field) {
+      field.addEventListener('input', () => { syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs'); updateSpeedGauge(); });
+      field.addEventListener('change', apply);
+    }
+  }
+
+  // applySpeedLimitLive pushes a new cap to the server immediately and mirrors
+  // the value into both speed controls so Settings and Downloads stay in sync.
+  async function applySpeedLimitLive(mbitVal) {
+    const v = parseFloat(mbitVal);
+    const mbitStr = isFinite(v) && v > 0 ? String(v) : '';
+    const maxSpeed = mbitToMaxSpeedStr(mbitVal);
+    try {
+      await api('POST', '/settings', { maxSpeed });
+      showToast(maxSpeed ? `Speed limit: ${mbitStr} Mbit/s` : 'Speed limit: unlimited', 'success');
+    } catch (e) {
+      showToast(`Failed to set speed: ${e.message}`, 'error');
+      // Revert both controls to server state so UI doesn't drift
+      try {
+        const data = await api('GET', '/settings');
+        const mbit = maxSpeedToMbit(data.maxSpeed);
+        if ($('#maxSpeed')) $('#maxSpeed').value = mbit;
+        if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = mbit;
+        syncPresetGroup('#speedPresets', '#maxSpeed');
+        syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
+        state.speedLimitLoaded = true;
+        updateSpeedGauge();
+      } catch (_) {
+        /* resync best-effort */
+        // Even if the revert GET fails, ensure the gauge is not stuck.
+        state.speedLimitLoaded = true;
+        updateSpeedGauge();
+      }
+      return;
+    }
+    state.speedLimitLoaded = true;
+    if ($('#maxSpeed')) $('#maxSpeed').value = mbitStr;
+    if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = mbitStr;
+    syncPresetGroup('#speedPresets', '#maxSpeed');
+    syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
+    updateSpeedGauge();
+  }
+
+  // loadSpeedCap fetches the current cap and fills the Downloads-tab control.
+  // Sets state.speedLimitLoaded regardless of fetch success so the gauge
+  // doesn't get stuck if settings are temporarily unreachable.
+  async function loadSpeedCap() {
+    try {
+      const data = await api('GET', '/settings');
+      const mbit = maxSpeedToMbit(data.maxSpeed);
+      if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = mbit;
+      syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
+    } catch (e) { /* non-fatal */ }
+    state.speedLimitLoaded = true;
+    updateSpeedGauge();
+  }
+
+  let settingsTokenBaseline = '';
+  let settingsTokenReset = false;
+
+  function setSettingsTokenDisplay(value) {
+    settingsTokenBaseline = value || '';
+    settingsTokenReset = false;
+    $('#hfToken').value = settingsTokenBaseline;
+  }
+
+  async function loadSettings() {
+    let data;
+    try {
+      data = await api('GET', '/settings');
+    } catch (e) {
+      // Only a failed metadata fetch is a hard failure. It gates saving so a
+      // broken load cannot POST empty/unknown values over stored preferences.
+      console.error('Failed to load settings:', e);
+      state.settingsLoadFailed = true;
+      renderHubDirField(null);
+      const hint = $('#hubDirHint');
+      if (hint) {
+        hint.textContent = 'Could not load storage settings from the server. Reload the page before saving.';
+        hint.classList.add('form-hint-error');
+      }
+      return;
+    }
+    state.settings = data;
+    state.settingsLoadFailed = false;
+    rememberSettingsEndpoint(data);
+    // Settings are authoritative for the configured endpoint, so refresh the
+    // Model Details Hub action when they (re)load after a repository was
+    // already selected.
+    syncSelectedModelHeader();
+
+    // Populating the form is separated from the fetch: a partially missing DOM
+    // must not be treated as an unknown server state that blocks saving.
+    try {
+      // The visible Hub destination is server output (effectiveHubDir), never
+      // the editable preference. configuredCacheDir is the raw, possibly-empty
+      // app preference and is the only value that must round-trip on save.
+      // It may be empty by design, so presence must be tested by key, not by
+      // truthiness. Older servers omit it; fall back to the legacy effective
+      // cacheDir for display and never auto-submit that fallback as a clear.
+      const cacheDirInput = $('#cacheDirInput');
+      const hasRaw = Object.prototype.hasOwnProperty.call(data, 'configuredCacheDir');
+      state.rawCacheDirAvailable = hasRaw;
+      const initialCacheDir = (hasRaw ? data.configuredCacheDir : data.cacheDir) || '';
+      state.loadedCacheDir = initialCacheDir;
+      if (cacheDirInput) {
+        cacheDirInput.value = initialCacheDir;
+      }
+      renderHubDirField(data);
+      const localScanDirs = $('#localScanDirs');
+      if (localScanDirs) {
+        localScanDirs.value = (data.localScanDirs || []).join('\n');
+      }
+      const localDirInput = $('#localDirInput');
+      if (localDirInput) {
+        localDirInput.value = data.localDir || '';
+      }
+      const downloadLayout = $('#downloadLayout');
+      if (downloadLayout) {
+        downloadLayout.value = data.storageMode === 'local' ? 'local' : 'cache';
+      }
+      // Populate the labeled type-folder fields from the keyed route map. The
+      // label<->key mapping lives only in ROUTE_LABELS; the user never sees a
+      // raw key.
+      const routes = data.downloadRoutes || {};
+      ROUTE_LABELS.forEach(r => {
+        const el = $(`#${r.fieldId}`);
+        if (el) el.value = routes[r.key] || '';
+      });
+      syncStorageFields();
+
+      // Display config file paths
+      const configPathEl = $('#settingsConfigPath');
+      if (configPathEl && data.configFile) {
+        const fileName = path => String(path || '').split(/[\\/]/).pop() || path;
+        const escapeAttr = value => escapeHtml(value).replace(/"/g, '&quot;');
+        configPathEl.innerHTML = `<span class="config-chip" title="${escapeAttr(data.configFile)}">Config: <code>${escapeHtml(fileName(data.configFile))}</code></span>`;
+        if (data.targetsFile) {
+          configPathEl.innerHTML += `<span class="config-chip" title="${escapeAttr(data.targetsFile)}">Targets: <code>${escapeHtml(fileName(data.targetsFile))}</code></span>`;
+        }
+      }
+
+      setSettingsTokenDisplay(data.token);
+      $('#connections').value = data.connections ?? 8;
+      $('#maxActive').value = data.maxActive ?? 3;
+      $('#maxSpeed').value = maxSpeedToMbit(data.maxSpeed);
+      bindSpeedPresets();
+      syncSpeedPresets();
+      if ($('#maxSpeedJobs')) $('#maxSpeedJobs').value = maxSpeedToMbit(data.maxSpeed);
+      syncPresetGroup('#speedPresetsJobs', '#maxSpeedJobs');
+      $('#retries').value = data.retries ?? 4;
+      $('#verify').value = data.verify || 'size';
+      $('#endpoint').value = data.endpoint || '';
+
+      // Load proxy settings
+      if (data.proxy) {
+        $('#proxyUrl').value = data.proxy.url || '';
+        $('#proxyUsername').value = data.proxy.username || '';
+        $('#proxyPassword').value = ''; // Never show saved password
+        $('#proxyNoProxy').value = data.proxy.noProxy || '';
+        $('#proxyNoEnvProxy').checked = data.proxy.noEnvProxy || false;
+      } else {
+        $('#proxyUrl').value = '';
+        $('#proxyUsername').value = '';
+        $('#proxyPassword').value = '';
+        $('#proxyNoProxy').value = '';
+        $('#proxyNoEnvProxy').checked = false;
+      }
+    } catch (e) {
+      // Dom population problems are reported but must not block an otherwise
+      // successful metadata load from being saveable.
+      console.error('Failed to populate settings form:', e);
+    }
+  }
+
+  // renderHubDirField shows the server's actual Hub destination as read-only
+  // output. The raw app preference never appears here, and the Hub path is
+  // never submitted: changing the friendly cache folder does not move Hub
+  // files, and the actual destination is set by the server environment.
+  function renderHubDirField(data) {
+    const input = $('#effectiveHubDirInput');
+    const hint = $('#hubDirHint');
+    if (!input) return;
+
+    const known = data && typeof data.effectiveHubDir === 'string' && data.effectiveHubDir !== '';
+    input.value = known ? data.effectiveHubDir : '';
+    input.title = known ? data.effectiveHubDir : '';
+
+    if (!hint) return;
+    hint.classList.remove('form-hint-error');
+    if (!known) {
+      // Older server (or load failure): no effectiveHubDir metadata. Show a
+      // neutral note; do not invent a source or precedence.
+      hint.textContent = 'Hub cache path is not reported by this server.';
+      return;
+    }
+    let text;
+    if (data.hubDirSource === 'HF_HUB_CACHE') {
+      text = 'Controlled by HF_HUB_CACHE in the server environment; change or remove that launch variable and restart to move it.';
+    } else if (data.hubDirSource === 'cacheDir') {
+      text = 'Derived from the friendly cache folder above; each repo lives under its "hub" subfolder.';
+    } else if (data.hubDirSource === 'HF_HOME') {
+      text = 'Derived from HF_HOME in the server environment; each repo lives under its "hub" subfolder.';
+    } else {
+      text = 'Default location; each repo lives under its "hub" subfolder.';
+    }
+    // Local mode redirects ordinary downloads to a flat local folder; say so
+    // rather than implying routed/local downloads land in the Hub path.
+    if (data.storageMode === 'local') {
+      text += ' Server is in local mode, so downloads write flat files to the local folder instead.';
+    }
+    hint.textContent = text;
+  }
+
+  function initSettingsPage() {
+    $('#saveSettingsBtn')?.addEventListener('click', saveSettings);
+    $('#resetSettingsBtn')?.addEventListener('click', resetSettings);
+    $('#downloadLayout')?.addEventListener('change', syncStorageFields);
+    $('#fillRoutePresetBtn')?.addEventListener('click', fillRoutePreset);
+
+    // Toggle password visibility
+    $$('.toggle-visibility').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const target = btn.dataset.target;
+        const input = $(`#${target}`);
+        if (input) {
+          const isPassword = input.type === 'password';
+          input.type = isPassword ? 'text' : 'password';
+          btn.querySelector('.icon-show').style.display = isPassword ? 'none' : 'block';
+          btn.querySelector('.icon-hide').style.display = isPassword ? 'block' : 'none';
+        }
+      });
+    });
+
+    // Initialize stepper controls
+    initStepperControls();
+  }
+
+  function initStepperControls() {
+    $$('.stepper-control').forEach(control => {
+      const input = control.querySelector('input[type="number"]');
+      const decreaseBtn = control.querySelector('[data-action="decrease"]');
+      const increaseBtn = control.querySelector('[data-action="increase"]');
+
+      if (!input || !decreaseBtn || !increaseBtn) return;
+
+      const parseBound = (val, fallback) => {
+        const n = parseInt(val);
+        return Number.isNaN(n) ? fallback : n;
+      };
+
+      const updateButtons = () => {
+        const val = parseInt(input.value) || 0;
+        const min = parseBound(input.min, -Infinity);
+        const max = parseBound(input.max, Infinity);
+        decreaseBtn.disabled = val <= min;
+        increaseBtn.disabled = val >= max;
+      };
+
+      const clampValue = (value) => {
+        const min = parseBound(input.min, -Infinity);
+        const max = parseBound(input.max, Infinity);
+        return Math.max(min, Math.min(max, value));
+      };
+
+      decreaseBtn.addEventListener('click', () => {
+        const current = parseInt(input.value) || 0;
+        input.value = clampValue(current - 1);
+        updateButtons();
+      });
+
+      increaseBtn.addEventListener('click', () => {
+        const current = parseInt(input.value) || 0;
+        input.value = clampValue(current + 1);
+        updateButtons();
+      });
+
+      input.addEventListener('input', () => {
+        // Allow empty value during typing, clamp on blur
+        if (input.value === '') return;
+        updateButtons();
+      });
+
+      input.addEventListener('blur', () => {
+        if (input.value === '' || Number.isNaN(parseInt(input.value))) {
+          // Restore default if empty/invalid
+          const defaultVal = input.dataset.default || input.min || '0';
+          input.value = defaultVal;
+        } else {
+          // Clamp to bounds on blur
+          const val = parseInt(input.value);
+          input.value = clampValue(val);
+        }
+        updateButtons();
+      });
+
+      // Initialize button states
+      updateButtons();
+    });
+  }
+
+  async function saveSettings() {
+    // Refuse to save only when a load attempt failed; an explicit failure must
+    // not POST empty/unknown values over the stored preference.
+    if (state.settingsLoadFailed) {
+      showToast('Settings are not loaded yet. Reload the page before saving.', 'error');
+      return;
+    }
+    const layout = $('#downloadLayout')?.value || 'cache';
+    const defaultLocalDir = $('#localDirInput')?.value?.trim() || '';
+    if (layout === 'local' && !defaultLocalDir) {
+      showToast('Set a default local download folder first', 'error');
+      return;
+    }
+    const retries = parseInt($('#retries')?.value);
+
+    // Build the route map by merging the labeled fields onto the currently
+    // loaded map. Keys not surfaced by the UI (e.g. "llm") survive a dashboard
+    // save, while a cleared labeled field still removes its route. The server
+    // replaces the map wholesale, so the client must send the merged object.
+    // This is independent of `downloadLayout`: switching to HF cache must not
+    // wipe configured route folders (plan §7.2.1).
+    const downloadRoutes = { ...(state.settings?.downloadRoutes || {}) };
+    ROUTE_LABELS.forEach(r => {
+      const value = $(`#${r.fieldId}`)?.value?.trim() || '';
+      if (value) {
+        downloadRoutes[r.key] = value;
+      } else {
+        delete downloadRoutes[r.key];
+      }
+    });
+
+    const body = {
+      localDir: layout === 'local' ? defaultLocalDir : '',
+      localScanDirs: ($('#localScanDirs')?.value || '')
+        .split(/\r?\n/)
+        .map(v => v.trim())
+        .filter(Boolean),
+      downloadRoutes,
+      connections: parseInt($('#connections')?.value) || 8,
+      maxActive: parseInt($('#maxActive')?.value) || 3,
+      maxSpeed: mbitToMaxSpeedStr($('#maxSpeed')?.value),
+      retries: Number.isNaN(retries) ? 4 : retries,
+      verify: $('#verify')?.value || 'size',
+      endpoint: $('#endpoint')?.value || ''
+    };
+
+    const cacheDirValue = $('#cacheDirInput')?.value?.trim() || '';
+    if (state.rawCacheDirAvailable) {
+      body.cacheDir = cacheDirValue;
+    } else if (cacheDirValue !== (state.loadedCacheDir || '').trim()) {
+      body.cacheDir = cacheDirValue;
+    }
+
+    // The loaded mask is display-only. Only authored changes or Reset carry
+    // token intent; an ordinary Save must preserve active and stored tokens.
+    const token = $('#hfToken')?.value || '';
+    if (settingsTokenReset || token !== settingsTokenBaseline) {
+      body.token = token;
+    }
+
+    // Add proxy settings if URL is provided
+    const proxyUrl = $('#proxyUrl')?.value || '';
+    if (proxyUrl || $('#proxyNoEnvProxy')?.checked) {
+      body.proxy = {
+        url: proxyUrl,
+        username: $('#proxyUsername')?.value || '',
+        noProxy: $('#proxyNoProxy')?.value || '',
+        noEnvProxy: $('#proxyNoEnvProxy')?.checked || false
+      };
+      // Only send password if it was changed (not empty)
+      const proxyPassword = $('#proxyPassword')?.value;
+      if (proxyPassword) {
+        body.proxy.password = proxyPassword;
+      }
+    }
+
+    try {
+      const result = await api('POST', '/settings', body);
+      showToast(result.message || 'Settings saved', 'success');
+      if (Object.prototype.hasOwnProperty.call(body, 'token')) {
+        // Avoid retaining a raw replacement or replaying a clear if the
+        // follow-up GET fails. The server remains the display source of truth.
+        setSettingsTokenDisplay(body.token ? '********' : '');
+      }
+      await loadSettings();
+      // Clear password field after save
+      if ($('#proxyPassword')) {
+        $('#proxyPassword').value = '';
+      }
+    } catch (e) {
+      showToast(`Failed: ${e.message}`, 'error');
+    }
+  }
+
+  function syncStorageFields() {
+    const layout = $('#downloadLayout')?.value || 'cache';
+    const cacheGroup = $('#cacheDirGroup');
+    const localGroup = $('#localDirGroup');
+    if (cacheGroup) {
+      cacheGroup.style.display = layout === 'cache' ? '' : 'none';
+    }
+    if (localGroup) {
+      localGroup.style.display = layout === 'local' ? '' : 'none';
+    }
+    // Type folders are independent of the layout toggle and stay visible.
+  }
+
+  // fillRoutePreset fills the labeled type-folder fields from a single root
+  // path. Form-only: it never creates directories and never saves (plan §2.7).
+  function fillRoutePreset() {
+    const root = $('#routePresetRoot')?.value?.trim() || '';
+    if (!root) {
+      showToast('Enter a preset root folder first', 'info');
+      return;
+    }
+    const sep = root.includes('\\') && !root.includes('/') ? '\\' : '/';
+    const cleanRoot = root.replace(/[\\/]+$/, '');
+    ROUTE_LABELS.forEach(r => {
+      const el = $(`#${r.fieldId}`);
+      if (el) el.value = [cleanRoot, ...r.preset].join(sep);
+    });
+    showToast('Type folders filled — review and save to apply', 'info');
+  }
+
+  function resetSettings() {
+    if (!confirm('Reset all settings to defaults? This clears the saved app preferences and cannot be undone. It does not change server environment paths (such as HF_HUB_CACHE) or move any cached files.')) return;
+
+    const setVal = (id, val) => { const el = $(id); if (el) el.value = val; };
+    const setChecked = (id, checked) => { const el = $(id); if (el) el.checked = checked; };
+
+    // Clears the raw app preference only. The read-only actual Hub cache field
+    // stays as the server reported it until the next settings reload; reset
+    // never claims to unset ENV or relocate cached files.
+    setVal('#cacheDirInput', '');
+    setVal('#localDirInput', '');
+    setVal('#localScanDirs', '');
+    setVal('#downloadLayout', 'cache');
+    ROUTE_LABELS.forEach(r => setVal(`#${r.fieldId}`, ''));
+    // Clear every route key, including keys the dashboard does not surface
+    // (e.g. "llm"). saveSettings merges the labeled fields onto this map, so
+    // starting from an empty map makes the next save send downloadRoutes={}
+    // rather than resurrecting an unsurfaced key from the loaded settings.
+    if (state.settings) state.settings.downloadRoutes = {};
+    setVal('#routePresetRoot', '');
+    setVal('#hfToken', '');
+    settingsTokenReset = true;
+    setVal('#connections', '8');
+    setVal('#maxActive', '3');
+    setVal('#maxSpeed', '');
+    syncSpeedPresets();
+    setVal('#retries', '4');
+    setVal('#verify', 'size');
+    setVal('#endpoint', '');
+    setVal('#proxyUrl', '');
+    setVal('#proxyUsername', '');
+    setVal('#proxyPassword', '');
+    setVal('#proxyNoProxy', '');
+    setChecked('#proxyNoEnvProxy', false);
+    syncStorageFields();
+    showToast('Settings reset to defaults — save to apply', 'info');
+  }
+
+  // =========================================
+  // Mirror Page
+  // =========================================
+
+  let mirrorData = { targets: [], localStats: null, diffResults: null };
+  let diffFilter = 'all';
+  let diffSearch = '';
+
+  function initMirrorPage() {
+    $('#addTargetBtn')?.addEventListener('click', showAddTargetModal);
+    $('#refreshMirrorBtn')?.addEventListener('click', () => loadMirrorTargets());
+    $('#mirrorDiffBtn')?.addEventListener('click', runMirrorDiff);
+    $('#mirrorPushBtn')?.addEventListener('click', () => runMirrorSync('push'));
+    $('#mirrorPullBtn')?.addEventListener('click', () => runMirrorSync('pull'));
+
+    // Diff filter buttons
+    $$('[data-diff-filter]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        $$('[data-diff-filter]').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        diffFilter = btn.dataset.diffFilter;
+        renderDiffResults(mirrorData.diffResults);
+      });
+    });
+
+    // Diff search
+    $('#diffSearch')?.addEventListener('input', (e) => {
+      diffSearch = e.target.value.toLowerCase();
+      renderDiffResults(mirrorData.diffResults);
+    });
+  }
+
+  async function loadMirrorTargets() {
+    const container = $('#targetsList');
+    if (isFilePreview()) {
+      mirrorData.targets = [];
+      renderMirrorTargets(mirrorData.targets);
+      updateTargetSelect(mirrorData.targets);
+      updateMirrorStats(mirrorData.targets);
+      return;
+    }
+
+    if (container) {
+      container.innerHTML = `
+        <div class="loading-state">
+          <div class="spinner"></div>
+          <p>Loading targets...</p>
+        </div>
+      `;
+    }
+
+    try {
+      const result = await api('GET', '/mirror/targets');
+      mirrorData.targets = result.targets || [];
+      renderMirrorTargets(mirrorData.targets);
+      updateTargetSelect(mirrorData.targets);
+      updateMirrorStats(mirrorData.targets);
+
+      // Also load local cache stats
+      try {
+        const cacheResult = await api('GET', '/cache');
+        mirrorData.localStats = cacheResult.stats;
+        updateMirrorStats(mirrorData.targets);
+      } catch (e) {
+        // Ignore cache stats error
+      }
+    } catch (e) {
+      if (container) {
+        container.innerHTML = `
+          <div class="empty-state">
+            <p>Failed to load targets: ${escapeHtml(e.message)}</p>
+          </div>
+        `;
+      }
+    }
+  }
+
+  function updateMirrorStats(targets) {
+    const onlineCount = targets.filter(t => t.exists).length;
+    const totalCount = targets.length;
+
+    $('#statTargets').textContent = totalCount;
+    $('#statOnline').textContent = `${onlineCount}/${totalCount}`;
+
+    // Local cache size
+    if (mirrorData.localStats) {
+      $('#statLocalSize').textContent = mirrorData.localStats.totalSizeHuman || '-';
+    }
+
+    // Sync status
+    const syncStatusEl = $('#statSyncStatus');
+    const syncStatusCard = $('#syncStatusCard');
+    if (mirrorData.diffResults) {
+      const s = mirrorData.diffResults.summary;
+      if (s.inSync) {
+        syncStatusEl.textContent = 'In Sync';
+        syncStatusCard?.classList.remove('out-of-sync');
+        syncStatusCard?.classList.add('in-sync');
+      } else {
+        syncStatusEl.textContent = `${s.missing || 0} pending`;
+        syncStatusCard?.classList.remove('in-sync');
+        syncStatusCard?.classList.add('out-of-sync');
+      }
+    } else {
+      syncStatusEl.textContent = 'Unknown';
+      syncStatusCard?.classList.remove('in-sync', 'out-of-sync');
+    }
+  }
+
+  function renderMirrorTargets(targets) {
+    const container = $('#targetsList');
+    if (!container) return;
+
+    // Build the targets grid with cards
+    let html = '';
+
+    if (!targets || targets.length === 0) {
+      // Empty state as a card
+      html = `
+        <div class="target-card target-card-add" onclick="showAddTargetModal()">
+          <div class="target-card-add-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+          </div>
+          <span class="target-card-add-text">Add your first mirror target</span>
+        </div>
+      `;
+    } else {
+      // Render target cards
+      html = targets.map(t => `
+        <div class="target-card ${t.exists ? 'target-online' : 'target-offline'}">
+          <div class="target-card-header">
+            <div class="target-card-title">
+              <div class="target-card-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                  ${getTargetIcon(t.name)}
+                </svg>
+              </div>
+              <span class="target-card-name">${escapeHtml(t.name)}</span>
+            </div>
+            <div class="target-card-status ${t.exists ? 'online' : 'offline'}">
+              <span class="target-card-status-dot"></span>
+              ${t.exists ? 'Online' : 'Offline'}
+            </div>
+          </div>
+          <div class="target-card-path">${escapeHtml(t.path)}</div>
+          ${t.description ? `<div class="target-card-description">${escapeHtml(t.description)}</div>` : ''}
+          <div class="target-card-footer">
+            <div class="target-card-meta">
+              ${t.repoCount !== undefined ? `
+                <div class="target-card-meta-item">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                    <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                  </svg>
+                  ${t.repoCount} repos
+                </div>
+              ` : ''}
+              ${t.sizeHuman ? `
+                <div class="target-card-meta-item">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                  </svg>
+                  ${t.sizeHuman}
+                </div>
+              ` : ''}
+            </div>
+            <div class="target-card-actions">
+              <button class="btn btn-ghost btn-sm" onclick="event.stopPropagation(); selectTarget('${escapeHtml(t.name)}')" title="Select for sync">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                  <polyline points="9 11 12 14 22 4"/>
+                  <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+                </svg>
+              </button>
+              <button class="btn btn-ghost btn-sm" onclick="event.stopPropagation(); removeTarget('${escapeHtml(t.name)}')" title="Remove target">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                  <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      `).join('');
+
+      // Add the "Add Target" card at the end
+      html += `
+        <div class="target-card target-card-add" onclick="showAddTargetModal()">
+          <div class="target-card-add-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24">
+              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+          </div>
+          <span class="target-card-add-text">Add another target</span>
+        </div>
+      `;
+    }
+
+    container.innerHTML = html;
+  }
+
+  function getTargetIcon(name) {
+    const lowerName = name.toLowerCase();
+    if (lowerName.includes('nas') || lowerName.includes('network')) {
+      return '<rect x="2" y="6" width="20" height="12" rx="2" ry="2"/><line x1="6" y1="10" x2="6" y2="14"/><line x1="10" y1="10" x2="10" y2="14"/>';
+    } else if (lowerName.includes('usb') || lowerName.includes('drive') || lowerName.includes('external')) {
+      return '<rect x="4" y="4" width="16" height="16" rx="2" ry="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="2" x2="9" y2="4"/><line x1="15" y1="2" x2="15" y2="4"/>';
+    } else if (lowerName.includes('office') || lowerName.includes('work') || lowerName.includes('server')) {
+      return '<rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>';
+    } else if (lowerName.includes('cloud') || lowerName.includes('remote')) {
+      return '<path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/>';
+    } else {
+      // Default: sync/mirror icon
+      return '<polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/>';
+    }
+  }
+
+  window.selectTarget = function(name) {
+    const select = $('#syncTarget');
+    if (select) {
+      select.value = name;
+      // Scroll to sync control
+      document.querySelector('.sync-control-panel')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  };
+
+  function updateTargetSelect(targets) {
+    const select = $('#syncTarget');
+    if (!select) return;
+
+    const currentValue = select.value;
+    select.innerHTML = '<option value="">Select a target...</option>';
+
+    targets.forEach(t => {
+      const option = document.createElement('option');
+      option.value = t.name;
+      option.textContent = `${t.name} (${t.path})`;
+      if (!t.exists) option.textContent += ' [offline]';
+      select.appendChild(option);
+    });
+
+    if (currentValue) select.value = currentValue;
+  }
+
+  function showAddTargetModal() {
+    showModal('Add Mirror Target', `
+      <form id="addTargetForm" class="modal-form">
+        <div class="form-group">
+          <label for="targetName">Name</label>
+          <input type="text" id="targetName" placeholder="e.g., office, usb, nas" required>
+          <p class="form-hint">A short name to identify this target</p>
+        </div>
+        <div class="form-group">
+          <label for="targetPath">Path</label>
+          <input type="text" id="targetPath" placeholder="/path/to/hf/cache" required>
+          <p class="form-hint">Absolute path to the HuggingFace cache directory</p>
+        </div>
+        <div class="form-group">
+          <label for="targetDescription">Description (optional)</label>
+          <input type="text" id="targetDescription" placeholder="e.g., Office NAS server">
+        </div>
+        <div class="form-actions">
+          <button type="button" class="btn btn-ghost" onclick="hideModal()">Cancel</button>
+          <button type="submit" class="btn btn-primary">Add Target</button>
+        </div>
+      </form>
+    `);
+
+    $('#addTargetForm')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const name = $('#targetName')?.value?.trim();
+      const path = $('#targetPath')?.value?.trim();
+      const description = $('#targetDescription')?.value?.trim();
+
+      if (!name || !path) {
+        showToast('Name and path are required', 'error');
+        return;
+      }
+
+      try {
+        await api('POST', '/mirror/targets', { name, path, description });
+        hideModal();
+        showToast(`Added target "${name}"`, 'success');
+        loadMirrorTargets();
+      } catch (e) {
+        showToast(`Failed: ${e.message}`, 'error');
+      }
+    });
+  }
+
+  // Expose showAddTargetModal globally for onclick handlers
+  window.showAddTargetModal = showAddTargetModal;
+
+  window.removeTarget = async function(name) {
+    if (!confirm(`Remove target "${name}"?`)) return;
+
+    try {
+      await api('DELETE', `/mirror/targets/${name}`);
+      showToast(`Removed target "${name}"`, 'success');
+      loadMirrorTargets();
+    } catch (e) {
+      showToast(`Failed: ${e.message}`, 'error');
+    }
+  };
+
+  async function runMirrorDiff() {
+    const target = $('#syncTarget')?.value;
+    if (!target) {
+      showToast('Please select a target', 'error');
+      return;
+    }
+
+    const filter = $('#syncFilter')?.value?.trim() || '';
+    const btn = $('#mirrorDiffBtn');
+
+    try {
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner-sm"></span> Comparing...';
+
+      const result = await api('POST', '/mirror/diff', {
+        target,
+        repoFilter: filter
+      });
+
+      // Reset filters before showing new results
+      diffFilter = 'all';
+      diffSearch = '';
+      $$('[data-diff-filter]').forEach(b => b.classList.remove('active'));
+      $('[data-diff-filter="all"]')?.classList.add('active');
+      const searchInput = $('#diffSearch');
+      if (searchInput) searchInput.value = '';
+
+      renderDiffResults(result);
+
+      // Scroll to results
+      $('#mirrorDiffSection')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (e) {
+      showToast(`Failed: ${e.message}`, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = `
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="12"/>
+          <line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        Compare
+      `;
+    }
+  }
+
+  function renderDiffResults(result) {
+    const section = $('#mirrorDiffSection');
+    const container = $('#diffResults');
+    const summary = $('#diffSummary');
+
+    if (!section || !container) return;
+    if (!result) {
+      section.style.display = 'none';
+      return;
+    }
+
+    section.style.display = 'block';
+
+    // Store for filtering
+    mirrorData.diffResults = result;
+
+    const s = result.summary;
+
+    // Update stats with sync status
+    updateMirrorStats(mirrorData.targets);
+
+    if (s.inSync) {
+      summary.innerHTML = '<span class="badge badge-success">In Sync</span>';
+      container.innerHTML = `
+        <div class="empty-state" style="padding: 48px 24px;">
+          <div class="empty-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64" style="color: var(--color-success);">
+              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+              <polyline points="22 4 12 14.01 9 11.01"/>
+            </svg>
+          </div>
+          <h3>Caches are in sync</h3>
+          <p>No differences found between local and target.</p>
+        </div>
+      `;
+      return;
+    }
+
+    // Build summary badges
+    summary.innerHTML = `
+      ${s.missing > 0 ? `<span class="badge badge-warning">${s.missing} to push (${s.missingSizeHuman})</span>` : ''}
+      ${s.extra > 0 ? `<span class="badge badge-info">${s.extra} extra on target</span>` : ''}
+      ${s.outdated > 0 ? `<span class="badge badge-secondary">${s.outdated} outdated</span>` : ''}
+    `;
+
+    if (!result.diffs || result.diffs.length === 0) {
+      container.innerHTML = '<p style="padding: 24px; text-align: center; color: var(--color-text-muted);">No differences found.</p>';
+      return;
+    }
+
+    // Apply filters
+    let diffs = [...result.diffs];
+
+    // Filter by status
+    if (diffFilter !== 'all') {
+      diffs = diffs.filter(d => d.status === diffFilter);
+    }
+
+    // Filter by search
+    if (diffSearch) {
+      diffs = diffs.filter(d => d.repo.toLowerCase().includes(diffSearch));
+    }
+
+    if (diffs.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state" style="padding: 48px 24px;">
+          <h3>No matches</h3>
+          <p>No repositories match your current filter.</p>
+        </div>
+      `;
+      return;
+    }
+
+    // Render the diff items
+    const typeIcon = (type) => type === 'model'
+      ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+           <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+         </svg>`
+      : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+           <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+           <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+         </svg>`;
+
+    const statusLabel = (status) => {
+      switch (status) {
+        case 'missing': return 'To Push';
+        case 'extra': return 'Extra';
+        case 'outdated': return 'Outdated';
+        default: return status;
+      }
+    };
+
+    container.innerHTML = `
+      <div class="diff-results-header">
+        <span>Status</span>
+        <span>Type</span>
+        <span>Repository</span>
+        <span>Size</span>
+        <span></span>
+      </div>
+      ${diffs.map(d => `
+        <div class="diff-item">
+          <div>
+            <span class="diff-item-status ${d.status}">${statusLabel(d.status)}</span>
+          </div>
+          <div class="diff-item-type">
+            ${typeIcon(d.type)}
+            ${d.type}
+          </div>
+          <div class="diff-item-repo">${escapeHtml(d.repo)}</div>
+          <div class="diff-item-size">${d.sizeHuman || '-'}</div>
+          <div class="diff-item-action">
+            ${d.status === 'missing' ? `
+              <button class="btn btn-ghost btn-sm" onclick="event.stopPropagation();" title="Will be pushed">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                  <line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>
+                </svg>
+              </button>
+            ` : ''}
+          </div>
+        </div>
+      `).join('')}
+    `;
+  }
+
+  async function runMirrorSync(direction) {
+    const target = $('#syncTarget')?.value;
+    if (!target) {
+      showToast('Please select a target', 'error');
+      return;
+    }
+
+    const filter = $('#syncFilter')?.value?.trim() || '';
+    const verify = $('#syncVerify')?.checked || false;
+    const force = $('#syncForce')?.checked || false;
+    const deleteExtra = $('#syncDelete')?.checked || false;
+
+    const action = direction === 'push' ? 'Push to' : 'Pull from';
+    if (!confirm(`${action} target "${target}"?\n\nThis will copy repos ${direction === 'push' ? 'from local to target' : 'from target to local'}.${deleteExtra ? '\n\nWARNING: Extra repos will be deleted!' : ''}`)) {
+      return;
+    }
+
+    const btn = direction === 'push' ? $('#mirrorPushBtn') : $('#mirrorPullBtn');
+    const originalHtml = btn.innerHTML;
+
+    try {
+      btn.disabled = true;
+      btn.innerHTML = `<span class="spinner-sm"></span> ${direction === 'push' ? 'Pushing' : 'Pulling'}...`;
+
+      const result = await api('POST', `/mirror/${direction}`, {
+        target,
+        repoFilter: filter,
+        verify,
+        force,
+        deleteExtra,
+        dryRun: false
+      });
+
+      if (result.success) {
+        showToast(result.message, 'success');
+      } else {
+        showToast(result.message + (result.errors?.length ? ` (${result.errors.length} errors)` : ''), 'warning');
+      }
+
+      // Refresh diff after sync
+      runMirrorDiff();
+    } catch (e) {
+      showToast(`Failed: ${e.message}`, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = originalHtml;
+    }
+  }
+
+  // =========================================
+  // Modal
+  // =========================================
+
+  function showModal(title, content) {
+    // Opening any modal supersedes a revision picker. If an initial (pending)
+    // picker is open, settle its pending navigation first with the same explicit
+    // prompt the close hook renders, so an unrelated dialog that replaces the
+    // picker can never leave the pane on its indefinite loading spinner.
+    // Selection is not involved. A repository transition disarms this hook in
+    // dismissRevisionPickerForNavigation before it opens anything, so the old
+    // pending stop is never rolled back while a new navigation takes over.
+    const cancel = revisionPickerCancelHandler;
+    if (cancel) cancel();
+    revisionPickerCancelHandler = null;
+    revisionPickerRequestId = null;
+    revisionPickerRepo = null;
+    $('#modalTitle').textContent = title;
+    $('#modalBody').innerHTML = content;
+    $('#modalBackdrop').classList.add('active');
+  }
+
+  function setModalContent(content) {
+    $('#modalBody').innerHTML = content;
+  }
+
+  function hideModal() {
+    // Run the scoped cancel hook exactly once, after the dialog is closed.
+    const cancel = revisionPickerCancelHandler;
+    revisionPickerCancelHandler = null;
+    revisionPickerRequestId = null;
+    revisionPickerRepo = null;
+    $('#modalBackdrop').classList.remove('active');
+    if (cancel) cancel();
+  }
+
+  // Expose hideModal globally for onclick handlers
+  window.hideModal = hideModal;
+
+  function initModal() {
+    $('#modalClose')?.addEventListener('click', hideModal);
+    $('#modalBackdrop')?.addEventListener('click', (e) => {
+      if (e.target === $('#modalBackdrop')) hideModal();
+    });
+
+    // ESC key to close modals
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        const modal = $('#modalBackdrop');
+        if (modal?.classList.contains('active')) {
+          hideModal();
+        }
+      }
+    });
+  }
+
+  // =========================================
+  // Toast
+  // =========================================
+
+  function showToast(message, type = 'info') {
+    const container = $('#toastContainer');
+    if (!container) return;
+
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    toast.innerHTML = `<span class="toast-message">${escapeHtml(message)}</span>`;
+
+    container.appendChild(toast);
+
+    setTimeout(() => {
+      toast.style.animation = 'slideIn 0.3s ease reverse';
+      setTimeout(() => toast.remove(), 300);
+    }, 4000);
+  }
+
+  // =========================================
+  // Selectable Items Component
+  // =========================================
+
+  /**
+   * Renders downloadable items grouped by category.
+   * Works for all model types: GGUF quantizations, Diffusers components, etc.
+   */
+  // ── Quant/selectable row download status ──────────────────────────
+  // localStorage key: "dlStatus:<repo>:<model|dataset>" →
+  // { "<filter_value or artifact key>": "queued"|"running"|"done" }
+  // The type-scoped key is the only source of status. The pre-namespace
+  // untyped key ("dlStatus:<repo>") is intentionally ignored and left
+  // untouched: it has no repository type, so migrating it would assign one
+  // namespace's statuses to whichever type reads first. Cache synchronization
+  // reconstructs current artifact status for the open analysis instead.
+  function dlStatusStorageKey(repo, isDataset) {
+    return 'dlStatus:' + repo + ':' + (isDataset ? 'dataset' : 'model');
+  }
+  function parseDlStatus(raw) {
+    try { return raw ? JSON.parse(raw) : {}; } catch { return {}; }
+  }
+  function getDlStatus(repo, isDataset) {
+    try {
+      return parseDlStatus(localStorage.getItem(dlStatusStorageKey(repo, isDataset)));
+    } catch {
+      return {};
+    }
+  }
+  function saveDlStatus(repo, isDataset, map) {
+    const storageKey = dlStatusStorageKey(repo, isDataset);
+    try {
+      if (Object.keys(map).length === 0) localStorage.removeItem(storageKey);
+      else localStorage.setItem(storageKey, JSON.stringify(map));
+    } catch {
+      // Status persistence is best-effort.
+    }
+  }
+  function setDlStatus(repo, isDataset, filterValue, status) {
+    const map = getDlStatus(repo, isDataset);
+    map[filterValue] = status;
+    saveDlStatus(repo, isDataset, map);
+  }
+
+  // Job identity for the open analysis includes the visible destination
+  // (LocalRepo for upstream companions) and the repository namespace.
+  function jobVisibleRepo(job) {
+    return job?.localRepo || job?.repo || '';
+  }
+  function jobMatchesAnalysis(job, analysis) {
+    return !!job && !!analysis?.repo &&
+      jobVisibleRepo(job) === analysis.repo &&
+      !!job.isDataset === !!analysis.is_dataset;
+  }
+
+  // A combined recommended download can carry several artifacts' files in one
+  // filter set. Attribute an artifact's running/queued chip from containment:
+  // every file the item needs must be selected by the job. A job that selects
+  // only the quant shards therefore never marks the mmproj companion, and a
+  // companion-only job never marks the quant.
+  function artifactActiveKeys(items, jobs) {
+    const artifactItems = (items || []).map(item => {
+      const key = selectableStatusKey(item);
+      if (!String(key).startsWith('artifact:')) return null;
+      const files = (item.files || []).map(normalizeArtifactPath).filter(Boolean);
+      return files.length ? { key, files } : null;
+    }).filter(Boolean);
+    const active = {};
+    if (!artifactItems.length) return active;
+    jobs.forEach(job => {
+      if (job.status !== 'running' && job.status !== 'queued') return;
+      const jobPaths = new Set(artifactJobPaths(job.filters));
+      artifactItems.forEach(({ key, files }) => {
+        if (!files.every(file => jobPaths.has(file))) return;
+        const status = job.status === 'running' ? 'running' : 'queued';
+        // Running outranks queued regardless of job iteration order.
+        if (active[key] !== 'running') active[key] = status;
+      });
+    });
+    return active;
+  }
+
+  // A branch-variant job is a whole-revision, unfiltered download. Attribute
+  // running/queued to exactly the branch row with the same revision; a
+  // completed job is never evidence of presence.
+  function branchActiveKeys(items, jobs) {
+    const active = {};
+    (items || []).forEach(item => {
+      if (!(item?.branch_variant === true && item?.revision)) return;
+      const key = selectableStatusKey(item);
+      if (!key) return;
+      jobs.forEach(job => {
+        if (job.status !== 'running' && job.status !== 'queued') return;
+        if (job.branchVariant !== true) return;
+        if ((job.filters || []).length || (job.excludes || []).length) return;
+        if ((job.revision || 'main') !== item.revision) return;
+        const status = job.status === 'running' ? 'running' : 'queued';
+        if (active[key] !== 'running') active[key] = status;
+      });
+    });
+    return active;
+  }
+
+  function refreshDlStatusFromJobs(repo, items = [], isDataset = false) {
+    // Reconcile per-quant status with the live job list. Active jobs set
+    // running/queued; artifact completion is never inferred from job status,
+    // because a completed job can include a shard skipped as "downloading by
+    // another process". Cache synchronization is the authority for artifact
+    // 'done'. The same rule applies to branch variants. Stale running/queued
+    // entries (job gone, cancelled or failed) are cleared so the Download
+    // button reappears. 'done' is kept.
+    const map = getDlStatus(repo, isDataset);
+    const jobs = Array.from(state.jobs.values())
+      .filter(job => jobMatchesAnalysis(job, { repo, is_dataset: isDataset }));
+    const active = artifactActiveKeys(items, jobs);
+    const branchActive = branchActiveKeys(items, jobs);
+    Object.entries(branchActive).forEach(([key, status]) => {
+      if (active[key] !== 'running') active[key] = status;
+    });
+    jobs.forEach(j => {
+      // Branch jobs are not keyed by a filter set; their active rows were
+      // attributed above, and completion never implies their files exist.
+      if (j.branchVariant === true) return;
+      const f = (j.filters || []).join(',') || '__all__';
+      if (j.status === 'completed') active[f] = 'done';
+      else if (j.status === 'running') active[f] = 'running';
+      else if (j.status === 'queued') active[f] = 'queued';
+    });
+    let changed = false;
+    Object.keys(map).forEach(f => {
+      if ((map[f] === 'running' || map[f] === 'queued') && !active[f]) {
+        delete map[f];
+        changed = true;
+      }
+    });
+    Object.keys(active).forEach(f => {
+      if (map[f] !== active[f]) {
+        map[f] = active[f];
+        changed = true;
+      }
+    });
+    if (changed) saveDlStatus(repo, isDataset, map);
+  }
+
+  // Live job events arrive far more often than row status can meaningfully
+  // change. Coalesce them into one throttled reconciliation; only a matching
+  // completion re-reads cache presence, because cache presence is the sole
+  // authority for artifact 'done'.
+  const LIVE_STATUS_RECONCILE_DELAY_MS = 200;
+  let liveStatusReconcileTimer = null;
+  let liveStatusReconcileRunning = false;
+  let liveStatusReconcilePending = false;
+  let liveStatusReconcileNeedsCache = false;
+
+  function scheduleLiveAnalysisReconcile({ syncCache = false } = {}) {
+    if (!currentAnalysis?.repo) return;
+    liveStatusReconcilePending = true;
+    if (syncCache) liveStatusReconcileNeedsCache = true;
+    if (liveStatusReconcileTimer !== null || liveStatusReconcileRunning) return;
+    liveStatusReconcileTimer = setTimeout(runLiveAnalysisReconcile, LIVE_STATUS_RECONCILE_DELAY_MS);
+  }
+
+  // Called by loadRepositoryDetails once the new analysis is committed and
+  // rendered. A job event that arrived during the load was compared against
+  // the previous analysis and could not be scheduled, so run one coalesced
+  // reconciliation (including cache presence) for the committed analysis.
+  function reconcileAnalysisAfterLoad() {
+    scheduleLiveAnalysisReconcile({ syncCache: true });
+  }
+
+  async function runLiveAnalysisReconcile() {
+    liveStatusReconcileTimer = null;
+    const analysis = currentAnalysis;
+    if (!analysis?.repo) {
+      liveStatusReconcilePending = false;
+      liveStatusReconcileNeedsCache = false;
+      return;
+    }
+    liveStatusReconcilePending = false;
+    const syncCache = liveStatusReconcileNeedsCache;
+    liveStatusReconcileNeedsCache = false;
+    liveStatusReconcileRunning = true;
+    try {
+      refreshDlStatusFromJobs(analysis.repo, analysis.selectable_items, !!analysis.is_dataset);
+      updateSelectableRowStatuses(analysis.selectable_items);
+      if (syncCache) {
+        await syncLocalAnalysisStatus(analysis);
+        if (currentAnalysis !== analysis) return;
+        // Reapply live running/queued after the async lookup so a job event
+        // that arrived during the fetch is not overwritten by stale cache.
+        refreshDlStatusFromJobs(analysis.repo, analysis.selectable_items, !!analysis.is_dataset);
+        updateSelectableRowStatuses(analysis.selectable_items);
+      }
+    } finally {
+      liveStatusReconcileRunning = false;
+      if (liveStatusReconcilePending) {
+        liveStatusReconcilePending = false;
+        if (liveStatusReconcileTimer === null) {
+          liveStatusReconcileTimer = setTimeout(runLiveAnalysisReconcile, 0);
+        }
+      }
+    }
+  }
+
+  function selectableStatusChip(status) {
+    if (status === 'done') {
+      return `<span class="quant-dl-btn quant-dl-btn-done" title="Already downloaded">✓</span>`;
+    }
+    if (status === 'queued') {
+      return `<span class="quant-dl-btn quant-dl-btn-queued" title="Queued">…</span>`;
+    }
+    if (status === 'running') {
+      return `<span class="quant-dl-btn quant-dl-btn-running" title="Downloading…"><span class="quant-spinner"></span></span>`;
+    }
+    return '';
+  }
+
+  function selectableDownloadControl(item, status) {
+    const repo = currentAnalysis?.repo || '';
+    const fv = item.filter_value || item.id || '';
+    const files = Array.isArray(item.files) ? item.files : [];
+    const isBranch = item?.branch_variant === true && !!item?.revision;
+    const exactArtifact = files.length > 0 && ['quantization', 'vision_encoder'].includes(item.category);
+    const statusKey = isBranch ? selectableStatusKey(item) : (exactArtifact ? selectableStatusKey(item) : fv);
+    const dlRepo = item.upstream_repo || repo;
+    const statusRepo = repo;
+    const dlIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="14" height="14">
+                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                 <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+               </svg>`;
+    if (isBranch) {
+      // Only an active job replaces the action. A completed branch keeps a
+      // download control so the user can re-download it; the cache presence
+      // check remains the sole authority for the 'done' marker.
+      if (status === 'running' || status === 'queued') {
+        return { statusKey, html: selectableStatusChip(status) };
+      }
+      const payload = {
+        repo: dlRepo,
+        revision: item.revision,
+        statusKey,
+        isDataset: false,
+        label: item.label || '',
+        statusRepo,
+        branchVariant: true
+      };
+      const title = status === 'done'
+        ? 'Downloaded — click to download this variant again'
+        : 'Download this EXL variant';
+      const className = status === 'done' ? 'quant-dl-btn quant-dl-btn-done' : 'quant-dl-btn';
+      const style = status === 'done' ? ' style="cursor:pointer"' : '';
+      return {
+        statusKey,
+        html: `<button class="${className}"${style} title="${title}" onclick="downloadQuantFromButton(this)"
+                 data-download="${encodeURIComponent(JSON.stringify(payload))}">${dlIcon}</button>`
+      };
+    }
+    const chip = selectableStatusChip(status);
+    if (chip) return { statusKey, html: chip };
+    return {
+      statusKey,
+      html: `<button class="quant-dl-btn" title="Download this quantization" onclick="downloadQuantFromButton(this)"
+               data-download="${encodeURIComponent(JSON.stringify({repo: dlRepo, filterValue: fv, statusKey, isDataset: !!currentAnalysis?.is_dataset, label: item.label || '', localRepo: item.upstream_repo ? repo : '', statusRepo, files: exactArtifact ? files : null}))}">${dlIcon}</button>`
+    };
+  }
+
+  // Update the rendered rows for the open analysis without re-rendering the
+  // analysis or resetting scroll/focus. Rows carry their exact status key so
+  // distinct artifacts that share a filter_value stay independent.
+  function updateSelectableRowStatuses(items) {
+    const analysis = currentAnalysis;
+    const repo = analysis?.repo || '';
+    if (!repo || !Array.isArray(items) || !items.length) return;
+    const container = $('#selectableItems');
+    if (!container || typeof container.querySelectorAll !== 'function') return;
+    const itemByKey = new Map();
+    items.forEach(item => itemByKey.set(selectableStatusKey(item), item));
+    const map = getDlStatus(repo, !!analysis.is_dataset);
+    const rows = container.querySelectorAll('.quant-row[data-status-key]');
+    for (const row of rows) {
+      let statusKey = '';
+      try { statusKey = decodeURIComponent(row.dataset?.statusKey || ''); } catch { continue; }
+      const item = itemByKey.get(statusKey);
+      if (!item) continue;
+      const status = map[statusKey] || '';
+      if ((row.dataset?.dlStatus || '') === status) continue;
+      const control = selectableDownloadControl(item, status);
+      const controlNode = row.querySelector?.('.quant-dl-btn');
+      if (controlNode) controlNode.outerHTML = control.html;
+      if (row.dataset) row.dataset.dlStatus = status;
+    }
+  }
+
+  function renderSelectableItems(items, containerId) {
+    if (!items || items.length === 0) return '';
+
+    const repo = currentAnalysis?.repo || '';
+    // loadRepositoryDetails reconciles live jobs and cache presence before this
+    // render. Artifact 'done' status comes only from that cache check; do not
+    // infer it from job state here.
+    const dlMap = getDlStatus(repo, !!currentAnalysis?.is_dataset);
+
+    const categories = {};
+    items.forEach(item => {
+      const cat = item.category || 'default';
+      if (!categories[cat]) categories[cat] = [];
+      categories[cat].push(item);
+    });
+
+    const categoryTitles = {
+      'quantization': 'Quantizations',
+      'variant': 'Variants',
+      'component': 'Components',
+      'split': 'Dataset Splits',
+      'format': 'Weight Format',
+      'precision': 'Precision',
+      'vision_encoder': 'Vision Encoder',
+      'default': 'Options'
+    };
+
+    let html = `<div class="selectable-items quant-list" id="${containerId}">`;
+
+    // Offer a labeled destination choice when type folders are configured.
+    // The select lives once per analysis result; downloadQuant reads it. Keys
+    // never appear in the markup (renderRouteSelect uses option indexes).
+    // Datasets are never routed (the server ignores routeKey when dataset is
+    // set), so no control is offered for a dataset analysis.
+    if (!currentAnalysis?.is_dataset && getConfiguredRouteOptions().length) {
+      html += `
+        <div class="quant-category">
+          <div class="quant-category-title">Save to</div>
+          <div class="quant-route-control">
+            ${renderRouteSelect('quantRouteSelect', { className: 'search-select', style: 'display:block; width:100%; max-width:320px; margin:4px 0 0 12px', ariaLabel: 'Destination type folder' })}
+            <p class="form-hint" style="margin-top:4px">Choose a configured type folder, or keep the server default.</p>
+          </div>
+        </div>`;
+    }
+
+    for (const [category, categoryItems] of Object.entries(categories)) {
+      const title = categoryTitles[category] || category.charAt(0).toUpperCase() + category.slice(1);
+
+      html += `
+        <div class="quant-category">
+          <div class="quant-category-title">${escapeHtml(title)}</div>`;
+
+      categoryItems.forEach(item => {
+        const stars   = item.quality > 0 ? renderQualityStars(item.quality) : '';
+        const recBadge= item.recommended ? '<span class="quant-rec">★ rec</span>' : '';
+        const size    = item.size_human  ? `<span class="quant-size">${escapeHtml(item.size_human)}</span>` : '';
+        const ram     = item.ram_human   ? `<span class="quant-ram">${escapeHtml(item.ram_human)} RAM</span>` : '';
+        const desc    = item.description ? `<span class="quant-desc">${renderQuantDescription(item.description)}</span>` : '';
+
+        const fv = item.filter_value || item.id || '';
+        const statusKey = selectableStatusKey(item);
+        const dlStatus = dlMap[statusKey] || '';
+        // Left control: a Download button when idle; otherwise it is REPLACED by
+        // a status chip reflecting the quant's state in the download queue
+        // (done / downloading / queued) so it can't be started twice.
+        const control = selectableDownloadControl(item, dlStatus);
+
+        html += `
+          <div class="quant-row ${item.recommended ? 'quant-row-rec' : ''}" data-fv="${escapeHtml(fv)}"
+               data-status-key="${escapeHtmlAttribute(encodeURIComponent(control.statusKey))}"
+               data-dl-status="${escapeHtmlAttribute(dlStatus)}">
+            ${control.html}
+            <span class="quant-label">${escapeHtml(item.label)}</span>
+            ${recBadge}
+            ${size}
+            ${ram}
+            ${stars}
+            ${desc}
+          </div>`;
+      });
+
+      html += `</div>`;
+    }
+
+    html += '</div>';
+    return html;
+  }
+
+  window.downloadQuantFromButton = function(button) {
+    try {
+      const args = JSON.parse(decodeURIComponent(button.dataset.download));
+      return window.downloadQuant(args.repo, args.filterValue, args.isDataset, args.label, args.localRepo, args.statusRepo, args.files, button.closest('.quant-row'), args.statusKey, args.revision, args.branchVariant === true);
+    } catch (e) { console.error('Invalid selectable download data', e); }
+  };
+
+  // Download a single quantization from the quant list
+  window.downloadQuant = async function(repo, filterValue, isDataset, label, localRepo, statusRepo, files, sourceRow, statusKey, branchRevision, branchVariant) {
+    try {
+      // When downloading from an upstream repo (e.g. mmproj from base model),
+      // always use "main" — the current analysis revision applies only to
+      // the repo being analyzed, not to its ancestors. A branch variant names
+      // its own revision and selects that whole branch, never file filters.
+      const revision = branchVariant
+        ? branchRevision
+        : ((repo === currentAnalysis?.repo)
+          ? (currentAnalysis?.branch || 'main')
+          : 'main');
+      const body = branchVariant
+        ? { repo, revision, dataset: false, filters: [], exactMatch: false, branchVariant: true }
+        : {
+          repo,
+          revision,
+          dataset: isDataset,
+          filters: files ? artifactRequestPaths(files) : (filterValue ? [filterValue] : []),
+          exactMatch: files ? true : !!filterValue
+        };
+      // Send the labeled destination choice when type folders are configured.
+      // For an upstream companion (mmproj) this still resolves to the analyzed
+      // model's route, so companions land with the parent.
+      const routeKey = isDataset ? '' : routeSelectValue('quantRouteSelect');
+      if (routeKey) body.routeKey = routeKey;
+      // When downloading from an upstream repo (e.g. mmproj from a base model),
+      // tell the server to store the file under the current model's folder.
+      if (!branchVariant && localRepo) body.localRepo = localRepo;
+      if (!await checkDownloadDiskSpace(body)) return;
+      const data = await api('POST', '/download', body);
+
+      if (data.message) {
+        showToast(data.message, 'info');
+        return;
+      }
+
+      state.jobs.set(data.id, data);
+      setDlStatus(statusRepo || repo, isDataset, statusKey || filterValue, 'queued');
+      // Replace the download button with the queued chip immediately.
+      const row = sourceRow || document.querySelector(`.quant-row[data-fv="${CSS.escape(filterValue)}"]`);
+      if (row) {
+        const btn = row.querySelector('.quant-dl-btn');
+        if (btn) btn.outerHTML = selectableStatusChip('queued');
+        if (row.dataset) row.dataset.dlStatus = 'queued';
+      }
+
+      showToast(`Queued: ${label || repo}`, 'success');
+    } catch (e) {
+      showToast(`Failed: ${e.message}`, 'error');
+    }
+  };
+
+  /**
+   * For non-GGUF/non-selectable models: renders a plain file list with per-file download.
+   */
+  function renderNonSelectableFiles(data) {
+    if (!data.files?.length) return '';
+    const repo = data.repo;
+    // Offer a labeled destination choice when type folders are configured.
+    // Non-selectable types (e.g. audio) have no selectable_items, so this file
+    // list and the "Download All" wizard are the paths that reach the server;
+    // both read this one select. Keys never appear in the markup. Datasets are
+    // never routed, so no control is offered for a dataset analysis.
+    const routeGroup = !currentAnalysis?.is_dataset && getConfiguredRouteOptions().length ? `
+        <div class="quant-category">
+          <div class="quant-category-title">Save to</div>
+          <div class="quant-route-control">
+            ${renderRouteSelect('nonSelectableRoute', { className: 'search-select', style: 'display:block; width:100%; max-width:320px; margin:4px 0 0 12px', ariaLabel: 'Destination type folder' })}
+            <p class="form-hint" style="margin-top:4px">Choose a configured type folder, or keep the server default.</p>
+          </div>
+        </div>` : '';
+    // Exclude non-model files from the list (keep only content files)
+    const files = data.files.filter(f => {
+      const n = (f.path || f.name || '').toLowerCase();
+      return !n.endsWith('.md') && !n.endsWith('.gitattributes') && !n.endsWith('.txt') || data.files.length <= 5;
+    });
+    if (!files.length) return '';
+
+    const rows = files.slice(0, 50).map(f => {
+      const name = f.path || f.name || '';
+      const size = f.size_human || (f.size ? formatBytes(f.size) : '');
+      return `
+        <div class="quant-row">
+          <button class="quant-dl-btn" title="Download file"
+            onclick="downloadSingleFile('${escapeHtml(repo)}', '${escapeHtml(name)}', ${data.is_dataset})">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="14" height="14">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+          </button>
+          <span class="quant-label" style="font-family:var(--font-mono);font-size:12px">${escapeHtml(name)}</span>
+          ${size ? `<span class="quant-size">${escapeHtml(size)}</span>` : ''}
+        </div>`;
+    }).join('');
+
+    const more = data.files.length > 50 ? `<div class="quant-row" style="color:var(--color-text-muted);font-size:12px;padding:6px 12px">… and ${data.files.length - 50} more files</div>` : '';
+
+    return `
+      <div class="analysis-section">
+        ${routeGroup}
+        <div class="quant-category">
+          <div class="quant-category-title">Files (${data.files.length})</div>
+          ${rows}${more}
+        </div>
+      </div>`;
+  }
+
+  // Download a single specific file by its exact repository-relative path.
+  window.downloadSingleFile = async function(repo, filename, isDataset) {
+    try {
+      // Destination chosen in the file list's "Save to" select, when present.
+      const routeKey = isDataset ? '' : routeSelectValue('nonSelectableRoute');
+      // The file list identifies files by their repository-relative path. Send
+      // root-level entries through the exact "./name" selector so a same-named
+      // nested alias is not selected by legacy basename matching; nested paths
+      // remain canonical. Display and toast keep the unencoded filename.
+      const filters = artifactRequestPaths([filename]);
+      const body = {
+        repo, revision: currentAnalysis?.branch || 'main',
+        dataset: isDataset, filters, exactMatch: true
+      };
+      if (routeKey) body.routeKey = routeKey;
+      if (!await checkDownloadDiskSpace(body)) return;
+      await api('POST', '/download', body);
+      showToast(`Queued: ${filename}`, 'success');
+    } catch (e) {
+      showToast(`Failed: ${e.message}`, 'error');
+    }
+  };
+
+  /**
+   * Renders quality stars (1-5).
+   */
+  function renderQualityStars(quality) {
+    if (!quality || quality < 1 || quality > 5) return '';
+    const filled = '★'.repeat(quality);
+    const empty = '☆'.repeat(5 - quality);
+    return `<span class="selector-stars">${filled}${empty}</span>`;
+  }
+
+  function renderQuantDescription(description) {
+    if (!description) return '';
+    return escapeHtml(description).replace(/\brecommended\b/gi, '<span class="quant-desc-rec">$&</span>');
+  }
+
+  /**
+   * Renders related downloads section (e.g., base model for LoRA).
+   */
+  function renderRelatedDownloads(downloads) {
+    if (!downloads || downloads.length === 0) return '';
+
+    let html = `
+      <div class="analysis-section related-downloads-section">
+        <h4>Related Downloads</h4>
+        <div class="related-downloads">`;
+
+    downloads.forEach(dl => {
+      const requiredBadge = dl.required ? '<span class="badge-required">Required</span>' : '';
+
+      html += `
+        <div class="related-download-card ${dl.required ? 'required' : ''}">
+          <div class="related-download-info">
+            <span class="related-download-label">${escapeHtml(dl.label)} ${requiredBadge}</span>
+            <span class="related-download-repo">${escapeHtml(dl.repo)}</span>
+            ${dl.description ? `<span class="related-download-desc">${escapeHtml(dl.description)}</span>` : ''}
+            ${dl.size_human ? `<span class="related-download-size">${escapeHtml(dl.size_human)}</span>` : ''}
+          </div>
+          <button class="btn btn-secondary btn-sm" data-repo="${escapeHtmlAttribute(dl.repo)}" onclick="analyzeRelatedRepo(this.dataset.repo)">
+            Analyze
+          </button>
+        </div>`;
+    });
+
+    html += '</div></div>';
+    return html;
+  }
+
+  /**
+   * Analyze a related repo (from LoRA base model / lineage link).
+   */
+  window.analyzeRelatedRepo = function(repo) {
+    openRepositoryInDetails(repo, 'model', null, 'push');
+  };
+
+  // =========================================
+  // Models Page (unified Search + Analyze + Download)
+  // =========================================
+
+  let _modelsDebounce = null;
+  let _modelsInitialized = false;
+  let _currentSelectedRow = null;
+  let _syncModelsSearchClear = () => {};
+
+  function clearModelsSelection() {
+    if (_currentSelectedRow) {
+      _currentSelectedRow.classList.remove('model-row-active');
+      _currentSelectedRow = null;
+    }
+  }
+
+  function initModelsPage() {
+    if (_modelsInitialized) return;
+    _modelsInitialized = true;
+
+    initDetailTabs();
+
+    const input = $('#analyzeInput');
+    const btn   = $('#analyzeBtn');
+    const clearBtn = $('#modelsSearchClear');
+
+    // Toggle the clear (×) button based on whether the field has text
+    const syncClearBtn = () => {
+      if (clearBtn) clearBtn.hidden = !(input && input.value.length > 0);
+    };
+    _syncModelsSearchClear = syncClearBtn;
+    syncClearBtn();
+
+    // Debounced search on typing
+    input?.addEventListener('input', () => {
+      syncClearBtn();
+      clearModelsSelection();
+      clearTimeout(_modelsDebounce);
+      _modelsDebounce = setTimeout(loadModelsSearch, 380);
+    });
+
+    // Clear button: empty the field, hide itself, refresh results
+    clearBtn?.addEventListener('click', () => {
+      if (!input) return;
+      input.value = '';
+      syncClearBtn();
+      clearModelsSelection();
+      input.focus();
+      clearTimeout(_modelsDebounce);
+      loadModelsSearch();
+    });
+
+    // Enter key → analyze if looks like repo, else search
+    input?.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        clearTimeout(_modelsDebounce);
+        const v = input.value.trim();
+        if (v.includes('/')) {
+          analyzeRepo();
+        } else {
+          loadModelsSearch();
+        }
+      }
+    });
+
+    // Analyze/refresh button. On the unified Models page this refreshes the
+    // current view, not whatever text happens to be in the search field. The
+    // current history entry is authoritative while a navigation is pending
+    // (revision picker, type selection, failure, or an in-flight request), so
+    // refresh cannot target the previously resolved repository. It refines
+    // that entry instead of creating a duplicate.
+    btn?.addEventListener('click', () => {
+      const entry = currentRepoHistoryEntry();
+      const repo = entry?.repo || currentSelectedRepo || currentAnalysis?.repo || input?.value?.trim();
+      if (!repo) {
+        analyzeRepo();
+        return;
+      }
+      // The history entry is authoritative for an explicit type. Without one,
+      // preserve auto-detection instead of forcing a stale model selection.
+      const repoType = entry
+        ? entry.repoType
+        : (currentSelectedType || (currentSelectedIsDataset || currentAnalysis?.is_dataset ? 'dataset' : null));
+      const revision = entry
+        ? entry.revision
+        : currentSelectedBranch || currentAnalysis?.branch || 'main';
+      openRepositoryInDetails(repo, repoType, revision, 'replace');
+    });
+
+    // Example buttons
+    $$('.example-btn').forEach(b => {
+      b.addEventListener('click', () => {
+        if (input) input.value = b.dataset.repo;
+        _syncModelsSearchClear();
+        openRepositoryInDetails(b.dataset.repo, b.dataset.type === 'dataset' ? 'dataset' : null, null, 'push');
+      });
+    });
+
+    // README links are rendered/replaced inside the analysis pane. Delegate
+    // here rather than binding to #readmePreview, which does not exist yet.
+    $('#analyzeResult')?.addEventListener('click', handleReadmePreviewClick);
+
+    $('#modelsDetailBack')?.addEventListener('click', () => traverseRepoHistory(-1));
+    $('#modelsDetailForward')?.addEventListener('click', () => traverseRepoHistory(1));
+    syncRepoHistoryButtons();
+
+    // Filter controls trigger new search
+    ['modelsSortSelect','modelsTypeSelect','modelsGguf','modelsDatasets'].forEach(id => {
+      $(`#${id}`)?.addEventListener('change', () => {
+        clearTimeout(_modelsDebounce);
+        clearModelsSelection();
+        loadModelsSearch();
+      });
+    });
+
+    // Scroll arrows: contextual top/bottom
+    const scroller = $('#analyzeResult');
+    const arrowUp = $('#scrollArrowUp');
+    const arrowDown = $('#scrollArrowDown');
+
+    arrowUp?.addEventListener('click', () => {
+      if (scroller) scroller.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+    arrowDown?.addEventListener('click', () => {
+      if (scroller) scroller.scrollTo({ top: scroller.scrollHeight, behavior: 'smooth' });
+    });
+    scroller?.addEventListener('scroll', updateScrollArrows);
+  }
+
+  async function loadModelsSearch() {
+    const input   = $('#analyzeInput');
+    const spinner = $('#modelsSpinner');
+    const list    = $('#modelsResultList');
+    if (!list) return;
+
+    const q      = input?.value?.trim() || '';
+    const sortBy = $('#modelsSortSelect')?.value || 'downloads';
+    const filter = buildSearchFilter($('#modelsTypeSelect')?.value, $('#modelsGguf')?.checked);
+    const isDs   = $('#modelsDatasets')?.checked || false;
+
+    const params = new URLSearchParams({ sort: sortBy, limit: '40' });
+    if (q) params.set('q', q);
+    if (filter) params.set('filter', filter);
+    if (isDs) params.set('datasets', 'true');
+
+    if (spinner) spinner.style.display = '';
+
+    try {
+      const res  = await fetch('/api/search?' + params);
+      const data = await res.json();
+      renderModelsResultList(data.results || [], q, isDs);
+    } catch (e) {
+      list.innerHTML = `<div class="models-list-hint" style="color:var(--color-error)">Search error: ${escapeHtml(e.message)}</div>`;
+    } finally {
+      if (spinner) spinner.style.display = 'none';
+    }
+  }
+
+  function buildSearchFilter(type, ggufOnly) {
+    const parts = [];
+    if (type) parts.push(type);
+    if (ggufOnly) parts.push('gguf');
+    return parts.join(',');
+  }
+
+  function renderModelsResultList(items, q, isDataset = false) {
+    const list = $('#modelsResultList');
+    if (!items.length) {
+      list.innerHTML = `<div class="models-list-hint">${q ? 'No results for "' + escapeHtml(q) + '"' : 'No results'}</div>`;
+      return;
+    }
+    list.innerHTML = items.map(r => renderModelRow(r, isDataset)).join('');
+  }
+
+  function renderModelRow(r, isDataset = false) {
+    const parts  = (r.id || '').split('/');
+    const author = parts.length > 1 ? parts[0] : '';
+    const name   = parts.length > 1 ? parts.slice(1).join('/') : r.id;
+    const caps = detectSearchCapabilities(r);
+
+    const isGguf = (r.tags || []).includes('gguf');
+    const badge  = isGguf
+      ? `<span class="model-row-badge model-row-badge-gguf">GGUF</span>`
+      : '';
+    const localBadge = r.cached
+      ? `<span class="model-row-badge model-row-badge-local" title="${escapeHtml(r.cacheSource || 'Local cache')}">local</span>`
+      : '';
+
+    const dl = r.downloads ? `<span class="model-row-stat">↓${formatNumber(r.downloads)}</span>` : '';
+    const lk = r.likes     ? `<span class="model-row-stat like-accent">♥${formatNumber(r.likes)}</span>` : '';
+    const gated = r.gated  ? `<span class="model-row-stat" title="Gated">🔒</span>` : '';
+    const capabilityIcons = renderCapabilityIcons(caps.capabilities, caps.titles);
+
+    return `
+      <div class="model-row" data-repo="${escapeHtmlAttribute(r.id)}" data-repo-type="${isDataset ? 'dataset' : 'model'}" onclick="modelsSelectRow(this, this.dataset.repo)">
+        <div class="model-row-avatar">${escapeHtml((author || name).substring(0,2).toUpperCase())}</div>
+        <div class="model-row-info">
+          <div class="model-row-name">${escapeHtml(name)}</div>
+          <div class="model-row-meta">${escapeHtml(author)}${dl}${lk}${gated}</div>
+        </div>
+        <div class="model-row-right">${capabilityIcons}${localBadge}${badge}</div>
+      </div>`;
+  }
+
+  function detectSearchCapabilities(result) {
+    const tags = (result.tags || []).map(t => String(t).toLowerCase());
+    const text = [
+      result.id,
+      result.pipelineTag,
+      result.libraryName,
+      ...tags
+    ].filter(Boolean).join(' ').toLowerCase();
+    const capabilities = [];
+    const titles = {};
+
+    const hasAny = (needles) => needles.some(n => text.includes(n));
+    const hasTag = (needles) => needles.some(n => tags.includes(n));
+    const pipeline = String(result.pipelineTag || '').toLowerCase();
+
+    if (
+      ['image-to-text', 'image-text-to-text', 'visual-question-answering', 'image-classification', 'object-detection'].includes(pipeline) ||
+      hasTag(['vision', 'computer-vision', 'multimodal', 'vlm']) ||
+      hasAny([' vision', 'vision-', '-vision', 'vlm', 'multimodal', 'mmproj', 'image-to-text', 'image-text-to-text'])
+    ) {
+      capabilities.push('vision');
+      titles.vision = 'Vision capability detected from HF tags/name';
+    }
+
+    if (hasTag(['tool', 'tools', 'tool-use', 'function-calling']) || hasAny(['tool-use', 'tool_use', 'function-calling', 'function_calling', 'tools', ' tool '])) {
+      capabilities.push('tools');
+      titles.tools = 'Tool-use capability detected from HF tags/name';
+    }
+
+    if (hasTag(['reasoning', 'reasoner', 'thinking']) || hasAny(['reasoning', 'reasoner', 'thinking', 'deepseek-r1', 'qwq', 'cot', 'chain-of-thought'])) {
+      capabilities.push('reasoning');
+      titles.reasoning = 'Reasoning signal detected from HF tags/name';
+    }
+
+    return { capabilities, titles };
+  }
+
+  // Called when a row is clicked
+  window.modelsSelectRow = function(el, repoId) {
+    // Highlight active row
+    if (_currentSelectedRow) _currentSelectedRow.classList.remove('model-row-active');
+    el.classList.add('model-row-active');
+    _currentSelectedRow = el;
+
+    // Keep the search field user-owned; analyze the clicked repo separately.
+    // Search result rows know whether they came from the model or dataset API,
+    // so the common transition owner sets the header and selection identity
+    // (including the dataset Hub URL) from that type.
+    const repoType = el?.dataset?.repoType === 'dataset' ? 'dataset' : 'model';
+    openRepositoryInDetails(repoId, repoType, null, 'push');
+  };
+
+  // (legacy compat — old Search page rendered cards with Analyze button)
+  function renderSearchResults() {}
+  function renderModelCard() { return ''; }
+
+  function buildVisibleTags(tags) {
+    const result = [];
+    const skip = new Set(['region:us', 'endpoints_compatible', 'text-generation-inference', 'eval-results']);
+    let count = 0;
+    for (const t of tags) {
+      if (skip.has(t)) continue;
+      if (t.startsWith('base_model:') || t.startsWith('arxiv:') || t.startsWith('license:')) continue;
+      const isGguf = t === 'gguf';
+      if (isGguf) { result.unshift({ label: 'GGUF', cls: 'model-tag model-tag-gguf' }); continue; }
+      if (count < 4) {
+        result.push({ label: t, cls: 'model-tag' });
+        count++;
+      }
+    }
+    return result.slice(0, 6);
+  }
+
+  function navigateToAnalyze(repoId, repoType = null, revision = null) {
+    navigateTo('models');
+    openRepositoryInDetails(repoId, repoType, revision, 'push');
+  }
+
+  function formatNumber(n) {
+    if (!n) return '0';
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+    if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+    return String(n);
+  }
+
+  // =========================================
+  // History Page
+  // =========================================
+
+  async function loadHistory() {
+    const container = $('#historyList');
+    if (!container) return;
+
+    try {
+      const res  = await fetch('/api/history');
+      const data = await res.json();
+      renderHistory(data.entries || []);
+    } catch (e) {
+      container.innerHTML = `<div class="empty-state"><h3>Failed to load history</h3><p>${escapeHtml(e.message)}</p></div>`;
+    }
+  }
+
+  function renderHistory(entries) {
+    const container = $('#historyList');
+    if (!entries.length) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+              <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+            </svg>
+          </div>
+          <h3>No History Yet</h3>
+          <p>Completed and failed downloads will appear here.</p>
+        </div>`;
+      return;
+    }
+
+    // newest first
+    const sorted = [...entries].reverse();
+
+    const rows = sorted.map(e => {
+      const statusCls = e.status === 'completed' ? 'history-status-completed' : 'history-status-failed';
+      const statusLabel = e.status === 'completed' ? '✓ Completed' : '✗ Failed';
+      const date = e.endedAt ? formatRelativeDate(e.endedAt) : '—';
+      const size = e.totalBytes ? formatBytes(e.totalBytes) : '—';
+      const rev = e.revision && e.revision !== 'main' ? `<div class="history-repo-rev">@ ${escapeHtml(e.revision)}</div>` : '';
+      const type = e.isDataset ? '<span class="model-tag" style="font-size:11px">dataset</span>' : '';
+      // Only surface the frozen Hub destination when it is a meaningful,
+      // independent location; the conventional "<friendly>/hub" is already
+      // implied by the friendly root and would just add noise.
+      const hub = meaningfulHubDir(e.hubDir, e.outputDir)
+        ? `<div class="history-dir-hub" title="${escapeHtml(e.hubDir)}">Hub: ${escapeHtml(e.hubDir)}</div>`
+        : '';
+      return `
+        <tr>
+          <td>
+            <div class="history-repo">${escapeHtml(e.repo)}${type}</div>
+            ${rev}
+          </td>
+          <td><span class="${statusCls}">${statusLabel}</span>${e.error ? `<div style="font-size:11px;color:var(--color-error);margin-top:3px">${escapeHtml(e.error.substring(0,80))}</div>` : ''}</td>
+          <td>${e.totalFiles ? e.totalFiles + ' files' : '—'}</td>
+          <td>${size}</td>
+          <td class="history-date" title="${e.endedAt || ''}">${date}</td>
+          <td><div class="history-dir" title="${escapeHtml(e.outputDir || '')}">${escapeHtml(e.outputDir || '—')}</div>${hub}</td>
+        </tr>`;
+    }).join('');
+
+    container.innerHTML = `
+      <div class="history-table-wrap">
+        <table class="history-table">
+          <thead>
+            <tr>
+              <th>Repository</th>
+              <th>Status</th>
+              <th>Files</th>
+              <th>Size</th>
+              <th>Completed</th>
+              <th>Output Dir</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  }
+
+  // meaningfulHubDir reports whether a history row's frozen Hub destination
+  // (H) adds information beyond the shown friendly/app output dir (R). It
+  // returns false for the conventional "<R>/hub" derivation and for missing
+  // data, so ordinary rows keep their current single-line layout.
+  function meaningfulHubDir(hubDir, outputDir) {
+    const hub = (hubDir || '').trim();
+    if (!hub) return false;
+    const base = (outputDir || '').trim().replace(/[\\/]+$/, '');
+    if (!base) return true;
+    const conventional = (base + '/hub').replace(/\\/g, '/');
+    return hub.replace(/\\/g, '/').replace(/\/+$/, '') !== conventional;
+  }
+
+  function formatRelativeDate(iso) {
+    try {
+      const d = new Date(iso);
+      const diff = Date.now() - d.getTime();
+      const mins = Math.floor(diff / 60000);
+      if (mins < 1) return 'just now';
+      if (mins < 60) return `${mins}m ago`;
+      const hrs = Math.floor(mins / 60);
+      if (hrs < 24) return `${hrs}h ago`;
+      const days = Math.floor(hrs / 24);
+      if (days < 7) return `${days}d ago`;
+      return d.toLocaleDateString();
+    } catch { return iso; }
+  }
+
+  // =========================================
+  // Utilities
+  // =========================================
+
+  function escapeHtml(str) {
+    if (!str) return '';
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
+  // Text escaping alone does not protect quoted HTML attributes.
+  function escapeHtmlAttribute(value) {
+    return escapeHtml(String(value ?? '')).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function formatBytes(bytes) {
+    if (!bytes || bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+  }
+
+  // =========================================
+  // Sidebar resize
+  // =========================================
+  function initSidebarResize() {
+    const handle  = $('#sidebarResizeHandle');
+    const sidebar = handle?.closest('aside');
+    if (!handle || !sidebar) return;
+
+    // Restore saved width
+    const saved = localStorage.getItem('sidebarWidth');
+    if (saved) sidebar.style.width = saved + 'px';
+
+    let startX, startW;
+
+    handle.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      startX = e.clientX;
+      startW = sidebar.getBoundingClientRect().width;
+      handle.classList.add('dragging');
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', (e) => {
+      if (!handle.classList.contains('dragging')) return;
+      const delta = e.clientX - startX;
+      const newW  = Math.max(160, Math.min(600, startW + delta));
+      sidebar.style.width = newW + 'px';
+    });
+
+    document.addEventListener('mouseup', () => {
+      if (!handle.classList.contains('dragging')) return;
+      handle.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      const w = Math.round(sidebar.getBoundingClientRect().width);
+      localStorage.setItem('sidebarWidth', w);
+    });
+  }
+
+  // =========================================
+  // Models list resize
+  // =========================================
+  function initModelsListResize() {
+    const handle = $('#modelsListResizeHandle');
+    const split = $('.models-split');
+    const list = $('.models-list-panel');
+    if (!handle || !split || !list) return;
+
+    const minW = 300;
+    const defaultW = 400;
+    const preferredMaxW = 640;
+    const detailMinW = 360;
+    const clampWidth = (width) => {
+      const splitW = split.getBoundingClientRect().width || (preferredMaxW + detailMinW);
+      const maxW = Math.max(minW, Math.min(preferredMaxW, splitW - detailMinW));
+      return Math.max(minW, Math.min(maxW, width));
+    };
+    const applyWidth = (width) => {
+      split.style.setProperty('--models-list-width', clampWidth(width) + 'px');
+    };
+
+    const saved = parseInt(localStorage.getItem('modelsListWidth') || '', 10);
+    if (Number.isFinite(saved) && saved > 0) {
+      const migrated = localStorage.getItem('modelsListWidthV2') === '1';
+      const width = !migrated && saved < defaultW ? defaultW : saved;
+      applyWidth(width);
+      if (!migrated) {
+        localStorage.setItem('modelsListWidthV2', '1');
+        localStorage.setItem('modelsListWidth', Math.round(clampWidth(width)));
+      }
+    } else {
+      applyWidth(defaultW);
+      localStorage.setItem('modelsListWidthV2', '1');
+    }
+
+    let startX = 0;
+    let startW = 0;
+
+    handle.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      startX = e.clientX;
+      startW = list.getBoundingClientRect().width;
+      handle.classList.add('dragging');
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', (e) => {
+      if (!handle.classList.contains('dragging')) return;
+      applyWidth(startW + (e.clientX - startX));
+    });
+
+    document.addEventListener('mouseup', () => {
+      if (!handle.classList.contains('dragging')) return;
+      handle.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      const width = Math.round(list.getBoundingClientRect().width);
+      localStorage.setItem('modelsListWidth', width);
+    });
+  }
+
+  // =========================================
+  // Initialize
+  // =========================================
+
+  // Show the build version (from /api/health) in the sidebar, so the UI tracks
+  // the binary instead of a hardcoded number. The same response carries the
+  // effective configured HF endpoint, which lets the Model Details header work
+  // even when /api/settings has not resolved yet or has failed.
+  async function loadAppVersion() {
+    try {
+      const res = await fetch('/api/health');
+      if (!res.ok) return;
+      const data = await res.json();
+      const el = $('#appVersion');
+      if (el && data.version) el.textContent = 'v' + data.version;
+      const endpoint = typeof data.endpoint === 'string' ? data.endpoint.trim() : '';
+      if (!endpoint) return;
+      // Settings are authoritative once they have successfully supplied the
+      // endpoint (including the default). A health response that resolves late
+      // must not overwrite that remembered value with its stale startup state.
+      if (!state.settingsEndpointResolved) state.serverEndpoint = endpoint;
+      syncSelectedModelHeader();
+    } catch (_) { /* leave blank if unavailable */ }
+  }
+
+  function init() {
+    initNavigation();
+    initSidebarResize();
+    initModelsListResize();
+    if (!isFilePreview()) {
+      initWebSocket();
+    } else {
+      updateConnectionStatus(false);
+      const statusText = $('#connectionStatus .status-text');
+      if (statusText) statusText.textContent = 'Preview';
+    }
+    initModelsPage();      // unified: analyze + search + download
+    initCachePage();
+    initSettingsPage();
+    bindJobsSpeed();
+    initMirrorPage();
+    initModal();
+    loadAppVersion();
+
+    // Load initial data
+    if (!isFilePreview()) {
+      loadJobs();
+      loadModelsSearch();    // populate models list on startup
+    }
+    navigateTo(getInitialPage());
+  }
+
+  // Start
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+})();
