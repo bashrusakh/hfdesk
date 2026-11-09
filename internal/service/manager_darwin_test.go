@@ -4482,16 +4482,35 @@ func TestLaunchdRegistrationArgumentValueAcceptsBothArgumentForms(t *testing.T) 
 		})
 	}
 
-	// The first occurrence of a flag decides, whichever form it uses, and
-	// an equals value keeps everything after the first "=".
+	// The EFFECTIVE occurrence of a flag decides — the last one, the value
+	// the run parser makes effective, whichever form it uses — and an equals
+	// value keeps everything after the first "=".
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		wantList string
+	}{
+		{"repeated paired words", []string{"/usr/local/bin/hfdesk", "--listen", "127.0.0.1:9090", "--listen", "127.0.0.1:9999"}, "127.0.0.1:9999"},
+		{"repeated equals forms", []string{"/usr/local/bin/hfdesk", "--listen=127.0.0.1:9090", "--listen=127.0.0.1:9999"}, "127.0.0.1:9999"},
+		{"equals then paired", []string{"/usr/local/bin/hfdesk", "--listen=127.0.0.1:9090", "--listen", "127.0.0.1:9999"}, "127.0.0.1:9999"},
+		{"paired then equals", []string{"/usr/local/bin/hfdesk", "--listen", "127.0.0.1:9090", "--listen=127.0.0.1:9999"}, "127.0.0.1:9999"},
+	} {
+		t.Run("the effective occurrence: "+tc.name, func(t *testing.T) {
+			registration := plistRegistration{ProgramArguments: tc.args}
+			if got := registration.listen(); got != tc.wantList {
+				t.Errorf("listen() = %q, want the effective occurrence %q", got, tc.wantList)
+			}
+		})
+	}
+
 	registration := plistRegistration{ProgramArguments: []string{
 		"/usr/local/bin/hfdesk",
 		"--listen", "127.0.0.1:9090",
 		"--listen=127.0.0.1:9999",
 		"--cache-dir=/srv/a=b",
 	}}
-	if got := registration.listen(); got != "127.0.0.1:9090" {
-		t.Errorf("listen() = %q, want the first occurrence %q", got, "127.0.0.1:9090")
+	if got := registration.listen(); got != "127.0.0.1:9999" {
+		t.Errorf("listen() = %q, want the effective occurrence %q", got, "127.0.0.1:9999")
 	}
 	if got := registration.cacheDir(); got != "/srv/a=b" {
 		t.Errorf("cacheDir() = %q, want the value after the first \"=\"", got)

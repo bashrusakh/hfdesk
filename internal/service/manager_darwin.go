@@ -2482,20 +2482,28 @@ func (r plistRegistration) executable() string {
 //
 // Both registered forms carry the same setting: the paired words
 // ("--listen", "127.0.0.1:9090") and the equals form a hand-edited or
-// foreign property list may carry ("--listen=127.0.0.1:9090"). The first
-// occurrence of the flag decides, whichever form it uses, so a reinstall
-// reads the setting instead of silently dropping it. An equals form keeps
-// everything after the first "=" as the value.
+// foreign property list may carry ("--listen=127.0.0.1:9090"). The LAST
+// occurrence of the flag decides, whichever form it uses: the run parser
+// (parseRunArgsValues, the stdlib flag parser `service run` reads the
+// canonical vector with) makes the last occurrence effective, so this
+// reader preserves the value the instance really runs with instead of the
+// first, non-effective one. A paired word consumes the next argument the
+// way the run parser does, so that value is not read again as a flag, and
+// an equals form keeps everything after the first "=".
 func (r plistRegistration) argumentValue(flag string) string {
-	for i, arg := range r.ProgramArguments {
+	effective := ""
+	for i := 0; i < len(r.ProgramArguments); i++ {
+		arg := r.ProgramArguments[i]
 		if value, ok := strings.CutPrefix(arg, flag+"="); ok {
-			return value
+			effective = value
+			continue
 		}
 		if arg == flag && i+1 < len(r.ProgramArguments) {
-			return r.ProgramArguments[i+1]
+			effective = r.ProgramArguments[i+1]
+			i++
 		}
 	}
-	return ""
+	return effective
 }
 
 // listen returns the bind address of the registration.
