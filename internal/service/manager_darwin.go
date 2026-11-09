@@ -1122,11 +1122,11 @@ type launchdInstallPlan struct {
 //     list and touches the supervisor not at all: the stopped instance stays
 //     stopped, and starting stays an explicit command.
 //
-// The disabled flag of the override database is cleared afterwards only while
-// the job is loaded: a disabled job would never start, and an enable does not
-// start anything by itself. A repeat installation that left the job unloaded
-// never touches the flag, so the override state of a stopped instance is
-// preserved as well.
+// The disabled flag of the override database is cleared only by a first
+// installation: the job it loads must be able to start, and a repeat
+// installation never runs enable, so an administrator's `launchctl disable`
+// survives every update whether or not the attempt loaded the job. The
+// rollback below still restores the flag state it captured.
 //
 // The report tells a rollback what the attempt did to the supervisor: the
 // state the registration had before it and whether that state was captured,
@@ -1200,14 +1200,11 @@ func (m *launchdManager) load(ctx context.Context, path string, plan launchdInst
 		state.replaced = true
 	}
 
-	// A job that was disabled in the override database of launchd would
-	// never start, so the disabled flag is cleared explicitly — but only
-	// while the job is loaded, because that is the state the flag applies
-	// to and that is the only state an installation loaded it into before.
-	// The flag is cleared for the job that is in the domain now; it is
-	// never cleared for a job an installation did not load, and clearing it
-	// never starts anything by itself.
-	if loadedNow := state.bootstrapped || (previous.loaded && !state.replaced); loadedNow {
+	// A first installation enables the job it registered: that is the only
+	// installation that runs enable, so the flag is cleared for the job the
+	// first installation loads and never for a job a repeat installation
+	// found, and clearing the flag never starts anything by itself.
+	if plan.firstInstall {
 		if _, err := m.launchctl(ctx, "enable", m.target()); err != nil {
 			return state, fmt.Errorf("service: enable %s: %w", m.target(), err)
 		}

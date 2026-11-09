@@ -4336,7 +4336,9 @@ func TestLaunchdRepeatInstallRestartsARunningInstance(t *testing.T) {
 	// The commands an update of a running instance issues: the state of
 	// the registration is read, the instance is stopped the way a stop
 	// stops it, and the registration is loaded and started the way a start
-	// starts it.
+	// starts it. A repeat installation never runs enable — the autostart
+	// state it found is preserved by non-interference — so no enable
+	// appears here.
 	restart := []string{
 		"print " + launchd.target(),
 		"print-disabled " + launchd.domain(),
@@ -4347,7 +4349,6 @@ func TestLaunchdRepeatInstallRestartsARunningInstance(t *testing.T) {
 		"print " + launchd.target(),
 		"bootstrap " + launchd.domain() + " " + launchd.plistPath(),
 		"kickstart " + launchd.target(),
-		"enable " + launchd.target(),
 	}
 
 	// The update names nothing: the registration bytes do not change, and
@@ -4384,6 +4385,78 @@ func TestLaunchdRepeatInstallRestartsARunningInstance(t *testing.T) {
 	registration = darwinReadRegistration(t, launchd)
 	if registration.executable() != next.Executable {
 		t.Errorf("the executable = %q, want the request %q", registration.executable(), next.Executable)
+	}
+}
+
+// TestLaunchdFirstInstallEnablesTheRegistration pins the enablement side of
+// the autostart rule: the first installation registers the job and clears
+// the launchctl disable flag of the label it loads, so the instance can
+// start at boot. The fixture starts with the flag set: a first installation
+// that never runs enable leaves it in place, which this test denies.
+func TestLaunchdFirstInstallEnablesTheRegistration(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{disabled: true}
+	launchd.run = fake.run
+	ctx := context.Background()
+
+	program := darwinTempInstallOptions(t, t.TempDir())
+	if _, err := launchd.Install(ctx, program); err != nil {
+		t.Fatalf("Install() as a first installation: %v", err)
+	}
+
+	want := []string{
+		"print " + launchd.target(),
+		"print-disabled " + launchd.domain(),
+		"bootstrap " + launchd.domain() + " " + launchd.plistPath(),
+		"enable " + launchd.target(),
+	}
+	if !reflect.DeepEqual(fake.commands, want) {
+		t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
+	}
+	if fake.disabled {
+		t.Error("the first installation left the disabled flag of the override database set")
+	}
+	if !fake.running {
+		t.Error("the first installation did not register its instance into service")
+	}
+}
+
+// TestLaunchdRepeatInstallKeepsTheDisabledFlag pins the autostart rule of a
+// repeat installation on macOS: an update over a loaded registration that
+// does not run touches the override database not at all, so an
+// administrator's launchctl disable survives the update — the same
+// non-interference the systemd and Windows installations apply to their
+// autostart state.
+//
+// The fixture starts with the flag set and the property list unchanged: an
+// update that runs enable clears the flag and issues the enable command,
+// which is exactly the behavior this test denies.
+func TestLaunchdRepeatInstallKeepsTheDisabledFlag(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{loaded: true, disabled: true}
+	launchd.run = fake.run
+	ctx := context.Background()
+
+	program := darwinTempInstallOptions(t, t.TempDir())
+	darwinWriteRegistrationWithRunAtLoad(t, launchd, program, false)
+
+	fake.commands = nil
+	if _, err := launchd.Install(ctx, program); err != nil {
+		t.Fatalf("Install() over a loaded stopped instance: %v", err)
+	}
+	for _, command := range fake.commands {
+		if command == "enable "+launchd.target() {
+			t.Errorf("the repeat installation issued %q, want no enable: the found autostart state is preserved", command)
+		}
+	}
+	if !fake.disabled {
+		t.Error("the repeat installation cleared the disabled flag of the override database")
+	}
+	if !fake.loaded {
+		t.Error("the loaded registration was not left loaded")
+	}
+	if fake.running {
+		t.Error("the repeat installation started the stopped instance")
 	}
 }
 
