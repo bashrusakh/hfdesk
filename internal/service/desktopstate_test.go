@@ -373,3 +373,65 @@ func TestLiveServingDesktopFailsClosedOnAClaimItCannotRead(t *testing.T) {
 	})
 }
 
+// TestPublishedStateFileBelongsToOneSession pins the per-session claim file
+// through its discriminating counterexample: session A publishes a live
+// claim, session B ends and removes its own claim — with the shared
+// per-user file B's cleanup deleted A's claim and the guard of session A
+// went blind — and A's claim must survive B's cleanup and still refuse.
+// The scope is driven through the seam: the real Windows session identity
+// is not exercisable on this host.
+func TestPublishedStateFileBelongsToOneSession(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	t.Setenv("HOME", root)
+	t.Setenv("AppData", root)
+	t.Setenv("LOCALAPPDATA", root)
+
+	previousScope := publishedStateScope
+	t.Cleanup(func() { publishedStateScope = previousScope })
+	previousClaim := claimStatePath
+	claimStatePath = PublishedStatePath
+	t.Cleanup(func() { claimStatePath = previousClaim })
+
+	const sessionA = "S-1-5-21-test.1"
+	const sessionB = "S-1-5-21-test.2"
+
+	pathInSession := func(scope string) string {
+		publishedStateScope = func() string { return scope }
+		return PublishedStatePath()
+	}
+	if pathA, pathB := pathInSession(sessionA), pathInSession(sessionB); pathA == pathB {
+		t.Fatalf("two sessions of one user share the claim file %q", pathA)
+	}
+
+	// Session A publishes a live claim (the process of this test run).
+	publishedStateScope = func() string { return sessionA }
+	if err := PublishState(PublishedStatePath(), "http://127.0.0.1:8080"); err != nil {
+		t.Fatalf("session A publishes its claim: %v", err)
+	}
+
+	// Session B ends and removes ITS claim: with the shared file this was
+	// the counterexample — A's live claim disappeared and the guard of
+	// session A proceeded while A served.
+	publishedStateScope = func() string { return sessionB }
+	RemovePublishedState(PublishedStatePath())
+
+	publishedStateScope = func() string { return sessionA }
+	if _, err := os.Stat(PublishedStatePath()); err != nil {
+		t.Fatalf("session B's cleanup left session A's claim unreadable: %v", err)
+	}
+	if !LiveServingDesktop(true) {
+		t.Error("one session's cleanup removed the live claim of the other session: the guard of session A went blind")
+	}
+
+	// A stale cross-session file refuses nothing in its own session: only
+	// the liveness of the claim's process decides, in both sessions.
+	publishedStateScope = func() string { return sessionB }
+	stale := `{"url":"","pid":` + strconv.Itoa(exitedProcessPID(t)) + `}`
+	if err := os.WriteFile(PublishedStatePath(), []byte(stale), 0o600); err != nil {
+		t.Fatalf("session B writes its stale claim: %v", err)
+	}
+	if LiveServingDesktop(true) {
+		t.Error("a stale claim of another session refused the mutation in its own session")
+	}
+}

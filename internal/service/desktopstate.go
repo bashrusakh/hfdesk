@@ -37,13 +37,30 @@ type PublishedState struct {
 	PID int `json:"pid"`
 }
 
-// PublishedStatePath returns the path of the published state file.
+// PublishedStatePath returns the path of the published state file of this
+// session.
 //
-// The file lives in the per user configuration directory, so two users of
-// the same machine never share it.
+// The file lives in the per user configuration directory and its name
+// carries the session scope of the desktop that publishes it — the same
+// user-and-session identity the per-session desktop singleton is named with —
+// so two users never share it, and two sessions of one user never share it
+// either: the exit of a desktop removes only its own claim and can neither
+// hide nor delete the claim of another session. A platform without a desktop
+// host has no session to name and keeps the plain per-user file name.
 func PublishedStatePath() string {
-	return filepath.Join(server.AppConfigDir(), "desktop-state.json")
+	scope := publishedStateScope()
+	if scope == "" {
+		return filepath.Join(server.AppConfigDir(), "desktop-state.json")
+	}
+	return filepath.Join(server.AppConfigDir(), "desktop-state."+scope+".json")
 }
+
+// publishedStateScope is the session scope the claim file name carries.
+//
+// It is a variable so the tests can drive the cross-session behavior of the
+// claim file on a host whose real Windows session identity they cannot
+// exercise; the platform files own the real answer.
+var publishedStateScope = currentPublishedStateScope
 
 // PublishState writes the claim of this instance: the effective URL when
 // the server has one, always the process id that identifies it. An empty
