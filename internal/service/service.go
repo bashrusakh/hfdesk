@@ -293,8 +293,11 @@ type InstallOptions struct {
 	// ExpectedVersion is the version the started instance must report; empty
 	// and "dev" leave readiness as it was.
 	ExpectedVersion string
-	// Created and VersionVerified are results of Manager.Install, not inputs: a
-	// caller may remove only a registration the installation created itself.
+	// Created and VersionVerified are results of Manager.Install, not inputs:
+	// Created reports that THIS installation made the registration (its first
+	// one) — a caller may remove only a registration the installation created
+	// itself — and an update over an existing registration reports false on
+	// every platform.
 	Created         bool
 	VersionVerified bool
 }

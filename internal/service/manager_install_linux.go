@@ -305,6 +305,10 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 		}
 		return opts, err
 	}
+	// The unit file did not exist before this attempt when no registration
+	// was registered: the same result the other platforms report, so a
+	// caller may remove only what this installation created.
+	opts.Created = !registered
 	opts.VersionVerified = registrationResult.versionVerified
 	return opts, nil
 }

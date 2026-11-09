@@ -798,8 +798,14 @@ func TestSystemdReinstallOfAStoppedUnitDoesNotStartIt(t *testing.T) {
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
 
-	if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
+	updated, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+	if err != nil {
 		t.Fatalf("Install() = %v, want nil", err)
+	}
+	// Finding 3: the registration existed before this attempt — a repeat
+	// installation reports Created=false.
+	if updated.Created {
+		t.Error("the update of an existing registration reported Created=true")
 	}
 
 	content, err := os.ReadFile(unitPath)
@@ -1025,8 +1031,13 @@ func TestSystemdFreshInstallNeverStartsTheInstance(t *testing.T) {
 
 	m := &systemdManager{scope: ScopeUser}
 	systemdLoadedFromDiskSeam(t, m)
-	_, err := m.Install(context.Background(), systemdTempInstallOptions(t, root))
+	installed, err := m.Install(context.Background(), systemdTempInstallOptions(t, root))
 	assertNoError(t, err, "Install() = %v, want nil", err)
+	// Finding 3: the first installation created the registration — the
+	// result every platform reports.
+	if !installed.Created {
+		t.Error("the first installation reported Created=false, want true")
+	}
 
 	calls := systemdSupervisorCalls(t, logPath)
 	if got := systemdSupervisorCallsTo(calls, "enable", unitName); got != 1 {
