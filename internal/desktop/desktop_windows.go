@@ -18,6 +18,7 @@ import (
 
 	"github.com/bashrusakh/hfdesk/internal/app"
 	"github.com/bashrusakh/hfdesk/internal/logging"
+	"github.com/bashrusakh/hfdesk/internal/service"
 	"github.com/energye/systray"
 	"golang.org/x/sys/windows"
 )
@@ -78,6 +79,7 @@ func Run(o Options) error {
 func run(o Options, logPath string) (err error) {
 	var pipeline *logging.Pipeline
 	var shutdown func()
+	var shutdownCoordinator desktopShutdownCoordinator
 
 	// logFailure reports the failure of the persistent log to the user. It
 	// is assigned when the pipeline is installed, and it is called before
@@ -88,7 +90,7 @@ func run(o Options, logPath string) (err error) {
 	// The state path is the path of the published state file. It is
 	// computed before anything of the host starts, so every goroutine of
 	// the host reads a path that never changes.
-	statePath := publishedStatePath()
+	statePath := service.PublishedStatePath()
 
 	// The guard ends the host after a panic: it removes the published
 	// state, stops the server through the normal path and closes the log
@@ -96,15 +98,13 @@ func run(o Options, logPath string) (err error) {
 	//
 	// The shutdown is missing only while the host has not reached the
 	// server yet, and the server is started after the shutdown exists, so
-	// a missing shutdown means that no server is running: the process
-	// never ends with a running server that was not stopped through the
-	// graceful path.
+	// a missing shutdown means that no server is running.
 	guard := panicGuard{
 		logPath: logPath,
 		end: func() {
-			removePublishedState(statePath)
+			service.RemovePublishedState(statePath)
 			if shutdown != nil {
-				stopServer(shutdown)
+				stopDesktopServer(shutdown, &shutdownCoordinator)
 			}
 			closePipeline(pipeline, logFailure)
 		},
@@ -133,6 +133,10 @@ func run(o Options, logPath string) (err error) {
 	// log file break its rotation, because the rename of the rotation
 	// fails while the other process holds the file, and a failed
 	// rotation stops the persistent log.
+	// A lock that exists but cannot be accessed is a different failure
+	// than a lock this identity could not create: the report names the
+	// other Windows identity that holds the object, and the launch still
+	// starts no server.
 	lock, err := acquireInstanceLock()
 	if err != nil {
 		// The logging pipeline does not exist yet, so the failure cannot
@@ -140,7 +144,7 @@ func run(o Options, logPath string) (err error) {
 		// surface the user has, and it names no log file, because there
 		// is none.
 		reportStartupFailure("HFDesk could not start",
-			fmt.Sprintf("HFDesk could not create its single instance lock.\n\n%v", err), "")
+			instanceLockStartupText(err), "")
 		return err
 	}
 	defer lock.Release()
@@ -197,6 +201,19 @@ func run(o Options, logPath string) (err error) {
 		showSubsystemWarning(subsystemWarningText)
 	}
 
+	// The Windows service binds the same address, so the gate reads the
+	// registration before the application is created: a launch that finds one
+	// asks the user what to do and ends without starting a server — except a
+	// positively confirmed stopped service whose dialog was answered with the
+	// desktop mode, which continues this launch like a launch without a
+	// registration and never starts the service. It runs after the logging
+	// pipeline (its records are the support material of the launch) and before
+	// app.New, the first step that can create a server. A launch that ends
+	// here publishes no state.
+	if !serviceGate(lock.name) {
+		return nil
+	}
+
 	application, err := app.New(o.App, o.Version)
 	if err != nil {
 		reportStartupFailure("HFDesk could not start",
@@ -231,8 +248,26 @@ func run(o Options, logPath string) (err error) {
 	var shutdownOnce sync.Once
 	shutdown = func() {
 		shutdownOnce.Do(func() {
+			handover, committed := shutdownCoordinator.beginShutdown()
 			cancel()
-			if err := application.Wait(); err != nil {
+			if committed {
+				defer handover.close()
+				err := completeHandoverWithNotice(handover, func() error {
+					waitErr := application.Wait()
+					if waitErr != nil {
+						desktopLog.Error("the server did not stop cleanly before service installation", "error", waitErr)
+					}
+					handoverErr := application.WaitForHandover()
+					if waitErr != nil && handoverErr == nil {
+						return waitErr
+					}
+					return handoverErr
+				})
+				handover.close()
+				if err != nil {
+					reportServiceHandoverFailure(err)
+				}
+			} else if err := application.Wait(); err != nil {
 				desktopLog.Error("the server did not stop cleanly", "error", err)
 			}
 			// The runtime window is closed after the server stopped, so
@@ -281,14 +316,22 @@ func run(o Options, logPath string) (err error) {
 	}
 
 	url := application.URL()
-	desktopLog.Info("the desktop host started", "url", url, "logFile", logPath)
 
 	// The effective URL is published, so a second launch can open the web
-	// UI of this instance.
-	if err := publishState(statePath, url); err != nil {
-		desktopLog.Warn("could not publish the effective URL", "path", statePath, "error", err)
+	// UI of this instance. A host that cannot publish it must not serve:
+	// the mutation guard of this session reads the published state, so a
+	// serving desktop without one would let a service mutation start the
+	// service beside it. The failure stops the server through the graceful
+	// path, reports it like every other startup failure and ends the launch.
+	defer service.RemovePublishedState(statePath)
+	if err := publishServingState(statePath, url, func() {
+		stopDesktopServer(shutdown, &shutdownCoordinator)
+	}); err != nil {
+		reportStartupFailure("HFDesk could not start", publishStateStartupText(err), logPath)
+		return err
 	}
-	defer removePublishedState(statePath)
+
+	desktopLog.Info("the desktop host started", "url", url, "logFile", logPath)
 
 	if o.App.ShouldOpenUI() {
 		if err := application.OpenBrowser(); err != nil {
@@ -347,13 +390,11 @@ func run(o Options, logPath string) (err error) {
 				"HFDesk could not create its icon in the notification area.\n\n"+
 					"The desktop host needs the icon in the notification area to be reachable, so it stops.",
 				windows.MB_ICONERROR)
-			removePublishedState(statePath)
+			service.RemovePublishedState(statePath)
 			// The server is already serving: it is stopped through the
 			// normal path, so the jobs are quiesced, the HTTP drain
-			// runs and the job state is flushed. The wait is bounded,
-			// so a server that does not stop cannot keep the host from
-			// ending.
-			stopServer(shutdown)
+			// runs and the job state is flushed.
+			stopDesktopServer(shutdown, &shutdownCoordinator)
 			closePipeline(pipeline, logFailure)
 			os.Exit(1)
 		}
@@ -375,6 +416,31 @@ func run(o Options, logPath string) (err error) {
 			// comes up.
 			go guard.runBackground(func() {
 				showRuntimeWindow(window, url, webview2Ready)
+			})
+		},
+		install: func() {
+			// The confirmation, the prompt of the user account control and
+			// the graceful shutdown all take a moment, and the shutdown has
+			// to run outside the message loop of the tray. The action
+			// therefore runs on a goroutine of its own.
+			//
+			// The host commits shutdown only after the elevated helper has
+			// opened its wait handles and acknowledged readiness. Earlier
+			// failures leave the running desktop untouched; after commit,
+			// every quit path joins persistence and the helper still requires
+			// both successful completion and this process's exit.
+			go guard.runBackground(func() {
+				handover := installServiceFromTray(lock.name)
+				if handover == nil {
+					return
+				}
+				if !shutdownCoordinator.commit(handover) {
+					handover.close()
+					serviceInstallRunning.Store(false)
+					desktopLog.Info("service handover was not committed because desktop shutdown already started")
+					return
+				}
+				requestQuit()
 			})
 		},
 		quit: requestQuit,
