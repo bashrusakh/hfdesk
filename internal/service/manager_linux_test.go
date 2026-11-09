@@ -160,6 +160,13 @@ func waitForState(t *testing.T, ctx context.Context, m *systemdManager, want Sta
 //
 // The log path is returned. It is written even when the supervisor is asked
 // for a property only, so a test can tell a restart from a state query.
+//
+// When HFDESK_TEST_SYSTEMCTL_TAMPER_UNIT names a file and
+// HFDESK_TEST_SYSTEMCTL_TAMPER_MARKER a path that does not exist yet, the
+// first call of the fake appends one line to that file and creates the
+// marker, so the file changes exactly once between the snapshot of an
+// installation and the re-read that guards the atomic write. Every other
+// test leaves both variables unset and the fake never touches a unit file.
 func systemdRecordingSupervisor(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -167,6 +174,13 @@ func systemdRecordingSupervisor(t *testing.T) string {
 	script := `#!/bin/sh
 if [ -n "$HFDESK_TEST_SYSTEMCTL_LOG" ]; then
 	printf '%s\n' "$*" >> "$HFDESK_TEST_SYSTEMCTL_LOG" || exit 1
+fi
+if [ -n "$HFDESK_TEST_SYSTEMCTL_TAMPER_UNIT" ] && [ ! -e "$HFDESK_TEST_SYSTEMCTL_TAMPER_MARKER" ] && [ -e "$HFDESK_TEST_SYSTEMCTL_TAMPER_UNIT" ]; then
+	# A seam for the TOCTOU guard: the file this installation snapshotted
+	# is rewritten exactly once by "another installer" before the first
+	# supervisor command of the update reaches the manager.
+	: > "$HFDESK_TEST_SYSTEMCTL_TAMPER_MARKER" || exit 1
+	printf '# a concurrent installation wrote this file\n' >> "$HFDESK_TEST_SYSTEMCTL_TAMPER_UNIT" || exit 1
 fi
 if [ "$1" = "--user" ]; then
 	shift
