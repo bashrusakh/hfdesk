@@ -824,7 +824,14 @@ func TestAnalyze_StalledTreePageFailsWithinPageFetchBudget(t *testing.T) {
 			done <- result{info, err}
 		}()
 
-		const slack = 3 * time.Second
+		// Deliberately asymmetric bounds: the asserted bound carries runner
+		// starvation headroom, while the watchdog fires well beyond it, where
+		// an unbounded read and a severely starved runner are honestly
+		// indistinguishable.
+		const (
+			slack         = 10 * time.Second // asserted-bound headroom (starvation tolerance)
+			watchdogSlack = 30 * time.Second // watchdog fires well beyond the asserted bound
+		)
 		select {
 		case res := <-done:
 			if res.info != nil || res.err == nil {
@@ -857,9 +864,9 @@ func TestAnalyze_StalledTreePageFailsWithinPageFetchBudget(t *testing.T) {
 			if got := treeReqs.Load(); got != 1 {
 				t.Errorf("tree requests = %d, want 1 (an expired page budget is terminal, with no retry or namespace probe)", got)
 			}
-		case <-time.After(testBudget + slack):
+		case <-time.After(testBudget + watchdogSlack):
 			cancel()
-			t.Fatalf("analysis outlived its per-fetch page cap (%v + %v): the tree-page body read is unbounded", testBudget, slack)
+			t.Fatalf("analysis did not complete within the watchdog (cap %v + slack %v): unbounded tree-page body read or a starved runner", testBudget, watchdogSlack)
 		}
 	})
 

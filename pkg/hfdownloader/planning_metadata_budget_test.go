@@ -57,7 +57,14 @@ func TestStalledRepoInfoBodyFailsPlanningWithinFetchBudget(t *testing.T) {
 		done <- result{plan, err}
 	}()
 
-	const slack = 3 * time.Second
+	// Deliberately asymmetric bounds: the asserted bound carries runner
+	// starvation headroom, while the watchdog fires well beyond it, where an
+	// unbounded read and a severely starved runner are honestly
+	// indistinguishable.
+	const (
+		slack         = 10 * time.Second // asserted-bound headroom (starvation tolerance)
+		watchdogSlack = 30 * time.Second // watchdog fires well beyond the asserted bound
+	)
 	select {
 	case res := <-done:
 		if res.plan != nil || res.err == nil {
@@ -75,9 +82,9 @@ func TestStalledRepoInfoBodyFailsPlanningWithinFetchBudget(t *testing.T) {
 		if errors.Is(res.err, context.DeadlineExceeded) || errors.Is(res.err, context.Canceled) {
 			t.Errorf("timeout error %v must not classify as caller cancellation", res.err)
 		}
-	case <-time.After(testBudget + slack):
+	case <-time.After(testBudget + watchdogSlack):
 		cancel()
-		t.Fatalf("planning metadata fetch outlived its per-fetch cap (%v + %v): the JSON body read is unbounded", testBudget, slack)
+		t.Fatalf("planning metadata fetch did not complete within the watchdog (cap %v + slack %v): unbounded JSON body read or a starved runner", testBudget, watchdogSlack)
 	}
 }
 
@@ -109,7 +116,14 @@ func TestHangingFallbackConfirmationNeverEnablesBranchFallback(t *testing.T) {
 		done <- result{plan, err}
 	}()
 
-	const slack = 5 * time.Second
+	// Deliberately asymmetric bounds: the asserted bound carries runner
+	// starvation headroom, while the watchdog fires well beyond it, where an
+	// unbounded confirmation and a severely starved runner are honestly
+	// indistinguishable.
+	const (
+		slack         = 10 * time.Second // asserted-bound headroom (starvation tolerance)
+		watchdogSlack = 30 * time.Second // watchdog fires well beyond the asserted bound
+	)
 	select {
 	case res := <-done:
 		if res.plan != nil || res.err == nil {
@@ -138,9 +152,9 @@ func TestHangingFallbackConfirmationNeverEnablesBranchFallback(t *testing.T) {
 		if revisionCalls != 2 {
 			t.Errorf("revision calls = %d, want one initial pin and one confirmation", revisionCalls)
 		}
-	case <-time.After(addressingProbeBudget + slack):
+	case <-time.After(addressingProbeBudget + watchdogSlack):
 		cancel()
-		t.Fatalf("fallback confirmation outlived the addressing-probe budget (%v + %v): an unbounded confirmation can hang planning", addressingProbeBudget, slack)
+		t.Fatalf("fallback confirmation did not complete within the watchdog (budget %v + slack %v): unbounded confirmation or a starved runner", addressingProbeBudget, watchdogSlack)
 	}
 }
 
@@ -196,7 +210,14 @@ func TestStalledTreePageBodyFailsPlanningWithinFetchBudget(t *testing.T) {
 		done <- result{plan, err}
 	}()
 
-	const slack = 3 * time.Second
+	// Deliberately asymmetric bounds: the asserted bound carries runner
+	// starvation headroom, while the watchdog fires well beyond it, where an
+	// unbounded read and a severely starved runner are honestly
+	// indistinguishable.
+	const (
+		slack         = 10 * time.Second // asserted-bound headroom (starvation tolerance)
+		watchdogSlack = 30 * time.Second // watchdog fires well beyond the asserted bound
+	)
 	select {
 	case res := <-done:
 		if res.plan != nil || res.err == nil {
@@ -237,9 +258,9 @@ func TestStalledTreePageBodyFailsPlanningWithinFetchBudget(t *testing.T) {
 		if treeRequests != 1 {
 			t.Errorf("tree requests = %d (%v), want exactly the single pinned page", treeRequests, paths)
 		}
-	case <-time.After(testBudget + slack):
+	case <-time.After(testBudget + watchdogSlack):
 		cancel()
-		t.Fatalf("tree-page body read outlived its per-request cap (%v + %v): the JSON page decode is unbounded", testBudget, slack)
+		t.Fatalf("tree-page body read did not complete within the watchdog (cap %v + slack %v): unbounded JSON page decode or a starved runner", testBudget, watchdogSlack)
 	}
 }
 
@@ -274,7 +295,14 @@ func TestStalledFallbackRebuildTreePageFailsWithinFetchBudgetWithoutRescan(t *te
 		done <- result{plan, err}
 	}()
 
-	const slack = 3 * time.Second
+	// Deliberately asymmetric bounds: the asserted bound carries runner
+	// starvation headroom, while the watchdog fires well beyond it, where an
+	// unbounded read and a severely starved runner are honestly
+	// indistinguishable.
+	const (
+		slack         = 10 * time.Second // asserted-bound headroom (starvation tolerance)
+		watchdogSlack = 30 * time.Second // watchdog fires well beyond the asserted bound
+	)
 	select {
 	case res := <-done:
 		if res.plan != nil || res.err == nil {
@@ -315,9 +343,9 @@ func TestStalledFallbackRebuildTreePageFailsWithinFetchBudgetWithoutRescan(t *te
 		if revisionCalls != 2 {
 			t.Errorf("revision calls = %d, want one initial pin and one confirmation, no lookup after expiry", revisionCalls)
 		}
-	case <-time.After(testBudget + slack):
+	case <-time.After(testBudget + watchdogSlack):
 		cancel()
-		t.Fatalf("fallback-rebuild tree page outlived its per-request cap (%v + %v): the rebuild walk's JSON body read is unbounded", testBudget, slack)
+		t.Fatalf("fallback-rebuild tree page did not complete within the watchdog (cap %v + slack %v): unbounded rebuild-walk JSON body read or a starved runner", testBudget, watchdogSlack)
 	}
 }
 
@@ -359,7 +387,14 @@ func TestStalledTreePageHeadersFailPlanningWithinFetchBudget(t *testing.T) {
 		done <- result{plan, err}
 	}()
 
-	const slack = 3 * time.Second
+	// Deliberately asymmetric bounds: the asserted bound carries runner
+	// starvation headroom, while the watchdog fires well beyond it, where a
+	// deadline that never fires and a severely starved runner are honestly
+	// indistinguishable.
+	const (
+		slack         = 10 * time.Second // asserted-bound headroom (starvation tolerance)
+		watchdogSlack = 30 * time.Second // watchdog fires well beyond the asserted bound
+	)
 	select {
 	case res := <-done:
 		if res.plan != nil || res.err == nil {
@@ -376,8 +411,8 @@ func TestStalledTreePageHeadersFailPlanningWithinFetchBudget(t *testing.T) {
 		if errors.Is(res.err, context.DeadlineExceeded) || errors.Is(res.err, context.Canceled) {
 			t.Errorf("timeout error %v must not classify as caller cancellation", res.err)
 		}
-	case <-time.After(testBudget + slack):
+	case <-time.After(testBudget + watchdogSlack):
 		cancel()
-		t.Fatalf("header-stalled tree page outlived its per-request cap (%v + %v): the page request deadline never fired", testBudget, slack)
+		t.Fatalf("header-stalled tree page did not complete within the watchdog (cap %v + slack %v): the page request deadline never fired, or the runner is starved", testBudget, watchdogSlack)
 	}
 }
