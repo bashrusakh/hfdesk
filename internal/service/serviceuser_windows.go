@@ -71,33 +71,52 @@ func processUserSID() (string, error) {
 	return user.User.Sid.String(), nil
 }
 
-// holdDesktopSingleton holds the per-session desktop singleton object of
-// HoldDesktopSingleton for the calling process.
-//
-// The object is created with the descriptor of the desktop host's own
-// instance lock — the user of the process with full mutex access, the
-// administrators and the system with read control — so the hold behaves
-// exactly like that lock: a launch of the desktop app of the same identity
-// finds the object and reports the running instance, and the descriptor of an
-// existing object is never replaced. ERROR_ALREADY_EXISTS still returns a
-// live handle to the existing object, and that handle is exactly the hold
-// this path needs: the operating system keeps the object until the last
-// handle closes, which is how the hold outlives the mutation it protects.
-func holdDesktopSingleton(name string) (func(), error) {
+// resolveDesktopSingletonName returns the object name to operate on: the
+// given name, or the name of the session of this process for an unnamed
+// caller.
+func resolveDesktopSingletonName(name string) (string, error) {
 	if strings.TrimSpace(name) == "" {
 		computed, err := DesktopSingletonName()
 		if err != nil {
-			return nil, fmt.Errorf("service: the per-session desktop singleton cannot be named: %w", err)
+			return "", fmt.Errorf("the per-session desktop singleton cannot be named: %w", err)
 		}
-		name = computed
+		return computed, nil
 	}
+	return name, nil
+}
+
+// desktopSingletonObjectPointer encodes the name of the singleton object.
+func desktopSingletonObjectPointer(name string) (*uint16, error) {
 	namePtr, err := windows.UTF16PtrFromString(name)
 	if err != nil {
-		return nil, fmt.Errorf("service: the desktop singleton %q is not a valid Windows object name: %w", name, err)
+		return nil, fmt.Errorf("the desktop singleton %q is not a valid Windows object name: %w", name, err)
 	}
+	return namePtr, nil
+}
+
+// openDesktopSingletonForMutation opens the per-session desktop singleton:
+// it creates the object when it does not exist and opens the existing one
+// otherwise, and reports whether it already existed — the fact that proves
+// another process of this session held the object, because the kernel object
+// dies with the last handle of its holders.
+//
+// The object is created with the descriptor of the desktop host's own
+// instance lock — the user of the process with full mutex access, the
+// administrators and the system with read control — and the descriptor of an
+// existing object is never replaced.
+//
+// A create request that Windows denies did so because the object exists and
+// belongs to a token outside the descriptor's full-access entry (for example
+// a helper elevated under another administrator account): the existing
+// object is then opened with the read-control access the descriptor grants
+// to the administrators. Any open handle keeps the object alive, which is
+// all a hold needs, and this path never waits on the object. Only when even
+// that open fails is the access denial returned to the caller, and a denied
+// request reports the object as pre-existing either way.
+func openDesktopSingletonForMutation(name string, namePtr *uint16) (windows.Handle, bool, error) {
 	attrs, descriptor, err := desktopSingletonObjectSecurity()
 	if err != nil {
-		return nil, fmt.Errorf("service: secure the desktop singleton %q: %w", name, err)
+		return 0, false, fmt.Errorf("secure the desktop singleton %q: %w", name, err)
 	}
 	handle, err := windows.CreateMutex(attrs, false, namePtr)
 	runtime.KeepAlive(descriptor)
@@ -105,20 +124,58 @@ func holdDesktopSingleton(name string) (func(), error) {
 		if err == nil {
 			err = errors.New("the operating system returned no handle")
 		}
-		// The object is created with a descriptor this process owns, so a
-		// refusal to create it is a refusal to open an object that exists
-		// and belongs to another identity: the hold is refused before the
-		// mutation, with the reason and the step that ends it.
 		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
-			return nil, fmt.Errorf(
-				"service: the desktop singleton %q exists but this Windows identity cannot access it: another HFDesk process under a different Windows account created it; end that process and try again%w",
-				name, ErrSingletonAccessDenied)
+			limited, openErr := windows.OpenMutex(windows.READ_CONTROL, false, namePtr)
+			if openErr == nil && limited != 0 {
+				return limited, true, nil
+			}
+			return 0, true, err
 		}
-		return nil, fmt.Errorf("service: hold the desktop singleton %q during the service mutation: %w", name, err)
+		return 0, false, err
 	}
 	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
 		_ = windows.CloseHandle(handle)
-		return nil, fmt.Errorf("service: hold the desktop singleton %q during the service mutation: %w", name, err)
+		return 0, false, err
+	}
+	return handle, errors.Is(err, windows.ERROR_ALREADY_EXISTS), nil
+}
+
+// holdDesktopSingleton holds the per-session desktop singleton object of
+// HoldDesktopSingleton for the calling process.
+//
+// The object is the desktop host's instance lock, so a launch of the desktop
+// app of the same identity finds the object and reports the running
+// instance; ERROR_ALREADY_EXISTS still returns a live handle to the existing
+// object, and that handle is exactly the hold this path needs: the operating
+// system keeps the object until the last handle closes, which is how the
+// hold outlives the mutation it protects. An object owned by another
+// Windows identity is held through its read-control open (see
+// openDesktopSingletonForMutation); an object this identity cannot open at
+// all ends the hold with ErrSingletonAccessDenied, before the mutation.
+func holdDesktopSingleton(name string) (func(), error) {
+	resolved, err := resolveDesktopSingletonName(name)
+	if err != nil {
+		return nil, fmt.Errorf("service: %w", err)
+	}
+	namePtr, err := desktopSingletonObjectPointer(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("service: %w", err)
+	}
+	handle, _, err := openDesktopSingletonForMutation(resolved, namePtr)
+	if handle == 0 {
+		if err == nil {
+			err = errors.New("the operating system returned no handle")
+		}
+		// The fallback open of the mutation also failed, so this identity
+		// cannot touch an object that exists and belongs to another
+		// identity: the hold is refused before the mutation, with the
+		// reason and the step that ends it.
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			return nil, fmt.Errorf(
+				"service: the desktop singleton %q exists but this Windows identity cannot access it: another HFDesk process under a different Windows account created it; end that process and try again%w",
+				resolved, ErrSingletonAccessDenied)
+		}
+		return nil, fmt.Errorf("service: hold the desktop singleton %q during the service mutation: %w", resolved, err)
 	}
 	return func() {
 		if handle != 0 {

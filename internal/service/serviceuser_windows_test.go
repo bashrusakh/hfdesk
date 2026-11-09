@@ -143,11 +143,100 @@ func TestHoldDesktopSingletonReportsAnIdentityThatCannotAccessTheObject(t *testi
 	}
 }
 
+// TestHoldDesktopSingletonHoldsAnObjectOfAnotherIdentityThroughReadControl
+// proves the cross-identity side of the hold: an object whose descriptor
+// grants this identity read control only denies the full-access create
+// request, and the hold still succeeds through the limited open — any handle
+// keeps the object alive, which is all a hold needs — while the descriptor
+// itself stays untouched: the administrators keep read control and nothing
+// more. Without the fallback the hold would refuse although the rights model
+// allows it.
+func TestHoldDesktopSingletonHoldsAnObjectOfAnotherIdentityThroughReadControl(t *testing.T) {
+	const name = `Local\HFDesk.Test.ServiceLimited.1`
+	sid, err := processUserSID()
+	if err != nil {
+		t.Fatalf("read the user of the process: %v", err)
+	}
+	fixture := createReadControlMutex(t, name, sid)
+
+	release, err := HoldDesktopSingleton(name)
+	if err != nil {
+		t.Fatalf("the hold refused although its descriptor grants this identity read control: %v", err)
+	}
+	if release == nil {
+		t.Fatal("a successful hold returned no release")
+	}
+
+	// The creator of the object is gone: only the hold keeps it alive, so
+	// the probe below proves that the limited handle really is a hold.
+	_ = windows.CloseHandle(fixture)
+
+	namePtr, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		release()
+		t.Fatalf("encode the test singleton name: %v", err)
+	}
+	if handle, err := windows.OpenMutex(windows.READ_CONTROL, false, namePtr); err == nil {
+		_ = windows.CloseHandle(handle)
+	} else {
+		release()
+		t.Fatalf("the object did not survive its creator during the hold: %v", err)
+	}
+
+	release()
+	// A second release ends nothing instead of closing a handle twice.
+	release()
+
+	if handle, err := windows.OpenMutex(windows.READ_CONTROL, false, namePtr); err == nil {
+		_ = windows.CloseHandle(handle)
+		t.Fatal("the singleton object survived the release: a later launch would be refused as already running")
+	} else if !errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+		t.Fatalf("read the singleton after the release: %v", err)
+	}
+}
+
+// createReadControlMutex creates a named mutex whose descriptor grants this
+// identity read control only: the shape a singleton of this session has for
+// a hold that requested full mutex access — the request is denied, while the
+// limited access of the descriptor still opens the object. The fixture
+// handle is closed when the test ends unless the test closes it earlier, and
+// the object dies with its last handle.
+func createReadControlMutex(t *testing.T, name, sid string) windows.Handle {
+	t.Helper()
+	descriptor, err := windows.SecurityDescriptorFromString(
+		fmt.Sprintf("D:P(A;;0x%08X;;;%s)", uint32(windows.READ_CONTROL), sid))
+	if err != nil {
+		t.Fatalf("build the read-control descriptor: %v", err)
+	}
+	attrs := &windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: descriptor,
+	}
+	namePtr, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		t.Fatalf("encode the test singleton name: %v", err)
+	}
+	handle, err := windows.CreateMutex(attrs, false, namePtr)
+	if handle == 0 {
+		if err == nil {
+			err = errors.New("the operating system returned no handle")
+		}
+		t.Fatalf("create the read-control fixture object: %v", err)
+	}
+	if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		_ = windows.CloseHandle(handle)
+		t.Fatal("the fixture object already exists: the test would deny a real object")
+	}
+	t.Cleanup(func() { _ = windows.CloseHandle(handle) })
+	return handle
+}
+
 // createDeniedMutex creates a named mutex whose descriptor grants the object
 // to SYSTEM only: the identity of the test has no access to it, which is the
-// shape a singleton another Windows identity created has for this one. The
-// fixture handle is closed when the test ends, and the object dies with its
-// last handle.
+// shape a singleton another Windows identity created has for this one — the
+// object cannot be opened even with the limited read-control access, so the
+// hold refuses with ErrSingletonAccessDenied. The fixture handle is closed
+// when the test ends, and the object dies with its last handle.
 func createDeniedMutex(t *testing.T, name string) {
 	t.Helper()
 	descriptor, err := windows.SecurityDescriptorFromString(
