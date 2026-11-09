@@ -3096,6 +3096,115 @@ func TestServiceHelperRefusesAStartBesideAServingDesktop(t *testing.T) {
 	requireSingletonReleased(t)
 }
 
+// TestServiceHelperRefusesAnUpdateOfARunningServiceBesideAServingDesktop
+// proves the refusal still covers the outcome that restarts: an update over
+// a running instance stops and starts it beside the desktop that already
+// serves the address, so it ends before the first service step — only the
+// read of the state runs — and reports the result, the cause and the one
+// next action, without a second command.
+func TestServiceHelperRefusesAnUpdateOfARunningServiceBesideAServingDesktop(t *testing.T) {
+	requireFreeSingleton(t)
+	useTemporaryStateDir(t)
+	if err := service.PublishState(service.PublishedStatePath(), "http://127.0.0.1:1"); err != nil {
+		t.Fatalf("publish the state of the desktop instance: %v", err)
+	}
+
+	// The desktop instance of this session keeps the singleton held, so the
+	// probe around the hold of the action finds the object alive.
+	lock, err := acquireInstanceLock()
+	if err != nil {
+		t.Fatalf("acquire the desktop singleton of this session: %v", err)
+	}
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return `C:\portable\hfdesk.exe`, nil
+	})
+
+	running := runningServiceStatus(service.StateRunning, "127.0.0.1:18080")
+	manager := &fakeServiceManager{statuses: []service.Status{running}}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	err = RunServiceAction(ServiceActionOptions{Action: "update"})
+	lock.Release()
+	if err == nil {
+		t.Fatal("the update ran although a desktop instance of this session serves the address")
+	}
+	for _, step := range manager.steps {
+		if step != "status" {
+			t.Fatalf("the helper touched the service before its refusal, steps: %v", manager.steps)
+		}
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the helper showed %d message boxes, want the refusal of the update", len(*messages))
+	}
+	if caption := serviceFailureCaption(serviceActionUpdate); (*messages)[0].caption != caption {
+		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
+	}
+	text := (*messages)[0].text
+	for _, want := range []string{
+		"could not update", "No service action was performed",
+		"serves its local server", "notification-area icon",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the report %q does not mention %q", text, want)
+		}
+	}
+	if strings.Contains(text, "hfdesk service status") {
+		t.Errorf("the report %q carries a second next action next to the quit of the desktop", text)
+	}
+	requireSingletonReleased(t)
+}
+
+// TestServiceHelperUpdateOfAStoppedServiceProceedsBesideAServingDesktop
+// proves the narrowed side at the helper level: an update over a positively
+// confirmed stopped registration is a pure registration rewrite beside the
+// desktop that serves the address — both facts of the discriminator are
+// true here — so the rewrite runs its registration write, keeps the service
+// stopped and never starts anything.
+func TestServiceHelperUpdateOfAStoppedServiceProceedsBesideAServingDesktop(t *testing.T) {
+	requireFreeSingleton(t)
+	useTemporaryStateDir(t)
+	if err := service.PublishState(service.PublishedStatePath(), "http://127.0.0.1:1"); err != nil {
+		t.Fatalf("publish the state of the desktop instance: %v", err)
+	}
+
+	// The desktop instance of this session keeps the singleton held, so the
+	// probe around the hold of the action finds the object alive: both
+	// facts of the serving-desktop check are true in this test.
+	lock, err := acquireInstanceLock()
+	if err != nil {
+		t.Fatalf("acquire the desktop singleton of this session: %v", err)
+	}
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return `C:\portable\hfdesk.exe`, nil
+	})
+
+	stopped := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
+	manager := &fakeServiceManager{statuses: []service.Status{stopped, stopped}}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	runErr := RunServiceAction(ServiceActionOptions{Action: "update"})
+	lock.Release()
+	if runErr != nil {
+		t.Fatalf("the rewrite of a stopped registration refused beside a serving desktop: %v", runErr)
+	}
+	if manager.starts != 0 {
+		t.Errorf("the rewrite started the service %d times, want none", manager.starts)
+	}
+	if stepIndex(manager.steps, "install") < 0 {
+		t.Errorf("the rewrite did not run its registration write, steps: %v", manager.steps)
+	}
+	if len(*messages) != 1 || (*messages)[0].caption != serviceUpdatedCaption {
+		t.Fatalf("the helper showed %v, want the report of the finished update", *messages)
+	}
+	requireSingletonReleased(t)
+}
+
 // TestServiceHelperStartProceedsWhenNoDesktopHoldsTheSingleton proves the
 // preserved side of the same discriminator: a published state whose holder
 // is gone — the state file of a crashed desktop — meets a fresh probe and

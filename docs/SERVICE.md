@@ -309,9 +309,17 @@ elevation: the instance belongs to the user who runs the command.
 
 On Windows, `install`, `start` and `restart` also refuse — before the
 service is touched — while a desktop instance of HFDesk serves its address:
-the service would fight that desktop for the address. The refusal changes
-nothing and names the one step that ends it: quit HFDesk from its
-notification-area icon and repeat the command.
+the service would fight that desktop for the address. The refusal covers
+the outcomes that start or restart the service: `start` and `restart`
+always, `install` for a first registration (the registration it writes may
+start the instance) and `install` over a running instance (which the
+installation restarts); the elevated helper's update follows the same rule.
+An `install` or update over an existing registration that is positively
+confirmed stopped only rewrites the registration — it starts nothing — and
+proceeds beside that desktop, while any state that is not positively
+stopped (or cannot be read) fails closed with the same refusal. Every
+refusal changes nothing and names the one step that ends it: quit HFDesk
+from its notification-area icon and repeat the command.
 
 **Uninstall never deletes user data.** It removes the registration and nothing
 else: not the models, not the cache, not the config file, not the jobs or the

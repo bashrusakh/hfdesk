@@ -321,11 +321,16 @@ func updateWindowsService(reporter *serviceActionReporter, version string) error
 	}
 	wasRunning := serviceStatusRunning(before)
 
-	// The installation over a running registration stops and restarts the
-	// instance beside whatever serves the address now: a desktop instance
-	// of this session that already serves it ends the action here, before
-	// the first step.
-	if service.LiveServingDesktop(reporter.singletonPreExisting) {
+	// The refusal covers the outcomes that start or restart the service:
+	// this update stops and restarts a running instance beside whatever
+	// serves the address now, so a desktop instance of this session that
+	// already serves it ends the action here, before the first step. An
+	// update over a positively confirmed stopped registration only
+	// rewrites the registration and starts nothing, so it proceeds beside
+	// that desktop; every state that is not positively stopped fails
+	// closed.
+	positivelyStopped := before.State == service.StateStopped && !wasRunning
+	if !positivelyStopped && service.LiveServingDesktop(reporter.singletonPreExisting) {
 		return reporter.servingDesktopRefused()
 	}
 

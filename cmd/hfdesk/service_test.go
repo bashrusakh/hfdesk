@@ -3288,25 +3288,36 @@ func (m *untouchedServiceManager) Restart(context.Context) error {
 }
 
 // TestServiceMutationRefusesWhenADesktopInstanceServes proves the CLI side
-// of the boundary for every command that starts or restarts the service: a
+// of the boundary for every outcome that starts or restarts the service: a
 // mutation whose probe found a singleton holder while a desktop state is
 // published refuses with the unchanged state, the cause and one next action,
 // and the service is never touched. Without the check the command would
-// start the service beside the desktop that serves the same address.
+// start the service beside the desktop that serves the same address. A
+// first installation, an installation over a running instance (which the
+// installation restarts) and an installation whose registration state
+// cannot be read all fail closed; start and restart always start or
+// restart and always refuse.
 func TestServiceMutationRefusesWhenADesktopInstanceServes(t *testing.T) {
 	program := temporaryServiceProgram(t)
 
 	for _, tc := range []struct {
-		name string
-		args []string
+		name      string
+		args      []string
+		status    service.Status
+		statusErr error
 	}{
-		{"install", []string{"install", "--system", "--executable", program}},
-		{"start", []string{"start"}},
-		{"restart", []string{"restart"}},
+		{"first install", []string{"install", "--system", "--executable", program},
+			service.Status{State: service.StateNotInstalled}, nil},
+		{"install over a running instance", []string{"install", "--system", "--executable", program},
+			service.Status{State: service.StateRunning, Running: true}, nil},
+		{"install over an unreadable registration state", []string{"install", "--system", "--executable", program},
+			service.Status{}, errors.New("the supervisor did not answer")},
+		{"start", []string{"start"}, service.Status{State: service.StateStopped}, nil},
+		{"restart", []string{"restart"}, service.Status{State: service.StateStopped}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			useFakeManager(t, &untouchedServiceManager{
-				fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+				fakeManager: fakeManager{status: tc.status, err: tc.statusErr},
 				t:           t,
 			})
 			useSingletonProbe(t, true)
@@ -3334,6 +3345,49 @@ func TestServiceMutationRefusesWhenADesktopInstanceServes(t *testing.T) {
 				t.Errorf("a refused command must not report a result:\n%s", stdout.String())
 			}
 		})
+	}
+}
+
+// TestServiceInstallOverAStoppedRegistrationProceedsBesideAServingDesktop
+// proves the narrowed side of the boundary: an installation over a
+// positively confirmed stopped registration is a pure registration rewrite
+// beside the desktop that serves the address — both discriminator facts of
+// the refusal are true in this test — so the rewrite proceeds with the
+// singleton held as before and never starts or restarts anything.
+func TestServiceInstallOverAStoppedRegistrationProceedsBesideAServingDesktop(t *testing.T) {
+	program := temporaryServiceProgram(t)
+
+	manager := &holdObservingManager{
+		fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+	}
+	useFakeManager(t, manager)
+	record := useRecordedHold(t)
+	manager.hold = record
+	useSingletonProbe(t, true)
+	writePublishedDesktopState(t)
+
+	var stdout, stderr bytes.Buffer
+	code := runServiceCommand([]string{"install", "--system", "--executable", program}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("the rewrite of a stopped registration must exit with 0, got %d:\n%s", code, stderr.String())
+	}
+	if !manager.observed["install"] {
+		t.Errorf("the installation did not run, observations: %v", manager.observed)
+	}
+	for _, operation := range []string{"start", "restart"} {
+		if _, ran := manager.observed[operation]; ran {
+			t.Errorf("the rewrite ran a %s beside the desktop that serves the address", operation)
+		}
+	}
+	if record.acquired != 1 || record.released != 1 {
+		t.Errorf("the hold was acquired %d times and released %d times, want one of each",
+			record.acquired, record.released)
+	}
+	if !strings.Contains(stdout.String(), "The service was registered.") {
+		t.Errorf("the rewrite did not report its registration:\n%s", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("the rewrite must not report a failure:\n%s", stderr.String())
 	}
 }
 

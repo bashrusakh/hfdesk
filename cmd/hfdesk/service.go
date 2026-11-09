@@ -837,11 +837,20 @@ func serviceInstall(args []string, stdout io.Writer) error {
 		return err
 	}
 	defer holdRelease()
-	// The command is about to start or restart the service: a desktop
-	// instance of this session that already serves the address ends the
-	// command here, before the first service step.
+	// The refusal covers the outcomes that start or restart the
+	// service: only an installation over a positively confirmed stopped
+	// registration — the observed stopped state with no running fact,
+	// the standard the desktop gate uses as well — is a pure rewrite
+	// that starts nothing and proceeds beside the desktop that serves
+	// the address. Every other answer fails closed: a first
+	// installation writes a registration its supervisor may start, a
+	// running instance is restarted on the new program, and a state
+	// that is not positively stopped cannot prove that nothing starts.
 	if service.LiveServingDesktop(singletonPreExisting) {
-		return servingDesktopRefusal()
+		status, statusErr := mgr.Status(ctx)
+		if statusErr != nil || status.State != service.StateStopped || status.Running {
+			return servingDesktopRefusal()
+		}
 	}
 
 	effective, err := mgr.Install(ctx, opts)
