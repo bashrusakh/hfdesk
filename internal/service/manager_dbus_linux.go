@@ -302,6 +302,64 @@ func loadedMatchesUnit(loaded systemdLoadedConfig, unit parsedUnit) error {
 	return nil
 }
 
+// detectExecStartOverride refuses an installation whose effective command a
+// drop-in owns: ExecStart is the field HFDesk owns, so a typed loaded
+// command that differs from the command of our own unit file is an override
+// in force, and HFDesk refuses before any change instead of overwriting it.
+// The file side is read like every unit file, the loaded side is the typed
+// D-Bus projection of registrationUnitConfig, and an unloaded unit has no
+// effective command to defend.
+func detectExecStartOverride(unitPath string, loaded systemdLoadedConfig, content []byte) error {
+	if !loaded.loaded {
+		return nil
+	}
+	if err := loadedMatchesUnit(loaded, parseUnit(string(content))); err != nil {
+		return execStartOverrideRefusal(unitPath, loaded)
+	}
+	return nil
+}
+
+// execStartOverrideRefusal states the result, the cause with the DropInPaths
+// the supervisor reports, and the one next action of the ownership contract.
+func execStartOverrideRefusal(unitPath string, loaded systemdLoadedConfig) error {
+	cause := fmt.Sprintf("the command systemd loads for %s is not the command in its unit file", unitName)
+	if loaded.dropInPathsKnown && len(loaded.dropInPaths) > 0 {
+		quoted := make([]string, 0, len(loaded.dropInPaths))
+		for _, dropIn := range loaded.dropInPaths {
+			quoted = append(quoted, fmt.Sprintf("%q", dropIn))
+		}
+		cause += fmt.Sprintf(" (drop-ins: %s)", strings.Join(quoted, ", "))
+	}
+	return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Move your customizations into %q and run %q again",
+		cause, unitDropInPath(unitPath), "hfdesk service install")
+}
+
+// detectForeignRegistration refuses a registration whose loaded unit does
+// not come from the unit file HFDesk writes: a vendor or generated fragment
+// under our unit name is not our registration and is never adopted, while a
+// unit systemd did not load has nothing to refuse.
+func detectForeignRegistration(unitPath string, loaded systemdLoadedConfig) error {
+	if !loaded.loaded {
+		return nil
+	}
+	if loaded.fragmentPathKnown && filepath.IsAbs(loaded.fragmentPath) &&
+		filepath.Clean(loaded.fragmentPath) == filepath.Clean(unitPath) {
+		return nil
+	}
+	return foreignRegistrationRefusal(unitPath, loaded)
+}
+
+// foreignRegistrationRefusal states the result, the cause with the fragment
+// systemd loaded, and the one next action of the ownership contract.
+func foreignRegistrationRefusal(unitPath string, loaded systemdLoadedConfig) error {
+	cause := fmt.Sprintf("the loaded registration of %s has no readable fragment of its own", unitName)
+	if loaded.fragmentPathKnown && filepath.IsAbs(loaded.fragmentPath) {
+		cause = fmt.Sprintf("systemd loads %s from %q, not from its unit file %q", unitName, loaded.fragmentPath, unitPath)
+	}
+	return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Move your customizations into %q and run %q again",
+		cause, unitDropInPath(unitPath), "hfdesk service install")
+}
+
 func sameSystemdLoadedConfig(a, b systemdLoadedConfig) bool {
 	return a.loaded == b.loaded && a.execPath == b.execPath && slices.Equal(a.execArgs, b.execArgs) &&
 		slices.Equal(a.execFlags, b.execFlags) && a.ignoreErrors == b.ignoreErrors &&

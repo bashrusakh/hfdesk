@@ -2561,3 +2561,116 @@ func TestSystemdReadCanonicalUnitRejectsNonCanonicalShapes(t *testing.T) {
 		})
 	}
 }
+
+// assertSingleDropInAction proves the refusal standard of the ownership
+// contract on one error: the result (refused, nothing changed), the path of
+// the refused state and exactly one real next action — the administrator
+// drop-in beside the unit and the installation command — with no
+// alternative offered.
+func assertSingleDropInAction(t *testing.T, err error, unitPath string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("the refusal = nil, want a refusal")
+	}
+	message := err.Error()
+	for _, want := range []string{
+		"the update was refused and the registration was not changed",
+		unitPath,
+		unitDropInPath(unitPath),
+		`run "hfdesk service install" again`,
+	} {
+		if !strings.Contains(message, want) {
+			t.Errorf("the refusal %q does not contain %q", message, want)
+		}
+	}
+	if strings.Contains(message, " or ") {
+		t.Errorf("the refusal %q offers an alternative instead of one action", message)
+	}
+	if got := strings.Count(message, "Move your customizations into"); got != 1 {
+		t.Errorf("the refusal %q states %d customization actions, want exactly one", message, got)
+	}
+}
+
+func TestSystemdDetectHandEditedUnit(t *testing.T) {
+	t.Setenv("HOME", "/home/golden")
+	unitPath := "/etc/systemd/system/hfdesk.service"
+
+	unit, err := detectHandEditedUnit(unitPath, []byte(canonicalGoldenUserUnitText), ScopeUser)
+	if err != nil {
+		t.Fatalf("detectHandEditedUnit() = %v, want the facts of the canonical unit", err)
+	}
+	if unit != canonicalGoldenUserUnit() {
+		t.Errorf("detectHandEditedUnit() = %+v, want %+v", unit, canonicalGoldenUserUnit())
+	}
+	if _, err := detectHandEditedUnit(unitPath, []byte(canonicalGoldenSystemUnitText), ScopeSystem); err != nil {
+		t.Errorf("detectHandEditedUnit() over the canonical machine-wide unit = %v, want nil", err)
+	}
+
+	base := canonicalGoldenUserUnitText
+	mutate := func(old, replacement string) string {
+		t.Helper()
+		if !strings.Contains(base, old) {
+			t.Fatalf("the golden fixture no longer holds %q", old)
+		}
+		return strings.Replace(base, old, replacement, 1)
+	}
+	notRendered := errUnitNotRendered.Error()
+	for _, tc := range []struct {
+		name    string
+		content string
+		wantErr string
+	}{
+		{"added comment", mutate("Type=simple\n", "Type=simple\n# administrator note\n"), notRendered},
+		{"added directive", mutate("Restart=on-failure\n", "Restart=on-failure\nRestartPreventExitStatus=42\n"), notRendered},
+		{"edited fixed directive", mutate("RestartSec=5s", "RestartSec=30s"), notRendered},
+		{"indented directive", mutate("ExecStart=", "  ExecStart="), notRendered},
+		{"env wrapper command", mutate(`ExecStart="/opt/hf desk/bin/100%%$$hf" service run`, `ExecStart="/usr/bin/env" -i HF_OFFLINE=1 "/opt/hf desk/bin/100%%$$hf" service run`), "not a program"},
+		{"specifier operand", mutate("--listen 127.0.0.1:18080", "--listen %h"), "carries a character"},
+		{"line continuation", mutate("Type=simple\n", "Type=simple\\\n"), "continuation"},
+		{"removed format marker", mutate("# format: 1\n", ""), "marker"},
+		{"reordered run flags", mutate(`--config "/opt/hf desk/etc/c\"fg.json" --state-dir "/opt/hf desk/var/lib\\dir"`, `--state-dir "/opt/hf desk/var/lib\\dir" --config "/opt/hf desk/etc/c\"fg.json"`), "--config"},
+		{"duplicate ExecStart", mutate("WorkingDirectory=", "ExecStart=x\nWorkingDirectory="), "more than one ExecStart"},
+		{"edited WorkingDirectory", mutate(`WorkingDirectory=/opt/hf desk/var/lib\dir`, "WorkingDirectory=/other"), "WorkingDirectory= holds"},
+		{"removed final newline", strings.TrimSuffix(base, "\n"), "final newline"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := detectHandEditedUnit(unitPath, []byte(tc.content), ScopeUser)
+			if err == nil {
+				t.Fatalf("detectHandEditedUnit() = nil, want a %q refusal", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("detectHandEditedUnit() = %q, want the refusal to mention %q", err, tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), "is not the unit HFDesk generates") {
+				t.Errorf("detectHandEditedUnit() = %q, want the cause to name the non-generated unit file", err)
+			}
+			assertSingleDropInAction(t, err, unitPath)
+		})
+	}
+}
+
+func TestUnitFileUnchanged(t *testing.T) {
+	snapshot := []byte("unit content\n")
+	for _, tc := range []struct {
+		name           string
+		snapshot       []byte
+		snapshotExists bool
+		current        []byte
+		currentExists  bool
+		want           bool
+	}{
+		{"absent and still absent", nil, false, nil, false, true},
+		{"unchanged file", snapshot, true, []byte("unit content\n"), true, true},
+		{"content changed", snapshot, true, []byte("unit changed\n"), true, false},
+		{"content grew", snapshot, true, []byte("unit content\nmore\n"), true, false},
+		{"file appeared", nil, false, []byte("unit content\n"), true, false},
+		{"file vanished", snapshot, true, nil, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := unitFileUnchanged(tc.snapshot, tc.snapshotExists, tc.current, tc.currentExists)
+			if got != tc.want {
+				t.Errorf("unitFileUnchanged() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

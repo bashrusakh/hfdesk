@@ -6,6 +6,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -744,6 +745,50 @@ func decodeCanonicalCommand(value string) ([]string, error) {
 		return nil, errors.New("the command holds no word")
 	}
 	return words, nil
+}
+
+// errUnitNotRendered classifies a file whose facts parse but whose bytes are
+// not the rendering of those facts: a line, spacing or directive outside the
+// canonical form.
+var errUnitNotRendered = errors.New("the file bytes are not the rendering of the settings they hold")
+
+// unitDropInPath returns the drop-in the ownership contract gives the
+// administrator beside the unit HFDesk writes; HFDesk never writes it.
+func unitDropInPath(unitPath string) string {
+	return filepath.Join(filepath.Dir(unitPath), unitName+".d", "local.conf")
+}
+
+// detectHandEditedUnit refuses a base file HFDesk did not render: the bytes
+// must be the canonical rendering of their own facts, so a hand edit, a
+// wrapper, a foreign version or a dynamic operand classifies as not ours
+// before anything is changed. The facts come back only for that exact form.
+func detectHandEditedUnit(unitPath string, content []byte, scope Scope) (canonicalUnit, error) {
+	unit, err := readCanonicalUnit(content, scope)
+	if err != nil {
+		return canonicalUnit{}, handEditedUnitRefusal(unitPath, err)
+	}
+	rendered, err := renderCanonicalUnit(unit)
+	if err != nil {
+		return canonicalUnit{}, handEditedUnitRefusal(unitPath, err)
+	}
+	if rendered != string(content) {
+		return canonicalUnit{}, handEditedUnitRefusal(unitPath, errUnitNotRendered)
+	}
+	return unit, nil
+}
+
+// handEditedUnitRefusal states the result, the cause with the round-trip
+// reason, and the one next action of the ownership contract.
+func handEditedUnitRefusal(unitPath string, reason error) error {
+	return fmt.Errorf("service: the update was refused and the registration was not changed: the unit file %q is not the unit HFDesk generates: %v. Move your customizations into %q and run %q again",
+		unitPath, reason, unitDropInPath(unitPath), "hfdesk service install")
+}
+
+// unitFileUnchanged is the TOCTOU guard of the atomic write: the file
+// re-read immediately before writeUnitFile must still be the snapshot the
+// update read — same existence, same bytes — or the write is refused.
+func unitFileUnchanged(snapshot []byte, snapshotExists bool, current []byte, currentExists bool) bool {
+	return snapshotExists == currentExists && bytes.Equal(snapshot, current)
 }
 
 type systemdDirectiveChange struct {

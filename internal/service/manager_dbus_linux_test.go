@@ -347,3 +347,135 @@ func setSystemdTypedPropertySequence(t *testing.T, manager *systemdManager, prop
 		return properties[index], nil
 	}
 }
+
+func TestSystemdDetectExecStartOverride(t *testing.T) {
+	unitPath := "/etc/systemd/system/hfdesk.service"
+	content := []byte(canonicalGoldenSystemUnitText)
+
+	matching, err := loadedConfigFromProperties(systemdTestPropertiesFromUnit(string(content)))
+	if err != nil {
+		t.Fatalf("decode the matching typed configuration: %v", err)
+	}
+	if err := detectExecStartOverride(unitPath, matching, content); err != nil {
+		t.Errorf("detectExecStartOverride() over the matching command = %v, want nil", err)
+	}
+	if err := detectExecStartOverride(unitPath, systemdLoadedConfig{}, content); err != nil {
+		t.Errorf("detectExecStartOverride() over an unloaded unit = %v, want nil", err)
+	}
+
+	parsed := parseUnit(string(content))
+	argv := append([]string{parsed.ExecStartRaw}, parsed.ExecArgsRaw...)
+	override := slices.Clone(argv)
+	for i, arg := range override {
+		if arg == "--config" {
+			override[i+1] = "/etc/admin/hfdesk.json"
+			break
+		}
+	}
+	if slices.Equal(override, argv) {
+		t.Fatal("the override fixture did not change the config operand")
+	}
+	driftedProperties := func(dropIns []string) map[string]dbus.Variant {
+		properties := systemdTestPropertiesFromUnit(string(content))
+		properties["ExecStartEx"] = dbus.MakeVariant([]systemdExecStartExEntry{{Path: argv[0], Argv: override}})
+		properties["DropInPaths"] = dbus.MakeVariant(dropIns)
+		return properties
+	}
+
+	t.Run("drop-in owns the effective command", func(t *testing.T) {
+		loaded, err := loadedConfigFromProperties(driftedProperties([]string{"/etc/systemd/system/hfdesk.service.d/local.conf"}))
+		if err != nil {
+			t.Fatalf("decode the typed override: %v", err)
+		}
+		err = detectExecStartOverride(unitPath, loaded, content)
+		if err == nil {
+			t.Fatal("detectExecStartOverride() = nil, want the refusal of an overridden command")
+		}
+		if !strings.Contains(err.Error(), `drop-ins: "/etc/systemd/system/hfdesk.service.d/local.conf"`) {
+			t.Errorf("the refusal %q does not name the DropInPaths the supervisor reported", err)
+		}
+		assertSingleDropInAction(t, err, unitPath)
+	})
+
+	t.Run("drift without a reported drop-in", func(t *testing.T) {
+		loaded, err := loadedConfigFromProperties(driftedProperties([]string{}))
+		if err != nil {
+			t.Fatalf("decode the typed override: %v", err)
+		}
+		err = detectExecStartOverride(unitPath, loaded, content)
+		if err == nil {
+			t.Fatal("detectExecStartOverride() = nil, want the fail-closed refusal of a drifted command")
+		}
+		if strings.Contains(err.Error(), "(drop-ins:") {
+			t.Errorf("the refusal %q names drop-ins the supervisor did not report", err)
+		}
+		assertSingleDropInAction(t, err, unitPath)
+	})
+
+	t.Run("command with loaded flags", func(t *testing.T) {
+		properties := systemdTestPropertiesFromUnit(string(content))
+		properties["ExecStartEx"] = dbus.MakeVariant([]systemdExecStartExEntry{{Path: argv[0], Argv: argv, Flags: []string{"full-privileges"}}})
+		loaded, err := loadedConfigFromProperties(properties)
+		if err != nil {
+			t.Fatalf("decode the typed command: %v", err)
+		}
+		err = detectExecStartOverride(unitPath, loaded, content)
+		if err == nil {
+			t.Fatal("detectExecStartOverride() = nil, want the refusal of a command the file does not describe")
+		}
+		assertSingleDropInAction(t, err, unitPath)
+	})
+}
+
+func TestSystemdDetectForeignRegistration(t *testing.T) {
+	unitPath := "/etc/systemd/system/hfdesk.service"
+
+	if err := detectForeignRegistration(unitPath, systemdLoadedConfig{}); err != nil {
+		t.Errorf("detectForeignRegistration() over an unloaded unit = %v, want nil", err)
+	}
+	ours := systemdLoadedConfig{loaded: true, fragmentPathKnown: true, fragmentPath: unitPath}
+	if err := detectForeignRegistration(unitPath, ours); err != nil {
+		t.Errorf("detectForeignRegistration() over our own fragment = %v, want nil", err)
+	}
+
+	t.Run("vendor fragment under our name", func(t *testing.T) {
+		loaded := systemdLoadedConfig{
+			loaded: true, fragmentPathKnown: true,
+			fragmentPath: "/usr/lib/systemd/system/hfdesk.service",
+		}
+		err := detectForeignRegistration(unitPath, loaded)
+		if err == nil {
+			t.Fatal("detectForeignRegistration() = nil, want the refusal of a foreign fragment")
+		}
+		for _, want := range []string{"/usr/lib/systemd/system/hfdesk.service", unitPath} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal %q does not name %q", err, want)
+			}
+		}
+		assertSingleDropInAction(t, err, unitPath)
+	})
+
+	t.Run("unreadable fragment", func(t *testing.T) {
+		loaded := systemdLoadedConfig{loaded: true}
+		err := detectForeignRegistration(unitPath, loaded)
+		if err == nil {
+			t.Fatal("detectForeignRegistration() = nil, want the fail-closed refusal of an unproved source")
+		}
+		if !strings.Contains(err.Error(), "no readable fragment") {
+			t.Errorf("the refusal %q does not state the unreadable fragment", err)
+		}
+		assertSingleDropInAction(t, err, unitPath)
+	})
+
+	t.Run("relative fragment", func(t *testing.T) {
+		loaded := systemdLoadedConfig{loaded: true, fragmentPathKnown: true, fragmentPath: "hfdesk.service"}
+		err := detectForeignRegistration(unitPath, loaded)
+		if err == nil {
+			t.Fatal("detectForeignRegistration() = nil, want the refusal of a fragment outside our unit path")
+		}
+		if !strings.Contains(err.Error(), "no readable fragment") {
+			t.Errorf("the refusal %q does not state the unproved fragment", err)
+		}
+		assertSingleDropInAction(t, err, unitPath)
+	})
+}
