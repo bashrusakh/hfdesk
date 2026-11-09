@@ -409,10 +409,26 @@ func TestJobManagerCloseWaitsForTerminalHistoryAndReportsWriteFailures(t *testin
 			if err := m.Close(ctx); !errors.Is(err, context.Canceled) {
 				t.Fatalf("Close while terminal history is blocked = %v, want context.Canceled", err)
 			}
+			// The close coordinator (finishClose) may close closeDone
+			// only after the runner releases runWG, and the runner
+			// holds runWG for the whole history write — but the check
+			// has to give the coordinator goroutine a window to run
+			// before it can observe that it waits: an instant
+			// nonblocking select could pass while the goroutine is
+			// still unscheduled, which proves nothing either way.
+			// There is no in-process signal of the coordinator before
+			// the history is released — its first actions are
+			// WaitGroup waits, and its first observable call (the
+			// final persistStateFile) happens only after the drain —
+			// so a bounded observation is the strongest evidence this
+			// test can hold without a production seam. The window
+			// cannot fail on a correct coordinator: closeDone closes
+			// only behind runWG.Wait, which the blocked runner keeps
+			// closed for the whole window.
 			select {
 			case <-m.closeDone:
 				t.Fatal("close completed before the terminal history write")
-			default:
+			case <-time.After(time.Second):
 			}
 
 			releaseHistory()
