@@ -339,8 +339,10 @@ func TestServiceUpdatedTextReportsARunningService(t *testing.T) {
 }
 
 // TestServiceUpdatedTextNamesTheObservedPriorState proves that the report of a
-// successful update that did not leave the service running names the prior
-// state the update actually observed instead of restating it as "stopped".
+// successful update that did not leave the service running carries both
+// established facts of that state: it names the prior state the update
+// actually observed instead of restating it as "stopped", and it says that the
+// not-running service stays stopped.
 //
 // An update over a registration whose state was "failed", or "broken" without a
 // running instance, rewrites the registration and starts nothing. The report of
@@ -348,7 +350,13 @@ func TestServiceUpdatedTextReportsARunningService(t *testing.T) {
 // never had — although the helper tracked the observed state. The report keeps
 // the shape of these notices (result, cause, one next action), quotes the
 // observed state the way the failure reports of these actions already do, and
-// keeps the warning that nothing serves HFDesk now.
+// keeps both facts of the not-running outcome: the observed prior state and
+// that the update leaves a service that was not running not running.
+//
+// The forbidden claim is the false prior state — that this registration was
+// observed stopped — and not the word "stopped": the established Windows
+// oracle of these reports requires the sentence that the service stays
+// stopped, and a matcher that forbade the word would contradict it.
 func TestServiceUpdatedTextNamesTheObservedPriorState(t *testing.T) {
 	const address = "http://127.0.0.1:8080"
 	for _, tc := range []struct {
@@ -366,6 +374,7 @@ func TestServiceUpdatedTextNamesTheObservedPriorState(t *testing.T) {
 				tc.quote,
 				"is not running after the update",
 				"never starts a service that was not running",
+				"stays stopped",
 				"Nothing serves HFDesk right now",
 				"Start the desktop app again and choose Start service",
 				"hfdesk service start",
@@ -375,8 +384,11 @@ func TestServiceUpdatedTextNamesTheObservedPriorState(t *testing.T) {
 					t.Errorf("the report %q does not mention %q", text, want)
 				}
 			}
-			if strings.Contains(text, "stopped") {
-				t.Errorf("the report %q claims the service was stopped, want the observed prior state %q", text, tc.before)
+			// The only false claim this report must never carry is the
+			// prior state it did not observe: this registration was
+			// %q, never stopped.
+			if strings.Contains(text, "it was stopped before the update") {
+				t.Errorf("the report %q claims the service was stopped before the update, want the observed prior state %q", text, tc.before)
 			}
 			if strings.Contains(text, address) {
 				t.Errorf("the report %q sends the user to the address of a service that does not run", text)

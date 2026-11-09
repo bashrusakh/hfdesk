@@ -368,12 +368,14 @@ func serviceUpdatedText(version, console, dataDir, address string, running bool,
 // service that was stopped before the update keeps the sentence it always had.
 // Any other observed prior state is quoted as what the supervisor reported
 // instead of being restated as "stopped", the way the failure reports of these
-// actions already name a prior state.
+// actions already name a prior state. Every not-running report also says that
+// the service stays stopped: an update never starts a service that was not
+// running, so a report that lost that fact would leave it unstated.
 func serviceUpdateNotRunningReport(before service.State) string {
 	if before == service.StateStopped {
 		return "The service stays stopped: it was stopped before the update, and an update never starts a stopped service. Nothing serves HFDesk right now."
 	}
-	return fmt.Sprintf("The service is not running after the update: it was %q before the update, and an update never starts a service that was not running. Nothing serves HFDesk right now.", before)
+	return fmt.Sprintf("The service is not running after the update: it was %q before the update, and an update never starts a service that was not running, so the service stays stopped. Nothing serves HFDesk right now.", before)
 }
 
 // serviceStartedText returns the report of a started service.
