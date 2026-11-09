@@ -7,6 +7,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -124,9 +125,7 @@ func TestSCMHandlerWaitsForTheHostWhenTheReadinessFails(t *testing.T) {
 	// HTTP server of the instance: the readiness of the instance fails and
 	// it fails for sure, because the port belongs to the test.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Listen() = %v, want nil", err)
 	defer listener.Close()
 	go func() {
 		for {
@@ -162,7 +161,10 @@ func TestSCMHandlerWaitsForTheHostWhenTheReadinessFails(t *testing.T) {
 	// The host never outlives the test, not even when the test fails
 	// before it releases the host.
 	t.Cleanup(releaseHost)
-	handler.run = func(ctx context.Context, opts RunOptions) error {
+	handler.run = func(ctx context.Context, opts RunOptions, listening chan<- struct{}) error {
+		// The host never binds its own listener: the address of the
+		// instance belongs to the test, so the own-liveness signal
+		// stays open for the whole life of this host.
 		close(started)
 		<-ctx.Done()
 		close(cancelled)
@@ -384,9 +386,7 @@ func TestResolveOptionsFallsBackToTheHandedOverOptions(t *testing.T) {
 	handler := newSCMHandler(RunOptions{Paths: model, Listen: "127.0.0.1:8080"})
 
 	opts, err := handler.resolveOptions([]string{ServiceName})
-	if err != nil {
-		t.Fatalf("resolveOptions() = %v, want nil", err)
-	}
+	assertNoError(t, err, "resolveOptions() = %v, want nil", err)
 	if opts.Paths != model {
 		t.Errorf("the paths = %+v, want %+v", opts.Paths, model)
 	}
@@ -412,9 +412,7 @@ func TestResolveOptionsReadsTheRegisteredArguments(t *testing.T) {
 		"--log-dir", model.LogDir,
 		"--listen", "127.0.0.1:9090",
 	})
-	if err != nil {
-		t.Fatalf("resolveOptions() = %v, want nil", err)
-	}
+	assertNoError(t, err, "resolveOptions() = %v, want nil", err)
 	if opts.Paths != model {
 		t.Errorf("the paths = %+v, want %+v", opts.Paths, model)
 	}
@@ -423,74 +421,348 @@ func TestResolveOptionsReadsTheRegisteredArguments(t *testing.T) {
 	}
 }
 
-// TestSCMProbeAddressMapsTheWildcardBindOntoTheLoopback checks the address
-// the readiness probe dials.
+// scmTestServe starts an HTTP server of the test on the given address.
 //
-// A wildcard bind has no address a client can connect to: 0.0.0.0 and ::
-// are the addresses every interface answers on, and a connect() to them
-// fails with WSAEADDRNOTAVAIL. The probe therefore dials the loopback
-// address of the same family, and every other host is used unchanged.
-func TestSCMProbeAddressMapsTheWildcardBindOntoTheLoopback(t *testing.T) {
-	cases := []struct {
-		name   string
-		listen string
-		want   string
-	}{
-		{"the IPv4 wildcard", "0.0.0.0:8080", "127.0.0.1:8080"},
-		{"the IPv6 wildcard", "[::]:8080", "[::1]:8080"},
-		{"an empty host", ":8080", "127.0.0.1:8080"},
-		{"an IPv4 loopback", "127.0.0.1:8080", "127.0.0.1:8080"},
-		{"an IPv6 loopback", "[::1]:8080", "[::1]:8080"},
-		{"an address of the network", "192.168.1.5:8080", "192.168.1.5:8080"},
-		{"a host name", "localhost:8080", "localhost:8080"},
-		{"no address at all", "", DefaultListen},
+// The server answers the readiness probe of the handler with the health
+// document of HFDesk, so the handler reports the instance as running without
+// the real host of the service. The server is closed when the test ends.
+func scmTestServe(t *testing.T, addr string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", addr)
+	assertNoError(t, err, "Listen(%q) = %v, want nil", addr, err)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// The probe of an instance proves the server and not merely a
+		// listener: an answer that is not the health document of HFDesk is
+		// a failed readiness.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","version":"test"}`))
+	})}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+}
+
+// scmTestHandlerOptions returns the argument vector of an instance of the test
+// that listens on the given address.
+func scmTestHandlerOptions(t *testing.T, addr string) []string {
+	t.Helper()
+	root := t.TempDir()
+	model := runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   filepath.Join(root, "var"),
+		LogDir:     filepath.Join(root, "var", "logs"),
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := scmProbeAddress(tc.listen); got != tc.want {
-				t.Errorf("scmProbeAddress(%q) = %q, want %q", tc.listen, got, tc.want)
-			}
-		})
+	t.Cleanup(runtimepaths.Reset)
+	return []string{
+		ServiceName,
+		"service", "run",
+		"--config", model.ConfigFile,
+		"--state-dir", model.StateDir,
+		"--log-dir", model.LogDir,
+		"--listen", addr,
 	}
 }
 
-// TestProbeServiceReadyReachesAWildcardListener checks that the readiness
-// probe reaches a server that binds every interface of the machine.
+// TestSCMHandlerReportsACleanStopWhenTheShutdownFails checks the exit code of a
+// stop the manager requested while the orderly shutdown reports an error.
 //
-// The server answers with the status of the basic authentication of the
-// instance: the probe accepts every answer, because the point of the probe
-// is that an HTTP server listens on the address and not that it answers
-// with a particular code.
-func TestProbeServiceReadyReachesAWildcardListener(t *testing.T) {
-	cases := []struct {
-		name string
-		bind string
-		host string
-	}{
-		{"the IPv4 wildcard", "0.0.0.0:0", "0.0.0.0"},
-		{"the IPv6 wildcard", "[::]:0", "::"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			listener, err := net.Listen("tcp", tc.bind)
-			if err != nil {
-				t.Skipf("the address %q cannot be bound: %v", tc.bind, err)
-			}
-			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusUnauthorized)
-			})}
-			go func() {
-				_ = server.Serve(listener)
-			}()
-			t.Cleanup(func() {
-				_ = server.Close()
-			})
+// A stop the user asked for is a clean end: the instance reports the stopped
+// state with the exit code 0 and returns 0, so the recovery of the platform,
+// which also keys on a non-zero exit code, never restarts a service the user
+// stopped. The error of the shutdown is written to the event log instead.
+func TestSCMHandlerReportsACleanStopWhenTheShutdownFails(t *testing.T) {
+	addr := "127.0.0.1:" + strconv.Itoa(freePort(t))
+	scmTestServe(t, addr)
 
-			port := listener.Addr().(*net.TCPAddr).Port
-			listen := net.JoinHostPort(tc.host, strconv.Itoa(port))
-			if err := probeServiceReady(listen); err != nil {
-				t.Errorf("probeServiceReady(%q) = %v, want nil for a server that binds %q", listen, err, tc.bind)
+	handler := newSCMHandler(RunOptions{})
+	handler.readinessTimeout = 5 * time.Second
+	handler.run = func(ctx context.Context, _ RunOptions, listening chan<- struct{}) error {
+		// The host binds its own listener, the way the host of the
+		// instance reports it before it serves.
+		close(listening)
+		<-ctx.Done()
+		return errors.New("the orderly shutdown of the test reported an error")
+	}
+
+	changes := make(chan svc.Status, 16)
+	requests := make(chan svc.ChangeRequest)
+	args := scmTestHandlerOptions(t, addr)
+	done := make(chan uint32, 1)
+	go func() {
+		_, code := handler.Execute(args, requests, changes)
+		done <- code
+		close(changes)
+	}()
+
+	// The manager asks the instance to stop once it runs: the request is
+	// sent after the running state was reported, so the stop path of a
+	// running instance is the one the test drives.
+	var statuses []svc.Status
+	for status := range changes {
+		statuses = append(statuses, status)
+		if status.State == svc.Running {
+			requests <- svc.ChangeRequest{Cmd: svc.Stop}
+		}
+	}
+	if code := <-done; code != scmExitCodeOK {
+		t.Errorf("the exit code = %d, want %d for a stop the manager requested", code, scmExitCodeOK)
+	}
+	stopped := scmTestLastStatus(t, statuses, svc.Stopped)
+	if stopped.Win32ExitCode != scmExitCodeOK {
+		t.Errorf("the exit code of the stopped status = %d, want %d: a stop the manager requested is never a recovery signal", stopped.Win32ExitCode, scmExitCodeOK)
+	}
+}
+
+// TestSCMHandlerReportsAFailureExitCodeWhenTheStartFails checks the exit code of
+// an instance whose HTTP server never answered.
+//
+// The failure is reported with the stopped state as well as returned: the
+// recovery of the platform that also covers a non-crash failure keys on the
+// code, and a failed start has to reach it even when nothing but the reported
+// status is read.
+func TestSCMHandlerReportsAFailureExitCodeWhenTheStartFails(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	assertNoError(t, err, "Listen() = %v, want nil", err)
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
 			}
-		})
+			_ = conn.Close()
+		}
+	}()
+	addr := listener.Addr().String()
+
+	handler := newSCMHandler(RunOptions{})
+	handler.readinessTimeout = 50 * time.Millisecond
+	handler.readinessInterval = 10 * time.Millisecond
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	handler.run = func(ctx context.Context, _ RunOptions, listening chan<- struct{}) error {
+		<-ctx.Done()
+		<-release
+		return nil
+	}
+
+	requests := make(chan svc.ChangeRequest, 1)
+	changes := make(chan svc.Status, 16)
+	args := scmTestHandlerOptions(t, addr)
+	done := make(chan uint32, 1)
+	go func() {
+		_, code := handler.Execute(args, requests, changes)
+		done <- code
+		close(changes)
+	}()
+
+	// The handler waits for the host before it reports the stopped state,
+	// so the host is released once the start failed.
+	var statuses []svc.Status
+	for status := range changes {
+		statuses = append(statuses, status)
+		unblock()
+	}
+	if code := <-done; code != scmExitCodeFailure {
+		t.Errorf("the exit code = %d, want %d for a failed start", code, scmExitCodeFailure)
+	}
+	stopped := scmTestLastStatus(t, statuses, svc.Stopped)
+	if stopped.Win32ExitCode != scmExitCodeFailure {
+		t.Errorf("the exit code of the stopped status = %d, want %d for a failed start", stopped.Win32ExitCode, scmExitCodeFailure)
+	}
+}
+
+// TestSCMHandlerReportsAFailureExitCodeWhenTheHostFails checks the exit code of
+// an instance whose host ended with an error on its own.
+//
+// The failure is the end of the instance and not a stop the manager asked for,
+// so it is reported with the failure code and the recovery of the platform may
+// restart the instance.
+func TestSCMHandlerReportsAFailureExitCodeWhenTheHostFails(t *testing.T) {
+	addr := "127.0.0.1:" + strconv.Itoa(freePort(t))
+	scmTestServe(t, addr)
+
+	fail := make(chan struct{})
+	var failOnce sync.Once
+	failHost := func() { failOnce.Do(func() { close(fail) }) }
+	t.Cleanup(failHost)
+	handler := newSCMHandler(RunOptions{})
+	handler.readinessTimeout = 5 * time.Second
+	handler.run = func(ctx context.Context, _ RunOptions, listening chan<- struct{}) error {
+		// The host binds its own listener, so the instance reports the
+		// running state from its own evidence before the host fails.
+		close(listening)
+		select {
+		case <-fail:
+		case <-ctx.Done():
+		}
+		return errors.New("the host of the test failed")
+	}
+
+	changes := make(chan svc.Status, 16)
+	requests := make(chan svc.ChangeRequest)
+	args := scmTestHandlerOptions(t, addr)
+	done := make(chan uint32, 1)
+	go func() {
+		_, code := handler.Execute(args, requests, changes)
+		done <- code
+		close(changes)
+	}()
+
+	// The instance runs before its host fails: the failure is observed on
+	// the path of an instance that was serving.
+	var statuses []svc.Status
+	for status := range changes {
+		statuses = append(statuses, status)
+		if status.State == svc.Running {
+			failHost()
+		}
+	}
+	if code := <-done; code != scmExitCodeFailure {
+		t.Errorf("the exit code = %d, want %d for a host that failed", code, scmExitCodeFailure)
+	}
+	stopped := scmTestLastStatus(t, statuses, svc.Stopped)
+	if stopped.Win32ExitCode != scmExitCodeFailure {
+		t.Errorf("the exit code of the stopped status = %d, want %d for a host that failed", stopped.Win32ExitCode, scmExitCodeFailure)
+	}
+}
+
+// scmTestLastStatus returns the last reported status of the given state, and
+// fails the test when the handler never reported it.
+func scmTestLastStatus(t *testing.T, statuses []svc.Status, state svc.State) svc.Status {
+	t.Helper()
+	for i := len(statuses) - 1; i >= 0; i-- {
+		if statuses[i].State == state {
+			return statuses[i]
+		}
+	}
+	t.Fatalf("the handler never reported the state %v: %v", state, statuses)
+	return svc.Status{}
+}
+
+// TestSCMHandlerNeverReportsRunningFromAForeignInstance proves that a start
+// whose own host failed to bind never reaches the running state although
+// another HFDesk answers the readiness probe on the address.
+//
+// The probe accepts any HFDesk on the address, so before the own-liveness
+// gate the handler reported the foreign answer as the readiness of its own
+// instance. The instance has to fail instead: stopped after the start
+// attempt with the failure exit code, and never running at any stage.
+func TestSCMHandlerNeverReportsRunningFromAForeignInstance(t *testing.T) {
+	// Another HFDesk answers the probe on the address of the instance
+	// with the health document of HFDesk.
+	addr := "127.0.0.1:" + strconv.Itoa(freePort(t))
+	scmTestServe(t, addr)
+
+	handler := newSCMHandler(RunOptions{})
+	handler.readinessTimeout = 5 * time.Second
+	handler.readinessInterval = 10 * time.Millisecond
+	// The own host fails to bind the address: the foreign instance owns
+	// it, and the host reports that failure without ever binding, so the
+	// own-liveness signal stays open.
+	handler.run = func(ctx context.Context, _ RunOptions, listening chan<- struct{}) error {
+		return errors.New("the address of the instance is already in use")
+	}
+
+	changes := make(chan svc.Status, 16)
+	requests := make(chan svc.ChangeRequest)
+	done := make(chan uint32, 1)
+	go func() {
+		_, code := handler.Execute(scmTestHandlerOptions(t, addr), requests, changes)
+		done <- code
+		close(changes)
+	}()
+
+	var states []svc.State
+	for status := range changes {
+		states = append(states, status.State)
+	}
+	if code := <-done; code != scmExitCodeFailure {
+		t.Errorf("the exit code = %d, want %d for a start whose own host failed", code, scmExitCodeFailure)
+	}
+	want := []svc.State{svc.StartPending, svc.Stopped}
+	if !reflect.DeepEqual(states, want) {
+		t.Errorf("the reported states = %v, want %v and no running state at any stage", states, want)
+	}
+}
+
+// TestWaitForReadyFailsWithTheOwnCauseWhenAnotherInstanceAnswers proves
+// that the answer of a foreign HFDesk never reports the own start ready:
+// the wait fails with the failure of the own host instead.
+func TestWaitForReadyFailsWithTheOwnCauseWhenAnotherInstanceAnswers(t *testing.T) {
+	addr := "127.0.0.1:" + strconv.Itoa(freePort(t))
+	scmTestServe(t, addr)
+
+	ownErr := errors.New("the address of the instance is already in use")
+	host := &scmHost{listening: make(chan struct{}), done: make(chan struct{})}
+	host.err = ownErr
+	close(host.done)
+
+	handler := newSCMHandler(RunOptions{})
+	handler.readinessTimeout = 5 * time.Second
+	changes := make(chan svc.Status, 4)
+	stop, err := handler.waitForReady(context.Background(), addr, host, nil, changes)
+
+	if err == nil {
+		t.Fatal("waitForReady() = nil, want the failure of the own host although the foreign instance answered")
+	}
+	if !errors.Is(err, ownErr) {
+		t.Errorf("waitForReady() = %v, want the own cause %v", err, ownErr)
+	}
+	if stop {
+		t.Error("waitForReady() reports a stop request that was never made")
+	}
+}
+
+// TestWaitForReadyWaitsForTheOwnListenerWhileAnotherInstanceAnswers proves
+// the pending stage: while the own bind has not finished, the answer of a
+// foreign HFDesk reports no success, and the start becomes ready only once
+// the own listener is up and the probe answers.
+func TestWaitForReadyWaitsForTheOwnListenerWhileAnotherInstanceAnswers(t *testing.T) {
+	addr := "127.0.0.1:" + strconv.Itoa(freePort(t))
+	scmTestServe(t, addr)
+
+	host := &scmHost{listening: make(chan struct{}), done: make(chan struct{})}
+	handler := newSCMHandler(RunOptions{})
+	handler.readinessTimeout = 5 * time.Second
+	handler.readinessInterval = 10 * time.Millisecond
+
+	changes := make(chan svc.Status, 4)
+	type result struct {
+		stop bool
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		stop, err := handler.waitForReady(context.Background(), addr, host, nil, changes)
+		done <- result{stop: stop, err: err}
+	}()
+
+	// The own bind is still pending while the foreign instance answers:
+	// no success may be reported in that stage.
+	select {
+	case got := <-done:
+		t.Fatalf("waitForReady() = %+v while the own listener was still pending, want no success", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// The own listener comes up: the own-liveness evidence exists now
+	// and the probe answers, so the normal path reports the start ready.
+	close(host.listening)
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("waitForReady() = %v after the own listener came up, want nil", got.err)
+		}
+		if got.stop {
+			t.Error("waitForReady() reports a stop request that was never made")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("waitForReady() did not report the start ready after the own listener came up")
 	}
 }

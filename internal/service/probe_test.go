@@ -1,0 +1,528 @@
+// Copyright 2025
+// SPDX-License-Identifier: Apache-2.0
+
+package service
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/bashrusakh/hfdesk/internal/server"
+)
+
+// TestProbeServiceAddressMapsTheWildcardBindOntoTheLoopback checks the address
+// the readiness probe asks.
+//
+// A wildcard bind has no address a client can connect to: 0.0.0.0 and :: are
+// the addresses every interface answers on, and a connect() to them fails with
+// WSAEADDRNOTAVAIL on Windows and EADDRNOTAVAIL elsewhere. The probe therefore
+// asks the loopback address of the same family, and every other host is used
+// unchanged. An address without a port cannot be mapped and is passed through,
+// so the request reports the error of the address.
+func TestProbeServiceAddressMapsTheWildcardBindOntoTheLoopback(t *testing.T) {
+	cases := []struct {
+		name   string
+		listen string
+		want   string
+	}{
+		{"the IPv4 wildcard", "0.0.0.0:8080", "127.0.0.1:8080"},
+		{"the IPv6 wildcard", "[::]:8080", "[::1]:8080"},
+		{"an empty host", ":8080", "127.0.0.1:8080"},
+		{"an IPv4 loopback", "127.0.0.1:8080", "127.0.0.1:8080"},
+		{"an IPv6 loopback", "[::1]:8080", "[::1]:8080"},
+		{"an address of the network", "192.168.1.5:8080", "192.168.1.5:8080"},
+		{"a host name", "localhost:8080", "localhost:8080"},
+		{"no address at all", "", DefaultListen},
+		{"an address without a port", "127.0.0.1", "127.0.0.1"},
+		{"an address that is no host and port", "8080", "8080"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := probeServiceAddress(tc.listen); got != tc.want {
+				t.Errorf("probeServiceAddress(%q) = %q, want %q", tc.listen, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProbeServiceReadySerializesAnIPv6ZoneWithoutDialingTheNetwork(t *testing.T) {
+	const listen = "[fe80::1%eth0]:8080"
+	probeURL, err := serviceProbeURL(listen)
+	assertNoError(t, err, "serviceProbeURL(%q) = %v", listen, err)
+	parsed, err := url.Parse(probeURL.String())
+	assertNoError(t, err, "parse serialized probe URL %q: %v", probeURL, err)
+	if !strings.Contains(probeURL.String(), "%25eth0]:8080") {
+		t.Fatalf("probe URL = %q, want the RFC 6874 encoded zone", probeURL)
+	}
+	if got := parsed.Port(); got != "8080" || parsed.Path != server.HealthPath {
+		t.Fatalf("probe URL = %q, want port 8080 and health path %q", probeURL, server.HealthPath)
+	}
+
+	dialErr := errors.New("test intercepted the socket dial")
+	var dialedAddress string
+	previous := serviceProbeTransport
+	transport := previous.Clone()
+	transport.DialContext = func(_ context.Context, _, address string) (net.Conn, error) {
+		dialedAddress = address
+		return nil, dialErr
+	}
+	serviceProbeTransport = transport
+	t.Cleanup(func() {
+		serviceProbeTransport = previous
+		transport.CloseIdleConnections()
+	})
+
+	if err := probeServiceReady(listen); !errors.Is(err, dialErr) {
+		t.Fatalf("probeServiceReady(%q) = %v, want the intercepted dial error (not a URL parse failure)", listen, err)
+	}
+	if want := net.JoinHostPort("fe80::1%eth0", "8080"); dialedAddress != want {
+		t.Errorf("the probe dialed %q, want decoded host and zone %q", dialedAddress, want)
+	}
+}
+
+// TestLocalAddressIsTheRuleTheProbeAsks proves the exported address rule the
+// probe and the desktop host share.
+//
+// The probe is the only caller of probeServiceAddress, so the rule has to hold
+// without it as well: an empty listen is the default address of a service, a
+// wildcard is the loopback of its family, and an address that cannot be read as
+// a host and a port is an error instead of an address a caller would dial.
+func TestLocalAddressIsTheRuleTheProbeAsks(t *testing.T) {
+	cases := []struct {
+		listen string
+		want   string
+	}{
+		{"", DefaultListen},
+		{"  0.0.0.0:8080  ", "127.0.0.1:8080"},
+		{"[::]:8080", "[::1]:8080"},
+		{":8080", "127.0.0.1:8080"},
+		{"localhost:8080", "localhost:8080"},
+		{"[::1]:8080", "[::1]:8080"},
+	}
+	for _, tc := range cases {
+		got, err := LocalAddress(tc.listen)
+		if err != nil {
+			t.Errorf("LocalAddress(%q) = %v, want %q", tc.listen, err, tc.want)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("LocalAddress(%q) = %q, want %q", tc.listen, got, tc.want)
+		}
+	}
+
+	for _, listen := range []string{"8080", "127.0.0.1", "127.0.0.1:"} {
+		if got, err := LocalAddress(listen); err == nil {
+			t.Errorf("LocalAddress(%q) = %q, want the error of an address without a host and port", listen, got)
+		}
+	}
+}
+
+// TestProbeServiceReadyAcceptsTheHealthDocumentOfTheInstance checks the
+// readiness probe against the health answer of HFDesk.
+//
+// The endpoint answers with the healthy status and the version of the instance,
+// and the probe accepts exactly that answer: the address really serves the
+// instance that was started. The probe asks the health endpoint with the
+// request of a client that carries no access data, so it never sends the
+// credential of the config file of the instance.
+func TestProbeServiceReadyAcceptsTheHealthDocumentOfTheInstance(t *testing.T) {
+	path := make(chan string, 1)
+	authorization := make(chan string, 1)
+	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path <- r.URL.Path
+		authorization <- r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ok","version":"1.2.3","time":"2025-01-01T00:00:00Z","endpoint":"https://huggingface.co"}`)
+	}))
+	defer instance.Close()
+
+	err := probeServiceReady(instance.Listener.Addr().String())
+	assertNoError(t, err, "probeServiceReady(%q) = %v, want nil for the health answer of the instance", instance.Listener.Addr(), err)
+	if got := <-path; got != server.HealthPath {
+		t.Errorf("the probe asked %q, want the health endpoint %q of the instance", got, server.HealthPath)
+	}
+	if got := <-authorization; got != "" {
+		t.Errorf("the probe sent the credential %q, want no access data at all", got)
+	}
+}
+
+// TestProbeServiceReadyAcceptsTheChallengeOfTheInstance checks that a protected
+// instance is accepted without a credential.
+//
+// The basic authentication of the instance refuses a request without a
+// credential with the challenge of HFDesk. That challenge is the evidence that
+// the server on the address is the instance, and the probe needs no credential
+// to observe it.
+func TestProbeServiceReadyAcceptsTheChallengeOfTheInstance(t *testing.T) {
+	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("WWW-Authenticate", server.BasicAuthChallenge)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer instance.Close()
+	addr := instance.Listener.Addr().String()
+
+	err := probeServiceReady(addr)
+	assertNoError(t, err, "probeServiceReady(%q) = %v, want nil for the challenge of the instance", addr, err)
+	// The challenge carries no health document, so it proves readiness but no
+	// version.
+	if verified, err := probeServiceReadyForVersion(addr, "1.2.3"); err != nil || verified {
+		t.Errorf("probeServiceReadyForVersion(%q) = %t, %v, want the challenge without a verified version", addr, verified, err)
+	}
+}
+
+// TestProbeServiceReadyRejectsAServerThatIsNotTheInstance checks that the probe
+// proves the instance and not merely an HTTP server.
+//
+// A program that listens on the port of the instance is not the instance: only
+// the health document of HFDesk and the challenge of its basic authentication
+// are accepted, and every other answer is a failure that names the address and
+// the reason. A server that answers with a status and a body of its own is the
+// state the probe exists to refuse.
+func TestProbeServiceReadyRejectsAServerThatIsNotTheInstance(t *testing.T) {
+	cases := []struct {
+		name string
+		// handler answers the request of the probe the way the foreign
+		// program does.
+		handler http.HandlerFunc
+		// want is a fragment of the failure that names what the probe
+		// refused.
+		want string
+	}{
+		{
+			name: "a 200 with a JSON document that is not the health document",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"message":"hello"}`)
+			},
+			want: `the status ""`,
+		},
+		{
+			name: "a 200 without a version of the instance",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"status":"ok","version":""}`)
+			},
+			want: "reports no version",
+		},
+		{
+			name: "a 200 with a body that is no JSON at all",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, "<!doctype html><title>another server</title>")
+			},
+			want: "does not answer the health document",
+		},
+		{
+			name: "a 200 of an unhealthy instance",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"status":"degraded","version":"1.2.3"}`)
+			},
+			want: `the status "degraded"`,
+		},
+		{
+			name: "a 404 of another program",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				http.NotFound(w, r)
+			},
+			want: "404",
+		},
+		{
+			name: "a 500 of another program",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			want: "500",
+		},
+		{
+			name: "a 401 without the challenge of the instance",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusUnauthorized)
+			},
+			want: "challenge",
+		},
+		{
+			name: "a 401 with another realm",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("WWW-Authenticate", `Basic realm="Admin"`)
+				w.WriteHeader(http.StatusUnauthorized)
+			},
+			want: `realm=\"Admin\"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(tc.handler)
+			defer server.Close()
+
+			err := probeServiceReady(server.Listener.Addr().String())
+			if err == nil {
+				t.Fatalf("probeServiceReady(%q) = nil, want the failure of an answer that is not the instance", server.Listener.Addr())
+			}
+			assertNames(t, err.Error(), "probeServiceReady()", []string{"does not answer as the HFDesk server", tc.want})
+		})
+	}
+}
+
+// TestProbeServiceReadyDoesNotFollowARedirect checks that a redirect is not an
+// answer of the instance.
+//
+// A foreign server on the address can answer with a 302 to a real HFDesk
+// elsewhere. A client that follows redirects would then accept the health
+// document of that other instance, so the probe must return the 3xx as it is
+// and reject it; the redirect target is never requested.
+func TestProbeServiceReadyDoesNotFollowARedirect(t *testing.T) {
+	var targetRequests atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ok","version":"1.2.3"}`)
+	}))
+	defer target.Close()
+
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+server.HealthPath, http.StatusFound)
+	}))
+	defer foreign.Close()
+
+	err := probeServiceReady(foreign.Listener.Addr().String())
+	if err == nil {
+		t.Fatalf("probeServiceReady(%q) = nil, want the failure of the redirect", foreign.Listener.Addr())
+	}
+	assertNames(t, err.Error(), "probeServiceReady()", []string{"does not answer as the HFDesk server", "302"})
+	if got := targetRequests.Load(); got != 0 {
+		t.Errorf("the redirect target was requested %d times, want none", got)
+	}
+}
+
+// TestProbeServiceReadyDoesNotUseTheProxyForANonLoopbackAddress checks that a
+// probe of a LAN address reaches the instance directly instead of through the
+// proxy of the environment.
+func TestProbeServiceReadyDoesNotUseTheProxyForANonLoopbackAddress(t *testing.T) {
+	host := nonLoopbackIPv4(t)
+
+	var proxyRequests atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyRequests.Add(1)
+		http.Error(w, "the probe used the proxy", http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	assertNoError(t, err, "parse the proxy URL: %v", err)
+
+	// Every address outside loopback goes through the proxy of the environment.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = func(req *http.Request) (*url.URL, error) {
+		if ip := net.ParseIP(req.URL.Hostname()); ip != nil && ip.IsLoopback() {
+			return nil, nil
+		}
+		return proxyURL, nil
+	}
+	previous := http.DefaultTransport
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = previous })
+
+	var instanceRequests atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		instanceRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ok","version":"1.2.3"}`)
+	})
+
+	listener, err := net.Listen("tcp", "0.0.0.0:0")
+	assertNoError(t, err, "listen on every interface: %v", err)
+	instance := httptest.NewUnstartedServer(handler)
+	_ = instance.Listener.Close()
+	instance.Listener = listener
+	instance.Start()
+	defer instance.Close()
+
+	port := listener.Addr().(*net.TCPAddr).Port
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Skipf("the non-loopback address %s of the machine is not reachable: %v", addr, err)
+	}
+	_ = conn.Close()
+
+	if err := probeServiceReady(addr); err != nil {
+		t.Fatalf("probeServiceReady(%q) = %v, want nil for the instance on the LAN address", addr, err)
+	}
+	if got := proxyRequests.Load(); got != 0 {
+		t.Errorf("the proxy received %d requests, want none for a probe of the same machine", got)
+	}
+	if got := instanceRequests.Load(); got == 0 {
+		t.Error("the instance received no request, want the direct probe")
+	}
+}
+
+// nonLoopbackIPv4 returns an address of a local interface that is not
+// loopback.
+func nonLoopbackIPv4(t *testing.T) string {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skipf("the addresses of the machine cannot be read: %v", err)
+	}
+	for _, addr := range addrs {
+		ipnet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := ipnet.IP.To4()
+		if ip == nil || ip.IsLoopback() || !ip.IsGlobalUnicast() {
+			continue
+		}
+		return ip.String()
+	}
+	t.Skip("skipping: the machine has no non-loopback IPv4 address")
+	return ""
+}
+
+// TestProbeServiceReadyVerifiesTheExpectedVersion checks the version evidence of
+// a readiness probe: an expectation that matches verifies, a mismatch fails, and
+// an empty or local-build expectation proves readiness without a version.
+func TestProbeServiceReadyVerifiesTheExpectedVersion(t *testing.T) {
+	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ok","version":"1.2.3"}`)
+	}))
+	defer instance.Close()
+	addr := instance.Listener.Addr().String()
+
+	verified, err := probeServiceReadyForVersion(addr, "1.2.3")
+	if err != nil || !verified {
+		t.Fatalf("probeServiceReadyForVersion(%q, %q) = %t, %v, want a verified version", addr, "1.2.3", verified, err)
+	}
+
+	verified, err = probeServiceReadyForVersion(addr, "1.3.0")
+	if err == nil || verified {
+		t.Fatalf("probeServiceReadyForVersion(%q, %q) = %t, %v, want the mismatch", addr, "1.3.0", verified, err)
+	}
+	if !strings.Contains(err.Error(), "1.2.3") || !strings.Contains(err.Error(), "1.3.0") {
+		t.Errorf("probeServiceReadyForVersion() = %v, want both versions in the mismatch", err)
+	}
+
+	for _, expected := range []string{"", "dev"} {
+		verified, err := probeServiceReadyForVersion(addr, expected)
+		if err != nil || verified {
+			t.Errorf("probeServiceReadyForVersion(%q, %q) = %t, %v, want readiness without a verified version", addr, expected, verified, err)
+		}
+	}
+}
+
+// TestProbeServiceReadyReportsAConnectionThatIsRefused checks the readiness
+// probe of an instance that does not listen on its address.
+//
+// The address of the test was bound and released again, so nothing listens on
+// it: the probe has to report the error instead of a ready instance.
+func TestProbeServiceReadyReportsAConnectionThatIsRefused(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	assertNoError(t, err, "Listen() = %v, want nil", err)
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+
+	if err := probeServiceReady(addr); err == nil {
+		t.Errorf("probeServiceReady(%q) = nil, want the error of the refused connection", addr)
+	}
+}
+
+// TestProbeServiceReadyReachesAWildcardListener checks that the readiness probe
+// reaches a server that binds every interface of the machine.
+func TestProbeServiceReadyReachesAWildcardListener(t *testing.T) {
+	cases := []struct {
+		name string
+		bind string
+		host string
+	}{
+		{"the IPv4 wildcard", "0.0.0.0:0", "0.0.0.0"},
+		{"the IPv6 wildcard", "[::]:0", "::"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			listener, err := net.Listen("tcp", tc.bind)
+			if err != nil {
+				t.Skipf("the address %q cannot be bound: %v", tc.bind, err)
+			}
+			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"status":"ok","version":"dev"}`)
+			})}
+			go func() {
+				_ = server.Serve(listener)
+			}()
+			t.Cleanup(func() {
+				_ = server.Close()
+			})
+
+			port := listener.Addr().(*net.TCPAddr).Port
+			listen := net.JoinHostPort(tc.host, strconv.Itoa(port))
+			// The loopback address of the family has to be reachable for
+			// the check: a host without the family would report the probe
+			// of a server it cannot reach.
+			conn, err := net.DialTimeout("tcp", probeServiceAddress(listen), time.Second)
+			if err != nil {
+				t.Skipf("the loopback address of %q cannot be reached: %v", tc.bind, err)
+			}
+			_ = conn.Close()
+			if err := probeServiceReady(listen); err != nil {
+				t.Errorf("probeServiceReady(%q) = %v, want nil for a server that binds %q", listen, err, tc.bind)
+			}
+		})
+	}
+}
+
+// TestOwnInstanceReadyNeedsTheOwnInstanceAndTheProbe checks the readiness
+// rule of a start: only the own-liveness evidence of the host combined with
+// the probe answer may report the start ready.
+//
+// The probe accepts any HFDesk that answers on the address, so every case in
+// which the own host did not bind or already ended stays not ready although
+// the probe answers, and the probe answer itself stays required: without it
+// the own listener alone is no proof that HFDesk serves the address.
+func TestOwnInstanceReadyNeedsTheOwnInstanceAndTheProbe(t *testing.T) {
+	previous := serviceReadinessProbe
+	t.Cleanup(func() { serviceReadinessProbe = previous })
+
+	probeAnswers := func(string) error { return nil }
+	probeRefuses := func(string) error { return errors.New("the address does not answer as the HFDesk server") }
+
+	up := make(chan struct{})
+	close(up)
+	ended := make(chan struct{})
+	close(ended)
+	pending := make(chan struct{})
+
+	cases := []struct {
+		name      string
+		listening <-chan struct{}
+		done      <-chan struct{}
+		probe     func(string) error
+		want      bool
+	}{
+		{"the own listener is up, the host runs, the probe answers", up, pending, probeAnswers, true},
+		{"the own listener is up, the host runs, the probe fails", up, pending, probeRefuses, false},
+		{"the own bind is pending while the probe answers", pending, pending, probeAnswers, false},
+		{"the own host failed to bind while the probe answers", pending, ended, probeAnswers, false},
+		{"the own host ended although its listener was up", up, ended, probeAnswers, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			serviceReadinessProbe = tc.probe
+			if got := ownInstanceReady(tc.listening, tc.done, "127.0.0.1:8080"); got != tc.want {
+				t.Errorf("ownInstanceReady() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}

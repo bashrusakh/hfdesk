@@ -11,6 +11,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"os/user"
@@ -126,7 +127,7 @@ func newPlatformManager(scope Scope) (Manager, error) {
 	switch scope {
 	case ScopeUser, ScopeSystem:
 	default:
-		return nil, fmt.Errorf("service: unknown scope %q (want %q or %q)", scope, ScopeUser, ScopeSystem)
+		return nil, fmt.Errorf("service: unknown scope %q (want one of %q, %q)", scope, ScopeUser, ScopeSystem)
 	}
 
 	manager := &launchdManager{
@@ -187,108 +188,218 @@ func (m *launchdManager) target() string {
 // directories the installation created as well, so a failed attempt leaves
 // the machine as it was.
 //
+// A repeat installation updates the registration in place instead of
+// replacing it wholesale: the property list that is on disk is read first and
+// merged with the request through the shared merge of every platform, so only
+// a field the request names again changes, an absent optional directory stays
+// absent and the program always comes from the request. The autostart key
+// RunAtLoad keeps the value the existing registration carries; a first
+// installation writes the default that starts the instance.
+//
 // A machine-wide instance runs as a service account. The account is
 // resolved and validated before any directory is created and before the
 // property list is written, so a refused installation leaves nothing behind
 // and every shell reports the same reason.
-func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) error {
+func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) (InstallOptions, error) {
 	if err := ValidateInstallOptions(opts); err != nil {
-		return err
+		return opts, err
 	}
 	// A machine-wide instance must not adopt the state of the user who
-	// runs the install command. The check runs before the elevation
-	// requirement, before any directory is created and before the property
-	// list is written: a refused installation leaves nothing behind, and
-	// every platform reports the same reason for the same command line.
+	// runs the install command. The check runs before the registration is
+	// read, before the elevation requirement, before any directory is
+	// created and before the property list is written: a refused
+	// installation leaves nothing behind, and every platform reports the
+	// same reason for the same command line.
 	if err := m.checkSystemPaths(opts); err != nil {
-		return err
+		return opts, err
 	}
-	// The service account of a machine-wide instance is resolved before
-	// anything is created: an account that does not exist is a refusal with
-	// the commands that create it, not a property list that points at an
-	// identity the machine does not know.
+	// The registration of a repeat installation is read before anything is
+	// created: its settings are the merge source, its autostart key is the
+	// value the write keeps, and its bytes are what a failed attempt
+	// restores. There is no property list: the request decides every
+	// setting — whether the supervisor already holds the job is decided in
+	// load(), from the state it reports.
+	path := m.plistPath()
+	backup, err := backupPlist(path)
+	if err != nil {
+		return opts, err
+	}
+	runAtLoad := true
+	if backup.existed {
+		existing, parseErr := parsePlist(backup.content)
+		if parseErr != nil {
+			// A registration that cannot be read records no setting:
+			// the installation is the way a damaged registration is
+			// repaired, so it never fails over one. The request
+			// applies unchanged and the default autostart is written
+			// over the unreadable file.
+			log.Printf("service: the registration %q cannot be read (%v), the request applies", path, parseErr)
+		} else {
+			opts = mergeInstallOptions(opts, existing.registrationOptions(m.scope), true)
+			runAtLoad = existing.RunAtLoad
+		}
+	}
+	// The merged registration is validated as well: its values are the
+	// ones the write will emit, and a path the registration inherited is
+	// checked like a path the request named.
+	if err := ValidateInstallOptions(opts); err != nil {
+		return opts, err
+	}
+	if err := m.checkSystemPaths(opts); err != nil {
+		return opts, err
+	}
+	// The directories of the merged registration are judged before the
+	// state of the supervisor is read: the shape rules of the directories
+	// — required, absolute, never the filesystem root — are request
+	// validation, local and cheap, and their cause is clearer than any
+	// answer of the machine. The order the installation keeps: every
+	// request validation and the elevation requirement, then the state
+	// read, then the directories — so a validation error surfaces first
+	// and is never masked by a machine-state failure, while the read
+	// still precedes every mutation. PrepareDirs applies the same rules
+	// again where it creates.
+	if err := validateInstanceDirs(opts); err != nil {
+		return opts, err
+	}
+	// The service account of a machine-wide instance is resolved from the
+	// merged registration before anything is created: an update that names
+	// no account keeps the account the instance runs with, and an account
+	// that does not exist is a refusal with the commands that create it,
+	// not a property list that points at an identity the machine does not
+	// know.
 	account, err := m.resolveAccount(opts)
 	if err != nil {
-		return err
+		return opts, err
 	}
 	// A directory the user named outside of the state directory of the
 	// instance has to be writable by the account. The check runs before the
 	// directories of the instance are created, so a refused installation
 	// leaves nothing behind.
 	if err := m.checkNamedDirs(opts, account); err != nil {
-		return err
+		return opts, err
 	}
 	// The elevation requirement is checked before any directory is created:
 	// a permission error of the machine-wide directories is a much less
 	// readable answer than the real reason.
 	if err := m.requireElevated("an installation"); err != nil {
-		return err
+		return opts, err
+	}
+	// The state of the registration the supervisor holds is read before
+	// anything is created: an output that names neither a state nor a
+	// process id leaves the running fact undetermined, and the refusal —
+	// whose repair is the stop followed by a new installation — must not
+	// follow a mutation. A job the supervisor does not hold satisfies the
+	// condition never, and the state read here travels into load, which
+	// acts on this snapshot.
+	supervisor, err := m.supervisorState(ctx)
+	if err != nil {
+		return opts, err
+	}
+	if supervisor.loaded && !supervisor.runningKnown {
+		return opts, fmt.Errorf("service: the installation was refused: the supervisor reports neither a state nor a process id for %s, so whether the instance runs cannot be determined. Stop the instance with %q and run %q again",
+			m.target(), "hfdesk service stop", "hfdesk service install")
+	}
+	if supervisor.loaded && supervisor.runningKnown && supervisor.running && !backup.existed {
+		// Finding 5: a running job the supervisor holds without its
+		// property list has no file an update could restore — the write
+		// would replace the only registration that exists and a failed
+		// restart could not bring the instance back from a file that is
+		// gone. The refusal precedes every mutation, and the stop it
+		// names clears the state: the unloaded retry is a genuine first
+		// installation.
+		return opts, fmt.Errorf("service: the installation was refused: the supervisor holds %s as a running job while its property list is missing: an update could stop the instance but could not restore the registration it stops. Stop the instance with %q and run %q again",
+			m.target(), "hfdesk service stop", "hfdesk service install")
 	}
 	// The directories the installation is about to create are remembered
 	// before they are created, so the account is given the ownership of
 	// exactly those and of nothing else.
 	//
-	// The list is also what a failed installation removes again, so a
-	// failed installation leaves the machine as it was.
+	// The list is also what a failed installation may remove again — only
+	// when the prior registration cannot reference it (Finding 7): the
+	// same cleanup gate the other platforms apply.
 	created := make(map[string][]string, 3)
 	for _, dir := range instanceDirs(opts) {
 		created[dir.path] = createdDirs(dir.path)
 	}
 	if err := PrepareDirs(opts); err != nil {
 		// The preparation may have created some of the directories
-		// before it failed: they are removed again, so a failed attempt
-		// leaves the machine as it was.
-		removeCreatedDirs(createdDirOrder(opts, created))
-		return err
+		// before it failed. They are removed only when the previous
+		// registration cannot reference them: an unproven prior
+		// registration keeps the directories and the error says so.
+		if launchdCreatedDirsSafeToRemove(backup, created) {
+			removeCreatedDirs(createdDirOrder(opts, created))
+		} else {
+			err = fmt.Errorf("%w (installation-created directories were retained because the prior registration may still reference them)", err)
+		}
+		return opts, err
 	}
-	// The installation owns the directories it created from here on: a
-	// failure removes them again, so a failed installation never leaves
-	// the directories of the instance behind.
-	if err := m.register(ctx, opts, account, created); err != nil {
-		removeCreatedDirs(createdDirOrder(opts, created))
-		return err
+	// The registration result decides whether a failed attempt may remove
+	// these paths; an indeterminate registration keeps them.
+	createdDirsSafe, registerErr := m.register(ctx, opts, account, created, backup, runAtLoad, supervisor)
+	if registerErr != nil {
+		if createdDirsSafe {
+			removeCreatedDirs(createdDirOrder(opts, created))
+		} else {
+			registerErr = fmt.Errorf("%w (installation-created directories were retained because the supervisor could not prove that the surviving registration no longer references them)", registerErr)
+		}
+		return opts, registerErr
 	}
-	return nil
+	// Created is the result of this installation: the registration exists
+	// now and did not exist before — no property list and no job the
+	// supervisor held — the first-registration fact load acted on.
+	opts.Created = !backup.existed && !supervisor.loaded
+	return opts, nil
 }
 
 // register writes the registration of the instance and hands it to the
 // supervisor.
 //
 // The directories of the instance are already created when the function is
-// called. A failure of the registration is rolled back: the property list is
-// restored and the directories the installation created are removed by the
-// caller, so a failed installation leaves no half configured registration and
-// no empty directories behind.
-func (m *launchdManager) register(ctx context.Context, opts InstallOptions, account *serviceAccount, created map[string][]string) error {
+// called, backup holds the property list an update replaces (it did not exist
+// for a first installation) and runAtLoad is the autostart value the write
+// carries: the found value of a repeat installation whose property list
+// could be read, and the default otherwise — a first installation, or a
+// repeat over a property list that is missing or unreadable. The property
+// list is the canonical rendering of the merged options —
+// HFDesk owns the file it writes, so a failed registration is rolled back
+// from the exact bytes in backup: the property list is restored, and the
+// result reports whether the directories this attempt created are safe to
+// remove — a rollback the supervisor cannot prove restored keeps them, so a
+// failed installation never removes a directory the surviving registration
+// may still reference.
+func (m *launchdManager) register(ctx context.Context, opts InstallOptions, account *serviceAccount, created map[string][]string, backup *plistBackup, runAtLoad bool, supervisor launchdSupervisorState) (bool, error) {
+	// The prior property list decides whether the directories this attempt
+	// created may ever be removed — the rule the other platforms apply:
+	// only a proven-unreferenced cleanup runs, and a rollback the
+	// supervisor cannot prove restored keeps the directories.
+	safe := launchdCreatedDirsSafeToRemove(backup, created)
 	// The instance runs as the account, so the account owns the directories
 	// the instance writes.
 	if err := m.grantInstanceDirs(opts, account, created); err != nil {
-		return err
+		return safe, err
 	}
 	if err := m.preflight(opts); err != nil {
-		return err
+		return safe, err
 	}
 
-	content, err := renderPlist(opts, account)
+	content, err := renderPlistWithRunAtLoad(opts, account, runAtLoad)
 	if err != nil {
-		return err
+		return safe, err
 	}
 
 	path := m.plistPath()
-	backup, err := backupPlist(path)
-	if err != nil {
-		return err
-	}
 	changed := !backup.existed || !bytes.Equal(backup.content, []byte(content))
 	if err := writePlist(path, []byte(content), plistMode); err != nil {
-		return err
+		return safe, err
 	}
 
-	state, err := m.load(ctx, path, changed)
+	plan := launchdInstallPlan{firstInstall: !backup.existed, changed: changed}
+	state, err := m.load(ctx, path, plan, supervisor)
 	if err != nil {
-		return m.rollback(ctx, backup, state, err)
+		restored, rollbackErr := m.rollback(ctx, backup, state, err)
+		return restored && safe, rollbackErr
 	}
-	return nil
+	return safe, nil
 }
 
 // Uninstall removes the registration of the instance.
@@ -300,17 +411,29 @@ func (m *launchdManager) register(ctx context.Context, opts InstallOptions, acco
 // A machine-wide uninstallation needs an elevated shell: the LaunchDaemon is
 // registered in /Library/LaunchDaemons and it is unloaded from the system
 // domain, and both belong to the machine. The check runs after the existence
-// of the registration, so a registration that is not there stays a clean
-// success in every shell. A user scope instance belongs to the user who
+// of the registration, so a registration that is not there and a job the
+// supervisor does not hold stay a clean success in every shell, while a job
+// the supervisor holds without its property list is removed like any other
+// registration. A user scope instance belongs to the user who
 // installed it and needs no elevation.
 func (m *launchdManager) Uninstall(ctx context.Context) error {
 	path := m.plistPath()
 	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			// There is no registration: the uninstall is already done.
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("service: read the registration %q: %w", path, err)
+		}
+		// A job the supervisor holds is an existing registration even
+		// without its property list: it is unloaded below like every
+		// other registration, and a plain success here would leave it
+		// loaded. Only a job the supervisor does not hold is already
+		// uninstalled.
+		loaded, _, stateErr := m.printState(ctx)
+		if stateErr != nil {
+			return stateErr
+		}
+		if !loaded {
 			return nil
 		}
-		return fmt.Errorf("service: read the registration %q: %w", path, err)
 	}
 
 	// The elevation requirement is checked before the job is unloaded and
@@ -355,9 +478,6 @@ func (m *launchdManager) Start(ctx context.Context) error {
 		}
 		return fmt.Errorf("service: read the registration %q: %w", path, err)
 	}
-	// The elevation requirement is checked before the job is started: a
-	// permission error of the machine is a much less readable answer than
-	// the real reason.
 	if err := m.requireElevated("a start"); err != nil {
 		return err
 	}
@@ -390,22 +510,31 @@ func (m *launchdManager) Start(ctx context.Context) error {
 // A machine-wide instance needs an elevated shell: the LaunchDaemon is
 // unloaded from the system domain, and the system domain belongs to the
 // machine. The check runs after the existence of the registration, so a
-// registration that is not there stays a clean success in every shell. A
+// registration that is not there and a job the supervisor does not hold
+// stay a clean success in every shell, while a job the supervisor holds
+// without its property list is stopped like any other registration. A
 // user scope instance belongs to the user who installs it and needs no
 // elevation.
 func (m *launchdManager) Stop(ctx context.Context) error {
 	path := m.plistPath()
 	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			// The instance is not registered, so it does not run either.
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("service: read the registration %q: %w", path, err)
+		}
+		// A job the supervisor holds is an existing registration even
+		// without its property list: stopping it is what this command
+		// means, and a plain success here would hide a possibly
+		// running instance. Only a job the supervisor does not hold
+		// keeps the clean success of an absent registration.
+		loaded, _, stateErr := m.printState(ctx)
+		if stateErr != nil {
+			return stateErr
+		}
+		if !loaded {
 			return nil
 		}
-		return fmt.Errorf("service: read the registration %q: %w", path, err)
 	}
 
-	// The elevation requirement is checked before the job is unloaded: a
-	// permission error of the machine is a much less readable answer than
-	// the real reason.
 	if err := m.requireElevated("a stop"); err != nil {
 		return err
 	}
@@ -428,12 +557,12 @@ func (m *launchdManager) Stop(ctx context.Context) error {
 	// launchd under the KeepAlive policy of the registration.
 	if _, err := m.launchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
 		if waitErr != nil {
-			return fmt.Errorf("%w (the registration could not be unloaded: %v)", waitErr, err)
+			return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the registration could not be unloaded: %v)", waitErr, err), statusReadHint)
 		}
 		return fmt.Errorf("service: bootout %s: %w", m.target(), err)
 	}
 	if waitErr != nil {
-		return fmt.Errorf("%w (the instance was unloaded anyway)", waitErr)
+		return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the instance was unloaded anyway)", waitErr), statusReadHint)
 	}
 	return nil
 }
@@ -464,9 +593,6 @@ func (m *launchdManager) Restart(ctx context.Context) error {
 		}
 		return fmt.Errorf("service: read the registration %q: %w", path, err)
 	}
-	// The elevation requirement is checked before the job is stopped and
-	// before the job is started: a permission error of the machine is a
-	// much less readable answer than the real reason.
 	if err := m.requireElevated("a restart"); err != nil {
 		return err
 	}
@@ -486,7 +612,9 @@ func (m *launchdManager) Restart(ctx context.Context) error {
 //
 // The description of the instance comes from the property list that is on
 // disk, so the status describes the registration and not the intent of the
-// caller. The state comes from launchd itself.
+// caller. The state comes from launchd itself, and so does the running fact:
+// a registration whose program is gone is reported as broken even while the
+// job it started still runs.
 func (m *launchdManager) Status(ctx context.Context) (Status, error) {
 	path := m.plistPath()
 	status := Status{
@@ -532,12 +660,23 @@ func (m *launchdManager) Status(ctx context.Context) (Status, error) {
 		status.State, status.Detail = launchdStatusState(m.target(), output)
 	}
 
+	// The state the supervisor reports is also the running fact of the
+	// instance: a job that runs is running, and one that is waiting to start
+	// is about to run. The fact is kept next to the diagnosis below, so a
+	// registration whose program was deleted is reported as broken while its
+	// process still serves.
+	status.Running = runningState(status.State)
+
 	// A registration that points at a program that is gone is broken: the
 	// instance can never run again until it is installed again.
 	if status.Executable != "" {
 		if _, err := os.Stat(status.Executable); err != nil {
 			status.State = StateBroken
-			status.Detail = fmt.Sprintf("the registered executable %s does not exist", status.Executable)
+			detail := fmt.Sprintf("the registered executable %s does not exist", status.Executable)
+			if status.Running {
+				detail += brokenRunningDetail
+			}
+			status.Detail = detail
 		}
 	}
 	return status, nil
@@ -592,7 +731,7 @@ func (m *launchdManager) requireElevatedFor(action string, uid int) error {
 	if uid == 0 {
 		return nil
 	}
-	return fmt.Errorf("service: %s in the system scope requires an elevated shell: the LaunchDaemon is registered in %s and started by the system domain, HFDesk never escalates privileges itself", action, launchDaemonsDir)
+	return AppendActionErrorIfUnnamed(fmt.Errorf("service: %s in the system scope requires an elevated shell: run the command from an elevated shell, the LaunchDaemon is registered in %s and started by the system domain, HFDesk never escalates privileges itself", action, launchDaemonsDir), statusReadHint)
 }
 
 // checkSystemPaths rejects a machine-wide installation that would reuse the
@@ -740,7 +879,7 @@ func resolveServiceAccount(opts InstallOptions) (*serviceAccount, error) {
 // commands that create it, so the administrator can run them and install
 // again.
 func missingServiceAccountError(name string) error {
-	return fmt.Errorf("service: the machine-wide instance needs the service account %q: create it with %q, %q and %q, then install again (HFDesk never creates accounts itself)",
+	return fmt.Errorf("service: the machine-wide instance needs the service account %q: create it with %q and %q, then add a UniqueID with the template command %q — the <a free numeric id> part is a placeholder: replace it with a free numeric id that is not in use — and install again (HFDesk never creates accounts itself)",
 		name,
 		fmt.Sprintf("dscl . -create /Users/%s UserShell /usr/bin/false", name),
 		fmt.Sprintf("dscl . -create /Users/%s UserHome %s", name, systemHome),
@@ -775,6 +914,53 @@ func instanceDirs(opts InstallOptions) []instanceDir {
 		{name: "state directory", path: opts.Paths.StateDir},
 		{name: "log directory", path: opts.Paths.LogDir},
 	}
+}
+
+// launchdCreatedDirsSafeToRemove reports whether the directories this
+// attempt created may be removed after a failure: they may be removed
+// whenever the previous property list — the registration in backup —
+// neither references one of them nor stands unread, because an unreadable
+// previous registration might reference anything. The rule mirrors
+// systemdCreatedDirsSafeToRemove on Linux and the Windows result: only a
+// proven-unreferenced cleanup runs, and an indeterminate previous
+// registration keeps the directories.
+func launchdCreatedDirsSafeToRemove(backup *plistBackup, created map[string][]string) bool {
+	var createdPaths []string
+	for _, paths := range created {
+		createdPaths = append(createdPaths, paths...)
+	}
+	if len(createdPaths) == 0 || !backup.existed {
+		return true
+	}
+	previous, err := parsePlist(backup.content)
+	if err != nil {
+		return false
+	}
+	var referenced []string
+	for _, dir := range instanceDirs(InstallOptions{Paths: previous.paths()}) {
+		referenced = append(referenced, dir.path)
+	}
+	for _, value := range previous.Environment {
+		if filepath.IsAbs(value) {
+			referenced = append(referenced, value)
+		}
+	}
+	for _, createdPath := range createdPaths {
+		resolvedCreated, err := resolvePath(createdPath)
+		if err != nil {
+			return false
+		}
+		for _, referencedPath := range referenced {
+			resolvedReference, err := resolvePath(referencedPath)
+			if err != nil {
+				return false
+			}
+			if pathContains(resolvedCreated, resolvedReference) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // instanceDir is one directory an instance owns.
@@ -972,10 +1158,9 @@ func (m *launchdManager) grantInstanceDirs(opts InstallOptions, account *service
 // tree: a model or a cache tree belongs to whoever put it there.
 //
 // The refusal names the directory, the account and the access that is
-// missing. It never recommends a recursive ownership change of such a tree:
-// the access is granted to the directory itself or through the group that
-// owns it, and for a tree that holds a lot of data the group is preferable
-// to a new owner.
+// missing. It never recommends a recursive ownership change of such a
+// tree: the access is granted to the directory itself, never to the tree
+// inside it.
 func (m *launchdManager) checkNamedDirs(opts InstallOptions, account *serviceAccount) error {
 	if account == nil {
 		// A user scope instance runs as the user who installs it: it can
@@ -1011,7 +1196,7 @@ func (m *launchdManager) checkNamedDirs(opts InstallOptions, account *serviceAcc
 			return fmt.Errorf("service: the %s %q of the machine-wide instance cannot be used: %w", dir.name, dir.path, err)
 		}
 		if !ok {
-			return fmt.Errorf("service: the service account %q has no write access to the %s %q: grant it access to that directory (for example %q) or make it a member of the group that owns the directory; for a tree that holds a lot of data, granting group access is preferable to changing the owner, and install again",
+			return fmt.Errorf("service: the service account %q has no write access to the %s %q: give the directory itself to the account (never the tree inside it) with %q, then install again",
 				account.Name, dir.name, dir.path, "chown "+account.Name+" "+dir.path)
 		}
 	}
@@ -1036,52 +1221,147 @@ func accountCanWrite(path string, account *serviceAccount) (bool, error) {
 	})
 }
 
-// load registers the property list with launchd and reports what it did to
-// the registration of the instance.
+// launchdInstallPlan is what an installation asks the supervisor to do with
+// the property list it writes.
+type launchdInstallPlan struct {
+	// firstInstall reports that there was no property list before this
+	// installation.
+	firstInstall bool
+	// changed reports that the written property list differs from the one
+	// it replaces. It is always true for a first installation.
+	changed bool
+}
+
+// load hands the written property list to the supervisor according to the
+// plan of the installation and the state the registration had before it.
 //
-// A job that is not loaded yet is bootstrapped. A job that is already loaded
-// keeps its registration: an installation that does not change the property
-// list must not restart the running instance. An installation that does
-// change the property list loads the job again, so the new configuration
-// takes effect instead of waiting for the next boot of the machine.
+// The state before the attempt decides what has to happen, so the four
+// outcomes of an installation stay distinct:
+//
+//   - A first installation registers the job: the property list it writes
+//     carries RunAtLoad, so launchd starts the instance — exactly what every
+//     first installation did before. A first installation is a machine where
+//     neither a property list nor a loaded job exists: a job launchd already
+//     holds is an existing registration even without its file.
+//   - An instance that ran before the installation is stopped the way a stop
+//     stops it and started again the way a start starts it: the graceful
+//     shutdown of the old instance completes before the new registration is
+//     loaded and started. This runs whether or not the property list changed:
+//     a binary replaced in place keeps the same registration bytes, and the
+//     new program still has to be the one that runs.
+//   - A repeat installation over a loaded job that does not run unloads the
+//     stale registration and does not load the file again — also when no
+//     property list existed and the job was loaded without one: the stopped
+//     instance stays stopped, and a later start loads the property list this
+//     installation wrote, never the registration the supervisor held before.
+//   - A repeat installation over a job that is not loaded writes the property
+//     list and touches the supervisor not at all: the stopped instance stays
+//     stopped, and starting stays an explicit command.
+//
+// The disable flag of the override database is cleared only by a first
+// installation and by the two dances that must load a disabled label —
+// restarting a running disabled job above and the rollback below restoring
+// a loaded disabled registration — each of which restores the flag in the
+// same operation. Every other state is left as observed, so a repeat
+// installation never leaves an administrator's `launchctl disable` cleared.
 //
 // The report tells a rollback what the attempt did to the supervisor: the
-// state the registration had before it, whether the attempt loaded the job
-// and whether it took over the registration of a job that was loaded
-// already.
-func (m *launchdManager) load(ctx context.Context, path string, changed bool) (launchdLoadState, error) {
-	previous, err := m.supervisorState(ctx)
-	if err != nil {
-		return launchdLoadState{}, err
-	}
-	state := launchdLoadState{previous: previous}
+// state the registration had before it and whether that state was captured,
+// whether the attempt loaded the job and whether it took over the
+// registration of a job that was loaded already.
+//
+// An update over a loaded registration fails closed on a fact the supervisor
+// does not report: an output that names neither a state nor a process id
+// leaves the running state of the instance undetermined, and the update
+// refuses instead of treating a possibly running instance as stopped — the
+// stopped-instance branch would unload a job that may run and leave the
+// instance down. Only a job the supervisor holds can report that unknown
+// fact: a job it does not hold has no previous running state to give back,
+// so a genuine first installation never reaches this refusal — whichever
+// branch it takes, it ends with the property list it just wrote and its
+// RunAtLoad deciding the start.
+func (m *launchdManager) load(ctx context.Context, path string, plan launchdInstallPlan, previous launchdSupervisorState) (launchdLoadState, error) {
+	state := launchdLoadState{previous: previous, previousKnown: true}
+	// A first registration is a first installation without a job the
+	// supervisor already holds: only that state may bootstrap the job and
+	// run enable. Everything else follows the repeat-install rules, so a
+	// stopped instance is never started and no autostart decision of an
+	// administrator is overwritten. (The unknown running fact of a held
+	// job — and a RUNNING job whose property list is missing — refuse
+	// in Install, before anything is written: this snapshot is the
+	// state those refusals let through.)
+	firstRegistration := plan.firstInstall && !previous.loaded
 
 	switch {
-	case !previous.loaded:
+	case previous.running:
+		// From the first step of the stop on, the attempt counts as
+		// having taken the registration out of the supervisor: a stop
+		// unloads the job even when the instance did not finish its
+		// shutdown in an orderly way, so a failure at any point of the
+		// restart restores the previous property list and loads it
+		// again.
+		state.replaced = true
+		if previous.disabled {
+			// launchd refuses to load a disabled label, so the restart
+			// of a running disabled job runs the dance: enable for the
+			// load, and restore the flag before this attempt returns —
+			// the running state is preserved without leaving the
+			// disable flag cleared. A failed `enable` leaves the flag
+			// untouched, so only the exits below this point restore.
+			if _, err := m.launchctl(ctx, "enable", m.target()); err != nil {
+				return state, fmt.Errorf("service: enable %s: %w", m.target(), err)
+			}
+		}
+		// Once the dance enabled, every exit restores the flag — the
+		// rollback that follows a failed restart restores it again
+		// anyway, and the restore is a harmless re-assertion where
+		// nothing cleared it.
+		if err := m.Stop(ctx); err != nil {
+			if previous.disabled {
+				err = m.restoreDisableFlag(ctx, err)
+			}
+			return state, err
+		}
+		if err := m.Start(ctx); err != nil {
+			if previous.disabled {
+				err = m.restoreDisableFlag(ctx, err)
+			}
+			return state, err
+		}
+		state.bootstrapped = true
+		if previous.disabled {
+			if _, err := m.launchctl(ctx, "disable", m.target()); err != nil {
+				return state, fmt.Errorf("the disable flag could not be restored after the restart of %s: %w", m.target(), err)
+			}
+		}
+	case firstRegistration:
+		// The first installation may clear a forgotten disable of the
+		// label: launchd refuses to bootstrap a disabled job, so the
+		// flag goes first — the established first-install semantics,
+		// the design comment above — and only then does the bootstrap
+		// load the job it registered.
+		if _, err := m.launchctl(ctx, "enable", m.target()); err != nil {
+			return state, fmt.Errorf("service: enable %s: %w", m.target(), err)
+		}
 		if _, err := m.launchctl(ctx, "bootstrap", m.domain(), path); err != nil {
 			return state, fmt.Errorf("service: bootstrap %s: %w", m.target(), err)
 		}
 		state.bootstrapped = true
-	case changed:
+	case plan.changed && previous.loaded:
+		// A repeat installation over a loaded job that does not run
+		// takes the registration launchd still holds out of the
+		// supervisor and does not load the file again: the stopped
+		// instance stays stopped, and a later start loads the
+		// property list this installation wrote — never the
+		// registration the supervisor held before. This is also the
+		// branch of a job that was loaded without a property list, so
+		// such a job is never bootstrapped into an auto-start here.
 		if _, err := m.launchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
 			return state, fmt.Errorf("service: bootout %s: %w", m.target(), err)
 		}
-		// The job is unloaded now: it holds no registration of its
-		// own, so the restored file has to be loaded again by a
-		// rollback.
 		state.replaced = true
-		if _, err := m.launchctl(ctx, "bootstrap", m.domain(), path); err != nil {
-			return state, fmt.Errorf("service: bootstrap %s: %w", m.target(), err)
-		}
-		state.bootstrapped = true
 	}
 
-	// A job that was disabled in the override database of launchd would
-	// never start, so the disabled flag is cleared explicitly. The job is
-	// loaded at this point, so the command can address it.
-	if _, err := m.launchctl(ctx, "enable", m.target()); err != nil {
-		return state, fmt.Errorf("service: enable %s: %w", m.target(), err)
-	}
 	return state, nil
 }
 
@@ -1090,6 +1370,11 @@ func (m *launchdManager) load(ctx context.Context, path string, changed bool) (l
 type launchdLoadState struct {
 	// previous is the state the registration had before the attempt.
 	previous launchdSupervisorState
+	// previousKnown reports whether that state was read successfully. An
+	// attempt that failed before the read has no state to restore and no
+	// reference for a read back, and its rollback claims only the
+	// restoration of the property list it did itself.
+	previousKnown bool
 	// bootstrapped reports whether the attempt loaded the job into its
 	// domain.
 	bootstrapped bool
@@ -1104,36 +1389,61 @@ type launchdLoadState struct {
 type launchdSupervisorState struct {
 	// loaded reports whether the job is loaded into its domain.
 	loaded bool
+	// running reports whether the job runs now: the supervisor reports the
+	// state "running" or the id of a live process. A job that is not
+	// loaded never runs.
+	running bool
+	// runningKnown reports whether the output of the supervisor carried
+	// the running fact at all. Apple documents that output as unstable: an
+	// output that names neither a state nor a process id leaves the fact
+	// undetermined, and a plan that would act on it fails closed instead
+	// of reading "not running" from a missing field.
+	runningKnown bool
 	// disabled reports whether the job is disabled in the override
 	// database of launchd.
 	disabled bool
 }
 
 // supervisorState reports the state of the registration of the instance in
-// the supervisor: whether the job is loaded into its domain and whether it
-// is disabled in the override database of launchd.
+// the supervisor: whether the job is loaded into its domain, whether it runs,
+// whether that running fact is reported at all and whether it is disabled in
+// the override database of launchd.
 func (m *launchdManager) supervisorState(ctx context.Context) (launchdSupervisorState, error) {
-	loaded, _, err := m.printState(ctx)
+	loaded, output, err := m.printState(ctx)
 	if err != nil {
 		return launchdSupervisorState{}, err
 	}
-	return launchdSupervisorState{
+	disabled, disableErr := m.jobDisabled(ctx)
+	if disableErr != nil {
+		return launchdSupervisorState{}, disableErr
+	}
+	state := launchdSupervisorState{
 		loaded:   loaded,
-		disabled: m.jobDisabled(ctx),
-	}, nil
+		disabled: disabled,
+		// A job that is not loaded never runs: the fact is known
+		// without an output to read it from.
+		runningKnown: !loaded,
+	}
+	if loaded {
+		jobState, _, pid := launchdPrintFields(output)
+		state.running = launchdJobRunning(jobState, pid)
+		state.runningKnown = jobState != "" || pid > 0
+	}
+	return state, nil
 }
 
 // jobDisabled reports whether the job of the instance is disabled in the
 // override database of launchd.
 //
 // The database of the domain is asked, because that is where the disabled
-// flag of a job lives. The question is best effort: a supervisor that cannot
-// answer it is treated as one that knows no disabled job, so an installation
-// never fails because of it.
-func (m *launchdManager) jobDisabled(ctx context.Context) bool {
+// flag of a job lives. The answer is required, not best effort: a
+// supervisor that cannot answer leaves the enablement state unknown, and an
+// unknown state is never decided into an enable — the caller fails with the
+// read error instead, which preserves the flag by non-interference.
+func (m *launchdManager) jobDisabled(ctx context.Context) (bool, error) {
 	output, err := m.launchctl(ctx, "print-disabled", m.domain())
 	if err != nil {
-		return false
+		return false, fmt.Errorf("service: print-disabled %s: %w", m.domain(), err)
 	}
 	return launchdDisabledLabel(output, launchdLabel())
 }
@@ -1141,51 +1451,80 @@ func (m *launchdManager) jobDisabled(ctx context.Context) bool {
 // launchdDisabledLabel reports whether the output of "launchctl
 // print-disabled" says that the job of the given label is disabled.
 //
-// The output of launchd is not an API: a disabled job is listed as
-// "<label> => disabled", and a job that carries further overrides is listed
-// as a block that names the disabled flag. Both forms are read. A job that
-// is not listed at all is not disabled.
-func launchdDisabledLabel(output, label string) bool {
-	lines := strings.Split(output, "\n")
-	for i, line := range lines {
-		sep := strings.Index(line, "=>")
-		if sep < 0 {
+// launchctl(1) documents what the command does, not the grammar of its
+// output — the captured outputs are the source of truth here: a
+// "disabled services = {" dictionary of quoted entries
+// `"label" => value`, where the value is `true`/`false` on the releases up
+// to Monterey (captured: stackoverflow.com/questions/29815537,
+// usnistgov/macos_security#167 "Sample check on Monterey") and
+// `disabled`/`enabled` since Ventura (captured: the same issue, "Sample
+// check on Ventura"). Only the `=>` separator is evidenced; a line of our
+// label with any other shape, a value outside the two vocabularies (the
+// wild Ventura sample itself carried a typo'd "disablked") or an output
+// without the dictionary is UNRECOGNIZED: the answer is unknown and the
+// caller fails closed — an unknown enablement is never decided into an
+// enable. The empty answer belongs to that case: no captured sample shows
+// launchd printing nothing at all, while the samples with nothing disabled
+// print an empty dictionary. A label absent from a recognized dictionary
+// is not disabled.
+func launchdDisabledLabel(output, label string) (bool, error) {
+	inDictionary := false
+	sawDictionary := false
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
+		if !inDictionary {
+			if strings.HasPrefix(line, "disabled services") && strings.HasSuffix(line, "{") {
+				inDictionary = true
+				sawDictionary = true
+			}
 			continue
 		}
-		if strings.TrimSpace(line[:sep]) != label {
-			continue
-		}
-		value := strings.TrimSpace(line[sep+2:])
-		if value == "" || value == "{" {
-			// The job carries a block of overrides: the flags of the
-			// block are read.
-			return launchdDisabledBlock(lines[i+1:])
-		}
-		return strings.Contains(strings.ToLower(value), "disabled")
-	}
-	return false
-}
-
-// launchdDisabledBlock reports whether a block of overrides of a job names
-// the disabled flag.
-func launchdDisabledBlock(lines []string) bool {
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
 		if line == "}" {
-			return false
+			inDictionary = false
+			continue
 		}
 		sep := strings.Index(line, "=>")
 		if sep < 0 {
-			continue
+			// Our label inside the dictionary with no evidenced
+			// separator: an unrecognized shape OF our label, not
+			// noise — unknown, fail closed (single-quoted spellings
+			// included, which the quoted-only match read as noise).
+			if strings.Contains(line, label) {
+				return false, fmt.Errorf("unrecognized print-disabled entry for %s: %q", label, line)
+			}
+			continue // noise inside the dictionary
 		}
 		key := strings.Trim(strings.TrimSpace(line[:sep]), `"`)
-		if launchdPrintKey(key) != "disabled" {
-			continue
+		if key != label {
+			// The key may still BE our label wrapped in punctuation
+			// the grammar does not know — single quotes, a stray
+			// comma: not another job's entry, and deciding it into
+			// "another service" would read a silent "not disabled".
+			// A key that merely extends ours keeps its recognized
+			// shape and stays another job's entry.
+			if strings.Trim(key, `'",`) == label {
+				return false, fmt.Errorf("unrecognized print-disabled key for %s: %q", label, line)
+			}
+			continue // another job's entry
 		}
-		value := strings.Trim(strings.TrimSpace(line[sep+2:]), `"`)
-		return strings.EqualFold(value, "true")
+		value := strings.TrimSuffix(strings.TrimSpace(line[sep+2:]), ",")
+		switch value {
+		case "true", "disabled":
+			return true, nil
+		case "false", "enabled":
+			return false, nil
+		default:
+			// A block value, a typo or a future vocabulary: unknown.
+			return false, fmt.Errorf("unrecognized print-disabled value %q for %s", value, label)
+		}
 	}
-	return false
+	if !sawDictionary {
+		// Not empty, no dictionary: a shape this parser does not know —
+		// flat unquoted lines are not something launchd prints.
+		return false, fmt.Errorf("unrecognized print-disabled output: no \"disabled services\" dictionary")
+	}
+	// A recognized dictionary that does not list the label: not disabled.
+	return false, nil
 }
 
 // ensureLoaded registers the job with launchd when it is not loaded into its
@@ -1223,6 +1562,11 @@ func (m *launchdManager) printState(ctx context.Context) (bool, string, error) {
 // caller forever. The bound is the shared budget of the service layer, and
 // an instance that is still there when the budget is over is reported: the
 // caller has to know that the orderly shutdown did not happen.
+//
+// An output that carries neither a state nor a process id leaves the running
+// fact unknown: the shutdown is neither proven complete nor disproven, so
+// the wait honors the budget in that state instead of returning a success
+// the caller would read as a drained instance.
 func (m *launchdManager) waitForExit(ctx context.Context, pid int) error {
 	budget := m.shutdownBudget()
 	deadline := time.Now().Add(budget)
@@ -1236,16 +1580,18 @@ func (m *launchdManager) waitForExit(ctx context.Context, pid int) error {
 			return nil
 		}
 		state, _, current := launchdPrintFields(output)
-		if !launchdJobRunning(state, current) {
+		runningKnown := state != "" || current > 0
+		if runningKnown && !launchdJobRunning(state, current) {
 			return nil
 		}
-		if pid > 0 && current != pid {
+		if runningKnown && pid > 0 && current != pid {
 			// The process was replaced: the old one is gone.
 			return nil
 		}
 		if time.Now().After(deadline) {
-			// The instance is still there: the shutdown did not
-			// happen in an orderly way.
+			// The instance is still there — or its running fact never
+			// became readable —: the shutdown did not happen in an
+			// orderly way.
 			return &stopTimeoutError{budget: budget}
 		}
 		select {
@@ -1287,9 +1633,46 @@ func (e *stopTimeoutError) Error() string {
 // The state of the supervisor is restored as well: the instance may have
 // been running before the installation, and a rollback that only restores the
 // file would leave a registration that claims to be running while nothing
-// runs. A state that cannot be restored is reported, so the failure of the
-// installation never hides the failure of the rollback.
-func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, state launchdLoadState, cause error) error {
+// runs. The restored registration is then read back the same way the attempt
+// read it, and the returned error preserves the cause of the installation
+// while naming only the outcome the read proves — restored, not restored or
+// a restored registration whose instance is not confirmed running — so the
+// failure of the installation never hides the failure of the rollback and a
+// success is never claimed from the write alone.
+//
+// Every recovery command runs on a bounded context of its own
+// (rollbackRecoveryContext): the attempt context may already be dead when
+// the rollback starts, and the property list is restored before any
+// supervisor command, so no failure of a recovery command can skip the
+// restore of the file.
+func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, state launchdLoadState, cause error) (bool, error) {
+	// The recovery detaches from the attempt and takes its own budget: a
+	// cancelled or expired installation context must not stop the
+	// recovery, and the recovery must not hang either.
+	recovery, cancel := rollbackRecoveryContext(ctx)
+	defer cancel()
+	// The disable flag may be cleared at every point of this rollback:
+	// the attempt's restart dance may have cleared it before the attempt
+	// failed, and this rollback clears it again for its own bootstrap.
+	// Every exit therefore restores it when the flag was observed
+	// disabled — a restore is a re-assertion, so it is harmless where
+	// nothing cleared the flag — and keeps the established shape of the
+	// report: result and cause, the restore note when the restore itself
+	// fails, and the one action last.
+	restore := func(inner string, args ...interface{}) error {
+		base := fmt.Errorf("%w %s", cause, fmt.Sprintf(inner, args...))
+		if state.previous.disabled {
+			base = m.restoreDisableFlag(recovery, base)
+		}
+		return AppendActionErrorIfUnnamed(base, statusReadHint)
+	}
+	// The property list is restored BEFORE the supervisor is commanded:
+	// every exit below — a bootout failing as the first recovery command
+	// included — leaves the previous registration on disk, so no failure
+	// of a supervisor command can skip the restore of the file.
+	if err := backup.restore(); err != nil {
+		return false, restore("(the property list could not be restored: %v)", err)
+	}
 	// The registration of the failed attempt is unloaded when the attempt
 	// loaded the job or took over the registration of a job that was
 	// loaded already: launchd must not keep the registration of an
@@ -1297,33 +1680,120 @@ func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, stat
 	// again.
 	unload := state.replaced || (state.bootstrapped && !state.previous.loaded)
 	if unload {
-		if _, err := m.launchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
-			return fmt.Errorf("%w (the registration could not be unloaded: %v)", cause, err)
+		if _, err := m.launchctl(recovery, "bootout", m.target()); err != nil && !isServiceMissing(err) {
+			return false, restore("(the registration could not be unloaded: %v)", err)
 		}
 	}
-	if err := backup.restore(); err != nil {
-		return fmt.Errorf("%w (the property list could not be restored: %v)", cause, err)
-	}
 	if state.replaced {
+		if state.previous.disabled {
+			// launchd refuses to load a disabled label: the restore of
+			// a loaded disabled registration runs the dance — enable
+			// for the bootstrap, and the restore on every exit below
+			// and at the end of this function — so the rollback gives
+			// the loaded state back without leaving the disable flag
+			// cleared, whichever step of it fails.
+			if _, err := m.launchctl(recovery, "enable", m.target()); err != nil {
+				return false, restore("(the restored registration could not be enabled for the load: %v)", err)
+			}
+		}
 		// The attempt took over the registration of a job that was
 		// loaded before it: the restored file is loaded again, so the
 		// instance runs like it did before.
-		if _, err := m.launchctl(ctx, "bootstrap", m.domain(), backup.path); err != nil {
-			return fmt.Errorf("%w (the restored registration could not be loaded: %v)", cause, err)
+		if _, err := m.launchctl(recovery, "bootstrap", m.domain(), backup.path); err != nil {
+			return false, restore("(the restored registration could not be loaded: %v)", err)
+		}
+		// The instance ran before the attempt. A restored property list
+		// whose RunAtLoad is false is loaded by that bootstrap but not
+		// started by it, so it is started explicitly — the same start
+		// the lifecycle uses — and only then does the registration run
+		// like it did before the attempt. A restored property list that
+		// cannot be read is not started here: launchd refuses to load
+		// it at all, and the load above already reported that.
+		if state.previous.running {
+			if parsed, parseErr := parsePlist(backup.content); parseErr == nil && !parsed.RunAtLoad {
+				if _, err := m.launchctl(recovery, "kickstart", m.target()); err != nil {
+					return false, restore("(the restored registration could not be started: %v)", err)
+				}
+			}
 		}
 	}
-	// The enable state of the registration is restored: the failed
-	// attempt may have enabled a job that was disabled before it.
+	// The disable flag of the registration is restored: the dance above
+	// cleared it for the bootstrap, and a failed attempt may have cleared
+	// it another way. An attempt never disables a job that was not
+	// disabled, so no enable runs here — the flag is restored only as
+	// observed, and a job that was not disabled needs nothing back.
 	if state.previous.disabled {
-		if _, err := m.launchctl(ctx, "disable", m.target()); err != nil {
-			return fmt.Errorf("%w (the restored registration could not be disabled: %v)", cause, err)
-		}
-	} else if state.previous.loaded {
-		if _, err := m.launchctl(ctx, "enable", m.target()); err != nil {
-			return fmt.Errorf("%w (the restored registration could not be enabled: %v)", cause, err)
+		if _, err := m.launchctl(recovery, "disable", m.target()); err != nil {
+			return false, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the disable flag could not be restored: %v)", cause, err), statusReadHint)
 		}
 	}
-	return cause
+	return m.verifyRestoredRegistration(recovery, state, cause)
+}
+
+// rollbackRecoveryBudget bounds every command of a rollback: the recovery
+// detaches from the cancelled attempt and must still not hang — the
+// shutdown budget of the service layer plus its margin is the span a
+// bootout may wait for a graceful exit (the ExitTimeOut of the
+// registration is sized from the same budget), so one shutdown's worth
+// covers the unload, the reload and the read-back. A test shortens it to
+// prove the exhaustion report.
+var rollbackRecoveryBudget = ShutdownBudget + shutdownMargin
+
+// rollbackRecoveryContext is the recovery context of a rollback:
+// cancellation of the attempt does not reach it, rollbackRecoveryBudget
+// bounds it, and the caller stops its timer when the recovery ends.
+func rollbackRecoveryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), rollbackRecoveryBudget)
+}
+
+// restoreDisableFlag re-asserts the observed disable flag after a dance
+// cleared it. The restore owns its recovery context — detached from the
+// cancelled attempt and bounded (rollbackRecoveryContext) — so a cancelled
+// attempt cannot degrade it and it cannot hang; a failure is named in the
+// error it wraps instead of being hidden.
+func (m *launchdManager) restoreDisableFlag(ctx context.Context, err error) error {
+	recovery, cancel := rollbackRecoveryContext(ctx)
+	defer cancel()
+	if _, derr := m.launchctl(recovery, "disable", m.target()); derr != nil {
+		return fmt.Errorf("%w (the disable flag could not be restored: %v)", err, derr)
+	}
+	return err
+}
+
+// verifyRestoredRegistration reads the restored registration back and turns
+// the state the supervisor reports into the outcome of the rollback,
+// preserving the cause of the failed installation.
+//
+// The read decides, not the commands that succeeded: the registration was
+// restored only when the loaded state and the override flag match the state
+// the rollback gave back, and an instance that ran before the attempt has to
+// be observed running for that full claim. Everything the read cannot prove —
+// a state it cannot reach, a state that does not match, an instance that does
+// not come back — is reported as what it is. The read runs on the recovery
+// context of the rollback — detached from the cancelled attempt and bounded
+// — so a cancelled installation must not degrade its own rollback report
+// into unknown. The boolean reports whether the registration is PROVEN back
+// at its previous state: the created-directory cleanup of the caller keys
+// on it, and every uncertain read reports false.
+func (m *launchdManager) verifyRestoredRegistration(ctx context.Context, state launchdLoadState, cause error) (bool, error) {
+	if !state.previousKnown {
+		// The attempt failed before it captured the state of the
+		// registration: there is nothing to compare a read back
+		// against, and the rollback claims only what it did itself —
+		// the property list is back at its previous state.
+		return true, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the property list was restored; the previous state of the registration was not captured)", cause), statusReadHint)
+	}
+	readback, err := m.supervisorState(ctx)
+	if err != nil {
+		return false, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the state of the restored registration could not be read back: %v)", cause, err), statusReadHint)
+	}
+	if readback.loaded != state.previous.loaded || readback.disabled != state.previous.disabled {
+		return false, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the registration does not hold the previous state again)", cause), statusReadHint)
+	}
+	if state.previous.running && !readback.running {
+		return true, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the registration was restored, but the instance was not confirmed running)", cause), statusReadHint)
+	}
+	return true, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the registration was restored)", cause), statusReadHint)
 }
 
 // plistBackup is the state of a property list before it was overwritten.
@@ -1497,6 +1967,13 @@ func pathWithin(path, dir string) bool {
 // produce the same bytes and the bytes can be inspected without touching
 // the system.
 //
+// RunAtLoad is the one policy key an update preserves from the registration
+// it replaces: the template renders the value the installation carries — the
+// value found in the existing property list for a repeat installation, true
+// for a first one. The other policy keys (KeepAlive, ProcessType,
+// ExitTimeOut) are HFDesk's own rendering of its policy, and a key this
+// template does not carry is not part of the file HFDesk owns.
+//
 // The property list carries no StandardOutPath and no StandardErrorPath:
 // launchd does not rotate those files, so they would grow without bound.
 // HFDesk writes its own bounded rotating log file into the log directory of
@@ -1534,7 +2011,7 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 	<key>WorkingDirectory</key>
 	<string>{{.WorkingDirectory | xml}}</string>
 	<key>RunAtLoad</key>
-	<true/>
+	{{if .RunAtLoad}}<true/>{{else}}<false/>{{end}}
 	<key>KeepAlive</key>
 	<dict>
 		<key>SuccessfulExit</key>
@@ -1589,13 +2066,23 @@ type plistData struct {
 	// GroupName is the primary group of the account.
 	GroupName string
 	// ExitTimeOut is the number of seconds launchd waits after it asked
-	// the instance to stop before it kills it. It is the shared budget of
-	// the service layer, so the deadline of the supervisor is never
-	// shorter than the graceful shutdown of the instance.
+	// the instance to stop before it kills it: the shared budget of the
+	// service layer (see plistTemplate).
 	ExitTimeOut int
+	// RunAtLoad is the autostart key of the property list: true for a
+	// first installation, the value found in the existing registration for
+	// a repeat installation.
+	RunAtLoad bool
 }
 
-// renderPlist renders the launchd property list of an installation.
+// renderPlist renders the launchd property list of a first installation:
+// the autostart key carries the default that starts the instance.
+func renderPlist(opts InstallOptions, account *serviceAccount) (string, error) {
+	return renderPlistWithRunAtLoad(opts, account, true)
+}
+
+// renderPlistWithRunAtLoad renders the launchd property list of an
+// installation with the given autostart value.
 //
 // The function is pure: it reads the environment of the caller and it
 // writes nothing, so the property list of an installation can be inspected
@@ -1604,9 +2091,8 @@ type plistData struct {
 // A machine-wide instance runs as the given service account: the property
 // list names the account and its primary group, so launchd starts the
 // instance with the identity the installation granted its directories to.
-// A user scope instance names neither: it runs as the user of its gui
-// domain.
-func renderPlist(opts InstallOptions, account *serviceAccount) (string, error) {
+// A user scope instance names neither (see plistTemplate).
+func renderPlistWithRunAtLoad(opts InstallOptions, account *serviceAccount, runAtLoad bool) (string, error) {
 	if err := validatePlistOptions(opts); err != nil {
 		return "", err
 	}
@@ -1621,6 +2107,7 @@ func renderPlist(opts InstallOptions, account *serviceAccount) (string, error) {
 		WorkingDirectory: opts.Paths.StateDir,
 		Home:             home,
 		ExitTimeOut:      int(ShutdownBudget / time.Second),
+		RunAtLoad:        runAtLoad,
 	}
 	if opts.Scope == ScopeSystem {
 		if account == nil {
@@ -1647,7 +2134,7 @@ func validatePlistOptions(opts InstallOptions) error {
 	switch opts.Scope {
 	case ScopeUser, ScopeSystem:
 	default:
-		return fmt.Errorf("service: invalid scope %q (want %q or %q)", opts.Scope, ScopeUser, ScopeSystem)
+		return fmt.Errorf("service: invalid scope %q (want one of %q, %q)", opts.Scope, ScopeUser, ScopeSystem)
 	}
 	if opts.Executable == "" {
 		return fmt.Errorf("service: executable is required")
@@ -1983,6 +2470,29 @@ func (r plistRegistration) paths() runtimepaths.Paths {
 	}
 }
 
+// registrationOptions returns the installation options a property list
+// carries: the program of the registration, the bind address, the runtime
+// paths, the cache layout and the service account of a machine-wide
+// instance.
+//
+// These are the values an update that names nothing keeps. No field is
+// marked explicit: a value of the registration is a found setting and never
+// the request of an installation. A key the property list does not carry
+// records no setting, so the request decides that field — an absent optional
+// directory stays absent through the shared merge.
+func (r plistRegistration) registrationOptions(scope Scope) InstallOptions {
+	return InstallOptions{
+		Scope:       scope,
+		Executable:  r.executable(),
+		Listen:      r.listen(),
+		Paths:       r.paths(),
+		CacheDir:    r.cacheDir(),
+		HubDir:      r.argumentValue("--hub-dir"),
+		LocalDir:    r.argumentValue("--local-dir"),
+		ServiceUser: r.UserName,
+	}
+}
+
 // launchdStatusState maps the output of "launchctl print" to the state of the
 // instance and to the detail of the status.
 //
@@ -1993,8 +2503,8 @@ func (r plistRegistration) paths() runtimepaths.Paths {
 // this build does not know is read through the process of the job: launchd
 // reports the pid of the live process of a job that runs. A job that does
 // not run, that exited cleanly and whose state this build does not know is
-// reported as unknown, and the detail carries what the supervisor reported,
-// so an administrator and a failing test see the same thing.
+// reported as unknown with the supervisor's own detail
+// (launchdUnknownStateDetail owns that sentence).
 func launchdStatusState(target, output string) (State, string) {
 	state := parseLaunchdPrint(output)
 	switch state {
@@ -2017,10 +2527,7 @@ func launchdStatusState(target, output string) (State, string) {
 }
 
 // parseLaunchdPrint maps the output of "launchctl print" to the state of the
-// instance.
-//
-// A job that is not running is stopped, unless it exited with a non-zero
-// status: such a job failed.
+// instance (launchdStatusState owns the state rules).
 func parseLaunchdPrint(output string) State {
 	state, exitCode, _ := launchdPrintFields(output)
 	switch strings.ToLower(state) {
