@@ -544,10 +544,12 @@ keeps everything the command does not name again:
 owns. Three states refuse it **before anything changes** — nothing is
 stopped, nothing is written, no directory is created — and each refusal says
 first that the update was refused and the registration was not changed, then
-names the cause, and then states exactly one next action:
-
-> Move your customizations into "<unit directory>/hfdesk.service.d/local.conf"
-> and run "hfdesk service install" again.
+names the cause, and then states exactly one instruction whose steps clear
+that cause before the attempt runs again. The supervisor holds loaded unit
+configuration in memory until a reload reads the file system again, so an
+instruction that changes a file ends with `<scope> daemon-reload` and the
+retry after it — a retry without that reload would read the same stale load
+and refuse the same way.
 
 1. **A hand-edited base file.** The bytes of `hfdesk.service` must be the
    canonical unit HFDesk generates. Any deviation refuses the update instead
@@ -556,20 +558,35 @@ names the cause, and then states exactly one next action:
    `ExecStart=`, a command that is the program alone or carries words the
    canonical vector does not — and an `env`-wrapped command such as `env -u
    NAME /path/to/hfdesk service run …` as well, which is refused as a hand
-   edit of HFDesk's file rather than rewritten.
+   edit of HFDesk's file rather than rewritten. The one instruction moves the
+   customizations into the drop-in, removes the unit file, reloads the unit
+   files and runs the installation again: the removal makes that attempt the
+   first installation which writes HFDesk's canonical rendering (an edit the
+   move alone cannot undo would otherwise refuse forever), and the reload
+   clears the supervisor's copy of the removed file.
 2. **A drop-in that owns the command.** `ExecStart=` is the field HFDesk
    owns. When systemd loads a command that differs from the one in the unit
    file — because a drop-in overrides it — the update refuses before any
    change and names the drop-in paths the supervisor reports. The one next
    action must clear that cause: it names the exact drop-in file that carries
-   the override — *remove the `ExecStart=` override from that file*, with
-   `local.conf` itself no exception — and when no reported drop-in carries
-   one, it names a reload of the unit files, which makes the supervisor read
-   the command of the file again. The command of the instance is changed by
-   naming the install flags again, never by a drop-in.
+   the override — *remove the `ExecStart=` override from that file* (with
+   `local.conf` itself no exception) *and reload the unit files*, because the
+   supervisor keeps the overridden command in memory until the reload reads
+   the edited drop-in again — and when no reported drop-in carries one, it
+   names the reload alone, which makes the supervisor read the command of the
+   file again. The command of the instance is changed by naming the install
+   flags again, never by a drop-in.
 3. **A foreign or vendor fragment.** When systemd loads a unit under the
    HFDesk name from a file HFDesk did not write — a packaged or generated
    fragment — the update refuses instead of adopting it or writing over it.
+   The one instruction depends on what systemd reports: a fragment file that
+   is there is removed at that path after the customizations worth keeping
+   moved into the drop-in, the unit files are reloaded and the installation
+   runs again; a fragment file that is already gone (the load is stale until
+   a reload) names only that reload and the retry; and a loaded registration
+   that reports no readable fragment has no file to remove, so the refusal
+   names no command and states that whatever loaded it must remove it before
+   an installation can pass.
 
 **What a drop-in may do.** Everything except the command. A drop-in that sets
 `Environment=`, `EnvironmentFile=`, `SupplementaryGroups=`, `WorkingDirectory=`
@@ -662,10 +679,11 @@ confirm.
   `ExitTimeOut`) is rewritten to HFDesk's rendering. A property list that
   cannot be read at all records no setting: the installation repairs it
   from the request instead of failing over it. The launchd override
-  database is not part of the property list: an installation clears the
-  `launchctl disable` flag of a job it loads into the domain, exactly as
-  before, never of a stopped job it leaves unloaded, and clearing the flag
-  starts nothing by itself.
+  database is not part of the property list: a **first** installation
+  clears the `launchctl disable` flag of the job it loads into the domain,
+  and a repeat installation never runs `enable` — the flag an administrator
+  set survives every update, whether or not the attempt loads the job —
+  and clearing the flag starts nothing by itself.
 - The property list holds the label, the program arguments and the environment
   of the instance — no credential.
 - The **macOS CI job** is narrowed to the service package: the launchd
@@ -1072,9 +1090,9 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   or a disabled start stays manual or disabled and a delayed automatic start
   stays delayed. On macOS the property list keeps the `RunAtLoad` value it
   carries — a first installation writes the default that starts the instance,
-  a repeat installation keeps the found value — and a job the installation
-  does not load keeps its `launchctl disable` flag untouched, so the override
-  state of a stopped instance survives the update. Only a **first**
+  a repeat installation keeps the found value — and a repeat installation
+  never runs `enable`, so the `launchctl disable` flag of the label survives
+  every update, whether or not the attempt loads the job. Only a **first**
   installation enables the registration it writes for the boot of its scope.
 - **A state the installation cannot update is refused.** A masked systemd unit
   is refused before the unit file is written, whether the mask is persistent or
