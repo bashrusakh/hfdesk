@@ -114,7 +114,7 @@ func (a *Analyzer) analyzeWithRevision(ctx context.Context, repo string, isDatas
 
 	// Fetch file tree - auto-detect model vs dataset unless the caller forced a
 	// namespace or explicitly selected a dataset.
-	files, detectedIsDataset, commit, err := a.fetchFileTreeAutoDetect(ctx, repo, isDataset, forceModel, revision)
+	files, detectedIsDataset, commit, probeDegrade, err := a.fetchFileTreeAutoDetect(ctx, repo, isDataset, forceModel, revision)
 	if err != nil {
 		return nil, fmt.Errorf("fetch file tree: %w", err)
 	}
@@ -143,6 +143,22 @@ func (a *Analyzer) analyzeWithRevision(ctx context.Context, repo string, isDatas
 		info.TotalSize += f.Size
 	}
 	info.TotalSizeHuman = humanSize(info.TotalSize)
+
+	// The optional probe failed, so ErrBothExist detection is unverified:
+	// report the degradation instead of dropping it — caller context first,
+	// so cancellation or a caller deadline never becomes a warning cause.
+	if probeDegrade != nil && ctx.Err() == nil {
+		cause := "probe_unavailable"
+		if errors.Is(probeDegrade, hubtree.ErrPageFetchTimeout) {
+			cause = "probe_timeout"
+		}
+		info.AnalysisWarnings = append(info.AnalysisWarnings, AnalysisWarning{
+			Code:      bothNamespaceDetectionWarningCode,
+			Message:   fmt.Sprintf("Both-namespaces (ErrBothExist) detection was degraded: the dataset-namespace existence probe failed, so this repository was not checked for also existing as a dataset (cause: %v). Retry analysis to try again.", probeDegrade),
+			Causes:    []string{cause},
+			Retryable: true,
+		})
+	}
 
 	info.Type = a.detectType(files, isDataset)
 	info.TypeDescription = info.Type.Description()
@@ -209,6 +225,8 @@ type hfTreeNode struct {
 
 // ErrBothExist is returned when a repo exists as both model and dataset.
 var ErrBothExist = fmt.Errorf("repository exists as both model and dataset")
+
+const bothNamespaceDetectionWarningCode = "both_namespace_detection_degraded"
 
 // GatedRepoError reports that the Hub requires the user to accept an access
 // agreement or obtain approval before the repository can be read. It carries
@@ -335,18 +353,20 @@ func (a *Analyzer) newGatedRepoError(repo string, isDataset bool, message string
 // error. If both model and dataset exist, returns ErrBothExist. When forceModel
 // is true, only the model namespace is fetched and no dataset probe follows; a
 // missing model is reported as an error instead of falling back.
-func (a *Analyzer) fetchFileTreeAutoDetect(ctx context.Context, repo string, isDataset, forceModel bool, revision string) ([]FileInfo, bool, string, error) {
+// probeDegrade, when non-nil, is the failure of the optional post-success
+// dataset probe (the ErrBothExist check); it is never returned as err.
+func (a *Analyzer) fetchFileTreeAutoDetect(ctx context.Context, repo string, isDataset, forceModel bool, revision string) ([]FileInfo, bool, string, error, error) {
 	// If explicitly marked as dataset, fetch as dataset directly
 	if isDataset {
 		files, commit, err := a.fetchFileTree(ctx, repo, true, revision)
-		return files, true, commit, err
+		return files, true, commit, nil, err
 	}
 
 	// A forced model analyze must not auto-detect: probing the dataset
 	// namespace here would turn a valid model selection back into ErrBothExist.
 	if forceModel {
 		files, commit, err := a.fetchFileTree(ctx, repo, false, revision)
-		return files, false, commit, err
+		return files, false, commit, nil, err
 	}
 
 	modelFiles, modelCommit, modelErr := a.fetchFileTree(ctx, repo, false, revision)
@@ -371,26 +391,31 @@ func (a *Analyzer) fetchFileTreeAutoDetect(ctx context.Context, repo string, isD
 	if isModelNotFound(modelErr) {
 		datasetFiles, datasetCommit, datasetErr := a.fetchFileTree(ctx, repo, true, revision)
 		if datasetErr == nil {
-			return datasetFiles, true, datasetCommit, nil
+			return datasetFiles, true, datasetCommit, nil, nil
 		}
 		// If dataset also fails with not found/unauthorized, return helpful error
 		if isModelNotFound(datasetErr) {
-			return nil, false, "", fmt.Errorf("repository not found as model or dataset: %s", repo)
+			return nil, false, "", nil, fmt.Errorf("repository not found as model or dataset: %s", repo)
 		}
 		// Dataset failed with different error (actual auth issue, network, etc.)
-		return nil, false, "", datasetErr
+		return nil, false, "", nil, datasetErr
 	}
 
 	if modelErr == nil {
 		_, _, datasetErr := a.fetchFileTree(ctx, repo, true, revision)
 		if datasetErr == nil {
-			return nil, false, "", ErrBothExist
+			return nil, false, "", nil, ErrBothExist
 		}
-		return modelFiles, false, modelCommit, nil
+		// An authoritative namespace miss (401/404) is a completed probe with
+		// a negative answer; only an unanswerable probe degrades detection.
+		if !isModelNotFound(datasetErr) {
+			return modelFiles, false, modelCommit, datasetErr, nil
+		}
+		return modelFiles, false, modelCommit, nil, nil
 	}
 
 	// Return original error for other failures (network, etc.)
-	return nil, false, "", modelErr
+	return nil, false, "", nil, modelErr
 }
 
 // treeHTTPStatusError preserves the existing status diagnostic while retaining

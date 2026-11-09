@@ -310,7 +310,9 @@ or job ownership behavior. This section is the agent-level summary; when it and
   and the remedy — never a silently partial result for the required
   file-list walks, which always fail loudly, while the three optional
   enrichment walks (post-success dataset namespace probe, mmproj discovery,
-  EXL size pass) keep their pre-existing optional-failure semantics and may
+  EXL size pass) keep their pre-existing optional-failure semantics (the
+  dataset namespace probe's optional failure now surfaces as an analysis
+  warning instead of silently, never failing the analysis) and may
   be skipped on expiry — and stays a failure
   matching `hubtree.ErrPageFetchTimeout`, never a caller cancellation
   (`errors.Is(context.DeadlineExceeded|Canceled)` is always false for it).

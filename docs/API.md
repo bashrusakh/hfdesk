@@ -389,11 +389,17 @@ array of bounded, non-fatal diagnostics:
 }
 ```
 
-`code` identifies the warning. The only code currently emitted is
-`exl_branch_discovery_incomplete`. `causes` contains stable reason codes, not
-upstream response bodies or URLs: `header_unavailable`,
-`header_uninterpretable`, `probe_timeout`, `probe_limit`, and
-`weight_role_unrecognized`. `retryable` indicates that repeating the same
+`code` identifies the warning. The codes currently emitted are
+`exl_branch_discovery_incomplete` and `both_namespace_detection_degraded`,
+the latter when the optional dataset-namespace probe after a successful model
+listing failed, so both-namespaces (`needsSelection`) detection is unverified
+for this analysis — the analysis outcome is unchanged, only the warning is
+added. `causes` contains stable reason codes, not upstream response bodies or
+URLs: `header_unavailable`, `header_uninterpretable`, `probe_timeout`,
+`probe_limit`, `weight_role_unrecognized`, and `probe_unavailable`.
+`both_namespace_detection_degraded` carries the underlying failure text in
+`message` (an expired tree-page budget keeps its actionable timeout text).
+`retryable` indicates that repeating the same
 analyze request may complete the optional discovery. A retry repeats the same
 repository, namespace, and revision request; it does not change the selection
 or start a download.
