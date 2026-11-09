@@ -53,6 +53,8 @@ browser-only presentation belongs in `internal/assets/static`.
 Read relevant Markdown before changing behavior:
 
 - General project behavior: `README.md`
+- Downloader/cache correctness contract: `pkg/hfdownloader/doc.go` (canonical
+  detailed contract; the Downloader contract section below is a summary)
 - API contracts: `docs/API.md`
 - Service mode reference: `docs/SERVICE.md`
 - Contribution and commit conventions: `CONTRIBUTING.md`
@@ -125,28 +127,143 @@ change is documentation-only.
 - Do not hide data loss, verification failure, or fallback behavior.
 - Finish end-to-end: implementation, focused tests, and cleanup.
 
-## Downloader correctness rules
+## Downloader contract
 
-Downloader bugs often produce silent corruption, so safety beats clever resume.
+The canonical, detailed contract for downloader and cache correctness is
+`pkg/hfdownloader/doc.go`. Read it before changing downloader, cache, mirror,
+or job ownership behavior. This section is the agent-level summary; when it and
+`doc.go` differ, `doc.go` is authoritative and this summary must be updated.
 
-- Never assemble multipart downloads after context cancellation or known part
-  errors.
-- Multipart part files are only reusable when their byte-range layout is known
-  to match the current file size and connection count.
-- If resume metadata is missing, invalid, or mismatched, discard stale part files
-  and restart that file rather than guessing.
-- LFS files with known SHA-256 must be verified after download.
-- Size checks are only a fallback for files without a trusted hash.
-- Keep retry resume offsets based on bytes actually written to disk.
-- Do not delete partial data on transient network failure unless it is known to
-  be stale or incompatible.
-- Use context-aware sleeps/requests so pause, cancel, shutdown, and requeue stop
-  promptly.
+- Cache ownership is cache-owned by default: Hub items use the durable control
+  tree at `H/.hfdesk-control/v1` derived only from the frozen `HubDir` H, while
+  friendly-view items use `R/.hfdesk-control/v1` derived from the frozen cache
+  root R. The downloader link operation scopes each actual H/R output it
+  mutates; server deletion, mirror destructive steps and the HF branch of
+  selected-GGUF deletion participate through the cache-owned admission API
+  (`OpenCacheAdmission`, `AdmitTreeRemoval`/`AdmitFileWrite`), and selected
+  deletion's local-root branch through the same API against the flat
+  `OwnershipDir` realm (`OpenFlatAdmission`, `AdmitFileWrites`) — as strong as
+  the flat writers' existing coordination: one shared `OwnershipDir` (default
+  per-user) reads the same realm id, and realm-relative keys converge when the
+  rel-token input matches — one common shared mount cancels prefix movement,
+  and split topologies need the same structure below the lowest common
+  ancestor and the same descending component spellings (documented residual).
+  Tree removals admit the tree first and
+  treat a missing target as gone only after re-verifying the vanish while
+  holding its creator-side keys; an admission that establishes neither fails
+  closed. Shared H clients converge without per-user `OwnershipDir` setup.
+  `Settings.OwnershipDir` is for flat `OutputDir` mode only; a non-empty value
+  in cache mode is rejected instead of selecting another cache namespace.
+  Cache-owned node metadata is separated from payload components, IDs/profiles
+  are persistent, and lock files are regular metadata files that are never
+  unlinked. Current writers create no payload-side domain-lock files.
+- ONE destination scope is acquired after the authoritative skip decision and
+  before resume inspection/HEAD/claim, then held through transfer,
+  publication/store and cancel cleanup. Content-addressed cache items use
+  logical key `blobs/<sha>` across single and ranged routes; digest-less items
+  use the reserved `tmp-path-` namespace; flat items use their destination path.
+  Scope leases include actual staging/publish paths. Snapshot and enabled
+  friendly mutations acquire their actual paths while the blob domain remains
+  held. Missing parents use the preparation gates, create-parent phase and
+  physical-key promotion before payload mutation. `FinalizeBlob`, cache store,
+  `CheckBlob` and applicable cleanup/probes participate in the applicable
+  cache-owned H/R or flat-mode realm/key protocol.
+- The multipart claim takes NO second item lock: it receives the held scope,
+  verifies coverage of its staging path, fails closed otherwise, and serializes
+  record transitions with the intra-item metadata gate. New/updated v4 records
+  carry `LockFenced` plus `OwnershipFence`, bound to the current realm and item
+  key. `LockFenced` alone is legacy diagnostic data, not proof. The shared
+  predicate in claim, `CheckBlob`, `FinalizeBlob` and unowned cleanup accepts
+  only an exact current proof or independent self/death evidence; unknown or
+  mismatched live records are preserved and refused with
+  `ErrStagingOwnershipUnproven`. `CheckBlob` probes the applicable item scope with
+  a non-owning shared lease, never the obsolete payload-side lock. Claim records
+  are not freshness leases: no heartbeat, timer rewrite or age-based takeover;
+  `StaleTimeout` remains removed. Ownership waits are bounded/context-aware at
+  five minutes and waiters return/reacquire transfer slots. Unavailable or
+  unresolved ownership fails before payload mutation and preserves partials.
+- Resume is v4-only: the version-4 `<staging>.incomplete`/`.meta` record and
+  the version-1 `<dst>.part.meta` sidecar are the only resume state. Any other
+  version is never migrated: a fenced old-version record (or one whose owner is
+  provably dead or is this process) is discarded under the claim and
+  re-downloaded from zero, while an unfenced old-version record whose owner
+  cannot be proven dead is refused as unproven and preserved (the ownership
+  gate runs before the version branch). Every pre-#140 `.part-NN`/`.parts.json`
+  family is discarded, never migrated, and re-downloaded from zero. Inherit
+  staged bytes only under a
+  matching identity pinned on both sides (repo, commit, path, size, through the
+  one shared `resumeIdentity.matches` rule); the single-path exact-size shortcut
+  also requires `framing_complete`, and inherited bytes are bounded by the
+  sidecar's durable byte offset, never the stat-visible size — everything above
+  that offset is discarded and re-fetched. The whole transfer (tree walk and every
+  per-file URL) is pinned to the resolved commit. Ordinary custom endpoints may
+  select a confirmed branch-only mode before plan callbacks/reservations; it
+  rebuilds the whole plan, inherits no partials, retries from zero, and makes no
+  immutable snapshot/ref/manifest claim. Arbitrary network/auth/server errors
+  never downgrade, transfers never switch modes mid-job, and branch variants
+  remain pinned. Known-digest proof still follows `Settings.Verify`. An
+  oversized `.part` is
+  discarded, never clamped. The sidecar goes only when its partial is actually
+  gone; only a not-exist `stat` proves that.
+- Only a content-addressed `blobs/<known-sha>` target is completion proof by
+  existence; an arbitrary destination follows the authoritative pre-download
+  skip decision. Publication asserts two independent gates: a complete range layout
+  (`errStagingLayoutIncomplete`) and the exact payload length after flush
+  (`errStagingPayloadSize`). Never assemble or publish after cancellation or a
+  known part error; publication checks cancellation immediately before the
+  rename. Content-addressed publication has two tiers: atomic hard-link
+  no-replace normally, and domain-exclusive check-then-rename on a filesystem
+  without hard links. The cache store's cross-device copy fallback runs inside
+  the domain, but its final rename is not no-replace. A loser of a publication
+  race discards its own staging pair. Mirror and selected-GGUF operations do
+  not publish through this primitive: the mirror takes entry admission per
+  copied destination file — the copy itself stays a non-atomic
+  truncate-and-write checked only by `io.Copy`'s error contract, with the
+  explicit size comparison in the opt-in verify pass — tree admission per
+  removed repository, entry admission for its symlink-leaf replacement and
+  admitted directory creation for directories it creates; the sync/rebuild
+  path creates, replaces and removes snapshot/friendly entries, prunes empty
+  directories and writes the rebuild script through the same shared admission
+  funnels; selected-GGUF deletion takes repository and friendly tree admission
+  for HF locations and flat-realm entry admission over the member paths for
+  local locations, rather than the blob domain. Neither performs
+  domain-exclusive placement, so no publication guarantee extends to them.
+- JOB CONTRACT: success means every requested file is present AND reachable at
+  its snapshot/friendly path. A file owned by another live writer is never a
+  completed skip: wait bounded, re-check the content-addressed blob, otherwise
+  download it or fail with the actionable live-owner error. A link-creation
+  failure fails the item in both transfer and skip paths with
+  `ErrCacheLinkUnreachable`; a disabled friendly view (`NoFriendlyView`) is not
+  an error. Waiters do not hold a `MaxActiveDownloads` slot: the slot is a
+  per-item lease returned for every domain wait and taken back before transfer.
+- Cache surfaces use one exhaustive name-shape classifier for staging
+  artifacts in `blobs/`; unusual published names are content. Staging-shaped
+  blob keys are refused by `StoreDownloadedFile` and `FinalizeBlob` before
+  placement. Cleanup runs only under the destination domain, through the
+  collapsed entry points `removeStagingArtifactsLocked` and
+  `removeStagingArtifactsIfUnowned`. A route removes only the artifacts it
+  creates (B1): for example, a multipart HEAD failure leaves a single-route
+  `.part`/sidecar alone.
+- `Settings.Verify` controls LFS verification too: `none`, `size` (default, no
+  normal-path full-file reread), `sha256` (at most one pre-publication pass),
+  and `etag` (the same pre-publication pass for a known digest; historical
+  non-LFS ETag behavior). A known digest is never hashed only after publication.
+  `ProofPending` forces a re-proof on resume in every mode except `none`. Size
+  checks are only a fallback for files without a trusted hash.
+- Keep retry/resume offsets based on bytes actually written to disk; do not
+  delete partial data on transient network failure unless it is known to be
+  stale or incompatible; use context-aware sleeps/requests so pause, cancel,
+  shutdown and requeue stop promptly.
 
 ## Job and server state rules
 
 - `JobManager` owns live job state; callers should receive snapshots, not shared
   mutable pointers.
+- A job that reports success must mean the requested files are present AND
+  reachable at their snapshot/friendly paths; the wait/re-check, link-failure
+  and transfer-slot rules are in the Downloader contract above and in
+  `pkg/hfdownloader/doc.go`. A job that ends with such a failure is `failed`,
+  not `completed`.
 - Do not hold the job manager lock while broadcasting to listeners or WebSocket
   clients.
 - Scheduler changes must preserve `max-active` semantics: queued jobs start in
@@ -188,6 +305,36 @@ Downloader bugs often produce silent corruption, so safety beats clever resume.
 
 - `pkg/smartdl` should classify repositories and selectable files without
   starting downloads.
+- The analyze flow's tree-page fetches run under the same 2-minute per-fetch
+  metadata cap family as planning (`treePageFetchTimeout` in `pkg/smartdl`,
+  delivered through `hubtree.Walker.PageFetchTimeout`): one TOTAL bound per
+  request attempt over dial + response headers + the JSON page body, with
+  retry waits and the request budget excluded. A caller deadline still wins.
+  Cap expiry fails the analysis with an actionable timeout naming the budget
+  and the remedy — never a silently partial result for the required
+  file-list walks, which always fail loudly, while the three optional
+  enrichment walks (post-success dataset namespace probe, mmproj discovery,
+  EXL size pass) keep their pre-existing optional-failure semantics (the
+  dataset namespace probe's optional failure now surfaces as an analysis
+  warning instead of silently, never failing the analysis) and may
+  be skipped on expiry — and stays a failure
+  matching `hubtree.ErrPageFetchTimeout`, never a caller cancellation
+  (`errors.Is(context.DeadlineExceeded|Canceled)` is always false for it).
+- Every other analyze-flow HTTP fetch runs under its own per-fetch TOTAL cap
+  from the same 2-minute family (`metadataFetchTimeout` in `pkg/smartdl`,
+  mirrored with `treePageFetchTimeout` and hfdownloader's
+  `metadataFetchTimeout`): the refs API, config/metadata file content
+  (`fetchFile`, including its `/resolve/` retry), safetensors ranged header
+  reads, and the model-info lineage lookup. Expiry follows each site's class:
+  a required read — a metadata body read or an LFS/pointer resolve the
+  analysis reports as a named-file failure — fails with the actionable
+  budget error, which never matches `context.DeadlineExceeded|Canceled`,
+  while the optional sites (refs, lineage, EXL branch config lookups, plain
+  non-LFS transport failures) degrade exactly as they already do on any
+  error, just bounded now. Exclusions are unchanged: the auth-check probe
+  keeps `authCheckTimeout` (5s), the EXL branch lookups and header-probe pass
+  keep their 15s contexts, and a caller deadline wins over every internal
+  cap.
 - Recommended download output should remain a structured request body, not a
   shell command string contract.
 - Exact matching and filter behavior must remain predictable for GGUF quants,
