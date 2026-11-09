@@ -248,6 +248,19 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	if err := m.checkSystemPaths(opts); err != nil {
 		return opts, err
 	}
+	// The directories of the merged registration are judged before the
+	// state of the supervisor is read: the shape rules of the directories
+	// — required, absolute, never the filesystem root — are request
+	// validation, local and cheap, and their cause is clearer than any
+	// answer of the machine. The order the installation keeps: every
+	// request validation and the elevation requirement, then the state
+	// read, then the directories — so a validation error surfaces first
+	// and is never masked by a machine-state failure, while the read
+	// still precedes every mutation. PrepareDirs applies the same rules
+	// again where it creates.
+	if err := validateInstanceDirs(opts); err != nil {
+		return opts, err
+	}
 	// The service account of a machine-wide instance is resolved from the
 	// merged registration before anything is created: an update that names
 	// no account keeps the account the instance runs with, and an account

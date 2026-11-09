@@ -798,6 +798,47 @@ func ValidateInstallOptions(opts InstallOptions) error {
 // that it exists.
 //
 // Nothing outside those three directories is touched.
+// instanceDirRule is the shape rule of a directory an installation owns:
+// required, absolute and never the filesystem root — the installation
+// would tighten the root otherwise. PrepareDirs applies it where it
+// creates; validateInstanceDirs applies the same rule where a machine
+// state is about to be read, so a violation carries the identical message
+// at either moment.
+func instanceDirRule(name, path string) error {
+	if path == "" || path == "." {
+		return fmt.Errorf("service: %s path is required", name)
+	}
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("service: %s path %q must be an absolute path", name, path)
+	}
+	if isRootDir(path) {
+		return fmt.Errorf("service: %s path %q is the filesystem root and must not be tightened", name, path)
+	}
+	return nil
+}
+
+// validateInstanceDirs applies the directory rules of an installation
+// without touching the filesystem. The darwin installation calls it after
+// the request is validated and before it reads the state of the
+// supervisor: request validation is local, cheap and gives the clearest
+// cause, so it must neither pay for a machine-state read nor be masked by
+// one. PrepareDirs applies the same rules again where it creates.
+func validateInstanceDirs(opts InstallOptions) error {
+	for _, dir := range []struct {
+		name string
+		path string
+	}{
+		{"config dir", filepath.Dir(opts.Paths.ConfigFile)},
+		{"state dir", opts.Paths.StateDir},
+		{"log dir", opts.Paths.LogDir},
+	} {
+		if err := instanceDirRule(dir.name, dir.path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func PrepareDirs(opts InstallOptions) error {
 	dirs := []struct {
 		name string
@@ -810,14 +851,8 @@ func PrepareDirs(opts InstallOptions) error {
 
 	seen := make(map[string]bool, len(dirs))
 	for _, dir := range dirs {
-		if dir.path == "" || dir.path == "." {
-			return fmt.Errorf("service: %s path is required", dir.name)
-		}
-		if !filepath.IsAbs(dir.path) {
-			return fmt.Errorf("service: %s path %q must be an absolute path", dir.name, dir.path)
-		}
-		if isRootDir(dir.path) {
-			return fmt.Errorf("service: %s path %q is the filesystem root and must not be tightened", dir.name, dir.path)
+		if err := instanceDirRule(dir.name, dir.path); err != nil {
+			return err
 		}
 		if seen[dir.path] {
 			continue
