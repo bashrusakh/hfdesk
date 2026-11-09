@@ -474,6 +474,20 @@ func HoldDesktopSingleton(name string) (release func(), err error) {
 	return holdDesktopSingleton(name)
 }
 
+// ProbeDesktopSingleton reports whether the per-session desktop singleton
+// object already existed when this process first touched it, through the
+// probe of the platform, and returns a release that keeps the object alive
+// until the caller ends it.
+//
+// A service mutation probes before it holds: together with the published
+// state (LiveServingDesktop), the result tells whether a desktop instance
+// of this session is alive. The platform owns the object: Windows has it,
+// and a platform without the desktop host has no object, so nobody can
+// hold one and the probe reports that the object did not pre-exist.
+func ProbeDesktopSingleton(name string) (release func(), preExisting bool, err error) {
+	return probeDesktopSingleton(name)
+}
+
 type installStarter interface {
 	InstallAndStart(context.Context, InstallOptions) (InstallStartResult, error)
 }

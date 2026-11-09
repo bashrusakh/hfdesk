@@ -18,6 +18,7 @@ import (
 
 	"github.com/bashrusakh/hfdesk/internal/app"
 	"github.com/bashrusakh/hfdesk/internal/logging"
+	"github.com/bashrusakh/hfdesk/internal/service"
 	"github.com/energye/systray"
 	"golang.org/x/sys/windows"
 )
@@ -89,7 +90,7 @@ func run(o Options, logPath string) (err error) {
 	// The state path is the path of the published state file. It is
 	// computed before anything of the host starts, so every goroutine of
 	// the host reads a path that never changes.
-	statePath := publishedStatePath()
+	statePath := service.PublishedStatePath()
 
 	// The guard ends the host after a panic: it removes the published
 	// state, stops the server through the normal path and closes the log
@@ -103,7 +104,7 @@ func run(o Options, logPath string) (err error) {
 	guard := panicGuard{
 		logPath: logPath,
 		end: func() {
-			removePublishedState(statePath)
+			service.RemovePublishedState(statePath)
 			if shutdown != nil {
 				stopDesktopServer(shutdown, &shutdownCoordinator)
 			}
@@ -321,10 +322,10 @@ func run(o Options, logPath string) (err error) {
 
 	// The effective URL is published, so a second launch can open the web
 	// UI of this instance.
-	if err := publishState(statePath, url); err != nil {
+	if err := service.PublishState(statePath, url); err != nil {
 		desktopLog.Warn("could not publish the effective URL", "path", statePath, "error", err)
 	}
-	defer removePublishedState(statePath)
+	defer service.RemovePublishedState(statePath)
 
 	if o.App.ShouldOpenUI() {
 		if err := application.OpenBrowser(); err != nil {
@@ -383,7 +384,7 @@ func run(o Options, logPath string) (err error) {
 				"HFDesk could not create its icon in the notification area.\n\n"+
 					"The desktop host needs the icon in the notification area to be reachable, so it stops.",
 				windows.MB_ICONERROR)
-			removePublishedState(statePath)
+			service.RemovePublishedState(statePath)
 			// The server is already serving: it is stopped through the
 			// normal path, so the jobs are quiesced, the HTTP drain
 			// runs and the job state is flushed. The wait is bounded,

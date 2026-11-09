@@ -19,7 +19,6 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/bashrusakh/hfdesk/internal/desktop"
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/internal/service"
 )
@@ -144,7 +143,7 @@ var holdServiceMutation = service.HoldDesktopSingleton
 //
 // The variable is the seam of the tests for the same reason the hold is
 // one: a test classifies a hold without creating the object of its session.
-var probeServiceMutation = desktop.ProbeDesktopSingleton
+var probeServiceMutation = service.ProbeDesktopSingleton
 
 // serviceStatusNextAction is the next action of a refusal that changed
 // nothing: the command that reads the current state of the instance. The
@@ -841,7 +840,7 @@ func serviceInstall(args []string, stdout io.Writer) error {
 	// The command is about to start or restart the service: a desktop
 	// instance of this session that already serves the address ends the
 	// command here, before the first service step.
-	if desktop.LiveServingDesktop(singletonPreExisting) {
+	if service.LiveServingDesktop(singletonPreExisting) {
 		return servingDesktopRefusal()
 	}
 
@@ -1246,7 +1245,7 @@ func serviceStart(args []string, stdout io.Writer) error {
 	// The command is about to start or restart the service: a desktop
 	// instance of this session that already serves the address ends the
 	// command here, before the first service step.
-	if desktop.LiveServingDesktop(singletonPreExisting) {
+	if service.LiveServingDesktop(singletonPreExisting) {
 		return servingDesktopRefusal()
 	}
 
@@ -1301,7 +1300,7 @@ func serviceRestart(args []string, stdout io.Writer) error {
 	// The command is about to start or restart the service: a desktop
 	// instance of this session that already serves the address ends the
 	// command here, before the first service step.
-	if desktop.LiveServingDesktop(singletonPreExisting) {
+	if service.LiveServingDesktop(singletonPreExisting) {
 		return servingDesktopRefusal()
 	}
 

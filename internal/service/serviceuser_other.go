@@ -49,3 +49,12 @@ func supportsNamedServiceAccount() bool {
 func holdDesktopSingleton(string) (func(), error) {
 	return func() {}, nil
 }
+
+// probeDesktopSingleton reports that the object did not pre-exist.
+//
+// The per-session desktop singleton belongs to the Windows desktop host.
+// A platform without that host has no such object, so nobody can hold one:
+// the probe reports that it did not pre-exist.
+func probeDesktopSingleton(string) (func(), bool, error) {
+	return nil, false, nil
+}

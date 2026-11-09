@@ -368,7 +368,7 @@ func TestLaunchWithARunningServiceNeverStartsItsOwnServer(t *testing.T) {
 	if len(opened) != 1 || opened[0] != "http://127.0.0.1:18080" {
 		t.Errorf("the launch opened %v, want the web UI of the service", opened)
 	}
-	if _, ok := readPublishedState(publishedStatePath()); ok {
+	if _, ok := service.ReadPublishedState(service.PublishedStatePath()); ok {
 		t.Error("the launch published a state file although it started no server")
 	}
 	for _, message := range *messages {
@@ -432,7 +432,7 @@ func TestLaunchWithAnUnreadableServiceStartsNoServer(t *testing.T) {
 		t.Fatal("the launch with an unreadable service did not end: it started a server of its own")
 	}
 
-	if _, ok := readPublishedState(publishedStatePath()); ok {
+	if _, ok := service.ReadPublishedState(service.PublishedStatePath()); ok {
 		t.Error("the launch published a state file although it started no server")
 	}
 
@@ -2534,7 +2534,7 @@ func TestServiceHelperProceedsWhenTheSingletonGrantsOnlyReadControl(t *testing.T
 	// fact of the serving-desktop check would have to come from the
 	// published state: no desktop runs in this test, and that state must
 	// not be read from the configuration directory of the user.
-	replaceSeam(t, &publishedStatePresent, func() bool { return false })
+	replaceSeam(t, &service.PublishedStatePresent, func() bool { return false })
 	stopped := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
 	manager := &readControlObservingManager{fakeServiceManager: &fakeServiceManager{
 		statuses: []service.Status{stopped, stopped},
@@ -3047,7 +3047,7 @@ func TestServiceHelperInstallSignalsReadyAfterAPassedPreflight(t *testing.T) {
 func TestServiceHelperRefusesAStartBesideAServingDesktop(t *testing.T) {
 	requireFreeSingleton(t)
 	useTemporaryStateDir(t)
-	if err := publishState(publishedStatePath(), "http://127.0.0.1:1"); err != nil {
+	if err := service.PublishState(service.PublishedStatePath(), "http://127.0.0.1:1"); err != nil {
 		t.Fatalf("publish the state of the desktop instance: %v", err)
 	}
 
@@ -3104,7 +3104,7 @@ func TestServiceHelperRefusesAStartBesideAServingDesktop(t *testing.T) {
 func TestServiceHelperStartProceedsWhenNoDesktopHoldsTheSingleton(t *testing.T) {
 	requireFreeSingleton(t)
 	useTemporaryStateDir(t)
-	if err := publishState(publishedStatePath(), "http://127.0.0.1:1"); err != nil {
+	if err := service.PublishState(service.PublishedStatePath(), "http://127.0.0.1:1"); err != nil {
 		t.Fatalf("publish the stale state: %v", err)
 	}
 

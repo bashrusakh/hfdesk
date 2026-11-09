@@ -185,10 +185,11 @@ func holdDesktopSingleton(name string) (func(), error) {
 	}, nil
 }
 
-// ProbeDesktopSingleton reports whether the per-session desktop singleton
-// object already existed when this process first touched it — the evidence
-// that another HFDesk process of this session held the object at that
-// moment.
+// probeDesktopSingleton is the Windows implementation behind
+// ProbeDesktopSingleton: it reports whether the per-session desktop
+// singleton object already existed when this process first touched it —
+// the evidence that another HFDesk process of this session held the object
+// at that moment.
 //
 // The probe opens or creates the object and keeps it through the returned
 // release, so the object never disappears between the probe and a hold taken
@@ -201,7 +202,7 @@ func holdDesktopSingleton(name string) (func(), error) {
 // open — it reports preExisting together with the error, so a caller never
 // mistakes an unproven freshness for proof that no desktop of this session
 // is alive.
-func ProbeDesktopSingleton(name string) (release func(), preExisting bool, err error) {
+func probeDesktopSingleton(name string) (release func(), preExisting bool, err error) {
 	resolved, err := resolveDesktopSingletonName(name)
 	if err != nil {
 		return nil, true, fmt.Errorf("service: %w", err)

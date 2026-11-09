@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/bashrusakh/hfdesk/internal/service"
 )
 
 // TestSecondLaunchReportsAFailedBrowserOpen proves that a second launch
@@ -43,7 +45,7 @@ func TestSecondLaunchReportsAFailedBrowserOpen(t *testing.T) {
 	}))
 	defer running.Close()
 
-	if err := publishState(publishedStatePath(), running.URL); err != nil {
+	if err := service.PublishState(service.PublishedStatePath(), running.URL); err != nil {
 		t.Fatalf("publish the state of the running instance: %v", err)
 	}
 
@@ -120,7 +122,7 @@ func TestSecondLaunchOpensTheWebUIOfTheRunningInstance(t *testing.T) {
 	}))
 	defer running.Close()
 
-	if err := publishState(publishedStatePath(), running.URL); err != nil {
+	if err := service.PublishState(service.PublishedStatePath(), running.URL); err != nil {
 		t.Fatalf("publish the state of the running instance: %v", err)
 	}
 

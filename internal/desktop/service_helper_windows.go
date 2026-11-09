@@ -135,7 +135,7 @@ func RunServiceAction(o ServiceActionOptions) error {
 		// the check beside a serving desktop. A failed probe is classified
 		// fail-closed; the hold stays the authority on whether the action
 		// may run at all.
-		probeRelease, probeExisting, probeErr := ProbeDesktopSingleton(o.InstanceMutex)
+		probeRelease, probeExisting, probeErr := service.ProbeDesktopSingleton(o.InstanceMutex)
 		if probeErr != nil {
 			probeExisting = true
 			desktopLog.Warn("the desktop singleton probe failed during the service action",
@@ -261,7 +261,7 @@ func installWindowsService(reporter *serviceActionReporter, version string) erro
 
 	// The installation starts the first instance: a desktop instance that
 	// already serves the address ends the action here, before any step.
-	if LiveServingDesktop(reporter.singletonPreExisting) {
+	if service.LiveServingDesktop(reporter.singletonPreExisting) {
 		return reporter.servingDesktopRefused()
 	}
 
@@ -325,7 +325,7 @@ func updateWindowsService(reporter *serviceActionReporter, version string) error
 	// instance beside whatever serves the address now: a desktop instance
 	// of this session that already serves it ends the action here, before
 	// the first step.
-	if LiveServingDesktop(reporter.singletonPreExisting) {
+	if service.LiveServingDesktop(reporter.singletonPreExisting) {
 		return reporter.servingDesktopRefused()
 	}
 
@@ -395,7 +395,7 @@ func startWindowsService(reporter *serviceActionReporter) error {
 	// The start moves the service out of its stopped state onto the
 	// address: a desktop instance of this session that already serves it
 	// ends the action here, before the start.
-	if LiveServingDesktop(reporter.singletonPreExisting) {
+	if service.LiveServingDesktop(reporter.singletonPreExisting) {
 		return reporter.servingDesktopRefused()
 	}
 	if err := manager.Start(ctx); err != nil {
