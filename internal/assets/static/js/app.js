@@ -1523,11 +1523,7 @@ async function loadRepositoryDetails(entry) {
       return;
     }
 
-    // Reconcile live job state before the cache check. Job state contributes
-    // running/queued for artifacts; cache presence (and a 404) is the final
-    // authority for artifact 'done' status. Job completion does not prove the
-    // artifact is cached: a file can be skipped while another process is still
-    // downloading it.
+    // Jobs supply active artifact states; cache presence determines artifact completion.
     refreshDlStatusFromJobs(data.repo, data.selectable_items, !!data.is_dataset);
     await syncLocalAnalysisStatus(data);
     if (requestId !== analyzeRequestId) return;
@@ -1977,19 +1973,39 @@ async function loadRepositoryDetails(entry) {
     weight_role_unrecognized: 'Unrecognized model-weight file role'
   };
 
-  // Render only the bounded EXL branch-discovery warning. Messages and causes
-  // are server-owned, non-secret strings; escape both before injecting them.
+  // Labels are scoped per warning code: both_namespace_detection_degraded
+  // reuses the probe_* codes for the dataset-namespace existence probe, where
+  // no safetensors header probe runs, so it must not inherit the EXL
+  // header-probe wording above. probe_unavailable never occurs in the EXL
+  // warning, so its human label lives only here rather than a raw-code
+  // fallback.
+  const BOTH_NAMESPACE_WARNING_CAUSE_LABELS = {
+    probe_timeout: 'Dataset-namespace probe timed out',
+    probe_unavailable: 'Dataset-namespace probe unavailable'
+  };
+
+  // Render only the bounded EXL branch-discovery and namespace-detection
+  // warnings. Messages and causes are server-owned, non-secret strings;
+  // escape both before injecting them.
   function renderAnalysisWarnings(data, { showRetry = true } = {}) {
     const warnings = (Array.isArray(data?.analysis_warnings) ? data.analysis_warnings : [])
-      .filter(w => w?.code === 'exl_branch_discovery_incomplete');
+      .filter(w => w?.code === 'exl_branch_discovery_incomplete' || w?.code === 'both_namespace_detection_degraded');
     if (!warnings.length) return '';
 
+    const labelsByCode = {
+      exl_branch_discovery_incomplete: ANALYSIS_WARNING_CAUSE_LABELS,
+      both_namespace_detection_degraded: BOTH_NAMESPACE_WARNING_CAUSE_LABELS
+    };
     const causes = [];
     warnings.forEach(w => (Array.isArray(w.causes) ? w.causes : []).forEach(cause => {
-      if (cause && !causes.includes(cause)) causes.push(cause);
+      // Dedup stays first-wins; the label is chosen by the warning code that
+      // first produced the cause, so each chip text stays context-accurate.
+      if (cause && !causes.some(entry => entry.cause === cause)) {
+        const labels = labelsByCode[w.code] || ANALYSIS_WARNING_CAUSE_LABELS;
+        causes.push({ cause, label: labels[cause] || cause });
+      }
     }));
-    const causeLabels = causes.map(cause => {
-      const label = ANALYSIS_WARNING_CAUSE_LABELS[cause] || cause;
+    const causeLabels = causes.map(({ cause, label }) => {
       return `<span class="analysis-warning-cause" data-cause="${escapeHtmlAttribute(cause)}" title="${escapeHtmlAttribute(cause)}">${escapeHtml(label)}</span>`;
     }).join(' · ');
     const retry = showRetry && warnings.some(w => w.retryable === true)
