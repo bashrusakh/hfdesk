@@ -128,17 +128,13 @@ func TestServiceGateTextOffersTheDesktopModeForAStoppedService(t *testing.T) {
 		"stopped service stays stopped",
 		prompt.DataDir,
 	})
-	for _, unwanted := range []string{
+	assertNamesWithout(t, text, "the dialog", nil, []string{
 		// The service does not serve, so no address is offered.
 		"The web UI of the service is at",
 		// This dialog can continue the launch, so the sentence of the
 		// dialogs that always end it does not belong to it.
 		"started no server of its own",
-	} {
-		if strings.Contains(text, unwanted) {
-			t.Errorf("the dialog %q carries %q", text, unwanted)
-		}
-	}
+	})
 	if got, want := serviceGateDesktopLabel, "Work in desktop mode"; got != want {
 		t.Errorf("the desktop button is %q, want %q", got, want)
 	}
@@ -295,11 +291,7 @@ func TestServiceUpdatedTextKeepsAStoppedServiceStopped(t *testing.T) {
 	})
 	// One report, one route: the relaunch of the desktop app is the single
 	// named action, and no elevated command line is offered next to it.
-	for _, unwanted := range []string{"hfdesk service start", "elevated shell", " or "} {
-		if strings.Contains(text, unwanted) {
-			t.Errorf("the report %q offers %q instead of one action", text, unwanted)
-		}
-	}
+	assertNamesWithout(t, text, "the report", nil, []string{"hfdesk service start", "elevated shell", " or "})
 	if strings.Contains(text, address) {
 		t.Errorf("the report %q sends the user to the address of a stopped service", text)
 	}
@@ -315,11 +307,7 @@ func TestServiceUpdatedTextReportsARunningService(t *testing.T) {
 	const address = "http://127.0.0.1:8080"
 	text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, true, service.StateRunning)
 
-	for _, want := range []string{address, "not needed to use the service", `C:\portable\hfdesk.exe`, "keeps the settings"} {
-		if !strings.Contains(text, want) {
-			t.Errorf("the report %q does not mention %q", text, want)
-		}
-	}
+	assertNames(t, text, "the report", []string{address, "not needed to use the service", `C:\portable\hfdesk.exe`, "keeps the settings"})
 }
 
 // TestServiceUpdatedTextNamesTheObservedPriorState proves that the report of a
@@ -364,11 +352,7 @@ func TestServiceUpdatedTextNamesTheObservedPriorState(t *testing.T) {
 			})
 			// One report, one route: no elevated command line and no
 			// alternative beside the relaunch of the desktop app.
-			for _, unwanted := range []string{"hfdesk service start", "elevated shell", " or "} {
-				if strings.Contains(text, unwanted) {
-					t.Errorf("the report %q offers %q instead of one action", text, unwanted)
-				}
-			}
+			assertNamesWithout(t, text, "the report", nil, []string{"hfdesk service start", "elevated shell", " or "})
 			// The only false claim this report must never carry is the
 			// prior state it did not observe: this registration was
 			// %q, never stopped.
@@ -455,7 +439,7 @@ func TestServiceActionFailureTextOfAnAlreadyRegisteredFirstInstall(t *testing.T)
 			"Start HFDesk again",
 			"startup gate offers to open or start the service and to update it",
 		})
-		for _, unwanted := range []string{
+		assertNamesWithout(t, text, "the report", nil, []string{
 			"A registration may remain",
 			`"hfdesk service uninstall"`,
 			"do not want to keep the registration",
@@ -467,11 +451,7 @@ func TestServiceActionFailureTextOfAnAlreadyRegisteredFirstInstall(t *testing.T)
 			// unknown: the refusal states its own cause.
 			program,
 			`NT AUTHORITY\LocalService`,
-		} {
-			if strings.Contains(text, unwanted) {
-				t.Errorf("the report %q carries %q although this attempt changed no registration", text, unwanted)
-			}
-		}
+		})
 		// One report, one place to act from: the state command of an
 		// unobservable outcome does not belong to a refusal that states the
 		// outcome itself.
@@ -489,16 +469,12 @@ func TestServiceActionFailureTextOfAnAlreadyRegisteredFirstInstall(t *testing.T)
 		"did not create, change or start it",
 		"startup gate",
 	})
-	for _, unwanted := range []string{
+	assertNamesWithout(t, rewordedText, "the report", nil, []string{
 		"A registration may remain",
 		`"hfdesk service uninstall"`,
 		`"hfdesk service install"`,
 		"elevated shell",
-	} {
-		if strings.Contains(rewordedText, unwanted) {
-			t.Errorf("the report %q of a reworded refusal carries %q although this attempt changed no registration", rewordedText, unwanted)
-		}
-	}
+	})
 
 	// The text markers are gone: the same clause without the marker no longer
 	// classifies, so a wording match cannot creep back unnoticed.
@@ -513,11 +489,7 @@ func TestServiceActionFailureTextOfAnAlreadyRegisteredFirstInstall(t *testing.T)
 	// above must not swallow it.
 	generic := serviceActionFailureText(serviceActionInstall,
 		errors.New("the service control manager refused the registration"), program)
-	for _, want := range []string{"A registration may remain.", `"hfdesk service status"`} {
-		if !strings.Contains(generic, want) {
-			t.Errorf("the generic report %q does not mention %q", generic, want)
-		}
-	}
+	assertNames(t, generic, "the generic report", []string{"A registration may remain.", `"hfdesk service status"`})
 	if strings.Contains(generic, `"hfdesk service uninstall"`) {
 		t.Errorf("the generic report %q carries the removed conditional action", generic)
 	}
@@ -560,11 +532,7 @@ func TestServiceActionFailureTextIsTheResultTheCauseAndOneAction(t *testing.T) {
 	// One report carries one command: reading the state resolves the
 	// uncertainty the report states, so the conditional removal must not
 	// sit beside it.
-	for _, unwanted := range []string{`"hfdesk service uninstall"`, "do not want to keep the registration"} {
-		if strings.Contains(install, unwanted) {
-			t.Errorf("the report %q carries the conditional action %q beside its one action", install, unwanted)
-		}
-	}
+	assertNamesWithout(t, install, "the report", nil, []string{`"hfdesk service uninstall"`, "do not want to keep the registration"})
 	if got := strings.Count(install, "hfdesk service"); got != 1 {
 		t.Errorf("the report %q names %d commands, want exactly one", install, got)
 	}
@@ -573,28 +541,12 @@ func TestServiceActionFailureTextIsTheResultTheCauseAndOneAction(t *testing.T) {
 	}
 
 	update := serviceActionFailureText(serviceActionUpdate, reason, program)
-	for _, want := range []string{reason.Error(), "hfdesk service status"} {
-		if !strings.Contains(update, want) {
-			t.Errorf("the report %q does not mention %q", update, want)
-		}
-	}
-	for _, unwanted := range []string{"registration may remain", "hfdesk service uninstall", "were not touched"} {
-		if strings.Contains(update, unwanted) {
-			t.Errorf("the report of the update %q carries %q, want the state it left and one command", update, unwanted)
-		}
-	}
+	assertNames(t, update, "the report", []string{reason.Error(), "hfdesk service status"})
+	assertNamesWithout(t, update, "the report of the update", nil, []string{"registration may remain", "hfdesk service uninstall", "were not touched"})
 
 	start := serviceActionFailureText(serviceActionStart, reason, program)
-	for _, want := range []string{reason.Error(), "The start was not confirmed.", "hfdesk service status"} {
-		if !strings.Contains(start, want) {
-			t.Errorf("the report %q does not mention %q", start, want)
-		}
-	}
-	for _, unwanted := range []string{"registration may remain", "hfdesk service uninstall", "were not touched"} {
-		if strings.Contains(start, unwanted) {
-			t.Errorf("the report of the start %q carries %q, want the state it left and one command", start, unwanted)
-		}
-	}
+	assertNames(t, start, "the report", []string{reason.Error(), "The start was not confirmed.", "hfdesk service status"})
+	assertNamesWithout(t, start, "the report of the start", nil, []string{"registration may remain", "hfdesk service uninstall", "were not touched"})
 }
 
 // TestServiceActionFailureTextNamesTheFolderOfTheProgram proves that the report of
@@ -612,11 +564,7 @@ func TestServiceActionFailureTextNamesTheFolderOfTheProgram(t *testing.T) {
 	const program = `C:\portable\hfdesk.exe`
 
 	text := serviceActionFailureText(serviceActionInstall, reason, program)
-	for _, want := range []string{program, `NT AUTHORITY\LocalService`, "must be able to execute", "traverse the folder"} {
-		if !strings.Contains(text, want) {
-			t.Errorf("the report of the installation is %q, want it to mention %q", text, want)
-		}
-	}
+	assertNames(t, text, "the report of the installation is", []string{program, `NT AUTHORITY\LocalService`, "must be able to execute", "traverse the folder"})
 
 	for _, action := range []serviceAction{serviceActionUpdate, serviceActionStart} {
 		text := serviceActionFailureText(action, reason, program)
@@ -646,40 +594,24 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 	reason := errors.New("the health endpoint reports another version")
 	const program = `C:\portable\hfdesk.exe`
 	removed := serviceInstallStartFailureText(reason, program, &service.InstallStartError{Cause: reason, RegistrationRemoved: true})
-	for _, want := range []string{reason.Error(), "registration created by this attempt was removed", "start the desktop app normally again"} {
-		if !strings.Contains(removed, want) {
-			t.Errorf("the removed-install report %q does not mention %q", removed, want)
-		}
-	}
-	for _, unwanted := range []string{"hfdesk service uninstall", program, `NT AUTHORITY\LocalService`} {
-		if strings.Contains(removed, unwanted) {
-			t.Errorf("the removed-install report %q names %q although nothing remains to inspect", removed, unwanted)
-		}
-	}
+	assertNames(t, removed, "the removed-install report", []string{reason.Error(), "registration created by this attempt was removed", "start the desktop app normally again"})
+	assertNamesWithout(t, removed, "the removed-install report", nil, []string{"hfdesk service uninstall", program, `NT AUTHORITY\LocalService`})
 
 	cleanupErr := errors.New("the service process identity changed")
 	cleanup := &service.InstallStartError{Cause: reason, CleanupError: cleanupErr}
 	kept := serviceInstallStartFailureText(cleanup, program, cleanup)
-	for _, want := range []string{reason.Error(), cleanupErr.Error(), "registration was kept", "could not be proven", "hfdesk service status", program} {
-		if !strings.Contains(kept, want) {
-			t.Errorf("the kept-install report %q does not mention %q", kept, want)
-		}
-	}
+	assertNames(t, kept, "the kept-install report", []string{reason.Error(), cleanupErr.Error(), "registration was kept", "could not be proven", "hfdesk service status", program})
 	if strings.Contains(kept, "the service does not run") {
 		t.Errorf("the kept-install report %q claims more than the cleanup established", kept)
 	}
 	// One report, one action: reading the state resolves the uncertainty
 	// the report states, so neither a removal menu nor a second imperative
 	// may sit beside the state command.
-	for _, unwanted := range []string{
+	assertNamesWithout(t, kept, "the kept-install report", nil, []string{
 		`"hfdesk service uninstall"`,
 		"do not want to keep the registration",
 		"Read the service state before taking another action",
-	} {
-		if strings.Contains(kept, unwanted) {
-			t.Errorf("the kept-install report %q carries %q beside its one action", kept, unwanted)
-		}
-	}
+	})
 	if got := strings.Count(kept, "hfdesk service"); got != 1 {
 		t.Errorf("the kept-install report %q names %d commands, want exactly one", kept, got)
 	}
@@ -692,19 +624,11 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 		CleanupError:      removeErr,
 	}
 	removeText := serviceInstallStartFailureText(stoppedButKept, program, stoppedButKept)
-	for _, want := range []string{removeErr.Error(), "process was proven stopped", "could not be removed", "hfdesk service status"} {
-		if !strings.Contains(removeText, want) {
-			t.Errorf("the stopped-but-kept report %q does not mention %q", removeText, want)
-		}
-	}
+	assertNames(t, removeText, "the stopped-but-kept report", []string{removeErr.Error(), "process was proven stopped", "could not be removed", "hfdesk service status"})
 	if strings.Contains(removeText, "ownership could not be proven") {
 		t.Errorf("the stopped-but-kept report %q misstates registration ownership", removeText)
 	}
-	for _, unwanted := range []string{`"hfdesk service uninstall"`, "do not want to keep the registration"} {
-		if strings.Contains(removeText, unwanted) {
-			t.Errorf("the stopped-but-kept report %q carries %q beside its one action", removeText, unwanted)
-		}
-	}
+	assertNamesWithout(t, removeText, "the stopped-but-kept report", nil, []string{`"hfdesk service uninstall"`, "do not want to keep the registration"})
 	if got := strings.Count(removeText, "hfdesk service"); got != 1 {
 		t.Errorf("the stopped-but-kept report %q names %d commands, want exactly one", removeText, got)
 	}
@@ -731,11 +655,7 @@ func TestServiceGateUnreadableTextStatesWhatTheLaunchDid(t *testing.T) {
 	})
 	// The diagnostic is the single named action: no imperative relaunch may
 	// follow it as a promise, and no alternative route sits beside it.
-	for _, unwanted := range []string{"then start the desktop app again", " or "} {
-		if strings.Contains(text, unwanted) {
-			t.Errorf("the notice %q carries %q beside its one action", text, unwanted)
-		}
-	}
+	assertNamesWithout(t, text, "the notice", nil, []string{"then start the desktop app again", " or "})
 	if got := strings.Count(text, "hfdesk service"); got != 1 {
 		t.Errorf("the notice %q names %d commands, want exactly one", text, got)
 	}
@@ -810,11 +730,7 @@ func TestServiceGateChangedTextNamesTheDiagnostic(t *testing.T) {
 		"leaves the state unknown",
 		"will not guess it",
 	})
-	for _, unwanted := range []string{"then start the desktop app again", " or "} {
-		if strings.Contains(text, unwanted) {
-			t.Errorf("the notice %q carries %q beside its one action", text, unwanted)
-		}
-	}
+	assertNamesWithout(t, text, "the notice", nil, []string{"then start the desktop app again", " or "})
 	if got := strings.Count(text, "hfdesk service"); got != 1 {
 		t.Errorf("the notice %q names %d commands, want exactly one", text, got)
 	}
@@ -826,11 +742,7 @@ func TestServiceLaunchFailedTextSaysWhatDidNotHappen(t *testing.T) {
 	refused := errors.New(elevationDeclined)
 
 	text := serviceLaunchFailedText(serviceActionInstall, refused)
-	for _, want := range []string{elevationDeclined, "The service was not installed."} {
-		if !strings.Contains(text, want) {
-			t.Errorf("the report %q does not mention %q", text, want)
-		}
-	}
+	assertNames(t, text, "the report", []string{elevationDeclined, "The service was not installed."})
 	if text := serviceLaunchFailedText(serviceActionUpdate, refused); !strings.Contains(text, "The service was not updated.") {
 		t.Errorf("the report of the update %q does not say that nothing was updated", text)
 	}
@@ -859,11 +771,7 @@ func TestServiceSiblingMissingTextNamesTheFolder(t *testing.T) {
 	const folder = `C:\portable`
 	text := serviceSiblingMissingText(folder, errors.New("there is no hfdesk.exe in "+folder))
 
-	for _, want := range []string{folder, "hfdesk.exe", "hfdesk-desktop.exe", "same folder"} {
-		if !strings.Contains(text, want) {
-			t.Errorf("the report %q does not mention %q", text, want)
-		}
-	}
+	assertNames(t, text, "the report", []string{folder, "hfdesk.exe", "hfdesk-desktop.exe", "same folder"})
 }
 
 // TestServiceSingletonHoldRefusedTextStatesNoActionAndOneCommand proves the
@@ -1008,11 +916,7 @@ func TestServiceLaunchFailedTextKeepsTheNeverRanReport(t *testing.T) {
 		"cannot be approved",
 		"that cause stays",
 	})
-	for _, unwanted := range []string{"hfdesk service status", "hfdesk service install", "hfdesk service uninstall", " or "} {
-		if strings.Contains(text, unwanted) {
-			t.Errorf("the report %q carries %q beside its one action", text, unwanted)
-		}
-	}
+	assertNamesWithout(t, text, "the report", nil, []string{"hfdesk service status", "hfdesk service install", "hfdesk service uninstall", " or "})
 }
 
 // TestUnknownServiceActionTextNamesOneAction proves the report of an unknown
@@ -1027,9 +931,5 @@ func TestUnknownServiceActionTextNamesOneAction(t *testing.T) {
 		"Nothing was installed, updated or started.",
 		"Start the desktop app again.",
 	})
-	for _, unwanted := range []string{"hfdesk service status", "hfdesk service install", "elevated shell"} {
-		if strings.Contains(text, unwanted) {
-			t.Errorf("the report %q carries %q beside its one action", text, unwanted)
-		}
-	}
+	assertNamesWithout(t, text, "the report", nil, []string{"hfdesk service status", "hfdesk service install", "elevated shell"})
 }

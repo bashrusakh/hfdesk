@@ -598,9 +598,8 @@ func TestSystemdInstallRefusesAPreExistingDirectory(t *testing.T) {
 
 	root := t.TempDir()
 	state := filepath.Join(root, "state")
-	if err := os.Mkdir(state, 0o700); err != nil {
-		t.Fatalf("create the state directory: %v", err)
-	}
+	err := os.Mkdir(state, 0o700)
+	assertNoError(t, err, "create the state directory: %v", err)
 	stateOwner, stateGroup := systemdOwner(t, state)
 
 	m := &systemdManager{scope: ScopeSystem}
@@ -811,12 +810,10 @@ func TestSystemdCheckServiceAccountAccessSkipsAMissingDirectoryInsideTheStateRoo
 	// The state directory belongs to the account of the test, so the
 	// account of the check cannot write into it.
 	state := filepath.Join(root, "state")
-	if err := os.Mkdir(state, 0o700); err != nil {
-		t.Fatalf("create the state directory: %v", err)
-	}
-	if err := os.Chmod(state, 0o700); err != nil {
-		t.Fatalf("close the state directory: %v", err)
-	}
+	err := os.Mkdir(state, 0o700)
+	assertNoError(t, err, "create the state directory: %v", err)
+	err = os.Chmod(state, 0o700)
+	assertNoError(t, err, "close the state directory: %v", err)
 
 	m := &systemdManager{scope: ScopeSystem}
 	opts := systemdTestOptions(t, ScopeSystem)
@@ -839,12 +836,10 @@ func TestSystemdCheckServiceAccountAccessSkipsAMissingDirectoryInsideTheStateRoo
 	// A directory outside of the state directory is still checked: the
 	// installation never grants it to the account.
 	foreign := filepath.Join(root, "foreign")
-	if err := os.Mkdir(foreign, 0o700); err != nil {
-		t.Fatalf("create the foreign directory: %v", err)
-	}
-	if err := os.Chmod(foreign, 0o700); err != nil {
-		t.Fatalf("close the foreign directory: %v", err)
-	}
+	err = os.Mkdir(foreign, 0o700)
+	assertNoError(t, err, "create the foreign directory: %v", err)
+	err = os.Chmod(foreign, 0o700)
+	assertNoError(t, err, "close the foreign directory: %v", err)
 	opts.LocalDir = foreign
 	if err := m.checkServiceAccountAccess(opts, other); err == nil {
 		t.Error("checkServiceAccountAccess() = nil, want the refusal of a directory outside of the state directory of the instance")
@@ -869,12 +864,10 @@ func TestSystemdCheckServiceAccountAccessChecksAnExistingDirectoryInsideTheState
 	// the account, so the account passes through it: the mode leaves the
 	// traversal to every account.
 	state := filepath.Join(root, "state")
-	if err := os.Mkdir(state, 0o711); err != nil {
-		t.Fatalf("create the state directory: %v", err)
-	}
-	if err := os.Chmod(state, 0o711); err != nil {
-		t.Fatalf("open the state directory to the traversal: %v", err)
-	}
+	err := os.Mkdir(state, 0o711)
+	assertNoError(t, err, "create the state directory: %v", err)
+	err = os.Chmod(state, 0o711)
+	assertNoError(t, err, "open the state directory to the traversal: %v", err)
 
 	// A named directory inside the state directory that does not exist
 	// yet: the service creates it below the state directory, and the
@@ -885,22 +878,18 @@ func TestSystemdCheckServiceAccountAccessChecksAnExistingDirectoryInsideTheState
 	// the account cannot write into: it belongs to the user of the test
 	// and to nobody else.
 	closed := filepath.Join(state, "closed")
-	if err := os.Mkdir(closed, 0o700); err != nil {
-		t.Fatalf("create the closed directory: %v", err)
-	}
-	if err := os.Chmod(closed, 0o700); err != nil {
-		t.Fatalf("close the closed directory: %v", err)
-	}
+	err = os.Mkdir(closed, 0o700)
+	assertNoError(t, err, "create the closed directory: %v", err)
+	err = os.Chmod(closed, 0o700)
+	assertNoError(t, err, "close the closed directory: %v", err)
 
 	// A named directory inside the state directory that exists and that
 	// the account can write into.
 	open := filepath.Join(state, "open")
-	if err := os.Mkdir(open, 0o777); err != nil {
-		t.Fatalf("create the open directory: %v", err)
-	}
-	if err := os.Chmod(open, 0o777); err != nil {
-		t.Fatalf("open the open directory: %v", err)
-	}
+	err = os.Mkdir(open, 0o777)
+	assertNoError(t, err, "create the open directory: %v", err)
+	err = os.Chmod(open, 0o777)
+	assertNoError(t, err, "open the open directory: %v", err)
 
 	// A named directory outside of the state directory that does not
 	// exist yet: the account has to create it below the scratch
@@ -910,26 +899,22 @@ func TestSystemdCheckServiceAccountAccessChecksAnExistingDirectoryInsideTheState
 	// A directory outside of the state directory that the account of the
 	// check cannot write into.
 	foreign := filepath.Join(root, "foreign")
-	if err := os.Mkdir(foreign, 0o700); err != nil {
-		t.Fatalf("create the foreign directory: %v", err)
-	}
-	if err := os.Chmod(foreign, 0o700); err != nil {
-		t.Fatalf("close the foreign directory: %v", err)
-	}
+	err = os.Mkdir(foreign, 0o700)
+	assertNoError(t, err, "create the foreign directory: %v", err)
+	err = os.Chmod(foreign, 0o700)
+	assertNoError(t, err, "close the foreign directory: %v", err)
 
 	// A link inside the state directory that points out of it, to a
 	// directory that exists.
 	outside := filepath.Join(state, "outside")
-	if err := os.Symlink(foreign, outside); err != nil {
-		t.Fatalf("create the link out of the state directory: %v", err)
-	}
+	err = os.Symlink(foreign, outside)
+	assertNoError(t, err, "create the link out of the state directory: %v", err)
 
 	// A link inside the state directory that points out of it, to a
 	// directory that does not exist yet.
 	outsideMissingLink := filepath.Join(state, "outside-missing")
-	if err := os.Symlink(outsideMissing, outsideMissingLink); err != nil {
-		t.Fatalf("create the link to the missing directory: %v", err)
-	}
+	err = os.Symlink(outsideMissing, outsideMissingLink)
+	assertNoError(t, err, "create the link to the missing directory: %v", err)
 
 	m := &systemdManager{scope: ScopeSystem}
 	opts := systemdTestOptions(t, ScopeSystem)
@@ -992,54 +977,44 @@ func TestSystemdCheckServiceAccountAccessUsesTheRealLocationOfTheDirectory(t *te
 	// pass through it, so a refusal of a case is about the directory of the
 	// case and not about the state directory.
 	state := filepath.Join(root, "state")
-	if err := os.Mkdir(state, 0o711); err != nil {
-		t.Fatalf("create the state directory: %v", err)
-	}
-	if err := os.Chmod(state, 0o711); err != nil {
-		t.Fatalf("open the state directory to the traversal: %v", err)
-	}
+	err := os.Mkdir(state, 0o711)
+	assertNoError(t, err, "create the state directory: %v", err)
+	err = os.Chmod(state, 0o711)
+	assertNoError(t, err, "open the state directory to the traversal: %v", err)
 
 	// A plain directory inside the state directory. It exists already, so
 	// it belongs to whoever owns it: the account of the check cannot write
 	// into it, and the installation refuses it.
 	plain := filepath.Join(state, "models")
-	if err := os.Mkdir(plain, 0o700); err != nil {
-		t.Fatalf("create the plain directory: %v", err)
-	}
-	if err := os.Chmod(plain, 0o700); err != nil {
-		t.Fatalf("close the plain directory: %v", err)
-	}
+	err = os.Mkdir(plain, 0o700)
+	assertNoError(t, err, "create the plain directory: %v", err)
+	err = os.Chmod(plain, 0o700)
+	assertNoError(t, err, "close the plain directory: %v", err)
 
 	foreign := filepath.Join(root, "foreign")
-	if err := os.Mkdir(foreign, 0o700); err != nil {
-		t.Fatalf("create the foreign directory: %v", err)
-	}
-	if err := os.Chmod(foreign, 0o700); err != nil {
-		t.Fatalf("close the foreign directory: %v", err)
-	}
+	err = os.Mkdir(foreign, 0o700)
+	assertNoError(t, err, "create the foreign directory: %v", err)
+	err = os.Chmod(foreign, 0o700)
+	assertNoError(t, err, "close the foreign directory: %v", err)
 
 	// A directory outside of the state directory that every account can
 	// write into.
 	reachable := filepath.Join(root, "reachable")
-	if err := os.Mkdir(reachable, 0o777); err != nil {
-		t.Fatalf("create the reachable directory: %v", err)
-	}
-	if err := os.Chmod(reachable, 0o777); err != nil {
-		t.Fatalf("open the reachable directory: %v", err)
-	}
+	err = os.Mkdir(reachable, 0o777)
+	assertNoError(t, err, "create the reachable directory: %v", err)
+	err = os.Chmod(reachable, 0o777)
+	assertNoError(t, err, "open the reachable directory: %v", err)
 
 	// A link inside the state directory that points out of it.
 	outside := filepath.Join(state, "outside")
-	if err := os.Symlink(foreign, outside); err != nil {
-		t.Fatalf("create the link out of the state directory: %v", err)
-	}
+	err = os.Symlink(foreign, outside)
+	assertNoError(t, err, "create the link out of the state directory: %v", err)
 
 	// A link inside the state directory that points to a place the account
 	// of the check can reach.
 	inside := filepath.Join(state, "inside")
-	if err := os.Symlink(reachable, inside); err != nil {
-		t.Fatalf("create the link to the reachable directory: %v", err)
-	}
+	err = os.Symlink(reachable, inside)
+	assertNoError(t, err, "create the link to the reachable directory: %v", err)
 
 	// A directory inside the state directory that does not exist yet: the
 	// installation creates it below the state directory, and the account
@@ -1090,23 +1065,18 @@ func TestSystemdCheckServiceAccountAccessUsesTheRealLocationOfTheDirectory(t *te
 		// directory inside it that does not exist yet is not checked
 		// against the account.
 		real := filepath.Join(root, "real-state")
-		if err := os.Mkdir(real, 0o700); err != nil {
-			t.Fatalf("create the real state directory: %v", err)
-		}
-		if err := os.Chmod(real, 0o700); err != nil {
-			t.Fatalf("close the real state directory: %v", err)
-		}
+		err := os.Mkdir(real, 0o700)
+		assertNoError(t, err, "create the real state directory: %v", err)
+		err = os.Chmod(real, 0o700)
+		assertNoError(t, err, "close the real state directory: %v", err)
 		models := filepath.Join(real, "models")
-		if err := os.Mkdir(models, 0o700); err != nil {
-			t.Fatalf("create the models directory: %v", err)
-		}
-		if err := os.Chmod(models, 0o700); err != nil {
-			t.Fatalf("close the models directory: %v", err)
-		}
+		err = os.Mkdir(models, 0o700)
+		assertNoError(t, err, "create the models directory: %v", err)
+		err = os.Chmod(models, 0o700)
+		assertNoError(t, err, "close the models directory: %v", err)
 		link := filepath.Join(root, "state-link")
-		if err := os.Symlink(real, link); err != nil {
-			t.Fatalf("create the link of the state directory: %v", err)
-		}
+		err = os.Symlink(real, link)
+		assertNoError(t, err, "create the link of the state directory: %v", err)
 
 		opts.Paths.StateDir = link
 
@@ -1153,9 +1123,8 @@ func TestSystemdAccessCheckUsesTheEffectivePermission(t *testing.T) {
 	// The group of the directories of the test is the group of the test
 	// process, so the other identity reaches them through the group.
 	probe := filepath.Join(root, "probe")
-	if err := os.Mkdir(probe, 0o700); err != nil {
-		t.Fatalf("create the probe directory: %v", err)
-	}
+	err := os.Mkdir(probe, 0o700)
+	assertNoError(t, err, "create the probe directory: %v", err)
 	_, group := systemdOwner(t, probe)
 
 	// The other identity owns nothing of the test and belongs to the
@@ -1237,22 +1206,18 @@ func TestSystemdAccessCheckUsesTheEffectivePermission(t *testing.T) {
 
 	t.Run("a directory below a parent without the execute permission", func(t *testing.T) {
 		parent := filepath.Join(root, "closed-parent")
-		if err := os.Mkdir(parent, 0o700); err != nil {
-			t.Fatalf("create the parent directory: %v", err)
-		}
+		err := os.Mkdir(parent, 0o700)
+		assertNoError(t, err, "create the parent directory: %v", err)
 		child := filepath.Join(parent, "child")
-		if err := os.Mkdir(child, 0o700); err != nil {
-			t.Fatalf("create the child directory: %v", err)
-		}
+		err = os.Mkdir(child, 0o700)
+		assertNoError(t, err, "create the child directory: %v", err)
 		// The group of the child directory is the group of the
 		// account, so the account could use it if it could reach it.
-		if err := os.Chmod(child, 0o770); err != nil {
-			t.Fatalf("make the child directory usable: %v", err)
-		}
+		err = os.Chmod(child, 0o770)
+		assertNoError(t, err, "make the child directory usable: %v", err)
 		// The parent is closed for everybody but its owner.
-		if err := os.Chmod(parent, 0o700); err != nil {
-			t.Fatalf("close the parent directory: %v", err)
-		}
+		err = os.Chmod(parent, 0o700)
+		assertNoError(t, err, "close the parent directory: %v", err)
 		if err := checkDirWritableByAccount(child, other); err == nil {
 			t.Error("checkDirWritableByAccount() = nil, want the refusal of a directory the account cannot reach")
 		}
@@ -1279,69 +1244,54 @@ func TestSystemdAccessCheckResolvesTheSymlinksOfThePath(t *testing.T) {
 	// a directory in it. The private directory is closed for everybody but
 	// its owner, so the account never reaches what is below it.
 	public := filepath.Join(root, "public")
-	if err := os.Mkdir(public, 0o777); err != nil {
-		t.Fatalf("create the public directory: %v", err)
-	}
-	if err := os.Chmod(public, 0o777); err != nil {
-		t.Fatalf("make the public directory world writable: %v", err)
-	}
+	err := os.Mkdir(public, 0o777)
+	assertNoError(t, err, "create the public directory: %v", err)
+	err = os.Chmod(public, 0o777)
+	assertNoError(t, err, "make the public directory world writable: %v", err)
 	private := filepath.Join(root, "private")
-	if err := os.Mkdir(private, 0o700); err != nil {
-		t.Fatalf("create the private directory: %v", err)
-	}
-	if err := os.Chmod(private, 0o700); err != nil {
-		t.Fatalf("close the private directory: %v", err)
-	}
+	err = os.Mkdir(private, 0o700)
+	assertNoError(t, err, "create the private directory: %v", err)
+	err = os.Chmod(private, 0o700)
+	assertNoError(t, err, "close the private directory: %v", err)
 	data := filepath.Join(private, "data")
-	if err := os.Mkdir(data, 0o777); err != nil {
-		t.Fatalf("create the data directory: %v", err)
-	}
-	if err := os.Chmod(data, 0o777); err != nil {
-		t.Fatalf("make the data directory world writable: %v", err)
-	}
+	err = os.Mkdir(data, 0o777)
+	assertNoError(t, err, "create the data directory: %v", err)
+	err = os.Chmod(data, 0o777)
+	assertNoError(t, err, "make the data directory world writable: %v", err)
 
 	// The open directory is traversable by the account, so the real
 	// location of the directory below it is usable.
 	open := filepath.Join(root, "open")
-	if err := os.Mkdir(open, 0o755); err != nil {
-		t.Fatalf("create the open directory: %v", err)
-	}
+	err = os.Mkdir(open, 0o755)
+	assertNoError(t, err, "create the open directory: %v", err)
 	openData := filepath.Join(open, "data")
-	if err := os.Mkdir(openData, 0o777); err != nil {
-		t.Fatalf("create the data directory of the open directory: %v", err)
-	}
-	if err := os.Chmod(openData, 0o777); err != nil {
-		t.Fatalf("make the data directory world writable: %v", err)
-	}
+	err = os.Mkdir(openData, 0o777)
+	assertNoError(t, err, "create the data directory of the open directory: %v", err)
+	err = os.Chmod(openData, 0o777)
+	assertNoError(t, err, "make the data directory world writable: %v", err)
 
 	// The locked directory is closed for everybody but its owner, so the
 	// account never reaches the link in it.
 	locked := filepath.Join(root, "locked")
-	if err := os.Mkdir(locked, 0o700); err != nil {
-		t.Fatalf("create the locked directory: %v", err)
-	}
-	if err := os.Chmod(locked, 0o700); err != nil {
-		t.Fatalf("close the locked directory: %v", err)
-	}
+	err = os.Mkdir(locked, 0o700)
+	assertNoError(t, err, "create the locked directory: %v", err)
+	err = os.Chmod(locked, 0o700)
+	assertNoError(t, err, "close the locked directory: %v", err)
 	lockedLink := filepath.Join(locked, "cache")
-	if err := os.Symlink(filepath.Join("..", "open", "data"), lockedLink); err != nil {
-		t.Fatalf("create the link in the locked directory: %v", err)
-	}
+	err = os.Symlink(filepath.Join("..", "open", "data"), lockedLink)
+	assertNoError(t, err, "create the link in the locked directory: %v", err)
 
 	// The links are the paths the user names: the cache points into the
 	// private directory, the models into the open one.
 	linked := filepath.Join(public, "cache")
-	if err := os.Symlink(filepath.Join("..", "private", "data"), linked); err != nil {
-		t.Fatalf("create the link into the private directory: %v", err)
-	}
+	err = os.Symlink(filepath.Join("..", "private", "data"), linked)
+	assertNoError(t, err, "create the link into the private directory: %v", err)
 	linkedMissing := filepath.Join(public, "missing")
-	if err := os.Symlink(filepath.Join("..", "private", "new"), linkedMissing); err != nil {
-		t.Fatalf("create the link into the missing directory: %v", err)
-	}
+	err = os.Symlink(filepath.Join("..", "private", "new"), linkedMissing)
+	assertNoError(t, err, "create the link into the missing directory: %v", err)
 	openLink := filepath.Join(public, "models")
-	if err := os.Symlink(filepath.Join("..", "open", "data"), openLink); err != nil {
-		t.Fatalf("create the link into the open directory: %v", err)
-	}
+	err = os.Symlink(filepath.Join("..", "open", "data"), openLink)
+	assertNoError(t, err, "create the link into the open directory: %v", err)
 
 	cases := []struct {
 		name    string
@@ -1397,9 +1347,8 @@ func TestSystemdAccessCheckUsesTheSupplementaryGroups(t *testing.T) {
 	root := systemdTraversableTempDir(t)
 
 	dir := filepath.Join(root, "supplementary")
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Fatalf("create the directory: %v", err)
-	}
+	err := os.Mkdir(dir, 0o700)
+	assertNoError(t, err, "create the directory: %v", err)
 	gid, err := strconv.Atoi(group)
 	assertNoError(t, err, "the group id %q is not a number: %v", group, err)
 	// The directory belongs to the group of the account, not to the
@@ -1550,11 +1499,7 @@ func TestSystemdInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T) {
 	})
 	// The refusal names the directory, the account and the missing write
 	// access.
-	for _, part := range []string{account.Username, cache, "cannot write to"} {
-		if !strings.Contains(err.Error(), part) {
-			t.Errorf("Install() = %q, want the %q in the refusal", err, part)
-		}
-	}
+	assertNames(t, err.Error(), "Install()", []string{account.Username, cache, "cannot write to"})
 	// The refusal never names a recursive ownership change: the tree of a
 	// model or a cache directory belongs to the user who named it, and the
 	// installation never walks it.
@@ -1690,9 +1635,8 @@ func TestSystemdFailedInstallKeepsADirectoryThatExistedBefore(t *testing.T) {
 
 	// The config directory existed before the installation.
 	config := filepath.Join(root, "etc")
-	if err := os.Mkdir(config, 0o750); err != nil {
-		t.Fatalf("create the config directory: %v", err)
-	}
+	err := os.Mkdir(config, 0o750)
+	assertNoError(t, err, "create the config directory: %v", err)
 	owner, group := systemdOwner(t, config)
 
 	opts := systemdTempInstallOptions(t, root)
@@ -1889,9 +1833,8 @@ func TestSystemdSuccessfulInstallKeepsItsDirectories(t *testing.T) {
 	opts := systemdTempInstallOptions(t, root)
 	m := &systemdManager{scope: ScopeUser}
 	systemdLoadedFromDiskSeam(t, m)
-	if _, err := m.Install(context.Background(), opts); err != nil {
-		t.Fatalf("Install() = %v, want nil", err)
-	}
+	_, err := m.Install(context.Background(), opts)
+	assertNoError(t, err, "Install() = %v, want nil", err)
 
 	for _, dir := range []string{
 		filepath.Join(root, "etc"),

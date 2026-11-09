@@ -504,9 +504,8 @@ func TestSCMStatusFromRegistrationReportsTheStateAndTheCommandLine(t *testing.T)
 	root := t.TempDir()
 	opts := scmTestOptions()
 	opts.Executable = filepath.Join(root, "hfdesk.exe")
-	if err := os.WriteFile(opts.Executable, []byte("not a program"), 0o600); err != nil {
-		t.Fatalf("WriteFile() = %v, want nil", err)
-	}
+	err := os.WriteFile(opts.Executable, []byte("not a program"), 0o600)
+	assertNoError(t, err, "WriteFile() = %v, want nil", err)
 
 	facts := scmRegistrationFacts{
 		present:     true,
@@ -626,11 +625,7 @@ func TestSCMStatusFromABrokenRegistrationThatRunsKeepsTheRunningFact(t *testing.
 	if !status.Running {
 		t.Error("a registration the supervisor reports as running is reported as not running")
 	}
-	for _, want := range []string{missing, "the instance still runs"} {
-		if !strings.Contains(status.Detail, want) {
-			t.Errorf("the detail = %q, want it to mention %q", status.Detail, want)
-		}
-	}
+	assertNames(t, status.Detail, "the detail", []string{missing, "the instance still runs"})
 }
 
 // TestSCMStatusFromAFailedInstanceIsFailedAndNamesTheExitCode checks that
@@ -645,9 +640,8 @@ func TestSCMStatusFromAFailedInstanceIsFailedAndNamesTheExitCode(t *testing.T) {
 	root := t.TempDir()
 	opts := scmTestOptions()
 	opts.Executable = filepath.Join(root, "hfdesk.exe")
-	if err := os.WriteFile(opts.Executable, []byte("not a program"), 0o600); err != nil {
-		t.Fatalf("WriteFile() = %v, want nil", err)
-	}
+	err := os.WriteFile(opts.Executable, []byte("not a program"), 0o600)
+	assertNoError(t, err, "WriteFile() = %v, want nil", err)
 
 	facts := scmRegistrationFacts{
 		present:     true,
@@ -675,9 +669,8 @@ func TestSCMStatusFromACleanlyStoppedInstanceIsStopped(t *testing.T) {
 	root := t.TempDir()
 	opts := scmTestOptions()
 	opts.Executable = filepath.Join(root, "hfdesk.exe")
-	if err := os.WriteFile(opts.Executable, []byte("not a program"), 0o600); err != nil {
-		t.Fatalf("WriteFile() = %v, want nil", err)
-	}
+	err := os.WriteFile(opts.Executable, []byte("not a program"), 0o600)
+	assertNoError(t, err, "WriteFile() = %v, want nil", err)
 
 	facts := scmRegistrationFacts{
 		present:     true,
@@ -707,9 +700,8 @@ func TestSCMStatusFromANeverStartedInstanceIsStopped(t *testing.T) {
 	root := t.TempDir()
 	opts := scmTestOptions()
 	opts.Executable = filepath.Join(root, "hfdesk.exe")
-	if err := os.WriteFile(opts.Executable, []byte("not a program"), 0o600); err != nil {
-		t.Fatalf("WriteFile() = %v, want nil", err)
-	}
+	err := os.WriteFile(opts.Executable, []byte("not a program"), 0o600)
+	assertNoError(t, err, "WriteFile() = %v, want nil", err)
 
 	facts := scmRegistrationFacts{
 		present:     true,
@@ -753,9 +745,8 @@ func TestSCMStatusFromKeepsTheOtherSupervisorStates(t *testing.T) {
 			root := t.TempDir()
 			opts := scmTestOptions()
 			opts.Executable = filepath.Join(root, "hfdesk.exe")
-			if err := os.WriteFile(opts.Executable, []byte("not a program"), 0o600); err != nil {
-				t.Fatalf("WriteFile() = %v, want nil", err)
-			}
+			err := os.WriteFile(opts.Executable, []byte("not a program"), 0o600)
+			assertNoError(t, err, "WriteFile() = %v, want nil", err)
 
 			facts := scmRegistrationFacts{
 				present:     true,

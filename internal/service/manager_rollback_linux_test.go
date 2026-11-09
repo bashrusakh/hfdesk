@@ -49,9 +49,8 @@ func TestSystemdVerifiedRollbackRetainsPathsReferencedByPreviousNativeDirective(
 		return properties, nil
 	}
 	for _, dir := range instanceDirs(previous) {
-		if err := os.MkdirAll(dir.path, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		err := os.MkdirAll(dir.path, 0o700)
+		assertNoError(t, err, "")
 	}
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 	// The first reload of the write fails, so the registration goes through
@@ -186,9 +185,7 @@ func TestSystemdFailedRestartRestoresThePreviousRegistration(t *testing.T) {
 	}
 
 	content, readErr := os.ReadFile(unitPath)
-	if readErr != nil {
-		t.Fatalf("read the unit file: %v", readErr)
-	}
+	assertNoError(t, readErr, "read the unit file: %v", readErr)
 	if string(content) != previousUnit {
 		t.Errorf("the unit file was not restored:\n%s\nwant\n%s", content, previousUnit)
 	}
@@ -245,25 +242,15 @@ func TestSystemdRollbackReloadFailureDoesNotRestartOrClaimRecovery(t *testing.T)
 	if err == nil {
 		t.Fatal("Install() = nil, want the environment mismatch and unconfirmed rollback")
 	}
-	for _, want := range []string{"did not preserve the loaded environment", "reload the restored unit"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Install() = %q, want the original/rollback failure %q", err, want)
-		}
-	}
-	for _, unsupported := range []string{"captured loaded command/launch settings were restored", "previous instance was started again"} {
-		if strings.Contains(err.Error(), unsupported) {
-			t.Errorf("Install() = %q, must not claim %q", err, unsupported)
-		}
-	}
+	assertNames(t, err.Error(), "Install()", []string{"did not preserve the loaded environment", "reload the restored unit"})
+	assertNamesWithout(t, err.Error(), "Install()", nil, []string{"captured loaded command/launch settings were restored", "previous instance was started again"})
 
 	disk, readErr := os.ReadFile(unitPath)
 	if readErr != nil || string(disk) != previousUnit {
 		t.Errorf("stored unit after rollback (error %v) =\n%s\nwant\n%s", readErr, disk, previousUnit)
 	}
 	loadedBytes, readErr := os.ReadFile(os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT"))
-	if readErr != nil {
-		t.Fatalf("read the supervisor-loaded unit: %v", readErr)
-	}
+	assertNoError(t, readErr, "read the supervisor-loaded unit: %v", readErr)
 	loaded := parseUnit(string(loadedBytes))
 	if loaded.Program != executable || loaded.listen() != previous.Listen || loaded.flagValue("--config") == previous.Paths.ConfigFile {
 		t.Errorf("the supervisor-loaded command does not distinguish the failed update: %+v", loaded)
@@ -337,9 +324,7 @@ func TestSystemdActiveUnitThatDoesNotServeIsAFailedUpdate(t *testing.T) {
 	})
 
 	content, readErr := os.ReadFile(unitPath)
-	if readErr != nil {
-		t.Fatalf("read the unit file: %v", readErr)
-	}
+	assertNoError(t, readErr, "read the unit file: %v", readErr)
 	if string(content) != previousUnit {
 		t.Errorf("the unit file was not restored:\n%s\nwant\n%s", content, previousUnit)
 	}
@@ -455,9 +440,7 @@ func TestSystemdRestoreThatIsNotConfirmedIsNotReportedAsStartedAgain(t *testing.
 	}
 
 	content, readErr := os.ReadFile(unitPath)
-	if readErr != nil {
-		t.Fatalf("read the unit file: %v", readErr)
-	}
+	assertNoError(t, readErr, "read the unit file: %v", readErr)
 	if string(content) != previousUnit {
 		t.Errorf("the unit file was not restored:\n%s\nwant\n%s", content, previousUnit)
 	}

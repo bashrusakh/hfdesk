@@ -34,9 +34,8 @@ func TestRunInstallsRuntimeModelAndStopsOnCancel(t *testing.T) {
 
 	opts := RunOptions{Paths: model}
 	start := time.Now()
-	if err := runService(t, opts); err != nil {
-		t.Fatalf("Run() = %v, want nil", err)
-	}
+	err := runService(t, opts)
+	assertNoError(t, err, "Run() = %v, want nil", err)
 	if elapsed := time.Since(start); elapsed > 30*time.Second {
 		t.Errorf("Run() returned after %s, want a prompt shutdown", elapsed)
 	}
@@ -92,9 +91,8 @@ func TestRunWritesTheRecordsOfTheServerIntoTheLogFileOfTheInstance(t *testing.T)
 		t.Fatalf("the instance never answered: %v", err)
 	}
 	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("Run() = %v, want nil", err)
-	}
+	err := <-done
+	assertNoError(t, err, "Run() = %v, want nil", err)
 
 	// The pipeline is closed when the host returns, so the log file of the
 	// instance is complete when the run is over.
@@ -241,9 +239,8 @@ func TestRunCreatesTheLogDirectoryOwnerOnly(t *testing.T) {
 		}
 		t.Cleanup(runtimepaths.Reset)
 
-		if err := runService(t, RunOptions{Paths: model}); err != nil {
-			t.Fatalf("Run() = %v, want nil", err)
-		}
+		err := runService(t, RunOptions{Paths: model})
+		assertNoError(t, err, "Run() = %v, want nil", err)
 
 		info, err := os.Stat(model.LogDir)
 		assertNoError(t, err, "stat %s: %v", model.LogDir, err)
@@ -270,16 +267,13 @@ func TestRunCreatesTheLogDirectoryOwnerOnly(t *testing.T) {
 
 		// The log directory exists and belongs to somebody else: the
 		// instance writes there and leaves the mode alone.
-		if err := os.MkdirAll(model.LogDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chmod(model.LogDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
+		err := os.MkdirAll(model.LogDir, 0o755)
+		assertNoError(t, err, "")
+		err = os.Chmod(model.LogDir, 0o755)
+		assertNoError(t, err, "")
 
-		if err := runService(t, RunOptions{Paths: model}); err != nil {
-			t.Fatalf("Run() = %v, want nil", err)
-		}
+		err = runService(t, RunOptions{Paths: model})
+		assertNoError(t, err, "Run() = %v, want nil", err)
 
 		info, err := os.Stat(model.LogDir)
 		assertNoError(t, err, "stat %s: %v", model.LogDir, err)
@@ -357,13 +351,12 @@ func TestRunShutdownPersistsTheJobListWithinTheBudget(t *testing.T) {
 	// The instance starts with a job in its list: the shutdown has to
 	// persist it.
 	runtimepaths.Install(model)
-	if err := server.SaveJobsState([]*server.Job{{
+	err := server.SaveJobsState([]*server.Job{{
 		ID:     "job-of-the-test",
 		Repo:   "owner/model",
 		Status: server.JobStatusPaused,
-	}}); err != nil {
-		t.Fatalf("SaveJobsState(): %v", err)
-	}
+	}})
+	assertNoError(t, err, "SaveJobsState(): %v", err)
 	stateFile := model.JobsStateFile()
 
 	port := freePort(t)
@@ -551,9 +544,8 @@ func TestBuildConfigInstallsTheRuntimeModel(t *testing.T) {
 		StateDir:   filepath.Join(root, "var"),
 		LogDir:     filepath.Join(root, "var", "logs"),
 	}
-	if err := os.MkdirAll(filepath.Dir(model.ConfigFile), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(filepath.Dir(model.ConfigFile), 0o700)
+	assertNoError(t, err, "")
 	cacheRoot := filepath.Join(root, "from-config-file")
 	data, err := json.Marshal(map[string]string{
 		"cache-dir": cacheRoot,
@@ -595,9 +587,8 @@ func serviceInstance(t *testing.T, fields map[string]string) runtimepaths.Paths 
 		StateDir:   filepath.Join(root, "var"),
 		LogDir:     filepath.Join(root, "var", "logs"),
 	}
-	if err := os.MkdirAll(filepath.Dir(model.ConfigFile), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(filepath.Dir(model.ConfigFile), 0o700)
+	assertNoError(t, err, "")
 	data, err := json.Marshal(fields)
 	assertNoError(t, err, "")
 	if err := os.WriteFile(model.ConfigFile, data, 0o600); err != nil {
@@ -687,14 +678,13 @@ func TestBuildConfigKeepsInheritedCacheEnvironmentWhenRegistrationOmitsIt(t *tes
 	if effective.CacheDir != "" || effective.HubDir != "" {
 		t.Fatalf("effective registration destinations = %q/%q, want absence", effective.CacheDir, effective.HubDir)
 	}
-	if _, err := buildConfig(RunOptions{
+	_, err := buildConfig(RunOptions{
 		Paths:    effective.Paths,
 		Listen:   effective.Listen,
 		CacheDir: effective.CacheDir,
 		HubDir:   effective.HubDir,
-	}, "127.0.0.1", 8080); err != nil {
-		t.Fatalf("buildConfig() = %v, want nil", err)
-	}
+	}, "127.0.0.1", 8080)
+	assertNoError(t, err, "buildConfig() = %v, want nil", err)
 	if got := os.Getenv("HF_HOME"); got != "/operator/cache-root" {
 		t.Errorf("HF_HOME = %q, want the inherited value", got)
 	}
@@ -716,13 +706,12 @@ func TestBuildConfigDerivesTheHubDir(t *testing.T) {
 		t.Setenv("HF_HOME", "/stale/home")
 		t.Setenv("HF_HUB_CACHE", "/stale/hub")
 
-		if _, err := buildConfig(RunOptions{
+		_, err := buildConfig(RunOptions{
 			Paths:    model,
 			CacheDir: "/registered/cache",
 			HubDir:   "/registered/cache/hub",
-		}, "127.0.0.1", 8080); err != nil {
-			t.Fatalf("buildConfig() = %v, want nil", err)
-		}
+		}, "127.0.0.1", 8080)
+		assertNoError(t, err, "buildConfig() = %v, want nil", err)
 		if got, want := os.Getenv("HF_HUB_CACHE"), filepath.Join("/from/config/file", "hub"); got != want {
 			t.Errorf("HF_HUB_CACHE = %q, want %q", got, want)
 		}
@@ -733,13 +722,12 @@ func TestBuildConfigDerivesTheHubDir(t *testing.T) {
 		t.Setenv("HF_HOME", "/stale/home")
 		t.Setenv("HF_HUB_CACHE", "/stale/hub")
 
-		if _, err := buildConfig(RunOptions{
+		_, err := buildConfig(RunOptions{
 			Paths:    model,
 			CacheDir: "/registered/cache",
 			HubDir:   "/registered/hub",
-		}, "127.0.0.1", 8080); err != nil {
-			t.Fatalf("buildConfig() = %v, want nil", err)
-		}
+		}, "127.0.0.1", 8080)
+		assertNoError(t, err, "buildConfig() = %v, want nil", err)
 		if got := os.Getenv("HF_HUB_CACHE"); got != "/registered/hub" {
 			t.Errorf("HF_HUB_CACHE = %q, want the registered hub dir %q", got, "/registered/hub")
 		}
@@ -750,12 +738,11 @@ func TestBuildConfigDerivesTheHubDir(t *testing.T) {
 		t.Setenv("HF_HOME", "/stale/home")
 		t.Setenv("HF_HUB_CACHE", "/stale/hub")
 
-		if _, err := buildConfig(RunOptions{
+		_, err := buildConfig(RunOptions{
 			Paths:    model,
 			CacheDir: "/registered/cache",
-		}, "127.0.0.1", 8080); err != nil {
-			t.Fatalf("buildConfig() = %v, want nil", err)
-		}
+		}, "127.0.0.1", 8080)
+		assertNoError(t, err, "buildConfig() = %v, want nil", err)
 		if got, want := os.Getenv("HF_HUB_CACHE"), filepath.Join("/registered/cache", "hub"); got != want {
 			t.Errorf("HF_HUB_CACHE = %q, want %q", got, want)
 		}
@@ -811,13 +798,12 @@ func TestBuildConfigPinsTheCacheEnvironment(t *testing.T) {
 	t.Setenv("HF_HOME", "/stale/home")
 	t.Setenv("HF_HUB_CACHE", "/stale/hub")
 
-	if _, err := buildConfig(RunOptions{
+	_, err := buildConfig(RunOptions{
 		Paths:    model,
 		CacheDir: "/registered/cache",
 		HubDir:   "/registered/cache/hub",
-	}, "127.0.0.1", 8080); err != nil {
-		t.Fatalf("buildConfig() = %v, want nil", err)
-	}
+	}, "127.0.0.1", 8080)
+	assertNoError(t, err, "buildConfig() = %v, want nil", err)
 
 	if got := os.Getenv("HF_HOME"); got != "/from/config/file" {
 		t.Errorf("HF_HOME = %q, want the effective cache root %q", got, "/from/config/file")
@@ -840,9 +826,8 @@ func TestRunUsesTheConfigFileOfTheInstance(t *testing.T) {
 		StateDir:   filepath.Join(root, "var"),
 		LogDir:     filepath.Join(root, "var", "logs"),
 	}
-	if err := os.MkdirAll(filepath.Dir(model.ConfigFile), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(filepath.Dir(model.ConfigFile), 0o700)
+	assertNoError(t, err, "")
 	cacheRoot := filepath.Join(root, "from-config-file")
 	localDir := filepath.Join(root, "from-config-file", "models")
 	data, err := json.Marshal(map[string]string{
@@ -881,9 +866,7 @@ func TestRunUsesTheConfigFileOfTheInstance(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("Run() = %v, want nil", err)
 	}
-	if settingsErr != nil {
-		t.Fatalf("the settings of the instance: %v", settingsErr)
-	}
+	assertNoError(t, settingsErr, "the settings of the instance: %v", settingsErr)
 
 	if settings.CacheDir != cacheRoot {
 		t.Errorf("the cache dir of the instance = %q, want the cache dir of the config file %q", settings.CacheDir, cacheRoot)
@@ -944,15 +927,12 @@ func TestServiceDirectoriesAreOwnerOnly(t *testing.T) {
 	runtimepaths.Install(model)
 	t.Cleanup(runtimepaths.Reset)
 
-	if err := server.SaveConfigFile(&server.ConfigFile{CacheDir: "/from/config/file"}); err != nil {
-		t.Fatalf("SaveConfigFile() = %v, want nil", err)
-	}
-	if err := server.SaveJobsState(nil); err != nil {
-		t.Fatalf("SaveJobsState() = %v, want nil", err)
-	}
-	if err := server.AppendHistory(&server.Job{ID: "job", Status: server.JobStatusCompleted}); err != nil {
-		t.Fatalf("AppendHistory() = %v, want nil", err)
-	}
+	err := server.SaveConfigFile(&server.ConfigFile{CacheDir: "/from/config/file"})
+	assertNoError(t, err, "SaveConfigFile() = %v, want nil", err)
+	err = server.SaveJobsState(nil)
+	assertNoError(t, err, "SaveJobsState() = %v, want nil", err)
+	err = server.AppendHistory(&server.Job{ID: "job", Status: server.JobStatusCompleted})
+	assertNoError(t, err, "AppendHistory() = %v, want nil", err)
 
 	for _, dir := range []string{filepath.Dir(model.ConfigFile), model.StateDir} {
 		info, err := os.Stat(dir)
@@ -996,9 +976,8 @@ func TestBuildConfigRejectsARelativeStateDir(t *testing.T) {
 func TestBuildConfigTakesTheTokenFromTheConfigFile(t *testing.T) {
 	root := t.TempDir()
 	configFile := filepath.Join(root, "etc", "hfdesk.json")
-	if err := os.MkdirAll(filepath.Dir(configFile), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(filepath.Dir(configFile), 0o700)
+	assertNoError(t, err, "")
 	data, err := json.Marshal(map[string]string{"token": "hf_file_token"})
 	assertNoError(t, err, "")
 	if err := os.WriteFile(configFile, data, 0o600); err != nil {

@@ -28,17 +28,9 @@ func TestSCMStateSDDLGrantsOnlyTheMachineAccounts(t *testing.T) {
 
 	// SYSTEM, the administrators of the machine and the account the
 	// instance runs as.
-	for _, want := range []string{";;;SY)", ";;;BA)", ";;;LS)"} {
-		if !strings.Contains(sddl, want) {
-			t.Errorf("the descriptor %q does not grant %q", sddl, want)
-		}
-	}
+	assertNames(t, sddl, "the descriptor", []string{";;;SY)", ";;;BA)", ";;;LS)"})
 	// Nobody else.
-	for _, forbidden := range []string{"WD", "Everyone", "Users", "AU;", ";;;AU)", "IU)", "BU)", "Authenticated"} {
-		if strings.Contains(sddl, forbidden) {
-			t.Errorf("the descriptor %q grants access to %q", sddl, forbidden)
-		}
-	}
+	assertNamesWithout(t, sddl, "the descriptor", nil, []string{"WD", "Everyone", "Users", "AU;", ";;;AU)", "IU)", "BU)", "Authenticated"})
 	// The inheritance of the parent directory is blocked.
 	if !strings.HasPrefix(sddl, "D:P") {
 		t.Errorf("the descriptor %q does not block the inheritance", sddl)
@@ -86,9 +78,8 @@ func scmTestNamesPath(message, path string) bool {
 // names.
 func TestSCMTestNamesPathAcceptsTheRealLocationOfAPath(t *testing.T) {
 	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, "cache"), 0o700); err != nil {
-		t.Fatalf("Mkdir() = %v, want nil", err)
-	}
+	err := os.Mkdir(filepath.Join(root, "cache"), 0o700)
+	assertNoError(t, err, "Mkdir() = %v, want nil", err)
 
 	// The path as it was written names the directory with another case: the
 	// platform reports the name the directory has on the disk.
@@ -279,9 +270,8 @@ func TestPreflightDataPathJudgesTheNearestExistingAncestor(t *testing.T) {
 	// The directory that holds the named directory does not exist yet
 	// either: the nearest existing ancestor is the one below the root.
 	ancestor := filepath.Join(root, "a")
-	if err := os.Mkdir(ancestor, 0o750); err != nil {
-		t.Fatalf("Mkdir() = %v, want nil", err)
-	}
+	err := os.Mkdir(ancestor, 0o750)
+	assertNoError(t, err, "Mkdir() = %v, want nil", err)
 	path := filepath.Join(ancestor, "b", "cache")
 	access := scmTestPathAccessFor(t, path, true)
 	if err := preflightDataPath("cache dir", path, access); err != nil {
@@ -308,9 +298,8 @@ func TestPreflightDataPathJudgesTheNearestExistingAncestor(t *testing.T) {
 func TestSCMPreflightDataPathsAcceptADirectoryInsideTheStateRoot(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "var", "lib", "hfdesk")
-	if err := os.MkdirAll(stateDir, 0o750); err != nil {
-		t.Fatalf("MkdirAll() = %v, want nil", err)
-	}
+	err := os.MkdirAll(stateDir, 0o750)
+	assertNoError(t, err, "MkdirAll() = %v, want nil", err)
 	opts := scmTestOptions()
 	opts.Paths = runtimepaths.Paths{
 		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
@@ -456,16 +445,14 @@ func TestSCMPreflightDataPathsCheckAnExistingDirectoryOutsideTheStateRoot(t *tes
 func TestSCMPreflightDataPathsRefuseALinkThatLeavesTheStateRoot(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "var", "lib", "hfdesk")
-	if err := os.MkdirAll(stateDir, 0o750); err != nil {
-		t.Fatalf("MkdirAll() = %v, want nil", err)
-	}
+	err := os.MkdirAll(stateDir, 0o750)
+	assertNoError(t, err, "MkdirAll() = %v, want nil", err)
 
 	// A directory outside of the state root that the account of the
 	// instance cannot use.
 	outside := filepath.Join(root, "models")
-	if err := os.Mkdir(outside, 0o750); err != nil {
-		t.Fatalf("Mkdir() = %v, want nil", err)
-	}
+	err = os.Mkdir(outside, 0o750)
+	assertNoError(t, err, "Mkdir() = %v, want nil", err)
 
 	// A link inside the state root that points at it.
 	link := filepath.Join(stateDir, "cache")
@@ -578,9 +565,8 @@ func TestPreflightDataPathDoesNotInferLocalServiceAccessWithoutItsToken(t *testi
 func TestPreflightDataPathLeavesDescriptorReadFailureInconclusive(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "cache")
-	if err := os.Mkdir(path, 0o700); err != nil {
-		t.Fatalf("Mkdir() = %v, want nil", err)
-	}
+	err := os.Mkdir(path, 0o700)
+	assertNoError(t, err, "Mkdir() = %v, want nil", err)
 	resolved, err := scmResolvePath(path)
 	assertNoError(t, err, "resolve directory %q: %v", path, err)
 	access := &scmTestPathAccess{errors: map[string]error{resolved: errors.New("descriptor unavailable")}}
@@ -779,9 +765,7 @@ func scmTestPathAccessFor(t *testing.T, path string, allowed bool) *scmTestPathA
 	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 		var nearestErr error
 		checked, nearestErr = scmNearestExistingDir(path)
-		if nearestErr != nil {
-			t.Fatalf("find the AccessCheck target for %q: %v", path, nearestErr)
-		}
+		assertNoError(t, nearestErr, "find the AccessCheck target for %q: %v", path, nearestErr)
 	}
 	resolved, err := scmResolvePath(checked)
 	assertNoError(t, err, "resolve the AccessCheck target for %q: %v", path, err)
@@ -796,15 +780,13 @@ func scmTestPathAccessFor(t *testing.T, path string, allowed bool) *scmTestPathA
 func scmTestImpersonationToken(t *testing.T) windows.Token {
 	t.Helper()
 	var primary windows.Token
-	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY|windows.TOKEN_DUPLICATE, &primary); err != nil {
-		t.Fatalf("OpenProcessToken() = %v", err)
-	}
+	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY|windows.TOKEN_DUPLICATE, &primary)
+	assertNoError(t, err, "OpenProcessToken() = %v", err)
 	t.Cleanup(func() { _ = primary.Close() })
 	var token windows.Token
-	if err := windows.DuplicateTokenEx(primary, windows.TOKEN_QUERY,
-		nil, windows.SecurityImpersonation, windows.TokenImpersonation, &token); err != nil {
-		t.Fatalf("DuplicateTokenEx() = %v", err)
-	}
+	err = windows.DuplicateTokenEx(primary, windows.TOKEN_QUERY,
+		nil, windows.SecurityImpersonation, windows.TokenImpersonation, &token)
+	assertNoError(t, err, "DuplicateTokenEx() = %v", err)
 	t.Cleanup(func() { _ = token.Close() })
 	return token
 }
@@ -969,9 +951,8 @@ func TestSCMPathRouteChecksEveryAncestorOfAResolvedReparseRoute(t *testing.T) {
 	nestedLink := filepath.Join(middleDir, "nested")
 	scmTestCreateDirectorySymlink(t, targetDir, nestedLink)
 	sourcePath := filepath.Join(firstLink, "nested", "hfdesk.exe")
-	if err := os.WriteFile(filepath.Join(targetDir, "hfdesk.exe"), []byte("test image"), 0o600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	err := os.WriteFile(filepath.Join(targetDir, "hfdesk.exe"), []byte("test image"), 0o600)
+	assertNoError(t, err, "WriteFile: %v", err)
 	resolvedDenied, err := scmResolvePath(deniedDir)
 	assertNoError(t, err, "resolve the intermediate ancestor %q: %v", deniedDir, err)
 	denyTraverse := func(path string, desired uint32) bool {
@@ -1017,13 +998,11 @@ func TestSCMPathRouteChecksEveryAncestorOfAResolvedReparseRoute(t *testing.T) {
 func TestSCMPathAccessHonorsTraversePrivilegeAndUnknownEvidence(t *testing.T) {
 	root := t.TempDir()
 	parent := filepath.Join(root, "parent")
-	if err := os.Mkdir(parent, 0o700); err != nil {
-		t.Fatalf("Mkdir(%q): %v", parent, err)
-	}
+	err := os.Mkdir(parent, 0o700)
+	assertNoError(t, err, "Mkdir(%q): %v", parent, err)
 	path := filepath.Join(parent, "hfdesk.exe")
-	if err := os.WriteFile(path, []byte("test image"), 0o600); err != nil {
-		t.Fatalf("WriteFile(%q): %v", path, err)
-	}
+	err = os.WriteFile(path, []byte("test image"), 0o600)
+	assertNoError(t, err, "WriteFile(%q): %v", path, err)
 	resolved, err := scmResolvePath(path)
 	assertNoError(t, err, "resolve executable %q: %v", path, err)
 	resolvedParent, err := scmResolvePath(parent)
@@ -1095,9 +1074,7 @@ func TestSCMDataDirectoryPreflightUsesTheSameAccessCheckOwner(t *testing.T) {
 		t.Fatalf("preflightDataPath() = %v, want the actual AccessCheck denial", err)
 	}
 	unknown := preflightDataPath("cache dir", dir)
-	if unknown != nil {
-		t.Fatalf("preflightDataPath() without a service token = %v, want inconclusive success", unknown)
-	}
+	assertNoError(t, unknown, "preflightDataPath() without a service token = %v, want inconclusive success", unknown)
 }
 
 // TestPreflightExecutableImageRefusesAFileThatIsNotAProgram proves that an

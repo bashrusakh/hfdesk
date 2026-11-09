@@ -460,9 +460,8 @@ func TestSystemdWorkingDirectoryRejectsUnrepresentableTrailingSpace(t *testing.T
 	if err := validateUnitPaths(opts, false); err == nil || !strings.Contains(err.Error(), "trailing spaces are stripped") {
 		t.Fatalf("first-install validateUnitPaths() = %v, want refusal of an unrepresentable WorkingDirectory", err)
 	}
-	if err := validateUnitPaths(opts, true); err != nil {
-		t.Fatalf("executable-only validation rejected the inherited app state path: %v", err)
-	}
+	err := validateUnitPaths(opts, true)
+	assertNoError(t, err, "executable-only validation rejected the inherited app state path: %v", err)
 	if _, err := renderUnit(opts, nil); err == nil || !strings.Contains(err.Error(), "trailing spaces are stripped") {
 		t.Fatalf("renderUnit() = %v, want refusal of an unrepresentable WorkingDirectory", err)
 	}
@@ -540,9 +539,8 @@ func TestSystemdExecutableUpdatePreservesInheritedStatePathAndIndependentWorking
 	}
 	dataPath := filepath.Join(state, "jobs_state.json")
 	data := []byte(`{"jobs":[{"id":"preserved-state"}]}`)
-	if err := os.WriteFile(dataPath, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(dataPath, data, 0o600)
+	assertNoError(t, err, "")
 	content := "[Service]\nExecStart=/bin/true service run --config \"" + config + "\" --state-dir \"" + state + "\" --log-dir \"" + logs + "\"\n" +
 		"WorkingDirectory=" + workingDirectory + "\nRestart=on-failure\n[Install]\nWantedBy=default.target\n"
 
@@ -946,12 +944,10 @@ func TestSystemdStoredUnloadedUpdateKeepsHexEscapedConfigPath(t *testing.T) {
 	systemdTempInstallEnvironment(t)
 	root := t.TempDir()
 	config := filepath.Join(root, "config one", "hfdesk.json")
-	if err := os.MkdirAll(filepath.Dir(config), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(config, []byte(`{"connections":3}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(filepath.Dir(config), 0o700)
+	assertNoError(t, err, "")
+	err = os.WriteFile(config, []byte(`{"connections":3}`), 0o600)
+	assertNoError(t, err, "")
 	stateDir, logDir := filepath.Join(root, "state"), filepath.Join(root, "logs")
 	content := fmt.Sprintf("[Service]\nExecStart=/bin/true service run -config=%s -state-dir=%s -log-dir=%s --cache-dir=\n[Install]\nWantedBy=default.target\n", strings.ReplaceAll(config, " ", `\x20`), stateDir, logDir)
 	manager := &systemdManager{scope: ScopeUser}
@@ -974,9 +970,7 @@ func TestSystemdStoredUnloadedUpdateKeepsHexEscapedConfigPath(t *testing.T) {
 		}
 	}
 	updated, readErr := os.ReadFile(path)
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
+	assertNoError(t, readErr, "")
 	if string(updated) != content {
 		t.Errorf("the refused update changed the unit:\n%s", updated)
 	}
@@ -1497,12 +1491,10 @@ func newSystemdDynamicPathFixture(t *testing.T) systemdDynamicPathFixture {
 	root := t.TempDir()
 	configSource := filepath.Join(root, "${HF_CONFIG}", "hfdesk.json")
 	actualConfig := filepath.Join(root, "config with spaces", "hfdesk.json")
-	if err := os.MkdirAll(filepath.Dir(actualConfig), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(actualConfig, []byte(`{"connections":3}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(filepath.Dir(actualConfig), 0o700)
+	assertNoError(t, err, "")
+	err = os.WriteFile(actualConfig, []byte(`{"connections":3}`), 0o600)
+	assertNoError(t, err, "")
 	actualCache := filepath.Join(root, "cache with spaces")
 	logDir := filepath.Join(root, "%n", "logs")
 	managerLogDir := filepath.Join(root, unitName, "logs")
@@ -1664,9 +1656,8 @@ func TestSystemdReinstallRefusesAShadowedLoadedCommand(t *testing.T) {
 	}
 	loadedUnit = strings.Replace(loadedUnit, "\n\n[Install]", "\nEnvironment=HF_HUB_CACHE=/operator/hub\n\n[Install]", 1)
 	loadedPath := os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")
-	if err := os.WriteFile(loadedPath, []byte(loadedUnit), 0o644); err != nil {
-		t.Fatalf("write the simulated loaded unit: %v", err)
-	}
+	err := os.WriteFile(loadedPath, []byte(loadedUnit), 0o644)
+	assertNoError(t, err, "write the simulated loaded unit: %v", err)
 	loadedArgv := append([]string{oldExecutable}, RunArgs(previous)...)
 	for i, arg := range loadedArgv {
 		if arg == previous.Paths.ConfigFile {
@@ -1711,9 +1702,7 @@ func TestSystemdReinstallRefusesAShadowedLoadedCommand(t *testing.T) {
 	assertSingleRemoveOverrideAction(t, err, unitDropInPath(unitPath))
 
 	content, readErr := os.ReadFile(unitPath)
-	if readErr != nil {
-		t.Fatalf("read the unit file: %v", readErr)
-	}
+	assertNoError(t, readErr, "read the unit file: %v", readErr)
 	if string(content) != previousUnit {
 		t.Errorf("the base unit changed despite the override refusal:\n%s\nwant\n%s", content, previousUnit)
 	}
@@ -2415,7 +2404,7 @@ func TestHandEditedUnitRefusalNamesNoRouteForAnUnknownHome(t *testing.T) {
 		"names no file-editing route",
 		"nothing of the registration was changed",
 	})
-	for _, unwanted := range []string{
+	assertNamesWithout(t, err.Error(), "the refusal", nil, []string{
 		"Move your customizations into",
 		"remove the unit file",
 		// The refusal prints the reload instruction lowercase ("reload
@@ -2424,11 +2413,7 @@ func TestHandEditedUnitRefusalNamesNoRouteForAnUnknownHome(t *testing.T) {
 		"reload the unit files",
 		`run "hfdesk service install"`,
 		" or ",
-	} {
-		if strings.Contains(err.Error(), unwanted) {
-			t.Errorf("the refusal %q names %q, want the honest terminal of this cause", err, unwanted)
-		}
-	}
+	})
 }
 
 // assertSingleDropInAction proves the refusal standard of the ownership

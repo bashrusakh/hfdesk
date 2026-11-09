@@ -470,16 +470,13 @@ func TestSystemdInstallUsesLoadedVendorFragmentAndRetainsItsPaths(t *testing.T) 
 	// executable stands in for the reload that makes the real supervisor
 	// forget the removed fragment. The retry must then install as a first
 	// installation instead of refusing again.
-	if removeErr := os.Remove(vendorPath); removeErr != nil {
-		t.Fatalf("remove the foreign fragment (the named action): %v", removeErr)
-	}
-	if removeErr := os.Remove(loadedPath); removeErr != nil {
-		t.Fatalf("drop the loaded-unit record of the fake: %v", removeErr)
-	}
+	removeErr := os.Remove(vendorPath)
+	assertNoError(t, removeErr, "remove the foreign fragment (the named action): %v", removeErr)
+	removeErr = os.Remove(loadedPath)
+	assertNoError(t, removeErr, "drop the loaded-unit record of the fake: %v", removeErr)
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", "")
-	if _, retryErr := manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, systemdTestExecutable(t))); retryErr != nil {
-		t.Fatalf("the retry after the named action = %v, want the successful first installation the action promises", retryErr)
-	}
+	_, retryErr := manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, systemdTestExecutable(t)))
+	assertNoError(t, retryErr, "the retry after the named action = %v, want the successful first installation the action promises", retryErr)
 	if _, statErr := os.Stat(unitPath); statErr != nil {
 		t.Errorf("the retried installation wrote no unit file at %q: %v", unitPath, statErr)
 	}
@@ -799,9 +796,7 @@ func TestSystemdReinstallOfAStoppedUnitDoesNotStartIt(t *testing.T) {
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
 
 	updated, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
-	if err != nil {
-		t.Fatalf("Install() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Install() = %v, want nil", err)
 	// Finding 3: the registration existed before this attempt — a repeat
 	// installation reports Created=false.
 	if updated.Created {
@@ -851,12 +846,10 @@ func TestSystemdReinstallPreservesUnrelatedUnitSettings(t *testing.T) {
 		"EnvironmentFile=-/etc/hfdesk/service.env\n" +
 		"Restart=always\n" +
 		"ExecStartPre=/usr/bin/test -d /operator/data\n"
-	if err := os.MkdirAll(filepath.Dir(dropInPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dropInPath, []byte(dropIn), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(filepath.Dir(dropInPath), 0o755)
+	assertNoError(t, err, "")
+	err = os.WriteFile(dropInPath, []byte(dropIn), 0o644)
+	assertNoError(t, err, "")
 	// The typed configuration is what the supervisor loads from the base
 	// file plus the drop-in layer, and it is read the same way before and
 	// after the write: the drop-in layer itself never changes.
@@ -896,17 +889,11 @@ func TestSystemdReinstallPreservesUnrelatedUnitSettings(t *testing.T) {
 	// The base file is exactly the canonical rendering of the merged
 	// facts: the semantic diff of the write is the executable alone.
 	content, readErr := os.ReadFile(unitPath)
-	if readErr != nil {
-		t.Fatalf("read the updated unit: %v", readErr)
-	}
+	assertNoError(t, readErr, "read the updated unit: %v", readErr)
 	facts, factErr := canonicalUnitForInstall(want, nil)
-	if factErr != nil {
-		t.Fatalf("canonicalUnitForInstall() = %v, want nil", factErr)
-	}
+	assertNoError(t, factErr, "canonicalUnitForInstall() = %v, want nil", factErr)
 	wantContent, renderErr := renderCanonicalUnit(facts)
-	if renderErr != nil {
-		t.Fatalf("renderCanonicalUnit() = %v, want nil", renderErr)
-	}
+	assertNoError(t, renderErr, "renderCanonicalUnit() = %v, want nil", renderErr)
 	if string(content) != wantContent {
 		t.Errorf("the updated base unit =\n%s\nwant the canonical rendering\n%s", content, wantContent)
 	}
@@ -926,9 +913,8 @@ func TestSystemdUpdateOfStoredButUnloadedUnitStaysStopped(t *testing.T) {
 	previous := systemdExistingOptions(t, oldExecutable, root)
 	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
 	loadedPath := os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")
-	if err := os.Remove(loadedPath); err != nil {
-		t.Fatalf("mark the stored unit as not loaded: %v", err)
-	}
+	err := os.Remove(loadedPath)
+	assertNoError(t, err, "mark the stored unit as not loaded: %v", err)
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 
 	effective, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
@@ -976,13 +962,9 @@ func TestSystemdUpdateUsesTypedArgvForSpacesQuotesEmptyArgsAndEnvironment(t *tes
 	// across the write (V1 proves it), and the written bytes changed only
 	// where the request named the executable.
 	facts, factErr := canonicalUnitForInstall(fixture.updated, nil)
-	if factErr != nil {
-		t.Fatalf("canonicalUnitForInstall() = %v, want nil", factErr)
-	}
+	assertNoError(t, factErr, "canonicalUnitForInstall() = %v, want nil", factErr)
 	wantContent, renderErr := renderCanonicalUnit(facts)
-	if renderErr != nil {
-		t.Fatalf("renderCanonicalUnit() = %v, want nil", renderErr)
-	}
+	assertNoError(t, renderErr, "renderCanonicalUnit() = %v, want nil", renderErr)
 	if string(content) != wantContent {
 		t.Errorf("updated unit =\n%s\nwant the canonical rendering\n%s", content, wantContent)
 	}
@@ -1224,9 +1206,7 @@ func TestSystemdInstallRefusesAMaskedUnit(t *testing.T) {
 
 	// The unit path is untouched: it still holds the mask.
 	info, lstatErr := os.Lstat(unitPath)
-	if lstatErr != nil {
-		t.Fatalf("the unit path is gone after the refused installation: %v", lstatErr)
-	}
+	assertNoError(t, lstatErr, "the unit path is gone after the refused installation: %v", lstatErr)
 	if info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("the unit path is no mask any more (mode %s), want a symbolic link", info.Mode())
 	}
@@ -1296,9 +1276,7 @@ func TestSystemdInstallRefusesARuntimeMaskedUnit(t *testing.T) {
 	// and the refused installation writes none. The directory of the unit
 	// file is not created either, so the refusal came before the write.
 	unitPath, pathErr := m.unitPath()
-	if pathErr != nil {
-		t.Fatalf("unitPath() = %v, want nil", pathErr)
-	}
+	assertNoError(t, pathErr, "unitPath() = %v, want nil", pathErr)
 	if _, statErr := os.Stat(unitPath); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Errorf("the refused installation created the unit file %q (stat error: %v)", unitPath, statErr)
 	}
@@ -1399,21 +1377,15 @@ func TestSystemdInstallRefusesAPersistentMaskWithoutTheSupervisorAnswer(t *testi
 		}
 		// The degraded mask read must not fall through to the hand-edit
 		// refusal: its action never clears the mask.
-		for _, wrong := range []string{
+		assertNamesWithout(t, err.Error(), "Install()", nil, []string{
 			"is not the unit HFDesk generates",
 			"Move your customizations into",
-		} {
-			if strings.Contains(err.Error(), wrong) {
-				t.Errorf("Install() = %q, want no hand-edit refusal (%q) for a mask", err, wrong)
-			}
-		}
+		})
 
 		// The mask itself is untouched, and the supervisor is asked
 		// nothing but the mask: never unmasked, never reloaded.
 		info, lstatErr := os.Lstat(unitPath)
-		if lstatErr != nil {
-			t.Fatalf("the unit path is gone after the refused installation: %v", lstatErr)
-		}
+		assertNoError(t, lstatErr, "the unit path is gone after the refused installation: %v", lstatErr)
 		if info.Mode()&os.ModeSymlink == 0 {
 			t.Fatalf("the unit path is no mask any more (mode %s), want a symbolic link", info.Mode())
 		}
@@ -1454,13 +1426,10 @@ func TestSystemdInstallRefusesAPersistentMaskWithoutTheSupervisorAnswer(t *testi
 		t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
 		t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLED_STATE", "unavailable")
 
-		if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
-			t.Fatalf("Install() = %v, want the empty answer without a mask to refuse nothing", err)
-		}
+		_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+		assertNoError(t, err, "Install() = %v, want the empty answer without a mask to refuse nothing", err)
 		info, lstatErr := os.Lstat(unitPath)
-		if lstatErr != nil {
-			t.Fatalf("read the unit path: %v", lstatErr)
-		}
+		assertNoError(t, lstatErr, "read the unit path: %v", lstatErr)
 		if info.Mode()&os.ModeSymlink != 0 {
 			t.Fatalf("the unit path became a link (mode %s), want the written unit file", info.Mode())
 		}
@@ -1540,9 +1509,7 @@ func TestSystemdEnablementFailureIsAFailedInstallation(t *testing.T) {
 	}
 
 	path, pathErr := m.unitPath()
-	if pathErr != nil {
-		t.Fatalf("unitPath() = %v, want nil", pathErr)
-	}
+	assertNoError(t, pathErr, "unitPath() = %v, want nil", pathErr)
 	if _, statErr := os.Stat(path); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Errorf("the unit file %q is still there after the failed installation (stat error: %v)", path, statErr)
 	}
@@ -1826,17 +1793,11 @@ func TestSystemdInstallHandlesTheHandEditedBaseFileOnBothSides(t *testing.T) {
 			t.Errorf("Install() returned\n%+v\nwant the merged registration\n%+v", effective, want)
 		}
 		facts, factErr := canonicalUnitForInstall(want, nil)
-		if factErr != nil {
-			t.Fatalf("canonicalUnitForInstall() = %v, want nil", factErr)
-		}
+		assertNoError(t, factErr, "canonicalUnitForInstall() = %v, want nil", factErr)
 		wantContent, renderErr := renderCanonicalUnit(facts)
-		if renderErr != nil {
-			t.Fatalf("renderCanonicalUnit() = %v, want nil", renderErr)
-		}
+		assertNoError(t, renderErr, "renderCanonicalUnit() = %v, want nil", renderErr)
 		content, readErr := os.ReadFile(unitPath)
-		if readErr != nil {
-			t.Fatalf("read the updated unit: %v", readErr)
-		}
+		assertNoError(t, readErr, "read the updated unit: %v", readErr)
 		if string(content) != wantContent {
 			t.Errorf("the updated unit =\n%s\nwant the canonical rendering of the merged facts\n%s", content, wantContent)
 		}
@@ -1892,9 +1853,7 @@ func TestSystemdUpdateThatKeepsTheMainPIDFailsVerification(t *testing.T) {
 	})
 
 	content, readErr := os.ReadFile(unitPath)
-	if readErr != nil {
-		t.Fatalf("read the unit file: %v", readErr)
-	}
+	assertNoError(t, readErr, "read the unit file: %v", readErr)
 	if string(content) != previousUnit {
 		t.Errorf("the unit file was not restored:\n%s\nwant\n%s", content, previousUnit)
 	}
@@ -1960,9 +1919,7 @@ func TestSystemdUpdateRefusesACommandTheReloadDoesNotLoad(t *testing.T) {
 	}
 
 	content, readErr := os.ReadFile(unitPath)
-	if readErr != nil {
-		t.Fatalf("read the unit file: %v", readErr)
-	}
+	assertNoError(t, readErr, "read the unit file: %v", readErr)
 	if string(content) != previousUnit {
 		t.Errorf("the unit file was not restored:\n%s\nwant\n%s", content, previousUnit)
 	}
@@ -2071,9 +2028,7 @@ func TestSystemdUpdateVerifiesThePreservedAndRequestedFields(t *testing.T) {
 			written := mergeInstallOptions(requested, previous, true)
 			writtenArgv := append([]string{written.Executable}, RunArgs(written)...)
 			home, homeErr := unitHomeDir(previous)
-			if homeErr != nil {
-				t.Fatalf("unitHomeDir() = %v, want nil", homeErr)
-			}
+			assertNoError(t, homeErr, "unitHomeDir() = %v, want nil", homeErr)
 
 			oldProperties := systemdTestPropertiesFromUnit(previousUnit)
 			drift := systemdLoadedDriftFields{workingDirectory: previous.Paths.StateDir}
@@ -2097,9 +2052,7 @@ func TestSystemdUpdateVerifiesThePreservedAndRequestedFields(t *testing.T) {
 			}
 
 			content, readErr := os.ReadFile(unitPath)
-			if readErr != nil {
-				t.Fatalf("read the unit file: %v", readErr)
-			}
+			assertNoError(t, readErr, "read the unit file: %v", readErr)
 			if string(content) != previousUnit {
 				t.Errorf("the unit file was not restored:\n%s\nwant\n%s", content, previousUnit)
 			}
@@ -2173,9 +2126,7 @@ func TestSystemdUpdateFailsClosedOnAnUnconfirmableSupplementaryGroupsSnapshot(t 
 			written := mergeInstallOptions(requested, previous, true)
 			writtenArgv := append([]string{written.Executable}, RunArgs(written)...)
 			home, homeErr := unitHomeDir(previous)
-			if homeErr != nil {
-				t.Fatalf("unitHomeDir() = %v, want nil", homeErr)
-			}
+			assertNoError(t, homeErr, "unitHomeDir() = %v, want nil", homeErr)
 
 			oldProperties := systemdTestPropertiesFromUnit(previousUnit)
 			if tc.snapshot != nil {
@@ -2294,13 +2245,11 @@ func TestSystemdInstallRefusesTheRegistrationWhoseOwnFragmentVanished(t *testing
 	// fixture flag that forced the stale in-memory load is dropped, which
 	// is what that reload does to the real supervisor. The retry must then
 	// install as a first installation instead of refusing again.
-	if _, reloadErr := m.runSystemctl(context.Background(), "daemon-reload"); reloadErr != nil {
-		t.Fatalf("reload the unit files (the named action): %v", reloadErr)
-	}
+	_, reloadErr := m.runSystemctl(context.Background(), "daemon-reload")
+	assertNoError(t, reloadErr, "reload the unit files (the named action): %v", reloadErr)
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", "")
-	if _, retryErr := m.Install(context.Background(), requested); retryErr != nil {
-		t.Fatalf("the retry after the named action = %v, want the successful first installation the action promises", retryErr)
-	}
+	_, retryErr := m.Install(context.Background(), requested)
+	assertNoError(t, retryErr, "the retry after the named action = %v, want the successful first installation the action promises", retryErr)
 	if _, statErr := os.Stat(unitPath); statErr != nil {
 		t.Errorf("the retried installation wrote no unit file at %q: %v", unitPath, statErr)
 	}
@@ -2341,9 +2290,7 @@ func TestSystemdInstallRefusesAnUpdateWhoseUnitChangesDuringTheUpdate(t *testing
 	// installation never wrote its canonical rendering over it.
 	tampered := previousUnit + "# a concurrent installation wrote this file\n"
 	content, readErr := os.ReadFile(unitPath)
-	if readErr != nil {
-		t.Fatalf("read the unit file: %v", readErr)
-	}
+	assertNoError(t, readErr, "read the unit file: %v", readErr)
 	if string(content) != tampered {
 		t.Errorf("the unit file =\n%s\nwant the snapshot with exactly the concurrent line\n%s", content, tampered)
 	}
@@ -2387,11 +2334,7 @@ func TestSystemdInstallRefusesARunningUnitWithoutAMainPID(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of a running unit without a MainPID")
 	}
-	for _, want := range []string{"exposed no MainPID", "the registration was not changed"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
-		}
-	}
+	assertNames(t, err.Error(), "Install()", []string{"exposed no MainPID", "the registration was not changed"})
 	content, readErr := os.ReadFile(unitPath)
 	if readErr != nil || string(content) != previousUnit {
 		t.Errorf("the refused update changed the unit (read error %v):\n%s", readErr, content)

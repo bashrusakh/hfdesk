@@ -155,11 +155,7 @@ func TestFindConsoleExecutableRequiresThePairOfAVersionedProgram(t *testing.T) {
 			t.Errorf("the version-stamped desktop program in %s yielded %q, want an error", dir, found)
 			continue
 		}
-		for _, want := range []string{"hfdesk_windows_amd64_1.4.0.exe", dir} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("the error is %q, want it to mention %q", err, want)
-			}
-		}
+		assertNames(t, err.Error(), "the error is", []string{"hfdesk_windows_amd64_1.4.0.exe", dir})
 	}
 }
 
@@ -269,11 +265,7 @@ func TestFindConsoleExecutableRefusesSeveralPrograms(t *testing.T) {
 	if err == nil {
 		t.Fatalf("the folder with two candidates yielded %q, want an error", found)
 	}
-	for _, want := range []string{dir, "hfdesk_windows_amd64_1.3.0.exe", "hfdesk_windows_amd64_1.4.0.exe"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the error is %q, want it to mention %q", err, want)
-		}
-	}
+	assertNames(t, err.Error(), "the error is", []string{dir, "hfdesk_windows_amd64_1.3.0.exe", "hfdesk_windows_amd64_1.4.0.exe"})
 }
 
 // TestDesktopVersionStamp proves which names of a desktop program carry a
@@ -361,6 +353,18 @@ func assertNames(t *testing.T, message, context string, wants []string) {
 	for _, want := range wants {
 		if !strings.Contains(message, want) {
 			t.Errorf("%s = %q, want a message that mentions %q", context, message, want)
+		}
+	}
+}
+
+// assertNamesWithout proves the named fragments AND the absent ones: the
+// message keeps its standard and offers no second route.
+func assertNamesWithout(t *testing.T, message, context string, wants, forbidden []string) {
+	t.Helper()
+	assertNames(t, message, context, wants)
+	for _, unwanted := range forbidden {
+		if strings.Contains(message, unwanted) {
+			t.Errorf("%s = %q, must not mention %q", context, message, unwanted)
 		}
 	}
 }

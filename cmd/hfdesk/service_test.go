@@ -1820,19 +1820,15 @@ func TestServiceInstallAcceptsAnExistingExecutable(t *testing.T) {
 func TestResolveExecutableKeepsTheStableNameOfTheInvocation(t *testing.T) {
 	root := t.TempDir()
 	release := filepath.Join(root, "hfdesk-1.2.3", "hfdesk")
-	if err := os.MkdirAll(filepath.Dir(release), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(release, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(filepath.Dir(release), 0o755)
+	assertNoError(t, err, "")
+	err = os.WriteFile(release, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 	stable := filepath.Join(root, "bin", "hfdesk")
-	if err := os.MkdirAll(filepath.Dir(stable), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(release, stable); err != nil {
-		t.Fatal(err)
-	}
+	err = os.MkdirAll(filepath.Dir(stable), 0o755)
+	assertNoError(t, err, "")
+	err = os.Symlink(release, stable)
+	assertNoError(t, err, "")
 
 	got, err := resolveExecutable("", stable)
 	assertNoError(t, err, "resolveExecutable() = %v, want nil", err)
@@ -1850,19 +1846,15 @@ func TestResolveExecutableKeepsTheStableNameOfTheInvocation(t *testing.T) {
 func TestUpgradeWarningStaysQuietForAStableName(t *testing.T) {
 	root := treeOutsideTempDir(t)
 	release := filepath.Join(root, "hfdesk-1.2.3", "hfdesk")
-	if err := os.MkdirAll(filepath.Dir(release), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(release, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(filepath.Dir(release), 0o755)
+	assertNoError(t, err, "")
+	err = os.WriteFile(release, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 	stable := filepath.Join(root, "bin", "hfdesk")
-	if err := os.MkdirAll(filepath.Dir(stable), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(release, stable); err != nil {
-		t.Fatal(err)
-	}
+	err = os.MkdirAll(filepath.Dir(stable), 0o755)
+	assertNoError(t, err, "")
+	err = os.Symlink(release, stable)
+	assertNoError(t, err, "")
 
 	registered, err := resolveExecutable("", stable)
 	assertNoError(t, err, "resolveExecutable() = %v, want nil", err)
@@ -1902,9 +1894,8 @@ func treeOutsideTempDir(t *testing.T) string {
 func TestResolveExecutablePrefersTheInvocationPath(t *testing.T) {
 	root := t.TempDir()
 	bin := filepath.Join(root, "hfdesk")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 
 	got, err := resolveExecutable("", bin)
 	assertNoError(t, err, "resolveExecutable() = %v, want nil", err)
@@ -1923,9 +1914,8 @@ func TestResolveExecutablePrefersTheInvocationPath(t *testing.T) {
 func TestResolveExecutableFallsBackToTheRunningBinary(t *testing.T) {
 	root := t.TempDir()
 	// A file with the name of the command in the working directory.
-	if err := os.WriteFile(filepath.Join(root, "hfdesk"), []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(filepath.Join(root, "hfdesk"), []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 	previous, err := os.Getwd()
 	assertNoError(t, err, "")
 	if err := os.Chdir(root); err != nil {
@@ -1957,9 +1947,8 @@ func TestResolveExecutableFallsBackToTheRunningBinary(t *testing.T) {
 func TestResolveExecutableRejectsAnUnusableExplicitPath(t *testing.T) {
 	root := t.TempDir()
 	program := filepath.Join(root, "hfdesk")
-	if err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 
 	cases := []struct {
 		name string
@@ -1993,9 +1982,8 @@ func TestResolveExecutableRejectsAnUnusableExplicitPath(t *testing.T) {
 func TestResolveExecutableAcceptsAnExistingFile(t *testing.T) {
 	root := t.TempDir()
 	plain := filepath.Join(root, "notes.txt")
-	if err := os.WriteFile(plain, []byte("notes\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(plain, []byte("notes\n"), 0o644)
+	assertNoError(t, err, "")
 
 	got, err := resolveExecutable(plain, "")
 	assertNoError(t, err, "resolveExecutable(%q) = %v, want nil", plain, err)
@@ -2009,9 +1997,8 @@ func TestResolveExecutableAcceptsAnExistingFile(t *testing.T) {
 func TestResolveExecutableUsesTheExplicitPath(t *testing.T) {
 	root := t.TempDir()
 	program := filepath.Join(root, "hfdesk")
-	if err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 
 	got, err := resolveExecutable(program, filepath.Join(root, "other"))
 	assertNoError(t, err, "resolveExecutable() = %v, want nil", err)

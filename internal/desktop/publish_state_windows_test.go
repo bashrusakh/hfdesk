@@ -102,9 +102,7 @@ func TestDesktopHostStopsServingWhenTheStateCannotBePublished(t *testing.T) {
 
 	// The failure survives in the log file of the launch.
 	logged, readErr := os.ReadFile(logFile)
-	if readErr != nil {
-		t.Fatalf("read %s: %v", logFile, readErr)
-	}
+	assertNoError(t, readErr, "read %s: %v", logFile, readErr)
 	if !strings.Contains(string(logged), "publish the effective URL") {
 		t.Errorf("the log file %s does not record the failure of the publish", logFile)
 	}

@@ -70,9 +70,8 @@ func TestServerShutdownDrainsHandlerBeforeFinalJobSnapshot(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("accepted handler did not perform its manager mutation")
 	}
-	if err := <-clientDone; err != nil {
-		t.Fatal(err)
-	}
+	err := <-clientDone
+	assertNoError(t, err, "")
 	select {
 	case <-finalWriteStarted:
 	case <-time.After(5 * time.Second):
@@ -339,9 +338,8 @@ func waitForServerListener(t *testing.T, addr string) {
 	for {
 		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err == nil {
-			if closeErr := conn.Close(); closeErr != nil {
-				t.Fatal(closeErr)
-			}
+			closeErr := conn.Close()
+			assertNoError(t, closeErr, "")
 			return
 		}
 		select {

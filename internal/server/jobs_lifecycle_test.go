@@ -208,9 +208,8 @@ func TestJobManagerCloseDrainsAcceptedMutationAndSharesResult(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("close coordinator did not finish after mutation drained")
 	}
-	if err := m.Close(context.Background()); err != nil {
-		t.Fatalf("repeated Close changed result: %v", err)
-	}
+	err := m.Close(context.Background())
+	assertNoError(t, err, "repeated Close changed result: %v", err)
 	if calls != 2 {
 		t.Fatalf("persistence calls = %d, want mutation + final snapshot", calls)
 	}
@@ -286,9 +285,8 @@ func TestJobManagerFinalSnapshotAndNoWritesAfterClose(t *testing.T) {
 	if got, _ := m.GetJob("paused"); got.Status != JobStatusQueued || got.starting {
 		t.Fatalf("quiesce dispatched a resumed job: %#v", got)
 	}
-	if err := m.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	err := m.Close(context.Background())
+	assertNoError(t, err, "")
 	loaded, err := loadJobsState(m.statePath)
 	assertNoError(t, err, "")
 	if len(loaded) != 1 || loaded[0].Status != JobStatusPaused {
@@ -427,9 +425,7 @@ func TestJobManagerCloseWaitsForTerminalHistoryAndReportsWriteFailures(t *testin
 				}
 				return
 			}
-			if closeErr != nil {
-				t.Fatalf("Close after successful history persistence: %v", closeErr)
-			}
+			assertNoError(t, closeErr, "Close after successful history persistence: %v", closeErr)
 			entries, err := LoadHistory()
 			assertNoError(t, err, "")
 			if len(entries) != 1 || entries[0].ID != job.ID || entries[0].Status != tc.status {

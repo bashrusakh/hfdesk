@@ -706,9 +706,8 @@ func TestWritePlistIsAtomic(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, launchdLabel()+".plist")
 
-	if err := writePlist(path, []byte("<plist/>"), plistMode); err != nil {
-		t.Fatalf("writePlist(): %v", err)
-	}
+	err := writePlist(path, []byte("<plist/>"), plistMode)
+	assertNoError(t, err, "writePlist(): %v", err)
 	info, err := os.Stat(path)
 	assertNoError(t, err, "stat the property list: %v", err)
 	if info.Mode().Perm() != plistMode {
@@ -1963,9 +1962,8 @@ func TestLaunchdSystemInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T)
 
 	root := t.TempDir()
 	cache := filepath.Join(root, "cache")
-	if err := os.Mkdir(cache, 0o755); err != nil {
-		t.Fatalf("create the cache directory: %v", err)
-	}
+	err := os.Mkdir(cache, 0o755)
+	assertNoError(t, err, "create the cache directory: %v", err)
 	beforeUID, beforeGID := darwinOwner(t, cache)
 
 	manager, err := newPlatformManager(ScopeSystem)
@@ -2003,11 +2001,7 @@ func TestLaunchdSystemInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T)
 		t.Fatal("Install() = nil, want the refusal of a cache directory the account cannot write to")
 	}
 	message := err.Error()
-	for _, want := range []string{account.Name, cache, "chown"} {
-		if !strings.Contains(message, want) {
-			t.Errorf("Install() = %q, want a message that mentions %q", message, want)
-		}
-	}
+	assertNames(t, message, "Install()", []string{account.Name, cache, "chown"})
 	// The refusal never recommends a recursive ownership change of the
 	// cache tree.
 	if strings.Contains(message, "-R") {
@@ -2078,15 +2072,11 @@ func TestLaunchdRefusesANamedDirTheAccountCannotWrite(t *testing.T) {
 		"never the tree inside it",
 		"then install again",
 	})
-	for _, unwanted := range []string{
+	assertNamesWithout(t, message, "checkNamedDirs()", nil, []string{
 		"member of the group that owns the directory",
 		"group access is preferable",
 		" or ",
-	} {
-		if strings.Contains(message, unwanted) {
-			t.Errorf("checkNamedDirs() = %q, must not name the removed route %q", message, unwanted)
-		}
-	}
+	})
 }
 
 // TestLaunchdCheckNamedDirsUsesTheRealLocationOfTheDirectory checks that the
@@ -2107,56 +2097,46 @@ func TestLaunchdCheckNamedDirsUsesTheRealLocationOfTheDirectory(t *testing.T) {
 	// pass through it, so a refusal of a case is about the directory of the
 	// case and not about the state directory.
 	state := filepath.Join(root, "state")
-	if err := os.Mkdir(state, 0o711); err != nil {
-		t.Fatalf("create the state directory: %v", err)
-	}
-	if err := os.Chmod(state, 0o711); err != nil {
-		t.Fatalf("open the state directory to the traversal: %v", err)
-	}
+	err := os.Mkdir(state, 0o711)
+	assertNoError(t, err, "create the state directory: %v", err)
+	err = os.Chmod(state, 0o711)
+	assertNoError(t, err, "open the state directory to the traversal: %v", err)
 
 	// A plain directory inside the state directory. It exists already, so
 	// it belongs to whoever owns it: the account of the check cannot write
 	// into it, and the installation refuses it.
 	plain := filepath.Join(state, "models")
-	if err := os.Mkdir(plain, 0o700); err != nil {
-		t.Fatalf("create the plain directory: %v", err)
-	}
-	if err := os.Chmod(plain, 0o700); err != nil {
-		t.Fatalf("close the plain directory: %v", err)
-	}
+	err = os.Mkdir(plain, 0o700)
+	assertNoError(t, err, "create the plain directory: %v", err)
+	err = os.Chmod(plain, 0o700)
+	assertNoError(t, err, "close the plain directory: %v", err)
 
 	// A directory outside of the state directory that the account of the
 	// check cannot write into.
 	foreign := filepath.Join(root, "foreign")
-	if err := os.Mkdir(foreign, 0o700); err != nil {
-		t.Fatalf("create the foreign directory: %v", err)
-	}
-	if err := os.Chmod(foreign, 0o700); err != nil {
-		t.Fatalf("close the foreign directory: %v", err)
-	}
+	err = os.Mkdir(foreign, 0o700)
+	assertNoError(t, err, "create the foreign directory: %v", err)
+	err = os.Chmod(foreign, 0o700)
+	assertNoError(t, err, "close the foreign directory: %v", err)
 
 	// A directory outside of the state directory that every account can
 	// write into.
 	reachable := filepath.Join(root, "reachable")
-	if err := os.Mkdir(reachable, 0o777); err != nil {
-		t.Fatalf("create the reachable directory: %v", err)
-	}
-	if err := os.Chmod(reachable, 0o777); err != nil {
-		t.Fatalf("open the reachable directory: %v", err)
-	}
+	err = os.Mkdir(reachable, 0o777)
+	assertNoError(t, err, "create the reachable directory: %v", err)
+	err = os.Chmod(reachable, 0o777)
+	assertNoError(t, err, "open the reachable directory: %v", err)
 
 	// A link inside the state directory that points out of it.
 	outside := filepath.Join(state, "outside")
-	if err := os.Symlink(foreign, outside); err != nil {
-		t.Fatalf("create the link out of the state directory: %v", err)
-	}
+	err = os.Symlink(foreign, outside)
+	assertNoError(t, err, "create the link out of the state directory: %v", err)
 
 	// A link inside the state directory that points to a place the account
 	// of the check can reach.
 	inside := filepath.Join(state, "inside")
-	if err := os.Symlink(reachable, inside); err != nil {
-		t.Fatalf("create the link to the reachable directory: %v", err)
-	}
+	err = os.Symlink(reachable, inside)
+	assertNoError(t, err, "create the link to the reachable directory: %v", err)
 
 	// A directory inside the state directory that does not exist yet: the
 	// installation creates it below the state directory, and the account
@@ -2213,23 +2193,18 @@ func TestLaunchdCheckNamedDirsUsesTheRealLocationOfTheDirectory(t *testing.T) {
 		// directory inside it that does not exist yet is not checked
 		// against the account.
 		real := filepath.Join(root, "real-state")
-		if err := os.Mkdir(real, 0o700); err != nil {
-			t.Fatalf("create the real state directory: %v", err)
-		}
-		if err := os.Chmod(real, 0o700); err != nil {
-			t.Fatalf("close the real state directory: %v", err)
-		}
+		err := os.Mkdir(real, 0o700)
+		assertNoError(t, err, "create the real state directory: %v", err)
+		err = os.Chmod(real, 0o700)
+		assertNoError(t, err, "close the real state directory: %v", err)
 		models := filepath.Join(real, "models")
-		if err := os.Mkdir(models, 0o700); err != nil {
-			t.Fatalf("create the models directory: %v", err)
-		}
-		if err := os.Chmod(models, 0o700); err != nil {
-			t.Fatalf("close the models directory: %v", err)
-		}
+		err = os.Mkdir(models, 0o700)
+		assertNoError(t, err, "create the models directory: %v", err)
+		err = os.Chmod(models, 0o700)
+		assertNoError(t, err, "close the models directory: %v", err)
 		link := filepath.Join(root, "state-link")
-		if err := os.Symlink(real, link); err != nil {
-			t.Fatalf("create the link of the state directory: %v", err)
-		}
+		err = os.Symlink(real, link)
+		assertNoError(t, err, "create the link of the state directory: %v", err)
 
 		opts.Paths.StateDir = link
 
@@ -2281,12 +2256,10 @@ func TestLaunchdCheckNamedDirsChecksAnExistingDirectoryInsideTheStateRoot(t *tes
 	// the account, so the account passes through it: the mode leaves the
 	// traversal to every account.
 	state := filepath.Join(root, "state")
-	if err := os.Mkdir(state, 0o711); err != nil {
-		t.Fatalf("create the state directory: %v", err)
-	}
-	if err := os.Chmod(state, 0o711); err != nil {
-		t.Fatalf("open the state directory to the traversal: %v", err)
-	}
+	err := os.Mkdir(state, 0o711)
+	assertNoError(t, err, "create the state directory: %v", err)
+	err = os.Chmod(state, 0o711)
+	assertNoError(t, err, "open the state directory to the traversal: %v", err)
 
 	// A named directory inside the state directory that does not exist
 	// yet: the service creates it below the state directory, and the
@@ -2297,22 +2270,18 @@ func TestLaunchdCheckNamedDirsChecksAnExistingDirectoryInsideTheStateRoot(t *tes
 	// the account cannot write into: it belongs to the user of the test
 	// and to nobody else.
 	closed := filepath.Join(state, "closed")
-	if err := os.Mkdir(closed, 0o700); err != nil {
-		t.Fatalf("create the closed directory: %v", err)
-	}
-	if err := os.Chmod(closed, 0o700); err != nil {
-		t.Fatalf("close the closed directory: %v", err)
-	}
+	err = os.Mkdir(closed, 0o700)
+	assertNoError(t, err, "create the closed directory: %v", err)
+	err = os.Chmod(closed, 0o700)
+	assertNoError(t, err, "close the closed directory: %v", err)
 
 	// A named directory inside the state directory that exists and that
 	// the account can write into.
 	open := filepath.Join(state, "open")
-	if err := os.Mkdir(open, 0o777); err != nil {
-		t.Fatalf("create the open directory: %v", err)
-	}
-	if err := os.Chmod(open, 0o777); err != nil {
-		t.Fatalf("open the open directory: %v", err)
-	}
+	err = os.Mkdir(open, 0o777)
+	assertNoError(t, err, "create the open directory: %v", err)
+	err = os.Chmod(open, 0o777)
+	assertNoError(t, err, "open the open directory: %v", err)
 
 	// A named directory outside of the state directory that does not
 	// exist yet: the account has to create it below the scratch
@@ -2320,26 +2289,22 @@ func TestLaunchdCheckNamedDirsChecksAnExistingDirectoryInsideTheStateRoot(t *tes
 	outsideMissing := filepath.Join(root, "outside-missing")
 
 	foreign := filepath.Join(root, "foreign")
-	if err := os.Mkdir(foreign, 0o700); err != nil {
-		t.Fatalf("create the foreign directory: %v", err)
-	}
-	if err := os.Chmod(foreign, 0o700); err != nil {
-		t.Fatalf("close the foreign directory: %v", err)
-	}
+	err = os.Mkdir(foreign, 0o700)
+	assertNoError(t, err, "create the foreign directory: %v", err)
+	err = os.Chmod(foreign, 0o700)
+	assertNoError(t, err, "close the foreign directory: %v", err)
 
 	// A link inside the state directory that points out of it, to a
 	// directory that exists.
 	outside := filepath.Join(state, "outside")
-	if err := os.Symlink(foreign, outside); err != nil {
-		t.Fatalf("create the link out of the state directory: %v", err)
-	}
+	err = os.Symlink(foreign, outside)
+	assertNoError(t, err, "create the link out of the state directory: %v", err)
 
 	// A link inside the state directory that points out of it, to a
 	// directory that does not exist yet.
 	outsideMissingLink := filepath.Join(state, "outside-missing")
-	if err := os.Symlink(outsideMissing, outsideMissingLink); err != nil {
-		t.Fatalf("create the link to the missing directory: %v", err)
-	}
+	err = os.Symlink(outsideMissing, outsideMissingLink)
+	assertNoError(t, err, "create the link to the missing directory: %v", err)
 
 	launchd := &launchdManager{scope: ScopeSystem}
 	opts := InstallOptions{
@@ -2403,9 +2368,8 @@ func TestLaunchdAccessCheckUsesTheEffectivePermission(t *testing.T) {
 	// The group of the directories of the test is the group of the test
 	// process, so the other identity reaches them through the group.
 	probe := filepath.Join(root, "probe")
-	if err := os.Mkdir(probe, 0o700); err != nil {
-		t.Fatalf("create the probe directory: %v", err)
-	}
+	err := os.Mkdir(probe, 0o700)
+	assertNoError(t, err, "create the probe directory: %v", err)
 	_, group := darwinOwner(t, probe)
 
 	// The owner of the test is the account of the test process.
@@ -2484,12 +2448,10 @@ func TestLaunchdAccessCheckUsesTheEffectivePermission(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := filepath.Join(root, tc.dir)
-			if err := os.Mkdir(dir, 0o700); err != nil {
-				t.Fatalf("create the directory: %v", err)
-			}
-			if err := os.Chmod(dir, tc.mode); err != nil {
-				t.Fatalf("set the mode of the directory: %v", err)
-			}
+			err := os.Mkdir(dir, 0o700)
+			assertNoError(t, err, "create the directory: %v", err)
+			err = os.Chmod(dir, tc.mode)
+			assertNoError(t, err, "set the mode of the directory: %v", err)
 			ok, err := accountCanWrite(dir, tc.account)
 			if tc.wantErr {
 				if ok {
@@ -2505,22 +2467,18 @@ func TestLaunchdAccessCheckUsesTheEffectivePermission(t *testing.T) {
 
 	t.Run("a directory below a parent without the execute permission", func(t *testing.T) {
 		parent := filepath.Join(root, "closed-parent")
-		if err := os.Mkdir(parent, 0o700); err != nil {
-			t.Fatalf("create the parent directory: %v", err)
-		}
+		err := os.Mkdir(parent, 0o700)
+		assertNoError(t, err, "create the parent directory: %v", err)
 		child := filepath.Join(parent, "child")
-		if err := os.Mkdir(child, 0o700); err != nil {
-			t.Fatalf("create the child directory: %v", err)
-		}
+		err = os.Mkdir(child, 0o700)
+		assertNoError(t, err, "create the child directory: %v", err)
 		// The group of the child directory is the group of the
 		// account, so the account could use it if it could reach it.
-		if err := os.Chmod(child, 0o770); err != nil {
-			t.Fatalf("make the child directory usable: %v", err)
-		}
+		err = os.Chmod(child, 0o770)
+		assertNoError(t, err, "make the child directory usable: %v", err)
 		// The parent is closed for everybody but its owner.
-		if err := os.Chmod(parent, 0o700); err != nil {
-			t.Fatalf("close the parent directory: %v", err)
-		}
+		err = os.Chmod(parent, 0o700)
+		assertNoError(t, err, "close the parent directory: %v", err)
 		ok, err := accountCanWrite(child, other)
 		if ok {
 			t.Error("accountCanWrite() = true, want the refusal of a directory the account cannot reach")
@@ -2545,14 +2503,12 @@ func TestLaunchdAccessCheckUsesTheSupplementaryGroups(t *testing.T) {
 	root := darwinScratchDir(t)
 
 	dir := filepath.Join(root, "supplementary")
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Fatalf("create the directory: %v", err)
-	}
+	err := os.Mkdir(dir, 0o700)
+	assertNoError(t, err, "create the directory: %v", err)
 	// The directory belongs to the supplementary group of the account, not
 	// to the account itself.
-	if err := os.Chown(dir, os.Getuid(), supplementary); err != nil {
-		t.Fatalf("give the directory to the group %d: %v", supplementary, err)
-	}
+	err = os.Chown(dir, os.Getuid(), supplementary)
+	assertNoError(t, err, "give the directory to the group %d: %v", supplementary, err)
 
 	account := &serviceAccount{
 		Name:   "hfdesk-access-test",
@@ -2568,9 +2524,8 @@ func TestLaunchdAccessCheckUsesTheSupplementaryGroups(t *testing.T) {
 
 	// The group permissions apply to the account: it can create entries
 	// in the directory and it can reach it.
-	if err := os.Chmod(dir, 0o770); err != nil {
-		t.Fatalf("make the directory usable: %v", err)
-	}
+	err = os.Chmod(dir, 0o770)
+	assertNoError(t, err, "make the directory usable: %v", err)
 	allowed, err := accountCanWrite(dir, account)
 	if !allowed {
 		t.Errorf("accountCanWrite() = false (%v), want true for a directory of the supplementary group of the account", err)
@@ -3036,9 +2991,8 @@ func TestLaunchdFailedInstallKeepsADirectoryThatExistedBefore(t *testing.T) {
 
 	// The config directory existed before the installation.
 	config := filepath.Join(root, "etc")
-	if err := os.Mkdir(config, 0o750); err != nil {
-		t.Fatalf("create the config directory: %v", err)
-	}
+	err := os.Mkdir(config, 0o750)
+	assertNoError(t, err, "create the config directory: %v", err)
 	owner, group := darwinOwner(t, config)
 
 	opts := darwinTempInstallOptions(t, root)
@@ -3173,9 +3127,7 @@ func TestLaunchdSuccessfulInstallKeepsItsDirectories(t *testing.T) {
 	opts := darwinTempInstallOptions(t, root)
 	m := darwinStatusManager(t)
 	installed, err := m.Install(context.Background(), opts)
-	if err != nil {
-		t.Fatalf("Install() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Install() = %v, want nil", err)
 	// Finding 3: the first installation created the registration — the
 	// result every platform reports.
 	if !installed.Created {
@@ -3659,12 +3611,10 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 	writeRegistration := func(t *testing.T, launchd *launchdManager) (*plistBackup, string) {
 		t.Helper()
 		path := launchd.plistPath()
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			t.Fatalf("create the registration directory: %v", err)
-		}
-		if err := os.WriteFile(path, []byte(previous), plistMode); err != nil {
-			t.Fatalf("write the registration: %v", err)
-		}
+		err := os.MkdirAll(filepath.Dir(path), 0o755)
+		assertNoError(t, err, "create the registration directory: %v", err)
+		err = os.WriteFile(path, []byte(previous), plistMode)
+		assertNoError(t, err, "write the registration: %v", err)
 		backup, err := backupPlist(path)
 		assertNoError(t, err, "backupPlist(): %v", err)
 		// The installation wrote another registration and failed.
@@ -4096,9 +4046,7 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 		}
 		// The property list is restored even then.
 		content, readErr := os.ReadFile(path)
-		if readErr != nil {
-			t.Fatalf("read the registration: %v", readErr)
-		}
+		assertNoError(t, readErr, "read the registration: %v", readErr)
 		if string(content) != previous {
 			t.Errorf("the restored registration = %q, want %q", content, previous)
 		}
@@ -4204,9 +4152,7 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			t.Errorf("rollback() = %v, want no restoration claim without a captured state", err)
 		}
 		content, readErr := os.ReadFile(path)
-		if readErr != nil {
-			t.Fatalf("read the registration: %v", readErr)
-		}
+		assertNoError(t, readErr, "read the registration: %v", readErr)
 		if string(content) != previous {
 			t.Errorf("the restored registration = %q, want %q", content, previous)
 		}
@@ -4411,14 +4357,12 @@ func TestLaunchdRepeatInstallKeepsTheSettingsTheRequestDoesNotName(t *testing.T)
 	first.CacheDir = filepath.Join(t.TempDir(), "cache")
 	first.HubDir = filepath.Join(first.CacheDir, "hub")
 	first.LocalDir = filepath.Join(t.TempDir(), "models")
-	if _, err := launchd.Install(ctx, first); err != nil {
-		t.Fatalf("Install(): %v", err)
-	}
+	_, err := launchd.Install(ctx, first)
+	assertNoError(t, err, "Install(): %v", err)
 	// The instance stops again, so the update below is an update over a
 	// stopped registration.
-	if err := launchd.Stop(ctx); err != nil {
-		t.Fatalf("Stop(): %v", err)
-	}
+	err = launchd.Stop(ctx)
+	assertNoError(t, err, "Stop(): %v", err)
 
 	// The second installation names the bind address and the program only.
 	// Its own values for the paths and the cache layout are request
@@ -4879,11 +4823,7 @@ func TestLaunchdSupervisorStateFailsClosedOnAnUnreadableEnablement(t *testing.T)
 	if err == nil {
 		t.Fatal("supervisorState() = nil, want the read error of an unknown enablement state")
 	}
-	for _, want := range []string{"print-disabled", "the override database cannot be read"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("supervisorState() = %q, want an error that mentions %q", err, want)
-		}
-	}
+	assertNames(t, err.Error(), "supervisorState()", []string{"print-disabled", "the override database cannot be read"})
 }
 
 // TestLaunchdRefusesAnUnknownRunningFactOverALoadedJobWithoutAFile pins the
@@ -4963,17 +4903,15 @@ func TestLaunchdRefusesAnUnknownRunningFactOverALoadedJobWithoutAFile(t *testing
 	// loaded, so the retry refused again — and the retry after it
 	// installs as the message promises.
 	fake.commands = nil
-	if err := launchd.Stop(ctx); err != nil {
-		t.Fatalf("the named action Stop() = %v, want the loaded job unloaded", err)
-	}
+	err := launchd.Stop(ctx)
+	assertNoError(t, err, "the named action Stop() = %v, want the loaded job unloaded", err)
 	if fake.loaded {
 		t.Errorf("Stop() left the loaded job behind: commands %v", fake.commands)
 	}
 
 	fake.commands = nil
-	if _, err := launchd.Install(ctx, program); err != nil {
-		t.Fatalf("the retry after the named action = %v, want the successful installation", err)
-	}
+	_, err = launchd.Install(ctx, program)
+	assertNoError(t, err, "the retry after the named action = %v, want the successful installation", err)
 	if _, err := os.Stat(launchd.plistPath()); err != nil {
 		t.Errorf("the retried installation wrote no property list: %v", err)
 	}
@@ -5330,9 +5268,8 @@ func TestLaunchdUninstallOverALoadedJobWithoutAFile(t *testing.T) {
 		launchd.run = fake.run
 
 		fake.commands = nil
-		if err := launchd.Uninstall(context.Background()); err != nil {
-			t.Fatalf("Uninstall() over a loaded job without a property list: %v", err)
-		}
+		err := launchd.Uninstall(context.Background())
+		assertNoError(t, err, "Uninstall() over a loaded job without a property list: %v", err)
 		want := []string{
 			"print " + launchd.target(),
 			"bootout " + launchd.target(),
@@ -5446,9 +5383,8 @@ func TestLaunchdStopDrainsAnUnknownRunningFact(t *testing.T) {
 		launchd.run = fake.run
 
 		fake.commands = nil
-		if err := launchd.Stop(context.Background()); err != nil {
-			t.Fatalf("Stop() over a known not-running instance: %v", err)
-		}
+		err := launchd.Stop(context.Background())
+		assertNoError(t, err, "Stop() over a known not-running instance: %v", err)
 		// One wait answer, no blind polls: the known fact decides
 		// immediately.
 		want := []string{
@@ -5597,30 +5533,25 @@ func TestLaunchdRepeatInstallKeepsTheDataDirectories(t *testing.T) {
 	opts.LocalDir = filepath.Join(root, "models")
 	// The data of the instance exists before the installations: the local
 	// directory holds a model, the state directory holds the history.
-	if err := os.MkdirAll(opts.LocalDir, 0o755); err != nil {
-		t.Fatalf("create the local directory: %v", err)
-	}
+	err := os.MkdirAll(opts.LocalDir, 0o755)
+	assertNoError(t, err, "create the local directory: %v", err)
 	model := filepath.Join(opts.LocalDir, "model.gguf")
-	if err := os.WriteFile(model, []byte("model bytes"), 0o644); err != nil {
-		t.Fatalf("write the model: %v", err)
-	}
+	err = os.WriteFile(model, []byte("model bytes"), 0o644)
+	assertNoError(t, err, "write the model: %v", err)
 	cacheOwner, cacheGroup := darwinOwner(t, opts.LocalDir)
 
-	if _, err := launchd.Install(ctx, opts); err != nil {
-		t.Fatalf("Install(): %v", err)
-	}
+	_, err = launchd.Install(ctx, opts)
+	assertNoError(t, err, "Install(): %v", err)
 	history := filepath.Join(opts.Paths.StateDir, "history.json")
-	if err := os.WriteFile(history, []byte(`[{"id":"kept"}]`), 0o600); err != nil {
-		t.Fatalf("write the history: %v", err)
-	}
+	err = os.WriteFile(history, []byte(`[{"id":"kept"}]`), 0o600)
+	assertNoError(t, err, "write the history: %v", err)
 
 	// The update names the bind address only.
 	update := opts
 	update.Listen = "127.0.0.1:9911"
 	update.Explicit.Listen = true
-	if _, err := launchd.Install(ctx, update); err != nil {
-		t.Fatalf("Install() a second time: %v", err)
-	}
+	_, err = launchd.Install(ctx, update)
+	assertNoError(t, err, "Install() a second time: %v", err)
 
 	content, err := os.ReadFile(model)
 	if err != nil {

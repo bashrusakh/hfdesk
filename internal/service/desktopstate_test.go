@@ -75,9 +75,8 @@ func TestReadPublishedStateToleratesAMissingOrBrokenFile(t *testing.T) {
 // instance ends.
 func TestRemovePublishedState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "desktop-state.json")
-	if err := PublishState(path, "http://127.0.0.1:8080"); err != nil {
-		t.Fatalf("publish the state: %v", err)
-	}
+	err := PublishState(path, "http://127.0.0.1:8080")
+	assertNoError(t, err, "publish the state: %v", err)
 
 	RemovePublishedState(path)
 

@@ -152,15 +152,12 @@ func TestHandoverEventsAreUniqueNonsignaledAndRestricted(t *testing.T) {
 func TestWaitForHelperReadyRequiresLiveHelper(t *testing.T) {
 	helper := testEvent(t)
 	ready := testEvent(t)
-	if err := windows.SetEvent(ready); err != nil {
-		t.Fatalf("signal helper readiness: %v", err)
-	}
-	if err := waitForHelperReady(helper, ready, time.Second); err != nil {
-		t.Fatalf("a live ready helper was rejected: %v", err)
-	}
-	if err := windows.SetEvent(helper); err != nil {
-		t.Fatalf("signal helper exit: %v", err)
-	}
+	err := windows.SetEvent(ready)
+	assertNoError(t, err, "signal helper readiness: %v", err)
+	err = waitForHelperReady(helper, ready, time.Second)
+	assertNoError(t, err, "a live ready helper was rejected: %v", err)
+	err = windows.SetEvent(helper)
+	assertNoError(t, err, "signal helper exit: %v", err)
 	if err := waitForHelperReady(helper, ready, time.Second); err == nil {
 		t.Fatal("simultaneous ready and helper exit authorized shutdown")
 	}
@@ -213,9 +210,8 @@ func TestOnlySuccessfulCompletionSignalsTheHelper(t *testing.T) {
 	if result, err := windows.WaitForSingleObject(success, 0); err != nil || result != uint32(windows.WAIT_TIMEOUT) {
 		t.Fatalf("failed completion signaled success: result=%#x err=%v", result, err)
 	}
-	if err := windows.SetEvent(helper); err != nil {
-		t.Fatalf("signal early helper exit: %v", err)
-	}
+	err := windows.SetEvent(helper)
+	assertNoError(t, err, "signal early helper exit: %v", err)
 	if err := authorizeHandoverCompletion(func() error { return nil }, helper, success, confirmed); err == nil {
 		t.Fatal("an exited helper was treated as waiting for success")
 	}
@@ -223,12 +219,10 @@ func TestOnlySuccessfulCompletionSignalsTheHelper(t *testing.T) {
 		t.Fatalf("early helper exit signaled success: result=%#x err=%v", result, err)
 	}
 	liveHelper, liveConfirmed := testEvent(t), testEvent(t)
-	if err := windows.SetEvent(liveConfirmed); err != nil {
-		t.Fatalf("preset the acknowledgment of the live helper: %v", err)
-	}
-	if err := authorizeHandoverCompletion(func() error { return nil }, liveHelper, success, liveConfirmed); err != nil {
-		t.Fatalf("successful completion did not authorize the live helper: %v", err)
-	}
+	err = windows.SetEvent(liveConfirmed)
+	assertNoError(t, err, "preset the acknowledgment of the live helper: %v", err)
+	err = authorizeHandoverCompletion(func() error { return nil }, liveHelper, success, liveConfirmed)
+	assertNoError(t, err, "successful completion did not authorize the live helper: %v", err)
 	if result, err := windows.WaitForSingleObject(success, 0); err != nil || result != windows.WAIT_OBJECT_0 {
 		t.Fatalf("successful completion did not signal the helper: result=%#x err=%v", result, err)
 	}
@@ -279,14 +273,10 @@ func TestHandoverAuthorizationNeedsTheConfirmationOfTheHelper(t *testing.T) {
 		if err == nil {
 			t.Fatal("authorizeHandoverCompletion() = nil, want the unconfirmed authorization to be reported")
 		}
-		for _, want := range []string{
+		assertNames(t, err.Error(), "the report", []string{
 			"did not confirm the installation authorization",
 			"the installation was not started",
-		} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("the report %q does not mention %q", err, want)
-			}
-		}
+		})
 		// The give-up withdraws the evidence together with its report:
 		// no helper can consume the standing authorization after the
 		// desktop declared that the installation was not started.
@@ -303,9 +293,8 @@ func TestHandoverAuthorizationNeedsTheConfirmationOfTheHelper(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 			_ = windows.SetEvent(confirmed)
 		}()
-		if err := authorizeHandoverCompletion(func() error { return nil }, helper, success, confirmed); err != nil {
-			t.Fatalf("authorizeHandoverCompletion() = %v, want the acknowledged authorization to settle", err)
-		}
+		err := authorizeHandoverCompletion(func() error { return nil }, helper, success, confirmed)
+		assertNoError(t, err, "authorizeHandoverCompletion() = %v, want the acknowledged authorization to settle", err)
 		<-acknowledged
 	})
 
@@ -422,11 +411,7 @@ func TestWithdrawnHandoverAuthorizationCannotInstallALateHelper(t *testing.T) {
 		if err == nil {
 			t.Fatal("the helper installed from an authorization the desktop had withdrawn")
 		}
-		for _, want := range []string{"authorization withdrawn", "the installation was not started"} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("the refusal %q does not mention %q", err, want)
-			}
-		}
+		assertNames(t, err.Error(), "the refusal", []string{"authorization withdrawn", "the installation was not started"})
 	})
 }
 
@@ -521,9 +506,8 @@ func TestProcessWaitUsesCurrentWindowsProcess(t *testing.T) {
 // success signal proceed while the modal box is still undismissed.
 func TestHandoverNoticeDoesNotHoldCompletionAuthorization(t *testing.T) {
 	confirmed := testEvent(t)
-	if err := windows.SetEvent(confirmed); err != nil {
-		t.Fatalf("preset the helper acknowledgment: %v", err)
-	}
+	err := windows.SetEvent(confirmed)
+	assertNoError(t, err, "preset the helper acknowledgment: %v", err)
 	handover := &desktopHandover{
 		events: &handoverEvents{ready: testEvent(t), success: testEvent(t), confirmed: confirmed},
 		helper: &elevatedProcess{handle: testEvent(t)},

@@ -171,9 +171,8 @@ func TestProbeServiceReadyAcceptsTheChallengeOfTheInstance(t *testing.T) {
 	defer instance.Close()
 	addr := instance.Listener.Addr().String()
 
-	if err := probeServiceReady(addr); err != nil {
-		t.Fatalf("probeServiceReady(%q) = %v, want nil for the challenge of the instance", addr, err)
-	}
+	err := probeServiceReady(addr)
+	assertNoError(t, err, "probeServiceReady(%q) = %v, want nil for the challenge of the instance", addr, err)
 	// The challenge carries no health document, so it proves readiness but no
 	// version.
 	if verified, err := probeServiceReadyForVersion(addr, "1.2.3"); err != nil || verified {
@@ -269,11 +268,7 @@ func TestProbeServiceReadyRejectsAServerThatIsNotTheInstance(t *testing.T) {
 			if err == nil {
 				t.Fatalf("probeServiceReady(%q) = nil, want the failure of an answer that is not the instance", server.Listener.Addr())
 			}
-			for _, want := range []string{"does not answer as the HFDesk server", tc.want} {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("probeServiceReady() = %q, want an error that mentions %q", err, want)
-				}
-			}
+			assertNames(t, err.Error(), "probeServiceReady()", []string{"does not answer as the HFDesk server", tc.want})
 		})
 	}
 }
@@ -303,11 +298,7 @@ func TestProbeServiceReadyDoesNotFollowARedirect(t *testing.T) {
 	if err == nil {
 		t.Fatalf("probeServiceReady(%q) = nil, want the failure of the redirect", foreign.Listener.Addr())
 	}
-	for _, want := range []string{"does not answer as the HFDesk server", "302"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("probeServiceReady() = %q, want an error that mentions %q", err, want)
-		}
-	}
+	assertNames(t, err.Error(), "probeServiceReady()", []string{"does not answer as the HFDesk server", "302"})
 	if got := targetRequests.Load(); got != 0 {
 		t.Errorf("the redirect target was requested %d times, want none", got)
 	}

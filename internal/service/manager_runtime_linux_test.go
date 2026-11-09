@@ -620,9 +620,8 @@ func TestSystemdCheckExecutableAccessUsesKernelPermissions(t *testing.T) {
 
 	root := t.TempDir()
 	executable := filepath.Join(root, "program")
-	if err := os.WriteFile(executable, []byte("fixture"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(executable, []byte("fixture"), 0o700)
+	assertNoError(t, err, "")
 	identity := currentExecutableAccessIdentity()
 	readOnlyDenial := executableAccessDenied
 	if os.Geteuid() == 0 {
@@ -640,9 +639,8 @@ func TestSystemdCheckExecutableAccessUsesKernelPermissions(t *testing.T) {
 		{"no execute permission", 0o600, executableAccessDenied, unix.X_OK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := os.Chmod(executable, tc.mode); err != nil {
-				t.Fatal(err)
-			}
+			err := os.Chmod(executable, tc.mode)
+			assertNoError(t, err, "")
 			got, err := checkExecutableAccess(context.Background(), executable, identity, tc.bits, "")
 			assertNoError(t, err, "")
 			if got != tc.want {
@@ -656,16 +654,13 @@ func TestSystemdCheckExecutableAccessUsesKernelPermissions(t *testing.T) {
 			t.Skip("root can bypass this DAC search denial")
 		}
 		parent := filepath.Join(root, "blocked")
-		if err := os.Mkdir(parent, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		err := os.Mkdir(parent, 0o700)
+		assertNoError(t, err, "")
 		blocked := filepath.Join(parent, "program")
-		if err := os.WriteFile(blocked, []byte("fixture"), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chmod(parent, 0o600); err != nil {
-			t.Fatal(err)
-		}
+		err = os.WriteFile(blocked, []byte("fixture"), 0o700)
+		assertNoError(t, err, "")
+		err = os.Chmod(parent, 0o600)
+		assertNoError(t, err, "")
 		got, err := checkExecutableAccess(context.Background(), blocked, identity, unix.X_OK, "")
 		assertNoError(t, err, "")
 		if got != executableAccessDenied {
@@ -677,13 +672,11 @@ func TestSystemdCheckExecutableAccessUsesKernelPermissions(t *testing.T) {
 	})
 
 	t.Run("symlink to executable", func(t *testing.T) {
-		if err := os.Chmod(executable, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		err := os.Chmod(executable, 0o700)
+		assertNoError(t, err, "")
 		link := filepath.Join(root, "program-link")
-		if err := os.Symlink(executable, link); err != nil {
-			t.Fatal(err)
-		}
+		err = os.Symlink(executable, link)
+		assertNoError(t, err, "")
 		got, err := checkExecutableAccess(context.Background(), link, identity, unix.X_OK, "")
 		assertNoError(t, err, "")
 		if got != executableAccessAllowed {
@@ -975,11 +968,7 @@ func TestSystemdPreflightUsesLoadedWorkingDirectoryForRelativeInterpreters(t *te
 			// The refusal names the interpreter as its cause and the
 			// one action path: grant the account access to it, then
 			// rerun the installation in this manager's scope.
-			for _, want := range []string{"names an interpreter the account", `run "hfdesk service install --user" again`} {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("the interpreter refusal %q does not mention %q", err, want)
-				}
-			}
+			assertNames(t, err.Error(), "the interpreter refusal", []string{"names an interpreter the account", `run "hfdesk service install --user" again`})
 			unknownCWD := systemdWorkingDirectoryForPreflight(opts, true, systemdLoadedConfig{}, false)
 			if unknownCWD != "" {
 				t.Fatalf("unavailable native WorkingDirectory = %q, want unknown", unknownCWD)
@@ -1023,9 +1012,7 @@ func TestSystemdInstallRefusesAnExecutableTheAccountCannotRun(t *testing.T) {
 	}
 
 	path, pathErr := m.unitPath()
-	if pathErr != nil {
-		t.Fatalf("unitPath() = %v, want nil", pathErr)
-	}
+	assertNoError(t, pathErr, "unitPath() = %v, want nil", pathErr)
 	if _, statErr := os.Stat(path); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Errorf("the refused installation wrote the unit file %q: %v", path, statErr)
 	}
@@ -1046,9 +1033,8 @@ func TestSystemdInstallRefusesAnExecutableTheAccountCannotRun(t *testing.T) {
 func writeBinfmtMiscState(t *testing.T, active bool) string {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "status"), []byte("enabled\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(filepath.Join(dir, "status"), []byte("enabled\n"), 0o600)
+	assertNoError(t, err, "")
 	if active {
 		err := os.WriteFile(filepath.Join(dir, "custom"), []byte("enabled\ninterpreter /usr/bin/qemu\n"), 0o600)
 		assertNoError(t, err, "")
@@ -1165,12 +1151,10 @@ func TestSystemdInterpreterPathsPreserveKernelSymlinkDotDotResolution(t *testing
 	makeInterpreterSymlinkTree(t, validRoot, "/bin/sh", false)
 	absoluteInterpreter := validRoot + "/via/../runner"
 	absoluteScript := filepath.Join(validRoot, "absolute-script")
-	if err := os.WriteFile(absoluteScript, []byte("#!"+absoluteInterpreter+"\nexit 0\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if out, err := exec.Command(absoluteScript).CombinedOutput(); err != nil {
-		t.Fatalf("kernel rejected valid absolute shebang path %q: %v: %s", absoluteInterpreter, err, out)
-	}
+	err := os.WriteFile(absoluteScript, []byte("#!"+absoluteInterpreter+"\nexit 0\n"), 0o700)
+	assertNoError(t, err, "")
+	out, err := exec.Command(absoluteScript).CombinedOutput()
+	assertNoError(t, err, "kernel rejected valid absolute shebang path %q: %v: %s", absoluteInterpreter, err, out)
 	inspection, err := inspectExecutable(absoluteScript, validRoot, linuxBinfmtMiscDirectory)
 	if err != nil || inspection.interpreter != absoluteInterpreter {
 		t.Fatalf("absolute shebang inspection = (%+v, %v), want raw path %q", inspection, err, absoluteInterpreter)
@@ -1424,13 +1408,11 @@ func assertSystemdInstallRefusedBeforeRestart(t *testing.T, candidate, workingDi
 		previous.Paths.StateDir = workingDirectory
 	}
 	manager, unitPath, previousUnit := systemdExistingInstallation(t, previous)
-	if err := os.MkdirAll(previous.Paths.StateDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(previous.Paths.StateDir, 0o700)
+	assertNoError(t, err, "")
 	stateSentinel := filepath.Join(previous.Paths.StateDir, "jobs_state.json")
-	if err := os.WriteFile(stateSentinel, []byte(`{"jobs":[{"id":"keep"}]}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	err = os.WriteFile(stateSentinel, []byte(`{"jobs":[{"id":"keep"}]}`), 0o600)
+	assertNoError(t, err, "")
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", candidate)
 	if _, err := manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, candidate)); err == nil {
@@ -1695,16 +1677,8 @@ func TestSystemdVerifyRejectsAnUnintendedWrappedCommand(t *testing.T) {
 			if err == nil {
 				t.Fatal("verifyRunningExecutable() = nil, want the wrapped command rejected")
 			}
-			for _, want := range append([]string{"does not run", executable}, tc.want...) {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("verification error = %q, want it to contain %q", err, want)
-				}
-			}
-			for _, not := range tc.wantNot {
-				if strings.Contains(err.Error(), not) {
-					t.Errorf("verification error = %q, want it not to contain %q", err, not)
-				}
-			}
+			assertNames(t, err.Error(), "verification error", append([]string{"does not run", executable}, tc.want...))
+			assertNamesWithout(t, err.Error(), "verification error", nil, tc.wantNot)
 		})
 	}
 }
@@ -1726,9 +1700,8 @@ func TestSystemdReadinessAcceptsLiveScriptWrapperWithHFDeskArgs(t *testing.T) {
 	args := append([]string{"-test.run=^TestSystemdRuntimeListenProcessFixture$"}, RunArgs(serviceOptions)...)
 	wrapper := filepath.Join(root, "hfdesk-wrapper")
 	script := "#!/bin/sh\n\"$@\" &\nchild=$!\ntrap 'kill \"$child\" 2>/dev/null || :; wait \"$child\" 2>/dev/null || :' TERM INT\nwait \"$child\"\n"
-	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(wrapper, []byte(script), 0o755)
+	assertNoError(t, err, "")
 	command := exec.Command(wrapper, append([]string{os.Args[0]}, args...)...)
 	command.Env = append(os.Environ(),
 		"HFDESK_TEST_SYSTEMD_RUNTIME_PROCESS_FIXTURE=1",
@@ -1737,9 +1710,8 @@ func TestSystemdReadinessAcceptsLiveScriptWrapperWithHFDeskArgs(t *testing.T) {
 	command.Stdout = io.Discard
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
-	if err := command.Start(); err != nil {
-		t.Fatalf("start the standalone wrapper process: %v", err)
-	}
+	err = command.Start()
+	assertNoError(t, err, "start the standalone wrapper process: %v", err)
 	done := make(chan struct{})
 	go func() {
 		_ = command.Wait()
@@ -1881,9 +1853,8 @@ func startSystemdServiceProcess(t *testing.T, options RunOptions, version string
 	cmd.Stdout = io.Discard
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start standalone HFDesk process: %v", err)
-	}
+	err := cmd.Start()
+	assertNoError(t, err, "start standalone HFDesk process: %v", err)
 	done := make(chan struct{})
 	var processErr error
 	go func() {

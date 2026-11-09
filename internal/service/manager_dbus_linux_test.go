@@ -507,16 +507,12 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 			"names no command",
 			"the refusal repeats until the ExecStart= override is removed",
 		})
-		for _, unwanted := range []string{
+		assertNamesWithout(t, err.Error(), "the refusal", nil, []string{
 			`Reload the unit files with`,
 			`run "hfdesk service install"`,
 			`Remove the "ExecStart=" override`,
 			" or ",
-		} {
-			if strings.Contains(err.Error(), unwanted) {
-				t.Errorf("the refusal %q names %q, want no command that cannot clear this state", err, unwanted)
-			}
-		}
+		})
 	})
 
 	t.Run("an unreadable drop-in beside a readable holder names no command", func(t *testing.T) {
@@ -549,16 +545,12 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 			"names no command",
 			"the refusal repeats until the ExecStart= override is removed",
 		})
-		for _, unwanted := range []string{
+		assertNamesWithout(t, err.Error(), "the refusal", nil, []string{
 			`Reload the unit files with`,
 			`run "hfdesk service install"`,
 			`Remove the "ExecStart=" override`,
 			" or ",
-		} {
-			if strings.Contains(err.Error(), unwanted) {
-				t.Errorf("the refusal %q names %q, want the honest terminal of this state", err, unwanted)
-			}
-		}
+		})
 	})
 
 	t.Run("a vanished drop-in beside a readable holder names the holder", func(t *testing.T) {
@@ -678,11 +670,7 @@ func TestSystemdDetectForeignRegistration(t *testing.T) {
 		if err == nil {
 			t.Fatal("detectForeignRegistration() = nil, want the refusal of a foreign fragment")
 		}
-		for _, want := range []string{fragment, unitPath} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("the refusal %q does not name %q", err, want)
-			}
-		}
+		assertNames(t, err.Error(), "the refusal", []string{fragment, unitPath})
 		// The fragment file exists: the action removes it, reloads the
 		// unit files (the supervisor holds the removed fragment until
 		// that reload) and only then retries the installation.
@@ -746,16 +734,12 @@ func assertNamesNoClearingCommand(t *testing.T, err error) {
 		"whatever loaded it must remove it",
 		"refuses again until the supervisor no longer loads it",
 	})
-	for _, unwanted := range []string{
+	assertNamesWithout(t, message, "the refusal", nil, []string{
 		"hfdesk service install",
 		"Move your customizations into",
 		"daemon-reload",
 		" or ",
-	} {
-		if strings.Contains(message, unwanted) {
-			t.Errorf("the refusal %q names %q, want no command for a state no command clears", message, unwanted)
-		}
-	}
+	})
 }
 
 // A fresh manager connection occasionally gets no reply at all, and that
@@ -804,9 +788,8 @@ func TestLoadedServicePropertiesRetriesALostReply(t *testing.T) {
 			return map[string]dbus.Variant{"Marker": dbus.MakeVariant("read")}, nil
 		}
 
-		if _, err := m.loadedServiceProperties(context.Background(), unitName); err != nil {
-			t.Fatalf("loadedServiceProperties() = %v, want nil", err)
-		}
+		_, err := m.loadedServiceProperties(context.Background(), unitName)
+		assertNoError(t, err, "loadedServiceProperties() = %v, want nil", err)
 		if calls != 1 {
 			t.Errorf("the healthy read was attempted %d times, want exactly one", calls)
 		}

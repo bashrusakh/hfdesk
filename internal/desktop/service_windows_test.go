@@ -1135,11 +1135,7 @@ func TestTrayServiceInstallReportsARefusedElevation(t *testing.T) {
 	if !strings.HasPrefix((*messages)[0].text, "HFDesk could not start its administrator helper.") {
 		t.Errorf("the message %q does not keep the report of a launch that never ran", (*messages)[0].text)
 	}
-	for _, want := range []string{elevationDeclined, "The service was not installed."} {
-		if !strings.Contains((*messages)[0].text, want) {
-			t.Errorf("the message %q does not mention %q", (*messages)[0].text, want)
-		}
-	}
+	assertNames(t, (*messages)[0].text, "the message", []string{elevationDeclined, "The service was not installed."})
 	if icon := (*messages)[0].icon; icon != windows.MB_ICONERROR {
 		t.Errorf("the icon of the message is %d, want the error icon %d", icon, windows.MB_ICONERROR)
 	}
@@ -1170,11 +1166,7 @@ func TestServiceHandoverFailureReportNamesTheStateCommand(t *testing.T) {
 		reason.Error(),
 		`"hfdesk service status"`,
 	})
-	for _, unwanted := range []string{"Read the current service state", "before trying again"} {
-		if strings.Contains(text, unwanted) {
-			t.Errorf("the report %q asks for %q without naming the command", text, unwanted)
-		}
-	}
+	assertNamesWithout(t, text, "the report", nil, []string{"Read the current service state", "before trying again"})
 }
 
 func TestTrayServiceInstallReadinessFailureKeepsRetryAvailable(t *testing.T) {
@@ -1511,11 +1503,7 @@ func TestServiceHelperUpdateKeepsARunningServiceRunning(t *testing.T) {
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the report of the update", len(*messages))
 	}
-	for _, want := range []string{"http://127.0.0.1:18080", "not needed to use the service"} {
-		if !strings.Contains((*messages)[0].text, want) {
-			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
-		}
-	}
+	assertNames(t, (*messages)[0].text, "the report", []string{"http://127.0.0.1:18080", "not needed to use the service"})
 }
 
 // TestServiceHelperRendersOnlyTheManagerVersionResult checks the desktop
@@ -1707,11 +1695,7 @@ func TestServiceHelperInstallStartsTheServiceAndReportsTheAddress(t *testing.T) 
 	if len(manager.steps) != 1 || manager.steps[0] != "install-start" {
 		t.Errorf("the helper steps are %v, want one service-owned install/start call", manager.steps)
 	}
-	for _, want := range []string{`C:\portable\hfdesk.exe`, "http://127.0.0.1:18080", "not needed to use the service"} {
-		if !strings.Contains((*messages)[0].text, want) {
-			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
-		}
-	}
+	assertNames(t, (*messages)[0].text, "the report", []string{`C:\portable\hfdesk.exe`, "http://127.0.0.1:18080", "not needed to use the service"})
 }
 
 func TestServiceHelperInstallReportsTheServiceOwnedCleanupResult(t *testing.T) {
@@ -1739,11 +1723,7 @@ func TestServiceHelperInstallReportsTheServiceOwnedCleanupResult(t *testing.T) {
 			if len(*messages) != 1 {
 				t.Fatalf("the helper showed %d message boxes, want one", len(*messages))
 			}
-			for _, want := range tc.want {
-				if !strings.Contains((*messages)[0].text, want) {
-					t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
-				}
-			}
+			assertNames(t, (*messages)[0].text, "the report", tc.want)
 		})
 	}
 }
@@ -1797,23 +1777,15 @@ func TestServiceHelperInstallReportsARegistrationConflictWithoutStatusLookup(t *
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the refusal of the existing registration", len(*messages))
 	}
-	for _, want := range []string{"already registered", "did not create, change or start it", "startup gate"} {
-		if !strings.Contains((*messages)[0].text, want) {
-			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
-		}
-	}
-	for _, unwanted := range []string{
+	assertNames(t, (*messages)[0].text, "the report", []string{"already registered", "did not create, change or start it", "startup gate"})
+	assertNamesWithout(t, (*messages)[0].text, "the report", nil, []string{
 		"A registration may remain",
 		`"hfdesk service uninstall"`,
 		// The startup gate is the single next action: the elevated
 		// installation command beside it would be a second route.
 		`"hfdesk service install"`,
 		"elevated shell",
-	} {
-		if strings.Contains((*messages)[0].text, unwanted) {
-			t.Errorf("the report %q carries %q although this attempt changed no registration", (*messages)[0].text, unwanted)
-		}
-	}
+	})
 }
 
 // TestHandoverFailureCarriesTheStateCommand pins the helper's handover
@@ -1919,11 +1891,7 @@ func TestServiceHelperKeepsAnUnconfirmedCleanupResult(t *testing.T) {
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the cleanup outcome", len(*messages))
 	}
-	for _, want := range []string{"could not be proven", "registration was kept", "service status"} {
-		if !strings.Contains((*messages)[0].text, want) {
-			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
-		}
-	}
+	assertNames(t, (*messages)[0].text, "the report", []string{"could not be proven", "registration was kept", "service status"})
 }
 
 // stubConsoleProgram points the console-program lookup at a real executable
@@ -2005,9 +1973,8 @@ func TestServiceHelperRejectsDesktopExitWithoutSuccessfulShutdown(t *testing.T) 
 	if result, err := windows.WaitForSingleObject(handover.ready, 2_000); err != nil || result != windows.WAIT_OBJECT_0 {
 		t.Fatalf("the helper did not signal ready: result=%#x err=%v", result, err)
 	}
-	if err := windows.SetEvent(handover.parent); err != nil {
-		t.Fatalf("signal desktop exit: %v", err)
-	}
+	err := windows.SetEvent(handover.parent)
+	assertNoError(t, err, "signal desktop exit: %v", err)
 	if err := <-done; err == nil {
 		t.Fatal("the installation succeeded although the desktop supplied no successful-shutdown signal")
 	}
@@ -2113,16 +2080,8 @@ func TestServiceHelperStartReportsTheRefusedStartAndTheStatusCommand(t *testing.
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the failure of the start", len(*messages))
 	}
-	for _, want := range []string{"the service control manager refused the start", "The start was not confirmed.", "hfdesk service status"} {
-		if !strings.Contains((*messages)[0].text, want) {
-			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
-		}
-	}
-	for _, unwanted := range []string{status.Executable, `NT AUTHORITY\LocalService`} {
-		if strings.Contains((*messages)[0].text, unwanted) {
-			t.Errorf("the report %q names %q, want no folder guidance on a registration that already ran", (*messages)[0].text, unwanted)
-		}
-	}
+	assertNames(t, (*messages)[0].text, "the report", []string{"the service control manager refused the start", "The start was not confirmed.", "hfdesk service status"})
+	assertNamesWithout(t, (*messages)[0].text, "the report", nil, []string{status.Executable, `NT AUTHORITY\LocalService`})
 }
 
 // TestServiceHelperInstallNamesTheEffectiveProgram proves that a failed
@@ -2147,11 +2106,7 @@ func TestServiceHelperInstallNamesTheEffectiveProgram(t *testing.T) {
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the failure of the installation", len(*messages))
 	}
-	for _, want := range []string{console, `NT AUTHORITY\LocalService`} {
-		if !strings.Contains((*messages)[0].text, want) {
-			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
-		}
-	}
+	assertNames(t, (*messages)[0].text, "the report", []string{console, `NT AUTHORITY\LocalService`})
 }
 
 // TestServiceHelperUpdateRefusesAMachineWithoutARegistration proves that an
@@ -2303,11 +2258,7 @@ func TestServiceHelperStartReportsTheAddress(t *testing.T) {
 	if caption := serviceStartedCaption; (*messages)[0].caption != caption {
 		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 	}
-	for _, want := range []string{"http://127.0.0.1:18080", `C:\portable\hfdesk.exe`, "not needed to use the service"} {
-		if !strings.Contains((*messages)[0].text, want) {
-			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
-		}
-	}
+	assertNames(t, (*messages)[0].text, "the report", []string{"http://127.0.0.1:18080", `C:\portable\hfdesk.exe`, "not needed to use the service"})
 }
 
 // TestServiceHelperSingletonArgumentRules proves the helper accepts exactly
@@ -2507,11 +2458,7 @@ func TestServiceHelperFailsWhenTheSingletonCannotBeHeld(t *testing.T) {
 			if caption := serviceFailureCaption(tc.action); (*messages)[0].caption != caption {
 				t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 			}
-			for _, want := range []string{tc.result, "No service action was performed", "hfdesk service status"} {
-				if !strings.Contains((*messages)[0].text, want) {
-					t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
-				}
-			}
+			assertNames(t, (*messages)[0].text, "the report", []string{tc.result, "No service action was performed", "hfdesk service status"})
 		})
 	}
 }
@@ -2634,11 +2581,7 @@ func TestServiceHelperRefusesAnIdentityThatCannotAccessTheSingleton(t *testing.T
 		t.Fatalf("the helper showed %d message boxes, want the refusal of the action", len(*messages))
 	}
 	text := (*messages)[0].text
-	for _, want := range []string{"No service action was performed", "end that process and try again"} {
-		if !strings.Contains(text, want) {
-			t.Errorf("the report %q does not mention %q", text, want)
-		}
-	}
+	assertNames(t, text, "the report", []string{"No service action was performed", "end that process and try again"})
 	if strings.Contains(text, "hfdesk service status") {
 		t.Errorf("the report %q carries a second next action next to the step of the identity refusal", text)
 	}
@@ -2880,11 +2823,7 @@ func TestServiceHelperUpdateRejectsAVanishedRegistration(t *testing.T) {
 	if caption := serviceFailureCaption(serviceActionUpdate); (*messages)[0].caption != caption {
 		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 	}
-	for _, want := range []string{"could not update", "registration of the service is gone", "hfdesk service status"} {
-		if !strings.Contains((*messages)[0].text, want) {
-			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
-		}
-	}
+	assertNames(t, (*messages)[0].text, "the report", []string{"could not update", "registration of the service is gone", "hfdesk service status"})
 }
 
 // TestServiceHelperStartRejectsAVanishedRegistration proves the same rule for
@@ -3110,11 +3049,7 @@ func TestServiceHelperInstallRejectsABadImageBeforeReady(t *testing.T) {
 			if caption := serviceFailureCaption(serviceActionInstall); (*messages)[0].caption != caption {
 				t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 			}
-			for _, want := range []string{"No service action was performed", tc.want} {
-				if !strings.Contains((*messages)[0].text, want) {
-					t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
-				}
-			}
+			assertNames(t, (*messages)[0].text, "the report", []string{"No service action was performed", tc.want})
 		})
 	}
 }
@@ -3174,9 +3109,8 @@ func TestServiceHelperInstallSignalsReadyAfterAPassedPreflight(t *testing.T) {
 func TestServiceHelperRefusesAStartBesideAServingDesktop(t *testing.T) {
 	requireFreeSingleton(t)
 	useTemporaryStateDir(t)
-	if err := service.PublishState(service.PublishedStatePath(), "http://127.0.0.1:1"); err != nil {
-		t.Fatalf("publish the state of the desktop instance: %v", err)
-	}
+	err := service.PublishState(service.PublishedStatePath(), "http://127.0.0.1:1")
+	assertNoError(t, err, "publish the state of the desktop instance: %v", err)
 
 	// The desktop instance of this session keeps the singleton held, so the
 	// probe around the hold of the action finds the object alive.
@@ -3226,9 +3160,8 @@ func TestServiceHelperRefusesAStartBesideAServingDesktop(t *testing.T) {
 func TestServiceHelperRefusesAnUpdateOfARunningServiceBesideAServingDesktop(t *testing.T) {
 	requireFreeSingleton(t)
 	useTemporaryStateDir(t)
-	if err := service.PublishState(service.PublishedStatePath(), "http://127.0.0.1:1"); err != nil {
-		t.Fatalf("publish the state of the desktop instance: %v", err)
-	}
+	err := service.PublishState(service.PublishedStatePath(), "http://127.0.0.1:1")
+	assertNoError(t, err, "publish the state of the desktop instance: %v", err)
 
 	lock, err := acquireInstanceLock()
 	assertNoError(t, err, "acquire the desktop singleton of this session: %v", err)
@@ -3279,9 +3212,8 @@ func TestServiceHelperRefusesAnUpdateOfARunningServiceBesideAServingDesktop(t *t
 func TestServiceHelperUpdateOfAStoppedServiceProceedsBesideAServingDesktop(t *testing.T) {
 	requireFreeSingleton(t)
 	useTemporaryStateDir(t)
-	if err := service.PublishState(service.PublishedStatePath(), "http://127.0.0.1:1"); err != nil {
-		t.Fatalf("publish the state of the desktop instance: %v", err)
-	}
+	err := service.PublishState(service.PublishedStatePath(), "http://127.0.0.1:1")
+	assertNoError(t, err, "publish the state of the desktop instance: %v", err)
 
 	// The desktop instance of this session keeps the singleton held, so the
 	// probe around the hold of the action finds the object alive: both
@@ -3301,9 +3233,7 @@ func TestServiceHelperUpdateOfAStoppedServiceProceedsBesideAServingDesktop(t *te
 
 	runErr := RunServiceAction(ServiceActionOptions{Action: "update"})
 	lock.Release()
-	if runErr != nil {
-		t.Fatalf("the rewrite of a stopped registration refused beside a serving desktop: %v", runErr)
-	}
+	assertNoError(t, runErr, "the rewrite of a stopped registration refused beside a serving desktop: %v", runErr)
 	if manager.starts != 0 {
 		t.Errorf("the rewrite started the service %d times, want none", manager.starts)
 	}

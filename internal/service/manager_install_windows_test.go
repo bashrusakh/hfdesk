@@ -476,13 +476,11 @@ func TestSCMDirectoryCleanupUsesProvenRegistrationOutcome(t *testing.T) {
 	}
 
 	dir := filepath.Join(t.TempDir(), "created-state")
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Fatalf("Mkdir(%q) = %v", dir, err)
-	}
+	err := os.Mkdir(dir, 0o700)
+	assertNoError(t, err, "Mkdir(%q) = %v", dir, err)
 	cleanupCreatedSCMInstallDirs([]string{dir}, scmRegisterResult{createdDirsSafeToRemove: false})
-	if _, err := os.Stat(dir); err != nil {
-		t.Fatalf("an unproven registration outcome removed %q: %v", dir, err)
-	}
+	_, err = os.Stat(dir)
+	assertNoError(t, err, "an unproven registration outcome removed %q: %v", dir, err)
 	cleanupCreatedSCMInstallDirs([]string{dir}, scmRegisterResult{createdDirsSafeToRemove: true})
 	if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("a proven-safe cleanup left %q in place: %v", dir, err)
@@ -584,9 +582,8 @@ func TestSCMFailedInstallKeepsADirectoryThatExistedBefore(t *testing.T) {
 	// The config directory of the instance existed before the
 	// installation as well.
 	configDir := filepath.Dir(opts.Paths.ConfigFile)
-	if err := os.MkdirAll(configDir, 0o750); err != nil {
-		t.Fatalf("MkdirAll(%q) = %v, want nil", configDir, err)
-	}
+	err := os.MkdirAll(configDir, 0o750)
+	assertNoError(t, err, "MkdirAll(%q) = %v, want nil", configDir, err)
 	// The directory has to be usable by the account of the instance:
 	// the installation refuses it otherwise, before it reaches the local
 	// directory.
@@ -645,17 +642,14 @@ func TestSCMFailedInstallKeepsADirectoryThatExistedBefore(t *testing.T) {
 func TestSCMRemoveCreatedDirsKeepsADirectoryThatHoldsData(t *testing.T) {
 	root := t.TempDir()
 	holding := filepath.Join(root, "holding")
-	if err := os.Mkdir(holding, 0o700); err != nil {
-		t.Fatalf("Mkdir() = %v, want nil", err)
-	}
+	err := os.Mkdir(holding, 0o700)
+	assertNoError(t, err, "Mkdir() = %v, want nil", err)
 	marker := filepath.Join(holding, "marker")
-	if err := os.WriteFile(marker, []byte("data"), 0o600); err != nil {
-		t.Fatalf("WriteFile() = %v, want nil", err)
-	}
+	err = os.WriteFile(marker, []byte("data"), 0o600)
+	assertNoError(t, err, "WriteFile() = %v, want nil", err)
 	empty := filepath.Join(root, "empty")
-	if err := os.Mkdir(empty, 0o700); err != nil {
-		t.Fatalf("Mkdir() = %v, want nil", err)
-	}
+	err = os.Mkdir(empty, 0o700)
+	assertNoError(t, err, "Mkdir() = %v, want nil", err)
 
 	removeCreatedDirs([]string{holding, empty})
 
@@ -1475,11 +1469,7 @@ func TestSCMFailedUpdateConfigRestoresThePreviousConfiguration(t *testing.T) {
 			if !errors.Is(err, updateErr) {
 				t.Errorf("updateRegistrationConfig() = %v, want the original failure wrapped", err)
 			}
-			for _, want := range tc.want {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("updateRegistrationConfig() = %q, want it to mention %q", err, want)
-				}
-			}
+			assertNames(t, err.Error(), "updateRegistrationConfig()", tc.want)
 			if tc.wantUnproven && strings.Contains(err.Error(), "was restored") {
 				t.Errorf("updateRegistrationConfig() = %q, want no claim that the configuration was restored", err)
 			}

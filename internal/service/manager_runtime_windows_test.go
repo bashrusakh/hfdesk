@@ -199,11 +199,7 @@ func TestSCMVerifyRunningExecutableKeepsTheProbeCause(t *testing.T) {
 	if check != scmImageVerified || verified {
 		t.Errorf("verifyRunningExecutableVersion() = %d, %t, want verified image evidence and no version claim", check, verified)
 	}
-	for _, want := range []string{listen, probeErr.Error()} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("verifyRunningExecutableVersion() = %q, want an error that mentions %q", err, want)
-		}
-	}
+	assertNames(t, err.Error(), "verifyRunningExecutableVersion()", []string{listen, probeErr.Error()})
 }
 
 // TestSCMProcessExcluded checks the decision that keeps a process of the failed

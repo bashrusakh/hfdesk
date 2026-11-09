@@ -85,9 +85,8 @@ func TestCompleteHandoverFencesAndDrainsAdmittedSettings(t *testing.T) {
 	if response := <-first; !strings.Contains(response.Body.String(), "skipped") {
 		t.Fatalf("superseded admitted request = %s", response.Body.String())
 	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
+	err := <-done
+	assertNoError(t, err, "")
 	file, err := LoadConfigFile()
 	if err != nil || file.Connections != 13 || file.MaxActive != 17 || file.Token != "hf_admitted" {
 		t.Fatalf("latest admitted settings snapshot = %+v, %v", file, err)
@@ -106,12 +105,10 @@ func TestCompleteHandoverDoesNotAdmitAnUnvalidatedBody(t *testing.T) {
 		s.handleUpdateSettings(w, httptest.NewRequest(http.MethodPost, "/api/settings", reader))
 		response <- w
 	}()
-	if _, err := io.WriteString(writer, `{"connections":`); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.CompleteHandover(); err != nil {
-		t.Fatalf("handover waited for body validation: %v", err)
-	}
+	_, err := io.WriteString(writer, `{"connections":`)
+	assertNoError(t, err, "")
+	err = s.CompleteHandover()
+	assertNoError(t, err, "handover waited for body validation: %v", err)
 	_, _ = io.WriteString(writer, `19}`)
 	_ = writer.Close()
 	if w := <-response; w.Code != http.StatusServiceUnavailable {
@@ -326,4 +323,27 @@ func assertNoError(t *testing.T, err error, format string, a ...any) {
 		return
 	}
 	t.Fatalf(format, a...)
+}
+
+// assertNames proves that a message names every fragment of the standard
+// the test pins, one diagnostic per missing fragment.
+func assertNames(t *testing.T, message, context string, wants []string) {
+	t.Helper()
+	for _, want := range wants {
+		if !strings.Contains(message, want) {
+			t.Errorf("%s = %q, want a message that mentions %q", context, message, want)
+		}
+	}
+}
+
+// assertNamesWithout proves the named fragments AND the absent ones: the
+// message keeps its standard and offers no second route.
+func assertNamesWithout(t *testing.T, message, context string, wants, forbidden []string) {
+	t.Helper()
+	assertNames(t, message, context, wants)
+	for _, unwanted := range forbidden {
+		if strings.Contains(message, unwanted) {
+			t.Errorf("%s = %q, must not mention %q", context, message, unwanted)
+		}
+	}
 }

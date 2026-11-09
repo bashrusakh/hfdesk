@@ -63,9 +63,8 @@ func TestSubsystemReadsThePE32PlusOptionalHeader(t *testing.T) {
 func TestSubsystemReadsTheFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hfdesk.exe")
 	image := buildPEImage(SubsystemWindowsCUI, magicPE32Plus, testOptionalHeaderSize64)
-	if err := os.WriteFile(path, image, 0o600); err != nil {
-		t.Fatalf("write the image: %v", err)
-	}
+	err := os.WriteFile(path, image, 0o600)
+	assertNoError(t, err, "write the image: %v", err)
 
 	subsystem, err := Subsystem(path)
 	assertNoError(t, err, "Subsystem: %v", err)
@@ -200,9 +199,8 @@ func TestMachineReadsTheCOFFHeader(t *testing.T) {
 func TestMachineReadsTheFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hfdesk.exe")
 	image := buildPEImageWithMachine(SubsystemWindowsCUI, magicPE32Plus, testOptionalHeaderSize64, MachineAMD64)
-	if err := os.WriteFile(path, image, 0o600); err != nil {
-		t.Fatalf("write the image: %v", err)
-	}
+	err := os.WriteFile(path, image, 0o600)
+	assertNoError(t, err, "write the image: %v", err)
 
 	machine, err := Machine(path)
 	assertNoError(t, err, "Machine: %v", err)

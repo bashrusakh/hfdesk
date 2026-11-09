@@ -328,12 +328,10 @@ func TestValidateInstallOptionsAcceptsValidInstallation(t *testing.T) {
 func TestValidateInstallOptionsRejectsInvalidInstallation(t *testing.T) {
 	root := t.TempDir()
 	executable := filepath.Join(root, "bin", "hfdesk")
-	if err := os.MkdirAll(filepath.Dir(executable), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(filepath.Dir(executable), 0o755)
+	assertNoError(t, err, "")
+	err = os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 
 	valid := func() InstallOptions {
 		return InstallOptions{
@@ -404,9 +402,8 @@ func TestPrepareDirsCreatesOwnedDirectories(t *testing.T) {
 			LogDir:     logDir,
 		},
 	}
-	if err := PrepareDirs(opts); err != nil {
-		t.Fatalf("PrepareDirs() = %v, want nil", err)
-	}
+	err := PrepareDirs(opts)
+	assertNoError(t, err, "PrepareDirs() = %v, want nil", err)
 
 	for _, dir := range []string{configDir, stateDir, logDir} {
 		info, err := os.Stat(dir)
@@ -438,12 +435,10 @@ func TestPrepareDirsLeavesTheModeOfAnExistingDirectoryAlone(t *testing.T) {
 
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "var")
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(stateDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(stateDir, 0o755)
+	assertNoError(t, err, "")
+	err = os.Chmod(stateDir, 0o755)
+	assertNoError(t, err, "")
 
 	opts := InstallOptions{
 		Paths: runtimepaths.Paths{
@@ -452,9 +447,8 @@ func TestPrepareDirsLeavesTheModeOfAnExistingDirectoryAlone(t *testing.T) {
 			LogDir:     filepath.Join(root, "logs"),
 		},
 	}
-	if err := PrepareDirs(opts); err != nil {
-		t.Fatalf("PrepareDirs() = %v, want nil", err)
-	}
+	err = PrepareDirs(opts)
+	assertNoError(t, err, "PrepareDirs() = %v, want nil", err)
 
 	info, err := os.Stat(stateDir)
 	assertNoError(t, err, "stat %s: %v", stateDir, err)
@@ -466,16 +460,13 @@ func TestPrepareDirsLeavesTheModeOfAnExistingDirectoryAlone(t *testing.T) {
 func TestPrepareDirsLeavesUnrelatedPathsAlone(t *testing.T) {
 	root := t.TempDir()
 	unrelatedDir := filepath.Join(root, "other")
-	if err := os.MkdirAll(unrelatedDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(unrelatedDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(unrelatedDir, 0o755)
+	assertNoError(t, err, "")
+	err = os.Chmod(unrelatedDir, 0o755)
+	assertNoError(t, err, "")
 	unrelatedFile := filepath.Join(root, "keep.txt")
-	if err := os.WriteFile(unrelatedFile, []byte("keep"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	err = os.WriteFile(unrelatedFile, []byte("keep"), 0o644)
+	assertNoError(t, err, "")
 
 	opts := InstallOptions{
 		Paths: runtimepaths.Paths{
@@ -484,9 +475,8 @@ func TestPrepareDirsLeavesUnrelatedPathsAlone(t *testing.T) {
 			LogDir:     filepath.Join(root, "var", "logs"),
 		},
 	}
-	if err := PrepareDirs(opts); err != nil {
-		t.Fatalf("PrepareDirs() = %v, want nil", err)
-	}
+	err = PrepareDirs(opts)
+	assertNoError(t, err, "PrepareDirs() = %v, want nil", err)
 
 	if runtime.GOOS != "windows" {
 		info, err := os.Stat(unrelatedDir)

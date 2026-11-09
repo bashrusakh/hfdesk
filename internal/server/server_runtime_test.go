@@ -504,11 +504,7 @@ func TestServerRequestLogUsesStructuredPipeline(t *testing.T) {
 	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/health", nil))
 
 	out := captured.String()
-	for _, want := range []string{"[server]", "method=GET", "path=/api/health"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("captured pipeline output %q does not contain %q", out, want)
-		}
-	}
+	assertNames(t, out, "captured pipeline output", []string{"[server]", "method=GET", "path=/api/health"})
 	if standardLog.String() != "" {
 		t.Errorf("request log still wrote through the standard library logger: %q", standardLog.String())
 	}
@@ -630,11 +626,7 @@ func TestProxyErrorReasonDropsCredentialBearingURL(t *testing.T) {
 	if reason == "" {
 		t.Fatal("proxy error reason is empty")
 	}
-	for _, secret := range []string{"proxysecret", "proxyuser", "proxy.example"} {
-		if strings.Contains(reason, secret) {
-			t.Errorf("proxy error reason %q still carries %q", reason, secret)
-		}
-	}
+	assertNamesWithout(t, reason, "proxy error reason", nil, []string{"proxysecret", "proxyuser", "proxy.example"})
 }
 
 // waitForServerBoundAddr waits until the server reports the given bound
