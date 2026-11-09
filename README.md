@@ -103,16 +103,23 @@ unchanged and stays the right one for a terminal, for redirecting the output
 into a file, for a script and for a service.
 
 The GUI subsystem is a build time property of the linker, so a local build of
-the desktop host needs the flag `-H=windowsgui`:
+the desktop host needs the flag `-H=windowsgui`. The desktop host also embeds a
+Windows resource that carries the icon and the application manifest — the
+manifest declares the common controls version 6 that the startup dialog needs —
+so the resource is generated before the build:
 
 ```bash
+go install github.com/akavel/rsrc@v0.10.2
+go run ./cmd/hfdesk/genico.go
+rsrc -ico cmd/hfdesk/hfdesk.ico -manifest cmd/hfdesk-desktop/hfdesk.manifest -o cmd/hfdesk-desktop/resource_windows_amd64.syso
 go build -ldflags "-H=windowsgui" -o hfdesk-desktop.exe ./cmd/hfdesk-desktop
 ```
 
 A binary that was built without the flag opens a console window next to the
 notification area icon. The desktop host reads the PE header of its own
 executable at startup and tells you how to rebuild the binary when it was
-built wrong.
+built wrong. A binary that was built without the resource still works: the
+startup dialog falls back to a message box that asks the same question.
 
 The desktop host runs the very same HFDesk server in its own process and adds
 a desktop shell around it:
@@ -122,9 +129,35 @@ a desktop shell around it:
   number of active jobs and the live log records.
 
 The tray icon opens the Runtime / Logs window on a left click. Its menu has
-three actions: **Open HFDesk** opens the web UI in the default browser,
-**Runtime / Logs** shows the runtime window, and **Quit HFDesk** stops the
-server with a graceful shutdown and leaves the notification area.
+four actions: **Open HFDesk** opens the web UI in the default browser,
+**Runtime / Logs** shows the runtime window, **Install service…** installs the
+Windows service, and **Quit HFDesk** stops the server with a graceful shutdown
+and leaves the notification area.
+
+The desktop app can install the Windows service from that menu. **Install
+service…** confirms the machine-wide change first, needs the console program
+in the same folder as the desktop program (nothing is downloaded or copied) —
+for a release that is the program paired with this desktop program, and a
+desktop program whose name carries a version has no other candidate, so a
+missing pair is an error that names the console file it expected; a local build
+without a version falls back to `hfdesk.exe` and then to exactly one
+`hfdesk*.exe` in the folder — and then asks Windows for administrator
+rights. The elevated helper waits until the desktop app has
+stopped its own server through the graceful shutdown and exited, so the two
+never serve the same address; it then installs and starts the service from that
+folder and reports the result. A launch that finds an installed service starts
+no server of its own either: it asks whether to open the running service, to
+update it from the folder of this app, or to start a stopped one, and **Cancel**
+changes nothing. **Work in desktop mode** is the exception and the default
+answer for a positively confirmed stopped service: it continues the launch as
+an ordinary desktop app — the service state is read again when the answer is
+taken — and neither starts nor changes the service.
+
+The service is a second HFDesk with **separate data**: it keeps its own config,
+jobs, history and cache under `%ProgramData%\HFDesk`. The settings, jobs and
+models of the desktop app are not migrated and do not appear in the service.
+See [docs/SERVICE.md](docs/SERVICE.md#the-windows-desktop-host) for the detailed
+behavior.
 
 The desktop host is single-instance per user and session. A second launch
 detects the running instance, tells the user that HFDesk is already running
@@ -241,6 +274,21 @@ hfdesk service status
 Service mode binds loopback by default (`127.0.0.1:8080`). Exposing the
 dashboard to the network needs an explicit `--listen 0.0.0.0:8080`.
 
+On every platform, `service install` over an existing registration keeps the
+settings the command does not name again and the autostart state the
+registration already has — an enabled systemd unit stays enabled, a disabled
+one is not enabled again, a masked one refuses the installation, a Windows
+start type and delayed-auto-start flag are written back as they are, and a
+macOS property list keeps its `RunAtLoad` value — and applies an update to a
+running instance, which is restarted on the new program; a stopped service
+stays stopped. HFDesk owns the registrations it writes: on Linux the update
+applies only to the unit HFDesk owns — a hand-edited unit file, a drop-in that
+overrides the command and a fragment HFDesk did not write each refuse it before
+anything changes, and customizations belong in `hfdesk.service.d/*.conf`,
+which HFDesk never writes — and on macOS a key the HFDesk property list does
+not carry does not survive an update (see
+[docs/SERVICE.md](docs/SERVICE.md)).
+
 See [docs/SERVICE.md](docs/SERVICE.md) for the full reference: scopes, runtime
 paths, credentials, logs, and per-platform notes.
 
@@ -263,6 +311,10 @@ console window:
 ```bash
 GOOS=windows go build -ldflags "-H=windowsgui" -o hfdesk-desktop.exe ./cmd/hfdesk-desktop
 ```
+
+The resource that carries the icon and the application manifest is generated
+separately, as described in [Windows desktop app](#windows-desktop-app); a
+binary built without it still works and uses the message box fallback.
 
 Run tests:
 
