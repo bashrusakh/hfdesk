@@ -434,10 +434,12 @@ const (
 )
 
 // statusIfUnnamed returns the state command for a report whose detail does
-// not name it yet, and nothing when the manager text already carries that
-// command: a report states one action, never the same command twice.
+// not name an action yet, and nothing when the detail already carries one —
+// in whatever shape the service layer printed it: a report states one
+// action, never the same route twice. The marker rule itself lives with the
+// service layer (service.HasNamedAction), so both surfaces share it.
 func statusIfUnnamed(detail string) string {
-	if strings.Contains(detail, "hfdesk service status") {
+	if service.HasNamedAction(detail) {
 		return ""
 	}
 	return "\n\n" + serviceStatusCommandText

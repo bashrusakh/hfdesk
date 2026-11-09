@@ -831,6 +831,18 @@ func TestServiceActionFailureTextKeepsTheStateCommandOfTheManagerOnce(t *testing
 			}
 		})
 	}
+
+	// A detail that already names its own action keeps it as the single
+	// route: the state command is not served beside it. The perturbation is
+	// the detail — a status-only rule appended a second command here.
+	actionDetail := errors.New(`service: executable "C:\portable\hfdesk.exe" is not usable: grant the account execute access, then run "hfdesk service install" from an elevated shell again`)
+	text := serviceActionFailureText(serviceActionUpdate, actionDetail, program)
+	if got := strings.Count(text, "hfdesk service status"); got != 0 {
+		t.Errorf("the report %q names the state command %d times beside the manager's own action, want none", text, got)
+	}
+	if got := strings.Count(text, `"hfdesk service install"`); got != 1 {
+		t.Errorf("the report %q carries the manager's own action %d times, want exactly one", text, got)
+	}
 }
 
 // TestServiceGateChangedTextNamesTheDiagnostic proves the notice of a state

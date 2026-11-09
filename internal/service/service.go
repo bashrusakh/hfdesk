@@ -175,6 +175,62 @@ const brokenRunningDetail = " (the instance still runs, but the registration can
 // action.
 const statusReadHint = `run "hfdesk service status" to read the current state of the service`
 
+// namedActionMarkers are the command and instruction shapes the refusal and
+// reason texts of the service layer print as the one action of a report:
+// quoted commands of the hfdesk/supervisor families, the Windows repair
+// commands, the account-creation and directory-grant instructions, and the
+// elevation reasons of the three platforms. The list is the single rule
+// every surface consults before it appends an action of its own, so a
+// composite report states exactly one route whichever layer reads it — a
+// marker also matches the diagnostic hint itself, which keeps a cause that
+// carries it from being served a second one.
+//
+// The list recognizes the shapes the texts print TODAY: every command a
+// message names is printed QUOTED (the refusal family renders commands with
+// %q), and the prose instructions are listed by their fixed wording. A
+// future message that prints an action unquoted must add its shape here —
+// the owner test pins the list.
+var namedActionMarkers = []string{
+	`"hfdesk service `,
+	`"systemctl `,
+	"sc config ",
+	`"chown `,
+	"create it with ",
+	"run the command as ",
+	"run the command from ",
+	"install again",
+}
+
+// HasNamedAction reports whether text already carries a named next action
+// from that list.
+func HasNamedAction(text string) bool {
+	for _, marker := range namedActionMarkers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// AppendActionIfUnnamed returns the report with the diagnostic action
+// appended — unless the report already names one: a report states exactly
+// one route, whichever layer reads it.
+func AppendActionIfUnnamed(report, action string) string {
+	if HasNamedAction(report) {
+		return report
+	}
+	return report + "; " + action
+}
+
+// AppendActionErrorIfUnnamed is the error form of AppendActionIfUnnamed:
+// the wrapping stays %w-based, so classification of the cause survives.
+func AppendActionErrorIfUnnamed(report error, action string) error {
+	if HasNamedAction(report.Error()) {
+		return report
+	}
+	return fmt.Errorf("%w; %s", report, action)
+}
+
 // InstallFieldSet marks the fields of an InstallOptions that a request set
 // explicitly.
 //

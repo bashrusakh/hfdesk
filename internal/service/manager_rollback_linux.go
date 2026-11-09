@@ -112,15 +112,15 @@ func (m *systemdManager) restorePreviousRegistration(ctx context.Context, previo
 // only the outcome the storage and loaded-configuration checks proved.
 func (m *systemdManager) reportUnitRollback(ctx context.Context, previous previousRegistration, created map[string][]string, failure error) (bool, error) {
 	if err := m.rollbackUnit(context.WithoutCancel(ctx), previous); err != nil {
-		return false, fmt.Errorf("%w (the previous unit file or captured loaded settings could not be restored or verified: %v); %s", failure, err, statusReadHint)
+		return false, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the previous unit file or captured loaded settings could not be restored or verified: %v)", failure, err), statusReadHint)
 	}
 	if previous.registrationPresent() {
 		if !previous.loaded.loaded {
-			return systemdCreatedDirsSafeToRemove(previous, created), fmt.Errorf("%w (the previous registration and command were restored and loaded; no instance was restarted); %s", failure, statusReadHint)
+			return systemdCreatedDirsSafeToRemove(previous, created), AppendActionErrorIfUnnamed(fmt.Errorf("%w (the previous registration and command were restored and loaded; no instance was restarted)", failure), statusReadHint)
 		}
-		return systemdCreatedDirsSafeToRemove(previous, created), fmt.Errorf("%w (the previous registration and captured loaded command/launch settings were restored); %s", failure, statusReadHint)
+		return systemdCreatedDirsSafeToRemove(previous, created), AppendActionErrorIfUnnamed(fmt.Errorf("%w (the previous registration and captured loaded command/launch settings were restored)", failure), statusReadHint)
 	}
-	return true, fmt.Errorf("%w (the failed registration was removed from disk and the supervisor); %s", failure, statusReadHint)
+	return true, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the failed registration was removed from disk and the supervisor)", failure), statusReadHint)
 }
 
 // verifyRestoredUnit checks that the unit file holds the previous registration

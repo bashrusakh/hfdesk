@@ -762,3 +762,51 @@ func TestHoldDesktopSingletonWithoutADesktopHostHoldsNothing(t *testing.T) {
 	release()
 	release()
 }
+
+// TestAppendActionIfUnnamedIsTheSingleActionRule pins the shared owner of
+// the message model: every composite report appends its diagnostic action
+// only when the report carries none, in whatever shape the cause named one —
+// so both surfaces (the manager texts and the desktop notices) state
+// exactly one route, input-independently.
+func TestAppendActionIfUnnamedIsTheSingleActionRule(t *testing.T) {
+	const hint = `run "hfdesk service status" to read the current state of the service`
+	for _, tc := range []struct {
+		name   string
+		report string
+		want   string
+	}{
+		{"a plain cause gains the action", "the previous registration was restored", "the previous registration was restored; " + hint},
+		{"a quoted hfdesk command keeps its route", `the instance is stopped: run "hfdesk service stop" and run "hfdesk service install" again`, `the instance is stopped: run "hfdesk service stop" and run "hfdesk service install" again`},
+		{"a quoted supervisor command", `Unmask it with "systemctl unmask hfdesk.service" and run the installation again`, `Unmask it with "systemctl unmask hfdesk.service" and run the installation again`},
+		{"the windows repair command", "restore it: sc config hfdesk start= demand, and run the installation again", "restore it: sc config hfdesk start= demand, and run the installation again"},
+		{"the linux elevation reason", "an installation in the system scope requires root: run the command as root, HFDesk never escalates privileges itself", "an installation in the system scope requires root: run the command as root, HFDesk never escalates privileges itself"},
+		{"the macos elevation reason", "an installation in the system scope requires an elevated shell: run the command from an elevated shell", "an installation in the system scope requires an elevated shell: run the command from an elevated shell"},
+		{"the account creation instruction", `create it with "useradd -r hfdesk-svc" and install again`, `create it with "useradd -r hfdesk-svc" and install again`},
+		{"the grant then retry instruction", "give the directory itself to the account and install again", "give the directory itself to the account and install again"},
+		{"a quoted chown command", `give the directory with "chown hfdesk /var/lib/hfdesk", then run "hfdesk service install --system" again`, `give the directory with "chown hfdesk /var/lib/hfdesk", then run "hfdesk service install --system" again`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := AppendActionIfUnnamed(tc.report, hint); got != tc.want {
+				t.Errorf("AppendActionIfUnnamed() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	// The error form keeps the classification of the cause.
+	sentinel := errors.New(`the installation was refused: stop the instance with "hfdesk service stop" and run "hfdesk service install" again`)
+	wrapped := AppendActionErrorIfUnnamed(sentinel, hint)
+	if !errors.Is(wrapped, sentinel) {
+		t.Errorf("AppendActionErrorIfUnnamed() = %v, want the cause preserved", wrapped)
+	}
+	if strings.Contains(wrapped.Error(), "hfdesk service status") {
+		t.Errorf("AppendActionErrorIfUnnamed() = %q, served a second route beside the cause's own action", wrapped)
+	}
+	plainSentinel := errors.New("the state of the restored registration could not be read back")
+	plain := AppendActionErrorIfUnnamed(plainSentinel, hint)
+	if !errors.Is(plain, plainSentinel) {
+		t.Errorf("AppendActionErrorIfUnnamed() = %v, want the cause preserved", plain)
+	}
+	if !strings.Contains(plain.Error(), hint) {
+		t.Errorf("AppendActionErrorIfUnnamed() = %q, want the diagnostic action appended", plain)
+	}
+}
