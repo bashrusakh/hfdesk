@@ -439,7 +439,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		}
 	})
 
-	t.Run("the last reported drop-in that carries an override wins", func(t *testing.T) {
+	t.Run("every readable carrier of several is named", func(t *testing.T) {
 		first := writeDropIn(t, "00-first.conf", "[Service]\nExecStart=/usr/bin/first --config /one.json\n")
 		last := writeDropIn(t, "local.conf", "[Service]\nExecStart="+strings.Join(override, " ")+"\n")
 		loaded, err := loadedConfigFromProperties(driftedProperties([]string{first, last}))
@@ -450,7 +450,32 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the refusal of an overridden command")
 		}
-		assertSingleRemoveOverrideAction(t, err, last)
+		// Review finding 2 (b): with several readable carriers one
+		// removal does not clear the cause — the one instruction names
+		// EVERY carrier in the plural form (the merge order of the
+		// drop-ins no longer decides what the action covers), offers
+		// no alternative and stays a single action.
+		message := err.Error()
+		for _, want := range []string{
+			"the update was refused and the registration was not changed",
+			"the drop-ins carrying the override: \"" + first + "\", \"" + last + "\"",
+			`Remove the "ExecStart=" override from each of them`,
+			"reload the unit files with \"",
+			`run "hfdesk service install" again`,
+		} {
+			if !strings.Contains(message, want) {
+				t.Errorf("the refusal %q does not contain %q", message, want)
+			}
+		}
+		if strings.Contains(message, " or ") {
+			t.Errorf("the refusal %q offers an alternative instead of one action", message)
+		}
+		if got := strings.Count(message, `Remove the "ExecStart=" override`); got != 1 {
+			t.Errorf("the refusal %q states %d removal actions, want exactly one", message, got)
+		}
+		if strings.Contains(message, "Move your customizations into") {
+			t.Errorf("the refusal %q names the customization move, which never clears an override", message)
+		}
 	})
 
 	t.Run("a drop-in without an override names the reload", func(t *testing.T) {
@@ -527,7 +552,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		}
 	})
 
-	t.Run("a readable holder is named even beside an unreadable drop-in", func(t *testing.T) {
+	t.Run("an unreadable drop-in beside a readable holder names no command", func(t *testing.T) {
 		if os.Geteuid() == 0 {
 			t.Skip("root reads every file; the unreadable state needs an unprivileged reader")
 		}
@@ -544,10 +569,98 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		}
 		err = detectExecStartOverride(loaded, facts, ScopeSystem)
 		if err == nil {
-			t.Fatal("detectExecStartOverride() = nil, want the refusal that names the carrying drop-in")
+			t.Fatal("detectExecStartOverride() = nil, want the refusal over a partially unreadable drop-in set")
 		}
-		// The readable holder proves where the override lives: the one
-		// action clears it, so the removal is named.
+		// Review finding 2 (a): the unreadable decoy cannot be proven
+		// free of an ExecStart= override of its own, so removing the
+		// override from the readable holder would NOT clear the state —
+		// the refusal is the honest terminal exactly as its comment
+		// promises ("names no command" for that state). This
+		// expectation FLIPS the earlier rule that named the readable
+		// holder beside an unreadable drop-in: there the named action
+		// did not clear the cause.
+		for _, want := range []string{
+			"cannot read every drop-in the supervisor reports",
+			"names no command",
+			"the refusal repeats until the ExecStart= override is removed",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal %q does not mention %q", err, want)
+			}
+		}
+		for _, unwanted := range []string{
+			`Reload the unit files with`,
+			`run "hfdesk service install"`,
+			`Remove the "ExecStart=" override`,
+			" or ",
+		} {
+			if strings.Contains(err.Error(), unwanted) {
+				t.Errorf("the refusal %q names %q, want the honest terminal of this state", err, unwanted)
+			}
+		}
+	})
+
+	t.Run("a vanished drop-in beside a readable holder names the holder", func(t *testing.T) {
+		// The realistic retry of the reviewer: the operator follows
+		// an earlier "Remove the override from X", deletes the FILE
+		// and runs install again without a reload. The vanished path
+		// is provably free of directives — there is no content that
+		// could carry an override — so the readable holder's removal
+		// still clears the cause. Before the fix ENOENT joined the
+		// unreadable class and the terminal named no command at all
+		// (the recorded reason for this expectation).
+		vanished := filepath.Join(t.TempDir(), "00-vanished.conf")
+		owner := writeDropIn(t, "local.conf", "[Service]\nExecStart="+strings.Join(override, " ")+"\n")
+
+		loaded, err := loadedConfigFromProperties(driftedProperties([]string{vanished, owner}))
+		if err != nil {
+			t.Fatalf("decode the typed override: %v", err)
+		}
+		err = detectExecStartOverride(loaded, facts, ScopeSystem)
+		if err == nil {
+			t.Fatal("detectExecStartOverride() = nil, want the refusal over a vanished drop-in")
+		}
+		assertSingleRemoveOverrideAction(t, err, owner)
+	})
+
+	t.Run("a vanished drop-in with no carrier names the reload", func(t *testing.T) {
+		// Nothing of the reported set can hold the override any more:
+		// the loaded command only a reload reads again decides, and
+		// the reload+retry is the action that clears the state — the
+		// honest terminal would name an impossible removal. Before
+		// the fix ENOENT reached the terminal and named no command.
+		vanished := filepath.Join(t.TempDir(), "00-vanished.conf")
+
+		loaded, err := loadedConfigFromProperties(driftedProperties([]string{vanished}))
+		if err != nil {
+			t.Fatalf("decode the typed override: %v", err)
+		}
+		err = detectExecStartOverride(loaded, facts, ScopeSystem)
+		if err == nil {
+			t.Fatal("detectExecStartOverride() = nil, want the refusal over a vanished drop-in")
+		}
+		assertSingleReloadAction(t, err, "systemctl")
+	})
+
+	t.Run("a directory in place of a drop-in is not a carrier", func(t *testing.T) {
+		// A directory where a file was reported has no directive
+		// content either (the read fails with EISDIR): the same
+		// exclusion as a vanished file — the readable holder's
+		// removal clears the cause, the terminal would not.
+		dirEntry := filepath.Join(t.TempDir(), "00-directory.conf")
+		if err := os.MkdirAll(dirEntry, 0o755); err != nil {
+			t.Fatalf("create the directory in place of the drop-in: %v", err)
+		}
+		owner := writeDropIn(t, "local.conf", "[Service]\nExecStart="+strings.Join(override, " ")+"\n")
+
+		loaded, err := loadedConfigFromProperties(driftedProperties([]string{dirEntry, owner}))
+		if err != nil {
+			t.Fatalf("decode the typed override: %v", err)
+		}
+		err = detectExecStartOverride(loaded, facts, ScopeSystem)
+		if err == nil {
+			t.Fatal("detectExecStartOverride() = nil, want the refusal over a directory entry")
+		}
 		assertSingleRemoveOverrideAction(t, err, owner)
 	})
 

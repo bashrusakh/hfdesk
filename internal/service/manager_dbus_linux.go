@@ -389,10 +389,18 @@ func detectExecStartOverride(loaded systemdLoadedConfig, unit canonicalUnit, sco
 // an override that already lives there — and the unit files are reloaded
 // after the edit, because the supervisor holds the loaded command in memory
 // until that reload reads the file again; a loaded command no reported
-// drop-in explains only a reload reads again. A reported drop-in this
-// process cannot read may be the one that carries the override, so no
-// command is named for that state: the refusal says it repeats until the
-// override is removed instead of promising a reload that cannot clear it.
+// drop-in explains only a reload reads again. When every reported drop-in
+// is readable, EVERY carrier is named in the one removal instruction: one
+// removal out of several would leave the others owning the command. A
+// reported drop-in that vanished after the load or is a directory holds no
+// file content to carry an override — provably free, excluded from both
+// classes — so it leaves the state to the readable carriers or to the
+// reload that reads the files again. A drop-in that exists and this
+// process cannot read may be the one that carries the override, and it
+// cannot be proven free of it — so the unreadable state wins over any
+// readable carrier and the refusal names no command at all: it says it
+// repeats until the override is removed instead of promising an action
+// that could not clear the state.
 func execStartOverrideRefusal(loaded systemdLoadedConfig, scope Scope) error {
 	cause := fmt.Sprintf("the command systemd loads for %s is not the command in its unit file", unitName)
 	if loaded.dropInPathsKnown && len(loaded.dropInPaths) > 0 {
@@ -404,50 +412,85 @@ func execStartOverrideRefusal(loaded systemdLoadedConfig, scope Scope) error {
 	}
 	install := "hfdesk service install"
 	reload := scopeSupervisorHint(scope) + " daemon-reload"
-	if owner, unreadable := execStartOverrideDropIn(loaded.dropInPaths); owner != "" {
-		return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Remove the %q override from %q, reload the unit files with %q, and run %q again",
-			cause, "ExecStart=", owner, reload, install)
-	} else if unreadable {
+	owners, unreadable := execStartOverrideDropIn(loaded.dropInPaths)
+	switch {
+	case unreadable:
 		return fmt.Errorf("service: the update was refused and the registration was not changed: %s. HFDesk cannot read every drop-in the supervisor reports, so it names no command: the refusal repeats until the ExecStart= override is removed from the drop-in that carries it", cause)
+	case len(owners) == 1:
+		return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Remove the %q override from %q, reload the unit files with %q, and run %q again",
+			cause, "ExecStart=", owners[0], reload, install)
+	case len(owners) > 1:
+		quoted := make([]string, len(owners))
+		for i, owner := range owners {
+			quoted[i] = fmt.Sprintf("%q", owner)
+		}
+		return fmt.Errorf("service: the update was refused and the registration was not changed: %s (the drop-ins carrying the override: %s). Remove the %q override from each of them, reload the unit files with %q, and run %q again",
+			cause, strings.Join(quoted, ", "), "ExecStart=", reload, install)
 	}
 	return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Reload the unit files with %q and run %q again",
 		cause, reload, install)
 }
 
-// execStartOverrideDropIn returns the drop-in that carries an ExecStart=
-// override: the last path the supervisor reports whose file holds such a
-// directive, because the last drop-in loaded wins, and whether a reported
-// drop-in could not be read. A file that cannot be read proves nothing: it
-// may be the drop-in that carries the override, and the caller must not
-// promise an action that cannot clear that state.
-func execStartOverrideDropIn(paths []string) (owner string, unreadable bool) {
+// execStartOverrideDropIn returns EVERY drop-in the supervisor reports
+// whose file carries an ExecStart= override — all of them are named, so
+// one removal does not leave another override behind — and whether a
+// reported drop-in could not be read. The read errors keep their classes:
+// a file that vanished after the load (the operator may have followed an
+// earlier removal) and a directory in place of the file have no content
+// this scanner could read — they are provably free of an override and
+// count as neither a carrier nor an unreadable file — while a file that
+// exists and cannot be read may be the drop-in that carries the override,
+// and the caller must not promise an action that cannot clear that state.
+func execStartOverrideDropIn(paths []string) (owners []string, unreadable bool) {
 	for _, path := range paths {
 		content, err := os.ReadFile(path)
 		if err != nil {
+			if os.IsNotExist(err) || errors.Is(err, unix.EISDIR) {
+				// A vanished drop-in and a directory in its place
+				// are provably free of directives: there is no file
+				// content that could carry an override, so they
+				// exclude themselves from both classes and leave
+				// the state to the readable carriers or to the
+				// reload that reads the files again.
+				continue
+			}
 			unreadable = true
 			continue
 		}
 		if dropInHoldsExecStart(content) {
-			owner = path
+			owners = append(owners, path)
 		}
 	}
-	return owner, unreadable
+	return owners, unreadable
 }
 
 // dropInHoldsExecStart reports whether a drop-in carries the ExecStart
-// directive — parsed with systemd's assignment grammar: optional
-// whitespace around the `=` and a trimmed, case-sensitive key (systemd
-// accepts `ExecStart = /bin/true` and `ExecStart  =  /bin/true` as the
-// same setting; verified against `systemd-analyze verify`). Commented lines
-// (`;`/`#` after the leading whitespace) are not directives, and only the
-// key decides — the value never matters to ownership.
+// directive OF THE [Service] SECTION — the only section systemd accepts it
+// in. Verified with `systemd-analyze verify`: `ExecStart=` under [Unit] or
+// [Install] reports `Unknown key 'ExecStart' in section […], ignoring.`, a
+// bare line outside any section reports `Assignment outside of section.
+// Ignoring.`, and `[service]` reports `Unknown section 'service'.
+// Ignoring.` — an assignment systemd ignores never owns the command, so
+// only an exact `[Service]` section counts and the section match is
+// case-sensitive. The assignment grammar: optional whitespace around the
+// `=` and a trimmed, case-sensitive key (systemd accepts
+// `ExecStart = /bin/true` and `ExecStart  =  /bin/true` as the same
+// setting). Commented lines (`;`/`#` after the leading whitespace) are not
+// directives, and only the key decides — the value never matters to
+// ownership.
 func dropInHoldsExecStart(content []byte) bool {
-	for _, line := range strings.Split(string(content), "\n") {
-		key, _, found := strings.Cut(strings.TrimSpace(line), "=")
+	section := ""
+	for _, raw := range strings.Split(string(content), "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = line[1 : len(line)-1]
+			continue
+		}
+		key, _, found := strings.Cut(line, "=")
 		if !found {
 			continue
 		}
-		if strings.TrimSpace(key) == "ExecStart" {
+		if section == "Service" && strings.TrimSpace(key) == "ExecStart" {
 			return true
 		}
 	}
