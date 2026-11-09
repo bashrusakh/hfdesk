@@ -330,30 +330,50 @@ func serviceInstalledText(version, console, dataDir, address string) string {
 // serviceUpdatedText returns the report of a finished update.
 //
 // The report depends on the state the service had before the update: a service
-// that was running is still running, and a service that was stopped stays
-// stopped. The stopped case says so explicitly: the update never starts a
-// service that was stopped, so nothing serves HFDesk after it, and a message
-// that claims otherwise would send the user to a dead address.
+// that was running is still running, and a service that did not run stays not
+// running. The not-running case states the prior state the update actually
+// observed (before): a registration that was stopped says so, and one that was
+// failed, broken or in another state is named as what it was instead of being
+// restated as stopped — a report claiming a state the machine did not have
+// would send the user to a cause that is not there. Either way nothing serves
+// HFDesk after such an update, and a message that claimed otherwise would send
+// the user to a dead address.
 //
-// The stopped case names the relaunch of the desktop app and not the tray: an
-// update is launched only from the service gate of a launch, and that launch
+// The not-running case names the relaunch of the desktop app and not the tray:
+// an update is launched only from the service gate of a launch, and that launch
 // ends the desktop host, so the tray is gone by the time this report is read. A
 // sentence that pointed at a tray icon that is not there would send the user
 // looking for an action they cannot reach.
-func serviceUpdatedText(version, console, dataDir, address string, running bool) string {
+func serviceUpdatedText(version, console, dataDir, address string, running bool, before service.State) string {
 	text := serviceVersionName(version) + " is updated as a Windows service.\n\n" +
 		"The registration now runs " + console + " and keeps the settings of the service and its data.\n\n"
 	if running {
 		text += serviceAddressText(address)
 		text += "The desktop app is not needed to use the service: open the address above."
 	} else {
-		text += "The service stays stopped: it was stopped before the update, and an update never starts a stopped service. Nothing serves HFDesk right now.\n\n" +
+		text += serviceUpdateNotRunningReport(before) + "\n\n" +
 			"Start the desktop app again and choose Start service, or run \"hfdesk service start\" from an elevated shell."
 	}
 	if dataDir != "" {
 		text += "\n\nThe service keeps its own data in " + dataDir + ". The settings, jobs and models of the desktop app do not appear in the service."
 	}
 	return text
+}
+
+// serviceUpdateNotRunningReport returns the result and the cause of the report
+// of an update that did not leave the service running.
+//
+// The result is the outcome of the update, the cause is the state the update
+// observed before it and the rule that explains why nothing serves now. A
+// service that was stopped before the update keeps the sentence it always had.
+// Any other observed prior state is quoted as what the supervisor reported
+// instead of being restated as "stopped", the way the failure reports of these
+// actions already name a prior state.
+func serviceUpdateNotRunningReport(before service.State) string {
+	if before == service.StateStopped {
+		return "The service stays stopped: it was stopped before the update, and an update never starts a stopped service. Nothing serves HFDesk right now."
+	}
+	return fmt.Sprintf("The service is not running after the update: it was %q before the update, and an update never starts a service that was not running. Nothing serves HFDesk right now.", before)
 }
 
 // serviceStartedText returns the report of a started service.

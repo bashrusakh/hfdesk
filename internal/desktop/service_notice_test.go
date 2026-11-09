@@ -301,7 +301,7 @@ func TestServiceGatePendingTextNamesTheTransitionAndTheUnchangedLaunch(t *testin
 // that the report could point at.
 func TestServiceUpdatedTextKeepsAStoppedServiceStopped(t *testing.T) {
 	const address = "http://127.0.0.1:8080"
-	text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, false)
+	text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, false, service.StateStopped)
 
 	for _, want := range []string{
 		"HFDesk 1.3.0",
@@ -329,12 +329,59 @@ func TestServiceUpdatedTextKeepsAStoppedServiceStopped(t *testing.T) {
 // desktop app is not needed to use the service.
 func TestServiceUpdatedTextReportsARunningService(t *testing.T) {
 	const address = "http://127.0.0.1:8080"
-	text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, true)
+	text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, true, service.StateRunning)
 
 	for _, want := range []string{address, "not needed to use the service", `C:\portable\hfdesk.exe`, "keeps the settings"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("the report %q does not mention %q", text, want)
 		}
+	}
+}
+
+// TestServiceUpdatedTextNamesTheObservedPriorState proves that the report of a
+// successful update that did not leave the service running names the prior
+// state the update actually observed instead of restating it as "stopped".
+//
+// An update over a registration whose state was "failed", or "broken" without a
+// running instance, rewrites the registration and starts nothing. The report of
+// that update claimed "it was stopped before the update" — a state the machine
+// never had — although the helper tracked the observed state. The report keeps
+// the shape of these notices (result, cause, one next action), quotes the
+// observed state the way the failure reports of these actions already do, and
+// keeps the warning that nothing serves HFDesk now.
+func TestServiceUpdatedTextNamesTheObservedPriorState(t *testing.T) {
+	const address = "http://127.0.0.1:8080"
+	for _, tc := range []struct {
+		name   string
+		before service.State
+		quote  string
+	}{
+		{name: "failed", before: service.StateFailed, quote: `it was "failed" before the update`},
+		{name: "broken", before: service.StateBroken, quote: `it was "broken" before the update`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, false, tc.before)
+
+			for _, want := range []string{
+				tc.quote,
+				"is not running after the update",
+				"never starts a service that was not running",
+				"Nothing serves HFDesk right now",
+				"Start the desktop app again and choose Start service",
+				"hfdesk service start",
+				"elevated shell",
+			} {
+				if !strings.Contains(text, want) {
+					t.Errorf("the report %q does not mention %q", text, want)
+				}
+			}
+			if strings.Contains(text, "stopped") {
+				t.Errorf("the report %q claims the service was stopped, want the observed prior state %q", text, tc.before)
+			}
+			if strings.Contains(text, address) {
+				t.Errorf("the report %q sends the user to the address of a service that does not run", text)
+			}
+		})
 	}
 }
 

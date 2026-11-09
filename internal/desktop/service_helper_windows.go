@@ -370,7 +370,7 @@ func updateWindowsService(reporter *serviceActionReporter, version string) error
 		"versionVerified", installed.VersionVerified)
 	reporter.message(serviceUpdatedCaption,
 		serviceUpdatedText(verifiedVersion(installed), report, status.Paths.StateDir,
-			serviceWebAddress(status), serviceStatusRunning(status)),
+			serviceWebAddress(status), serviceStatusRunning(status), before.State),
 		windows.MB_ICONINFORMATION)
 	return nil
 }
