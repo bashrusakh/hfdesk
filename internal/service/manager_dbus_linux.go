@@ -398,9 +398,8 @@ func detectExecStartOverride(loaded systemdLoadedConfig, unit canonicalUnit, sco
 // reload that reads the files again. A drop-in that exists and this
 // process cannot read may be the one that carries the override, and it
 // cannot be proven free of it — so the unreadable state wins over any
-// readable carrier and the refusal names no command at all: it says it
-// repeats until the override is removed instead of promising an action
-// that could not clear the state.
+// readable carrier and the refusal names no command at all: it repeats
+// until the override is removed.
 func execStartOverrideRefusal(loaded systemdLoadedConfig, scope Scope) error {
 	cause := fmt.Sprintf("the command systemd loads for %s is not the command in its unit file", unitName)
 	if loaded.dropInPathsKnown && len(loaded.dropInPaths) > 0 {
@@ -446,12 +445,8 @@ func execStartOverrideDropIn(paths []string) (owners []string, unreadable bool) 
 		content, err := os.ReadFile(path)
 		if err != nil {
 			if os.IsNotExist(err) || errors.Is(err, unix.EISDIR) {
-				// A vanished drop-in and a directory in its place
-				// are provably free of directives: there is no file
-				// content that could carry an override, so they
-				// exclude themselves from both classes and leave
-				// the state to the readable carriers or to the
-				// reload that reads the files again.
+				// Provably free: no file content to carry an
+				// override (the classes: execStartOverrideDropIn).
 				continue
 			}
 			unreadable = true

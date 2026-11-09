@@ -1948,9 +1948,8 @@ type plistData struct {
 	// GroupName is the primary group of the account.
 	GroupName string
 	// ExitTimeOut is the number of seconds launchd waits after it asked
-	// the instance to stop before it kills it. It is the shared budget of
-	// the service layer, so the deadline of the supervisor is never
-	// shorter than the graceful shutdown of the instance.
+	// the instance to stop before it kills it: the shared budget of the
+	// service layer (see plistTemplate).
 	ExitTimeOut int
 	// RunAtLoad is the autostart key of the property list: true for a
 	// first installation, the value found in the existing registration for
@@ -1974,8 +1973,7 @@ func renderPlist(opts InstallOptions, account *serviceAccount) (string, error) {
 // A machine-wide instance runs as the given service account: the property
 // list names the account and its primary group, so launchd starts the
 // instance with the identity the installation granted its directories to.
-// A user scope instance names neither: it runs as the user of its gui
-// domain.
+// A user scope instance names neither (see plistTemplate).
 func renderPlistWithRunAtLoad(opts InstallOptions, account *serviceAccount, runAtLoad bool) (string, error) {
 	if err := validatePlistOptions(opts); err != nil {
 		return "", err
@@ -2387,8 +2385,8 @@ func (r plistRegistration) registrationOptions(scope Scope) InstallOptions {
 // this build does not know is read through the process of the job: launchd
 // reports the pid of the live process of a job that runs. A job that does
 // not run, that exited cleanly and whose state this build does not know is
-// reported as unknown, and the detail carries what the supervisor reported,
-// so an administrator and a failing test see the same thing.
+// reported as unknown with the supervisor's own detail
+// (launchdUnknownStateDetail owns that sentence).
 func launchdStatusState(target, output string) (State, string) {
 	state := parseLaunchdPrint(output)
 	switch state {
@@ -2411,10 +2409,7 @@ func launchdStatusState(target, output string) (State, string) {
 }
 
 // parseLaunchdPrint maps the output of "launchctl print" to the state of the
-// instance.
-//
-// A job that is not running is stopped, unless it exited with a non-zero
-// status: such a job failed.
+// instance (launchdStatusState owns the state rules).
 func parseLaunchdPrint(output string) State {
 	state, exitCode, _ := launchdPrintFields(output)
 	switch strings.ToLower(state) {

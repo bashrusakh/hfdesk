@@ -227,8 +227,7 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 		return opts, err
 	}
 	// The check runs before the root requirement, before any directory is
-	// created and before the unit file is written: a refused installation
-	// leaves nothing behind.
+	// created and before the unit file is written.
 	if err := validateUnitPaths(opts, registered); err != nil {
 		return opts, err
 	}
@@ -363,10 +362,8 @@ type registrationEnablement struct {
 	// masked and cannot start.
 	masked bool
 	// maskedRuntime reports whether that mask is a runtime mask. The kind
-	// names the unmask command of the refusal: a plain `systemctl unmask`
-	// removes a persistent mask only, and `systemctl unmask --runtime`
-	// removes a runtime mask only, so naming the wrong form leaves the mask
-	// in place after the administrator follows the error and retries.
+	// names the unmask command of the refusal (the wrong form leaves the
+	// mask in place: maskedUnitRefusal).
 	maskedRuntime bool
 }
 
@@ -421,20 +418,19 @@ func enablementOf(state string) registrationEnablement {
 //
 // The answer comes from the supervisor, not from the file system: an
 // enablement is the links the supervisor keeps for the [Install] section, and
-// only the supervisor knows them. The printed state decides, so a state that
-// exits zero without being an enablement ("static", "indirect", "alias",
-// "linked") is not taken for one. A supervisor that cannot be reached prints
+// only the supervisor knows them. The printed state decides it (see
+// enablementOf): a state that exits zero without being an enablement is not
+// taken for one. A supervisor that cannot be reached prints
 // nothing and describes no enablement either, which leaves the autostart state
 // alone on a repeat installation, and the unreachable supervisor still fails the
 // installation at the reload.
 //
-// The runtime mask is part of the answer for the same reason: "systemctl
-// mask --runtime" lives in /run and leaves no file at the unit path, so that
-// kind of mask is visible only through the supervisor. The persistent mask —
-// the link to /dev/null at the unit path — is checked from the file as well,
-// because this answer degrades to "no mask" when the supervisor cannot be
-// reached. A fresh machine reports "not-found" and is not masked, which is
-// what a first installation needs.
+// The runtime mask is part of the answer for the same reason: it is visible
+// only through the supervisor, while the persistent mask — the link to
+// /dev/null at the unit path — is checked from the file as well, because
+// this answer degrades to "no mask" when the supervisor cannot be reached.
+// A fresh machine reports "not-found" and is not masked, which is what a
+// first installation needs.
 func (m *systemdManager) registrationEnablement(ctx context.Context) registrationEnablement {
 	out, _ := m.runSystemctl(ctx, "is-enabled", unitName)
 	return enablementOf(strings.TrimSpace(out))
@@ -489,14 +485,11 @@ type systemdRegisterResult struct {
 // installation enables it, so the enablement a repeat installation found —
 // persistent or runtime-only — is preserved untouched.
 //
-// A replaced registration that was running is restarted and verified: the
-// loaded command must be the canonical command that was written, the
-// restarted process must answer readiness as its own instance, and its
-// MainPID must be a different process than the snapshot taken before the
-// restart. A failure of any of those proofs restores the previous
-// registration and brings the previous instance back into service. The
-// restore reports a started instance only when the supervisor was observed
-// running it. The result reports whether the restarted instance reported
+// A replaced registration that was running is restarted and verified under
+// the Install contract above; a failed proof restores the previous
+// registration and brings the previous instance back into service (the
+// restore claims a started instance only when the supervisor was observed
+// running it). The result reports whether the restarted instance reported
 // the expected version.
 func (m *systemdManager) register(ctx context.Context, opts InstallOptions, account *user.User, identity systemdInstallIdentity, created map[string][]string, previous previousRegistration) (systemdRegisterResult, error) {
 	result := systemdRegisterResult{createdDirsSafeToRemove: systemdCreatedDirsSafeToRemove(previous, created)}

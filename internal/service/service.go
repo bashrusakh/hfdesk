@@ -213,8 +213,8 @@ func HasNamedAction(text string) bool {
 }
 
 // AppendActionIfUnnamed returns the report with the diagnostic action
-// appended — unless the report already names one: a report states exactly
-// one route, whichever layer reads it.
+// appended — unless the report already names one (the one-route rule of
+// namedActionMarkers).
 func AppendActionIfUnnamed(report, action string) string {
 	if HasNamedAction(report) {
 		return report
@@ -381,9 +381,8 @@ func DefaultServiceUser() string {
 // DefaultScope returns the scope of an installation that does not ask for
 // one.
 //
-// The user scope is the default on Linux and macOS. The Windows service
-// control manager registers machine-wide services only, so the system scope
-// is the default there.
+// The user scope is the default on Linux and macOS; on Windows the system
+// scope is (the platform rule: SupportsUserScope).
 //
 // The default scope is a fact of the platform: the shared layer never
 // compares the operating system itself.
@@ -408,9 +407,8 @@ func SupportsUserScope() bool {
 // SupportsNamedServiceAccount reports whether the account of a machine-wide
 // instance can be named on this platform.
 //
-// The account can be named on Linux and macOS. Windows has no account to
-// name: the instance runs as the built-in LocalService account, which has
-// no name of its own.
+// The account can be named on Linux and macOS; Windows has no account to
+// name — its platform default is stated with DefaultServiceUser.
 func SupportsNamedServiceAccount() bool {
 	return supportsNamedServiceAccount()
 }
@@ -498,16 +496,15 @@ var ErrAlreadyRegistered = errors.New("")
 // ErrSingletonAccessDenied classifies a refusal to hold the per-session
 // desktop singleton: the object exists, but the Windows identity of this
 // process has no access to it, because another identity created it. It
-// carries no text of its own so that %w adds nothing to the message shown to
-// the user verbatim; callers classify with errors.Is, never by wording.
+// carries no text of its own; classify with errors.Is (the verbatim-message
+// rule is stated with ErrAlreadyRegistered).
 var ErrSingletonAccessDenied = errors.New("")
 
 // ErrServiceAccountMismatch classifies the refusal of a Windows update over
 // a registration whose account is not the supported identity: an
 // administrator changed it away from the built-in LocalService account, and
 // the update refuses instead of silently cancelling that decision. It carries
-// no text of its own so that %w adds nothing to the refusal message shown to
-// the user verbatim; callers classify with errors.Is, never by wording.
+// no text of its own; classify with errors.Is (see ErrAlreadyRegistered).
 var ErrServiceAccountMismatch = errors.New("")
 
 // HoldDesktopSingleton holds the per-session desktop singleton object across
@@ -545,9 +542,9 @@ func HoldDesktopSingleton(name string) (release func(), err error) {
 //
 // A service mutation probes before it holds: together with the published
 // state (LiveServingDesktop), the result tells whether a desktop instance
-// of this session is alive. The platform owns the object: Windows has it,
-// and a platform without the desktop host has no object, so nobody can
-// hold one and the probe reports that the object did not pre-exist.
+// of this session is alive. A platform without the desktop host has no
+// object (the ownership rule: HoldDesktopSingleton), so the probe reports
+// that the object did not pre-exist.
 func ProbeDesktopSingleton(name string) (release func(), preExisting bool, err error) {
 	return probeDesktopSingleton(name)
 }
@@ -822,7 +819,7 @@ func instanceDirRule(name, path string) error {
 // the request is validated and before it reads the state of the
 // supervisor: request validation is local, cheap and gives the clearest
 // cause, so it must neither pay for a machine-state read nor be masked by
-// one. PrepareDirs applies the same rules again where it creates.
+// one.
 func validateInstanceDirs(opts InstallOptions) error {
 	for _, dir := range []struct {
 		name string
