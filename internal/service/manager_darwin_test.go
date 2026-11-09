@@ -6,6 +6,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -3164,8 +3165,10 @@ func TestLaunchdFailedInstallKeepsACreatedDirectoryThatHoldsData(t *testing.T) {
 	state := opts.Paths.StateDir
 	m := darwinStatusManager(t)
 
-	// The error of the failed supervisor call is the error the caller
-	// gets: the cleanup of the directories never replaces it.
+	// The error of the failed supervisor call stays in the error the
+	// caller gets: the cleanup of the directories never replaces it, and
+	// the rollback of the registration appends only the outcome it proved
+	// itself.
 	t.Setenv("HFDESK_TEST_MARKER_DIR", t.TempDir())
 	_, _, wantErr := m.printState(context.Background())
 	if wantErr == nil {
@@ -3179,8 +3182,8 @@ func TestLaunchdFailedInstallKeepsACreatedDirectoryThatHoldsData(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want the failure of the supervisor")
 	}
-	if err.Error() != wantErr.Error() {
-		t.Errorf("Install() = %q, want %q", err, wantErr)
+	if !strings.Contains(err.Error(), wantErr.Error()) {
+		t.Errorf("Install() = %q, want the cause %q to stay in the error", err, wantErr)
 	}
 
 	// The state directory holds the marker, so it is kept, and so are the
@@ -3450,6 +3453,15 @@ type darwinFakeLaunchd struct {
 	// instance stays alive, so the wait of the manager runs into its
 	// budget.
 	keepRunning bool
+	// withoutRunningFact makes the output of "launchctl print" carry
+	// neither a state nor a process id: the format of a release this
+	// build does not read, in which the running fact cannot be
+	// determined at all.
+	withoutRunningFact bool
+	// startIgnored makes the supervisor load the job without a process
+	// coming up: bootstrap and kickstart succeed, but the instance never
+	// runs, the way a registration whose program fails to start behaves.
+	startIgnored bool
 	// commands holds every command the manager issued, in order.
 	commands []string
 	// failures maps the first word of a command to the error the fake
@@ -3491,8 +3503,10 @@ func (f *darwinFakeLaunchd) run(ctx context.Context, args ...string) (string, er
 		return "", nil
 	case "bootstrap":
 		f.loaded = true
-		f.running = true
-		f.pid = darwinFakePID
+		if !f.startIgnored {
+			f.running = true
+			f.pid = darwinFakePID
+		}
 		return "", nil
 	case "enable":
 		f.disabled = false
@@ -3502,8 +3516,10 @@ func (f *darwinFakeLaunchd) run(ctx context.Context, args ...string) (string, er
 		return "", nil
 	case "kickstart":
 		f.loaded = true
-		f.running = true
-		f.pid = darwinFakePID
+		if !f.startIgnored {
+			f.running = true
+			f.pid = darwinFakePID
+		}
 		return "", nil
 	default:
 		return "", fmt.Errorf("service: launchctl %s: the fake supervisor does not know the command", command)
@@ -3512,6 +3528,11 @@ func (f *darwinFakeLaunchd) run(ctx context.Context, args ...string) (string, er
 
 // printOutput renders the output of "launchctl print" for the fake job.
 func (f *darwinFakeLaunchd) printOutput() string {
+	if f.withoutRunningFact {
+		// The block of the job without the fields the manager reads
+		// for the running fact: neither a state nor a process id.
+		return fmt.Sprintf("%s = {\n\tactive count = 0\n}", launchdLabel())
+	}
 	state := "not running"
 	pid := 0
 	if f.running {
@@ -3704,14 +3725,20 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			t.Errorf("the restored registration = %q, want %q", content, previous)
 		}
 		// The registration is loaded again, so the instance runs like it
-		// did before the attempt.
+		// did before the attempt, and the read back of the registration
+		// proves the restoration the error reports.
 		want := []string{
 			"bootout " + launchd.target(),
 			"bootstrap " + launchd.domain() + " " + path,
 			"enable " + launchd.target(),
+			"print " + launchd.target(),
+			"print-disabled " + launchd.domain(),
 		}
 		if !reflect.DeepEqual(fake.commands, want) {
 			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
+		}
+		if !strings.Contains(err.Error(), "(the registration was restored)") {
+			t.Errorf("rollback() = %v, want the outcome that names the restored registration", err)
 		}
 	})
 
@@ -3735,6 +3762,8 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			"bootout " + launchd.target(),
 			"bootstrap " + launchd.domain() + " " + path,
 			"disable " + launchd.target(),
+			"print " + launchd.target(),
+			"print-disabled " + launchd.domain(),
 		}
 		if !reflect.DeepEqual(fake.commands, want) {
 			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
@@ -3767,6 +3796,11 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 		if !strings.Contains(err.Error(), "could not be loaded") {
 			t.Errorf("rollback() = %v, want a message that names the failed restore of the registration", err)
 		}
+		// The rollback stopped at the failed step: it never claims a
+		// restoration it did not prove by reading the registration back.
+		if strings.Contains(err.Error(), "was restored") {
+			t.Errorf("rollback() = %v, want no restoration outcome for a rollback that failed", err)
+		}
 		// The property list is restored even then.
 		content, err := os.ReadFile(path)
 		if err != nil {
@@ -3794,7 +3828,11 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
 		}
 
-		want := []string{"bootout " + launchd.target()}
+		want := []string{
+			"bootout " + launchd.target(),
+			"print " + launchd.target(),
+			"print-disabled " + launchd.domain(),
+		}
 		if !reflect.DeepEqual(fake.commands, want) {
 			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
 		}
@@ -3835,8 +3873,9 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			bootstrapped: true,
 			replaced:     true,
 		}
-		if err := launchd.rollback(context.Background(), backup, state, cause); !errors.Is(err, cause) {
-			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
+		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		if !errors.Is(rollbackErr, cause) {
+			t.Errorf("rollback() = %v, want the cause of the failed installation", rollbackErr)
 		}
 
 		want := []string{
@@ -3844,6 +3883,8 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			"bootstrap " + launchd.domain() + " " + path,
 			"kickstart " + launchd.target(),
 			"enable " + launchd.target(),
+			"print " + launchd.target(),
+			"print-disabled " + launchd.domain(),
 		}
 		if !reflect.DeepEqual(fake.commands, want) {
 			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
@@ -3855,6 +3896,166 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 		}
 		if string(content) != restored {
 			t.Errorf("the restored registration = %q, want %q", content, restored)
+		}
+		if !strings.Contains(rollbackErr.Error(), "(the registration was restored)") {
+			t.Errorf("rollback() = %v, want the outcome that names the restored registration", rollbackErr)
+		}
+	})
+
+	t.Run("a registration that cannot be read back is unknown", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{
+			loaded:  true,
+			running: true,
+			pid:     darwinFakePID,
+			failures: map[string]error{
+				"print": errors.New("service: launchctl print: exit status 1"),
+			},
+		}
+		launchd.run = fake.run
+		backup, path := writeRegistration(t, launchd)
+
+		cause := errors.New("service: bootstrap " + launchd.target() + ": exit status 1")
+		state := launchdLoadState{
+			previous:      launchdSupervisorState{loaded: true, running: true},
+			bootstrapped:  true,
+			replaced:      true,
+			previousKnown: true,
+		}
+		err := launchd.rollback(context.Background(), backup, state, cause)
+		if !errors.Is(err, cause) {
+			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
+		}
+		if !strings.Contains(err.Error(), "could not be read back") {
+			t.Errorf("rollback() = %v, want an outcome that names the unprovable read back", err)
+		}
+		if strings.Contains(err.Error(), "was restored") {
+			t.Errorf("rollback() = %v, want no restoration claim the read back did not prove", err)
+		}
+		// The property list is restored even then.
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatalf("read the registration: %v", readErr)
+		}
+		if string(content) != previous {
+			t.Errorf("the restored registration = %q, want %q", content, previous)
+		}
+	})
+
+	t.Run("a registration the supervisor does not give back is not restored", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		// The job the attempt found is gone from the supervisor by the
+		// time the rollback reads it back: the restore cannot claim the
+		// previous state again.
+		fake := &darwinFakeLaunchd{loaded: false}
+		launchd.run = fake.run
+		backup, _ := writeRegistration(t, launchd)
+
+		cause := errors.New("service: bootstrap " + launchd.target() + ": exit status 1")
+		state := launchdLoadState{
+			previous:      launchdSupervisorState{loaded: true},
+			previousKnown: true,
+		}
+		err := launchd.rollback(context.Background(), backup, state, cause)
+		if !errors.Is(err, cause) {
+			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
+		}
+		if !strings.Contains(err.Error(), "does not hold the previous state again") {
+			t.Errorf("rollback() = %v, want an outcome that names the observed mismatch", err)
+		}
+		if strings.Contains(err.Error(), "(the registration was restored)") {
+			t.Errorf("rollback() = %v, want no restoration claim for a mismatching read back", err)
+		}
+	})
+
+	t.Run("a running instance that does not come back is not confirmed", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		// The supervisor loads the restored registration but the instance
+		// never comes up: the registration matches, the running state the
+		// rollback has to give back does not.
+		fake := &darwinFakeLaunchd{startIgnored: true}
+		launchd.run = fake.run
+
+		restored, err := renderPlistWithRunAtLoad(darwinTempInstallOptions(t, t.TempDir()), nil, false)
+		if err != nil {
+			t.Fatalf("renderPlistWithRunAtLoad(): %v", err)
+		}
+		path := launchd.plistPath()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("create the registration directory: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(restored), plistMode); err != nil {
+			t.Fatalf("write the registration: %v", err)
+		}
+		backup, err := backupPlist(path)
+		if err != nil {
+			t.Fatalf("backupPlist(): %v", err)
+		}
+		if err := os.WriteFile(path, []byte("<plist>the registration of the failed installation</plist>"), plistMode); err != nil {
+			t.Fatalf("write the registration of the failed installation: %v", err)
+		}
+
+		cause := errors.New("service: bootstrap " + launchd.target() + ": exit status 1")
+		state := launchdLoadState{
+			previous:      launchdSupervisorState{loaded: true, running: true},
+			bootstrapped:  true,
+			replaced:      true,
+			previousKnown: true,
+		}
+		err = launchd.rollback(context.Background(), backup, state, cause)
+		if !errors.Is(err, cause) {
+			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
+		}
+		if !strings.Contains(err.Error(), "was restored, but the instance was not confirmed running") {
+			t.Errorf("rollback() = %v, want the outcome that separates the registration from the instance", err)
+		}
+		// The kickstart of the RunAtLoad false registration still runs:
+		// the rollback starts the instance it restored, it just does not
+		// report a start it cannot prove.
+		want := []string{
+			"bootout " + launchd.target(),
+			"bootstrap " + launchd.domain() + " " + path,
+			"kickstart " + launchd.target(),
+			"enable " + launchd.target(),
+			"print " + launchd.target(),
+			"print-disabled " + launchd.domain(),
+		}
+		if !reflect.DeepEqual(fake.commands, want) {
+			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
+		}
+	})
+
+	t.Run("a rollback without a captured state does not claim a restoration", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{loaded: true, running: true, pid: darwinFakePID}
+		launchd.run = fake.run
+		backup, path := writeRegistration(t, launchd)
+
+		// The attempt failed before it read the state of the
+		// registration: there is no previous state to compare a read
+		// back against, so the rollback proves only what it did itself.
+		cause := errors.New("service: print " + launchd.target() + ": exit status 1")
+		err := launchd.rollback(context.Background(), backup, launchdLoadState{}, cause)
+		if !errors.Is(err, cause) {
+			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
+		}
+		if !strings.Contains(err.Error(), "the property list was restored") ||
+			!strings.Contains(err.Error(), "the previous state of the registration was not captured") {
+			t.Errorf("rollback() = %v, want the outcome that names the restored file and the uncaptured state", err)
+		}
+		if strings.Contains(err.Error(), "(the registration was restored)") {
+			t.Errorf("rollback() = %v, want no restoration claim without a captured state", err)
+		}
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatalf("read the registration: %v", readErr)
+		}
+		if string(content) != previous {
+			t.Errorf("the restored registration = %q, want %q", content, previous)
+		}
+		// Nothing without a captured state touches the supervisor.
+		if len(fake.commands) != 0 {
+			t.Errorf("the commands of the manager = %v, want none", fake.commands)
 		}
 	})
 }
@@ -4171,6 +4372,116 @@ func TestLaunchdRepeatInstallRestartsARunningInstance(t *testing.T) {
 	if registration.executable() != next.Executable {
 		t.Errorf("the executable = %q, want the request %q", registration.executable(), next.Executable)
 	}
+}
+
+// TestLaunchdRefusesAnUpdateThatCannotTellWhetherTheInstanceRuns checks
+// that the update plan never guesses the running fact.
+//
+// Apple documents the format of "launchctl print" as unstable: an output
+// that names neither a state nor a process id leaves the running fact
+// undetermined. The update then refuses instead of treating the instance
+// as stopped — the stopped-instance branch would unload a job that may
+// run and leave the instance down. With a reported fact the behavior is
+// unchanged: a loaded job that does not run keeps the stopped-instance
+// branch of the update.
+func TestLaunchdRefusesAnUpdateThatCannotTellWhetherTheInstanceRuns(t *testing.T) {
+	ctx := context.Background()
+
+	// changedOptions returns a request whose property list differs from
+	// the registration of the test, so the update takes the branch it
+	// would take over a stopped instance.
+	changedOptions := func(t *testing.T, root string) InstallOptions {
+		t.Helper()
+		opts := darwinTempInstallOptions(t, root)
+		opts.Listen = "127.0.0.1:9911"
+		opts.Explicit.Listen = true
+		return opts
+	}
+
+	t.Run("a reported running fact keeps the stopped instance stopped", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{loaded: true}
+		launchd.run = fake.run
+		root := t.TempDir()
+		darwinWriteRegistrationWithRunAtLoad(t, launchd, darwinTempInstallOptions(t, root), false)
+
+		fake.commands = nil
+		if _, err := launchd.Install(ctx, changedOptions(t, root)); err != nil {
+			t.Fatalf("Install() over a stopped instance: %v", err)
+		}
+		unloaded := false
+		for _, command := range fake.commands {
+			if command == "bootout "+launchd.target() {
+				unloaded = true
+			}
+		}
+		if !unloaded {
+			t.Errorf("the commands of the manager = %v, want the unload of the stale registration", fake.commands)
+		}
+		if fake.loaded {
+			t.Error("the stale registration is still loaded after the update")
+		}
+	})
+
+	t.Run("an unreported running fact refuses before the supervisor is touched", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{
+			loaded:             true,
+			running:            true,
+			pid:                darwinFakePID,
+			withoutRunningFact: true,
+		}
+		launchd.run = fake.run
+		root := t.TempDir()
+		darwinWriteRegistrationWithRunAtLoad(t, launchd, darwinTempInstallOptions(t, root), false)
+		before, err := os.ReadFile(launchd.plistPath())
+		if err != nil {
+			t.Fatalf("read the registration: %v", err)
+		}
+
+		fake.commands = nil
+		if _, err := launchd.Install(ctx, changedOptions(t, root)); err == nil {
+			t.Fatal("Install() = nil, want the refusal of an undetermined running fact")
+		} else {
+			for _, want := range []string{
+				"the installation was refused",
+				"neither a state nor a process id",
+				`Stop the instance with "hfdesk service stop"`,
+				`run "hfdesk service install" again`,
+				"(the registration was restored)",
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Install() = %q, want a message that mentions %q", err, want)
+				}
+			}
+			if strings.Contains(err.Error(), " or ") {
+				t.Errorf("Install() = %q, want one action instead of an alternative", err)
+			}
+		}
+
+		// The refusal leaves the supervisor and the registration exactly
+		// as they were: the running instance is neither unloaded nor
+		// started, and the property list of the attempt is restored.
+		for _, command := range fake.commands {
+			if strings.HasPrefix(command, "bootout ") || strings.HasPrefix(command, "bootstrap ") ||
+				strings.HasPrefix(command, "kickstart ") || strings.HasPrefix(command, "kill ") {
+				t.Errorf("the refused installation issued the mutating command %q: %v", command, fake.commands)
+			}
+		}
+		if !fake.loaded || !fake.running {
+			t.Errorf("the refused installation stopped the running registration (loaded %v, running %v)", fake.loaded, fake.running)
+		}
+		if fake.disabled {
+			t.Error("the refused installation changed the disabled flag")
+		}
+		after, err := os.ReadFile(launchd.plistPath())
+		if err != nil {
+			t.Fatalf("read the registration: %v", err)
+		}
+		if !bytes.Equal(after, before) {
+			t.Errorf("the refused installation left the registration %q, want %q", after, before)
+		}
+	})
 }
 
 // TestLaunchdRepeatInstallKeepsTheDataDirectories checks that an update never

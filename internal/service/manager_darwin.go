@@ -1129,15 +1129,25 @@ type launchdInstallPlan struct {
 // preserved as well.
 //
 // The report tells a rollback what the attempt did to the supervisor: the
-// state the registration had before it, whether the attempt loaded the job
-// and whether it took over the registration of a job that was loaded
-// already.
+// state the registration had before it and whether that state was captured,
+// whether the attempt loaded the job and whether it took over the
+// registration of a job that was loaded already.
+//
+// The plan itself fails closed on a fact the supervisor does not report: an
+// output that names neither a state nor a process id leaves the running
+// state of the instance undetermined, and the installation refuses instead
+// of treating a possibly running instance as stopped — the stopped-instance
+// branch would unload a job that may run and leave the instance down.
 func (m *launchdManager) load(ctx context.Context, path string, plan launchdInstallPlan) (launchdLoadState, error) {
 	previous, err := m.supervisorState(ctx)
 	if err != nil {
 		return launchdLoadState{}, err
 	}
-	state := launchdLoadState{previous: previous}
+	state := launchdLoadState{previous: previous, previousKnown: true}
+	if previous.loaded && !previous.runningKnown {
+		return state, fmt.Errorf("service: the installation was refused: the supervisor reports neither a state nor a process id for %s, so whether the instance runs cannot be determined. Stop the instance with %q and run %q again",
+			m.target(), "hfdesk service stop", "hfdesk service install")
+	}
 
 	switch {
 	case previous.running:
@@ -1202,6 +1212,11 @@ func (m *launchdManager) load(ctx context.Context, path string, plan launchdInst
 type launchdLoadState struct {
 	// previous is the state the registration had before the attempt.
 	previous launchdSupervisorState
+	// previousKnown reports whether that state was read successfully. An
+	// attempt that failed before the read has no state to restore and no
+	// reference for a read back, and its rollback claims only the
+	// restoration of the property list it did itself.
+	previousKnown bool
 	// bootstrapped reports whether the attempt loaded the job into its
 	// domain.
 	bootstrapped bool
@@ -1220,14 +1235,21 @@ type launchdSupervisorState struct {
 	// state "running" or the id of a live process. A job that is not
 	// loaded never runs.
 	running bool
+	// runningKnown reports whether the output of the supervisor carried
+	// the running fact at all. Apple documents that output as unstable: an
+	// output that names neither a state nor a process id leaves the fact
+	// undetermined, and a plan that would act on it fails closed instead
+	// of reading "not running" from a missing field.
+	runningKnown bool
 	// disabled reports whether the job is disabled in the override
 	// database of launchd.
 	disabled bool
 }
 
 // supervisorState reports the state of the registration of the instance in
-// the supervisor: whether the job is loaded into its domain, whether it runs
-// and whether it is disabled in the override database of launchd.
+// the supervisor: whether the job is loaded into its domain, whether it runs,
+// whether that running fact is reported at all and whether it is disabled in
+// the override database of launchd.
 func (m *launchdManager) supervisorState(ctx context.Context) (launchdSupervisorState, error) {
 	loaded, output, err := m.printState(ctx)
 	if err != nil {
@@ -1236,10 +1258,14 @@ func (m *launchdManager) supervisorState(ctx context.Context) (launchdSupervisor
 	state := launchdSupervisorState{
 		loaded:   loaded,
 		disabled: m.jobDisabled(ctx),
+		// A job that is not loaded never runs: the fact is known
+		// without an output to read it from.
+		runningKnown: !loaded,
 	}
 	if loaded {
 		jobState, _, pid := launchdPrintFields(output)
 		state.running = launchdJobRunning(jobState, pid)
+		state.runningKnown = jobState != "" || pid > 0
 	}
 	return state, nil
 }
@@ -1408,8 +1434,12 @@ func (e *stopTimeoutError) Error() string {
 // The state of the supervisor is restored as well: the instance may have
 // been running before the installation, and a rollback that only restores the
 // file would leave a registration that claims to be running while nothing
-// runs. A state that cannot be restored is reported, so the failure of the
-// installation never hides the failure of the rollback.
+// runs. The restored registration is then read back the same way the attempt
+// read it, and the returned error preserves the cause of the installation
+// while naming only the outcome the read proves — restored, not restored or
+// a restored registration whose instance is not confirmed running — so the
+// failure of the installation never hides the failure of the rollback and a
+// success is never claimed from the write alone.
 func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, state launchdLoadState, cause error) error {
 	// The registration of the failed attempt is unloaded when the attempt
 	// loaded the job or took over the registration of a job that was
@@ -1458,7 +1488,39 @@ func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, stat
 			return fmt.Errorf("%w (the restored registration could not be enabled: %v)", cause, err)
 		}
 	}
-	return cause
+	return m.verifyRestoredRegistration(ctx, state, cause)
+}
+
+// verifyRestoredRegistration reads the restored registration back and turns
+// the state the supervisor reports into the outcome of the rollback,
+// preserving the cause of the failed installation.
+//
+// The read decides, not the commands that succeeded: the registration was
+// restored only when the loaded state and the override flag match the state
+// the rollback gave back, and an instance that ran before the attempt has to
+// be observed running for that full claim. Everything the read cannot prove —
+// a state it cannot reach, a state that does not match, an instance that does
+// not come back — is reported as what it is. The read runs on a context of
+// its own: a cancelled installation must not degrade its own rollback report
+// into unknown.
+func (m *launchdManager) verifyRestoredRegistration(ctx context.Context, state launchdLoadState, cause error) error {
+	if !state.previousKnown {
+		// The attempt failed before it captured the state of the
+		// registration: there is nothing to compare a read back
+		// against, and the rollback claims only what it did itself.
+		return fmt.Errorf("%w (the property list was restored; the previous state of the registration was not captured)", cause)
+	}
+	readback, err := m.supervisorState(context.WithoutCancel(ctx))
+	if err != nil {
+		return fmt.Errorf("%w (the state of the restored registration could not be read back: %v)", cause, err)
+	}
+	if readback.loaded != state.previous.loaded || readback.disabled != state.previous.disabled {
+		return fmt.Errorf("%w (the registration does not hold the previous state again)", cause)
+	}
+	if state.previous.running && !readback.running {
+		return fmt.Errorf("%w (the registration was restored, but the instance was not confirmed running)", cause)
+	}
+	return fmt.Errorf("%w (the registration was restored)", cause)
 }
 
 // plistBackup is the state of a property list before it was overwritten.
