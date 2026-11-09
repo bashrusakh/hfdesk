@@ -364,19 +364,26 @@ func loadedMatchesCanonicalCommand(loaded systemdLoadedConfig, unit canonicalUni
 // instead of overwriting it. The loaded side is the typed D-Bus projection
 // of registrationUnitConfig, and an unloaded unit has no effective command
 // to defend.
-func detectExecStartOverride(unitPath string, loaded systemdLoadedConfig, unit canonicalUnit) error {
+func detectExecStartOverride(loaded systemdLoadedConfig, unit canonicalUnit, scope Scope) error {
 	if !loaded.loaded {
 		return nil
 	}
 	if err := loadedMatchesCanonicalCommand(loaded, unit); err != nil {
-		return execStartOverrideRefusal(unitPath, loaded)
+		return execStartOverrideRefusal(loaded, scope)
 	}
 	return nil
 }
 
 // execStartOverrideRefusal states the result, the cause with the DropInPaths
 // the supervisor reports, and the one next action of the ownership contract.
-func execStartOverrideRefusal(unitPath string, loaded systemdLoadedConfig) error {
+//
+// The action must clear the cause: an ExecStart= override a drop-in carries
+// is removed from the exact drop-in file that carries it — moving
+// customizations into local.conf cannot clear an override that already lives
+// in that very file — and a loaded command no reported drop-in explains
+// comes from a configuration the supervisor loaded earlier, which only a
+// reload reads again.
+func execStartOverrideRefusal(loaded systemdLoadedConfig, scope Scope) error {
 	cause := fmt.Sprintf("the command systemd loads for %s is not the command in its unit file", unitName)
 	if loaded.dropInPathsKnown && len(loaded.dropInPaths) > 0 {
 		quoted := make([]string, 0, len(loaded.dropInPaths))
@@ -385,8 +392,43 @@ func execStartOverrideRefusal(unitPath string, loaded systemdLoadedConfig) error
 		}
 		cause += fmt.Sprintf(" (drop-ins: %s)", strings.Join(quoted, ", "))
 	}
-	return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Move your customizations into %q and run %q again",
-		cause, unitDropInPath(unitPath), "hfdesk service install")
+	install := "hfdesk service install"
+	if owner := execStartOverrideDropIn(loaded.dropInPaths); owner != "" {
+		return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Remove the %q override from %q and run %q again",
+			cause, "ExecStart=", owner, install)
+	}
+	return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Reload the unit files with %q and run %q again",
+		cause, scopeSupervisorHint(scope)+" daemon-reload", install)
+}
+
+// execStartOverrideDropIn returns the drop-in that carries an ExecStart=
+// override: the last path the supervisor reports whose file holds such a
+// directive, because the last drop-in loaded wins. A file that cannot be
+// read proves nothing and returns the empty string.
+func execStartOverrideDropIn(paths []string) string {
+	owner := ""
+	for _, path := range paths {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if dropInHoldsExecStart(content) {
+			owner = path
+		}
+	}
+	return owner
+}
+
+// dropInHoldsExecStart reports whether a drop-in carries an ExecStart=
+// directive, the one directive of a drop-in that changes the command the
+// supervisor loads.
+func dropInHoldsExecStart(content []byte) bool {
+	for _, line := range strings.Split(string(content), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "ExecStart=") {
+			return true
+		}
+	}
+	return false
 }
 
 // detectForeignRegistration refuses a registration whose loaded unit does

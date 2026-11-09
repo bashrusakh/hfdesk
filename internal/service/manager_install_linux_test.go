@@ -1381,6 +1381,173 @@ func TestSystemdInstallRefusesARuntimeMaskedUnit(t *testing.T) {
 	}
 }
 
+// TestSystemdInstallRefusesAPersistentMaskWithoutTheSupervisorAnswer checks
+// that the file evidence of a persistent mask refuses the installation even
+// when "systemctl is-enabled" cannot be reached.
+//
+// A persistent mask is the symbolic link to /dev/null at the unit path, and
+// that link answers without the supervisor. An unreachable supervisor degrades
+// the printed state to an empty answer — "no mask" — and the update must not
+// fall through to the hand-edit refusal then: its action moves customizations
+// into local.conf, which never clears a mask. The refusal names the plain
+// unmask command of the persistent mask instead, and an empty answer without
+// a mask at the unit path still refuses nothing.
+func TestSystemdInstallRefusesAPersistentMaskWithoutTheSupervisorAnswer(t *testing.T) {
+	t.Run("the mask at the unit path refuses", func(t *testing.T) {
+		logPath := systemdRecordingSupervisor(t)
+		root := t.TempDir()
+		oldExecutable := systemdTestExecutable(t)
+		newExecutable := systemdTestExecutable(t)
+		previous := systemdExistingOptions(t, oldExecutable, root)
+
+		m, unitPath, _ := systemdExistingInstallation(t, previous)
+		if err := os.Remove(unitPath); err != nil {
+			t.Fatalf("remove the unit file: %v", err)
+		}
+		if err := os.Symlink(os.DevNull, unitPath); err != nil {
+			t.Fatalf("mask the unit: %v", err)
+		}
+		t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+		t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", oldExecutable)
+		t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLED_STATE", "unavailable")
+
+		request := systemdTempInstallOptions(t, root)
+		request.Executable = newExecutable
+		_, err := m.Install(context.Background(), request)
+		if err == nil {
+			t.Fatal("Install() = nil, want the refusal of the masked unit without a supervisor answer")
+		}
+		for _, want := range []string{
+			unitName,
+			"is masked",
+			"does not replace the mask",
+			"systemctl --user unmask " + unitName,
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("Install() = %q, want an error that mentions %q", err, want)
+			}
+		}
+		if strings.Contains(err.Error(), "--runtime") {
+			t.Errorf("Install() = %q, want the plain unmask command for a persistent mask", err)
+		}
+		// The degraded mask read must not fall through to the hand-edit
+		// refusal: its action never clears the mask.
+		for _, wrong := range []string{
+			"is not the unit HFDesk generates",
+			"Move your customizations into",
+		} {
+			if strings.Contains(err.Error(), wrong) {
+				t.Errorf("Install() = %q, want no hand-edit refusal (%q) for a mask", err, wrong)
+			}
+		}
+
+		// The mask itself is untouched, and the supervisor is asked
+		// nothing but the mask: never unmasked, never reloaded.
+		info, lstatErr := os.Lstat(unitPath)
+		if lstatErr != nil {
+			t.Fatalf("the unit path is gone after the refused installation: %v", lstatErr)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("the unit path is no mask any more (mode %s), want a symbolic link", info.Mode())
+		}
+		if target, readErr := os.Readlink(unitPath); readErr != nil || target != os.DevNull {
+			t.Errorf("the unit path points at %q (error: %v), want the mask %q", target, readErr, os.DevNull)
+		}
+		calls := systemdSupervisorCalls(t, logPath)
+		for _, call := range calls {
+			got := strings.TrimPrefix(call, "--user ")
+			if got != "is-enabled "+unitName {
+				t.Errorf("the refused installation called the supervisor with unexpected command %q:\n%s", call, strings.Join(calls, "\n"))
+			}
+			if strings.Contains(got, "unmask") {
+				t.Errorf("the refused installation unmasked the unit itself (%q):\n%s", call, strings.Join(calls, "\n"))
+			}
+		}
+		for _, command := range [][]string{
+			{"daemon-reload"},
+			{"enable", unitName},
+			{"restart", unitName},
+			{"stop", unitName},
+		} {
+			if got := systemdSupervisorCallsTo(calls, command...); got != 0 {
+				t.Errorf("the refused installation called %q %d times:\n%s", strings.Join(command, " "), got, strings.Join(calls, "\n"))
+			}
+		}
+	})
+
+	t.Run("without the mask the empty answer refuses nothing", func(t *testing.T) {
+		logPath := systemdRecordingSupervisor(t)
+		root := t.TempDir()
+		oldExecutable := systemdTestExecutable(t)
+		newExecutable := systemdTestExecutable(t)
+		previous := systemdExistingOptions(t, oldExecutable, root)
+
+		m, unitPath, _ := systemdExistingInstallation(t, previous)
+		t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+		t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
+		t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLED_STATE", "unavailable")
+
+		if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
+			t.Fatalf("Install() = %v, want the empty answer without a mask to refuse nothing", err)
+		}
+		info, lstatErr := os.Lstat(unitPath)
+		if lstatErr != nil {
+			t.Fatalf("read the unit path: %v", lstatErr)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			t.Fatalf("the unit path became a link (mode %s), want the written unit file", info.Mode())
+		}
+		calls := systemdSupervisorCalls(t, logPath)
+		if got := systemdSupervisorCallsTo(calls, "is-enabled", unitName); got != 1 {
+			t.Errorf("the enablement was read %d times, want once:\n%s", got, strings.Join(calls, "\n"))
+		}
+		for _, call := range calls {
+			if strings.Contains(strings.TrimPrefix(call, "--user "), "unmask") {
+				t.Errorf("the installation unmasked the unit (%q):\n%s", call, strings.Join(calls, "\n"))
+			}
+		}
+	})
+}
+
+// TestUnitPathPersistentMask checks the file evidence of a persistent mask:
+// the symbolic link to /dev/null "systemctl mask" leaves at the unit path.
+// Every other shape of the path — a regular file, an absent path, a link to
+// another target — is not that mask and must not classify as one.
+func TestUnitPathPersistentMask(t *testing.T) {
+	dir := t.TempDir()
+	regular := filepath.Join(dir, "regular.service")
+	if err := os.WriteFile(regular, []byte("[Unit]\n"), 0o644); err != nil {
+		t.Fatalf("write the regular file: %v", err)
+	}
+	masked := filepath.Join(dir, "masked.service")
+	if err := os.Symlink(os.DevNull, masked); err != nil {
+		t.Fatalf("mask the unit: %v", err)
+	}
+	linked := filepath.Join(dir, "linked.service")
+	if err := os.Symlink(regular, linked); err != nil {
+		t.Fatalf("link the unit: %v", err)
+	}
+	missing := filepath.Join(dir, "missing.service")
+
+	cases := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"a link to /dev/null", masked, true},
+		{"a regular file", regular, false},
+		{"an absent path", missing, false},
+		{"a link to another file", linked, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := unitPathPersistentMask(tc.path); got != tc.want {
+				t.Errorf("unitPathPersistentMask(%q) = %v, want %v", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestSystemdEnablementFailureIsAFailedInstallation checks that the enable of a
 // first installation keeps its error handling: a registration the supervisor
 // refuses to enable is a failed installation, and the unit file the

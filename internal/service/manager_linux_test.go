@@ -153,7 +153,11 @@ func waitForState(t *testing.T, ctx context.Context, m *systemdManager, want Sta
 // mask, which the fake supervisor reports while a unit file may exist;
 // "masked-runtime" is the state of a unit masked at runtime, which a test
 // combines with an absent unit file, because the mask lives in /run and leaves
-// nothing at the unit path. For both mask states "show" reports
+// nothing at the unit path. "unavailable" prints nothing on standard output
+// and exits with a non-zero status, the way a supervisor the manager cannot
+// reach answers, so a test can drive a mask read that degrades to an empty
+// answer while every other command of the fake keeps working. For both mask
+// states "show" reports
 // LoadState=masked with no active instance as well, whether or not a unit file
 // exists, the way the real supervisor answers a masked unit. "not-found" is what
 // a fresh machine reports for a unit it does not know. An "enable" that fails once
@@ -190,6 +194,14 @@ fi
 case "$1" in
 is-enabled)
 	state="${HFDESK_TEST_SYSTEMCTL_ENABLED_STATE:-enabled}"
+	if [ "$state" = "unavailable" ]; then
+		# A supervisor the manager cannot reach prints nothing on
+		# standard output and exits with a non-zero status: the mask
+		# read of the manager degrades to an empty answer, the way an
+		# unreachable user bus answers.
+		echo "Failed to connect to bus: No medium found" >&2
+		exit 1
+	fi
 	echo "$state"
 	case "$state" in
 	enabled|enabled-runtime|static|indirect|alias|linked)

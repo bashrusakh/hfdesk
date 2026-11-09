@@ -87,19 +87,22 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 		return InstallOptions{}, err
 	}
 
-	// The mask is asked of the supervisor before anything else is judged: a
-	// persistent mask is a link to /dev/null whose bytes are no unit at
-	// all, so the hand-edit detector must not misclassify it; a runtime mask
-	// lives in /run and leaves no file at the unit path; and both mask kinds
-	// report LoadState="masked", so a masked unit has no loaded registration
-	// whose read could describe it — that read must not turn the refusal
-	// into a generic read error without the unmask action. The printed state
-	// decides; a masked unit refuses the installation instead of being
-	// replaced, is never unmasked, and its refusal names the unmask command
-	// of the observed mask kind. A fresh machine answers "not-found",
-	// which is no mask.
+	// The mask is judged before anything else is reported: a masked unit
+	// refuses the installation instead of being replaced, is never
+	// unmasked, and its refusal names the unmask command of the observed
+	// mask kind. The supervisor answers when it can be reached — a runtime
+	// mask ("systemctl mask --runtime") lives in /run and leaves no file
+	// at the unit path, and both mask kinds report LoadState="masked", so
+	// a masked unit has no loaded registration whose read could describe
+	// it — that read must not turn the refusal into a generic read error
+	// without the unmask action. The persistent mask answers on its own
+	// from the file: the symbolic link to /dev/null at the unit path,
+	// whose bytes are no unit at all, so the hand-edit detector must not
+	// misclassify it either. An unreachable supervisor degrades the printed
+	// state to an empty answer and the link still refuses; a fresh machine
+	// answers "not-found" with no link, which is no mask.
 	enablement := m.registrationEnablement(ctx)
-	if enablement.masked {
+	if enablement.masked || unitPathPersistentMask(path) {
 		return opts, m.maskedUnitRefusal(enablement.maskedRuntime)
 	}
 
@@ -165,7 +168,7 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 		loadedKnown = true
 	}
 	if registered && loaded.loaded {
-		if err := detectExecStartOverride(path, loaded, previous.facts); err != nil {
+		if err := detectExecStartOverride(loaded, previous.facts, m.scope); err != nil {
 			return opts, err
 		}
 	}
@@ -410,14 +413,24 @@ func enablementOf(state string) registrationEnablement {
 // alone on a repeat installation, and the unreachable supervisor still fails the
 // installation at the reload.
 //
-// The mask is part of the answer for the same reason: a persistent mask is a
-// link to /dev/null at the unit path, but a runtime mask ("systemctl mask
-// --runtime") lives in /run and leaves no file there, so the masked state is
-// only visible through the supervisor. A fresh machine reports "not-found" and
-// is not masked, which is what a first installation needs.
+// The runtime mask is part of the answer for the same reason: "systemctl
+// mask --runtime" lives in /run and leaves no file at the unit path, so that
+// kind of mask is visible only through the supervisor. The persistent mask —
+// the link to /dev/null at the unit path — is checked from the file as well,
+// because this answer degrades to "no mask" when the supervisor cannot be
+// reached. A fresh machine reports "not-found" and is not masked, which is
+// what a first installation needs.
 func (m *systemdManager) registrationEnablement(ctx context.Context) registrationEnablement {
 	out, _ := m.runSystemctl(ctx, "is-enabled", unitName)
 	return enablementOf(strings.TrimSpace(out))
+}
+
+// unitPathPersistentMask reports whether the unit path itself is a
+// persistent mask: the symbolic link to /dev/null "systemctl mask" leaves
+// there. The link is file evidence that answers without the supervisor.
+func unitPathPersistentMask(path string) bool {
+	target, err := os.Readlink(path)
+	return err == nil && target == os.DevNull
 }
 
 // maskedUnitRefusal returns the error of an installation over a masked unit.

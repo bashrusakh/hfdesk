@@ -353,7 +353,6 @@ func setSystemdTypedPropertySequence(t *testing.T, manager *systemdManager, prop
 }
 
 func TestSystemdDetectExecStartOverride(t *testing.T) {
-	unitPath := "/etc/systemd/system/hfdesk.service"
 	content := []byte(canonicalGoldenSystemUnitText)
 	t.Setenv("HOME", "/home/golden")
 	facts, err := readCanonicalUnit(content, ScopeSystem)
@@ -365,10 +364,10 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode the matching typed configuration: %v", err)
 	}
-	if err := detectExecStartOverride(unitPath, matching, facts); err != nil {
+	if err := detectExecStartOverride(matching, facts, ScopeSystem); err != nil {
 		t.Errorf("detectExecStartOverride() over the matching command = %v, want nil", err)
 	}
-	if err := detectExecStartOverride(unitPath, systemdLoadedConfig{}, facts); err != nil {
+	if err := detectExecStartOverride(systemdLoadedConfig{}, facts, ScopeSystem); err != nil {
 		t.Errorf("detectExecStartOverride() over an unloaded unit = %v, want nil", err)
 	}
 
@@ -390,19 +389,84 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		return properties
 	}
 
+	// writeDropIn writes a drop-in file and returns its path: the update
+	// reads the drop-ins the supervisor reports to find the file that
+	// carries the override.
+	writeDropIn := func(t *testing.T, name, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write the drop-in: %v", err)
+		}
+		return path
+	}
+
 	t.Run("drop-in owns the effective command", func(t *testing.T) {
-		loaded, err := loadedConfigFromProperties(driftedProperties([]string{"/etc/systemd/system/hfdesk.service.d/local.conf"}))
+		dropIn := writeDropIn(t, "local.conf", "[Service]\nExecStart="+strings.Join(override, " ")+"\n")
+		loaded, err := loadedConfigFromProperties(driftedProperties([]string{dropIn}))
 		if err != nil {
 			t.Fatalf("decode the typed override: %v", err)
 		}
-		err = detectExecStartOverride(unitPath, loaded, facts)
+		err = detectExecStartOverride(loaded, facts, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the refusal of an overridden command")
 		}
-		if !strings.Contains(err.Error(), `drop-ins: "/etc/systemd/system/hfdesk.service.d/local.conf"`) {
+		if !strings.Contains(err.Error(), `drop-ins: "`+dropIn+`"`) {
 			t.Errorf("the refusal %q does not name the DropInPaths the supervisor reported", err)
 		}
-		assertSingleDropInAction(t, err, unitPath)
+		// The override already lives in local.conf, the very file the
+		// install summary recommends: the action must remove it there
+		// instead of moving customizations into the same file again.
+		assertSingleRemoveOverrideAction(t, err, dropIn)
+	})
+
+	t.Run("two drop-ins, only the second carries the override", func(t *testing.T) {
+		decoy := writeDropIn(t, "00-other.conf", "[Service]\nEnvironment=HF_HUB_CACHE=/operator/hub\n")
+		owner := writeDropIn(t, "local.conf", "[Service]\nExecStart="+strings.Join(override, " ")+"\n")
+		loaded, err := loadedConfigFromProperties(driftedProperties([]string{decoy, owner}))
+		if err != nil {
+			t.Fatalf("decode the typed override: %v", err)
+		}
+		err = detectExecStartOverride(loaded, facts, ScopeSystem)
+		if err == nil {
+			t.Fatal("detectExecStartOverride() = nil, want the refusal of an overridden command")
+		}
+		// The action names the exact file that carries the override, not
+		// the first drop-in the supervisor reports.
+		assertSingleRemoveOverrideAction(t, err, owner)
+		if strings.Contains(err.Error(), `Remove the "ExecStart=" override from "`+decoy+`"`) {
+			t.Errorf("the refusal %q names the removal from a drop-in without the override", err)
+		}
+	})
+
+	t.Run("the last reported drop-in that carries an override wins", func(t *testing.T) {
+		first := writeDropIn(t, "00-first.conf", "[Service]\nExecStart=/usr/bin/first --config /one.json\n")
+		last := writeDropIn(t, "local.conf", "[Service]\nExecStart="+strings.Join(override, " ")+"\n")
+		loaded, err := loadedConfigFromProperties(driftedProperties([]string{first, last}))
+		if err != nil {
+			t.Fatalf("decode the typed override: %v", err)
+		}
+		err = detectExecStartOverride(loaded, facts, ScopeSystem)
+		if err == nil {
+			t.Fatal("detectExecStartOverride() = nil, want the refusal of an overridden command")
+		}
+		assertSingleRemoveOverrideAction(t, err, last)
+	})
+
+	t.Run("a drop-in without an override names the reload", func(t *testing.T) {
+		custom := writeDropIn(t, "local.conf", "[Service]\nEnvironment=HF_HUB_CACHE=/operator/hub\n")
+		loaded, err := loadedConfigFromProperties(driftedProperties([]string{custom}))
+		if err != nil {
+			t.Fatalf("decode the typed override: %v", err)
+		}
+		err = detectExecStartOverride(loaded, facts, ScopeSystem)
+		if err == nil {
+			t.Fatal("detectExecStartOverride() = nil, want the refusal of a drifted command")
+		}
+		// No reported drop-in carries an ExecStart=: the loaded command
+		// predates the file the supervisor holds, and only a reload makes
+		// the supervisor read it again.
+		assertSingleReloadAction(t, err, "systemctl")
 	})
 
 	t.Run("drift without a reported drop-in", func(t *testing.T) {
@@ -410,14 +474,14 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode the typed override: %v", err)
 		}
-		err = detectExecStartOverride(unitPath, loaded, facts)
+		err = detectExecStartOverride(loaded, facts, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the fail-closed refusal of a drifted command")
 		}
 		if strings.Contains(err.Error(), "(drop-ins:") {
 			t.Errorf("the refusal %q names drop-ins the supervisor did not report", err)
 		}
-		assertSingleDropInAction(t, err, unitPath)
+		assertSingleReloadAction(t, err, "systemctl")
 	})
 
 	t.Run("command with loaded flags", func(t *testing.T) {
@@ -427,11 +491,11 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode the typed command: %v", err)
 		}
-		err = detectExecStartOverride(unitPath, loaded, facts)
+		err = detectExecStartOverride(loaded, facts, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the refusal of a command the file does not describe")
 		}
-		assertSingleDropInAction(t, err, unitPath)
+		assertSingleReloadAction(t, err, "systemctl")
 	})
 }
 

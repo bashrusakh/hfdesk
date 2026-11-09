@@ -501,13 +501,18 @@ Two parties touch the systemd registration, and each owns its own files:
   never registered stays absent.
 - **The administrator owns the drop-ins** — every `*.conf` file in
   `hfdesk.service.d/` beside the unit; `<unit directory>/hfdesk.service.d/local.conf`
-  is the path the error messages name. HFDesk never writes, moves or deletes
+  is the path the refusal messages recommend for customizations. HFDesk never
+  writes, moves or deletes
   a drop-in, and it does not create the directory or the file — the
   administrator does, once. systemd composes the unit file and its drop-ins
   into the configuration it loads, and HFDesk judges its result by that
   loaded configuration. Every customization belongs there instead of into the
   unit file: environment values, environment files, supplementary groups, a
-  working directory or account, restart policy, hardening, limits.
+  working directory or account, restart policy, hardening, limits — except
+  `ExecStart=`, which HFDesk owns: an `ExecStart=` override in a drop-in
+  (`local.conf` included) is refused and must be **removed** from the drop-in
+  that carries it, never moved into it, because the command of the instance
+  comes only from the install flags.
 
 **What an update preserves.** An installation over an existing registration
 keeps everything the command does not name again:
@@ -555,9 +560,13 @@ names the cause, and then states exactly one next action:
 2. **A drop-in that owns the command.** `ExecStart=` is the field HFDesk
    owns. When systemd loads a command that differs from the one in the unit
    file — because a drop-in overrides it — the update refuses before any
-   change and names the drop-in paths the supervisor reports. The command of
-   the instance is changed by naming the install flags again, never by a
-   drop-in.
+   change and names the drop-in paths the supervisor reports. The one next
+   action must clear that cause: it names the exact drop-in file that carries
+   the override — *remove the `ExecStart=` override from that file*, with
+   `local.conf` itself no exception — and when no reported drop-in carries
+   one, it names a reload of the unit files, which makes the supervisor read
+   the command of the file again. The command of the instance is changed by
+   naming the install flags again, never by a drop-in.
 3. **A foreign or vendor fragment.** When systemd loads a unit under the
    HFDesk name from a file HFDesk did not write — a packaged or generated
    fragment — the update refuses instead of adopting it or writing over it.

@@ -125,7 +125,13 @@ func (m *systemdManager) systemctlArgs(args ...string) []string {
 // supervisorHint returns the command a user can run to inspect the unit of
 // the manager scope.
 func (m *systemdManager) supervisorHint() string {
-	if m.scope == ScopeUser {
+	return scopeSupervisorHint(m.scope)
+}
+
+// scopeSupervisorHint returns the command a user can run to inspect a unit
+// of the given scope.
+func scopeSupervisorHint(scope Scope) string {
+	if scope == ScopeUser {
 		return "systemctl --user"
 	}
 	return "systemctl"

@@ -1757,7 +1757,18 @@ func TestSystemdReinstallRefusesAShadowedLoadedCommand(t *testing.T) {
 	}
 	loadedEnvironment := []string{"HF_HUB_CACHE=/operator/hub", "HOME=" + home}
 	loadedProperties := systemdTypedProperties(oldExecutable, loadedArgv, loadedEnvironment, previous.Paths.StateDir, "", "", nil)
-	loadedProperties["DropInPaths"] = dbus.MakeVariant([]string{unitDropInPath(unitPath)})
+	// The override really lives in local.conf — the very file the install
+	// summary recommends. The refusal has to read the reported drop-in and
+	// name the removal of the ExecStart= override from that file: moving
+	// customizations into it again would never clear the override.
+	dropInPath := unitDropInPath(unitPath)
+	if err := os.MkdirAll(filepath.Dir(dropInPath), 0o755); err != nil {
+		t.Fatalf("create the drop-in directory: %v", err)
+	}
+	if err := os.WriteFile(dropInPath, []byte("[Service]\nExecStart="+strings.Join(loadedArgv, " ")+"\n"), 0o644); err != nil {
+		t.Fatalf("write the drop-in: %v", err)
+	}
+	loadedProperties["DropInPaths"] = dbus.MakeVariant([]string{dropInPath})
 	m.readServiceProperties = func(context.Context, string) (map[string]dbus.Variant, error) {
 		return loadedProperties, nil
 	}
@@ -1773,7 +1784,7 @@ func TestSystemdReinstallRefusesAShadowedLoadedCommand(t *testing.T) {
 	if !strings.Contains(err.Error(), unitDropInPath(unitPath)) {
 		t.Errorf("Install() = %q, want the refusal to name the DropInPaths the supervisor reported", err)
 	}
-	assertSingleDropInAction(t, err, unitPath)
+	assertSingleRemoveOverrideAction(t, err, unitDropInPath(unitPath))
 
 	content, readErr := os.ReadFile(unitPath)
 	if readErr != nil {
@@ -2167,6 +2178,68 @@ func assertSingleDropInAction(t *testing.T, err error, unitPath string) {
 	}
 	if got := strings.Count(message, "Move your customizations into"); got != 1 {
 		t.Errorf("the refusal %q states %d customization actions, want exactly one", message, got)
+	}
+}
+
+// assertSingleRemoveOverrideAction proves the refusal standard of the
+// ownership contract for an ExecStart= override a drop-in owns: the one
+// named action must clear the cause, so it removes the override from the
+// exact drop-in that carries it — the move into local.conf cannot clear an
+// override that already lives there — and it offers no alternative.
+func assertSingleRemoveOverrideAction(t *testing.T, err error, dropIn string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("the refusal = nil, want a refusal")
+	}
+	message := err.Error()
+	for _, want := range []string{
+		"the update was refused and the registration was not changed",
+		`Remove the "ExecStart=" override from "` + dropIn + `"`,
+		`run "hfdesk service install" again`,
+	} {
+		if !strings.Contains(message, want) {
+			t.Errorf("the refusal %q does not contain %q", message, want)
+		}
+	}
+	if strings.Contains(message, " or ") {
+		t.Errorf("the refusal %q offers an alternative instead of one action", message)
+	}
+	if got := strings.Count(message, `Remove the "ExecStart=" override`); got != 1 {
+		t.Errorf("the refusal %q states %d removal actions, want exactly one", message, got)
+	}
+	if strings.Contains(message, "Move your customizations into") {
+		t.Errorf("the refusal %q names the customization move, which never clears an override", message)
+	}
+}
+
+// assertSingleReloadAction proves the refusal standard of the ownership
+// contract for a drifted loaded command that no reported drop-in carries:
+// the one named action must clear the cause, so it reloads the configuration
+// the supervisor holds — the move into local.conf clears nothing a reload
+// would not — and it offers no alternative.
+func assertSingleReloadAction(t *testing.T, err error, hint string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("the refusal = nil, want a refusal")
+	}
+	message := err.Error()
+	for _, want := range []string{
+		"the update was refused and the registration was not changed",
+		`Reload the unit files with "` + hint + ` daemon-reload"`,
+		`run "hfdesk service install" again`,
+	} {
+		if !strings.Contains(message, want) {
+			t.Errorf("the refusal %q does not contain %q", message, want)
+		}
+	}
+	if strings.Contains(message, " or ") {
+		t.Errorf("the refusal %q offers an alternative instead of one action", message)
+	}
+	if strings.Contains(message, "Move your customizations into") {
+		t.Errorf("the refusal %q names the customization move, which clears no loaded command", message)
+	}
+	if strings.Contains(message, `Remove the "ExecStart=" override`) {
+		t.Errorf("the refusal %q names a removal from no drop-in that carries an override", message)
 	}
 }
 
