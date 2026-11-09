@@ -3500,9 +3500,10 @@ type darwinFakeLaunchd struct {
 	// coming up: bootstrap and kickstart succeed, but the instance never
 	// runs, the way a registration whose program fails to start behaves.
 	startIgnored bool
-	// printDisabledBoolean makes the fake answer "print-disabled" in the
-	// boolean format of the releases before Ventura ("label" => true/
-	// false) instead of the word format.
+	// printDisabledBoolean makes the fake answer "print-disabled" with
+	// the boolean vocabulary of the releases before Ventura
+	// (`"label" => true|false` in the dictionary) instead of the word
+	// vocabulary (`=> disabled|enabled`) — both real grammars.
 	printDisabledBoolean bool
 	// dying marks the window between the signal of a stop and the exit
 	// the supervisor then observes: while it lasts, a fixture that hides
@@ -3535,16 +3536,19 @@ func (f *darwinFakeLaunchd) run(ctx context.Context, args ...string) (string, er
 		}
 		return f.printOutput(), nil
 	case "print-disabled":
+		// The grammar of the real command (captured samples): a
+		// "disabled services" dictionary of quoted entries, with a noise
+		// line so the parser has to match this label specifically.
 		if f.printDisabledBoolean {
 			if f.disabled {
-				return launchdLabel() + " => true\n", nil
+				return "disabled services = {\n\t" + strconv.Quote(launchdLabel()) + " => true\n\t\"com.apple.atrun\" => false\n}\n", nil
 			}
-			return launchdLabel() + " => false\n", nil
+			return "disabled services = {\n\t\"com.apple.atrun\" => true\n}\n", nil
 		}
 		if f.disabled {
-			return launchdLabel() + " => disabled\n", nil
+			return "disabled services = {\n\t" + strconv.Quote(launchdLabel()) + " => disabled\n\t\"com.apple.AEServer\" => enabled\n}\n", nil
 		}
-		return "", nil
+		return "disabled services = {\n}\n", nil
 	case "kill":
 		if !f.keepRunning {
 			if f.withoutRunningFact && f.running {
@@ -4340,44 +4344,147 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 }
 
 // TestLaunchdDisabledLabel checks the reading of the database of the
-// disabled jobs of launchd.
+// disabled jobs of launchd against REAL captured outputs — launchctl(1)
+// documents what the command does, not the grammar of its output:
 //
-// The output of launchd is not an API: a disabled job is listed as
-// "<label> => disabled", and a job that carries further overrides is listed
-// as a block that names the disabled flag. Both forms are read.
+//   - the dictionary with boolean values (up to Monterey):
+//     stackoverflow.com/questions/29815537 ("disabled services = {"
+//     with `"label" => true|false`) and usnistgov/macos_security#167
+//     "Sample check on Monterey";
+//   - the dictionary with word values (Ventura+): usnistgov/macos_security#167
+//     "Sample check on Ventura" (`=> disabled|enabled` — the very sample
+//     carried the typo "disablked", which must read as UNKNOWN).
+//
+// launchd never prints flat unquoted lines: that legacy fixture shape is a
+// negative here, and an unknown shape or value fails closed instead of
+// being read as "not disabled".
 func TestLaunchdDisabledLabel(t *testing.T) {
 	label := launchdLabel()
 	cases := []struct {
-		name   string
-		output string
-		want   bool
+		name    string
+		output  string
+		want    bool
+		wantErr bool
 	}{
-		{name: "an empty database", output: "", want: false},
-		{name: "a disabled job", output: label + " => disabled\n", want: true},
-		{name: "another disabled job", output: "com.example.other => disabled\n", want: false},
-		// The boolean format of the releases before Ventura: "true"
-		// names a disabled job and "false" an enabled one. A parser that
-		// misses it reports a disabled job as enabled — the fail-open
-		// hole that let a rollback enable over an administrator's
-		// disable.
-		{name: "a disabled job in the boolean format", output: label + " => true\n", want: true},
-		{name: "an enabled job in the boolean format", output: label + " => false\n", want: false},
-		{name: "another job in the boolean format", output: "com.example.other => true\n", want: false},
 		{
-			name:   "a job with a block of overrides",
-			output: label + " => {\n\t\"Disabled\" => true\n\t\"ThrottleInterval\" => 10\n}\n",
+			// No captured sample shows launchd printing nothing: the
+			// samples with nothing disabled print an empty dictionary.
+			// An empty answer is UNKNOWN, never a reading — the sweep's
+			// own unevidenced-form rule, applied to stdout itself.
+			name:    "an empty answer fails closed",
+			output:  "",
+			wantErr: true,
+		},
+		{name: "an empty dictionary", output: "disabled services = {\n}\n", want: false},
+		{
+			name:   "monterey: our label disabled",
+			output: "disabled services = {\n\t" + strconv.Quote(label) + " => true\n\t\"com.apple.atrun\" => false\n}\n",
 			want:   true,
 		},
 		{
-			name:   "a block without the disabled flag",
-			output: label + " => {\n\t\"ThrottleInterval\" => 10\n}\n",
+			name:   "monterey: our label enabled",
+			output: "disabled services = {\n\t" + strconv.Quote(label) + " => false\n}\n",
+			want:   false,
+		},
+		{
+			name:   "ventura: our label disabled",
+			output: "disabled services = {\n\t" + strconv.Quote(label) + " => disabled\n\t\"com.apple.AEServer\" => enabled\n}\n",
+			want:   true,
+		},
+		{
+			name:   "ventura: our label enabled, another label disabled",
+			output: "disabled services = {\n\t\"com.apple.AEServer\" => disabled\n\t" + strconv.Quote(label) + " => enabled\n}\n",
+			want:   false,
+		},
+		{
+			name:   "our label is absent from the dictionary",
+			output: "disabled services = {\n\t\"com.apple.atrun\" => true\n}\n",
+			want:   false,
+		},
+		{
+			name: "our label appears only in the trailing login-items section",
+			output: "disabled services = {\n}\n\nlogin item associations = {\n\t" +
+				strconv.Quote(label) + " => true\n}\n",
+			want: false,
+		},
+		{
+			// The wild Ventura sample itself carried this typo: an
+			// unrecognized value for OUR label is UNKNOWN, never
+			// "not disabled".
+			name:    "a typo'd value for our label fails closed",
+			output:  "disabled services = {\n\t" + strconv.Quote(label) + " => disablked\n}\n",
+			wantErr: true,
+		},
+		{
+			// No captured sample shows a block value inside the
+			// dictionary: unrecognized shape → UNKNOWN.
+			name:    "a block value for our label fails closed",
+			output:  "disabled services = {\n\t" + strconv.Quote(label) + " => {\n\t\"Disabled\" => true\n\t}\n}\n",
+			wantErr: true,
+		},
+		{
+			// The legacy flat unquoted fixture shape: launchd never
+			// prints it (no dictionary header) → UNKNOWN.
+			name:    "flat unquoted lines fail closed",
+			output:  label + " => disabled\n",
+			wantErr: true,
+		},
+		{
+			// Only "=>" is evidenced anywhere; an entry of our label
+			// with any other separator is UNKNOWN.
+			name:    "an unevidenced separator for our label fails closed",
+			output:  "disabled services = {\n\t" + strconv.Quote(label) + " -> disabled\n}\n",
+			wantErr: true,
+		},
+		{
+			// #4: an entry whose key IS our label in a shape the
+			// grammar does not know — single quotes — is not another
+			// job's entry: unknown, fail closed (the quoted-only match
+			// read it as "another service's entry" and a silent "not
+			// disabled").
+			name:    "a single-quoted key for our label fails closed",
+			output:  "disabled services = {\n\t'" + label + "' => true\n}\n",
+			wantErr: true,
+		},
+		{
+			// #4: the same class with a stray comma after the key.
+			name:    "a comma after our quoted key fails closed",
+			output:  "disabled services = {\n\t" + strconv.Quote(label) + ", => true\n}\n",
+			wantErr: true,
+		},
+		{
+			// #4: the separatorless spelling of the same class — our
+			// label inside the dictionary with no evidenced `=>` at
+			// all (the quoted-only match let the single-quoted form
+			// through as noise).
+			name:    "a separatorless line carrying our label fails closed",
+			output:  "disabled services = {\n\t'" + label + "'\n}\n",
+			wantErr: true,
+		},
+		{
+			// The precision bound of the rule: a recognized entry whose
+			// key merely EXTENDS ours is another job's entry — the
+			// fail-closed covers unrecognized shapes OF our label, not
+			// recognized shapes of other keys.
+			name:   "a properly shaped entry whose name extends ours stays another job",
+			output: "disabled services = {\n\t" + strconv.Quote(label+".extra") + " => disabled\n}\n",
 			want:   false,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := launchdDisabledLabel(tc.output, label); got != tc.want {
+			got, err := launchdDisabledLabel(tc.output, label)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("launchdDisabledLabel() = %v, nil; want the unknown-answer error for %q", got, tc.output)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("launchdDisabledLabel() error = %v, want the parsed answer %v", err, tc.want)
+			}
+			if got != tc.want {
 				t.Errorf("launchdDisabledLabel() = %v, want %v", got, tc.want)
 			}
 		})
@@ -4681,8 +4788,11 @@ func TestLaunchdFirstInstallEnablesTheRegistration(t *testing.T) {
 	want := []string{
 		"print " + launchd.target(),
 		"print-disabled " + launchd.domain(),
-		"bootstrap " + launchd.domain() + " " + launchd.plistPath(),
+		// The flag goes before the bootstrap: launchd refuses to
+		// bootstrap a disabled label, and the first installation is
+		// allowed to clear it — the order IS the fix (F1b).
 		"enable " + launchd.target(),
+		"bootstrap " + launchd.domain() + " " + launchd.plistPath(),
 	}
 	if !reflect.DeepEqual(fake.commands, want) {
 		t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
@@ -4942,11 +5052,16 @@ func TestLaunchdRefusesAnUnknownRunningFactOverALoadedJobWithoutAFile(t *testing
 			"neither a state nor a process id",
 			`Stop the instance with "hfdesk service stop"`,
 			`run "hfdesk service install" again`,
-			"(the registration was restored)",
 		} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("Install() = %q, want a message that mentions %q", err, want)
 			}
+		}
+		// N2: the refusal fires before any mutation, so no rollback ran
+		// behind it — before the lift the report carried the restoration
+		// suffix of the post-write rollback.
+		if strings.Contains(err.Error(), "(the registration was restored)") {
+			t.Errorf("Install() = %q, claims a rollback for a refusal that precedes every write", err)
 		}
 		if strings.Contains(err.Error(), " or ") {
 			t.Errorf("Install() = %q, want one action instead of an alternative", err)
@@ -4957,9 +5072,15 @@ func TestLaunchdRefusesAnUnknownRunningFactOverALoadedJobWithoutAFile(t *testing
 			t.Errorf("Install() = %q, appends the state command beside the refusal's own action", err)
 		}
 	}
+	// N2: the supervisor was read and nothing else issued a command — the
+	// refusal precedes every mutation (before the lift the rollback read
+	// the state again).
+	if want := []string{"print " + launchd.target(), "print-disabled " + launchd.domain()}; !reflect.DeepEqual(fake.commands, want) {
+		t.Errorf("the commands of the manager =\n%v\nwant the state read and nothing else\n%v", fake.commands, want)
+	}
 	// The refused attempt guesses nothing: the loaded job is neither
-	// unloaded nor started, the disabled flag is untouched and the
-	// property list the attempt wrote is removed again.
+	// unloaded nor started, the disabled flag is untouched, and no
+	// property list was ever written.
 	for _, command := range fake.commands {
 		if strings.HasPrefix(command, "bootout ") || strings.HasPrefix(command, "bootstrap ") ||
 			strings.HasPrefix(command, "kickstart ") || strings.HasPrefix(command, "kill ") ||
@@ -5283,23 +5404,31 @@ func TestLaunchdRefusesAnUpdateThatCannotTellWhetherTheInstanceRuns(t *testing.T
 				"neither a state nor a process id",
 				`Stop the instance with "hfdesk service stop"`,
 				`run "hfdesk service install" again`,
-				"(the registration was restored)",
 			} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("Install() = %q, want a message that mentions %q", err, want)
 				}
+			}
+			// N2: before any mutation means before the rewrite of the
+			// registration: no rollback ran, so the report carries no
+			// restoration suffix (it did before the lift).
+			if strings.Contains(err.Error(), "(the registration was restored)") {
+				t.Errorf("Install() = %q, claims a rollback for a refusal that precedes every write", err)
 			}
 			if strings.Contains(err.Error(), " or ") {
 				t.Errorf("Install() = %q, want one action instead of an alternative", err)
 			}
 		}
 
-		// The refusal leaves the supervisor and the registration exactly
-		// as they were: the running instance is neither unloaded nor
-		// started, the property list of the attempt is restored, and
-		// the enablement is untouched — the unconditional rollback
-		// enable of an un-observed flag is gone, so no enable or
-		// disable runs for this state.
+		// N2 + the refusal leaves the supervisor and the registration
+		// exactly as they were: the state read is the only command the
+		// attempt issued, the running instance is neither unloaded nor
+		// started, the property list was never rewritten, and the
+		// enablement is untouched — no enable or disable runs for this
+		// state.
+		if want := []string{"print " + launchd.target(), "print-disabled " + launchd.domain()}; !reflect.DeepEqual(fake.commands, want) {
+			t.Errorf("the commands of the manager =\n%v\nwant the state read and nothing else\n%v", fake.commands, want)
+		}
 		for _, command := range fake.commands {
 			if strings.HasPrefix(command, "bootout ") || strings.HasPrefix(command, "bootstrap ") ||
 				strings.HasPrefix(command, "kickstart ") || strings.HasPrefix(command, "kill ") ||

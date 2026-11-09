@@ -271,6 +271,21 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	if err := m.requireElevated("an installation"); err != nil {
 		return opts, err
 	}
+	// The state of the registration the supervisor holds is read before
+	// anything is created: an output that names neither a state nor a
+	// process id leaves the running fact undetermined, and the refusal —
+	// whose repair is the stop followed by a new installation — must not
+	// follow a mutation. A job the supervisor does not hold satisfies the
+	// condition never, and the state read here travels into load, which
+	// acts on this snapshot.
+	supervisor, err := m.supervisorState(ctx)
+	if err != nil {
+		return opts, err
+	}
+	if supervisor.loaded && !supervisor.runningKnown {
+		return opts, fmt.Errorf("service: the installation was refused: the supervisor reports neither a state nor a process id for %s, so whether the instance runs cannot be determined. Stop the instance with %q and run %q again",
+			m.target(), "hfdesk service stop", "hfdesk service install")
+	}
 	// The directories the installation is about to create are remembered
 	// before they are created, so the account is given the ownership of
 	// exactly those and of nothing else.
@@ -291,7 +306,7 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	// The installation owns the directories it created from here on: a
 	// failure removes them again, so a failed installation never leaves
 	// the directories of the instance behind.
-	if err := m.register(ctx, opts, account, created, backup, runAtLoad); err != nil {
+	if err := m.register(ctx, opts, account, created, backup, runAtLoad, supervisor); err != nil {
 		removeCreatedDirs(createdDirOrder(opts, created))
 		return opts, err
 	}
@@ -313,7 +328,7 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 // directories the installation created are removed by the caller, so a failed
 // installation leaves no half configured registration and no empty
 // directories behind.
-func (m *launchdManager) register(ctx context.Context, opts InstallOptions, account *serviceAccount, created map[string][]string, backup *plistBackup, runAtLoad bool) error {
+func (m *launchdManager) register(ctx context.Context, opts InstallOptions, account *serviceAccount, created map[string][]string, backup *plistBackup, runAtLoad bool, supervisor launchdSupervisorState) error {
 	// The instance runs as the account, so the account owns the directories
 	// the instance writes.
 	if err := m.grantInstanceDirs(opts, account, created); err != nil {
@@ -335,7 +350,7 @@ func (m *launchdManager) register(ctx context.Context, opts InstallOptions, acco
 	}
 
 	plan := launchdInstallPlan{firstInstall: !backup.existed, changed: changed}
-	state, err := m.load(ctx, path, plan)
+	state, err := m.load(ctx, path, plan, supervisor)
 	if err != nil {
 		return m.rollback(ctx, backup, state, err)
 	}
@@ -1173,27 +1188,15 @@ type launchdInstallPlan struct {
 // so a genuine first installation never reaches this refusal — whichever
 // branch it takes, it ends with the property list it just wrote and its
 // RunAtLoad deciding the start.
-func (m *launchdManager) load(ctx context.Context, path string, plan launchdInstallPlan) (launchdLoadState, error) {
-	previous, err := m.supervisorState(ctx)
-	if err != nil {
-		return launchdLoadState{}, err
-	}
+func (m *launchdManager) load(ctx context.Context, path string, plan launchdInstallPlan, previous launchdSupervisorState) (launchdLoadState, error) {
 	state := launchdLoadState{previous: previous, previousKnown: true}
-	// A job already loaded in the supervisor is an existing registration
-	// even when no property list exists: the unknown running fact decides
-	// between the restart of a running instance and the unload of a stopped
-	// one, and the wrong guess loses it — so the refusal covers this case
-	// exactly like every other update over a loaded registration. An
-	// unloaded job satisfies neither condition and never refuses here.
-	if previous.loaded && !previous.runningKnown {
-		return state, fmt.Errorf("service: the installation was refused: the supervisor reports neither a state nor a process id for %s, so whether the instance runs cannot be determined. Stop the instance with %q and run %q again",
-			m.target(), "hfdesk service stop", "hfdesk service install")
-	}
 	// A first registration is a first installation without a job the
 	// supervisor already holds: only that state may bootstrap the job and
 	// run enable. Everything else follows the repeat-install rules, so a
 	// stopped instance is never started and no autostart decision of an
-	// administrator is overwritten.
+	// administrator is overwritten. (The unknown running fact of a held
+	// job refuses in Install, before anything is written — this snapshot
+	// is the state that refusal let through.)
 	firstRegistration := plan.firstInstall && !previous.loaded
 
 	switch {
@@ -1239,6 +1242,14 @@ func (m *launchdManager) load(ctx context.Context, path string, plan launchdInst
 			}
 		}
 	case firstRegistration:
+		// The first installation may clear a forgotten disable of the
+		// label: launchd refuses to bootstrap a disabled job, so the
+		// flag goes first — the established first-install semantics,
+		// the design comment above — and only then does the bootstrap
+		// load the job it registered.
+		if _, err := m.launchctl(ctx, "enable", m.target()); err != nil {
+			return state, fmt.Errorf("service: enable %s: %w", m.target(), err)
+		}
 		if _, err := m.launchctl(ctx, "bootstrap", m.domain(), path); err != nil {
 			return state, fmt.Errorf("service: bootstrap %s: %w", m.target(), err)
 		}
@@ -1258,16 +1269,6 @@ func (m *launchdManager) load(ctx context.Context, path string, plan launchdInst
 		state.replaced = true
 	}
 
-	// A first registration enables the job it registered. The only other
-	// enable of an installation is the dance of a running disabled job
-	// above, which restores the flag in the same operation: every other
-	// state is left exactly as the supervisor reports it, so an
-	// administrator's `launchctl disable` is never left cleared.
-	if firstRegistration {
-		if _, err := m.launchctl(ctx, "enable", m.target()); err != nil {
-			return state, fmt.Errorf("service: enable %s: %w", m.target(), err)
-		}
-	}
 	return state, nil
 }
 
@@ -1351,65 +1352,86 @@ func (m *launchdManager) jobDisabled(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("service: print-disabled %s: %w", m.domain(), err)
 	}
-	return launchdDisabledLabel(output, launchdLabel()), nil
+	return launchdDisabledLabel(output, launchdLabel())
 }
 
 // launchdDisabledLabel reports whether the output of "launchctl
 // print-disabled" says that the job of the given label is disabled.
 //
-// The output of launchd is not an API: a disabled job is listed as
-// "<label> => disabled" on the releases that print the word, as
-// "<label> => true" on the releases that print the boolean (where "false"
-// names an enabled job), and a job that carries further overrides is listed
-// as a block that names the disabled flag. All forms are read, because a
-// boolean format this parser missed would report a disabled job as enabled.
-// A job that is not listed at all is not disabled.
-func launchdDisabledLabel(output, label string) bool {
-	lines := strings.Split(output, "\n")
-	for i, line := range lines {
-		sep := strings.Index(line, "=>")
-		if sep < 0 {
+// launchctl(1) documents what the command does, not the grammar of its
+// output — the captured outputs are the source of truth here: a
+// "disabled services = {" dictionary of quoted entries
+// `"label" => value`, where the value is `true`/`false` on the releases up
+// to Monterey (captured: stackoverflow.com/questions/29815537,
+// usnistgov/macos_security#167 "Sample check on Monterey") and
+// `disabled`/`enabled` since Ventura (captured: the same issue, "Sample
+// check on Ventura"). Only the `=>` separator is evidenced; a line of our
+// label with any other shape, a value outside the two vocabularies (the
+// wild Ventura sample itself carried a typo'd "disablked") or an output
+// without the dictionary is UNRECOGNIZED: the answer is unknown and the
+// caller fails closed — an unknown enablement is never decided into an
+// enable. The empty answer belongs to that case: no captured sample shows
+// launchd printing nothing at all, while the samples with nothing disabled
+// print an empty dictionary. A label absent from a recognized dictionary
+// is not disabled.
+func launchdDisabledLabel(output, label string) (bool, error) {
+	inDictionary := false
+	sawDictionary := false
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
+		if !inDictionary {
+			if strings.HasPrefix(line, "disabled services") && strings.HasSuffix(line, "{") {
+				inDictionary = true
+				sawDictionary = true
+			}
 			continue
 		}
-		if strings.TrimSpace(line[:sep]) != label {
-			continue
-		}
-		value := strings.TrimSpace(line[sep+2:])
-		if value == "" || value == "{" {
-			// The job carries a block of overrides: the flags of the
-			// block are read.
-			return launchdDisabledBlock(lines[i+1:])
-		}
-		switch strings.ToLower(value) {
-		case "disabled", "true":
-			return true
-		default:
-			return false
-		}
-	}
-	return false
-}
-
-// launchdDisabledBlock reports whether a block of overrides of a job names
-// the disabled flag.
-func launchdDisabledBlock(lines []string) bool {
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
 		if line == "}" {
-			return false
+			inDictionary = false
+			continue
 		}
 		sep := strings.Index(line, "=>")
 		if sep < 0 {
-			continue
+			// Our label inside the dictionary with no evidenced
+			// separator: an unrecognized shape OF our label, not
+			// noise — unknown, fail closed (single-quoted spellings
+			// included, which the quoted-only match read as noise).
+			if strings.Contains(line, label) {
+				return false, fmt.Errorf("unrecognized print-disabled entry for %s: %q", label, line)
+			}
+			continue // noise inside the dictionary
 		}
 		key := strings.Trim(strings.TrimSpace(line[:sep]), `"`)
-		if launchdPrintKey(key) != "disabled" {
-			continue
+		if key != label {
+			// The key may still BE our label wrapped in punctuation
+			// the grammar does not know — single quotes, a stray
+			// comma: not another job's entry, and deciding it into
+			// "another service" would read a silent "not disabled".
+			// A key that merely extends ours keeps its recognized
+			// shape and stays another job's entry.
+			if strings.Trim(key, `'",`) == label {
+				return false, fmt.Errorf("unrecognized print-disabled key for %s: %q", label, line)
+			}
+			continue // another job's entry
 		}
-		value := strings.Trim(strings.TrimSpace(line[sep+2:]), `"`)
-		return strings.EqualFold(value, "true")
+		value := strings.TrimSuffix(strings.TrimSpace(line[sep+2:]), ",")
+		switch value {
+		case "true", "disabled":
+			return true, nil
+		case "false", "enabled":
+			return false, nil
+		default:
+			// A block value, a typo or a future vocabulary: unknown.
+			return false, fmt.Errorf("unrecognized print-disabled value %q for %s", value, label)
+		}
 	}
-	return false
+	if !sawDictionary {
+		// Not empty, no dictionary: a shape this parser does not know —
+		// flat unquoted lines are not something launchd prints.
+		return false, fmt.Errorf("unrecognized print-disabled output: no \"disabled services\" dictionary")
+	}
+	// A recognized dictionary that does not list the label: not disabled.
+	return false, nil
 }
 
 // ensureLoaded registers the job with launchd when it is not loaded into its
