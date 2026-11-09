@@ -725,8 +725,9 @@ func scmDisabledRunningRefusal(present, running bool, startType uint32) error {
 // before the instance is stopped — and names the command that restores the
 // supported identity. A registration that runs as the supported identity is
 // never refused, whatever spelling the operating system reports it under
-// (see scmSupportedServiceAccount): the update keeps its account exactly as
-// it does today, and a first installation is unaffected — it registers the
+// (see scmSupportedServiceAccount): the update keeps that identity — a
+// differently spelled name of the same account is stored in its canonical
+// spelling — and a first installation is unaffected: it registers the
 // supported identity itself and never reaches this check.
 func scmServiceAccountRefusal(account string) error {
 	if scmSupportedServiceAccount(account) {

@@ -1090,12 +1090,14 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   registration the same way, and exactly what that preserves is stated under
   [macOS (launchd)](#macos-launchd). The
   Windows identity remains the fixed `LocalService` account, and an SCM password
-  is never copied. An update never changes the account of a registration: one
-  whose account was changed away from `NT AUTHORITY\LocalService` — with the
-  service control manager, by an administrator — is refused before anything is
-  written or stopped, and the error names the command that restores the
-  supported identity, instead of the account being written back over the
-  administrator's decision.
+  is never copied. An update never changes the account identity of a
+  registration: one whose account was changed away from
+  `NT AUTHORITY\LocalService` — with the service control manager, by an
+  administrator — is refused before anything is written or stopped, and the
+  error names the command that restores the supported identity, instead of
+  the account being written back over the administrator's decision; a
+  differently spelled name of that same account (a localized name or a SID
+  string) is stored in its canonical spelling.
 - Linux compares the loaded command through systemd's typed D-Bus argv
   properties. It does not infer argument boundaries from `systemctl show`'s
   joined display. If the loaded properties cannot be read, an existing update
@@ -1132,7 +1134,12 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   was placed at runtime with `systemctl mask --runtime`: a persistent mask is a
   link to `/dev/null`, and writing the unit file would replace the mask, while a
   runtime mask lives in `/run` and leaves no file at the unit path, so the
-  installation would register a unit that stays masked and cannot start. The
+  installation would register a unit that stays masked and cannot start. A
+  runtime mask is visible only through the supervisor — when the supervisor
+  cannot answer at all, the mask cannot be observed before the write; the
+  attempt then fails at the reload with its honest report, and the mask is
+  never touched, while a persistent mask is still caught before the write
+  from its file. The
   error names the unmask command of the observed mask kind — `systemctl unmask
   hfdesk.service` for a persistent mask, `systemctl unmask --runtime
   hfdesk.service` for a runtime one — with the scope prefix of the
