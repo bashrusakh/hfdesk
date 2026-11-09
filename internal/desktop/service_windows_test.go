@@ -502,11 +502,17 @@ func TestServiceGateEndsTheLaunchWhenTheRegistrationCannotBeRead(t *testing.T) {
 		"started no server",
 		"hfdesk service status",
 		"elevated shell",
-		"start the desktop app again",
+		"can then be started again",
+		"leaves the state unknown",
 	} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the notice %q does not mention %q", (*messages)[0].text, want)
 		}
+	}
+	// The read is the single action: the notice promises no relaunch that
+	// would show the same notice again when the read fails persistently.
+	if strings.Contains((*messages)[0].text, "then start the desktop app again") {
+		t.Errorf("the notice %q promises a relaunch beside its one action", (*messages)[0].text)
 	}
 	// The launch writes the record as well: the helper installs no logging
 	// pipeline, and the record of a launch that ended at the gate is the
@@ -1700,12 +1706,19 @@ func TestServiceHelperInstallReportsARegistrationConflictWithoutStatusLookup(t *
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the refusal of the existing registration", len(*messages))
 	}
-	for _, want := range []string{"already registered", "did not create, change or start it", `"hfdesk service install"`} {
+	for _, want := range []string{"already registered", "did not create, change or start it", "startup gate"} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
 		}
 	}
-	for _, unwanted := range []string{"A registration may remain", `"hfdesk service uninstall"`} {
+	for _, unwanted := range []string{
+		"A registration may remain",
+		`"hfdesk service uninstall"`,
+		// The startup gate is the single next action: the elevated
+		// installation command beside it would be a second route.
+		`"hfdesk service install"`,
+		"elevated shell",
+	} {
 		if strings.Contains((*messages)[0].text, unwanted) {
 			t.Errorf("the report %q carries %q although this attempt changed no registration", (*messages)[0].text, unwanted)
 		}
@@ -2824,10 +2837,23 @@ func TestServiceGateRechecksTheStateBeforeDesktopMode(t *testing.T) {
 	if caption := serviceGateChangedCaption; (*messages)[0].caption != caption {
 		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 	}
-	for _, want := range []string{"changed while the dialog was open", "running now", "started no server", "hfdesk service status"} {
+	for _, want := range []string{
+		"changed while the dialog was open",
+		"running now",
+		"started no server",
+		"hfdesk service status",
+		"can then be started again",
+		"leaves the state unknown",
+	} {
 		if !strings.Contains((*messages)[0].text, want) {
 			t.Errorf("the notice %q does not mention %q", (*messages)[0].text, want)
 		}
+	}
+	// The read is the single action of the changed-state notice as well:
+	// no imperative relaunch may promise a retry that shows this notice
+	// again when the state keeps changing or stays unreadable.
+	if strings.Contains((*messages)[0].text, "then start the desktop app again") {
+		t.Errorf("the notice %q promises a relaunch beside its one action", (*messages)[0].text)
 	}
 }
 
