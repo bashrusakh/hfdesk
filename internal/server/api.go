@@ -27,6 +27,11 @@ import (
 // rebuilding updates the UI automatically — no hardcoded numbers to edit.
 var Version = "dev"
 
+// Apply staging exclusion only inside blobs/.
+var isBlobStagingArtifactName = func(name string) bool {
+	return hfdownloader.IsStagingArtifactName(name)
+}
+
 // effectiveEndpointURL returns the configured Hugging Face endpoint in the
 // normalized form exposed to clients: the public Hub when no custom endpoint is
 // configured, without a trailing slash, and preserving any path prefix (for
@@ -1432,7 +1437,7 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		var totalSize int64
 		var fileCount int
 		filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
-			if err == nil && !info.IsDir() && !strings.HasSuffix(path, ".incomplete") && !strings.HasSuffix(path, ".meta") {
+			if err == nil && !info.IsDir() && !isBlobStagingArtifactName(info.Name()) {
 				totalSize += info.Size()
 				fileCount++
 			}
@@ -1658,7 +1663,7 @@ func (s *Server) handleCacheInfo(w http.ResponseWriter, r *http.Request) {
 		})
 	} else {
 		filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
-			if err == nil && !info.IsDir() && !strings.HasSuffix(path, ".incomplete") && !strings.HasSuffix(path, ".meta") {
+			if err == nil && !info.IsDir() && !isBlobStagingArtifactName(info.Name()) {
 				totalSize += info.Size()
 				files = append(files, CachedFileInfo{
 					Name:      filepath.Base(path),
@@ -1766,7 +1771,7 @@ func (s *Server) handleCacheRebuild(w http.ResponseWriter, r *http.Request) {
 		filepath.Join(cfg.cacheRoot(), "datasets"),
 	)
 	if !ok {
-		writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+		writeError(w, http.StatusConflict, "Cache is busy", "An active download or another cache operation is using the cache view; retry when it finishes")
 		return
 	}
 	defer release()
@@ -1951,10 +1956,41 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 	// All security checks passed - proceed with deletion
 	release, ok := s.jobs.beginCacheMutation(absHubPath, friendlyPath)
 	if !ok {
-		writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+		writeError(w, http.StatusConflict, "Repository is busy", "An active download or another cache operation is using this repository; retry when it finishes")
 		return
 	}
 	defer release()
+
+	// The in-process reservation cannot see writers in other processes sharing this cache: take the
+	// downloader's cache-owned tree admission for both removals before any removal; refusal rolls back.
+	// A vanished target is admitted only by the shared re-verified-vanish rule: the admission itself
+	// re-verifies the target is gone while holding the missing target's creator-side keys, so a
+	// creator racing the removal holds admission while RemoveAll runs, and an ENOENT from anywhere
+	// else fails closed here instead of proceeding without exclusion.
+	hubAdmission, err := hfdownloader.OpenCacheAdmission(r.Context(), absHubDir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to delete cache", err.Error())
+		return
+	}
+	hubRelease, err := hubAdmission.AdmitTreeRemoval(r.Context(), absHubPath)
+	if err != nil {
+		writeCacheDeleteAdmission(w, err)
+		return
+	}
+	defer hubRelease()
+	if friendlyPath != "" {
+		friendlyAdmission, err := hfdownloader.OpenCacheAdmission(r.Context(), absCacheDir)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to delete cache", err.Error())
+			return
+		}
+		friendlyRelease, err := friendlyAdmission.AdmitTreeRemoval(r.Context(), friendlyPath)
+		if err != nil {
+			writeCacheDeleteAdmission(w, err)
+			return
+		}
+		defer friendlyRelease()
+	}
 	if err := os.RemoveAll(absHubPath); err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to delete cache", err.Error())
 		return
@@ -1974,6 +2010,17 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"message": fmt.Sprintf("Deleted %s from cache", repo),
 	})
+}
+
+// writeCacheDeleteAdmission reports a refused or failed cache-tree admission before anything
+// is removed: a conflict keeps the endpoint's accepted 409; any other failure stops the
+// deletion rather than proceeding without cross-process exclusion.
+func writeCacheDeleteAdmission(w http.ResponseWriter, err error) {
+	if errors.Is(err, hfdownloader.ErrOwnershipBusy) {
+		writeError(w, http.StatusConflict, "Repository is busy", "An active download or another cache operation is using this repository; retry when it finishes")
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "Failed to delete cache", err.Error())
 }
 
 // isValidRepoComponent checks if a repository owner or name contains only safe characters.

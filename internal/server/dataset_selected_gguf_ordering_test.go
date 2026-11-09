@@ -53,9 +53,14 @@ func TestPlanUnknownDatasetGGUFSelectedDeleteOrdering(t *testing.T) {
 							}
 							select {
 							case <-releaseTree:
-								_, _ = fmt.Fprint(w, `[{"type":"file","path":"train.csv","size":1},{"type":"file","path":"model-test.gguf","size":5},{"type":"file","path":"model-train.gguf","size":5}]`)
+								_, _ = fmt.Fprint(w, `[{"type":"file","path":"train.csv","size":5},{"type":"file","path":"model-test.gguf","size":5},{"type":"file","path":"model-train.gguf","size":5}]`)
 							case <-r.Context().Done():
 							}
+						case (strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/")) && r.Header.Get("X-HFDesk-Addressing-Probe") == "1":
+							w.Header().Set("Content-Range", "bytes 0-0/5")
+							w.Header().Set("Content-Length", "1")
+							w.WriteHeader(http.StatusPartialContent)
+							_, _ = w.Write([]byte("d"))
 						case strings.Contains(r.URL.Path, "/raw/") || strings.Contains(r.URL.Path, "/resolve/"):
 							select {
 							case rawStarted <- struct{}{}:
@@ -81,7 +86,7 @@ func TestPlanUnknownDatasetGGUFSelectedDeleteOrdering(t *testing.T) {
 					writer := &Job{OutputDir: storage, Repo: "owner/data", LocalRepo: "owner/data", IsDataset: true}
 					target := filepath.Join(jobDestinationBase(writer), tc.reservation)
 					if tc.name == "unrelated target control" {
-						other, err := hfdownloader.NewHFCache(storage, 0).Repo("owner/other", hfdownloader.RepoTypeDataset)
+						other, err := hfdownloader.NewHFCache(storage).Repo("owner/other", hfdownloader.RepoTypeDataset)
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -264,7 +269,7 @@ func assertFrozenDatasetDestination(t *testing.T, job *Job) {
 	if job.LocalRepo != "" {
 		repoID = job.LocalRepo
 	}
-	repo, err := hfdownloader.NewHFCacheResolved(job.OutputDir, job.HubDir, 0).Repo(repoID, hfdownloader.RepoTypeDataset)
+	repo, err := hfdownloader.NewHFCacheResolved(job.OutputDir, job.HubDir).Repo(repoID, hfdownloader.RepoTypeDataset)
 	if err != nil {
 		t.Fatal(err)
 	}

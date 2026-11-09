@@ -29,30 +29,39 @@ func (c contextReader) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
-// computeSHA256 computes and returns the SHA256 hash of a file.
 func computeSHA256(path string) (string, error) {
 	return computeSHA256Ctx(context.Background(), path)
 }
 
-// computeSHA256Ctx is computeSHA256 bounded by ctx: it aborts promptly with the
-// context error if ctx is cancelled while hashing. Existing ctx-free callers
-// keep using computeSHA256 (context.Background()).
+// computeSHA256Ctx checks cancellation between reads and returns the context
+// error if hashing is interrupted. computeSHA256 uses a background context.
+// Counters record each opened-file hash attempt and its initial logical size,
+// not necessarily bytes actually read when an attempt fails or is cancelled.
 func computeSHA256Ctx(ctx context.Context, path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
+	size := int64(0)
+	if fi, serr := f.Stat(); serr == nil {
+		size = fi.Size()
+	}
+	hashPassCount.Add(1)
+	hashPassBytes.Add(size)
 
 	h := sha256.New()
-	if _, err := io.Copy(h, contextReader{ctx: ctx, r: f}); err != nil {
+	var source io.Reader = contextReader{ctx: ctx, r: f}
+	if measurement := payloadIOMeasurementFromContext(ctx); measurement != nil {
+		source = measuredPayloadReader{r: source, m: measurement}
+	}
+	if _, err := io.Copy(h, source); err != nil {
 		return "", err
 	}
 
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// verifySHA256 computes the SHA256 of a file and compares it to expected.
 func verifySHA256(path string, expected string) error {
 	return verifySHA256Ctx(context.Background(), path, expected)
 }
@@ -71,41 +80,33 @@ func verifySHA256Ctx(ctx context.Context, path string, expected string) error {
 	return nil
 }
 
-// shouldSkipLocal checks if a file already exists and matches expected hash/size.
-// Returns (skip, reason, error).
 func shouldSkipLocal(it PlanItem, dst string) (bool, string, error) {
 	return shouldSkipLocalCtx(context.Background(), it, dst)
 }
 
-// shouldSkipLocalCtx is shouldSkipLocal bounded by ctx. A multi-GB LFS hash can
-// otherwise run to completion after a sibling's permanent error cancelled the
-// job; with ctx it aborts promptly. Successful skip behavior is unchanged: a
-// cancelled ctx returns ctx.Err() so the caller surfaces the cancellation
-// instead of skipping.
-//
-// This is the ordinary download's rule and it is unchanged: a file with a
-// known digest is reused only when that digest matches (LFS files), and every
-// other file is reused on size equality. A branch variant has a stricter rule,
-// because it is pinned to a commit (see shouldSkipLocalByHashCtx); both rules
-// share the hash comparison (skipLocalByHashCtx), so they cannot drift apart.
+// shouldSkipLocalCtx makes the pre-download decision context-aware, so a long
+// existing-file hash stops after cancellation. Unlike normal size-mode transfer,
+// this skip check may hash an existing LFS destination.
 func shouldSkipLocalCtx(ctx context.Context, it PlanItem, dst string) (bool, string, error) {
 	fi, err := os.Stat(dst)
 	if err != nil {
-		// no file
 		return false, "", nil
 	}
 
-	// Quick size check first: if known and different, don't skip
 	if it.Size > 0 && fi.Size() != it.Size {
 		return false, "", nil
 	}
 
-	// LFS with known sha: compute and compare
 	if it.LFS && it.SHA256 != "" {
-		return skipLocalByHashCtx(ctx, it, dst)
+		if err := verifySHA256Ctx(ctx, dst, it.SHA256); err == nil {
+			return true, "sha256 match", nil
+		} else if verr := ctx.Err(); verr != nil {
+			// Cancelled mid-verify: surface the cancellation, do not skip.
+			return false, "", verr
+		}
+		return false, "", nil
 	}
 
-	// Non-LFS (or unknown sha): size match is sufficient
 	if it.Size > 0 && fi.Size() == it.Size {
 		return true, "size match", nil
 	}

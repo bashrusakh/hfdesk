@@ -42,7 +42,7 @@ func BenchmarkPlanRepoDatasetSelectionInventory(b *testing.B) {
 					switch {
 					case r.URL.Path == "/api/datasets/owner/data/revision/main":
 						_, _ = w.Write([]byte(`{"sha":"bench"}`))
-					case r.URL.Path == "/api/datasets/owner/data/tree/main":
+					case r.URL.Path == "/api/datasets/owner/data/tree/bench":
 						_ = json.NewEncoder(w).Encode(files)
 					default:
 						http.NotFound(w, r)
@@ -98,7 +98,7 @@ func BenchmarkPlanRepoDatasetRootDefaultInventory(b *testing.B) {
 				switch {
 				case r.URL.Path == "/api/datasets/owner/data/revision/main":
 					_, _ = w.Write([]byte(`{"sha":"bench"}`))
-				case r.URL.Path == "/api/datasets/owner/data/tree/main":
+				case r.URL.Path == "/api/datasets/owner/data/tree/bench":
 					_ = json.NewEncoder(w).Encode(files)
 				default:
 					http.NotFound(w, r)
@@ -174,7 +174,7 @@ func BenchmarkPlanRepoDatasetDecisionShapes(b *testing.B) {
 					switch {
 					case r.URL.Path == "/api/datasets/owner/data/revision/main":
 						_, _ = w.Write([]byte(`{"sha":"bench"}`))
-					case r.URL.Path == "/api/datasets/owner/data/tree/main":
+					case r.URL.Path == "/api/datasets/owner/data/tree/bench":
 						_ = json.NewEncoder(w).Encode(files)
 					default:
 						http.NotFound(w, r)
@@ -223,7 +223,7 @@ func BenchmarkPlanRepoDatasetOrdinarySelectorInventory(b *testing.B) {
 				switch r.URL.Path {
 				case "/api/datasets/owner/data/revision/main":
 					_, _ = w.Write([]byte(`{"sha":"bench"}`))
-				case "/api/datasets/owner/data/tree/main":
+				case "/api/datasets/owner/data/tree/bench":
 					_ = json.NewEncoder(w).Encode(files)
 				default:
 					http.NotFound(w, r)
