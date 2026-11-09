@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,21 +21,60 @@ import (
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
-// TestCrossProcessCacheWriterHelper runs one real cache-mode download against
-// the gated endpoint its parent supplies; it never runs standalone.
-func TestCrossProcessCacheWriterHelper(t *testing.T) {
-	endpoint := os.Getenv("HFDESK_XPROC_ENDPOINT")
-	cacheDir := os.Getenv("HFDESK_XPROC_CACHE")
-	if endpoint == "" || cacheDir == "" {
-		t.Skip("cross-process writer helper needs its parent fixture")
+// crossProcessWriterMode names which downloader layout a re-executed writer
+// child builds; each mode reads only the environment its call site sets.
+type crossProcessWriterMode string
+
+const (
+	crossProcessCacheMode crossProcessWriterMode = "cache"
+	crossProcessFlatMode  crossProcessWriterMode = "flat"
+)
+
+// TestCrossProcessWriterHelper runs one real download — the cache-mode or
+// flat-mode layout its parent's environment selects — against the gated
+// endpoint its parent supplies; it never runs standalone. The mode is derived
+// from which endpoint variable the parent set, so every call site's
+// environment keeps working exactly as it does today.
+func TestCrossProcessWriterHelper(t *testing.T) {
+	mode := crossProcessCacheMode
+	if os.Getenv("HFDESK_XPROC_FLAT_ENDPOINT") != "" {
+		mode = crossProcessFlatMode
 	}
-	settings := hfdownloader.Settings{
-		CacheDir:           cacheDir,
-		HubDir:             filepath.Join(cacheDir, "hub"),
-		Endpoint:           endpoint,
-		Concurrency:        1,
-		MaxActiveDownloads: 1,
-		Verify:             "sha256",
+	runCrossProcessWriter(t, mode)
+}
+
+// runCrossProcessWriter performs the single download of the given writer
+// mode, reading only the environment variables that mode's call site sets.
+func runCrossProcessWriter(t *testing.T, mode crossProcessWriterMode) {
+	t.Helper()
+	var settings hfdownloader.Settings
+	switch mode {
+	case crossProcessFlatMode:
+		endpoint, root := os.Getenv("HFDESK_XPROC_FLAT_ENDPOINT"), os.Getenv("HFDESK_XPROC_FLAT_ROOT")
+		if endpoint == "" || root == "" {
+			t.Skip("cross-process flat writer helper needs its parent fixture")
+		}
+		settings = hfdownloader.Settings{
+			OutputDir:          root,
+			OwnershipDir:       os.Getenv("HFDESK_XPROC_FLAT_OWNERSHIP"),
+			Endpoint:           endpoint,
+			Concurrency:        1,
+			MaxActiveDownloads: 1,
+			Verify:             "sha256",
+		}
+	default:
+		endpoint, cacheDir := os.Getenv("HFDESK_XPROC_ENDPOINT"), os.Getenv("HFDESK_XPROC_CACHE")
+		if endpoint == "" || cacheDir == "" {
+			t.Skip("cross-process writer helper needs its parent fixture")
+		}
+		settings = hfdownloader.Settings{
+			CacheDir:           cacheDir,
+			HubDir:             filepath.Join(cacheDir, "hub"),
+			Endpoint:           endpoint,
+			Concurrency:        1,
+			MaxActiveDownloads: 1,
+			Verify:             "sha256",
+		}
 	}
 	if err := hfdownloader.Download(context.Background(), hfdownloader.Job{Repo: "owner/model", Revision: "main"}, settings, nil); err != nil {
 		t.Fatal(err)
@@ -48,14 +86,16 @@ type crossProcessWriter struct {
 	output bytes.Buffer
 }
 
-func startCrossProcessWriter(t *testing.T, endpoint, cacheDir string) *crossProcessWriter {
+// startCrossProcessWriter re-executes this test binary as a foreign writer,
+// passing through exactly the environment its call site provides.
+func startCrossProcessWriter(t *testing.T, env ...string) *crossProcessWriter {
 	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	writer := &crossProcessWriter{cmd: exec.Command(executable, "-test.run=^TestCrossProcessCacheWriterHelper$")}
-	writer.cmd.Env = append(os.Environ(), "HFDESK_XPROC_ENDPOINT="+endpoint, "HFDESK_XPROC_CACHE="+cacheDir)
+	writer := &crossProcessWriter{cmd: exec.Command(executable, "-test.run=^TestCrossProcessWriterHelper$")}
+	writer.cmd.Env = append(os.Environ(), env...)
 	writer.cmd.Stdout = &writer.output
 	writer.cmd.Stderr = &writer.output
 	if err := writer.cmd.Start(); err != nil {
@@ -83,9 +123,12 @@ func (writer *crossProcessWriter) wait(t *testing.T, timeout time.Duration) {
 	}
 }
 
-func newCrossProcessTestServer(t *testing.T, fx *gatedHubEndpoint, cacheDir string) *Server {
+// newCrossProcessTestServer builds a scenario server and registers the shared
+// teardown the cross-process fixtures always used: wait for its job manager to
+// close within ten seconds, swallowing the close error.
+func newCrossProcessTestServer(t *testing.T, cfg Config) *Server {
 	t.Helper()
-	s := New(Config{CacheDir: cacheDir, MaxActive: 1, Concurrency: 1, Verify: "sha256", Endpoint: fx.srv.URL})
+	s := New(cfg)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -103,22 +146,104 @@ func awaitGatedWriter(t *testing.T, fx *gatedHubEndpoint) {
 	}
 }
 
+// crossProcessScenario carries the state the cross-process refusal scenarios
+// share from setup through teardown.
+type crossProcessScenario struct {
+	iso      string // isolated HOME/XDG root returned by isolateCacheState
+	fx       *gatedHubEndpoint
+	cacheDir string
+	hubDir   string
+	s        *Server
+	writer   *crossProcessWriter
+}
+
+// crossProcessScenarioOpts supplies the parts each scenario owns: which
+// fixture to build (and any pre-server validation it performs), how to
+// configure its server, what to seed before the foreign writer starts, and
+// which environment the writer child reads.
+type crossProcessScenarioOpts struct {
+	fixture   func(*testing.T, *crossProcessScenario) *gatedHubEndpoint
+	config    func(*crossProcessScenario) Config
+	seed      func(*crossProcessScenario) // may be nil
+	writerEnv func(*crossProcessScenario) []string
+}
+
+// startCrossProcessScenario runs the setup shape the four cross-process
+// refusal scenarios share: isolate cache state, build the gated fixture,
+// create the cache root and test server, run the scenario's own pre-writer
+// seeding, then start the foreign writer and await its gate. Server close,
+// writer kill and fixture release are registered as teardown on t; each
+// scenario keeps its own seeds, requests and assertions in its own body.
+func startCrossProcessScenario(t *testing.T, opts crossProcessScenarioOpts) *crossProcessScenario {
+	t.Helper()
+	sc := &crossProcessScenario{iso: isolateCacheState(t)}
+	sc.fx = opts.fixture(t, sc)
+	sc.cacheDir = t.TempDir()
+	sc.hubDir = filepath.Join(sc.cacheDir, "hub")
+	sc.s = newCrossProcessTestServer(t, opts.config(sc))
+	if opts.seed != nil {
+		opts.seed(sc)
+	}
+	sc.writer = startCrossProcessWriter(t, opts.writerEnv(sc)...)
+	awaitGatedWriter(t, sc.fx)
+	return sc
+}
+
+// cacheModeScenarioOpts is the shared option set of the three cache-mode
+// cross-process refusal scenarios: the gated hub fixture, the standard
+// scenario server, and the cache-mode writer environment.
+func cacheModeScenarioOpts() crossProcessScenarioOpts {
+	return crossProcessScenarioOpts{
+		fixture: func(t *testing.T, _ *crossProcessScenario) *gatedHubEndpoint {
+			return newGatedHubEndpoint(t, "weights.safetensors", []byte("gated cache weights payload"), "commit123")
+		},
+		config: func(sc *crossProcessScenario) Config {
+			return Config{CacheDir: sc.cacheDir, MaxActive: 1, Concurrency: 1, Verify: "sha256", Endpoint: sc.fx.srv.URL}
+		},
+		writerEnv: func(sc *crossProcessScenario) []string {
+			return []string{
+				"HFDESK_XPROC_ENDPOINT=" + sc.fx.srv.URL,
+				"HFDESK_XPROC_CACHE=" + sc.cacheDir,
+			}
+		},
+	}
+}
+
+// pickDeletableGGUFGroup builds the selected-delete request for the first
+// deletable model-Q4_K_M.gguf group whose location the caller's predicate
+// accepts; when no such group exists the test fails under the caller's
+// location label. It is the one group picker behind both the HF-cache and the
+// local-root selection flows.
+func pickDeletableGGUFGroup(t *testing.T, s *Server, repo string, inLocation func(cacheSelectionLocation) bool, locationLabel string) testSelectedDeleteRequest {
+	t.Helper()
+	code, selection := getSelection(t, s, repo, "model", "")
+	if code != http.StatusOK {
+		t.Fatalf("selection for %s: status=%d", repo, code)
+	}
+	for _, loc := range selection.Locations {
+		if !inLocation(loc) {
+			continue
+		}
+		for _, group := range loc.Groups {
+			if group.CanDelete && len(group.Members) > 0 && group.Members[0].Path == "model-Q4_K_M.gguf" {
+				return testSelectedDeleteRequest{Repo: repo, Type: "model", LocationID: loc.ID, GroupID: group.ID, Members: group.Members}
+			}
+		}
+	}
+	t.Fatalf("no deletable %s GGUF group for %s: %+v", locationLabel, repo, selection.Locations)
+	return testSelectedDeleteRequest{}
+}
+
 // A whole-repository DELETE through the real server route must be refused
 // while a writer in ANOTHER process owns the repository: this process's
 // JobManager sees no activity at all, so only the cross-process admission can
 // refuse. An unrelated repository stays deletable, the foreign writer still
 // completes with correct bytes, and the DELETE succeeds only afterwards.
 func TestCacheDeleteRefusesCrossProcessWriter(t *testing.T) {
-	isolateCacheState(t)
-	fx := newGatedHubEndpoint(t)
-	cacheDir := t.TempDir()
-	hubDir := filepath.Join(cacheDir, "hub")
+	sc := startCrossProcessScenario(t, cacheModeScenarioOpts())
+	fx, s, cacheDir, hubDir, writer := sc.fx, sc.s, sc.cacheDir, sc.hubDir, sc.writer
 	repoDir := filepath.Join(hubDir, "models--owner--model")
 	friendlyDir := filepath.Join(cacheDir, "models", "owner", "model")
-	s := newCrossProcessTestServer(t, fx, cacheDir)
-
-	writer := startCrossProcessWriter(t, fx.srv.URL, cacheDir)
-	awaitGatedWriter(t, fx)
 
 	w := cacheRequest(t, s, http.MethodDelete, "/api/cache/owner/model", "")
 	if w.Code != http.StatusConflict {
@@ -163,15 +288,9 @@ func TestCacheDeleteRefusesCrossProcessWriter(t *testing.T) {
 // existing destination blob is not truncated, the mirror result reports both
 // refusals honestly, and the foreign writer still completes with correct bytes.
 func TestMirrorMutationsRefuseCrossProcessWriter(t *testing.T) {
-	isolateCacheState(t)
-	fx := newGatedHubEndpoint(t)
-	cacheDir := t.TempDir()
-	hubDir := filepath.Join(cacheDir, "hub")
+	sc := startCrossProcessScenario(t, cacheModeScenarioOpts())
+	fx, s, cacheDir, hubDir, writer := sc.fx, sc.s, sc.cacheDir, sc.hubDir, sc.writer
 	repoDir := filepath.Join(hubDir, "models--owner--model")
-	s := newCrossProcessTestServer(t, fx, cacheDir)
-
-	writer := startCrossProcessWriter(t, fx.srv.URL, cacheDir)
-	awaitGatedWriter(t, fx)
 
 	seed := []byte("pre-existing destination payload")
 	seedPath := filepath.Join(repoDir, "blobs", fx.hash)
@@ -381,36 +500,19 @@ func seedSelectedGGUFGroup(t *testing.T, hubDir, owner, name, version, fileName 
 // bytes, and the refused selection deletes normally afterwards without touching
 // the writer's output.
 func TestSelectedDeleteRefusesCrossProcessWriter(t *testing.T) {
-	isolateCacheState(t)
-	fx := newGatedHubEndpoint(t)
-	cacheDir := t.TempDir()
-	hubDir := filepath.Join(cacheDir, "hub")
-	s := newCrossProcessTestServer(t, fx, cacheDir)
-
-	writer := startCrossProcessWriter(t, fx.srv.URL, cacheDir)
-	awaitGatedWriter(t, fx)
+	sc := startCrossProcessScenario(t, cacheModeScenarioOpts())
+	fx, s, cacheDir, hubDir, writer := sc.fx, sc.s, sc.cacheDir, sc.hubDir, sc.writer
 
 	seededEntry, seededBlob := seedSelectedGGUFGroup(t, hubDir, "owner", "model", "seedcommit", "model-Q4_K_M.gguf", []byte("seeded gguf weights for owner/model"))
 	otherEntry, _ := seedSelectedGGUFGroup(t, hubDir, "owner", "other", "seedcommit", "model-Q4_K_M.gguf", []byte("seeded gguf weights for owner/other"))
 
+	// The HF-cache location filter: only a deletable HF-cache location may
+	// yield the group, exactly as before the picker was unified.
 	pickGroup := func(repo string) testSelectedDeleteRequest {
 		t.Helper()
-		code, selection := getSelection(t, s, repo, "model", "")
-		if code != http.StatusOK {
-			t.Fatalf("selection for %s: status=%d", repo, code)
-		}
-		for _, loc := range selection.Locations {
-			if loc.Source != "HF cache" || !loc.CanDelete {
-				continue
-			}
-			for _, group := range loc.Groups {
-				if group.CanDelete && len(group.Members) > 0 && group.Members[0].Path == "model-Q4_K_M.gguf" {
-					return testSelectedDeleteRequest{Repo: repo, Type: "model", LocationID: loc.ID, GroupID: group.ID, Members: group.Members}
-				}
-			}
-		}
-		t.Fatalf("no deletable HF GGUF group for %s: %+v", repo, selection.Locations)
-		return testSelectedDeleteRequest{}
+		return pickDeletableGGUFGroup(t, s, repo, func(loc cacheSelectionLocation) bool {
+			return loc.Source == "HF cache" && loc.CanDelete
+		}, "HF")
 	}
 
 	// The foreign writer owns owner/model: its selection must be refused with the
@@ -472,101 +574,6 @@ func TestSelectedDeleteRefusesCrossProcessWriter(t *testing.T) {
 	assertCacheArtifacts(t, cacheDir, hubDir, fx.body, fx.hash)
 }
 
-// newFlatGatedEndpoint builds the shared gated-endpoint fixture with a flat
-// local-layout tree (one GGUF payload) so a flat-mode download in another
-// process stays provably in flight while the test drives local selected
-// deletion through the real server route.
-func newFlatGatedEndpoint(t *testing.T) *gatedHubEndpoint {
-	t.Helper()
-	f := &gatedHubEndpoint{
-		body:    []byte("gated flat local gguf payload"),
-		reached: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	f.hash = fmt.Sprintf("%x", sha256.Sum256(f.body))
-	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/revision/"):
-			_ = json.NewEncoder(w).Encode(map[string]string{"sha": "flatcommit"})
-		case strings.Contains(r.URL.Path, "/tree/"):
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"type": "file", "path": "model-Q4_K_M.gguf", "size": len(f.body), "lfs": map[string]any{"oid": f.hash, "size": len(f.body)}}})
-		case strings.Contains(r.URL.Path, "/resolve/"):
-			switch {
-			case r.Header.Get("X-HFDesk-Addressing-Probe") == "1":
-				w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(f.body)))
-				w.Header().Set("Content-Length", "1")
-				w.WriteHeader(http.StatusPartialContent)
-				_, _ = w.Write(f.body[:1])
-			case r.Method == http.MethodHead:
-				w.Header().Set("Content-Length", fmt.Sprint(len(f.body)))
-				w.Header().Set("ETag", f.hash)
-			default:
-				f.reachedOne.Do(func() { close(f.reached) })
-				select {
-				case <-f.release:
-				case <-r.Context().Done():
-					return
-				}
-				w.Header().Set("Content-Length", fmt.Sprint(len(f.body)))
-				w.Header().Set("ETag", f.hash)
-				_, _ = w.Write(f.body)
-			}
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(f.srv.Close)
-	t.Cleanup(f.open)
-	return f
-}
-
-// TestCrossProcessFlatWriterHelper runs one real flat-mode OutputDir download
-// against the gated endpoint its parent supplies; it never runs standalone.
-func TestCrossProcessFlatWriterHelper(t *testing.T) {
-	endpoint := os.Getenv("HFDESK_XPROC_FLAT_ENDPOINT")
-	root := os.Getenv("HFDESK_XPROC_FLAT_ROOT")
-	if endpoint == "" || root == "" {
-		t.Skip("cross-process flat writer helper needs its parent fixture")
-	}
-	settings := hfdownloader.Settings{
-		OutputDir:          root,
-		OwnershipDir:       os.Getenv("HFDESK_XPROC_FLAT_OWNERSHIP"),
-		Endpoint:           endpoint,
-		Concurrency:        1,
-		MaxActiveDownloads: 1,
-		Verify:             "sha256",
-	}
-	if err := hfdownloader.Download(context.Background(), hfdownloader.Job{Repo: "owner/model", Revision: "main"}, settings, nil); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func startCrossProcessFlatWriter(t *testing.T, endpoint, root, ownershipDir string) *crossProcessWriter {
-	t.Helper()
-	executable, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer := &crossProcessWriter{cmd: exec.Command(executable, "-test.run=^TestCrossProcessFlatWriterHelper$")}
-	writer.cmd.Env = append(os.Environ(),
-		"HFDESK_XPROC_FLAT_ENDPOINT="+endpoint,
-		"HFDESK_XPROC_FLAT_ROOT="+root,
-		// The helper's own TestMain overwrites XDG_CONFIG_HOME with its sandbox,
-		// so the default realm would not match this process's: point both sides
-		// at one explicit OwnershipDir, exactly the documented shared-realm case.
-		"HFDESK_XPROC_FLAT_OWNERSHIP="+ownershipDir)
-	writer.cmd.Stdout = &writer.output
-	writer.cmd.Stderr = &writer.output
-	if err := writer.cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = writer.cmd.Process.Kill()
-		_ = writer.cmd.Wait()
-	})
-	return writer
-}
-
 // The local-root branch of selected-delete must be refused BEFORE any unlink
 // while a flat-mode writer in ANOTHER process holds the exact member file: this
 // process's JobManager sees no activity, so only the flat-realm admission can
@@ -574,64 +581,69 @@ func startCrossProcessFlatWriter(t *testing.T, endpoint, root, ownershipDir stri
 // still succeeds while that writer is in flight, the writer then completes with
 // correct bytes over the seed, and the refused selection deletes normally
 // afterwards.
+//
+// TestCrossProcessWriterHelper runs its flat mode for this scenario; the
+// fixture below serves a flat local-layout tree (one GGUF payload) so a
+// flat-mode download in another process stays provably in flight while the
+// test drives local selected deletion through the real server route.
 func TestLocalSelectedDeleteRefusesCrossProcessWriter(t *testing.T) {
-	iso := isolateCacheState(t)
-	fx := newFlatGatedEndpoint(t)
 	root := t.TempDir()
-	// The handler resolves the default realm from this process's UserConfigDir;
-	// give the foreign writer the same explicit OwnershipDir (its own TestMain
-	// would otherwise rederive a different default inside the child).
-	ucd, err := os.UserConfigDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	ownershipDir := filepath.Join(ucd, "HFDesk", "ownership")
-	if want := filepath.Join(iso, "HFDesk", "ownership"); ownershipDir != want {
-		t.Fatalf("default realm %q does not match the isolated sandbox %q", ownershipDir, want)
-	}
-	s := New(Config{CacheDir: t.TempDir(), MaxActive: 1, Concurrency: 1, Verify: "sha256", Endpoint: fx.srv.URL, LocalScanDirs: []string{root}})
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = s.jobs.Close(ctx)
-	})
-
 	seed := []byte("seeded local gguf for owner/model") // differs from the served payload, so the writer cannot skip it
 	seedPath := filepath.Join(root, "owner", "model", "model-Q4_K_M.gguf")
 	otherPath := filepath.Join(root, "owner", "other", "model-Q4_K_M.gguf")
-	for path, data := range map[string][]byte{
-		seedPath:  seed,
-		otherPath: []byte("seeded local gguf for owner/other"),
-	} {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, data, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	writer := startCrossProcessFlatWriter(t, fx.srv.URL, root, ownershipDir)
-	awaitGatedWriter(t, fx)
-
-	pickLocalGroup := func(repo string) testSelectedDeleteRequest {
-		t.Helper()
-		code, selection := getSelection(t, s, repo, "model", "")
-		if code != http.StatusOK {
-			t.Fatalf("selection for %s: status=%d", repo, code)
-		}
-		for _, loc := range selection.Locations {
-			if !strings.HasPrefix(loc.ID, "local-") || !loc.CanDelete {
-				continue
+	var ownershipDir string
+	sc := startCrossProcessScenario(t, crossProcessScenarioOpts{
+		fixture: func(t *testing.T, sc *crossProcessScenario) *gatedHubEndpoint {
+			fx := newGatedHubEndpoint(t, "model-Q4_K_M.gguf", []byte("gated flat local gguf payload"), "flatcommit")
+			// The handler resolves the default realm from this process's UserConfigDir;
+			// give the foreign writer the same explicit OwnershipDir (its own TestMain
+			// would otherwise rederive a different default inside the child).
+			ucd, err := os.UserConfigDir()
+			if err != nil {
+				t.Fatal(err)
 			}
-			for _, group := range loc.Groups {
-				if group.CanDelete && len(group.Members) > 0 && group.Members[0].Path == "model-Q4_K_M.gguf" {
-					return testSelectedDeleteRequest{Repo: repo, Type: "model", LocationID: loc.ID, GroupID: group.ID, Members: group.Members}
+			ownershipDir = filepath.Join(ucd, "HFDesk", "ownership")
+			if want := filepath.Join(sc.iso, "HFDesk", "ownership"); ownershipDir != want {
+				t.Fatalf("default realm %q does not match the isolated sandbox %q", ownershipDir, want)
+			}
+			return fx
+		},
+		config: func(sc *crossProcessScenario) Config {
+			return Config{CacheDir: t.TempDir(), MaxActive: 1, Concurrency: 1, Verify: "sha256", Endpoint: sc.fx.srv.URL, LocalScanDirs: []string{root}}
+		},
+		seed: func(sc *crossProcessScenario) {
+			for path, data := range map[string][]byte{
+				seedPath:  seed,
+				otherPath: []byte("seeded local gguf for owner/other"),
+			} {
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, data, 0o644); err != nil {
+					t.Fatal(err)
 				}
 			}
-		}
-		t.Fatalf("no deletable local GGUF group for %s: %+v", repo, selection.Locations)
-		return testSelectedDeleteRequest{}
+		},
+		writerEnv: func(sc *crossProcessScenario) []string {
+			return []string{
+				"HFDESK_XPROC_FLAT_ENDPOINT=" + sc.fx.srv.URL,
+				"HFDESK_XPROC_FLAT_ROOT=" + root,
+				// The helper's own TestMain overwrites XDG_CONFIG_HOME with its sandbox,
+				// so the default realm would not match this process's: point both sides
+				// at one explicit OwnershipDir, exactly the documented shared-realm case.
+				"HFDESK_XPROC_FLAT_OWNERSHIP=" + ownershipDir,
+			}
+		},
+	})
+	fx, s, writer := sc.fx, sc.s, sc.writer
+
+	// The local- ID-prefix location filter: only a deletable local- location
+	// may yield the group, exactly as before the picker was unified.
+	pickLocalGroup := func(repo string) testSelectedDeleteRequest {
+		t.Helper()
+		return pickDeletableGGUFGroup(t, s, repo, func(loc cacheSelectionLocation) bool {
+			return strings.HasPrefix(loc.ID, "local-") && loc.CanDelete
+		}, "local")
 	}
 
 	body, err := json.Marshal(pickLocalGroup("owner/model"))
@@ -793,12 +805,7 @@ func TestMirrorEntryAndDirectoryMutationsRefuseCrossProcessHolder(t *testing.T) 
 	isolateCacheState(t)
 	cacheDir := t.TempDir()
 	hubDir := filepath.Join(cacheDir, "hub")
-	s := New(Config{CacheDir: cacheDir, MaxActive: 1, Concurrency: 1, Verify: "sha256"})
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = s.jobs.Close(ctx)
-	})
+	s := newCrossProcessTestServer(t, Config{CacheDir: cacheDir, MaxActive: 1, Concurrency: 1, Verify: "sha256"})
 
 	blobName := strings.Repeat("a", 64)
 	payload := []byte("mirror entry replacement payload")

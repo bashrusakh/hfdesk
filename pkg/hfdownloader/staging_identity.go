@@ -37,7 +37,6 @@ func newRandomToken() string {
 	if _, err := rand.Read(b[:]); err == nil {
 		return hex.EncodeToString(b[:])
 	}
-	// Fall back to PID and time if the random source fails.
 	return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
 }
 

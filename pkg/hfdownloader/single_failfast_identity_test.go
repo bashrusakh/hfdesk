@@ -105,33 +105,3 @@ func TestSinglePathFailFastKeepsInheritedPartialAndIdentity(t *testing.T) {
 	}
 	assertExactFile(t, dst, body)
 }
-
-// Empty partials carry no progress; fail-fast removes them together with their sidecars.
-func TestSinglePathFailFastRemovesTheEmptyPartialAndItsSidecar(t *testing.T) {
-	body := []byte("the complete object content of the item")
-
-	dir := t.TempDir()
-	dst := filepath.Join(dir, "model.bin")
-	job := Job{Repo: "o/r"}
-	it := PlanItem{RelativePath: "model.bin", Size: int64(len(body))}
-	opts := singleTestIdentity
-
-	seedSinglePartial(t, dst, nil, job, it, opts)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-	}))
-	t.Cleanup(srv.Close)
-	it.URL = srv.URL + "/model.bin"
-
-	cfg := Settings{Retries: 0, StallTimeout: "0"}
-	if _, err := downloadSingle(context.Background(), srv.Client(), "", job, cfg, it, dst, opts, func(ProgressEvent) {}); err == nil {
-		t.Fatal("the permanent 403 did not fail the item")
-	}
-	if _, serr := os.Stat(dst + ".part"); !os.IsNotExist(serr) {
-		t.Errorf("the empty partial survived, stat err=%v", serr)
-	}
-	if _, serr := os.Stat(singlePartIdentityPath(dst)); !os.IsNotExist(serr) {
-		t.Errorf("the identity sidecar outlived its partial, stat err=%v", serr)
-	}
-}

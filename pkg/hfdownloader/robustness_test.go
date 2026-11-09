@@ -1029,8 +1029,9 @@ func TestDownloadSingle_IgnoredRangeRestartIsNotProgress(t *testing.T) {
 }
 
 // TestDownloadSingle_FailFastRemovesEmptyPartial verifies a fail-fast response
-// leaves no empty .part file behind, while a retryable failure preserves any
-// resumable partial.
+// leaves no empty .part file behind — together with its identity sidecar, the
+// only proof those bytes belonged to the object — while a retryable failure
+// preserves any resumable partial.
 func TestDownloadSingle_FailFastRemovesEmptyPartial(t *testing.T) {
 	tmpDir := t.TempDir()
 	full := []byte("payload")
@@ -1044,8 +1045,15 @@ func TestDownloadSingle_FailFastRemovesEmptyPartial(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	job := Job{Repo: "o/r"}
 	it := PlanItem{RelativePath: "f.bin", URL: srv.URL + "/f.bin", Size: int64(len(full))}
-	_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Retries: 3}, it, dst, singleOpts{}, func(ProgressEvent) {})
+	// Seed an empty partial plus its identity sidecar under a matching pinned
+	// identity, so their removal below is attributable to the fail-fast cleanup
+	// and not to an identity discard.
+	opts := singleTestIdentity
+	seedSinglePartial(t, dst, nil, job, it, opts)
+
+	_, err := downloadSingle(context.Background(), srv.Client(), "", job, Settings{Retries: 3}, it, dst, opts, func(ProgressEvent) {})
 	if err == nil {
 		t.Fatal("expected fail-fast error")
 	}
@@ -1054,6 +1062,9 @@ func TestDownloadSingle_FailFastRemovesEmptyPartial(t *testing.T) {
 	}
 	if _, statErr := os.Stat(dst + ".part"); !os.IsNotExist(statErr) {
 		t.Errorf("empty .part should have been removed on fail-fast, stat err: %v", statErr)
+	}
+	if _, statErr := os.Stat(singlePartIdentityPath(dst)); !os.IsNotExist(statErr) {
+		t.Errorf("the identity sidecar outlived its partial, stat err=%v", statErr)
 	}
 }
 

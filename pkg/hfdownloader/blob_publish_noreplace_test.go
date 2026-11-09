@@ -281,127 +281,73 @@ func denyCacheBlobEntryLock(t *testing.T, repo *RepoDir, sha string, denied erro
 	t.Cleanup(func() { ownershipLockOpen = oldOpen })
 }
 
-func TestSingleRouteFailsBeforePayloadMutationWhenTheDomainIsUnavailable(t *testing.T) {
-	const total = 4_096
-	body := bytes.Repeat([]byte{0x5A}, total)
-	sha := singleTestSHA(body)
-	cacheDir := t.TempDir()
-	hub, served := newPlainHub(t, total, sha, body)
-	repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.EnsureDirs(); err != nil {
-		t.Fatal(err)
-	}
-	denyCacheBlobEntryLock(t, repo, sha, errOwnershipUnavailable)
+// The single-request route must fail closed BEFORE payload mutation for every
+// mechanism that prevents holding the destination ownership domain, without
+// touching an earlier run's partial. The preserved-partial post-condition is
+// strictly stronger than a bare "nothing was staged" check: a payload write or
+// removal over the seeded bytes is observed.
+func TestSingleRouteFailsBeforePayloadMutationWhenTheDomainCannotBeHeld(t *testing.T) {
+	deniedLock := errors.New("injected ownership lock permission denied")
 
-	cfg := Settings{
-		CacheDir: cacheDir, Endpoint: hub.URL, Concurrency: 1, MaxActiveDownloads: 1,
-		MultipartThreshold: "1MB", Verify: "none", Retries: 0, StallTimeout: "0",
-	}
-	err = Download(t.Context(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ProgressEvent) {})
-	if err == nil {
-		t.Fatal("the download succeeded although the ownership domain was unavailable")
-	}
-	if !errors.Is(err, errOwnershipUnavailable) {
-		t.Fatalf("the download error = %v, want the injected destination-scope failure", err)
-	}
-	if !strings.Contains(err.Error(), "ownership") {
-		t.Fatalf("the download error = %v, want an actionable ownership failure", err)
-	}
-	if n := served(); n != 0 {
-		t.Errorf("the single-request route transferred the file %d times although the ownership domain was unavailable", n)
+	cases := []struct {
+		// name names the denial mechanism so a failure report names it too.
+		name   string
+		denied error
+	}{
+		{name: "the ownership domain is unavailable", denied: errOwnershipUnavailable},
+		{name: "the ownership lock is denied", denied: deniedLock},
 	}
 
-	// The single-request route would stage at blobs/tmp-<sha>.part.
-	if _, serr := os.Stat(filepath.Join(repo.BlobsDir(), "tmp-"+sha+".part")); serr == nil {
-		t.Error("the single-request route wrote a payload although the ownership domain was unavailable")
-	}
-	if _, serr := os.Stat(repo.BlobPath(sha)); serr == nil {
-		t.Error("the blob was published although the ownership domain was unavailable")
-	}
-}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			const total = 4_096
+			body := bytes.Repeat([]byte{0x5A}, total)
+			sha := singleTestSHA(body)
+			cacheDir := t.TempDir()
+			hub, served := newPlainHub(t, total, sha, body)
+			repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := repo.EnsureDirs(); err != nil {
+				t.Fatal(err)
+			}
+			// Seed an earlier run's partial at the single-request route's
+			// staging name, blobs/tmp-<sha>.part: the refused download must
+			// leave it byte for byte intact.
+			partial := filepath.Join(repo.BlobsDir(), "tmp-"+sha+".part")
+			earlier := []byte("the earlier run's bytes")
+			if err := os.WriteFile(partial, earlier, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			denyCacheBlobEntryLock(t, repo, sha, tc.denied)
 
-func TestSingleRouteFailsBeforePayloadMutationWithADeniedOwnershipLock(t *testing.T) {
-	denied := errors.New("injected ownership lock permission denied")
+			cfg := Settings{
+				CacheDir: cacheDir, Endpoint: hub.URL, Concurrency: 1, MaxActiveDownloads: 1,
+				MultipartThreshold: "1MB", Verify: "none", Retries: 0, StallTimeout: "0",
+			}
+			err = Download(t.Context(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ProgressEvent) {})
+			if err == nil {
+				t.Fatalf("the download succeeded although %s", tc.name)
+			}
+			if !errors.Is(err, tc.denied) {
+				t.Fatalf("the download error = %v, want the injected failure for %s", err, tc.name)
+			}
+			if !strings.Contains(err.Error(), "ownership") {
+				t.Fatalf("the download error = %v, want an actionable ownership failure", err)
+			}
+			if n := served(); n != 0 {
+				t.Errorf("the single-request route transferred the file %d times although %s", n, tc.name)
+			}
 
-	const total = 4_096
-	body := bytes.Repeat([]byte{0x33}, total)
-	sha := singleTestSHA(body)
-	cacheDir := t.TempDir()
-	hub, served := newPlainHub(t, total, sha, body)
-	repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.EnsureDirs(); err != nil {
-		t.Fatal(err)
-	}
-	denyCacheBlobEntryLock(t, repo, sha, denied)
-
-	cfg := Settings{
-		CacheDir: cacheDir, Endpoint: hub.URL, Concurrency: 1, MaxActiveDownloads: 1,
-		MultipartThreshold: "1MB", Verify: "none", Retries: 0, StallTimeout: "0",
-	}
-	err = Download(t.Context(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ProgressEvent) {})
-	if err == nil {
-		t.Fatal("the download succeeded although the ownership lock was denied")
-	}
-	if !errors.Is(err, denied) {
-		t.Fatalf("the download error = %v, want the injected destination-scope denial", err)
-	}
-	if !strings.Contains(err.Error(), "ownership") {
-		t.Fatalf("the download error = %v, want an actionable ownership failure", err)
-	}
-	if n := served(); n != 0 {
-		t.Errorf("the single-request route transferred the file %d times although the ownership lock was denied", n)
-	}
-
-	if _, serr := os.Stat(filepath.Join(repo.BlobsDir(), "tmp-"+sha+".part")); serr == nil {
-		t.Error("the single-request route wrote a payload although the ownership lock was denied")
-	}
-}
-
-func TestSingleRouteKeepsTheEarlierPartialWhenTheDomainIsUnavailable(t *testing.T) {
-	const total = 4_096
-	body := bytes.Repeat([]byte{0x77}, total)
-	sha := singleTestSHA(body)
-	cacheDir := t.TempDir()
-	hub, served := newPlainHub(t, total, sha, body)
-
-	repo, err := NewHFCache(cacheDir).Repo("owner/model", RepoTypeModel)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.EnsureDirs(); err != nil {
-		t.Fatal(err)
-	}
-	partial := filepath.Join(repo.BlobsDir(), "tmp-"+sha+".part")
-	earlier := []byte("the earlier run's bytes")
-	if err := os.WriteFile(partial, earlier, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	denyCacheBlobEntryLock(t, repo, sha, errOwnershipUnavailable)
-
-	cfg := Settings{
-		CacheDir: cacheDir, Endpoint: hub.URL, Concurrency: 1, MaxActiveDownloads: 1,
-		MultipartThreshold: "1MB", Verify: "none", Retries: 0, StallTimeout: "0",
-	}
-	err = Download(t.Context(), Job{Repo: "owner/model", Revision: "main"}, cfg, func(ProgressEvent) {})
-	if err == nil {
-		t.Fatal("the download succeeded although the ownership domain was unavailable")
-	}
-	if !errors.Is(err, errOwnershipUnavailable) {
-		t.Fatalf("the download error = %v, want the injected destination-scope failure", err)
-	}
-	if n := served(); n != 0 {
-		t.Errorf("the single-request route transferred the file %d times although the ownership domain was unavailable", n)
-	}
-
-	got, rerr := os.ReadFile(partial)
-	if rerr != nil || !bytes.Equal(got, earlier) {
-		t.Fatalf("the earlier partial = %q, %v; want it preserved", got, rerr)
+			got, rerr := os.ReadFile(partial)
+			if rerr != nil || !bytes.Equal(got, earlier) {
+				t.Fatalf("the earlier partial = %q, %v; want it preserved although %s", got, rerr, tc.name)
+			}
+			if _, serr := os.Stat(repo.BlobPath(sha)); serr == nil {
+				t.Errorf("the blob was published although %s", tc.name)
+			}
+		})
 	}
 }
 

@@ -70,6 +70,12 @@ func writeRecordWithoutPinnedFlag(t *testing.T, metaPath string) {
 
 // Unpinned resume state must restart from zero. With no known digest in
 // size mode, stale inherited bytes would otherwise escape content proof.
+// The record-side and plan-side unpinned dimensions are already discriminated
+// at unit level by TestResumeIdentityMatches (the shared resumeIdentity.matches
+// rule) and TestStagingMetaResumableIdentity (the adapter matrix), and
+// end-to-end by TestDownloadUnresolvedCommitDoesNotInheritStagedBytes; only
+// the persisted-state row those do not cover remains here: a record whose raw
+// JSON carries no commit_pinned flag at all.
 func TestRangedResumeRejectsAnUnpinnedIdentity(t *testing.T) {
 	const total = 8000
 	fresh := rangedTestPayload(total)
@@ -82,28 +88,9 @@ func TestRangedResumeRejectsAnUnpinnedIdentity(t *testing.T) {
 		planPinned bool
 	}{
 		{
-			name: "the record is not pinned",
-			record: func(t *testing.T, metaPath string) {
-				meta, err := readStagingMeta(metaPath)
-				if err != nil {
-					t.Fatal(err)
-				}
-				meta.CommitPinned = false
-				if err := writeStagingMeta(metaPath, meta); err != nil {
-					t.Fatal(err)
-				}
-			},
-			planPinned: true,
-		},
-		{
 			name:       "the record carries no pinned flag",
 			record:     writeRecordWithoutPinnedFlag,
 			planPinned: true,
-		},
-		{
-			name:       "the current plan is not pinned",
-			record:     func(t *testing.T, metaPath string) {},
-			planPinned: false,
 		},
 	}
 

@@ -692,7 +692,6 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 		// marker any more than the direct model-selection branches do.
 		matchedFilter = filterAttribution(matchedFilter, job.ExactMatch)
 
-		// Use the same identity as the tree walk.
 		var urlStr string
 		if isLFS {
 			urlStr = lfsURL(cfg.Endpoint, transferJob, rel)

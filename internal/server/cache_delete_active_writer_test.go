@@ -31,10 +31,14 @@ type gatedHubEndpoint struct {
 	releaseOne sync.Once
 }
 
-func newGatedHubEndpoint(t *testing.T) *gatedHubEndpoint {
+// newGatedHubEndpoint serves one small LFS file — the given path, body and
+// revision sha — and holds the first payload GET until opened, so a
+// production download stays provably in flight while the test drives the
+// registered cache routes.
+func newGatedHubEndpoint(t *testing.T, filePath string, body []byte, revisionSHA string) *gatedHubEndpoint {
 	t.Helper()
 	f := &gatedHubEndpoint{
-		body:    []byte("gated cache weights payload"),
+		body:    body,
 		reached: make(chan struct{}),
 		release: make(chan struct{}),
 	}
@@ -42,16 +46,13 @@ func newGatedHubEndpoint(t *testing.T) *gatedHubEndpoint {
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.Contains(r.URL.Path, "/revision/"):
-			_ = json.NewEncoder(w).Encode(map[string]string{"sha": "commit123"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"sha": revisionSHA})
 		case strings.Contains(r.URL.Path, "/tree/"):
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"type": "file", "path": "weights.safetensors", "size": len(f.body), "lfs": map[string]any{"oid": f.hash, "size": len(f.body)}}})
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"type": "file", "path": filePath, "size": len(f.body), "lfs": map[string]any{"oid": f.hash, "size": len(f.body)}}})
 		case strings.Contains(r.URL.Path, "/resolve/"):
 			switch {
-			case r.Header.Get("X-HFDesk-Addressing-Probe") == "1":
-				w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(f.body)))
-				w.Header().Set("Content-Length", "1")
-				w.WriteHeader(http.StatusPartialContent)
-				_, _ = w.Write(f.body[:1])
+			case r.Header.Get(addressingProbeHeader) == "1":
+				writeAddressingProbeResponse(w, len(f.body), f.body[:1])
 			case r.Method == http.MethodHead:
 				w.Header().Set("Content-Length", fmt.Sprint(len(f.body)))
 				w.Header().Set("ETag", f.hash)
@@ -84,13 +85,16 @@ func (f *gatedHubEndpoint) open() {
 // repositories stay deletable, and it succeeds once the writer is finished.
 func TestWholeCacheDeleteRefusesActiveWriter(t *testing.T) {
 	isolateCacheState(t)
-	fx := newGatedHubEndpoint(t)
+	fx := newGatedHubEndpoint(t, "weights.safetensors", []byte("gated cache weights payload"), "commit123")
 	cacheDir := t.TempDir()
 	hubDir := filepath.Join(cacheDir, "hub")
 	repoDir := filepath.Join(hubDir, "models--owner--model")
 	friendlyDir := filepath.Join(cacheDir, "models", "owner", "model")
 
-	s := New(Config{CacheDir: cacheDir, MaxActive: 1, Concurrency: 1, Verify: "sha256", Endpoint: fx.srv.URL})
+	s := newCrossProcessTestServer(t, Config{CacheDir: cacheDir, MaxActive: 1, Concurrency: 1, Verify: "sha256", Endpoint: fx.srv.URL})
+	// The shared teardown closes the job manager last; before that, release
+	// the gate and cancel anything still non-terminal so Close is not blocked
+	// by a deliberately stalled download.
 	t.Cleanup(func() {
 		fx.open()
 		for _, job := range s.jobs.ListJobs() {
@@ -98,9 +102,6 @@ func TestWholeCacheDeleteRefusesActiveWriter(t *testing.T) {
 				s.jobs.CancelJob(job.ID)
 			}
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = s.jobs.Close(ctx)
 	})
 
 	job, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "owner/model"})

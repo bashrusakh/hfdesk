@@ -826,14 +826,10 @@ func (r *ownershipRealm) acquireTreeRemovals(ctx context.Context, targets []stri
 }
 
 func (r *ownershipRealm) tryTreeRemovals(ctx context.Context, targets []string) (lease *ownershipLease, err error) {
-	// Whole-tree admission holds two open lock files per directory in the
-	// cache realm (entry and children locks) and three per existing
-	// directory in the flat realm (path, entry and object keys) from the
-	// first exclusive acquisition until the caller's removal finishes (the
-	// walk below), so the process soft file-descriptor limit is raised
-	// toward the hard limit for exactly this window and restored with this
-	// lease's release. An exhaustion that even the hard limit cannot cover
-	// surfaces below as the actionable limit error, never a raw EMFILE.
+	// Whole-tree admission holds two lock files per directory in the cache realm and
+	// three in the flat realm (see ownership_filedescriptor.go), so this lease raises
+	// the soft limit toward the hard limit for exactly its window; exhaustion surfaces
+	// as the actionable limit error, never a raw EMFILE.
 	releaseFileLimit := holdOwnershipFileLimit()
 	nodes := make([]ownershipTreeNode, 0)
 	defer func() {
@@ -1062,16 +1058,11 @@ func (a *CacheAdmission) AdmitTreeRemoval(ctx context.Context, target string) (f
 			return nil, treeErr
 		}
 		lastNotFound = treeErr
-		// The target reported gone. Establish the creator-side admission a
-		// creator of this target would take (never waiting while holding it)
-		// and re-verify the vanish before anything proceeds.
 		prep, prepErr := a.realm.prepareWriter(ctx, []string{target}, 0)
 		if prepErr != nil {
-			// Busy: a creator is active — refusal, not vanish, and the busy
-			// identity passes through untouched so callers keep their 409.
-			// Any other failure means admission could not be established —
-			// fail closed, re-identifying a not-exist-wrapped cause so no
-			// failed admission is ever readable as a vanished target.
+			// Busy: a creator is active — refusal, not vanish, with the busy identity
+			// passing through (callers keep their 409). Any other failure fails closed
+			// via admissionUnestablishedError, never readable as a vanished target.
 			return nil, admissionUnestablishedError(target, prepErr)
 		}
 		_, statErr := os.Lstat(prep.canonical[0])
@@ -1128,9 +1119,6 @@ func (a *CacheAdmission) AdmitDirectories(ctx context.Context, dirs []string) er
 	return a.realm.admitDirectoryCreation(ctx, dirs, 0)
 }
 
-// admitDirectoryCreation is the mkdir-only entry into ensureDirectories: existing
-// directories are skipped without taking admission, so a caller pays admission only
-// for creation that actually happens.
 func (r *ownershipRealm) admitDirectoryCreation(ctx context.Context, dirs []string, wait time.Duration) error {
 	if ctx == nil {
 		ctx = context.Background()

@@ -3,9 +3,7 @@
 
 package hfdownloader
 
-// Current writers combine a process-local waiter with an external realm scope.
-// Ranged claims and publication reuse the held scope; digest-less items retain
-// the reserved tmp-path- identity. See doc.go for the full protocol contract.
+// See doc.go for the full protocol contract: held-scope reuse by ranged claims and publication, and the reserved tmp-path- identity for digest-less items.
 
 import (
 	"context"
@@ -17,9 +15,8 @@ import (
 	"time"
 )
 
-// The ownership classification below now lives on the current path: the
-// realm-scope acquisition in acquireBlobDomainScoped produces these errors
-// and the wait budget it feeds is measured in stagingOwnershipAcquireWait.
+// These errors come from the realm-scope acquisition in acquireBlobDomainScoped;
+// the wait budget it feeds is stagingOwnershipAcquireWait.
 var (
 	// errStagingOwnershipBusy means a current external probe confirmed an
 	// exclusive holder for the requested ownership scope.

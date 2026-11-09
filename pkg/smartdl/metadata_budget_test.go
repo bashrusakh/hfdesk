@@ -62,6 +62,55 @@ func analyzeNormalEndpoints(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Metadata-budget watchdog bounds are deliberately asymmetric: the asserted
+// bound (slack) carries runner-starvation headroom, while watchdogSlack fires
+// well beyond it, where an unbounded read and a severely starved runner are
+// honestly indistinguishable. Every metadata-timeout test watches its attempt
+// through awaitBudgetedAnalysis with these bounds.
+const (
+	metadataBudgetSlack         = 10 * time.Second // asserted-bound headroom (starvation tolerance)
+	metadataBudgetWatchdogSlack = 30 * time.Second // watchdog fires well beyond the asserted bound
+)
+
+// awaitBudgetedAnalysis runs one analysis attempt under the shared
+// asymmetric-slack watchdog: it returns the attempt's result when it finishes
+// within budget+slack (flagging with t.Errorf any attempt that returned later
+// than the asserted bound), and fails the test from the watchdog — cancelling
+// the attempt first — when it does not finish within budget+watchdogSlack.
+// watchdogReason names what an expired watchdog implicates and is appended to
+// the watchdog message when non-empty. The attempt itself is run, and every
+// per-site assertion on its result — actionable timeout text, classifier
+// checks, stall counters — is written, by the caller.
+func awaitBudgetedAnalysis(t *testing.T, budget, slack, watchdogSlack time.Duration, watchdogReason string, run func(context.Context) (*RepoInfo, error)) (*RepoInfo, error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type analysisAttempt struct {
+		info *RepoInfo
+		err  error
+	}
+	done := make(chan analysisAttempt, 1)
+	start := time.Now()
+	go func() {
+		info, err := run(ctx)
+		done <- analysisAttempt{info: info, err: err}
+	}()
+	select {
+	case res := <-done:
+		if elapsed := time.Since(start); elapsed > budget+slack {
+			t.Errorf("analysis returned after %v, want within cap+slack %v", elapsed, budget+slack)
+		}
+		return res.info, res.err
+	case <-time.After(budget + watchdogSlack):
+		cancel()
+		if watchdogReason == "" {
+			t.Fatalf("analysis did not complete within the watchdog (cap %v + slack %v)", budget, watchdogSlack)
+		}
+		t.Fatalf("analysis did not complete within the watchdog (cap %v + slack %v): %s", budget, watchdogSlack, watchdogReason)
+		return nil, nil // unreachable: t.Fatalf does not return
+	}
+}
+
 // TestAnalyze_StalledMetadataBodyFailsWithinFetchBudget pins the per-fetch
 // metadata cap on the analyze flow's required config/metadata reads: a
 // server that sends response headers and a partial body and then stalls must
@@ -81,53 +130,30 @@ func TestAnalyze_StalledMetadataBodyFailsWithinFetchBudget(t *testing.T) {
 		metadataFetchTimeout = testBudget
 		defer func() { metadataFetchTimeout = oldBudget }()
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		type result struct {
-			info *RepoInfo
-			err  error
-		}
-		done := make(chan result, 1)
-		start := time.Now()
-		go func() {
-			info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).Analyze(ctx, "owner/model", false)
-			done <- result{info, err}
-		}()
+		info, err := awaitBudgetedAnalysis(t, testBudget, metadataBudgetSlack, metadataBudgetWatchdogSlack,
+			"unbounded config body read or a starved runner",
+			func(ctx context.Context) (*RepoInfo, error) {
+				return NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).
+					Analyze(ctx, "owner/model", false)
+			})
 
-		// Deliberately asymmetric bounds: the asserted bound carries runner
-		// starvation headroom, while the watchdog fires well beyond it, where
-		// an unbounded read and a severely starved runner are honestly
-		// indistinguishable.
-		const (
-			slack         = 10 * time.Second // asserted-bound headroom (starvation tolerance)
-			watchdogSlack = 30 * time.Second // watchdog fires well beyond the asserted bound
-		)
-		select {
-		case res := <-done:
-			if res.info != nil || res.err == nil {
-				t.Fatalf("stalled metadata body info=%v err=%v, want an analysis timeout failure and no partial result", res.info, res.err)
+		if info != nil || err == nil {
+			t.Fatalf("stalled metadata body info=%v err=%v, want an analysis timeout failure and no partial result", info, err)
+		}
+		for _, want := range []string{
+			`metadata config.json`,
+			`file content fetch for "config.json"`,
+			"timed out after 500ms",
+			"check the endpoint, proxy, or network and retry",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("timeout error = %q, want it to contain %q", err, want)
 			}
-			if elapsed := time.Since(start); elapsed > testBudget+slack {
-				t.Errorf("analysis returned after %v, want within cap+slack %v", elapsed, testBudget+slack)
-			}
-			for _, want := range []string{
-				`metadata config.json`,
-				`file content fetch for "config.json"`,
-				"timed out after 500ms",
-				"check the endpoint, proxy, or network and retry",
-			} {
-				if !strings.Contains(res.err.Error(), want) {
-					t.Errorf("timeout error = %q, want it to contain %q", res.err, want)
-				}
-			}
-			// The budget expiry stays a FAILURE for error classifiers and
-			// must never read as caller cancellation.
-			if errors.Is(res.err, context.DeadlineExceeded) || errors.Is(res.err, context.Canceled) {
-				t.Errorf("timeout error %v must not classify as caller cancellation", res.err)
-			}
-		case <-time.After(testBudget + watchdogSlack):
-			cancel()
-			t.Fatalf("analysis did not complete within the watchdog (cap %v + slack %v): unbounded config body read or a starved runner", testBudget, watchdogSlack)
+		}
+		// The budget expiry stays a FAILURE for error classifiers and
+		// must never read as caller cancellation.
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			t.Errorf("timeout error %v must not classify as caller cancellation", err)
 		}
 	})
 
@@ -174,49 +200,26 @@ func TestAnalyze_StalledRefsBodyDegradesWithinFetchBudget(t *testing.T) {
 	metadataFetchTimeout = testBudget
 	defer func() { metadataFetchTimeout = oldBudget }()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	type result struct {
-		info *RepoInfo
-		err  error
-	}
-	done := make(chan result, 1)
-	start := time.Now()
-	go func() {
-		info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).Analyze(ctx, "owner/model", false)
-		done <- result{info, err}
-	}()
+	info, err := awaitBudgetedAnalysis(t, testBudget, metadataBudgetSlack, metadataBudgetWatchdogSlack,
+		"unbounded refs body read or a starved runner",
+		func(ctx context.Context) (*RepoInfo, error) {
+			return NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).
+				Analyze(ctx, "owner/model", false)
+		})
 
-	// Deliberately asymmetric bounds: the asserted bound carries runner
-	// starvation headroom, while the watchdog fires well beyond it, where an
-	// unbounded read and a severely starved runner are honestly
-	// indistinguishable.
-	const (
-		slack         = 10 * time.Second // asserted-bound headroom (starvation tolerance)
-		watchdogSlack = 30 * time.Second // watchdog fires well beyond the asserted bound
-	)
-	select {
-	case res := <-done:
-		if res.err != nil {
-			t.Fatalf("optional refs failure became fatal: %v", res.err)
-		}
-		if res.info == nil {
-			t.Fatal("analysis returned no result after an optional refs failure")
-		}
-		if len(res.info.Refs) != 0 {
-			t.Errorf("refs = %v, want the established empty degradation for a failed refs fetch", res.info.Refs)
-		}
-		if got := stalledHits.Load(); got != 1 {
-			t.Errorf("stalled refs requests = %d, want exactly 1: the refs fetch must actually be attempted for this degradation to discriminate", got)
-		}
-		if elapsed := time.Since(start); elapsed > testBudget+slack {
-			t.Errorf("analysis returned after %v, want within cap+slack %v", elapsed, testBudget+slack)
-		}
-		if res.info.Metadata["config.json"] == nil {
-			t.Errorf("analysis metadata lost while degrading an optional refs failure: %+v", res.info.Metadata)
-		}
-	case <-time.After(testBudget + watchdogSlack):
-		cancel()
-		t.Fatalf("analysis did not complete within the watchdog (cap %v + slack %v): unbounded refs body read or a starved runner", testBudget, watchdogSlack)
+	if err != nil {
+		t.Fatalf("optional refs failure became fatal: %v", err)
+	}
+	if info == nil {
+		t.Fatal("analysis returned no result after an optional refs failure")
+	}
+	if len(info.Refs) != 0 {
+		t.Errorf("refs = %v, want the established empty degradation for a failed refs fetch", info.Refs)
+	}
+	if got := stalledHits.Load(); got != 1 {
+		t.Errorf("stalled refs requests = %d, want exactly 1: the refs fetch must actually be attempted for this degradation to discriminate", got)
+	}
+	if info.Metadata["config.json"] == nil {
+		t.Errorf("analysis metadata lost while degrading an optional refs failure: %+v", info.Metadata)
 	}
 }

@@ -101,12 +101,6 @@ func (l *ownershipRegisteredLock) release() {
 	unregisterExclusiveOwnershipLock(filepath.Clean(l.path))
 }
 
-// openRegisteredOwnershipLock is the production ownershipLockOpen: the
-// platform primitive plus the process-local held-lock record. The record is
-// written before the OS lock attempt and rolled back on refusal, so the
-// record can only ever over-claim this process's holds — a classification can
-// soften to same-process during the attempt window but can never miss a
-// same-process holder and falsely claim a foreign one.
 func openRegisteredOwnershipLock(path string, mode ownershipLockMode) (ownershipLockHandle, error) {
 	registered := mode == ownershipExclusive
 	clean := filepath.Clean(path)
