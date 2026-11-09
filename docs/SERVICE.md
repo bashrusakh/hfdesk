@@ -1147,9 +1147,11 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   repair (`sc config hfdesk obj= "NT AUTHORITY\LocalService" password= ""` from
   an elevated shell) and asks for another installation; a registration that runs
   as the supported identity keeps updating as before.
-- **The program is checked before anything is touched.** An installation
-  checks the path and effective execute access before it writes a registration,
-  creates an instance directory or stops a running instance. Linux uses the
+- **The program is checked before anything is touched — on Windows and
+  Linux in full, on macOS within its documented scope and moment.**
+  Windows and Linux check the path and effective execute access before they
+  write a registration, create an instance directory or stop a running
+  instance. Linux uses the
   kernel access check under the identity of the instance (including directory
   traversal and filesystem access rules); a native executable does not need a
   read bit. When the visible `binfmt_misc` state is readable and empty, a
@@ -1173,7 +1175,13 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   service update uses its actual `LocalService` process token for native
   `AccessCheck`, including its enabled traverse-bypass privilege. If that token
   cannot be obtained, access remains inconclusive rather than being inferred
-  from a partial group model. These executable access preflight checks do not
+  from a partial group model. macOS runs its own, lighter preflight — the
+  program exists and carries an executable bit, the listen address parses and
+  launchctl is available — after the account, directory and elevation checks
+  and after the instance directories are prepared and granted, but still
+  before the property list is written and before anything is loaded or
+  stopped; it does not run the effective-access, image or machine checks of the
+  other platforms. These executable access preflight checks do not
   change permissions.
 - **The running state decides the restart.** An instance that runs, or is
   starting, is stopped and started again on the new program. The update requires
