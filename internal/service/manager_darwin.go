@@ -299,30 +299,55 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 		return opts, fmt.Errorf("service: the installation was refused: the supervisor reports neither a state nor a process id for %s, so whether the instance runs cannot be determined. Stop the instance with %q and run %q again",
 			m.target(), "hfdesk service stop", "hfdesk service install")
 	}
+	if supervisor.loaded && supervisor.runningKnown && supervisor.running && !backup.existed {
+		// Finding 5: a running job the supervisor holds without its
+		// property list has no file an update could restore — the write
+		// would replace the only registration that exists and a failed
+		// restart could not bring the instance back from a file that is
+		// gone. The refusal precedes every mutation, and the stop it
+		// names clears the state: the unloaded retry is a genuine first
+		// installation.
+		return opts, fmt.Errorf("service: the installation was refused: the supervisor holds %s as a running job while its property list is missing: an update could stop the instance but could not restore the registration it stops. Stop the instance with %q and run %q again",
+			m.target(), "hfdesk service stop", "hfdesk service install")
+	}
 	// The directories the installation is about to create are remembered
 	// before they are created, so the account is given the ownership of
 	// exactly those and of nothing else.
 	//
-	// The list is also what a failed installation removes again, so a
-	// failed installation leaves the machine as it was.
+	// The list is also what a failed installation may remove again — only
+	// when the prior registration cannot reference it (Finding 7): the
+	// same cleanup gate the other platforms apply.
 	created := make(map[string][]string, 3)
 	for _, dir := range instanceDirs(opts) {
 		created[dir.path] = createdDirs(dir.path)
 	}
 	if err := PrepareDirs(opts); err != nil {
 		// The preparation may have created some of the directories
-		// before it failed: they are removed again, so a failed attempt
-		// leaves the machine as it was.
-		removeCreatedDirs(createdDirOrder(opts, created))
+		// before it failed. They are removed only when the previous
+		// registration cannot reference them: an unproven prior
+		// registration keeps the directories and the error says so.
+		if launchdCreatedDirsSafeToRemove(backup, created) {
+			removeCreatedDirs(createdDirOrder(opts, created))
+		} else {
+			err = fmt.Errorf("%w (installation-created directories were retained because the prior registration may still reference them)", err)
+		}
 		return opts, err
 	}
-	// The installation owns the directories it created from here on: a
-	// failure removes them again, so a failed installation never leaves
-	// the directories of the instance behind.
-	if err := m.register(ctx, opts, account, created, backup, runAtLoad, supervisor); err != nil {
-		removeCreatedDirs(createdDirOrder(opts, created))
-		return opts, err
+	// The registration result decides whether a failed attempt may remove
+	// these paths; an indeterminate registration keeps them.
+	createdDirsSafe, registerErr := m.register(ctx, opts, account, created, backup, runAtLoad, supervisor)
+	if registerErr != nil {
+		if createdDirsSafe {
+			removeCreatedDirs(createdDirOrder(opts, created))
+		} else {
+			registerErr = fmt.Errorf("%w (installation-created directories were retained because the supervisor could not prove the restored or retained registration no longer references them)", registerErr)
+		}
+		return opts, registerErr
 	}
+	// Created is the result of this installation: the registration exists
+	// now and did not exist before — no property list and no job the
+	// supervisor held — the first-registration fact load acted on.
+	opts.Created = !backup.existed && !supervisor.loaded
 	return opts, nil
 }
 
@@ -337,37 +362,44 @@ func (m *launchdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 // repeat over a property list that is missing or unreadable. The property
 // list is the canonical rendering of the merged options —
 // HFDesk owns the file it writes, so a failed registration is rolled back
-// from the exact bytes in backup: the property list is restored and the
-// directories the installation created are removed by the caller, so a failed
-// installation leaves no half configured registration and no empty
-// directories behind.
-func (m *launchdManager) register(ctx context.Context, opts InstallOptions, account *serviceAccount, created map[string][]string, backup *plistBackup, runAtLoad bool, supervisor launchdSupervisorState) error {
+// from the exact bytes in backup: the property list is restored, and the
+// result reports whether the directories this attempt created are safe to
+// remove — a rollback the supervisor cannot prove restored keeps them, so a
+// failed installation never removes a directory the surviving registration
+// may still reference.
+func (m *launchdManager) register(ctx context.Context, opts InstallOptions, account *serviceAccount, created map[string][]string, backup *plistBackup, runAtLoad bool, supervisor launchdSupervisorState) (bool, error) {
+	// The prior property list decides whether the directories this attempt
+	// created may ever be removed — the rule the other platforms apply:
+	// only a proven-unreferenced cleanup runs, and a rollback the
+	// supervisor cannot prove restored keeps the directories.
+	safe := launchdCreatedDirsSafeToRemove(backup, created)
 	// The instance runs as the account, so the account owns the directories
 	// the instance writes.
 	if err := m.grantInstanceDirs(opts, account, created); err != nil {
-		return err
+		return safe, err
 	}
 	if err := m.preflight(opts); err != nil {
-		return err
+		return safe, err
 	}
 
 	content, err := renderPlistWithRunAtLoad(opts, account, runAtLoad)
 	if err != nil {
-		return err
+		return safe, err
 	}
 
 	path := m.plistPath()
 	changed := !backup.existed || !bytes.Equal(backup.content, []byte(content))
 	if err := writePlist(path, []byte(content), plistMode); err != nil {
-		return err
+		return safe, err
 	}
 
 	plan := launchdInstallPlan{firstInstall: !backup.existed, changed: changed}
 	state, err := m.load(ctx, path, plan, supervisor)
 	if err != nil {
-		return m.rollback(ctx, backup, state, err)
+		restored, rollbackErr := m.rollback(ctx, backup, state, err)
+		return restored && safe, rollbackErr
 	}
-	return nil
+	return safe, nil
 }
 
 // Uninstall removes the registration of the instance.
@@ -884,6 +916,53 @@ func instanceDirs(opts InstallOptions) []instanceDir {
 	}
 }
 
+// launchdCreatedDirsSafeToRemove reports whether the directories this
+// attempt created may be removed after a failure: they may be removed
+// whenever the previous property list — the registration in backup —
+// neither references one of them nor stands unread, because an unreadable
+// previous registration might reference anything. The rule mirrors
+// systemdCreatedDirsSafeToRemove on Linux and the Windows result: only a
+// proven-unreferenced cleanup runs, and an indeterminate previous
+// registration keeps the directories.
+func launchdCreatedDirsSafeToRemove(backup *plistBackup, created map[string][]string) bool {
+	var createdPaths []string
+	for _, paths := range created {
+		createdPaths = append(createdPaths, paths...)
+	}
+	if len(createdPaths) == 0 || !backup.existed {
+		return true
+	}
+	previous, err := parsePlist(backup.content)
+	if err != nil {
+		return false
+	}
+	var referenced []string
+	for _, dir := range instanceDirs(InstallOptions{Paths: previous.paths()}) {
+		referenced = append(referenced, dir.path)
+	}
+	for _, value := range previous.Environment {
+		if filepath.IsAbs(value) {
+			referenced = append(referenced, value)
+		}
+	}
+	for _, createdPath := range createdPaths {
+		resolvedCreated, err := resolvePath(createdPath)
+		if err != nil {
+			return false
+		}
+		for _, referencedPath := range referenced {
+			resolvedReference, err := resolvePath(referencedPath)
+			if err != nil {
+				return false
+			}
+			if pathContains(resolvedCreated, resolvedReference) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // instanceDir is one directory an instance owns.
 type instanceDir struct {
 	// name is the name of the directory in an error message.
@@ -1208,8 +1287,9 @@ func (m *launchdManager) load(ctx context.Context, path string, plan launchdInst
 	// run enable. Everything else follows the repeat-install rules, so a
 	// stopped instance is never started and no autostart decision of an
 	// administrator is overwritten. (The unknown running fact of a held
-	// job refuses in Install, before anything is written — this snapshot
-	// is the state that refusal let through.)
+	// job — and a RUNNING job whose property list is missing — refuse
+	// in Install, before anything is written: this snapshot is the
+	// state those refusals let through.)
 	firstRegistration := plan.firstInstall && !previous.loaded
 
 	switch {
@@ -1559,7 +1639,18 @@ func (e *stopTimeoutError) Error() string {
 // a restored registration whose instance is not confirmed running — so the
 // failure of the installation never hides the failure of the rollback and a
 // success is never claimed from the write alone.
-func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, state launchdLoadState, cause error) error {
+//
+// Every recovery command runs on a bounded context of its own
+// (rollbackRecoveryContext): the attempt context may already be dead when
+// the rollback starts, and the property list is restored before any
+// supervisor command, so no failure of a recovery command can skip the
+// restore of the file.
+func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, state launchdLoadState, cause error) (bool, error) {
+	// The recovery detaches from the attempt and takes its own budget: a
+	// cancelled or expired installation context must not stop the
+	// recovery, and the recovery must not hang either.
+	recovery, cancel := rollbackRecoveryContext(ctx)
+	defer cancel()
 	// The disable flag may be cleared at every point of this rollback:
 	// the attempt's restart dance may have cleared it before the attempt
 	// failed, and this rollback clears it again for its own bootstrap.
@@ -1571,9 +1662,16 @@ func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, stat
 	restore := func(inner string, args ...interface{}) error {
 		base := fmt.Errorf("%w %s", cause, fmt.Sprintf(inner, args...))
 		if state.previous.disabled {
-			base = m.restoreDisableFlag(ctx, base)
+			base = m.restoreDisableFlag(recovery, base)
 		}
 		return AppendActionErrorIfUnnamed(base, statusReadHint)
+	}
+	// The property list is restored BEFORE the supervisor is commanded:
+	// every exit below — a bootout failing as the first recovery command
+	// included — leaves the previous registration on disk, so no failure
+	// of a supervisor command can skip the restore of the file.
+	if err := backup.restore(); err != nil {
+		return false, restore("(the property list could not be restored: %v)", err)
 	}
 	// The registration of the failed attempt is unloaded when the attempt
 	// loaded the job or took over the registration of a job that was
@@ -1582,12 +1680,9 @@ func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, stat
 	// again.
 	unload := state.replaced || (state.bootstrapped && !state.previous.loaded)
 	if unload {
-		if _, err := m.launchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
-			return restore("(the registration could not be unloaded: %v)", err)
+		if _, err := m.launchctl(recovery, "bootout", m.target()); err != nil && !isServiceMissing(err) {
+			return false, restore("(the registration could not be unloaded: %v)", err)
 		}
-	}
-	if err := backup.restore(); err != nil {
-		return restore("(the property list could not be restored: %v)", err)
 	}
 	if state.replaced {
 		if state.previous.disabled {
@@ -1597,15 +1692,15 @@ func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, stat
 			// and at the end of this function — so the rollback gives
 			// the loaded state back without leaving the disable flag
 			// cleared, whichever step of it fails.
-			if _, err := m.launchctl(ctx, "enable", m.target()); err != nil {
-				return restore("(the restored registration could not be enabled for the load: %v)", err)
+			if _, err := m.launchctl(recovery, "enable", m.target()); err != nil {
+				return false, restore("(the restored registration could not be enabled for the load: %v)", err)
 			}
 		}
 		// The attempt took over the registration of a job that was
 		// loaded before it: the restored file is loaded again, so the
 		// instance runs like it did before.
-		if _, err := m.launchctl(ctx, "bootstrap", m.domain(), backup.path); err != nil {
-			return restore("(the restored registration could not be loaded: %v)", err)
+		if _, err := m.launchctl(recovery, "bootstrap", m.domain(), backup.path); err != nil {
+			return false, restore("(the restored registration could not be loaded: %v)", err)
 		}
 		// The instance ran before the attempt. A restored property list
 		// whose RunAtLoad is false is loaded by that bootstrap but not
@@ -1615,9 +1710,9 @@ func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, stat
 		// cannot be read is not started here: launchd refuses to load
 		// it at all, and the load above already reported that.
 		if state.previous.running {
-			if restored, parseErr := parsePlist(backup.content); parseErr == nil && !restored.RunAtLoad {
-				if _, err := m.launchctl(ctx, "kickstart", m.target()); err != nil {
-					return restore("(the restored registration could not be started: %v)", err)
+			if parsed, parseErr := parsePlist(backup.content); parseErr == nil && !parsed.RunAtLoad {
+				if _, err := m.launchctl(recovery, "kickstart", m.target()); err != nil {
+					return false, restore("(the restored registration could not be started: %v)", err)
 				}
 			}
 		}
@@ -1628,19 +1723,38 @@ func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, stat
 	// disabled, so no enable runs here — the flag is restored only as
 	// observed, and a job that was not disabled needs nothing back.
 	if state.previous.disabled {
-		if _, err := m.launchctl(ctx, "disable", m.target()); err != nil {
-			return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the disable flag could not be restored: %v)", cause, err), statusReadHint)
+		if _, err := m.launchctl(recovery, "disable", m.target()); err != nil {
+			return false, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the disable flag could not be restored: %v)", cause, err), statusReadHint)
 		}
 	}
-	return m.verifyRestoredRegistration(ctx, state, cause)
+	return m.verifyRestoredRegistration(recovery, state, cause)
+}
+
+// rollbackRecoveryBudget bounds every command of a rollback: the recovery
+// detaches from the cancelled attempt and must still not hang — the
+// shutdown budget of the service layer plus its margin is the span a
+// bootout may wait for a graceful exit (the ExitTimeOut of the
+// registration is sized from the same budget), so one shutdown's worth
+// covers the unload, the reload and the read-back. A test shortens it to
+// prove the exhaustion report.
+var rollbackRecoveryBudget = ShutdownBudget + shutdownMargin
+
+// rollbackRecoveryContext is the recovery context of a rollback:
+// cancellation of the attempt does not reach it, rollbackRecoveryBudget
+// bounds it, and the caller stops its timer when the recovery ends.
+func rollbackRecoveryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), rollbackRecoveryBudget)
 }
 
 // restoreDisableFlag re-asserts the observed disable flag after a dance
-// cleared it, on a context of its own so a cancelled attempt cannot
-// degrade the restore; a restore that fails is named in the error it
-// wraps instead of being hidden.
+// cleared it. The restore owns its recovery context — detached from the
+// cancelled attempt and bounded (rollbackRecoveryContext) — so a cancelled
+// attempt cannot degrade it and it cannot hang; a failure is named in the
+// error it wraps instead of being hidden.
 func (m *launchdManager) restoreDisableFlag(ctx context.Context, err error) error {
-	if _, derr := m.launchctl(context.WithoutCancel(ctx), "disable", m.target()); derr != nil {
+	recovery, cancel := rollbackRecoveryContext(ctx)
+	defer cancel()
+	if _, derr := m.launchctl(recovery, "disable", m.target()); derr != nil {
 		return fmt.Errorf("%w (the disable flag could not be restored: %v)", err, derr)
 	}
 	return err
@@ -1655,27 +1769,31 @@ func (m *launchdManager) restoreDisableFlag(ctx context.Context, err error) erro
 // the rollback gave back, and an instance that ran before the attempt has to
 // be observed running for that full claim. Everything the read cannot prove —
 // a state it cannot reach, a state that does not match, an instance that does
-// not come back — is reported as what it is. The read runs on a context of
-// its own: a cancelled installation must not degrade its own rollback report
-// into unknown.
-func (m *launchdManager) verifyRestoredRegistration(ctx context.Context, state launchdLoadState, cause error) error {
+// not come back — is reported as what it is. The read runs on the recovery
+// context of the rollback — detached from the cancelled attempt and bounded
+// — so a cancelled installation must not degrade its own rollback report
+// into unknown. The boolean reports whether the registration is PROVEN back
+// at its previous state: the created-directory cleanup of the caller keys
+// on it, and every uncertain read reports false.
+func (m *launchdManager) verifyRestoredRegistration(ctx context.Context, state launchdLoadState, cause error) (bool, error) {
 	if !state.previousKnown {
 		// The attempt failed before it captured the state of the
 		// registration: there is nothing to compare a read back
-		// against, and the rollback claims only what it did itself.
-		return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the property list was restored; the previous state of the registration was not captured)", cause), statusReadHint)
+		// against, and the rollback claims only what it did itself —
+		// the property list is back at its previous state.
+		return true, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the property list was restored; the previous state of the registration was not captured)", cause), statusReadHint)
 	}
-	readback, err := m.supervisorState(context.WithoutCancel(ctx))
+	readback, err := m.supervisorState(ctx)
 	if err != nil {
-		return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the state of the restored registration could not be read back: %v)", cause, err), statusReadHint)
+		return false, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the state of the restored registration could not be read back: %v)", cause, err), statusReadHint)
 	}
 	if readback.loaded != state.previous.loaded || readback.disabled != state.previous.disabled {
-		return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the registration does not hold the previous state again)", cause), statusReadHint)
+		return false, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the registration does not hold the previous state again)", cause), statusReadHint)
 	}
 	if state.previous.running && !readback.running {
-		return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the registration was restored, but the instance was not confirmed running)", cause), statusReadHint)
+		return true, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the registration was restored, but the instance was not confirmed running)", cause), statusReadHint)
 	}
-	return AppendActionErrorIfUnnamed(fmt.Errorf("%w (the registration was restored)", cause), statusReadHint)
+	return true, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the registration was restored)", cause), statusReadHint)
 }
 
 // plistBackup is the state of a property list before it was overwritten.

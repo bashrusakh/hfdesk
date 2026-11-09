@@ -3172,8 +3172,14 @@ func TestLaunchdSuccessfulInstallKeepsItsDirectories(t *testing.T) {
 
 	opts := darwinTempInstallOptions(t, root)
 	m := darwinStatusManager(t)
-	if _, err := m.Install(context.Background(), opts); err != nil {
+	installed, err := m.Install(context.Background(), opts)
+	if err != nil {
 		t.Fatalf("Install() = %v, want nil", err)
+	}
+	// Finding 3: the first installation created the registration — the
+	// result every platform reports.
+	if !installed.Created {
+		t.Error("the first installation reported Created=false, want true")
 	}
 
 	for _, dir := range []string{
@@ -3399,6 +3405,12 @@ type darwinFakeLaunchd struct {
 	// failures maps the first word of a command to the error the fake
 	// returns for it.
 	failures map[string]error
+	// blockCommand names a command on which blockEffect runs before the
+	// fake answers it: a recovery fixture cancels the install context at
+	// exactly that command, so every later command must run on the
+	// rollback's own context to appear at all.
+	blockCommand string
+	blockEffect  context.CancelFunc
 }
 
 // run answers a command of the supervisor.
@@ -3410,6 +3422,15 @@ func (f *darwinFakeLaunchd) run(ctx context.Context, args ...string) (string, er
 	f.commands = append(f.commands, command)
 	if err, ok := f.failures[args[0]]; ok {
 		return "", err
+	}
+	if f.blockCommand != "" && args[0] == f.blockCommand && f.blockEffect != nil {
+		f.blockEffect()
+	}
+	// The fake mirrors exec.CommandContext: a dead context never executes
+	// the command — a rollback that shared the cancelled attempt context
+	// could not run a recovery command here at all.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", fmt.Errorf("service: launchctl %s: %w", command, ctxErr)
 	}
 	switch args[0] {
 	case "print":
@@ -3666,7 +3687,7 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			bootstrapped:  true,
 			replaced:      true,
 		}
-		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		_, rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
 		if !errors.Is(rollbackErr, cause) {
 			t.Errorf("rollback() = %v, want the cause of the failed installation", rollbackErr)
 		}
@@ -3707,7 +3728,7 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			bootstrapped:  true,
 			replaced:      true,
 		}
-		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		_, rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
 		if !errors.Is(rollbackErr, cause) {
 			t.Errorf("rollback() = %v, want the cause of the failed installation", rollbackErr)
 		}
@@ -3753,7 +3774,7 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			bootstrapped:  true,
 			replaced:      true,
 		}
-		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		_, rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
 		if !errors.Is(rollbackErr, cause) {
 			t.Errorf("rollback() = %v, want the cause of the failed installation", rollbackErr)
 		}
@@ -3804,7 +3825,7 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			bootstrapped:  true,
 			replaced:      true,
 		}
-		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		_, rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
 		if !errors.Is(rollbackErr, cause) || !strings.Contains(rollbackErr.Error(), bootstrapErr.Error()) {
 			t.Errorf("rollback() = %v, want the cause with the bootstrap failure", rollbackErr)
 		}
@@ -3842,7 +3863,7 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			bootstrapped:  true,
 			replaced:      true,
 		}
-		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		_, rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
 		if rollbackErr == nil {
 			t.Fatal("rollback() = nil, want the bootstrap failure with the named restore failure")
 		}
@@ -3898,7 +3919,7 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			bootstrapped:  true,
 			replaced:      true,
 		}
-		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		_, rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
 		if !errors.Is(rollbackErr, cause) || !strings.Contains(rollbackErr.Error(), kickstartErr.Error()) {
 			t.Errorf("rollback() = %v, want the cause with the kickstart failure", rollbackErr)
 		}
@@ -3933,7 +3954,7 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			bootstrapped:  true,
 			replaced:      true,
 		}
-		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		_, rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
 		if !errors.Is(rollbackErr, cause) {
 			t.Errorf("rollback() = %v, want the cause of the failed installation", rollbackErr)
 		}
@@ -3967,7 +3988,7 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			previousKnown: true,
 			bootstrapped:  true,
 		}
-		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		_, rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
 		if !errors.Is(rollbackErr, cause) {
 			t.Errorf("rollback() = %v, want the cause of the failed installation", rollbackErr)
 		}
@@ -4017,7 +4038,7 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			bootstrapped:  true,
 			replaced:      true,
 		}
-		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		_, rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
 		if !errors.Is(rollbackErr, cause) {
 			t.Errorf("rollback() = %v, want the cause of the failed installation", rollbackErr)
 		}
@@ -4063,7 +4084,7 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			replaced:      true,
 			previousKnown: true,
 		}
-		err := launchd.rollback(context.Background(), backup, state, cause)
+		_, err := launchd.rollback(context.Background(), backup, state, cause)
 		if !errors.Is(err, cause) {
 			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
 		}
@@ -4097,7 +4118,7 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			previous:      launchdSupervisorState{loaded: true},
 			previousKnown: true,
 		}
-		err := launchd.rollback(context.Background(), backup, state, cause)
+		_, err := launchd.rollback(context.Background(), backup, state, cause)
 		if !errors.Is(err, cause) {
 			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
 		}
@@ -4139,7 +4160,7 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			replaced:      true,
 			previousKnown: true,
 		}
-		err = launchd.rollback(context.Background(), backup, state, cause)
+		_, err = launchd.rollback(context.Background(), backup, state, cause)
 		if !errors.Is(err, cause) {
 			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
 		}
@@ -4171,7 +4192,7 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 		// registration: there is no previous state to compare a read
 		// back against, so the rollback proves only what it did itself.
 		cause := errors.New("service: print " + launchd.target() + ": exit status 1")
-		err := launchd.rollback(context.Background(), backup, launchdLoadState{}, cause)
+		_, err := launchd.rollback(context.Background(), backup, launchdLoadState{}, cause)
 		if !errors.Is(err, cause) {
 			t.Errorf("rollback() = %v, want the cause of the failed installation", err)
 		}
@@ -4706,8 +4727,13 @@ func TestLaunchdInstallOverALoadedJobWithoutAFileStaysStopped(t *testing.T) {
 	program := darwinTempInstallOptions(t, t.TempDir())
 
 	fake.commands = nil
-	_, err := launchd.Install(ctx, program)
+	installed, err := launchd.Install(ctx, program)
 	assertNoError(t, err, "Install() over a loaded job without a property list: %v", err)
+	// Finding 3: the held registration already existed — a repeat
+	// installation reports Created=false.
+	if installed.Created {
+		t.Error("the repeat installation over a held registration reported Created=true")
+	}
 	want := []string{
 		"print " + launchd.target(),
 		"print-disabled " + launchd.domain(),
@@ -4957,6 +4983,289 @@ func TestLaunchdRefusesAnUnknownRunningFactOverALoadedJobWithoutAFile(t *testing
 	if !fake.running || !fake.loaded {
 		t.Errorf("the retried first installation left the job loaded=%t running=%t, want it registered and started",
 			fake.loaded, fake.running)
+	}
+}
+
+// TestLaunchdRefusesARunningJobWithoutAFileUntilItIsStopped pins the
+// pre-write refusal of the held-without-file RUNNING state (Finding 5):
+// the update would stop the only registration that exists — no property
+// list survives to restore it from — so the attempt refuses before
+// anything changes, with the same repair the undetermined running fact
+// names: the stop clears the state and the retry is a genuine first
+// installation.
+func TestLaunchdRefusesARunningJobWithoutAFileUntilItIsStopped(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{loaded: true, running: true, pid: darwinFakePID}
+	launchd.run = fake.run
+	ctx := context.Background()
+	program := darwinTempInstallOptions(t, t.TempDir())
+
+	if _, err := os.Stat(launchd.plistPath()); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the fixture starts with a property list: %v", err)
+	}
+
+	fake.commands = nil
+	_, err := launchd.Install(ctx, program)
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of the running job without a file")
+	}
+	assertNames(t, err.Error(), "Install()", []string{
+		"the installation was refused",
+		"property list is missing",
+		`Stop the instance with "hfdesk service stop"`,
+		`run "hfdesk service install" again`,
+	})
+	assertNamesWithout(t, err.Error(), "Install()", nil, []string{
+		" or ",
+		"(the registration was restored)",
+		"neither a state nor a process id",
+	})
+	// The refusal precedes every mutation: the state read is the whole
+	// attempt — no stop, no write, no load.
+	if want := []string{"print " + launchd.target(), "print-disabled " + launchd.domain()}; !reflect.DeepEqual(fake.commands, want) {
+		t.Errorf("the commands of the manager =\n%v\nwant the state read and nothing else\n%v", fake.commands, want)
+	}
+	if !fake.loaded || !fake.running {
+		t.Errorf("the refused installation stopped the registration (loaded %v, running %v)", fake.loaded, fake.running)
+	}
+	if _, err := os.Stat(launchd.plistPath()); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the refused installation left a property list behind: %v", err)
+	}
+
+	// Simulated retry: the named action clears this state — Stop boots
+	// the held job out — and the retry installs as the message
+	// promises.
+	fake.commands = nil
+	if err := launchd.Stop(ctx); err != nil {
+		t.Fatalf("the named action Stop() = %v, want the loaded job unloaded", err)
+	}
+	if fake.loaded {
+		t.Errorf("Stop() left the loaded job behind: commands %v", fake.commands)
+	}
+	fake.commands = nil
+	if _, err := launchd.Install(ctx, program); err != nil {
+		t.Fatalf("the retry after the named action = %v, want the successful installation", err)
+	}
+	if _, err := os.Stat(launchd.plistPath()); err != nil {
+		t.Errorf("the retried installation wrote no property list: %v", err)
+	}
+	if !fake.running || !fake.loaded {
+		t.Errorf("the retried first installation left loaded=%t running=%t, want it registered and started",
+			fake.loaded, fake.running)
+	}
+}
+
+// TestLaunchdRollbackRestoresTheRegistrationAfterTheInstallContextExpires
+// pins the P1 recovery contract (Finding 4): the rollback runs its
+// recovery commands on its own bounded context — the install context is
+// already dead when the attempt fails — and the property list is restored
+// before any supervisor command, so the cancelled installation still gives
+// the previous registration back, reports it honestly and preserves the
+// original cause.
+func TestLaunchdRollbackRestoresTheRegistrationAfterTheInstallContextExpires(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{loaded: true, running: true, pid: darwinFakePID}
+	launchd.run = fake.run
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	original := darwinTempInstallOptions(t, t.TempDir())
+	darwinWriteRegistration(t, launchd, original)
+	previous, err := os.ReadFile(launchd.plistPath())
+	assertNoError(t, err, "read the previous registration: %v", err)
+
+	// The install context expires at the stop of the running instance —
+	// after the changed property list was written (the registration
+	// mutation): the recovery must not inherit that death.
+	changed := darwinTempInstallOptions(t, t.TempDir())
+	fake.blockCommand = "kill"
+	fake.blockEffect = cancel
+
+	fake.commands = nil
+	_, err = launchd.Install(ctx, changed)
+	if err == nil {
+		t.Fatal("Install() = nil, want the failure of the cancelled stop")
+	}
+	assertNames(t, err.Error(), "Install()", []string{
+		"context canceled",
+		"(the registration was restored)",
+	})
+	assertNamesWithout(t, err.Error(), "Install()", nil, []string{
+		"(the registration could not be unloaded",
+		" or ",
+	})
+
+	// The discriminator: the previous property list is back on disk —
+	// before the fix the bootout of the dead context returned first and
+	// the restore never ran, leaving the written attempt file behind.
+	after, readErr := os.ReadFile(launchd.plistPath())
+	assertNoError(t, readErr, "read the registration after the rollback: %v", readErr)
+	if !bytes.Equal(previous, after) {
+		t.Errorf("the registration after the rollback = %q, want the previous %q", after, previous)
+	}
+
+	// The recovery commands ran AFTER the cancelled stop, on the
+	// rollback's own context.
+	killAt := -1
+	for i, command := range fake.commands {
+		if strings.HasPrefix(command, "kill ") {
+			killAt = i
+			break
+		}
+	}
+	if killAt < 0 {
+		t.Fatalf("the manager never signalled the instance: %v", fake.commands)
+	}
+	sawBootout, sawBootstrap := false, false
+	for _, command := range fake.commands[killAt+1:] {
+		if strings.HasPrefix(command, "bootout ") {
+			sawBootout = true
+		}
+		if strings.HasPrefix(command, "bootstrap ") {
+			sawBootstrap = true
+		}
+	}
+	if !sawBootout || !sawBootstrap {
+		t.Errorf("the recovery after the cancelled stop ran bootout=%t bootstrap=%t: %v",
+			sawBootout, sawBootstrap, fake.commands)
+	}
+	if !fake.loaded || !fake.running {
+		t.Errorf("the rollback left loaded=%t running=%t, want the previous running registration",
+			fake.loaded, fake.running)
+	}
+}
+
+// TestLaunchdRollbackReportsAnExhaustedRecoveryBudget pins the bounded end
+// of the P1 recovery context (Finding 4): with the recovery budget gone
+// the rollback still restores the property list first — the file needs no
+// context — and then reports the command it could NOT run: the honest
+// «could not be …»-family outcome, never a silent restored claim.
+func TestLaunchdRollbackReportsAnExhaustedRecoveryBudget(t *testing.T) {
+	previousBudget := rollbackRecoveryBudget
+	rollbackRecoveryBudget = time.Nanosecond
+	t.Cleanup(func() { rollbackRecoveryBudget = previousBudget })
+
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{loaded: true, running: true, pid: darwinFakePID}
+	fake.failures = map[string]error{"kill": errors.New("the stop refused the instance")}
+	launchd.run = fake.run
+	ctx := context.Background()
+
+	original := darwinTempInstallOptions(t, t.TempDir())
+	darwinWriteRegistration(t, launchd, original)
+	previous, err := os.ReadFile(launchd.plistPath())
+	assertNoError(t, err, "read the previous registration: %v", err)
+
+	changed := darwinTempInstallOptions(t, t.TempDir())
+	fake.commands = nil
+	_, err = launchd.Install(ctx, changed)
+	if err == nil {
+		t.Fatal("Install() = nil, want the failure of the stop")
+	}
+	assertNames(t, err.Error(), "Install()", []string{
+		"the stop refused the instance",
+		"(the registration could not be unloaded",
+		"context deadline exceeded",
+	})
+	assertNamesWithout(t, err.Error(), "Install()", nil, []string{
+		"(the registration was restored)",
+		" or ",
+	})
+
+	after, readErr := os.ReadFile(launchd.plistPath())
+	assertNoError(t, readErr, "read the registration after the rollback: %v", readErr)
+	if !bytes.Equal(previous, after) {
+		t.Errorf("the registration after the rollback = %q, want the previous %q (restore-first survives the exhausted budget)", after, previous)
+	}
+}
+
+// TestLaunchdFailedInstallRemovesTheDirectoriesAfterAProvenRollback pins
+// the clean side of the macOS cleanup gate (Finding 7): the rollback
+// proves the registration back at its previous state and the previous
+// property list references nothing this attempt created, so the created
+// directories are removed as before.
+func TestLaunchdFailedInstallRemovesTheDirectoriesAfterAProvenRollback(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{failures: map[string]error{
+		"bootstrap": errors.New("service: launchctl bootstrap: the load failed"),
+	}}
+	launchd.run = fake.run
+	root := t.TempDir()
+	program := darwinTempInstallOptions(t, root)
+
+	_, err := launchd.Install(context.Background(), program)
+	if err == nil {
+		t.Fatal("Install() = nil, want the failure of the bootstrap")
+	}
+	assertNames(t, err.Error(), "Install()", []string{
+		"the load failed",
+		"(the registration was restored)",
+	})
+	assertNamesWithout(t, err.Error(), "Install()", nil, []string{
+		"retained because",
+		" or ",
+	})
+	for _, dir := range []string{
+		filepath.Join(root, "etc"),
+		filepath.Join(root, "etc", "hfdesk"),
+		filepath.Join(root, "var"),
+		filepath.Join(root, "var", "lib"),
+		filepath.Join(root, "var", "lib", "hfdesk"),
+		filepath.Join(root, "var", "log"),
+		filepath.Join(root, "var", "log", "hfdesk"),
+	} {
+		if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the directory %q survived a proven rollback (stat error: %v)", dir, err)
+		}
+	}
+}
+
+// TestLaunchdFailedInstallKeepsTheDirectoriesWhenTheRollbackIsUnproven
+// pins the failed side of the macOS cleanup gate (Finding 7): the rollback
+// cannot prove the disable flag restored — the registration state is
+// indeterminate — so the directories this attempt created SURVIVE (the
+// surviving registration may still reference them) and the error says so,
+// next to the honest rollback outcome.
+func TestLaunchdFailedInstallKeepsTheDirectoriesWhenTheRollbackIsUnproven(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{disabled: true, failures: map[string]error{
+		"bootstrap": errors.New("service: launchctl bootstrap: the load failed"),
+		"disable":   errors.New("service: launchctl disable: the flag refused"),
+	}}
+	launchd.run = fake.run
+	root := t.TempDir()
+	program := darwinTempInstallOptions(t, root)
+
+	_, err := launchd.Install(context.Background(), program)
+	if err == nil {
+		t.Fatal("Install() = nil, want the failure of the bootstrap")
+	}
+	assertNames(t, err.Error(), "Install()", []string{
+		"the load failed",
+		"(the disable flag could not be restored",
+		"installation-created directories were retained because",
+	})
+	assertNamesWithout(t, err.Error(), "Install()", nil, []string{
+		"(the registration was restored)",
+		" or ",
+	})
+	for _, dir := range []string{
+		filepath.Join(root, "etc"),
+		filepath.Join(root, "etc", "hfdesk"),
+		filepath.Join(root, "var"),
+		filepath.Join(root, "var", "lib"),
+		filepath.Join(root, "var", "lib", "hfdesk"),
+		filepath.Join(root, "var", "log"),
+		filepath.Join(root, "var", "log", "hfdesk"),
+	} {
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("the directory %q did not survive the unproven rollback (stat error: %v)", dir, err)
+		}
+	}
+	// Restore-first: the attempt's property list is gone even though the
+	// directory cleanup was withheld.
+	if _, err := os.Stat(launchd.plistPath()); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the attempt's property list survived the rollback: %v", err)
 	}
 }
 
