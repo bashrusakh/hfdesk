@@ -22,6 +22,12 @@
 //     RateLimit: "api";r=0;t=<secs> header (throttling responses only,
 //     mirroring pkg/hfdownloader/retry.go), capped and interruptible through
 //     context cancellation;
+//   - when Walker.PageFetchTimeout is set, bounds every page request
+//     (dial + response headers + JSON body) under its own deadline derived
+//     from the caller's context and fails the walk with an error matching
+//     ErrPageFetchTimeout on expiry — retry waits between attempts and the
+//     request budget stay under their own bounds on the caller's context,
+//     never charged to that per-request deadline;
 //
 // and fails 401/403/404 (and any other terminal status) immediately with
 // caller-supplied error text.
@@ -72,6 +78,16 @@ var maxWalkRequests = 10000
 // HTTP, transport, decoding, cancellation, budget or initial tree URL failures.
 var ErrPagination = errors.New("hubtree: structural pagination failure")
 
+// ErrPageFetchTimeout identifies a page request that exceeded
+// Walker.PageFetchTimeout: the deadline over dial, response headers and the
+// JSON body expired while the caller's own context was still live. It does
+// not classify caller cancellation (which surfaces as the caller's context
+// error) and it is never a retryable transport failure. The errors that
+// match it are built with %w on this sentinel only: the underlying context
+// expiry is deliberately carried as text, so a caller's failure classifier
+// cannot mistake the walk's internal budget for its own deadline.
+var ErrPageFetchTimeout = errors.New("hubtree: tree page request timed out")
+
 // paginationError marks the known structural failures without changing their
 // diagnostic text or losing an underlying URL parse error.
 type paginationError struct{ error }
@@ -116,6 +132,16 @@ type Walker struct {
 	// Client performs the requests; http.DefaultClient when nil.
 	Client *http.Client
 
+	// PageFetchTimeout, when > 0, bounds each page request this walk makes:
+	// the deadline covers dial, response headers and the JSON body read of
+	// one request and is derived from the caller's context, so caller
+	// cancellation still wins. Expiry fails the walk with an error matching
+	// ErrPageFetchTimeout. Retry waits between attempts and the request
+	// budget remain governed by their own bounds on the caller's context,
+	// never by this value. Zero (the default) leaves every request under
+	// the caller's context only.
+	PageFetchTimeout time.Duration
+
 	// StatusErr maps a terminal (non-200, non-retried) response to the
 	// caller's error text (401/403/404 messages, generic status errors).
 	// When nil a generic "tree API failed" error is built.
@@ -148,6 +174,7 @@ func (w *Walker) Walk(ctx context.Context, prefix string, fn func(Node) error) e
 		budget:      maxWalkRequests,
 		maxRequests: maxWalkRequests,
 		recursiveOK: true,
+		pageTimeout: w.PageFetchTimeout,
 	}
 	if st.client == nil {
 		st.client = http.DefaultClient
@@ -166,6 +193,7 @@ type walkState struct {
 	maxRequests int             // original budget, for the error message
 	recursiveOK bool            // latched false once a server rejects ?recursive
 	origin      *treeOrigin     // captured once from the first built tree URL
+	pageTimeout time.Duration   // optional per-request deadline (0 = caller's context only)
 }
 
 // treeOrigin compares URL origins without DNS resolution or path/userinfo
@@ -292,10 +320,12 @@ func (st *walkState) listAllPages(ctx context.Context, prefix string) ([]Node, e
 		fromLink bool
 	)
 	for {
-		resp, err := st.fetch(ctx, u)
+		resp, pageCtx, cancelPage, err := st.fetch(ctx, u)
 		if err != nil {
 			return nil, err
 		}
+		// Every branch below closes the body AND cancels the page context:
+		// the body read is bound to that per-request deadline.
 
 		// A mirror that rejects the query parameter we added gets the
 		// legacy no-query per-directory walk instead of a failure, so
@@ -305,6 +335,7 @@ func (st *walkState) listAllPages(ctx context.Context, prefix string) ([]Node, e
 		if !fromLink && useRecursive && st.recursiveOK &&
 			(resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity) {
 			resp.Body.Close()
+			cancelPage()
 			st.recursiveOK = false
 			useRecursive = false
 			if u, err = st.pageURL(prefix, false); err != nil {
@@ -316,15 +347,27 @@ func (st *walkState) listAllPages(ctx context.Context, prefix string) ([]Node, e
 
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
+			cancelPage()
 			return nil, st.statusErr(resp)
 		}
 
 		var page []Node
 		if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+			// Classify from the contexts, not the error's wrapping: the
+			// caller's context takes precedence, then expiry of the
+			// per-request deadline during the body read — the walk's own
+			// required-data failure, reported through ErrPageFetchTimeout.
+			// Any other decode failure keeps its historical mapping.
+			timedOut := ctx.Err() == nil && errors.Is(pageCtx.Err(), context.DeadlineExceeded)
 			resp.Body.Close()
+			cancelPage()
+			if timedOut {
+				return nil, fmt.Errorf("%w: %v", ErrPageFetchTimeout, err)
+			}
 			return nil, st.decodeErr(err)
 		}
 		resp.Body.Close()
+		cancelPage()
 		nodes = append(nodes, page...)
 
 		next, err := nextLink(resp.Header.Values("Link"))
@@ -375,19 +418,37 @@ func (st *walkState) pageURL(prefix string, recursive bool) (string, error) {
 }
 
 // fetch performs one tree request, retrying 429/5xx statuses and network
-// errors a bounded number of times with context-aware waits. It returns the
-// terminal response (any status) for the caller to classify, or an error for
-// transport failures, cancellation, or an exhausted request budget.
-func (st *walkState) fetch(ctx context.Context, u string) (*http.Response, error) {
+// errors a bounded number of times with context-aware waits. Each attempt
+// runs under its own deadline when pageTimeout is set, covering dial,
+// response headers and — through the returned page context — the response
+// body the caller still has to read. It returns the terminal response (any
+// status) with that page context and its cancel func: the caller must call
+// cancel after it closes the response body. On error it returns the caller's
+// context error unchanged, an error matching ErrPageFetchTimeout when the
+// per-request deadline expired while the caller's context was still live, or
+// a transport failure / exhausted request budget as before. Retry waits
+// between attempts always sleep on the caller's context, never on the
+// per-request deadline.
+func (st *walkState) fetch(ctx context.Context, u string) (*http.Response, context.Context, context.CancelFunc, error) {
 	for attempt := 0; ; attempt++ {
 		if st.budget <= 0 {
-			return nil, fmt.Errorf("hubtree: tree walk exceeded %d requests (breaking a suspected runaway listing)", st.maxRequests)
+			return nil, nil, nil, fmt.Errorf("hubtree: tree walk exceeded %d requests (breaking a suspected runaway listing)", st.maxRequests)
 		}
 		st.budget--
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		// One deadline per page request, derived under the caller's context
+		// so caller cancellation keeps precedence. Without a configured
+		// timeout the request keeps the caller's context as-is.
+		reqCtx := ctx
+		cancelPage := func() {}
+		if st.pageTimeout > 0 {
+			reqCtx, cancelPage = context.WithTimeout(ctx, st.pageTimeout)
+		}
+
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
 		if err != nil {
-			return nil, err
+			cancelPage()
+			return nil, nil, nil, err
 		}
 		if st.w.Token != "" {
 			req.Header.Set("Authorization", "Bearer "+st.w.Token)
@@ -396,14 +457,26 @@ func (st *walkState) fetch(ctx context.Context, u string) (*http.Response, error
 
 		resp, err := st.client.Do(req)
 		if err != nil {
+			// Classify from the contexts, not the error's wrapping: the
+			// caller's own error wins, then the per-request deadline (the
+			// transport's response-header window normally fires first, but
+			// the walk's invariant is that no attempt outlives its budget).
+			pageTimedOut := ctx.Err() == nil && errors.Is(reqCtx.Err(), context.DeadlineExceeded)
+			cancelPage()
 			if ctx.Err() != nil {
-				return nil, ctx.Err()
+				return nil, nil, nil, ctx.Err()
+			}
+			if pageTimedOut {
+				// Terminal: an expired page budget is the walk's own
+				// required-data failure in the same shape as a body-read
+				// expiry, not a transient network error to retry.
+				return nil, nil, nil, fmt.Errorf("%w: %v", ErrPageFetchTimeout, err)
 			}
 			if attempt+1 >= maxRetryableAttempts {
-				return nil, fmt.Errorf("tree request failed after %d attempts: %w", attempt+1, err)
+				return nil, nil, nil, fmt.Errorf("tree request failed after %d attempts: %w", attempt+1, err)
 			}
 			if !sleepCtx(ctx, backoffFor(attempt)) {
-				return nil, ctx.Err()
+				return nil, nil, nil, ctx.Err()
 			}
 			continue
 		}
@@ -412,17 +485,18 @@ func (st *walkState) fetch(ctx context.Context, u string) (*http.Response, error
 			st.w.OnResponse(resp)
 		}
 		if !retryableStatus(resp.StatusCode) {
-			return resp, nil
+			return resp, reqCtx, cancelPage, nil
 		}
 		// The last allowed attempt returns the throttled/failed response so
 		// the caller surfaces its own terminal error text.
 		if attempt+1 >= maxRetryableAttempts {
-			return resp, nil
+			return resp, reqCtx, cancelPage, nil
 		}
 		wait := retryWait(resp, backoffFor(attempt), time.Now())
 		resp.Body.Close()
+		cancelPage()
 		if !sleepCtx(ctx, wait) {
-			return nil, ctx.Err()
+			return nil, nil, nil, ctx.Err()
 		}
 	}
 }
