@@ -297,7 +297,7 @@ directory of the instance is the real log sink on macOS.
 
 | Command | Effect | A service that is not installed |
 |---|---|---|
-| `install` | Registers the service with the supervisor and enables it for the boot of the scope on a **first** installation; a **repeat** installation keeps the autostart state the registration already has — it never runs `enable` at all, so an enabled systemd unit stays enabled, a unit enabled with `systemctl enable --runtime` stays runtime-only instead of being made permanent, and a disabled one stays disabled — while a masked unit (persistent or `--runtime`) refuses the installation, and a Windows registration keeps its start type and its delayed-auto-start flag, a macOS registration keeps the `RunAtLoad` value of its property list, while a running Windows service with a disabled start type refuses the installation. A macOS first installation — no property list and no job launchd holds — registers the property list with `RunAtLoad`, so launchd starts the instance as soon as it is registered; a repeat installation, a job launchd holds without its property list included, starts nothing that did not run. A systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is updated in place on every platform — the settings the command does not name again are kept, a running instance is restarted on the new program, and a stopped one stays stopped (see [Upgrades](#upgrades)). | It creates the registration. |
+| `install` | Registers the service with the supervisor and enables it for the boot of the scope on a **first** installation; a **repeat** installation keeps the autostart state the registration already has — on Linux it never runs `enable` at all, so an enabled systemd unit stays enabled, a unit enabled with `systemctl enable --runtime` stays runtime-only instead of being made permanent, and a disabled one stays disabled, and on macOS it never **leaves** an administrator's `launchctl disable` cleared: the two loads launchd requires run `enable` only for that load and restore the flag in the same operation — while a masked unit (persistent or `--runtime`) refuses the installation, and a Windows registration keeps its start type and its delayed-auto-start flag, a macOS registration keeps the `RunAtLoad` value of its property list, while a running Windows service with a disabled start type refuses the installation. A macOS first installation — no property list and no job launchd holds — registers the property list with `RunAtLoad`, so launchd starts the instance as soon as it is registered; a repeat installation, a job launchd holds without its property list included, starts nothing that did not run. A systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is updated in place on every platform — the settings the command does not name again are kept, a running instance is restarted on the new program, and a stopped one stays stopped (see [Upgrades](#upgrades)). | It creates the registration. |
 | `uninstall` | Removes the **registration only**. | Clean success: the registration is already gone. |
 | `start` | Starts the registered service. | **Error** that says the service is not installed. |
 | `stop` | Stops the registered service. | Clean success: there is nothing running to stop. |
@@ -514,7 +514,10 @@ Two parties touch the systemd registration, and each owns its own files:
   `ExecStart=`, which HFDesk owns: an `ExecStart=` override in a drop-in
   (`local.conf` included) is refused and must be **removed** from the drop-in
   that carries it, never moved into it, because the command of the instance
-  comes only from the install flags.
+  comes only from the install flags. The ownership holds on a **first**
+  installation as well: `install` scans the drop-in directory for
+  `ExecStart=` before it writes anything and refuses over one, and after
+  the reload it verifies that the supervisor loads the command it wrote.
 
 **What an update preserves.** An installation over an existing registration
 keeps everything the command does not name again:
@@ -683,9 +686,16 @@ confirm.
   from the request instead of failing over it. The launchd override
   database is not part of the property list: a **first** installation
   clears the `launchctl disable` flag of the job it loads into the domain,
-  and a repeat installation never runs `enable` — the flag an administrator
-  set survives every update, whether or not the attempt loads the job —
-  and clearing the flag starts nothing by itself.
+  and a repeat installation never **leaves** an administrator's
+  `launchctl disable` cleared — launchd refuses to load a disabled label,
+  so the two places that must load one (restarting a running disabled job
+  and a rollback restoring a loaded disabled registration) run `enable`
+  only for that load and restore the flag in the same operation —
+  and clearing the flag starts nothing by itself. That database is read on
+  every install, update and rollback, and the read fails closed: a
+  `print-disabled` answer the supervisor cannot produce aborts the
+  operation with that reason instead of being read as "not disabled" — an
+  unknown enablement is never decided into an enable.
 - The property list holds the label, the program arguments and the environment
   of the instance — no credential.
 - The **macOS CI job** is narrowed to the service package: the launchd
@@ -1088,9 +1098,12 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   stops before changing the unit.
 - **The autostart state is kept.** The start at boot is a setting of the
   registration and not of the command: only a **first** installation enables
-  the registration it writes, and a repeat installation never runs `enable`
-  at all, so a reinstall with a new binary never undoes a decision of an
-  administrator. The enablement the supervisor reports survives by
+  the registration it writes, and a repeat installation never undoes a
+  decision of an administrator — on Linux it never runs `enable` at all, so
+  a reinstall with a new binary changes nothing, and on macOS it never
+  **leaves** an administrator's `launchctl disable` cleared (see the two
+  loads launchd requires through `enable` below). The enablement the
+  supervisor reports survives by
   non-interference: an enabled systemd unit stays enabled, a unit an
   administrator disabled stays disabled, and a unit enabled with `systemctl
   enable --runtime` keeps exactly that runtime-only enablement instead of
@@ -1104,8 +1117,10 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   over a property list that is missing or unreadable has no found value to
   keep and writes that default as well (the repair of the unreadable
   property list above) — and a repeat installation
-  never runs `enable`, so the `launchctl disable` flag of the label survives
-  every update, whether or not the attempt loads the job. Only a **first**
+  never leaves an administrator's `launchctl disable` cleared: the two loads
+  launchd requires through `enable` — restarting a running disabled job and
+  a rollback restoring a loaded disabled registration — restore the flag in
+  the same operation, so it survives every update. Only a **first**
   installation — no property list and no job launchd holds — enables the
   registration it writes for the boot of its scope.
 - **A state the installation cannot update is refused.** A masked systemd unit
