@@ -112,3 +112,25 @@ func TestAlreadyRunningOpenFailedTextUsesTheBrowserNotice(t *testing.T) {
 		t.Errorf("text = %q, want it to carry the notice of the browser failure", text)
 	}
 }
+
+// TestPublishStateStartupTextStatesTheResultTheCauseAndOneAction proves
+// the report of a launch that stopped over its unpublished state is honest:
+// it says that nothing is served, names the cause with the error, and asks
+// for exactly one next action.
+func TestPublishStateStartupTextStatesTheResultTheCauseAndOneAction(t *testing.T) {
+	text := publishStateStartupText(errors.New(
+		"desktop: publish the effective URL to /tmp/desktop-state.json: the state directory is read-only"))
+
+	for _, want := range []string{
+		"HFDesk is not serving",
+		"could not publish the effective URL",
+		"the state directory is read-only",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("text = %q, want it to mention %q", text, want)
+		}
+	}
+	if got := strings.Count(text, "start HFDesk again"); got != 1 {
+		t.Errorf("the number of next actions = %d, want exactly 1: %q", got, text)
+	}
+}

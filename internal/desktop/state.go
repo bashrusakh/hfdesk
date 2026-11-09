@@ -5,6 +5,7 @@ package desktop
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -12,6 +13,29 @@ import (
 
 	"github.com/bashrusakh/hfdesk/internal/service"
 )
+
+// publishState writes the published state of the desktop host. It is the
+// seam of the test: the fail-closed rule needs a publish that fails on any
+// machine.
+var publishState = service.PublishState
+
+// publishServingState publishes the effective URL of a desktop host whose
+// server already runs, and it fails closed in both directions.
+//
+// The mutation guard of this session decides whether a desktop serves from
+// the published state next to the singleton probe (service.LiveServingDesktop),
+// so a host that serves without its state would let `hfdesk service
+// install/start/restart` start the service beside it. A publish that succeeds
+// therefore lets the host serve exactly as before, and a publish that fails
+// stops the server through the graceful path (stop) and returns the failure,
+// so nothing is served and no state is ambiguous.
+func publishServingState(path, url string, stop func()) error {
+	if err := publishState(path, url); err != nil {
+		stop()
+		return fmt.Errorf("desktop: publish the effective URL to %s: %w", path, err)
+	}
+	return nil
+}
 
 // reachabilityTimeout bounds the probe of the published URL.
 //

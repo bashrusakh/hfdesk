@@ -318,14 +318,22 @@ func run(o Options, logPath string) (err error) {
 	}
 
 	url := application.URL()
-	desktopLog.Info("the desktop host started", "url", url, "logFile", logPath)
 
 	// The effective URL is published, so a second launch can open the web
-	// UI of this instance.
-	if err := service.PublishState(statePath, url); err != nil {
-		desktopLog.Warn("could not publish the effective URL", "path", statePath, "error", err)
-	}
+	// UI of this instance. A host that cannot publish it must not serve:
+	// the mutation guard of this session reads the published state, so a
+	// serving desktop without one would let a service mutation start the
+	// service beside it. The failure stops the server through the graceful
+	// path, reports it like every other startup failure and ends the launch.
 	defer service.RemovePublishedState(statePath)
+	if err := publishServingState(statePath, url, func() {
+		stopDesktopServer(shutdown, &shutdownCoordinator)
+	}); err != nil {
+		reportStartupFailure("HFDesk could not start", publishStateStartupText(err), logPath)
+		return err
+	}
+
+	desktopLog.Info("the desktop host started", "url", url, "logFile", logPath)
 
 	if o.App.ShouldOpenUI() {
 		if err := application.OpenBrowser(); err != nil {
