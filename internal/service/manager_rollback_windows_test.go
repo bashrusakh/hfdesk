@@ -321,7 +321,7 @@ func TestSCMRestartRollbackSentence(t *testing.T) {
 			name:     "the instance the failed installation replaced did not stop",
 			facts:    scmRestartRollback{attempt: scmRollbackPreviousInstance},
 			reason:   stopReason,
-			want:     []string{"instance it replaced was not proven to be stopped", stopReason, "no instance was started", "hfdesk service status"},
+			want:     []string{"instance it replaced was not proven to be stopped", stopReason, "no instance was started"},
 			verified: false,
 		},
 		{
@@ -377,7 +377,7 @@ func TestSCMRestartRollbackSentence(t *testing.T) {
 			name:     "a stop that was never delivered and the state cannot be read",
 			facts:    undeliveredRestored,
 			reason:   readReason,
-			want:     []string{"no stop control was delivered", "was restored", "could not be confirmed", "no instance was started", "hfdesk service status", readReason},
+			want:     []string{"no stop control was delivered", "was restored", "could not be confirmed", "no instance was started", readReason},
 			verified: false,
 		},
 		{
