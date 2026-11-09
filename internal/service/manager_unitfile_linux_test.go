@@ -1183,6 +1183,18 @@ func TestSystemdExecStartProgram(t *testing.T) {
 			readable: true,
 		},
 		{
+			name:     "an env wrapper whose separated option value reads the program",
+			output:   "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env -u LD_PRELOAD /opt/hfdesk/hfdesk service run --listen 127.0.0.1:19090 ; ignore_errors=no }\n",
+			program:  "/opt/hfdesk/hfdesk",
+			readable: true,
+		},
+		{
+			name:     "an env wrapper whose option value leaves no program slot",
+			output:   "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env -u LD_PRELOAD service run --listen 127.0.0.1:19090 ; ignore_errors=no }\n",
+			program:  "/usr/bin/env",
+			readable: false,
+		},
+		{
 			name:     "a wrapper shape without a program slot",
 			output:   "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env bare-word /opt/hfdesk/hfdesk service run ; ignore_errors=no }\n",
 			program:  "/usr/bin/env",
@@ -1366,6 +1378,26 @@ func TestSystemdExecStartUpdateRewritesOnlyRewritableCommands(t *testing.T) {
 			want:  `/usr/bin/env -i HF_HOME=/srv/hfdesk "` + executable + `" ` + tail,
 		},
 		{
+			name:  "an env wrapper whose separated option value is kept",
+			value: "/usr/bin/env -u NAME /path/to/hfdesk " + tail,
+			want:  `/usr/bin/env -u NAME "` + executable + `" ` + tail,
+		},
+		{
+			name:  "an env wrapper with the value-less -i option",
+			value: "/usr/bin/env -i /path/to/hfdesk " + tail,
+			want:  `/usr/bin/env -i "` + executable + `" ` + tail,
+		},
+		{
+			name:  "an env wrapper with an assignment before the program",
+			value: "/usr/bin/env FOO=bar /path/to/hfdesk " + tail,
+			want:  `/usr/bin/env FOO=bar "` + executable + `" ` + tail,
+		},
+		{
+			name:  "an env wrapper with an attached option value",
+			value: "/usr/bin/env --unset=NAME /path/to/hfdesk " + tail,
+			want:  `/usr/bin/env --unset=NAME "` + executable + `" ` + tail,
+		},
+		{
 			name:  "a dynamic program source",
 			value: "%h/bin/hfdesk " + tail,
 			want:  `"` + executable + `" ` + tail,
@@ -1402,9 +1434,14 @@ func TestSystemdExecStartUpdateRewritesOnlyRewritableCommands(t *testing.T) {
 			form:  "timeout 30",
 		},
 		{
-			name:  "an env wrapper with an option value",
-			value: "/usr/bin/env -u LD_PRELOAD hfdesk " + tail,
-			form:  "LD_PRELOAD",
+			name:  "an env wrapper whose option value leaves no program",
+			value: "/usr/bin/env -u NAME " + tail,
+			form:  "env -u NAME",
+		},
+		{
+			name:  "an env wrapper with an option word outside the subset",
+			value: "/usr/bin/env --debug /path/to/hfdesk " + tail,
+			form:  "--debug",
 		},
 		{
 			name:  "a command without the run vector",

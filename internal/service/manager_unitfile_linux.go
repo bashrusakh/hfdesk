@@ -442,7 +442,9 @@ func systemdExecStartProgramSlot(tokens []systemdWord, executable string) (int, 
 // systemdExecStartSlot returns the index of the program token of a command
 // and whether the command has a recognized shape: the program alone, or the
 // program followed by the canonical "service run" vector, optionally behind
-// an "env" prefix of options and NAME=VALUE assignments that stays intact.
+// an "env" prefix of the supported subset that stays intact. A prefix word
+// the subset does not list leaves the shape unrecognized instead of being
+// read by a guessed option arity.
 //
 // The registered process is the HFDesk program that receives the canonical
 // "service run" argument vector as its first arguments. Every other shape
@@ -460,9 +462,10 @@ func systemdExecStartSlot(tokens []systemdWord) (int, bool) {
 	}
 	slot := 0
 	if !tokens[0].dynamic && filepath.Base(tokens[0].value) == "env" {
-		slot = 1
-		for slot < len(tokens) && systemdEnvPrefixWord(tokens[slot]) {
-			slot++
+		var ok bool
+		slot, ok = systemdEnvPrefixProgramSlot(tokens)
+		if !ok {
+			return 0, false
 		}
 	}
 	if slot+2 >= len(tokens) || tokens[slot+1].value != "service" || tokens[slot+2].value != "run" {
@@ -471,18 +474,68 @@ func systemdExecStartSlot(tokens []systemdWord) (int, bool) {
 	return slot, true
 }
 
-// systemdEnvPrefixWord reports whether word is an argument an "env" wrapper
-// consumes before the program it executes: an option or a NAME=VALUE
-// assignment. A bare word there can be the value of an option ("env -u
-// NAME") or a program the wrapper runs with other arguments, and which of
-// the two it is cannot be read from the word alone, so such a form is not
-// recognized.
-func systemdEnvPrefixWord(word systemdWord) bool {
-	value := word.value
-	if strings.HasPrefix(value, "-") {
-		return true
+// systemdEnvPrefixProgramSlot walks the words between an "env" wrapper and
+// its program and returns the index of the program, or reports that the
+// prefix is not in the supported subset.
+//
+// The subset is fixed: a value-less option word (-i, --ignore-environment),
+// a value-taking option word with its separated value (-u NAME, --unset
+// NAME), an attached "--option=value" word such as --unset=NAME, which
+// carries its own value, and NAME=VALUE assignments. The word after a
+// value-taking option is that option's value, never the program; the first
+// bare word the subset does not consume is the program. Any other option
+// word would need its arity guessed, so such a shape is not recognized.
+func systemdEnvPrefixProgramSlot(tokens []systemdWord) (int, bool) {
+	for slot := 1; slot < len(tokens); {
+		value := tokens[slot].value
+		if strings.HasPrefix(value, "-") {
+			switch {
+			case value == "-i" || value == "--ignore-environment":
+				slot++
+			case value == "-u" || value == "--unset":
+				// The separated value is the next word when
+				// it is not itself an option word; without
+				// one no program remains behind the option.
+				if slot+1 >= len(tokens) || strings.HasPrefix(tokens[slot+1].value, "-") {
+					return 0, false
+				}
+				slot += 2
+			case systemdEnvAttachedOptionWord(value):
+				slot++
+			default:
+				// Any other option word: its arity would be a
+				// guess, so the command shape is not
+				// recognized and the line is refused.
+				return 0, false
+			}
+			continue
+		}
+		if systemdEnvAssignmentWord(value) {
+			slot++
+			continue
+		}
+		return slot, true
 	}
-	name, _, ok := strings.Cut(value, "=")
+	// The prefix ends without a program.
+	return 0, false
+}
+
+// systemdEnvAttachedOptionWord reports whether word is a long option in the
+// attached form "--option=value": the value sits inside the word itself, so
+// the word consumes no following word.
+func systemdEnvAttachedOptionWord(word string) bool {
+	if !strings.HasPrefix(word, "--") {
+		return false
+	}
+	name, _, ok := strings.Cut(word[2:], "=")
+	return ok && name != "" && !strings.HasPrefix(name, "-")
+}
+
+// systemdEnvAssignmentWord reports whether word is a NAME=VALUE assignment
+// of the prefix: a name of letters, digits (not first) and underscores,
+// separated by "=" from its value.
+func systemdEnvAssignmentWord(word string) bool {
+	name, _, ok := strings.Cut(word, "=")
 	if !ok || name == "" {
 		return false
 	}

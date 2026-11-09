@@ -468,15 +468,24 @@ exception" on demand.
 
 - the program alone;
 - the program followed by `service run` and its run flags — directly, or
-  behind an `env` prefix of option words and `NAME=VALUE` assignments.
+  behind an `env` prefix. The prefix accepts exactly these words: `-i` and
+  `--ignore-environment` (no value); `-u NAME` and `--unset NAME`, whose
+  separated word is consumed as the option's value; an attached
+  `--option=value` form such as `--unset=NAME`, which carries its own value
+  and consumes no following word; and `NAME=VALUE` assignments. The program
+  sits behind the prefix and `service run` behind the program, so
+  `env -u NAME /path/to/hfdesk service run ...` is recognized with `-u`
+  consuming `NAME` and the path as the program.
 
 A command of any other shape is refused before anything is changed, with an
 error that names the line:
 
-- a shell-string wrapper (`sh -c "..."`), an unknown wrapper, or an ambiguous
-  `env` form — `env -u NAME /path/to/hfdesk service run ...` stops at the bare
-  `NAME`, which could be the option's value or the program, so the shape is
-  not read as either and the line is refused;
+- a shell-string wrapper (`sh -c "..."`), an unknown wrapper, or an `env`
+  prefix word outside the list above — `env --debug /path/to/hfdesk service
+  run ...` names an option of unknown arity, so nothing is guessed and the
+  line is refused before anything changes; the same refusal takes
+  `env -u NAME service run ...`, where `-u` consumes `NAME` and no program
+  remains behind it;
 - for an update that must verify a running start: a command without the
   `service run` vector carrying all three required flags `--config`,
   `--state-dir` and `--log-dir`. The refusal happens before the running
