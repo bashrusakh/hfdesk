@@ -3030,7 +3030,9 @@ func darwinStripXMLEntities(value string) string {
 // every command except `print`: a machine with nothing loaded fails that
 // call the way launchctl fails for an unloaded label, so a first
 // installation classifies as what it is instead of as a loaded job with an
-// undetermined running fact.
+// undetermined running fact. `print-disabled` answers the real dictionary
+// of a machine with nothing disabled: an empty answer is not a form
+// launchd prints, and the parser fails closed on it.
 func darwinFakeSupervisor(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
@@ -3043,6 +3045,12 @@ if [ "$HFDESK_TEST_SUPERVISOR" = "ok" ]; then
 	if [ "$1" = "print" ]; then
 		echo "Could not find service" >&2
 		exit 1
+	fi
+	if [ "$1" = "print-disabled" ]; then
+		# The real command prints its dictionary even when nothing
+		# is disabled: an empty answer is not a form launchd emits.
+		printf 'disabled services = {\n}\n'
+		exit 0
 	fi
 	exit 0
 fi
