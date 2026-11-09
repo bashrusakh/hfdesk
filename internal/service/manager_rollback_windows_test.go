@@ -168,6 +168,11 @@ func TestSCMRollbackSettlesTheStopItInherits(t *testing.T) {
 					t.Errorf("the report %q does not mention %q", rollbackErr, want)
 				}
 			}
+			// Every rollback report carries the one action: reading the
+			// state of the service decides what the failure left behind.
+			if !strings.Contains(rollbackErr.Error(), "hfdesk service status") {
+				t.Errorf("the report %q names no state command, want the one action of the report", rollbackErr)
+			}
 		})
 	}
 }
@@ -363,6 +368,12 @@ func TestSCMRestartRollbackSentence(t *testing.T) {
 				if !strings.Contains(sentence, want) {
 					t.Errorf("the sentence %q does not carry %q", sentence, want)
 				}
+			}
+			// Every branch of the rollback sentence carries the one
+			// action: reading the state of the service decides what the
+			// failure left behind.
+			if !strings.Contains(sentence, "hfdesk service status") {
+				t.Errorf("the sentence %q names no state command, want the one action of the report", sentence)
 			}
 			// The success claim is only made for a verified restart: every
 			// other outcome reports what it proved instead.

@@ -793,6 +793,46 @@ func TestServiceGateUnreadableTextStatesWhatTheLaunchDid(t *testing.T) {
 	}
 }
 
+// TestServiceActionFailureTextKeepsTheStateCommandOfTheManagerOnce pins the
+// dedup of the state command: a manager text that already carries the one
+// action (the composite rollback outcomes name it now) passes it through as
+// the single action of the report, and the desktop surface adds no second
+// copy. The perturbation is the detail: without the dedup every branch below
+// would name the command twice.
+func TestServiceActionFailureTextKeepsTheStateCommandOfTheManagerOnce(t *testing.T) {
+	program := `C:\portable\hfdesk.exe`
+	managerDetail := errors.New(`service: the restart was not confirmed (the previous registration was restored); run "hfdesk service status" to read the current state of the service`)
+
+	for _, tc := range []struct {
+		name  string
+		build func() string
+	}{
+		{"an update failure", func() string {
+			return serviceActionFailureText(serviceActionUpdate, managerDetail, program)
+		}},
+		{"a start failure", func() string {
+			return serviceActionFailureText(serviceActionStart, managerDetail, program)
+		}},
+		{"an installation failure", func() string {
+			return serviceActionFailureText(serviceActionInstall, managerDetail, program)
+		}},
+		{"a kept registration of a failed first start", func() string {
+			return serviceInstallStartFailureText(managerDetail, program,
+				&service.InstallStartError{Cause: managerDetail})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			text := tc.build()
+			if !strings.Contains(text, managerDetail.Error()) {
+				t.Errorf("the report %q does not carry the cause of the manager", text)
+			}
+			if got := strings.Count(text, "hfdesk service status"); got != 1 {
+				t.Errorf("the report %q names the state command %d times, want exactly one", text, got)
+			}
+		})
+	}
+}
+
 // TestServiceGateChangedTextNamesTheDiagnostic proves the notice of a state
 // that changed while the dialog was open follows the same single-action rule
 // as the unreadable notice: the read of the state is the one named action, the

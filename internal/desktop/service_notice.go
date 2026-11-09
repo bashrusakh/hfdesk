@@ -433,6 +433,16 @@ const (
 	serviceStatusCommandText = `Run "hfdesk service status" from an elevated shell to read the current state of the service.`
 )
 
+// statusIfUnnamed returns the state command for a report whose detail does
+// not name it yet, and nothing when the manager text already carries that
+// command: a report states one action, never the same command twice.
+func statusIfUnnamed(detail string) string {
+	if strings.Contains(detail, "hfdesk service status") {
+		return ""
+	}
+	return "\n\n" + serviceStatusCommandText
+}
+
 // isAlreadyRegisteredRefusal reports whether err is the refusal of a
 // first-install attempt that found a registration it did not create.
 //
@@ -507,7 +517,7 @@ func serviceSingletonHoldRefusedText(action serviceAction, err error) string {
 	text := serviceActionFailureHeadline(action) + "\n\n" +
 		"No service action was performed: " + detail
 	if !errors.Is(err, service.ErrSingletonAccessDenied) {
-		text += "\n\n" + serviceStatusCommandText
+		text += statusIfUnnamed(detail)
 	}
 	return text
 }
@@ -541,11 +551,13 @@ func serviceActionFailureText(action serviceAction, err error, program string) s
 		// the report does not know which: reading the state resolves
 		// that uncertainty, so the state command is the one next action
 		// — no conditional removal sits beside it, because whether there
-		// is anything to remove is exactly what the read decides.
+		// is anything to remove is exactly what the read decides. A
+		// manager text that already names the command keeps it as the
+		// single action.
 		return serviceActionFailureHeadline(action) + "\n\n" + detail + "\n\n" +
 			"A registration may remain.\n\n" +
-			serviceFolderAccessText(program) + "\n\n" +
-			serviceStatusCommandText
+			serviceFolderAccessText(program) +
+			statusIfUnnamed(detail)
 	case serviceActionUpdate:
 		// The refusal of a changed account states its own report: the
 		// result (nothing was changed), the cause (the account the
@@ -555,12 +567,10 @@ func serviceActionFailureText(action serviceAction, err error, program string) s
 		if isServiceAccountRefusal(err) {
 			return serviceActionFailureHeadline(action) + "\n\n" + detail
 		}
-		return serviceActionFailureHeadline(action) + "\n\n" + detail + "\n\n" +
-			serviceStatusCommandText
+		return serviceActionFailureHeadline(action) + "\n\n" + detail + statusIfUnnamed(detail)
 	default:
 		return serviceActionFailureHeadline(action) + "\n\n" + detail + "\n\n" +
-			"The start was not confirmed.\n\n" +
-			serviceStatusCommandText
+			"The start was not confirmed." + statusIfUnnamed(detail)
 	}
 }
 
@@ -592,8 +602,8 @@ func serviceInstallStartFailureText(err error, program string, cleanup *service.
 		outcome = "The failed process was proven stopped, but the registration changed and was kept."
 	}
 	text := "HFDesk registered the service but could not confirm its start.\n\n" + detail + "\n\n" +
-		outcome + "\n\n" + serviceStatusCommandText
-	return text + "\n\n" + serviceFolderAccessText(program)
+		outcome
+	return text + statusIfUnnamed(detail) + "\n\n" + serviceFolderAccessText(program)
 }
 
 // serviceFolderAccessText returns the sentence that names the access the folder

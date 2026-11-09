@@ -590,8 +590,10 @@ func (r *serviceActionReporter) handoverFailure(err error) {
 		r.handover.close()
 	}
 	desktopLog.Error("the service helper could not authorize the desktop handover", "action", string(r.action), "error", err)
-	showMessage(serviceFailureCaption(r.action),
-		"HFDesk could not confirm the desktop handover. No service action was performed.\n\n"+err.Error(),
+	text := "HFDesk could not confirm the desktop handover. No service action was performed.\n\n" + err.Error()
+	// Exactly one action, input-independent: a cause that already names
+	// the state command keeps it as the single action of the report.
+	showMessage(serviceFailureCaption(r.action), text+statusIfUnnamed(err.Error()),
 		windows.MB_ICONERROR)
 }
 

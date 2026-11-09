@@ -1725,6 +1725,48 @@ func TestServiceHelperInstallReportsARegistrationConflictWithoutStatusLookup(t *
 	}
 }
 
+// TestHandoverFailureCarriesTheStateCommand pins the helper's handover
+// failure: result, cause and exactly one action — the state command — so
+// the report of the helper never reaches the user without a way to read
+// what the failure left behind.
+func TestHandoverFailureCarriesTheStateCommand(t *testing.T) {
+	previousShow := showMessage
+	var shown string
+	showMessage = func(caption, text string, icon uint32) {
+		shown = text
+	}
+	defer func() { showMessage = previousShow }()
+
+	reporter := &serviceActionReporter{action: serviceActionInstall}
+	reporter.handoverFailure(errors.New("the handover was not confirmed"))
+
+	for _, want := range []string{
+		"No service action was performed",
+		"the handover was not confirmed",
+		serviceStatusCommandText,
+	} {
+		if !strings.Contains(shown, want) {
+			t.Errorf("the report %q does not mention %q", shown, want)
+		}
+	}
+	if got := strings.Count(shown, "hfdesk service status"); got != 1 {
+		t.Errorf("the report %q names the state command %d times, want exactly one", shown, got)
+	}
+
+	// Input-independent dedup: a cause that already names the state
+	// command carries it as the single action — without the dedup the
+	// unconditional append made the report name it twice.
+	shown = ""
+	namedCause := errors.New(`service: the handover was not confirmed; run "hfdesk service status" to read the current state of the service`)
+	reporter.handoverFailure(namedCause)
+	if !strings.Contains(shown, namedCause.Error()) {
+		t.Errorf("the report %q does not carry the cause of the manager", shown)
+	}
+	if got := strings.Count(shown, "hfdesk service status"); got != 1 {
+		t.Errorf("the report %q names the state command %d times, want exactly one", shown, got)
+	}
+}
+
 func TestServiceHelperPassesTheVersionExpectationToTheServiceOwner(t *testing.T) {
 	const console = `C:\portable\hfdesk.exe`
 	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) { return console, nil })

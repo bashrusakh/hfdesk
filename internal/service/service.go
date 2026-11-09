@@ -167,6 +167,14 @@ func runningState(state State) bool {
 // differently.
 const brokenRunningDetail = " (the instance still runs, but the registration cannot start it again)"
 
+// statusReadHint is the one action of a failure report whose outcome the
+// report itself cannot settle: reading the state of the service decides
+// what the failure left behind. The composite rollback outcomes of the
+// service layer append it, so the command line — which prints the manager
+// text as it is — and the desktop surface both carry result, cause and one
+// action.
+const statusReadHint = `run "hfdesk service status" to read the current state of the service`
+
 // InstallFieldSet marks the fields of an InstallOptions that a request set
 // explicitly.
 //

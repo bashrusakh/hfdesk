@@ -143,9 +143,9 @@ func scmRestartRollbackSentence(facts scmRestartRollback, reason string) string 
 	if facts.attempt == scmRollbackUndeliveredInstance {
 		switch {
 		case !facts.restored:
-			return fmt.Sprintf("no stop control was delivered to the instance the failed installation replaced, but the configuration of the previous registration could not be put back: %s", reason)
+			return fmt.Sprintf("no stop control was delivered to the instance the failed installation replaced, but the configuration of the previous registration could not be put back: %s; %s", reason, scmStopStatusHint)
 		case facts.running:
-			return "no stop control was delivered to the instance the failed installation replaced and the configuration of the previous registration was restored; the instance still runs and no instance was started"
+			return "no stop control was delivered to the instance the failed installation replaced and the configuration of the previous registration was restored; the instance still runs and no instance was started; " + scmStopStatusHint
 		case !facts.stopped:
 			return fmt.Sprintf("no stop control was delivered to the instance the failed installation replaced and the configuration of the previous registration was restored, but the running state of the instance could not be confirmed, so no instance was started: %s; %s", reason, scmStopStatusHint)
 		}
@@ -159,36 +159,36 @@ func scmRestartRollbackSentence(facts scmRestartRollback, reason string) string 
 		return fmt.Sprintf("the registration of the failed installation was kept because the instance it started was not proven to be stopped: %s: the previous registration was not restored and no instance was started; %s", reason, scmStopStatusHint)
 	case !facts.restored:
 		if previousInstance {
-			return fmt.Sprintf("the previous instance was proven stopped, but the previous registration could not be put back: %s", reason)
+			return fmt.Sprintf("the previous instance was proven stopped, but the previous registration could not be put back: %s; %s", reason, scmStopStatusHint)
 		}
-		return fmt.Sprintf("the instance of the failed installation was stopped, but the previous registration could not be put back: %s", reason)
+		return fmt.Sprintf("the instance of the failed installation was stopped, but the previous registration could not be put back: %s; %s", reason, scmStopStatusHint)
 	case !facts.programKnown:
 		// The restored registration carries a command line that cannot be
 		// read, so there is no program to start: the rollback reports the
 		// registration and the state of the instance and never claims a
 		// start it did not make.
 		if previousInstance {
-			return fmt.Sprintf("the previous instance was proven stopped and the configuration of the previous registration was restored, but the restored registration names no program, so no instance was started: the instance of %s is stopped", ServiceName)
+			return "the previous instance was proven stopped and the configuration of the previous registration was restored, but the restored registration names no program, so no instance was started: the instance of " + ServiceName + " is stopped; " + scmStopStatusHint
 		}
-		return fmt.Sprintf("the instance of the failed installation was stopped and the configuration of the previous registration was restored, but the restored registration names no program, so no instance was started: the instance of %s is stopped", ServiceName)
+		return "the instance of the failed installation was stopped and the configuration of the previous registration was restored, but the restored registration names no program, so no instance was started: the instance of " + ServiceName + " is stopped; " + scmStopStatusHint
 	case !facts.started:
 		// The start was refused, or it was accepted and the instance never
 		// proved to run the previous program. Neither is a claim about the
 		// program that runs: the reason names what was observed.
 		if previousInstance {
-			return fmt.Sprintf("the previous instance was proven stopped and the configuration of the previous registration was restored, but the previous instance was not proven to be in service again: %s", reason)
+			return fmt.Sprintf("the previous instance was proven stopped and the configuration of the previous registration was restored, but the previous instance was not proven to be in service again: %s; %s", reason, scmStopStatusHint)
 		}
-		return fmt.Sprintf("the instance of the failed installation was stopped and the configuration of the previous registration was restored, but the previous instance was not proven to be in service again: %s", reason)
+		return fmt.Sprintf("the instance of the failed installation was stopped and the configuration of the previous registration was restored, but the previous instance was not proven to be in service again: %s; %s", reason, scmStopStatusHint)
 	case !facts.verified:
 		if previousInstance {
-			return "the previous instance was proven stopped and the configuration of the previous registration was restored and an instance was started, but the running process was not proven to be the previous program: the image of the process could not be read"
+			return "the previous instance was proven stopped and the configuration of the previous registration was restored and an instance was started, but the running process was not proven to be the previous program: the image of the process could not be read; " + scmStopStatusHint
 		}
-		return "the instance of the failed installation was stopped and the configuration of the previous registration was restored and an instance was started, but the running process was not proven to be the previous program: the image of the process could not be read"
+		return "the instance of the failed installation was stopped and the configuration of the previous registration was restored and an instance was started, but the running process was not proven to be the previous program: the image of the process could not be read; " + scmStopStatusHint
 	default:
 		if previousInstance {
-			return "the previous instance was proven stopped, the configuration of the previous registration was restored and the previous instance was started again; the failure recovery of the registration was not part of the restore and stays as the installation left it"
+			return "the previous instance was proven stopped, the configuration of the previous registration was restored and the previous instance was started again; the failure recovery of the registration was not part of the restore and stays as the installation left it; " + scmStopStatusHint
 		}
-		return "the instance of the failed installation was stopped, the configuration of the previous registration was restored and the previous instance was started again; the failure recovery of the registration was not part of the restore and stays as the installation left it"
+		return "the instance of the failed installation was stopped, the configuration of the previous registration was restored and the previous instance was started again; the failure recovery of the registration was not part of the restore and stays as the installation left it; " + scmStopStatusHint
 	}
 }
 
