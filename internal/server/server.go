@@ -12,8 +12,10 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"reflect"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/assets"
@@ -38,6 +40,25 @@ const ShutdownPhaseTimeout = 10 * time.Second
 // GracefulShutdownTimeout is the total budget of the orderly shutdown: the
 // sum of the budgets of its phases.
 const GracefulShutdownTimeout = 2 * ShutdownPhaseTimeout
+
+// HealthPath is the endpoint that reports the health of the instance.
+//
+// The path is published: a readiness probe of a supervised start asks it
+// before the supervisor accepts the instance, and a probe that carried a copy
+// of the path would keep asking a route this one no longer registers.
+const HealthPath = "/api/health"
+
+// BasicAuthRealm is the realm the basic authentication of the API announces to
+// a client that sends no credential.
+const BasicAuthRealm = "HFDesk"
+
+// BasicAuthChallenge is the challenge of the basic authentication: the value of
+// the WWW-Authenticate header of a refused request.
+//
+// The challenge is published as the whole header value, because a probe that
+// proves a protected instance compares the header with it as it is sent: the
+// quoting of the realm is part of the answer it accepts.
+const BasicAuthChallenge = `Basic realm="` + BasicAuthRealm + `"`
 
 // Config holds server configuration.
 type Config struct {
@@ -121,16 +142,32 @@ type Server struct {
 	// (jobs.UpdateConfig + SaveConfigFile). The generation re-check is taken
 	// under this lock so that only the latest committed writer persists, and
 	// an older writer cannot clobber a newer one's job-manager/file state.
-	persistMu           sync.Mutex
-	httpServer          *http.Server
-	jobs                *JobManager
-	wsHub               *WSHub
-	selectedDeleteHooks selectedDeleteHooks
+	persistMu sync.Mutex
+	// Guarded by persistMu; generation zero is not a persisted startup config.
+	settingsPersistedGen  uint64
+	settingsPersistErrGen uint64
+	settingsPersistErr    error
+	// Guarded by configMu together with settingsOps admission.
+	settingsSealed       bool
+	settingsOps          sync.WaitGroup
+	handoverOnce         sync.Once
+	handoverErr          error
+	saveSettingsConfigFn func(*ConfigFile, *string) error
+	httpServer           *http.Server
+	jobs                 *JobManager
+	wsHub                *WSHub
+	selectedDeleteHooks  selectedDeleteHooks
 	// boundAddr holds the effective address the server is actually bound to.
 	// It is written once the listener exists and read by BoundAddr and
 	// BrowserURL, which must work before the server finished starting.
-	boundAddrMu sync.RWMutex
-	boundAddr   net.Addr
+	// boundIPv6Only and boundFamilyKnown record the address-family behavior
+	// of that listener: whether an IPv6 wildcard socket accepts IPv4 (false)
+	// or IPv6 alone (true), and whether the listener allowed that question to
+	// be read. They are written with the address and never change after.
+	boundAddrMu      sync.RWMutex
+	boundAddr        net.Addr
+	boundIPv6Only    bool
+	boundFamilyKnown bool
 	// runID identifies the run of the server. It is generated once, when
 	// the server is asked for it the first time, and it never changes
 	// afterwards: a client compares it to tell a restart of the server
@@ -228,9 +265,10 @@ func New(cfg Config) *Server {
 	jobs := NewJobManager(cfg, wsHub)
 	jobs.LoadState()
 	s := &Server{
-		config: cfg,
-		jobs:   jobs,
-		wsHub:  wsHub,
+		config:               cfg,
+		jobs:                 jobs,
+		wsHub:                wsHub,
+		saveSettingsConfigFn: saveSettingsConfig,
 	}
 	return s
 }
@@ -240,14 +278,30 @@ func New(cfg Config) *Server {
 // It binds the configured address and serves the listener through Serve, so
 // the effective bound address is known as soon as the listener exists.
 func (s *Server) ListenAndServe(ctx context.Context) error {
+	listener, err := s.Listen()
+	if err != nil {
+		return err
+	}
+	return s.Serve(ctx, listener)
+}
+
+// Listen binds the configured address and returns the listener.
+//
+// It exists for a host that runs the serve path itself: the return of Listen
+// is the own-liveness fact of that host — its own listener is bound — which
+// the readiness of a start has to combine with the probe of the address. A
+// bind that fails closes the job manager within the shutdown budget and
+// returns the failure joined with the result of that cleanup, exactly as the
+// bind of ListenAndServe always did.
+func (s *Server) Listen() (net.Listener, error) {
 	cfg := s.snapshotConfig()
 	addr := fmt.Sprintf("%s:%d", cfg.Addr, cfg.Port)
 
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		return s.closeJobsAfterListenError(fmt.Errorf("listen on %s: %w", addr, err), ShutdownPhaseTimeout)
+		return nil, s.closeJobsAfterListenError(fmt.Errorf("listen on %s: %w", addr, err), ShutdownPhaseTimeout)
 	}
-	return s.Serve(ctx, listener)
+	return listener, nil
 }
 
 // Serve runs the HFDesk HTTP server on a caller-provided listener.
@@ -259,7 +313,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 // BrowserURL report the real address even when the caller asked for an
 // OS-assigned port.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	s.setBoundAddr(ln.Addr())
+	s.setBoundListener(ln)
 	s.logStartup(ln.Addr())
 	return s.serveListener(ctx, ln, s.handler(), ShutdownPhaseTimeout)
 }
@@ -277,9 +331,15 @@ func (s *Server) BoundAddr() net.Addr {
 
 // BrowserURL returns a browser-safe URL for the running server.
 //
-// A wildcard bind (0.0.0.0, :: or an empty host) yields the loopback
-// address 127.0.0.1 instead of the wildcard address, because a browser
-// cannot open the wildcard address. Any other host is used as bound. The
+// A wildcard bind has no address a browser can open, so it yields the loopback
+// address of its family instead: an unspecified IPv4 address and an empty host
+// yield 127.0.0.1, an unspecified IPv6 address yields ::1. The family is the one
+// of the configured address, because the listener of an IPv4 wildcard is a
+// dual-stack socket that reports the IPv6 wildcard on some platforms: the
+// operator asked for the IPv4 wildcard and not for the family the socket chose.
+// A configuration that names no family follows the listener itself (see
+// boundHostPort): an IPv6-only listener has to be reached at ::1, while a
+// dual-stack listener keeps 127.0.0.1. Any other host is used as bound. The
 // effective port is always included.
 func (s *Server) BrowserURL() string {
 	host, port := s.boundHostPort()
@@ -299,22 +359,87 @@ func (s *Server) ActiveJobCounts() (running, queued int) {
 	return s.jobs.activeCounts()
 }
 
-// setBoundAddr records the effective bound address of the server.
+// setBoundAddr records the effective bound address of the server without a
+// listener to ask: no address-family behavior is known for it, so BrowserURL
+// keeps its earlier derivation for that bind.
 func (s *Server) setBoundAddr(addr net.Addr) {
 	s.boundAddrMu.Lock()
 	s.boundAddr = addr
+	s.boundIPv6Only, s.boundFamilyKnown = false, false
 	s.boundAddrMu.Unlock()
+}
+
+// setBoundListener records the effective bound address of the server together
+// with the address-family behavior of the listener it came from, so a
+// wildcard bind can name a loopback address the listener really answers on.
+func (s *Server) setBoundListener(ln net.Listener) {
+	addr := ln.Addr()
+	only, known := listenerIPv6Only(addr, ln)
+	s.boundAddrMu.Lock()
+	s.boundAddr = addr
+	s.boundIPv6Only, s.boundFamilyKnown = only, known
+	s.boundAddrMu.Unlock()
+}
+
+// boundSocketFamily returns the recorded address-family behavior of the bound
+// listener. known is false when no listener supplied it.
+func (s *Server) boundSocketFamily() (only bool, known bool) {
+	s.boundAddrMu.RLock()
+	defer s.boundAddrMu.RUnlock()
+	return s.boundIPv6Only, s.boundFamilyKnown
 }
 
 // boundHostPort returns the host and the effective port of the running
 // server. Before the server is bound it falls back to the configured
 // address and port.
+//
+// A wildcard bind is reported with the spelling of the configuration when the
+// configuration names a family: the listener of an IPv4 wildcard is a
+// dual-stack socket that reports the IPv6 wildcard on some platforms, and the
+// loopback address a browser can open follows the family the operator asked
+// for and not the one the socket chose. A configuration that names no family
+// follows the listener itself: an IPv6 wildcard socket that accepts IPv6
+// alone (IPV6_V6ONLY set) never answers on 127.0.0.1, so it yields ::1,
+// while a dual-stack socket keeps 127.0.0.1. When the listener's behavior
+// could not be read, the earlier spelling (the IPv4 loopback) is kept.
+// A concrete bound host is never replaced, and a configuration that names no
+// wildcard leaves the bound spelling in place.
 func (s *Server) boundHostPort() (string, int) {
-	if addr := s.BoundAddr(); addr != nil {
-		return splitAddrHostPort(addr)
-	}
 	cfg := s.snapshotConfig()
+	if addr := s.BoundAddr(); addr != nil {
+		host, port := splitAddrHostPort(addr)
+		if isWildcardHost(host) && isWildcardHost(cfg.Addr) {
+			switch ip := net.ParseIP(host); {
+			case cfg.Addr != "":
+				// The configuration names the family of its wildcard.
+				host = cfg.Addr
+			case ip != nil && ip.IsUnspecified() && ip.To4() == nil:
+				// An IPv6 wildcard bind without a configured family: the
+				// listener's own behavior decides which loopback reaches it.
+				if only, known := s.boundSocketFamily(); known && only {
+					host = "::"
+				} else {
+					host = ""
+				}
+			default:
+				// An IPv4 wildcard (or an empty spelling of one) names the
+				// IPv4 loopback, with or without a configured family.
+				host = cfg.Addr
+			}
+		}
+		return host, port
+	}
 	return cfg.Addr, cfg.Port
+}
+
+// isWildcardHost reports whether a bind host is the address of every interface:
+// an empty host, or an unspecified IP address of either family.
+func isWildcardHost(host string) bool {
+	if host == "" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsUnspecified()
 }
 
 // browserURLFor builds the browser-safe URL for a bind host and an effective
@@ -324,13 +449,28 @@ func browserURLFor(host string, port int) string {
 }
 
 // browserHost maps a bind host to a host a browser can open. A wildcard or
-// empty bind host becomes the loopback address; every other host is kept.
+// empty bind host has no address a browser can open, so it becomes the loopback
+// address of the same family: an unspecified IPv4 address and an empty host
+// become 127.0.0.1, an unspecified IPv6 address becomes ::1. Every other host is
+// kept: a browser resolves the name localhost to the loopback interface itself.
+//
+// The caller resolves a wildcard bind from the configuration first, and,
+// when the configuration names no family, from the listener itself (see
+// boundHostPort), so the family of the loopback address is the family the
+// operator asked for. The mapping itself is the rule service.LocalAddress applies
+// to a registered listen address, so a start that is verified on an address and a
+// browser that is sent to it never disagree. The server package cannot import the
+// service package, so the rule is spelled here as well: a change to the mapping of
+// either copy has to change the other one.
 func browserHost(host string) string {
 	if host == "" {
 		return "127.0.0.1"
 	}
 	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
-		return "127.0.0.1"
+		if ip.To4() != nil {
+			return "127.0.0.1"
+		}
+		return "::1"
 	}
 	return host
 }
@@ -356,6 +496,64 @@ func splitAddrHostPort(addr net.Addr) (string, int) {
 		return host, 0
 	}
 	return host, port
+}
+
+// listenerIPv6Only reports whether the bound socket accepts IPv6 alone
+// (IPV6_V6ONLY set) or IPv4 as well (dual stack), for an IPv6 wildcard
+// address. known is false when the address is not an IPv6 wildcard or the
+// listener does not expose its socket, and the caller then keeps its earlier
+// derivation for the bind.
+func listenerIPv6Only(addr net.Addr, ln net.Listener) (only bool, known bool) {
+	host, _ := splitAddrHostPort(addr)
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsUnspecified() || ip.To4() != nil {
+		return false, false
+	}
+	sc, ok := ln.(interface {
+		SyscallConn() (syscall.RawConn, error)
+	})
+	if !ok {
+		return false, false
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return false, false
+	}
+	value, err := socketOptionInt(raw, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY)
+	if err != nil {
+		return false, false
+	}
+	return value != 0, true
+}
+
+// socketOptionInt reads an integer socket option of a raw socket.
+//
+// The syscall package spells the descriptor parameter of GetsockoptInt per
+// operating system (an int on Unix, a Handle on Windows), so the one call
+// goes through reflection once: that keeps this file buildable for every
+// supported system without per-operating-system source files.
+func socketOptionInt(raw syscall.RawConn, level, opt int) (int, error) {
+	var (
+		value int
+		opErr error
+	)
+	err := raw.Control(func(fd uintptr) {
+		getsockopt := reflect.ValueOf(syscall.GetsockoptInt)
+		args := []reflect.Value{
+			reflect.ValueOf(fd).Convert(getsockopt.Type().In(0)),
+			reflect.ValueOf(level),
+			reflect.ValueOf(opt),
+		}
+		out := getsockopt.Call(args)
+		value = int(out[0].Int())
+		if !out[1].IsNil() {
+			opErr = out[1].Interface().(error)
+		}
+	})
+	if err != nil {
+		return 0, err
+	}
+	return value, opErr
 }
 
 // logStartup records the startup information that used to be printed as a
@@ -517,7 +715,7 @@ func (s *Server) closeJobsAfterListenError(listenErr error, timeout time.Duratio
 // registerAPIRoutes sets up all API endpoints.
 func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	// Health check
-	mux.HandleFunc("GET /api/health", s.handleHealth)
+	mux.HandleFunc("GET "+HealthPath, s.handleHealth)
 
 	// Downloads
 	mux.HandleFunc("POST /api/download", s.handleStartDownload)
@@ -673,7 +871,7 @@ func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
 		userOK := subtle.ConstantTimeCompare([]byte(user), []byte(cfg.AuthUser)) == 1
 		passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.AuthPass)) == 1
 		if !ok || !userOK || !passOK {
-			w.Header().Set("WWW-Authenticate", `Basic realm="HFDesk"`)
+			w.Header().Set("WWW-Authenticate", BasicAuthChallenge)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
