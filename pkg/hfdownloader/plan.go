@@ -757,7 +757,24 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 			}
 		}
 		for _, item := range plan.Items {
-			safe := addressingProbeSafeForCache(ctx, probeRepoDir, useHFCache, item)
+			// Check the budget before every cache-side probe: the
+			// fully-cached path never reaches the deadline checks below.
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			// Start the cache-side probe only within the remaining budget
+			// and clamp its context to that remainder: the probe can wait
+			// minutes on the ownership init gate under a bare parent
+			// context. A cut probe fails gracefully (its false path) and
+			// the next iteration's deadline check ends the walk with the
+			// plan intact.
+			remaining := time.Until(probeDeadline)
+			if remaining <= 0 {
+				break
+			}
+			cacheCtx, cancelCache := context.WithTimeout(ctx, remaining)
+			safe := addressingProbeSafeForCache(cacheCtx, probeRepoDir, useHFCache, item)
+			cancelCache()
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
@@ -767,7 +784,7 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			remaining := time.Until(probeDeadline)
+			remaining = time.Until(probeDeadline)
 			if remaining <= 0 {
 				break
 			}
@@ -803,7 +820,15 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			if branchErr != nil || !branchUsable || !confirmedRevisionStillResolves(ctx, httpc, token, cfg.Endpoint, job, mode.commit) {
+			if branchErr != nil || !branchUsable {
+				continue
+			}
+			// The revision re-check shares the preflight budget: a slow
+			// metadata response must not outlive it.
+			revCtx, cancelRev := context.WithDeadline(ctx, probeDeadline)
+			resolves := confirmedRevisionStillResolves(revCtx, httpc, token, cfg.Endpoint, job, mode.commit)
+			cancelRev()
+			if !resolves {
 				continue
 			}
 			fallback := planAddressingMode{revision: job.Revision, commit: job.Revision}
@@ -849,10 +874,18 @@ func redirectTargetsRevision(sourceURL, location string, job Job, revision strin
 		strings.Contains(path, "/"+job.Repo+"/resolve/"+url.PathEscape(revision)+"/")
 }
 
+// addressingCacheProbeHook lets tests observe each cache-side probe in the
+// custom-endpoint addressing preflight walk, under the probe's own context
+// so a seam can stand in for a context-bound internal wait.
+var addressingCacheProbeHook func(ctx context.Context)
+
 // addressingProbeSafeForCache avoids issuing even a read-only capability GET
 // when a content-addressed cache item is already complete or its ownership
 // state is busy/unknown. The ordinary skip/ownership path remains authoritative.
 func addressingProbeSafeForCache(ctx context.Context, repoDir *RepoDir, useHFCache bool, item PlanItem) bool {
+	if addressingCacheProbeHook != nil {
+		addressingCacheProbeHook(ctx)
+	}
 	if item.SHA256 == "" {
 		if !useHFCache {
 			return true
@@ -869,7 +902,7 @@ func addressingProbeSafeForCache(ctx context.Context, repoDir *RepoDir, useHFCac
 		if err != nil {
 			return false
 		}
-		busy, err := realm.probeWriter(context.Background(), []string{dst, dst + ".incomplete"})
+		busy, err := realm.probeWriter(ctx, []string{dst, dst + ".incomplete"})
 		return err == nil && !busy
 	}
 	if !useHFCache {
