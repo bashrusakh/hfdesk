@@ -87,6 +87,21 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 		return InstallOptions{}, err
 	}
 
+	// The mask is asked of the supervisor before anything else is judged: a
+	// persistent mask is a link to /dev/null whose bytes are no unit at
+	// all, so the hand-edit detector must not misclassify it; a runtime mask
+	// lives in /run and leaves no file at the unit path; and both mask kinds
+	// report LoadState="masked", so a masked unit has no loaded registration
+	// whose read could describe it — that read must not turn the refusal
+	// into a generic read error without the unmask action. The printed state
+	// decides; a masked unit refuses the installation instead of being
+	// replaced and is never unmasked. A fresh machine answers "not-found",
+	// which is no mask.
+	enablement := m.registrationEnablement(ctx)
+	if enablement.masked {
+		return opts, m.maskedUnitRefusal()
+	}
+
 	// The loaded registration of a first installation is read before the
 	// file is judged: a missing writable override is still an existing
 	// registration when systemd loaded a fragment for this name, and such a
@@ -101,18 +116,6 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 			return opts, fmt.Errorf("service: determine whether %s already has a loaded registration: %w", unitName, err)
 		}
 		initialLoadedKnown = true
-	}
-
-	// The mask is asked of the supervisor before the file is judged: a
-	// persistent mask is a link to /dev/null whose bytes are no unit at
-	// all, so the hand-edit detector must not misclassify it, and a runtime
-	// mask lives in /run and leaves no file at the unit path. The printed
-	// state decides; a masked unit refuses the installation instead of
-	// being replaced and is never unmasked. A fresh machine answers
-	// "not-found", which is no mask.
-	enablement := m.registrationEnablement(ctx)
-	if enablement.masked {
-		return opts, m.maskedUnitRefusal()
 	}
 
 	previous := previousRegistration{

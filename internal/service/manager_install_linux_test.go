@@ -1270,6 +1270,13 @@ func TestSystemdInstallRefusesAMaskedUnit(t *testing.T) {
 			t.Errorf("the refused installation called %q %d times:\n%s", strings.Join(command, " "), got, strings.Join(calls, "\n"))
 		}
 	}
+	// The installation never removes the mask itself: unmasking is the one
+	// next action the error names for the administrator to run.
+	for _, call := range calls {
+		if got := strings.TrimPrefix(call, "--user "); strings.Contains(got, "unmask") {
+			t.Errorf("the refused installation unmasked the unit itself (%q):\n%s", call, strings.Join(calls, "\n"))
+		}
+	}
 }
 
 // TestSystemdInstallRefusesARuntimeMaskedUnit checks that an installation over a
@@ -1332,19 +1339,26 @@ func TestSystemdInstallRefusesARuntimeMaskedUnit(t *testing.T) {
 		t.Errorf("the refused installation created %v below %q, want no directory at all", names, root)
 	}
 
-	// The manager checks both loaded-source identity and enablement before
-	// preparation, and does not reload or change a masked registration.
+	// The manager asks the mask of the supervisor first, so the refusal
+	// comes from the enablement read and the loaded registration — which a
+	// real supervisor answers with LoadState="masked" for a masked unit — is
+	// never read at all: the mask must reach its refusal instead of a
+	// generic read error. Nothing changes: no reload, no enable, no start or
+	// stop, and the mask is never removed by the installation itself.
 	calls := systemdSupervisorCalls(t, logPath)
 	if got := systemdSupervisorCallsTo(calls, "is-enabled", unitName); got != 1 {
 		t.Errorf("the enablement was read %d times, want once before the refusal:\n%s", got, strings.Join(calls, "\n"))
 	}
-	if got := systemdSupervisorCallsTo(calls, "show", unitName, "--property=LoadState"); got != 1 {
-		t.Errorf("loaded registration was checked %d times, want once before the refusal:\n%s", got, strings.Join(calls, "\n"))
+	if got := systemdSupervisorCallsTo(calls, "show", unitName, "--property=LoadState"); got != 0 {
+		t.Errorf("the loaded registration was read %d times, want none: the mask refuses before that read:\n%s", got, strings.Join(calls, "\n"))
 	}
 	for _, call := range calls {
 		got := strings.TrimPrefix(call, "--user ")
-		if got != "show "+unitName+" --property=LoadState" && got != "is-enabled "+unitName {
+		if got != "is-enabled "+unitName {
 			t.Errorf("the refused installation called the supervisor with unexpected command %q:\n%s", call, strings.Join(calls, "\n"))
+		}
+		if strings.Contains(got, "unmask") {
+			t.Errorf("the refused installation unmasked the unit itself (%q):\n%s", call, strings.Join(calls, "\n"))
 		}
 	}
 	for _, command := range [][]string{

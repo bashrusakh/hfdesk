@@ -153,8 +153,10 @@ func waitForState(t *testing.T, ctx context.Context, m *systemdManager, want Sta
 // mask, which the fake supervisor reports while a unit file may exist;
 // "masked-runtime" is the state of a unit masked at runtime, which a test
 // combines with an absent unit file, because the mask lives in /run and leaves
-// nothing at the unit path. "not-found" is what a fresh machine reports for a
-// unit it does not know. An "enable" that fails once
+// nothing at the unit path. For both mask states "show" reports
+// LoadState=masked with no active instance as well, whether or not a unit file
+// exists, the way the real supervisor answers a masked unit. "not-found" is what
+// a fresh machine reports for a unit it does not know. An "enable" that fails once
 // HFDESK_TEST_SYSTEMCTL_ENABLE_FAIL is "1" drives the failure of an installation
 // that cannot enable its registration; "enable --runtime" fails with it.
 //
@@ -230,6 +232,18 @@ enable)
 	exit 0
 	;;
 show)
+	case "${HFDESK_TEST_SYSTEMCTL_ENABLED_STATE:-enabled}" in
+	masked|masked-runtime)
+		# A masked unit reports LoadState=masked with no active instance
+		# whether the mask is a link to /dev/null at the unit path or lives
+		# in /run and leaves no file there, the way the real supervisor
+		# answers both mask kinds.
+		echo "LoadState=masked"
+		echo "ActiveState=inactive"
+		echo "SubState=dead"
+		exit 0
+		;;
+	esac
 	active="${HFDESK_TEST_SYSTEMCTL_ACTIVE:-inactive}"
 	if [ -n "$HFDESK_TEST_SYSTEMCTL_RESTARTED" ] && [ -e "$HFDESK_TEST_SYSTEMCTL_RESTARTED" ] && [ -n "$HFDESK_TEST_SYSTEMCTL_ACTIVE_AFTER_RESTART" ]; then
 		active="$HFDESK_TEST_SYSTEMCTL_ACTIVE_AFTER_RESTART"
