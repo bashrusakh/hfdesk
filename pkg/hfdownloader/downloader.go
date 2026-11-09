@@ -1536,40 +1536,79 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	if err != nil {
 		return false, err
 	}
-	pos := fi.Size()
+	stat := fi.Size()
+
+	// pos is the record's durable offset, never the stat-visible size: bytes
+	// above it were written after the last checkpoint, so a size-preserving
+	// media loss could hide holes below the stat size. They are discarded here
+	// and re-fetched below; only known-digest proof is not what bounds them.
+	pos := int64(0)
+	if stat > 0 {
+		switch {
+		case !singlePartialInheritable(recorded, identity, stat):
+			// A size match is not identity; discard prefixes without a matching record.
+			if recorded == nil {
+				downloadLog.Warn("discarding old or unproven single-path partial; re-downloading from zero",
+					"repo", job.Repo,
+					"path", it.RelativePath,
+					"bytes", stat,
+					"record", sidecar,
+				)
+			} else {
+				downloadLog.Info("discarding unproven single-path partial",
+					"repo", job.Repo,
+					"path", it.RelativePath,
+					"bytes", stat,
+					"identity_recorded", recorded != nil,
+				)
+			}
+			if err := out.Truncate(0); err != nil {
+				return false, err
+			}
+		case recorded.Offset > stat:
+			// The record claims durable bytes this partial does not hold;
+			// neither side can prove which survived, so restart rather than
+			// trust a prefix the durability claim cannot back.
+			downloadLog.Warn("discarding single-path partial below its durable offset; re-downloading from zero",
+				"repo", job.Repo,
+				"path", it.RelativePath,
+				"bytes", stat,
+				"durable_offset", recorded.Offset,
+				"record", sidecar,
+			)
+			if err := out.Truncate(0); err != nil {
+				return false, err
+			}
+		default:
+			pos = recorded.Offset
+			if stat > pos {
+				downloadLog.Info("discarding single-path partial bytes above the durable offset",
+					"repo", job.Repo,
+					"path", it.RelativePath,
+					"bytes", stat-pos,
+					"durable_offset", pos,
+				)
+				if err := out.Truncate(pos); err != nil {
+					return false, err
+				}
+			}
+		}
+	}
 	// inherited marks the on-disk prefix that this run did not write.
 	inherited := pos > 0
 
-	// A size match is not identity; discard prefixes without a matching record.
-	if pos > 0 && !singlePartialInheritable(recorded, identity, pos) {
-		if recorded == nil {
-			downloadLog.Warn("discarding old or unproven single-path partial; re-downloading from zero",
-				"repo", job.Repo,
-				"path", it.RelativePath,
-				"bytes", pos,
-				"record", sidecar,
-			)
-		} else {
-			downloadLog.Info("discarding unproven single-path partial",
-				"repo", job.Repo,
-				"path", it.RelativePath,
-				"bytes", pos,
-				"identity_recorded", recorded != nil,
-			)
-		}
-		if err := out.Truncate(0); err != nil {
-			return false, err
-		}
-		pos = 0
-		inherited = false
-	}
-
 	// Persist identity before trusting bytes. Framing proof carries only with a
 	// matching exact-size partial; without it the prefix may resume, but a full
-	// partial must revalidate its final byte.
+	// partial must revalidate its final byte. The claim carries the durable
+	// offset just derived, or zero when the discard below reclaims those bytes,
+	// so it never outlasts the prefix it describes.
 	sizeValid := !((it.Size > 0 && pos > it.Size) || (it.Size <= 0 && pos > 0))
 	identity.FramingComplete = it.Size > 0 && pos == it.Size && recorded != nil &&
 		recorded.FramingComplete && recorded.inheritableBy(identity)
+	identity.Offset = pos
+	if !sizeValid {
+		identity.Offset = 0
+	}
 	if err := persistSinglePartIdentity(out, sidecar, identity); err != nil {
 		return false, fmt.Errorf("write single-part identity %s: %w", sidecar, err)
 	}
@@ -1595,15 +1634,16 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 			return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)
 		}
 		// Written size does not prove clean EOF. Reserve and re-request the final
-		// byte so a cleanly framed response commits the partial.
+		// byte so a cleanly framed response commits the partial. The reservation
+		// is the request offset only: the record already claims the full prefix
+		// durable and framing_complete — not the stat size — still gates
+		// publication, while truncating here would leave the record overclaiming
+		// the partial until the next checkpoint.
 		downloadLog.Info("revalidating unframed single-path final byte",
 			"repo", job.Repo,
 			"path", it.RelativePath,
 			"bytes", it.Size,
 		)
-		if err := out.Truncate(it.Size - 1); err != nil {
-			return false, err
-		}
 		pos = it.Size - 1
 		forceLastByteRange = pos == 0
 	}
@@ -1645,6 +1685,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 			pos, countedUpTo = 0, 0
 			forceLastByteRange = false
 			identity.FramingComplete = false
+			identity.Offset = 0
 			if err := persistSinglePartIdentity(out, sidecar, identity); err != nil {
 				return false, fmt.Errorf("write single-part identity %s: %w", sidecar, err)
 			}
@@ -1744,6 +1785,19 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						countedUpTo = 0
 						lastEmit = time.Time{}
 					}
+					// Correct the persisted claim before any byte it authorizes is
+					// rewritten: a crash mid-rewrite must leave a record claiming
+					// nothing, or a later resume would trust the rewritten prefix
+					// without a payload sync ever covering it.
+					if identity.Offset > 0 {
+						identity.FramingComplete = false
+						identity.Offset = 0
+						if err := persistSinglePartIdentity(out, sidecar, identity); err != nil {
+							resp.Body.Close()
+							attemptCancel()
+							return false, fmt.Errorf("write single-part identity %s: %w", sidecar, err)
+						}
+					}
 					base = 0
 					if it.Size > 0 {
 						limit = it.Size
@@ -1788,8 +1842,10 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						// Clean EOF and exact length establish framing. Persist that proof
 						// before publication: the claim must be durable, so a failed payload
 						// or record sync fails the item instead of publishing bytes whose
-						// durability ordering is known to be broken.
+						// durability ordering is known to be broken. The whole written
+						// range becomes the durable offset with this same ordering.
 						identity.FramingComplete = true
+						identity.Offset = base + w.written
 						werr := persistSinglePartIdentity(out, sidecar, identity)
 						attemptCancel()
 						if werr != nil {
@@ -1826,6 +1882,20 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 							}
 						} else {
 							pos = base + accepted
+						}
+					}
+					// Attempt-boundary checkpoint: make the bytes actually on disk
+					// durable in the sidecar before the next attempt, mirroring the
+					// ranged family's attempt-boundary flush — bounded to attempt
+					// boundaries (payload sync, then record sync, then rename),
+					// never per write chunk. It fires only when the claim must
+					// move, so a no-progress failure costs no sync, and only for
+					// pinned transfers: an unpinned record never authorizes
+					// inherited bytes, so its offset is never consumed.
+					if opts.CommitPinned && pos != identity.Offset {
+						identity.Offset = pos
+						if err := persistSinglePartIdentity(out, sidecar, identity); err != nil {
+							return false, fmt.Errorf("persist single-part resume checkpoint %s: %w", sidecar, err)
 						}
 					}
 				}

@@ -391,32 +391,59 @@ relative path and expected size, plus whether the identity is PINNED — that is
 whether the commit was actually resolved rather than the requested revision
 standing in for it. The sidecar is version 1. Bytes already on disk are
 inherited ONLY when the record exists, is readable and well-formed, matches the
-current item exactly (repo, commit, path, size) and is PINNED on both sides.
-Otherwise the inherited bytes are discarded (the partial is truncated) and the
-transfer starts from zero: unproven bytes are never published. An unpinned
-identity pins nothing — a moved branch may change the content under that name —
-so nothing is inherited from it.
+current item exactly (repo, commit, path, size) and is PINNED on both sides —
+and then only up to the record's durable byte offset, never the stat-visible
+size. Anything beyond that offset is discarded (the partial is truncated to it)
+and re-fetched. Otherwise the inherited bytes are discarded (the partial is
+truncated) and the transfer starts from zero: unproven bytes are never
+published. An unpinned identity pins nothing — a moved branch may change the
+content under that name — so nothing is inherited from it.
 
 Object identity is not clean response framing. A process can exit after the
 last `WriteAt` but before `io.Copy` observes EOF, so an exactly-sized partial can
 still hold a torn final byte. The sidecar separately records whether the run
 that produced the partial saw the body end cleanly at the exact expected byte
 count (`framing_complete`). An exactly-sized partial is published without a
-request only when the identity matches AND that proof is present. Otherwise the
-final byte is reserved and re-requested as the non-empty range `[size-1, size)`;
-only a cleanly-framed response commits it, and a body error during that
-revalidation leaves the final byte uncommitted for a later retry/restart. A
-fresh transfer records the flag false before any byte is trusted and sets it
-only after `io.Copy` returns nil and every exact body-length check passes. When
-the expected size is unknown the exact-size shortcut does not apply.
+request only when the identity matches AND that proof is present. When the
+record's durable offset is exactly the expected size, the final byte is
+reserved and re-requested as the non-empty range `[size-1, size)`; when the
+offset is below it, the unproven suffix `[offset, size)` — which includes the
+final byte — is discarded from the partial and re-fetched instead. Only a
+cleanly-framed response commits it, and a body error during that revalidation
+rolls the partial back so the byte stays uncommitted for a later
+retry/restart. A fresh transfer records the flag false before any byte is
+trusted and sets it only after `io.Copy` returns nil and every exact
+body-length check passes. When the expected size is unknown the exact-size
+shortcut does not apply.
 Durability is ordered as of each persist: before every sidecar persist the
 partial's written bytes are synced, and the record itself is synced before its
 rename publishes the claim, so both hold under power loss, not only a process
-crash. Unlike the ranged record's durable high-water marks, the sidecar carries
-no durable byte offset, so resume inherits the partial's stat-visible prefix;
-after a size-preserving media loss that prefix may include bytes written after
-the last persist, with holes below its stat size. Only known-digest proof, and
-only when `Verify` is not `"none"`, detects that.
+crash. The record carries the durable byte offset those persists establish,
+exactly as the ranged record's durable high-water marks: it is written only
+after the payload is ordered durable to it, and a resumed run re-derives its
+starting point from that offset alone — never from the partial's stat-visible
+size. A size-preserving media loss below the stat size therefore cannot smuggle
+bytes written after the last persist into a resumed run, with or without a
+known digest: everything above the durable offset is discarded from the partial
+and re-fetched. The offset advances at the ranged family's checkpoint cadence —
+at startup, at framing completion, and at each attempt boundary that moved it
+(pinned transfers only, since an unpinned record never authorizes inherited
+bytes) — never per write chunk, so a checkpoint costs a payload sync, a record
+sync and a rename, bounded by the attempt count. The crash-loss tradeoff this
+cadence implies is explicit: a run interrupted before its next checkpoint — a
+crash or power loss mid-attempt — resumes from the last checkpoint, not from
+the bytes visible on disk. Everything the interrupted attempt wrote since that
+checkpoint is discarded from the partial and re-fetched: at most one attempt's
+worth of transfer, and the whole partial when the interrupted attempt is a
+fresh transfer's first. The same ordering covers a restart: an ignored-Range
+`200 OK` that rewrites the partial from zero persists the corrected zero claim
+before the first rewritten byte, so a crash mid-restart leaves a record
+authorizing nothing. A sidecar that predates the
+offset field reads its absence as zero and inherits nothing: such dev-era
+partials restart from byte zero rather than fall back to stat-size trust. What
+remains out of scope, as in the ranged family, is a device that lies about
+flush completion — bytes it acknowledged without persisting them are
+indistinguishable from durable ones.
 
 Write the sidecar after discarding unproven bytes and before trusting inherited
 bytes, so it describes the on-disk partial. Remove it only with the partial on

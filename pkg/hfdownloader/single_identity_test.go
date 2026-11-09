@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -48,7 +49,12 @@ func seedSinglePartial(t *testing.T, dst string, data []byte, job Job, it PlanIt
 	if err := os.WriteFile(dst+".part", data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	seedSingleIdentity(t, dst, job, it, opts)
+	id := singleIdentityFor(job, it, opts)
+	// A prior run's checkpoint made exactly these bytes durable.
+	id.Offset = int64(len(data))
+	if err := writeSinglePartIdentity(singlePartIdentityPath(dst), id); err != nil {
+		t.Fatal(err)
+	}
 }
 
 type singleIdentityFixture struct {
@@ -211,6 +217,105 @@ func TestSinglePathIdentityUnresolvedCommitInheritsNothing(t *testing.T) {
 			assertExactFile(t, f.dst, full)
 		})
 	}
+}
+
+// The one-byte final-byte revalidation sends its reservation as Range [0,1)
+// while the sidecar still claims that byte durable, and the request offset is
+// zero. A server that ignores the Range rewrites the byte below the standing
+// claim without any truncation, so the correction must fire on the claim
+// alone, not on a positive request offset.
+func TestSingleIgnoredRangeOneByteRevalidationCorrectsClaimBeforeRewrite(t *testing.T) {
+	full := []byte{0x5A}
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "f.bin")
+	job := Job{Repo: "o/r"}
+	it := PlanItem{RelativePath: "f.bin", Size: int64(len(full))}
+	cfg := Settings{Retries: 0, StallTimeout: "0"}
+	seedSinglePartial(t, dst, full, job, it, singleTestIdentity)
+
+	var mu sync.Mutex
+	var gotRanges []string
+	var responding atomic.Bool
+	var sampled atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotRanges = append(gotRanges, r.Header.Get("Range"))
+		mu.Unlock()
+		responding.Store(true)
+		w.Header().Set("Content-Length", strconv.Itoa(len(full)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(full)
+	}))
+	t.Cleanup(srv.Close)
+	it.URL = srv.URL + "/f.bin"
+
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", job, cfg, it, dst, singleTestIdentity, func(ev ProgressEvent) {
+		// Only the first progress event after the response arrives lands
+		// mid-rewrite; the later framing-completion event may legitimately see
+		// the re-proven claim again.
+		if ev.Event != "file_progress" || !responding.Load() || !sampled.CompareAndSwap(false, true) {
+			return
+		}
+		rec, rerr := readSinglePartIdentity(singlePartIdentityPath(dst))
+		if rerr != nil || rec == nil {
+			t.Errorf("persisted record unreadable during the rewrite: id=%v err=%v", rec, rerr)
+			return
+		}
+		if rec.Offset != 0 {
+			t.Errorf("persisted claim %d during the one-byte rewrite authorizes the byte re-written below it; the claim must be corrected first", rec.Offset)
+		}
+	}); err != nil {
+		t.Fatalf("downloadSingle: %v", err)
+	}
+	mu.Lock()
+	got := append([]string(nil), gotRanges...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != "bytes=0-0" {
+		t.Errorf("requests = %v, want exactly one %q: the revalidation must reach the server as a ranged reservation", got, "bytes=0-0")
+	}
+	assertExactFile(t, dst, full)
+}
+
+// A record whose durable offset is negative is unusable: the read side
+// rejects it outright, so the resumed run discards the partial and
+// re-downloads from zero instead of resuming below byte zero.
+func TestSingleNegativeDurableOffsetIsUnusableAndRedisplaysFromZero(t *testing.T) {
+	full := []byte("content re-downloaded after an unusable durable offset")
+	f := newSingleIdentityFixture(t, "model.bin", int64(len(full)))
+
+	// The read side must reject the negative offset on its own.
+	record := fmt.Sprintf(`{"version":1,"repo":"o/r","commit":"%s","path":"model.bin","size":%d,"pinned":true,"offset":-1}`,
+		singleTestIdentity.Commit, len(full))
+	if err := os.WriteFile(singlePartIdentityPath(f.dst), []byte(record), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSinglePartIdentity(singlePartIdentityPath(f.dst)); err == nil {
+		t.Fatal("a negative durable offset was accepted; the fail-safe read rejection is missing")
+	}
+
+	// Fail-safe path: the unusable record inherits nothing, the staged bytes
+	// are discarded, and one full GET re-downloads the file.
+	if err := os.WriteFile(f.dst+".part", full[:8], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var (
+		mu     sync.Mutex
+		ranges []string
+	)
+	srv := serveWhole(t, full, &ranges, &mu)
+	f.it.URL = srv.URL + "/model.bin"
+
+	cfg := Settings{Retries: 0, StallTimeout: "0"}
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", f.job, cfg, f.it, f.dst, singleTestIdentity, func(ProgressEvent) {}); err != nil {
+		t.Fatalf("downloadSingle: %v", err)
+	}
+	mu.Lock()
+	got := append([]string(nil), ranges...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != "" {
+		t.Errorf("requests = %v, want one full request (an unusable record must not resume)", got)
+	}
+	assertExactFile(t, f.dst, full)
 }
 
 // A sidecar-less partial is unproven and must restart from zero.

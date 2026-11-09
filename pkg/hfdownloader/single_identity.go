@@ -6,7 +6,9 @@ package hfdownloader
 // Single-request partials use a sidecar to bind bytes to repository, resolved
 // commit, path, and size; only matching pinned identities inherit bytes. The
 // sidecar separately records clean response framing, so an exactly-sized
-// partial without that proof must revalidate its final byte.
+// partial without that proof must revalidate its final byte. It also records
+// the durable byte offset: resume inherits exactly that prefix and re-fetches
+// everything above it, never the stat-visible size.
 
 import (
 	"encoding/json"
@@ -50,6 +52,12 @@ type singlePartIdentity struct {
 	// resume without it, but an exact-size partial needs it to skip a request.
 	// Persist false before transfer and true only after clean EOF and exact length.
 	FramingComplete bool `json:"framing_complete,omitempty"`
+	// Offset is the durable byte prefix: bytes [0, Offset) were ordered
+	// durable before this record's rename published the claim, and resume
+	// inherits exactly them — never the stat-visible size, never a tail above
+	// them. It is written only after the payload sync covers it. Zero, or a
+	// record predating the field, inherits nothing. It is not identity.
+	Offset int64 `json:"offset"`
 }
 
 func singlePartIdentityPath(dst string) string {
@@ -75,6 +83,9 @@ func readSinglePartIdentity(path string) (*singlePartIdentity, error) {
 	}
 	if id.Repo == "" || id.Path == "" {
 		return nil, errors.New("incomplete single-part identity")
+	}
+	if id.Offset < 0 {
+		return nil, errors.New("negative single-part durable offset")
 	}
 	if id.Pinned && id.Commit == "" {
 		return nil, errors.New("pinned single-part identity without a commit")

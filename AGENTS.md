@@ -189,7 +189,9 @@ or job ownership behavior. This section is the agent-level summary; when it and
   staged bytes only under a
   matching identity pinned on both sides (repo, commit, path, size, through the
   one shared `resumeIdentity.matches` rule); the single-path exact-size shortcut
-  also requires `framing_complete`. The whole transfer (tree walk and every
+  also requires `framing_complete`, and inherited bytes are bounded by the
+  sidecar's durable byte offset, never the stat-visible size — everything above
+  that offset is discarded and re-fetched. The whole transfer (tree walk and every
   per-file URL) is pinned to the resolved commit. Ordinary custom endpoints may
   select a confirmed branch-only mode before plan callbacks/reservations; it
   rebuilds the whole plan, inherits no partials, retries from zero, and makes no
