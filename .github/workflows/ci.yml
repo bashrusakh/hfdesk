@@ -125,7 +125,7 @@ jobs:
         run: |
           go run ./cmd/hfdesk/genico.go
           rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk/resource_windows_amd64.syso
-          rsrc -ico cmd/hfdesk/hfdesk.ico -o cmd/hfdesk-desktop/resource_windows_amd64.syso
+          rsrc -ico cmd/hfdesk/hfdesk.ico -manifest cmd/hfdesk-desktop/hfdesk.manifest -o cmd/hfdesk-desktop/resource_windows_amd64.syso
           go build -ldflags "-s -w -X main.Version=$env:VERSION" -o hfdesk_windows_amd64_ci.exe ./cmd/hfdesk
           go build -ldflags "-s -w -X main.Version=$env:VERSION -H=windowsgui" -o hfdesk-desktop_windows_amd64_ci.exe ./cmd/hfdesk-desktop
 
@@ -161,8 +161,9 @@ jobs:
   # allows it.
   #
   # The repository has never run its full suite on macOS, so the job covers
-  # the darwin-only code only: the launchd manager, the property list
-  # rendering, the plutil validation and the launchctl lifecycle. Widening
+  # the darwin-only code and the platform-independent command layer: the
+  # launchd manager, the property list rendering, the plutil validation,
+  # the launchctl lifecycle and the `go test ./cmd/hfdesk` step. Widening
   # it to the full suite is a separate, deliberate step.
   go-macos:
     name: Go checks (macOS)
