@@ -622,9 +622,9 @@ func (m *scmManager) updateRegistrationConfig(registration scmConfiguration, con
 // the refused write did not touch it.
 func failedUpdateRestore(registration scmConfiguration, previous previousSCMRegistration, failure error) (createdDirsSafeToRemove bool, err error) {
 	if err := restoreSCMConfig(registration, previous); err != nil {
-		return false, fmt.Errorf("%w (the registration of %s may be partially changed: the previous configuration could not be restored or verified: %v)", failure, ServiceName, err)
+		return false, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the registration of %s may be partially changed: the previous configuration could not be restored or verified: %v)", failure, ServiceName, err), scmStopStatusHint)
 	}
-	return true, fmt.Errorf("%w (the configuration of the previous registration of %s was restored; the running instance was not touched)", failure, ServiceName)
+	return true, AppendActionErrorIfUnnamed(fmt.Errorf("%w (the previous registration of %s was restored, its command line verified; the running instance was not touched)", failure, ServiceName), scmStopStatusHint)
 }
 
 // scmConfigExecutable returns the program of a registration configuration.

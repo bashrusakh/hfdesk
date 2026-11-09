@@ -118,6 +118,11 @@ func TestSCMStopThatDoesNotSettleIsNotReportedAsRunning(t *testing.T) {
 			case tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr):
 				t.Errorf("stopService() = %v, want %q", err, tc.wantErr)
 			}
+			// The stop timeout carries the one action: reading the
+			// state of the service shows what the instance did.
+			if tc.wantErr == "did not stop within" && !strings.Contains(err.Error(), `run "hfdesk service status"`) {
+				t.Errorf("the stop timeout %q carries no state command, want the one action of the report", err)
+			}
 		})
 	}
 }

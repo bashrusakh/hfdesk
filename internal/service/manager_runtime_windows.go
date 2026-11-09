@@ -443,9 +443,9 @@ func (m *scmManager) stopService(ctx context.Context, handle scmServiceControl) 
 		}
 		if time.Now().After(deadline) {
 			if delivered || status.State == svc.StopPending {
-				return scmStopUnsettled, fmt.Errorf("service: %s did not stop within %s (the state of the instance was %v)", ServiceName, scmStopBudget, status.State)
+				return scmStopUnsettled, AppendActionErrorIfUnnamed(fmt.Errorf("service: %s did not stop within %s (the state of the instance was %v)", ServiceName, scmStopBudget, status.State), scmStopStatusHint)
 			}
-			return scmStopNotDelivered, fmt.Errorf("service: %s did not stop within %s (the state of the instance was %v)", ServiceName, scmStopBudget, status.State)
+			return scmStopNotDelivered, AppendActionErrorIfUnnamed(fmt.Errorf("service: %s did not stop within %s (the state of the instance was %v)", ServiceName, scmStopBudget, status.State), scmStopStatusHint)
 		}
 		select {
 		case <-ctx.Done():

@@ -8,6 +8,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -38,6 +39,10 @@ func TestSCMRollbackSettlesTheStopItInherits(t *testing.T) {
 		wantStarts   int
 		wantDirsSafe bool
 		wantReports  []string
+		// failure overrides the synthetic default with a real error of
+		// the stop path — the stop timeout carries the state command,
+		// exactly the input the message model composes.
+		failure error
 	}{
 		{
 			name:         "a control that was never delivered",
@@ -45,7 +50,7 @@ func TestSCMRollbackSettlesTheStopItInherits(t *testing.T) {
 			wantOutcome:  scmStopNotDelivered,
 			wantWrites:   1,
 			wantDirsSafe: true,
-			wantReports:  []string{"the configuration of the previous registration was restored", "the instance still runs", "no instance was started"},
+			wantReports:  []string{"the previous registration was restored, its command line verified", "the instance still runs", "no instance was started"},
 		},
 		{
 			name:         "the previous instance then stops",
@@ -67,7 +72,7 @@ func TestSCMRollbackSettlesTheStopItInherits(t *testing.T) {
 			wantOutcome:  scmStopNotDelivered,
 			wantWrites:   1,
 			wantDirsSafe: true,
-			wantReports:  []string{"the configuration of the previous registration was restored", "the running state of the instance could not be confirmed", "no instance was started", "hfdesk service status", "did not answer"},
+			wantReports:  []string{"the previous registration was restored, its command line verified", "the running state of the instance could not be confirmed", "no instance was started", "hfdesk service status", "did not answer"},
 		},
 		{
 			name:         "a state that cannot be read first and then reads as running",
@@ -75,7 +80,7 @@ func TestSCMRollbackSettlesTheStopItInherits(t *testing.T) {
 			wantOutcome:  scmStopNotDelivered,
 			wantWrites:   1,
 			wantDirsSafe: true,
-			wantReports:  []string{"the configuration of the previous registration was restored", "the instance still runs", "no instance was started"},
+			wantReports:  []string{"the previous registration was restored, its command line verified", "the instance still runs", "no instance was started"},
 		},
 		{
 			name:         "a state that cannot be read first and then reads as stopped",
@@ -85,7 +90,7 @@ func TestSCMRollbackSettlesTheStopItInherits(t *testing.T) {
 			wantWrites:   1,
 			wantStarts:   1,
 			wantDirsSafe: true,
-			wantReports:  []string{"the previous instance was proven stopped", "the configuration of the previous registration was restored", scmRollbackSuccessClaim},
+			wantReports:  []string{"the previous instance was proven stopped", "the previous registration was restored, its command line verified", scmRollbackSuccessClaim},
 		},
 		{
 			name:         "a state that cannot be read first and then stays stopping",
@@ -94,13 +99,36 @@ func TestSCMRollbackSettlesTheStopItInherits(t *testing.T) {
 			wantOutcome:  scmStopNotDelivered,
 			wantWrites:   1,
 			wantDirsSafe: true,
-			wantReports:  []string{"the configuration of the previous registration was restored", "the running state of the instance could not be confirmed", "no instance was started", "hfdesk service status"},
+			wantReports:  []string{"the previous registration was restored, its command line verified", "the running state of the instance could not be confirmed", "no instance was started", "hfdesk service status"},
 		},
 		{
 			name:        "the instance of a failed start",
 			mode:        scmRollbackRestart,
 			wantOutcome: scmStopUnsettled,
 			wantReports: []string{"the instance it started was not proven to be stopped"},
+		},
+		{
+			// The real composite the message model must survive: the
+			// failure IS the stop timeout as the install path wraps it
+			// (it carries the state command), and the rollback's own
+			// step fails with a plain reason. The final text must name
+			// the command exactly once — before the fix the sentence
+			// appended a second one over the plain reason.
+			name: "a real stop-timeout failure composed with a plain reason",
+			mode: scmRollbackUndeliveredStop,
+			failure: AppendActionErrorIfUnnamed(
+				fmt.Errorf("service: %s did not stop within %s (the state of the instance was %v)", ServiceName, 10*time.Millisecond, svc.StopPending),
+				scmStopStatusHint),
+			queryErr:     readErr,
+			wantOutcome:  scmStopNotDelivered,
+			wantWrites:   1,
+			wantDirsSafe: true,
+			wantReports: []string{
+				"could not be confirmed",
+				"no instance was started",
+				readErr.Error(),
+				"hfdesk service status",
+			},
 		},
 	}
 	for _, tc := range cases {
@@ -116,7 +144,10 @@ func TestSCMRollbackSettlesTheStopItInherits(t *testing.T) {
 			}
 			manager := &scmManager{scope: ScopeSystem}
 			previous := scmTestRunningPrevious()
-			failure := errors.New("the stop did not settle")
+			failure := tc.failure
+			if failure == nil {
+				failure = errors.New("the stop did not settle")
+			}
 
 			outcome, err := manager.stopService(context.Background(), target)
 			if err == nil {
@@ -168,10 +199,13 @@ func TestSCMRollbackSettlesTheStopItInherits(t *testing.T) {
 					t.Errorf("the report %q does not mention %q", rollbackErr, want)
 				}
 			}
-			// Every rollback report carries the one action: reading the
-			// state of the service decides what the failure left behind.
-			if !strings.Contains(rollbackErr.Error(), "hfdesk service status") {
-				t.Errorf("the report %q names no state command, want the one action of the report", rollbackErr)
+			// Full-message oracle: the FINAL composed text names the
+			// state command exactly once — a failure that already
+			// carries it (the real stop timeout above) must not be
+			// served a second one, and a plain failure must be served
+			// one.
+			if got := strings.Count(rollbackErr.Error(), "hfdesk service status"); got != 1 {
+				t.Errorf("the report %q names the state command %d times, want exactly once on the final text", rollbackErr, got)
 			}
 		})
 	}
@@ -197,7 +231,7 @@ func TestSCMRollbackOfAFailureOutsideTheInstanceRestoresTheRegistration(t *testi
 		t.Errorf("the rollback wrote %d configurations, started %d instances, delivered %d controls and removed %d registrations, want one write and no other change",
 			len(target.writes), target.starts, target.controls, target.deletes)
 	}
-	for _, want := range []string{"the configuration of the previous registration was restored", "the running instance was not restarted"} {
+	for _, want := range []string{"the previous registration was restored, its command line verified", "the running instance was not restarted"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the report %q does not mention %q", err, want)
 		}
@@ -266,6 +300,10 @@ func TestSCMRestartRollbackSentence(t *testing.T) {
 		facts scmRestartRollback
 		// reason is the detail the rollback embeds for a step that failed.
 		reason string
+		// causeHasAction declares whether the reason itself names an
+		// action. The expectation lives HERE: the test's want is never
+		// computed from the implementation's own observer.
+		causeHasAction bool
 		// want contains the phrases the sentence has to carry.
 		want []string
 		// verified reports whether the sentence may claim the previous
@@ -356,6 +394,21 @@ func TestSCMRestartRollbackSentence(t *testing.T) {
 			want:     []string{"the previous instance was proven stopped", "was restored", scmRollbackSuccessClaim},
 			verified: true,
 		},
+		{
+			// The reason names its own action: the sentence must not
+			// serve the state command beside it (A3, both sides).
+			name: "a reason that already names its own action",
+			facts: scmRestartRollback{
+				attempt:      scmRollbackPreviousInstance,
+				stopped:      true,
+				restored:     true,
+				programKnown: true,
+			},
+			reason:         "the shell is not elevated: run the command as an administrator",
+			causeHasAction: true,
+			want:           []string{"was not proven to be in service again", "run the command as an administrator"},
+			verified:       false,
+		},
 	}
 
 	for _, tc := range cases {
@@ -369,11 +422,25 @@ func TestSCMRestartRollbackSentence(t *testing.T) {
 					t.Errorf("the sentence %q does not carry %q", sentence, want)
 				}
 			}
-			// Every branch of the rollback sentence carries the one
-			// action: reading the state of the service decides what the
-			// failure left behind.
-			if !strings.Contains(sentence, "hfdesk service status") {
-				t.Errorf("the sentence %q names no state command, want the one action of the report", sentence)
+			// The sentence stays pure: it never appends the action —
+			// the report closures decide over the composed message.
+			if strings.Contains(sentence, "hfdesk service status") {
+				t.Errorf("the sentence %q appends the state command, want a pure sentence", sentence)
+			}
+			// The expectation is the declared column above, checked
+			// against the shared observer — never computed from it.
+			if got := HasNamedAction(sentence); got != tc.causeHasAction {
+				t.Errorf("the sentence %q names an action = %t, want the declared %t", sentence, got, tc.causeHasAction)
+			}
+			// The composed message — exactly the shape the report
+			// closures build — carries exactly one route.
+			composed := AppendActionErrorIfUnnamed(fmt.Errorf("%w (%s)", errors.New("the stop did not settle"), sentence), scmStopStatusHint)
+			routes := strings.Count(composed.Error(), "hfdesk service status")
+			if tc.causeHasAction {
+				routes++
+			}
+			if routes != 1 {
+				t.Errorf("the composed message %q carries %d routes, want exactly one", composed, routes)
 			}
 			// The success claim is only made for a verified restart: every
 			// other outcome reports what it proved instead.
@@ -384,7 +451,7 @@ func TestSCMRestartRollbackSentence(t *testing.T) {
 			// restore, unless the stop was never delivered: there was no
 			// control that could have put the instance down.
 			undelivered := tc.facts.attempt == scmRollbackUndeliveredInstance
-			if !tc.facts.stopped && !undelivered && strings.Contains(sentence, "the configuration of the previous registration was restored") {
+			if !tc.facts.stopped && !undelivered && strings.Contains(sentence, "the previous registration was restored, its command line verified") {
 				t.Errorf("the sentence %q claims the previous configuration was restored while the instance of the failed installation was not proven to be stopped", sentence)
 			}
 		})
