@@ -640,11 +640,8 @@ installation holds the loaded configuration against these proofs:
   the main process after the restart is a different process than the one
   snapshotted before it.
 
-One radius of that proof is acknowledged on Windows: the version claim opens
-the file at the executable's path, so an image that was renamed away while
-another file took its old path lies outside what it can see — Linux proves
-the identity of the executed inode itself and survives that — and an
-identity the platform cannot prove withholds the claim instead of guessing.
+The Linux path proves the identity of the executed inode itself and survives
+an image that was renamed away while another file took its old path.
 
 A failure of any proof restores the previous registration: the saved unit
 bytes are written back and read back, the supervisor reloads them, and the
@@ -1254,9 +1251,13 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   running instance does not change. That mismatch remains a failure when Windows
   cannot read the process image. If both the image and a health version are
   unavailable, the update makes no version claim; an unknown check is not treated
-  as a mismatching version, but this does not bypass readiness. A Basic-auth
-  challenge proves readiness without a version, and a local `dev` build asks
-  readiness without a release expectation.
+  as a mismatching version, but this does not bypass readiness. One limit of
+  that claim is acknowledged on Windows: the version claim opens the file at
+  the executable's path, so an image that was renamed away while another file
+  took its old path lies outside what it can see, and an identity the
+  platform cannot prove withholds the claim instead of guessing. A
+  Basic-auth challenge proves readiness without a version, and a local
+  `dev` build asks readiness without a release expectation.
   A first desktop install must pass the service-owned readiness check before it
   reports success. An instance that was stopped, failed, or absent is **not**
   started by the CLI: `hfdesk service install` never starts a service that was
