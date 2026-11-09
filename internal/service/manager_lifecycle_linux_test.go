@@ -26,9 +26,7 @@ func TestSystemdLifecycleOfAnAbsentUnit(t *testing.T) {
 		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 		m := &systemdManager{scope: ScopeUser}
 		path, err := m.unitPath()
-		if err != nil {
-			t.Fatalf("unitPath() = %v, want nil", err)
-		}
+		assertNoError(t, err, "unitPath() = %v, want nil", err)
 		if _, err := os.Stat(path); err == nil {
 			t.Fatalf("the unit file %q exists, the test needs a service that is not registered", path)
 		}
@@ -61,9 +59,7 @@ func TestSystemdLifecycleOfAnAbsentUnit(t *testing.T) {
 	t.Run("the machine-wide scope", func(t *testing.T) {
 		m := &systemdManager{scope: ScopeSystem}
 		path, err := m.unitPath()
-		if err != nil {
-			t.Fatalf("unitPath() = %v, want nil", err)
-		}
+		assertNoError(t, err, "unitPath() = %v, want nil", err)
 		if _, err := os.Stat(path); err == nil {
 			t.Skipf("the machine has a unit at %q: the test does not touch it", path)
 		}
@@ -164,9 +160,7 @@ func TestSystemdStopOfAnAbsentUnitReachesItsState(t *testing.T) {
 	m := &systemdManager{scope: ScopeSystem}
 
 	outcome, err := m.requireLifecycle(lifecycleStop, false, 501, "a stop")
-	if err != nil {
-		t.Fatalf("requireLifecycle() = %v, want nil for a stop of a service that is not registered", err)
-	}
+	assertNoError(t, err, "requireLifecycle() = %v, want nil for a stop of a service that is not registered", err)
 	if outcome != lifecycleAlreadyReached {
 		t.Errorf("requireLifecycle() = %d, want %d", outcome, lifecycleAlreadyReached)
 	}
@@ -194,9 +188,7 @@ func TestSystemdStopOfAnAbsentUnitReachesItsState(t *testing.T) {
 func TestSystemdAbsentUnitComesBeforeTheElevationRequirement(t *testing.T) {
 	m := &systemdManager{scope: ScopeSystem}
 	path, err := m.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath() = %v, want nil", err)
-	}
+	assertNoError(t, err, "unitPath() = %v, want nil", err)
 	if _, err := os.Stat(path); err == nil {
 		t.Skipf("the machine has a unit at %q: the test does not touch it", path)
 	}
@@ -241,9 +233,7 @@ func TestSystemdUserScopeLifecycleNeedsNoRoot(t *testing.T) {
 
 	m := &systemdManager{scope: ScopeUser}
 	path, err := m.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath() = %v, want nil", err)
-	}
+	assertNoError(t, err, "unitPath() = %v, want nil", err)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("create the unit directory: %v", err)
 	}

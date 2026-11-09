@@ -56,9 +56,7 @@ func TestParseRunArgsParsesTheFullVector(t *testing.T) {
 		"--hub-dir", hubDir,
 		"--local-dir", localDir,
 	})
-	if err != nil {
-		t.Fatalf("ParseRunArgs() = %v, want nil", err)
-	}
+	assertNoError(t, err, "ParseRunArgs() = %v, want nil", err)
 
 	want := RunOptions{
 		Paths: runtimepaths.Paths{
@@ -101,13 +99,9 @@ func TestParseRunArgsAcceptsTheEqualsForm(t *testing.T) {
 	}
 
 	fromSpace, err := ParseRunArgs(spaceForm)
-	if err != nil {
-		t.Fatalf("ParseRunArgs(%v) = %v, want nil", spaceForm, err)
-	}
+	assertNoError(t, err, "ParseRunArgs(%v) = %v, want nil", spaceForm, err)
 	fromEquals, err := ParseRunArgs(equalsForm)
-	if err != nil {
-		t.Fatalf("ParseRunArgs(%v) = %v, want nil", equalsForm, err)
-	}
+	assertNoError(t, err, "ParseRunArgs(%v) = %v, want nil", equalsForm, err)
 	if fromSpace != fromEquals {
 		t.Errorf("ParseRunArgs() = %+v for the equals form, want %+v", fromEquals, fromSpace)
 	}
@@ -126,9 +120,7 @@ func TestParseRunArgsUsesTheLastSingleDashAndEqualsValue(t *testing.T) {
 		"-listen=127.0.0.1:9091",
 		"--listen", "127.0.0.1:9092",
 	})
-	if err != nil {
-		t.Fatalf("ParseRunArgs() = %v, want nil", err)
-	}
+	assertNoError(t, err, "ParseRunArgs() = %v, want nil", err)
 	if got.Paths.ConfigFile != configFile || got.Paths.StateDir != stateDir || got.Paths.LogDir != logDir {
 		t.Errorf("parsed paths = %+v, want the last accepted values", got.Paths)
 	}
@@ -150,13 +142,9 @@ func TestParseRunArgsAcceptsTheFlagsWithoutTheCommandTokens(t *testing.T) {
 	}
 
 	got, err := ParseRunArgs(flags)
-	if err != nil {
-		t.Fatalf("ParseRunArgs(%v) = %v, want nil", flags, err)
-	}
+	assertNoError(t, err, "ParseRunArgs(%v) = %v, want nil", flags, err)
 	withCommand, err := ParseRunArgs(append([]string{"service", "run"}, flags...))
-	if err != nil {
-		t.Fatalf("ParseRunArgs() = %v, want nil", err)
-	}
+	assertNoError(t, err, "ParseRunArgs() = %v, want nil", err)
 	if got != withCommand {
 		t.Errorf("ParseRunArgs() = %+v, want %+v for the vector with the command tokens", got, withCommand)
 	}
@@ -252,9 +240,7 @@ func TestParseRunArgsIgnoresTheOrderOfTheFlags(t *testing.T) {
 		"--state-dir", stateDir,
 		"--config", configFile,
 	})
-	if err != nil {
-		t.Fatalf("ParseRunArgs() = %v, want nil", err)
-	}
+	assertNoError(t, err, "ParseRunArgs() = %v, want nil", err)
 	want := RunOptions{
 		Paths: runtimepaths.Paths{
 			ConfigFile: configFile,
@@ -272,9 +258,7 @@ func TestParseRunArgsUsesTheDefaultListen(t *testing.T) {
 	args := dropFlag(runArgsVector(t), "--listen")
 
 	got, err := ParseRunArgs(args)
-	if err != nil {
-		t.Fatalf("ParseRunArgs(%v) = %v, want nil", args, err)
-	}
+	assertNoError(t, err, "ParseRunArgs(%v) = %v, want nil", args, err)
 	if got.Listen != DefaultListen {
 		t.Errorf("Listen = %q, want the default %q", got.Listen, DefaultListen)
 	}
@@ -322,9 +306,7 @@ func TestParseRunArgsRoundTripsTheRunArgsVector(t *testing.T) {
 	}
 
 	got, err := ParseRunArgs(RunArgs(opts))
-	if err != nil {
-		t.Fatalf("ParseRunArgs(RunArgs(opts)) = %v, want nil", err)
-	}
+	assertNoError(t, err, "ParseRunArgs(RunArgs(opts)) = %v, want nil", err)
 	want := RunOptions{
 		Paths:    opts.Paths,
 		Listen:   opts.Listen,

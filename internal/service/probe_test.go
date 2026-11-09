@@ -58,13 +58,9 @@ func TestProbeServiceAddressMapsTheWildcardBindOntoTheLoopback(t *testing.T) {
 func TestProbeServiceReadySerializesAnIPv6ZoneWithoutDialingTheNetwork(t *testing.T) {
 	const listen = "[fe80::1%eth0]:8080"
 	probeURL, err := serviceProbeURL(listen)
-	if err != nil {
-		t.Fatalf("serviceProbeURL(%q) = %v", listen, err)
-	}
+	assertNoError(t, err, "serviceProbeURL(%q) = %v", listen, err)
 	parsed, err := url.Parse(probeURL.String())
-	if err != nil {
-		t.Fatalf("parse serialized probe URL %q: %v", probeURL, err)
-	}
+	assertNoError(t, err, "parse serialized probe URL %q: %v", probeURL, err)
 	if !strings.Contains(probeURL.String(), "%25eth0]:8080") {
 		t.Fatalf("probe URL = %q, want the RFC 6874 encoded zone", probeURL)
 	}
@@ -150,9 +146,8 @@ func TestProbeServiceReadyAcceptsTheHealthDocumentOfTheInstance(t *testing.T) {
 	}))
 	defer instance.Close()
 
-	if err := probeServiceReady(instance.Listener.Addr().String()); err != nil {
-		t.Fatalf("probeServiceReady(%q) = %v, want nil for the health answer of the instance", instance.Listener.Addr(), err)
-	}
+	err := probeServiceReady(instance.Listener.Addr().String())
+	assertNoError(t, err, "probeServiceReady(%q) = %v, want nil for the health answer of the instance", instance.Listener.Addr(), err)
 	if got := <-path; got != server.HealthPath {
 		t.Errorf("the probe asked %q, want the health endpoint %q of the instance", got, server.HealthPath)
 	}
@@ -331,9 +326,7 @@ func TestProbeServiceReadyDoesNotUseTheProxyForANonLoopbackAddress(t *testing.T)
 	}))
 	defer proxy.Close()
 	proxyURL, err := url.Parse(proxy.URL)
-	if err != nil {
-		t.Fatalf("parse the proxy URL: %v", err)
-	}
+	assertNoError(t, err, "parse the proxy URL: %v", err)
 
 	// Every address outside loopback goes through the proxy of the environment.
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -355,9 +348,7 @@ func TestProbeServiceReadyDoesNotUseTheProxyForANonLoopbackAddress(t *testing.T)
 	})
 
 	listener, err := net.Listen("tcp", "0.0.0.0:0")
-	if err != nil {
-		t.Fatalf("listen on every interface: %v", err)
-	}
+	assertNoError(t, err, "listen on every interface: %v", err)
 	instance := httptest.NewUnstartedServer(handler)
 	_ = instance.Listener.Close()
 	instance.Listener = listener
@@ -445,9 +436,7 @@ func TestProbeServiceReadyVerifiesTheExpectedVersion(t *testing.T) {
 // it: the probe has to report the error instead of a ready instance.
 func TestProbeServiceReadyReportsAConnectionThatIsRefused(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Listen() = %v, want nil", err)
 	addr := listener.Addr().String()
 	if err := listener.Close(); err != nil {
 		t.Fatalf("Close() = %v, want nil", err)

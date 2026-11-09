@@ -20,18 +20,14 @@ import (
 func readyTestProcess(t *testing.T, launch elevatedLaunch) *elevatedProcess {
 	t.Helper()
 	ready, err := openNamedEvent(launch.ReadyEvent, windows.EVENT_MODIFY_STATE)
-	if err != nil {
-		t.Fatalf("open the parent-created ready event: %v", err)
-	}
+	assertNoError(t, err, "open the parent-created ready event: %v", err)
 	if err := windows.SetEvent(ready); err != nil {
 		_ = windows.CloseHandle(ready)
 		t.Fatalf("signal the helper-ready event: %v", err)
 	}
 	_ = windows.CloseHandle(ready)
 	handle, err := windows.CreateEvent(nil, 1, 0, nil)
-	if err != nil {
-		t.Fatalf("create the test helper-process wait handle: %v", err)
-	}
+	assertNoError(t, err, "create the test helper-process wait handle: %v", err)
 	return &elevatedProcess{handle: handle, pid: 5151}
 }
 
@@ -56,9 +52,7 @@ func testHelperHandover(t *testing.T) *helperHandover {
 func testEvent(t *testing.T) windows.Handle {
 	t.Helper()
 	handle, err := windows.CreateEvent(nil, 1, 0, nil)
-	if err != nil {
-		t.Fatalf("create test event: %v", err)
-	}
+	assertNoError(t, err, "create test event: %v", err)
 	t.Cleanup(func() { _ = windows.CloseHandle(handle) })
 	return handle
 }
@@ -66,9 +60,7 @@ func testEvent(t *testing.T) windows.Handle {
 func duplicateTestHandle(t *testing.T, handle windows.Handle) windows.Handle {
 	t.Helper()
 	process, err := windows.GetCurrentProcess()
-	if err != nil {
-		t.Fatalf("get the current process handle: %v", err)
-	}
+	assertNoError(t, err, "get the current process handle: %v", err)
 	var duplicate windows.Handle
 	if err := windows.DuplicateHandle(process, handle, process, &duplicate, 0, false, windows.DUPLICATE_SAME_ACCESS); err != nil {
 		t.Fatalf("duplicate test handle: %v", err)
@@ -82,9 +74,8 @@ func securityEntries(t *testing.T, acl *windows.ACL) map[string]windows.ACCESS_M
 	entries := make(map[string]windows.ACCESS_MASK, acl.AceCount)
 	for i := uint32(0); i < uint32(acl.AceCount); i++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
-		if err := windows.GetAce(acl, i, &ace); err != nil {
-			t.Fatalf("read DACL entry %d: %v", i, err)
-		}
+		err := windows.GetAce(acl, i, &ace)
+		assertNoError(t, err, "read DACL entry %d: %v", i, err)
 		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
 			t.Fatalf("DACL entry %d has ACE type %d, want an allow ACE", i, ace.Header.AceType)
 		}
@@ -96,34 +87,24 @@ func securityEntries(t *testing.T, acl *windows.ACL) map[string]windows.ACCESS_M
 
 func TestHandoverEventsAreUniqueNonsignaledAndRestricted(t *testing.T) {
 	events, err := newHandoverEvents()
-	if err != nil {
-		t.Fatalf("create the handover event pair: %v", err)
-	}
+	assertNoError(t, err, "create the handover event pair: %v", err)
 	defer events.close()
 	if events.readyName == events.successName || !strings.HasPrefix(events.readyName, handoverEventPrefix) {
 		t.Fatalf("the event names are not a unique pair: %q, %q", events.readyName, events.successName)
 	}
 	sid, err := currentUserSID()
-	if err != nil {
-		t.Fatalf("read the initiating user's SID: %v", err)
-	}
+	assertNoError(t, err, "read the initiating user's SID: %v", err)
 	admin, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
-	if err != nil {
-		t.Fatalf("build the Administrators SID: %v", err)
-	}
+	assertNoError(t, err, "build the Administrators SID: %v", err)
 	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
-	if err != nil {
-		t.Fatalf("build the SYSTEM SID: %v", err)
-	}
+	assertNoError(t, err, "build the SYSTEM SID: %v", err)
 	for i, handle := range []windows.Handle{events.ready, events.success} {
 		result, err := windows.WaitForSingleObject(handle, 0)
 		if err != nil || result != uint32(windows.WAIT_TIMEOUT) {
 			t.Fatalf("new event state = %#x, err=%v; want nonsignaled", result, err)
 		}
 		descriptor, err := windows.GetSecurityInfo(handle, windows.SE_KERNEL_OBJECT, windows.DACL_SECURITY_INFORMATION)
-		if err != nil {
-			t.Fatalf("read the event security descriptor: %v", err)
-		}
+		assertNoError(t, err, "read the event security descriptor: %v", err)
 		acl, _, err := descriptor.DACL()
 		if err != nil || acl == nil || acl.AceCount != 3 {
 			t.Fatalf("event DACL = %v, err=%v; want exactly three explicit principals", acl, err)
@@ -147,9 +128,7 @@ func TestHandoverEventsAreUniqueNonsignaledAndRestricted(t *testing.T) {
 		}
 	}
 	attrs, descriptor, err := restrictedObjectSecurityFor(windows.SYNCHRONIZE, windows.EVENT_MODIFY_STATE, handoverEventAccess)
-	if err != nil {
-		t.Fatalf("build the event security descriptor for a duplicate-name probe: %v", err)
-	}
+	assertNoError(t, err, "build the event security descriptor for a duplicate-name probe: %v", err)
 	if _, err := createHandoverEvent(events.readyName, attrs); err == nil {
 		t.Error("a reused named event was accepted")
 	}
@@ -198,9 +177,8 @@ func TestWaitForHandoverAuthorizationRequiresBothSignals(t *testing.T) {
 	if err := windows.SetEvent(parentAndSuccess); err != nil {
 		t.Fatalf("signal parent exit: %v", err)
 	}
-	if err := waitForHandoverAuthorization(parentAndSuccess, bothSignals, time.Second, time.Second); err != nil {
-		t.Fatalf("simultaneous success and parent exit were rejected: %v", err)
-	}
+	err := waitForHandoverAuthorization(parentAndSuccess, bothSignals, time.Second, time.Second)
+	assertNoError(t, err, "simultaneous success and parent exit were rejected: %v", err)
 }
 
 func TestOnlySuccessfulCompletionSignalsTheHelper(t *testing.T) {
@@ -252,9 +230,7 @@ func TestShutdownCoordinatorDoesNotLetQuitRaceCommit(t *testing.T) {
 
 func TestInstanceMutexSurvivesParentHandleUntilHelperReleases(t *testing.T) {
 	parent, err := acquireInstanceLock()
-	if err != nil {
-		t.Fatalf("acquire the desktop singleton: %v", err)
-	}
+	assertNoError(t, err, "acquire the desktop singleton: %v", err)
 	if parent.Exists() {
 		parent.Release()
 		t.Skip("another desktop test or app owns the per-session singleton")
@@ -276,17 +252,11 @@ func TestInstanceMutexSurvivesParentHandleUntilHelperReleases(t *testing.T) {
 	} else {
 		entries := securityEntries(t, acl)
 		user, err := currentUserSID()
-		if err != nil {
-			t.Fatalf("read the initiating user's SID: %v", err)
-		}
+		assertNoError(t, err, "read the initiating user's SID: %v", err)
 		admin, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
-		if err != nil {
-			t.Fatalf("build the Administrators SID: %v", err)
-		}
+		assertNoError(t, err, "build the Administrators SID: %v", err)
 		system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
-		if err != nil {
-			t.Fatalf("build the SYSTEM SID: %v", err)
-		}
+		assertNoError(t, err, "build the SYSTEM SID: %v", err)
 		want := make(map[string]windows.ACCESS_MASK, 3)
 		want[user] |= windows.ACCESS_MASK(windows.MUTEX_ALL_ACCESS)
 		want[admin.String()] |= windows.ACCESS_MASK(windows.READ_CONTROL)
@@ -308,9 +278,7 @@ func TestInstanceMutexSurvivesParentHandleUntilHelperReleases(t *testing.T) {
 	probe.Release()
 	_ = windows.CloseHandle(helper)
 	fresh, err := acquireInstanceLock()
-	if err != nil {
-		t.Fatalf("acquire singleton after helper release: %v", err)
-	}
+	assertNoError(t, err, "acquire singleton after helper release: %v", err)
 	if fresh.Exists() {
 		t.Error("the singleton remained after its last helper handle closed")
 	}
@@ -319,9 +287,7 @@ func TestInstanceMutexSurvivesParentHandleUntilHelperReleases(t *testing.T) {
 
 func TestProcessWaitUsesCurrentWindowsProcess(t *testing.T) {
 	handle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(os.Getpid()))
-	if err != nil {
-		t.Fatalf("open the current process for synchronization: %v", err)
-	}
+	assertNoError(t, err, "open the current process for synchronization: %v", err)
 	defer windows.CloseHandle(handle)
 	if result, err := windows.WaitForSingleObject(handle, 0); err != nil || result != uint32(windows.WAIT_TIMEOUT) {
 		t.Fatalf("the current process is not reported live: result=%#x err=%v", result, err)
@@ -377,9 +343,7 @@ func TestHandoverNoticeDoesNotHoldCompletionAuthorization(t *testing.T) {
 	close(completionGate)
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("the authorized handover failed: %v", err)
-		}
+		assertNoError(t, err, "the authorized handover failed: %v", err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("completion authorization was held by the open notice")
 	}
@@ -418,9 +382,8 @@ func TestHandoverExitWindowSurvivesAFullCompletionWait(t *testing.T) {
 	}()
 
 	start := time.Now()
-	if err := waitForHandoverAuthorization(parent, success, budget, budget); err != nil {
-		t.Fatalf("a late completion starved the exit window: %v", err)
-	}
+	err := waitForHandoverAuthorization(parent, success, budget, budget)
+	assertNoError(t, err, "a late completion starved the exit window: %v", err)
 	if elapsed := time.Since(start); elapsed < budget {
 		t.Fatalf("authorization returned after %s, before the parent exit at ~1.1s", elapsed)
 	}

@@ -37,9 +37,7 @@ func TestServiceURLReturnsTheAddressABrowserCanOpen(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			url, err := serviceURL(test.addr)
-			if err != nil {
-				t.Fatalf("serviceURL(%q) failed: %v", test.addr, err)
-			}
+			assertNoError(t, err, "serviceURL(%q) failed: %v", test.addr, err)
 			if url != test.want {
 				t.Errorf("serviceURL(%q) = %q, want %q", test.addr, url, test.want)
 			}
@@ -108,9 +106,7 @@ func TestFindConsoleExecutableFindsThePlainNameOfALocalBuild(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "hfdesk_windows_amd64_1.3.0.exe"))
 
 	found, err := findConsoleExecutable(dir, filepath.Join(dir, "hfdesk-desktop.exe"))
-	if err != nil {
-		t.Fatalf("find the console program: %v", err)
-	}
+	assertNoError(t, err, "find the console program: %v", err)
 	if found != preferred {
 		t.Errorf("the console program is %q, want the plain name %q", found, preferred)
 	}
@@ -129,9 +125,7 @@ func TestFindConsoleExecutableAcceptsTheSingleProgramOfALocalBuild(t *testing.T)
 	writeFile(t, want)
 
 	found, err := findConsoleExecutable(dir, filepath.Join(dir, "hfdesk-desktop.exe"))
-	if err != nil {
-		t.Fatalf("find the console program: %v", err)
-	}
+	assertNoError(t, err, "find the console program: %v", err)
 	if found != want {
 		t.Errorf("the console program is %q, want %q", found, want)
 	}
@@ -189,9 +183,7 @@ func TestFindConsoleExecutableFindsThePairOfAVersionedProgram(t *testing.T) {
 	}
 
 	found, err := findConsoleExecutable(dir, filepath.Join(dir, "hfdesk-desktop_windows_amd64_1.4.0.exe"))
-	if err != nil {
-		t.Fatalf("find the console program: %v", err)
-	}
+	assertNoError(t, err, "find the console program: %v", err)
 	if found != want {
 		t.Errorf("the console program is %q, want the pair %q", found, want)
 	}
@@ -230,9 +222,7 @@ func TestFindConsoleExecutablePrefersThePairedProgram(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			found, err := findConsoleExecutable(dir, filepath.Join(dir, test.desktop))
-			if err != nil {
-				t.Fatalf("find the console program of %q: %v", test.desktop, err)
-			}
+			assertNoError(t, err, "find the console program of %q: %v", test.desktop, err)
 			if want := filepath.Join(dir, test.want); found != want {
 				t.Errorf("the console program is %q, want the pair %q", found, want)
 			}
@@ -342,7 +332,35 @@ func TestFindConsoleExecutableRefusesAFolderWithoutTheProgram(t *testing.T) {
 // worth reporting.
 func writeFile(t *testing.T, path string) {
 	t.Helper()
-	if err := os.WriteFile(path, []byte("hfdesk"), 0o600); err != nil {
-		t.Fatalf("create %s: %v", path, err)
+	err := os.WriteFile(path, []byte("hfdesk"), 0o600)
+	assertNoError(t, err, "create %s: %v", path, err)
+}
+
+// assertNoError fails the test when the call it wraps reported a failure,
+// with the diagnostic the inline check printed.
+func assertNoError(t *testing.T, err error, format string, a ...any) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	if format == "" {
+		t.Fatal(err)
+		return
+	}
+	if len(a) == 0 {
+		t.Fatal(format)
+		return
+	}
+	t.Fatalf(format, a...)
+}
+
+// assertNames proves that a message names every fragment of the standard
+// the test pins, one diagnostic per missing fragment.
+func assertNames(t *testing.T, message, context string, wants []string) {
+	t.Helper()
+	for _, want := range wants {
+		if !strings.Contains(message, want) {
+			t.Errorf("%s = %q, want a message that mentions %q", context, message, want)
+		}
 	}
 }

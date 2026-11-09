@@ -31,9 +31,7 @@ func TestSystemdRenderUnitUserScope(t *testing.T) {
 	opts := systemdTestOptions(t, ScopeUser)
 
 	unit, err := renderUnit(opts, nil)
-	if err != nil {
-		t.Fatalf("renderUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderUnit() = %v, want nil", err)
 
 	for _, want := range []string{
 		"Description=HFDesk",
@@ -74,9 +72,7 @@ func TestSystemdRenderUnitUserScope(t *testing.T) {
 	}
 
 	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatalf("UserHomeDir() = %v, want nil", err)
-	}
+	assertNoError(t, err, "UserHomeDir() = %v, want nil", err)
 	if got := parsed.Environment["HOME"]; got != home {
 		t.Errorf("Environment HOME = %q, want the home of the user %q", got, home)
 	}
@@ -103,9 +99,7 @@ func TestSystemdRenderUnitSystemScope(t *testing.T) {
 	opts.ServiceUser = account.Username
 
 	unit, err := renderUnit(opts, account)
-	if err != nil {
-		t.Fatalf("renderUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderUnit() = %v, want nil", err)
 
 	if !strings.Contains(unit, "WantedBy=multi-user.target") {
 		t.Errorf("the unit does not contain %q:\n%s", "WantedBy=multi-user.target", unit)
@@ -132,9 +126,7 @@ func TestSystemdRenderUnitSystemScope(t *testing.T) {
 	// The group of the unit is the primary group of the account, never the
 	// name of the account.
 	group, err := user.LookupGroupId(account.Gid)
-	if err != nil {
-		t.Fatalf("LookupGroupId(%q) = %v, want nil", account.Gid, err)
-	}
+	assertNoError(t, err, "LookupGroupId(%q) = %v, want nil", account.Gid, err)
 	if want := "Group=" + systemdQuote(group.Name) + "\n"; !strings.Contains(unit, want) {
 		t.Errorf("the unit does not run in the primary group %q of the service account %q:\n%s", group.Name, account.Username, unit)
 	}
@@ -157,9 +149,7 @@ func TestSystemdRenderUnitCarriesNoCredential(t *testing.T) {
 	setCredentialFields(&opts, sentinel)
 
 	unit, err := renderUnit(opts, nil)
-	if err != nil {
-		t.Fatalf("renderUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderUnit() = %v, want nil", err)
 	if strings.Contains(unit, sentinel) {
 		t.Errorf("the unit leaks the sentinel %q:\n%s", sentinel, unit)
 	}
@@ -189,9 +179,7 @@ func TestSystemdRenderUnitQuotesPathsWithSpaces(t *testing.T) {
 	opts.Paths.StateDir = "/var/lib/HF Desk"
 
 	unit, err := renderUnit(opts, nil)
-	if err != nil {
-		t.Fatalf("renderUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderUnit() = %v, want nil", err)
 	if !strings.Contains(unit, `ExecStart="/opt/HF Desk/bin/hfdesk"`) {
 		t.Errorf("the executable is not quoted:\n%s", unit)
 	}
@@ -230,9 +218,7 @@ func TestSystemdRenderUnitEscapesTheDollarSign(t *testing.T) {
 	opts.LocalDir = "/var/lib/models/hf$desk"
 
 	unit, err := renderUnit(opts, nil)
-	if err != nil {
-		t.Fatalf("renderUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderUnit() = %v, want nil", err)
 
 	command := unitDirective(unit, "ExecStart")
 	if command == "" {
@@ -273,9 +259,7 @@ func TestSystemdUnitPaths(t *testing.T) {
 		t.Setenv("XDG_CONFIG_HOME", "/tmp/hfdesk-xdg")
 		m := &systemdManager{scope: ScopeUser}
 		got, err := m.unitPath()
-		if err != nil {
-			t.Fatalf("unitPath() = %v, want nil", err)
-		}
+		assertNoError(t, err, "unitPath() = %v, want nil", err)
 		want := "/tmp/hfdesk-xdg/systemd/user/hfdesk.service"
 		if got != want {
 			t.Errorf("unitPath() = %q, want %q", got, want)
@@ -287,9 +271,7 @@ func TestSystemdUnitPaths(t *testing.T) {
 		t.Setenv("HOME", "/home/hfdesk-user")
 		m := &systemdManager{scope: ScopeUser}
 		got, err := m.unitPath()
-		if err != nil {
-			t.Fatalf("unitPath() = %v, want nil", err)
-		}
+		assertNoError(t, err, "unitPath() = %v, want nil", err)
 		want := "/home/hfdesk-user/.config/systemd/user/hfdesk.service"
 		if got != want {
 			t.Errorf("unitPath() = %q, want %q", got, want)
@@ -299,9 +281,7 @@ func TestSystemdUnitPaths(t *testing.T) {
 	t.Run("system scope", func(t *testing.T) {
 		m := &systemdManager{scope: ScopeSystem}
 		got, err := m.unitPath()
-		if err != nil {
-			t.Fatalf("unitPath() = %v, want nil", err)
-		}
+		assertNoError(t, err, "unitPath() = %v, want nil", err)
 		want := "/etc/systemd/system/hfdesk.service"
 		if got != want {
 			t.Errorf("unitPath() = %q, want %q", got, want)
@@ -313,9 +293,7 @@ func TestSystemdParseUnitRecoversTheRegistration(t *testing.T) {
 	opts := systemdTestOptions(t, ScopeUser)
 
 	unit, err := renderUnit(opts, nil)
-	if err != nil {
-		t.Fatalf("renderUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderUnit() = %v, want nil", err)
 	parsed := parseUnit(unit)
 
 	if parsed.Program != opts.Executable {
@@ -392,9 +370,7 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 		t.Skipf("skipping: systemd-analyze is not available in this environment: %v", err)
 	}
 	executable, err := os.Executable()
-	if err != nil {
-		t.Fatalf("Executable() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Executable() = %v, want nil", err)
 
 	root := t.TempDir()
 	opts := systemdTestOptions(t, ScopeUser)
@@ -413,9 +389,7 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 	}
 
 	unit, err := renderUnit(opts, nil)
-	if err != nil {
-		t.Fatalf("renderUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderUnit() = %v, want nil", err)
 	path := filepath.Join(root, unitName)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -463,9 +437,7 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 	trailingOpts := opts
 	trailingOpts.Paths.StateDir = trailingStateDir
 	trailingUnit, err := renderUnit(trailingOpts, nil)
-	if err != nil {
-		t.Fatalf("renderUnit() for terminal backslash = %v", err)
-	}
+	assertNoError(t, err, "renderUnit() for terminal backslash = %v", err)
 	if got := verify("first install with terminal backslash", trailingUnit); got != trailingStateDir {
 		t.Errorf("native terminal-backslash WorkingDirectory = %q, want %q", got, trailingStateDir)
 	}
@@ -476,9 +448,7 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 	pairedOpts := opts
 	pairedOpts.Paths.StateDir = pairedBackslashes
 	pairedUnit, err := renderUnit(pairedOpts, nil)
-	if err != nil {
-		t.Fatalf("renderUnit() for paired terminal backslashes = %v", err)
-	}
+	assertNoError(t, err, "renderUnit() for paired terminal backslashes = %v", err)
 	if got := verify("first install with paired terminal backslashes", pairedUnit); got != pairedBackslashes {
 		t.Errorf("native paired-backslash WorkingDirectory = %q, want %q", got, pairedBackslashes)
 	}
@@ -519,9 +489,7 @@ func TestSystemdInstallInsertsExplicitOptionBeforeTerminator(t *testing.T) {
 
 	manager := &systemdManager{scope: ScopeUser}
 	path, err := manager.unitPath()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -567,9 +535,8 @@ func TestSystemdExecutableUpdatePreservesInheritedStatePathAndIndependentWorking
 	logs := filepath.Join(root, "logs")
 	workingDirectory := filepath.Join(root, "native-working-directory")
 	for _, dir := range []string{state, filepath.Dir(config), logs, workingDirectory} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		err := os.MkdirAll(dir, 0o700)
+		assertNoError(t, err, "")
 	}
 	dataPath := filepath.Join(state, "jobs_state.json")
 	data := []byte(`{"jobs":[{"id":"preserved-state"}]}`)
@@ -581,9 +548,7 @@ func TestSystemdExecutableUpdatePreservesInheritedStatePathAndIndependentWorking
 
 	manager := &systemdManager{scope: ScopeUser}
 	unitPath, err := manager.unitPath()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -633,9 +598,7 @@ func TestSystemdAnalyzeVerifySystemScope(t *testing.T) {
 		t.Skipf("skipping: systemd-analyze is not available in this environment: %v", err)
 	}
 	executable, err := os.Executable()
-	if err != nil {
-		t.Fatalf("Executable() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Executable() = %v, want nil", err)
 	account, err := user.Current()
 	if err != nil {
 		t.Skipf("skipping: the account of the test process is unknown: %v", err)
@@ -661,9 +624,7 @@ func TestSystemdAnalyzeVerifySystemScope(t *testing.T) {
 	opts.Paths.StateDir = root
 
 	unit, err := renderUnit(opts, account)
-	if err != nil {
-		t.Fatalf("renderUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderUnit() = %v, want nil", err)
 	// The unit that is verified is the machine-wide one: it names the
 	// account and it is enabled for the boot of the machine.
 	if want := "User=" + systemdQuote(account.Username) + "\n"; !strings.Contains(unit, want) {
@@ -707,9 +668,7 @@ func TestSystemdRenderUnitNamesTheServiceAccount(t *testing.T) {
 		// The account is not on the machine, so no group of it can be
 		// resolved: the unit names the account and no group at all.
 		unit, err := renderUnit(opts, nil)
-		if err != nil {
-			t.Fatalf("renderUnit() = %v, want nil", err)
-		}
+		assertNoError(t, err, "renderUnit() = %v, want nil", err)
 		if got := unitDirective(unit, "User"); got != "hfdesk-svc" {
 			t.Errorf("the account of the unit = %q, want %q", got, "hfdesk-svc")
 		}
@@ -731,9 +690,7 @@ func TestSystemdRenderUnitNamesTheServiceAccount(t *testing.T) {
 		}
 
 		unit, err := renderUnit(opts, account)
-		if err != nil {
-			t.Fatalf("renderUnit() = %v, want nil", err)
-		}
+		assertNoError(t, err, "renderUnit() = %v, want nil", err)
 		name := DefaultServiceUser()
 		if got := unitDirective(unit, "User"); got != name {
 			t.Errorf("the account of the unit = %q, want the default service account %q", got, name)
@@ -741,9 +698,7 @@ func TestSystemdRenderUnitNamesTheServiceAccount(t *testing.T) {
 		wantGroup := ""
 		if account != nil {
 			group, err := user.LookupGroupId(account.Gid)
-			if err != nil {
-				t.Fatalf("LookupGroupId(%q) = %v, want nil", account.Gid, err)
-			}
+			assertNoError(t, err, "LookupGroupId(%q) = %v, want nil", account.Gid, err)
 			wantGroup = group.Name
 		}
 		if got := unitDirective(unit, "Group"); got != wantGroup {
@@ -756,9 +711,7 @@ func TestSystemdRenderUnitNamesTheServiceAccount(t *testing.T) {
 		opts.ServiceUser = "hfdesk-svc"
 
 		unit, err := renderUnit(opts, nil)
-		if err != nil {
-			t.Fatalf("renderUnit() = %v, want nil", err)
-		}
+		assertNoError(t, err, "renderUnit() = %v, want nil", err)
 		for _, directive := range unitDirectives(unit) {
 			if strings.HasPrefix(directive, "User=") || strings.HasPrefix(directive, "Group=") {
 				t.Errorf("a user scope unit names an account: %q", directive)
@@ -787,17 +740,13 @@ func TestSystemdRenderUnitNamesThePrimaryGroupOfTheAccount(t *testing.T) {
 		account = systemdCurrentAccount(t)
 	}
 	group, err := user.LookupGroupId(account.Gid)
-	if err != nil {
-		t.Fatalf("LookupGroupId(%q) = %v, want nil", account.Gid, err)
-	}
+	assertNoError(t, err, "LookupGroupId(%q) = %v, want nil", account.Gid, err)
 
 	opts := systemdTestOptions(t, ScopeSystem)
 	opts.ServiceUser = account.Username
 
 	unit, err := renderUnit(opts, account)
-	if err != nil {
-		t.Fatalf("renderUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderUnit() = %v, want nil", err)
 	t.Logf("the machine-wide unit of the account %q:\n%s", account.Username, unit)
 
 	if got := unitDirective(unit, "User"); got != account.Username {
@@ -827,9 +776,7 @@ func TestSystemdRenderUnitOmitsAnUnresolvableGroup(t *testing.T) {
 	opts.ServiceUser = account.Username
 
 	unit, err := renderUnit(opts, account)
-	if err != nil {
-		t.Fatalf("renderUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderUnit() = %v, want nil", err)
 	t.Logf("the machine-wide unit of the account %q:\n%s", account.Username, unit)
 
 	if got := unitDirective(unit, "User"); got != account.Username {
@@ -854,18 +801,14 @@ func TestSystemdStopTimeoutCoversTheShutdownOfTheServer(t *testing.T) {
 
 	opts := systemdTestOptions(t, ScopeUser)
 	unit, err := renderUnit(opts, nil)
-	if err != nil {
-		t.Fatalf("renderUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderUnit() = %v, want nil", err)
 
 	value := unitDirective(unit, "TimeoutStopSec")
 	if value == "" {
 		t.Fatalf("the unit has no TimeoutStopSec directive:\n%s", unit)
 	}
 	timeout, err := time.ParseDuration(value)
-	if err != nil {
-		t.Fatalf("the TimeoutStopSec of the unit = %q, want a duration: %v", value, err)
-	}
+	assertNoError(t, err, "the TimeoutStopSec of the unit = %q, want a duration: %v", value, err)
 	if timeout < server.GracefulShutdownTimeout {
 		t.Errorf("the TimeoutStopSec of the unit = %s, want at least %s: the deadline of the supervisor has to cover the graceful shutdown of the server", timeout, server.GracefulShutdownTimeout)
 	}
@@ -1014,9 +957,7 @@ func TestSystemdStoredUnloadedUpdateKeepsHexEscapedConfigPath(t *testing.T) {
 	manager := &systemdManager{scope: ScopeUser}
 	setSystemdTestPropertyReader(t, manager)
 	path, err := manager.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath() = %v", err)
-	}
+	assertNoError(t, err, "unitPath() = %v", err)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1060,16 +1001,12 @@ func TestSystemdUpdatePreservesEscapedDollarArguments(t *testing.T) {
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 
 	effective, err := m.Install(context.Background(), requested)
-	if err != nil {
-		t.Fatalf("Install() = %v, want the escaped-dollar update", err)
-	}
+	assertNoError(t, err, "Install() = %v, want the escaped-dollar update", err)
 	if effective.Executable != newExecutable || effective.Paths.ConfigFile != requested.Paths.ConfigFile {
 		t.Errorf("effective options = %+v, want the literal dollar paths", effective)
 	}
 	content, err := os.ReadFile(unitPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if !strings.Contains(string(content), "new$$desk") {
 		t.Errorf("the updated unit did not escape literal dollar signs:\n%s", content)
 	}
@@ -1130,9 +1067,8 @@ func TestSystemdInstallRefusesUnrewritableExecStartBeforeChangingTheUnit(t *test
 			wrapped := systemdWrapExecStart(t, previousUnit, oldExecutable,
 				`/bin/sh -c "exec hfdesk service run --listen 127.0.0.1:19090"`)
 			for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
-				if err := os.WriteFile(name, []byte(wrapped), 0o644); err != nil {
-					t.Fatalf("write the wrapped unit %q: %v", name, err)
-				}
+				err := os.WriteFile(name, []byte(wrapped), 0o644)
+				assertNoError(t, err, "write the wrapped unit %q: %v", name, err)
 			}
 			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", tc.active)
 			t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
@@ -1192,9 +1128,8 @@ func TestSystemdInstallRefusesAnUnverifiableRunningExecStartBeforeChangingTheUni
 			value := oldExecutable + tc.tail
 			edited := systemdWrapExecStart(t, previousUnit, oldExecutable, value)
 			for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
-				if err := os.WriteFile(name, []byte(edited), 0o644); err != nil {
-					t.Fatalf("write the hand-edited unit %q: %v", name, err)
-				}
+				err := os.WriteFile(name, []byte(edited), 0o644)
+				assertNoError(t, err, "write the hand-edited unit %q: %v", name, err)
 			}
 			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
 			t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
@@ -1251,9 +1186,8 @@ func TestSystemdInstallRefusesAnUnverifiableCommandOfAStoppedInstance(t *testing
 			m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
 			edited := systemdWrapExecStart(t, previousUnit, oldExecutable, oldExecutable+tc.tail)
 			for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
-				if err := os.WriteFile(name, []byte(edited), 0o644); err != nil {
-					t.Fatalf("write the hand-edited unit %q: %v", name, err)
-				}
+				err := os.WriteFile(name, []byte(edited), 0o644)
+				assertNoError(t, err, "write the hand-edited unit %q: %v", name, err)
 			}
 			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 			t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
@@ -1300,9 +1234,8 @@ func TestSystemdInstallRefusesAnEnvWrappedExecStart(t *testing.T) {
 	_, tail, _ := splitRenderedExecStart(t, previousUnit, oldExecutable)
 	wrapped := systemdWrapExecStart(t, previousUnit, oldExecutable, "/usr/bin/env HF_HOME=/srv/hfdesk hfdesk"+tail)
 	for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
-		if err := os.WriteFile(name, []byte(wrapped), 0o644); err != nil {
-			t.Fatalf("write the wrapped unit %q: %v", name, err)
-		}
+		err := os.WriteFile(name, []byte(wrapped), 0o644)
+		assertNoError(t, err, "write the wrapped unit %q: %v", name, err)
 	}
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
@@ -1344,18 +1277,16 @@ func TestSystemdUpdateOfARunningEnvWrappedExecStartRefusesBeforeTheRestart(t *te
 	previous := systemdExistingOptions(t, oldExecutable, root)
 	previous.Listen = "127.0.0.1:" + strconv.Itoa(freePort(t))
 	for _, dir := range []string{filepath.Dir(previous.Paths.ConfigFile), previous.Paths.StateDir, previous.Paths.LogDir} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		err := os.MkdirAll(dir, 0o700)
+		assertNoError(t, err, "")
 	}
 
 	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
 	_, tail, _ := splitRenderedExecStart(t, previousUnit, oldExecutable)
 	wrapped := systemdWrapExecStart(t, previousUnit, oldExecutable, "/usr/bin/env HF_HOME=/srv/hfdesk "+oldExecutable+tail)
 	for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
-		if err := os.WriteFile(name, []byte(wrapped), 0o644); err != nil {
-			t.Fatalf("write the wrapped unit %q: %v", name, err)
-		}
+		err := os.WriteFile(name, []byte(wrapped), 0o644)
+		assertNoError(t, err, "write the wrapped unit %q: %v", name, err)
 	}
 	process := startSystemdRegisteredProcess(t, previous, "fixture-version")
 	restartCount := filepath.Join(root, "restart-count")
@@ -1449,9 +1380,8 @@ func TestSystemdWrapperRegistrationReportsPreservedRunFlags(t *testing.T) {
 		_, tail, _ := splitRenderedExecStart(t, previousUnit, oldExecutable)
 		wrapped := systemdWrapExecStart(t, previousUnit, oldExecutable, "/usr/bin/env HF_HOME=/srv/hfdesk hfdesk"+tail)
 		for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
-			if err := os.WriteFile(name, []byte(wrapped), 0o644); err != nil {
-				t.Fatalf("write the wrapped unit %q: %v", name, err)
-			}
+			err := os.WriteFile(name, []byte(wrapped), 0o644)
+			assertNoError(t, err, "write the wrapped unit %q: %v", name, err)
 		}
 		t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 		t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
@@ -1498,9 +1428,8 @@ func newSystemdLosslessUpdateFixture(t *testing.T) systemdLosslessUpdateFixture 
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-			t.Fatal(err)
-		}
+		err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755)
+		assertNoError(t, err, "")
 		return path
 	}
 	oldExecutable := makeExecutable(filepath.Join(`bin old "quoted"`, "hfdesk"))
@@ -1520,9 +1449,7 @@ func newSystemdLosslessUpdateFixture(t *testing.T) systemdLosslessUpdateFixture 
 	// fixture pins preservation across a canonical rewrite without a
 	// hand-edited base file.
 	home, err := unitHomeDir(previous)
-	if err != nil {
-		t.Fatalf("unitHomeDir() = %v", err)
-	}
+	assertNoError(t, err, "unitHomeDir() = %v", err)
 	environment := []string{`HFDSK_TEST_LABEL=value with spaces and "quotes"`, "HOME=" + home}
 	environmentFiles := []systemdEnvironmentFile{{Path: "/etc/hfdesk/service.env", IgnoreErrors: true}}
 	oldArgv := append([]string{oldExecutable}, RunArgs(previous)...)
@@ -1581,9 +1508,7 @@ func newSystemdDynamicPathFixture(t *testing.T) systemdDynamicPathFixture {
 	managerLogDir := filepath.Join(root, unitName, "logs")
 	managerHome := filepath.Join(root, "manager home")
 	managerWorkingDir, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatalf("read the user home for the %%h fixture: %v", err)
-	}
+	assertNoError(t, err, "read the user home for the %%h fixture: %v", err)
 	managerState := filepath.Join(managerWorkingDir, "state with spaces")
 	listen := "127.0.0.1:19090"
 	stateSource := `%h/state with spaces`
@@ -1606,9 +1531,8 @@ func newSystemdDynamicPathFixture(t *testing.T) systemdDynamicPathFixture {
 		"Restart=on-failure\n\n[Install]\nWantedBy=default.target\n"
 	loadedPath := os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")
 	for _, path := range []string{unitPath, loadedPath} {
-		if err := os.WriteFile(path, []byte(sourceUnit), 0o644); err != nil {
-			t.Fatalf("write the dynamic source fixture %q: %v", path, err)
-		}
+		err := os.WriteFile(path, []byte(sourceUnit), 0o644)
+		assertNoError(t, err, "write the dynamic source fixture %q: %v", path, err)
 	}
 	newExecutable := systemdTestExecutable(t)
 	explicitConfig := filepath.Join(root, "explicit config", "hfdesk.json")
@@ -1683,9 +1607,8 @@ func TestSystemdUpdatePreservesDynamicNativeOperands(t *testing.T) {
 			}
 			setSystemdTypedPropertySequence(t, fixture.manager, fixture.oldProperties, properties)
 			if test.unloaded {
-				if err := os.Remove(fixture.loadedPath); err != nil {
-					t.Fatalf("mark the stored unit as not loaded: %v", err)
-				}
+				err := os.Remove(fixture.loadedPath)
+				assertNoError(t, err, "mark the stored unit as not loaded: %v", err)
 			}
 			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 
@@ -1752,9 +1675,7 @@ func TestSystemdReinstallRefusesAShadowedLoadedCommand(t *testing.T) {
 		}
 	}
 	home, err := unitHomeDir(previous)
-	if err != nil {
-		t.Fatalf("unitHomeDir() = %v", err)
-	}
+	assertNoError(t, err, "unitHomeDir() = %v", err)
 	loadedEnvironment := []string{"HF_HUB_CACHE=/operator/hub", "HOME=" + home}
 	loadedProperties := systemdTypedProperties(oldExecutable, loadedArgv, loadedEnvironment, previous.Paths.StateDir, "", "", nil)
 	// The override really lives in local.conf — the very file the install
@@ -1805,9 +1726,7 @@ func TestSystemdReinstallRefusesAShadowedLoadedCommand(t *testing.T) {
 		t.Errorf("the loaded override does not retain its distinct config/environment: %+v", registered)
 	}
 	typed, err := loadedConfigFromProperties(loadedProperties)
-	if err != nil {
-		t.Fatalf("decode the typed override: %v", err)
-	}
+	assertNoError(t, err, "decode the typed override: %v", err)
 	if typed.execPath != oldExecutable || runArgValue(typed.execArgs[1:], "--listen") != previous.Listen || runArgValue(typed.execArgs[1:], "--config") != overrideConfig || !slices.Equal(typed.environment, loadedEnvironment) {
 		t.Errorf("typed loaded override = %+v, want same executable/listen with distinct config/environment", typed)
 	}
@@ -2000,16 +1919,12 @@ func TestSystemdCanonicalUnitGoldenBytes(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := renderCanonicalUnit(tc.unit)
-			if err != nil {
-				t.Fatalf("renderCanonicalUnit() = %v, want nil", err)
-			}
+			assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
 			if got != tc.want {
 				t.Errorf("renderCanonicalUnit() =\n%s\nwant\n%s", got, tc.want)
 			}
 			read, err := readCanonicalUnit([]byte(got), tc.scope)
-			if err != nil {
-				t.Fatalf("readCanonicalUnit() = %v, want nil", err)
-			}
+			assertNoError(t, err, "readCanonicalUnit() = %v, want nil", err)
 			if read != tc.unit {
 				t.Errorf("readCanonicalUnit() = %+v, want %+v", read, tc.unit)
 			}
@@ -2021,20 +1936,14 @@ func TestSystemdCanonicalUnitRoundTrip(t *testing.T) {
 	t.Setenv("HOME", "/home/golden")
 	for _, unit := range canonicalFixtureUnits(t) {
 		content, err := renderCanonicalUnit(unit)
-		if err != nil {
-			t.Fatalf("renderCanonicalUnit(%+v) = %v, want nil", unit, err)
-		}
+		assertNoError(t, err, "renderCanonicalUnit(%+v) = %v, want nil", unit, err)
 		read, err := readCanonicalUnit([]byte(content), unit.scope)
-		if err != nil {
-			t.Fatalf("readCanonicalUnit() = %v, want the facts of\n%s", err, content)
-		}
+		assertNoError(t, err, "readCanonicalUnit() = %v, want the facts of\n%s", err, content)
 		if read != unit {
 			t.Errorf("readCanonicalUnit() = %+v, want %+v", read, unit)
 		}
 		again, err := renderCanonicalUnit(read)
-		if err != nil {
-			t.Fatalf("renderCanonicalUnit(read) = %v, want nil", err)
-		}
+		assertNoError(t, err, "renderCanonicalUnit(read) = %v, want nil", err)
 		if again != content {
 			t.Errorf("the second rendering differs from the first:\n%s\nwant\n%s", again, content)
 		}
@@ -2044,14 +1953,10 @@ func TestSystemdCanonicalUnitRoundTrip(t *testing.T) {
 func TestSystemdCanonicalUnitRenderIsByteStable(t *testing.T) {
 	unit := canonicalGoldenUserUnit()
 	first, err := renderCanonicalUnit(unit)
-	if err != nil {
-		t.Fatalf("renderCanonicalUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
 	for i := 0; i < 5; i++ {
 		again, err := renderCanonicalUnit(unit)
-		if err != nil {
-			t.Fatalf("renderCanonicalUnit() = %v, want nil", err)
-		}
+		assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
 		if again != first {
 			t.Fatalf("renderCanonicalUnit() is not deterministic at run %d", i)
 		}
@@ -2060,13 +1965,9 @@ func TestSystemdCanonicalUnitRenderIsByteStable(t *testing.T) {
 	// so no hidden state influences the rendering.
 	t.Setenv("HOME", "/home/golden")
 	read, err := readCanonicalUnit([]byte(first), ScopeUser)
-	if err != nil {
-		t.Fatalf("readCanonicalUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "readCanonicalUnit() = %v, want nil", err)
 	fromRead, err := renderCanonicalUnit(read)
-	if err != nil {
-		t.Fatalf("renderCanonicalUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
 	if fromRead != first {
 		t.Errorf("rendering the read facts =\n%s\nwant\n%s", fromRead, first)
 	}
@@ -2081,9 +1982,7 @@ func TestSystemdCanonicalUnitNeverWritesDirectoryDirectives(t *testing.T) {
 	t.Setenv("HOME", "/home/golden")
 	for _, unit := range canonicalFixtureUnits(t) {
 		content, err := renderCanonicalUnit(unit)
-		if err != nil {
-			t.Fatalf("renderCanonicalUnit() = %v, want nil", err)
-		}
+		assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
 		for _, line := range strings.Split(content, "\n") {
 			key, _, ok := strings.Cut(strings.TrimSpace(line), "=")
 			if !ok || !strings.HasSuffix(key, "Directory") {
@@ -2186,20 +2085,15 @@ func TestPreWriteExecStartOverrideClassifiesTheDirectory(t *testing.T) {
 		if err == nil {
 			t.Fatal("preWriteExecStartOverride() = nil, want the refusal of the unreadable drop-in directory")
 		}
-		for _, want := range []string{
+		assertNamesWithout(t, err.Error(), "the refusal", []string{
 			"the update was refused and the registration was not changed",
 			dir,
 			"cannot be read",
 			"Restore this user's read access to the directory",
 			`run "hfdesk service install" again`,
-		} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("the refusal %q does not mention %q", err, want)
-			}
-		}
-		if strings.Contains(err.Error(), " or ") {
-			t.Errorf("the refusal %q offers an alternative instead of one action", err)
-		}
+		}, []string{
+			" or ",
+		})
 	})
 }
 
@@ -2395,19 +2289,14 @@ func TestPreWriteScanRefusesACarrierInTheUnitPathOverride(t *testing.T) {
 	if err == nil {
 		t.Fatal("preWriteExecStartOverride() = nil, want the refusal of the env entry's carrier")
 	}
-	for _, want := range []string{
+	assertNamesWithout(t, err.Error(), "the refusal", []string{
 		"the update was refused and the registration was not changed",
 		carrier,
 		`Remove the "ExecStart=" override from "` + carrier + `"`,
 		`run "hfdesk service install" again`,
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the refusal %q does not mention %q", err, want)
-		}
-	}
-	if strings.Contains(err.Error(), " or ") {
-		t.Errorf("the refusal %q offers an alternative instead of one action", err)
-	}
+	}, []string{
+		" or ",
+	})
 }
 
 // TestPreWriteScanRefusesACarrierInAGeneratorTree pins the transient and
@@ -2438,19 +2327,14 @@ func TestPreWriteScanRefusesACarrierInAGeneratorTree(t *testing.T) {
 	if err == nil {
 		t.Fatal("preWriteExecStartOverride() = nil, want the refusal of the generator tree's carrier")
 	}
-	for _, want := range []string{
+	assertNamesWithout(t, err.Error(), "the refusal", []string{
 		"the update was refused and the registration was not changed",
 		carrier,
 		`Remove the "ExecStart=" override from "` + carrier + `"`,
 		`run "hfdesk service install" again`,
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the refusal %q does not mention %q", err, want)
-		}
-	}
-	if strings.Contains(err.Error(), " or ") {
-		t.Errorf("the refusal %q offers an alternative instead of one action", err)
-	}
+	}, []string{
+		" or ",
+	})
 }
 
 // TestPreWriteScanCoversTheDropInSearchPath pins the scope-wide scan: an
@@ -2478,19 +2362,14 @@ func TestPreWriteScanCoversTheDropInSearchPath(t *testing.T) {
 		if err == nil {
 			t.Fatal("preWriteExecStartOverride() = nil, want the refusal of the other directory's override")
 		}
-		for _, want := range []string{
+		assertNamesWithout(t, err.Error(), "the refusal", []string{
 			"the update was refused and the registration was not changed",
 			otherFile,
 			`Remove the "ExecStart=" override from "` + otherFile + `"`,
 			`run "hfdesk service install" again`,
-		} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("the refusal %q does not mention %q", err, want)
-			}
-		}
-		if strings.Contains(err.Error(), " or ") {
-			t.Errorf("the refusal %q offers an alternative instead of one action", err)
-		}
+		}, []string{
+			" or ",
+		})
 	})
 
 	t.Run("every directory that carries the directive is named", func(t *testing.T) {
@@ -2505,20 +2384,15 @@ func TestPreWriteScanCoversTheDropInSearchPath(t *testing.T) {
 		if err == nil {
 			t.Fatal("preWriteExecStartOverride() = nil, want the refusal that names both files")
 		}
-		for _, want := range []string{
+		assertNamesWithout(t, err.Error(), "the refusal", []string{
 			"the drop-ins",
 			ownFile,
 			filepath.Join(otherDir, "local.conf"),
 			`Remove the "ExecStart=" override from each of them`,
 			`run "hfdesk service install" again`,
-		} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("the refusal %q does not mention %q", err, want)
-			}
-		}
-		if strings.Contains(err.Error(), " or ") {
-			t.Errorf("the refusal %q offers an alternative instead of one action", err)
-		}
+		}, []string{
+			" or ",
+		})
 	})
 }
 
@@ -2535,16 +2409,12 @@ func TestHandEditedUnitRefusalNamesNoRouteForAnUnknownHome(t *testing.T) {
 	if err == nil {
 		t.Fatal("detectHandEditedUnit() = nil, want the refusal of the unresolvable home")
 	}
-	for _, want := range []string{
+	assertNames(t, err.Error(), "the refusal", []string{
 		"the update was refused and the registration was not changed",
 		"the home directory of the user is unknown",
 		"names no file-editing route",
 		"nothing of the registration was changed",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the refusal %q does not mention %q", err, want)
-		}
-	}
+	})
 	for _, unwanted := range []string{
 		"Move your customizations into",
 		"remove the unit file",
@@ -2576,7 +2446,7 @@ func assertSingleDropInAction(t *testing.T, err error, unitPath string) {
 		t.Fatal("the refusal = nil, want a refusal")
 	}
 	message := err.Error()
-	for _, want := range []string{
+	assertNamesWithout(t, message, "the refusal", []string{
 		"the update was refused and the registration was not changed",
 		unitPath,
 		`Move your customizations into "` + unitDropInPath(unitPath) + `"`,
@@ -2584,14 +2454,9 @@ func assertSingleDropInAction(t *testing.T, err error, unitPath string) {
 		"reload the unit files with \"",
 		`daemon-reload"`,
 		`run "hfdesk service install" again`,
-	} {
-		if !strings.Contains(message, want) {
-			t.Errorf("the refusal %q does not contain %q", message, want)
-		}
-	}
-	if strings.Contains(message, " or ") {
-		t.Errorf("the refusal %q offers an alternative instead of one action", message)
-	}
+	}, []string{
+		" or ",
+	})
 	if got := strings.Count(message, "Move your customizations into"); got != 1 {
 		t.Errorf("the refusal %q states %d customization actions, want exactly one", message, got)
 	}
@@ -2612,7 +2477,7 @@ func assertSingleForeignFragmentAction(t *testing.T, err error, unitPath, fragme
 		t.Fatal("the refusal = nil, want a refusal")
 	}
 	message := err.Error()
-	for _, want := range []string{
+	assertNamesWithout(t, message, "the refusal", []string{
 		"the update was refused and the registration was not changed",
 		fragment,
 		unitPath,
@@ -2621,14 +2486,9 @@ func assertSingleForeignFragmentAction(t *testing.T, err error, unitPath, fragme
 		"reload the unit files with \"",
 		`daemon-reload"`,
 		`run "hfdesk service install" again`,
-	} {
-		if !strings.Contains(message, want) {
-			t.Errorf("the refusal %q does not contain %q", message, want)
-		}
-	}
-	if strings.Contains(message, " or ") {
-		t.Errorf("the refusal %q offers an alternative instead of one action", message)
-	}
+	}, []string{
+		" or ",
+	})
 	if got := strings.Count(message, "remove the unit fragment"); got != 1 {
 		t.Errorf("the refusal %q states %d fragment removals, want exactly one", message, got)
 	}
@@ -2647,20 +2507,15 @@ func assertSingleRemoveOverrideAction(t *testing.T, err error, dropIn string) {
 		t.Fatal("the refusal = nil, want a refusal")
 	}
 	message := err.Error()
-	for _, want := range []string{
+	assertNamesWithout(t, message, "the refusal", []string{
 		"the update was refused and the registration was not changed",
 		`Remove the "ExecStart=" override from "` + dropIn + `"`,
 		"reload the unit files with \"",
 		`daemon-reload"`,
 		`run "hfdesk service install" again`,
-	} {
-		if !strings.Contains(message, want) {
-			t.Errorf("the refusal %q does not contain %q", message, want)
-		}
-	}
-	if strings.Contains(message, " or ") {
-		t.Errorf("the refusal %q offers an alternative instead of one action", message)
-	}
+	}, []string{
+		" or ",
+	})
 	if got := strings.Count(message, `Remove the "ExecStart=" override`); got != 1 {
 		t.Errorf("the refusal %q states %d removal actions, want exactly one", message, got)
 	}
@@ -2680,18 +2535,13 @@ func assertSingleReloadAction(t *testing.T, err error, hint string) {
 		t.Fatal("the refusal = nil, want a refusal")
 	}
 	message := err.Error()
-	for _, want := range []string{
+	assertNamesWithout(t, message, "the refusal", []string{
 		"the update was refused and the registration was not changed",
 		`Reload the unit files with "` + hint + ` daemon-reload"`,
 		`run "hfdesk service install" again`,
-	} {
-		if !strings.Contains(message, want) {
-			t.Errorf("the refusal %q does not contain %q", message, want)
-		}
-	}
-	if strings.Contains(message, " or ") {
-		t.Errorf("the refusal %q offers an alternative instead of one action", message)
-	}
+	}, []string{
+		" or ",
+	})
 	if strings.Contains(message, "Move your customizations into") {
 		t.Errorf("the refusal %q names the customization move, which clears no loaded command", message)
 	}
@@ -2705,9 +2555,7 @@ func TestSystemdDetectHandEditedUnit(t *testing.T) {
 	unitPath := "/etc/systemd/system/hfdesk.service"
 
 	unit, err := detectHandEditedUnit(unitPath, []byte(canonicalGoldenUserUnitText), ScopeUser)
-	if err != nil {
-		t.Fatalf("detectHandEditedUnit() = %v, want the facts of the canonical unit", err)
-	}
+	assertNoError(t, err, "detectHandEditedUnit() = %v, want the facts of the canonical unit", err)
 	if unit != canonicalGoldenUserUnit() {
 		t.Errorf("detectHandEditedUnit() = %+v, want %+v", unit, canonicalGoldenUserUnit())
 	}

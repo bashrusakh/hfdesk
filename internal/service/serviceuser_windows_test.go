@@ -27,13 +27,9 @@ import (
 // computed.
 func TestDesktopSingletonNameGuardsTheNameShape(t *testing.T) {
 	name, err := DesktopSingletonName()
-	if err != nil {
-		t.Fatalf("DesktopSingletonName() failed: %v", err)
-	}
+	assertNoError(t, err, "DesktopSingletonName() failed: %v", err)
 	sid, err := processUserSID()
-	if err != nil {
-		t.Fatalf("read the user of the process: %v", err)
-	}
+	assertNoError(t, err, "read the user of the process: %v", err)
 	var session uint32
 	if err := windows.ProcessIdToSessionId(uint32(os.Getpid()), &session); err != nil {
 		t.Fatalf("read the session of the process: %v", err)
@@ -62,22 +58,16 @@ func TestDesktopSingletonNameGuardsTheNameShape(t *testing.T) {
 func TestHoldDesktopSingletonHoldsAndReleasesANamedObject(t *testing.T) {
 	const name = `Local\HFDesk.Test.ServiceHold.1`
 	namePtr, err := windows.UTF16PtrFromString(name)
-	if err != nil {
-		t.Fatalf("encode the test singleton name: %v", err)
-	}
+	assertNoError(t, err, "encode the test singleton name: %v", err)
 
 	release, err := HoldDesktopSingleton(name)
-	if err != nil {
-		t.Fatalf("HoldDesktopSingleton(%q) failed: %v", name, err)
-	}
+	assertNoError(t, err, "HoldDesktopSingleton(%q) failed: %v", name, err)
 	if release == nil {
 		t.Fatal("a successful hold returned no release")
 	}
 
 	handle, err := windows.OpenMutex(windows.MUTEX_ALL_ACCESS, false, namePtr)
-	if err != nil {
-		t.Fatalf("the held object cannot be opened by the identity that created it: %v", err)
-	}
+	assertNoError(t, err, "the held object cannot be opened by the identity that created it: %v", err)
 	_ = windows.CloseHandle(handle)
 
 	release()
@@ -137,15 +127,11 @@ func TestHoldDesktopSingletonReportsAnIdentityThatCannotAccessTheObject(t *testi
 	if !errors.Is(err, ErrSingletonAccessDenied) {
 		t.Errorf("the refusal %v is not classified as ErrSingletonAccessDenied", err)
 	}
-	for _, want := range []string{
+	assertNames(t, err.Error(), "the refusal", []string{
 		"this Windows identity cannot access it",
 		"different Windows account",
 		"end that process and try again",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the refusal %q does not mention %q", err, want)
-		}
-	}
+	})
 }
 
 // TestHoldDesktopSingletonHoldsAnObjectOfAnotherIdentityThroughReadControl
@@ -159,9 +145,7 @@ func TestHoldDesktopSingletonReportsAnIdentityThatCannotAccessTheObject(t *testi
 func TestHoldDesktopSingletonHoldsAnObjectOfAnotherIdentityThroughReadControl(t *testing.T) {
 	const name = `Local\HFDesk.Test.ServiceLimited.1`
 	sid, err := processUserSID()
-	if err != nil {
-		t.Fatalf("read the user of the process: %v", err)
-	}
+	assertNoError(t, err, "read the user of the process: %v", err)
 	fixture := createReadControlMutex(t, name, sid)
 	defer func() {
 		if fixture != 0 {
@@ -170,9 +154,7 @@ func TestHoldDesktopSingletonHoldsAnObjectOfAnotherIdentityThroughReadControl(t 
 	}()
 
 	release, err := HoldDesktopSingleton(name)
-	if err != nil {
-		t.Fatalf("the hold refused although its descriptor grants this identity read control: %v", err)
-	}
+	assertNoError(t, err, "the hold refused although its descriptor grants this identity read control: %v", err)
 	if release == nil {
 		t.Fatal("a successful hold returned no release")
 	}
@@ -217,17 +199,13 @@ func createReadControlMutex(t *testing.T, name, sid string) windows.Handle {
 	t.Helper()
 	descriptor, err := windows.SecurityDescriptorFromString(
 		fmt.Sprintf("D:P(A;;0x%08X;;;%s)", uint32(windows.READ_CONTROL), sid))
-	if err != nil {
-		t.Fatalf("build the read-control descriptor: %v", err)
-	}
+	assertNoError(t, err, "build the read-control descriptor: %v", err)
 	attrs := &windows.SecurityAttributes{
 		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
 		SecurityDescriptor: descriptor,
 	}
 	namePtr, err := windows.UTF16PtrFromString(name)
-	if err != nil {
-		t.Fatalf("encode the test singleton name: %v", err)
-	}
+	assertNoError(t, err, "encode the test singleton name: %v", err)
 	handle, err := windows.CreateMutex(attrs, false, namePtr)
 	if handle == 0 {
 		if err == nil {
@@ -255,17 +233,13 @@ func createDeniedMutex(t *testing.T, name string) {
 	descriptor, err := windows.SecurityDescriptorFromString(
 		fmt.Sprintf("D:P(D;;0x%08X;;;S-1-3-4)(A;;0x%08X;;;S-1-3-4)(A;;0x%08X;;;SY)",
 			uint32(windows.READ_CONTROL), uint32(windows.SYNCHRONIZE), uint32(windows.MUTEX_ALL_ACCESS)))
-	if err != nil {
-		t.Fatalf("build the denying descriptor: %v", err)
-	}
+	assertNoError(t, err, "build the denying descriptor: %v", err)
 	attrs := &windows.SecurityAttributes{
 		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
 		SecurityDescriptor: descriptor,
 	}
 	namePtr, err := windows.UTF16PtrFromString(name)
-	if err != nil {
-		t.Fatalf("encode the test singleton name: %v", err)
-	}
+	assertNoError(t, err, "encode the test singleton name: %v", err)
 	handle, err := windows.CreateMutex(attrs, false, namePtr)
 	if handle == 0 {
 		if err == nil {

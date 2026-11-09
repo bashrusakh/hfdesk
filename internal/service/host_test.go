@@ -48,9 +48,7 @@ func TestRunInstallsRuntimeModelAndStopsOnCancel(t *testing.T) {
 	// The process log reached the log file of the instance.
 	logFile := filepath.Join(model.LogDir, "hfdesk.log")
 	data, err := os.ReadFile(logFile)
-	if err != nil {
-		t.Fatalf("read %s: %v", logFile, err)
-	}
+	assertNoError(t, err, "read %s: %v", logFile, err)
 	if len(data) == 0 {
 		t.Errorf("%s is empty, want the process log", logFile)
 	}
@@ -102,9 +100,7 @@ func TestRunWritesTheRecordsOfTheServerIntoTheLogFileOfTheInstance(t *testing.T)
 	// instance is complete when the run is over.
 	logFile := filepath.Join(model.LogDir, "hfdesk.log")
 	data, err := os.ReadFile(logFile)
-	if err != nil {
-		t.Fatalf("read %s: %v", logFile, err)
-	}
+	assertNoError(t, err, "read %s: %v", logFile, err)
 	if len(data) == 0 {
 		t.Fatalf("%s is empty, want the records of the server", logFile)
 	}
@@ -155,9 +151,8 @@ func TestRunKeepsRunningWhenTheLogFileCannotBeWritten(t *testing.T) {
 		t.Fatalf("the instance never answered: %v", err)
 	}
 	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("Run() = %v, want nil: the failure of the log file never stops the instance", err)
-	}
+	err := <-done
+	assertNoError(t, err, "Run() = %v, want nil: the failure of the log file never stops the instance", err)
 }
 
 // TestRunKeepsWritingTheLogFileWhenTheStandardErrorFails checks the log of
@@ -179,9 +174,7 @@ func TestRunKeepsWritingTheLogFileWhenTheStandardErrorFails(t *testing.T) {
 
 	// The standard error of the process is broken: every write to it fails.
 	broken, err := os.CreateTemp(t.TempDir(), "stderr")
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if err := broken.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -211,9 +204,7 @@ func TestRunKeepsWritingTheLogFileWhenTheStandardErrorFails(t *testing.T) {
 
 	logFile := filepath.Join(model.LogDir, "hfdesk.log")
 	data, err := os.ReadFile(logFile)
-	if err != nil {
-		t.Fatalf("read %s: %v", logFile, err)
-	}
+	assertNoError(t, err, "read %s: %v", logFile, err)
 	if !strings.Contains(string(data), `"message":"server starting"`) {
 		t.Errorf("%s = %s, want the record of the server: the console sink fails, the file sink still receives every record", logFile, data)
 	}
@@ -255,18 +246,14 @@ func TestRunCreatesTheLogDirectoryOwnerOnly(t *testing.T) {
 		}
 
 		info, err := os.Stat(model.LogDir)
-		if err != nil {
-			t.Fatalf("stat %s: %v", model.LogDir, err)
-		}
+		assertNoError(t, err, "stat %s: %v", model.LogDir, err)
 		if got := info.Mode().Perm(); got != 0o700 {
 			t.Errorf("the mode of the log directory = %04o, want 0700", got)
 		}
 
 		// The log file keeps the mode the shared file sink gives it.
 		info, err = os.Stat(filepath.Join(model.LogDir, "hfdesk.log"))
-		if err != nil {
-			t.Fatalf("stat the log file: %v", err)
-		}
+		assertNoError(t, err, "stat the log file: %v", err)
 		if got := info.Mode().Perm(); got != 0o600 {
 			t.Errorf("the mode of the log file = %04o, want 0600", got)
 		}
@@ -295,9 +282,7 @@ func TestRunCreatesTheLogDirectoryOwnerOnly(t *testing.T) {
 		}
 
 		info, err := os.Stat(model.LogDir)
-		if err != nil {
-			t.Fatalf("stat %s: %v", model.LogDir, err)
-		}
+		assertNoError(t, err, "stat %s: %v", model.LogDir, err)
 		if got := info.Mode().Perm(); got != 0o755 {
 			t.Errorf("the mode of the log directory = %04o, want 0755: the instance never widens the permissions of a directory it did not create", got)
 		}
@@ -337,9 +322,8 @@ func TestRunServesUntilTheContextIsCancelled(t *testing.T) {
 			lastErr = fmt.Errorf("unexpected health payload: %s", body)
 		default:
 			cancel()
-			if err := <-done; err != nil {
-				t.Fatalf("Run() = %v, want nil", err)
-			}
+			err := <-done
+			assertNoError(t, err, "Run() = %v, want nil", err)
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -454,9 +438,7 @@ func TestRunShutdownPersistsTheJobListWithinTheBudget(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("Run() = %v, want nil", err)
-		}
+		assertNoError(t, err, "Run() = %v, want nil", err)
 	case <-time.After(ShutdownBudget + shutdownMargin):
 		t.Fatalf("Run() did not return within %s", ShutdownBudget+shutdownMargin)
 	}
@@ -469,9 +451,7 @@ func TestRunShutdownPersistsTheJobListWithinTheBudget(t *testing.T) {
 
 	// The job list is persisted in the state directory of the instance.
 	data, err := os.ReadFile(stateFile)
-	if err != nil {
-		t.Fatalf("read %q: %v", stateFile, err)
-	}
+	assertNoError(t, err, "read %q: %v", stateFile, err)
 	if !strings.Contains(string(data), "job-of-the-test") {
 		t.Errorf("%q = %s, want the job of the instance", stateFile, data)
 	}
@@ -506,9 +486,8 @@ func TestRunPinsTheCacheEnvironment(t *testing.T) {
 	t.Setenv("HF_HUB_CACHE", filepath.Join(root, "stale-hub"))
 
 	opts := RunOptions{Paths: model, CacheDir: cacheDir, HubDir: hubDir}
-	if err := runService(t, opts); err != nil {
-		t.Fatalf("Run() = %v, want nil", err)
-	}
+	err := runService(t, opts)
+	assertNoError(t, err, "Run() = %v, want nil", err)
 
 	if got := os.Getenv("HF_HOME"); got != cacheDir {
 		t.Errorf("HF_HOME = %q, want the cache dir of the installation %q", got, cacheDir)
@@ -535,9 +514,7 @@ func TestBuildConfigUsesTheServiceOwnedPaths(t *testing.T) {
 		CacheDir: cacheDir,
 		LocalDir: localDir,
 	}, "127.0.0.1", 8080)
-	if err != nil {
-		t.Fatalf("buildConfig() = %v, want nil", err)
-	}
+	assertNoError(t, err, "buildConfig() = %v, want nil", err)
 
 	if cfg.Addr != "127.0.0.1" || cfg.Port != 8080 {
 		t.Errorf("listen = %q:%d, want 127.0.0.1:8080", cfg.Addr, cfg.Port)
@@ -582,9 +559,7 @@ func TestBuildConfigInstallsTheRuntimeModel(t *testing.T) {
 		"cache-dir": cacheRoot,
 		"token":     "hf_token_of_the_instance",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if err := os.WriteFile(model.ConfigFile, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -593,9 +568,7 @@ func TestBuildConfigInstallsTheRuntimeModel(t *testing.T) {
 		Paths:    model,
 		CacheDir: "/registered/cache",
 	}, "127.0.0.1", 8080)
-	if err != nil {
-		t.Fatalf("buildConfig() = %v, want nil", err)
-	}
+	assertNoError(t, err, "buildConfig() = %v, want nil", err)
 
 	if cfg.CacheDir != cacheRoot {
 		t.Errorf("CacheDir = %q, want the cache dir of the config file of the instance %q", cfg.CacheDir, cacheRoot)
@@ -626,9 +599,7 @@ func serviceInstance(t *testing.T, fields map[string]string) runtimepaths.Paths 
 		t.Fatal(err)
 	}
 	data, err := json.Marshal(fields)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if err := os.WriteFile(model.ConfigFile, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -658,9 +629,7 @@ func TestBuildConfigPrefersTheConfigFileOfTheInstance(t *testing.T) {
 		HubDir:   "/registered/cache/hub",
 		LocalDir: "/registered/models",
 	}, "127.0.0.1", 8080)
-	if err != nil {
-		t.Fatalf("buildConfig() = %v, want nil", err)
-	}
+	assertNoError(t, err, "buildConfig() = %v, want nil", err)
 
 	if cfg.CacheDir != "/from/config/file" {
 		t.Errorf("CacheDir = %q, want the cache dir of the config file %q", cfg.CacheDir, "/from/config/file")
@@ -690,9 +659,7 @@ func TestBuildConfigKeepsTheRegistrationWithoutAConfigFileValue(t *testing.T) {
 		HubDir:   "/registered/cache/hub",
 		LocalDir: "/registered/models",
 	}, "127.0.0.1", 8080)
-	if err != nil {
-		t.Fatalf("buildConfig() = %v, want nil", err)
-	}
+	assertNoError(t, err, "buildConfig() = %v, want nil", err)
 
 	if cfg.CacheDir != "/registered/cache" {
 		t.Errorf("CacheDir = %q, want the registered cache dir %q", cfg.CacheDir, "/registered/cache")
@@ -809,9 +776,7 @@ func TestBuildConfigAppliesTheLocalDirRule(t *testing.T) {
 			CacheDir: "/registered/cache",
 			LocalDir: "/registered/models",
 		}, "127.0.0.1", 8080)
-		if err != nil {
-			t.Fatalf("buildConfig() = %v, want nil", err)
-		}
+		assertNoError(t, err, "buildConfig() = %v, want nil", err)
 		if cfg.LocalDir != "/from/config/file/models" {
 			t.Errorf("LocalDir = %q, want the local dir of the config file %q", cfg.LocalDir, "/from/config/file/models")
 		}
@@ -827,9 +792,7 @@ func TestBuildConfigAppliesTheLocalDirRule(t *testing.T) {
 			CacheDir: "/registered/cache",
 			LocalDir: "/registered/models",
 		}, "127.0.0.1", 8080)
-		if err != nil {
-			t.Fatalf("buildConfig() = %v, want nil", err)
-		}
+		assertNoError(t, err, "buildConfig() = %v, want nil", err)
 		if cfg.LocalDir != "/registered/models" {
 			t.Errorf("LocalDir = %q, want the registered local dir %q", cfg.LocalDir, "/registered/models")
 		}
@@ -886,9 +849,7 @@ func TestRunUsesTheConfigFileOfTheInstance(t *testing.T) {
 		"cache-dir": cacheRoot,
 		"local-dir": localDir,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if err := os.WriteFile(model.ConfigFile, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -995,9 +956,7 @@ func TestServiceDirectoriesAreOwnerOnly(t *testing.T) {
 
 	for _, dir := range []string{filepath.Dir(model.ConfigFile), model.StateDir} {
 		info, err := os.Stat(dir)
-		if err != nil {
-			t.Fatalf("stat %s: %v", dir, err)
-		}
+		assertNoError(t, err, "stat %s: %v", dir, err)
 		if got := info.Mode().Perm(); got != 0o700 {
 			t.Errorf("the mode of %s = %04o, want 0700", dir, got)
 		}
@@ -1017,9 +976,7 @@ func TestBuildConfigKeepsIPv6HostsBracketed(t *testing.T) {
 	// The server composes the bind address as "<Addr>:<Port>": an IPv6 host
 	// must keep its brackets to stay a valid socket address.
 	cfg, err := buildConfig(RunOptions{Paths: model}, "::1", 8080)
-	if err != nil {
-		t.Fatalf("buildConfig() = %v, want nil", err)
-	}
+	assertNoError(t, err, "buildConfig() = %v, want nil", err)
 	if cfg.Addr != "[::1]" {
 		t.Errorf("Addr = %q, want %q", cfg.Addr, "[::1]")
 	}
@@ -1043,9 +1000,7 @@ func TestBuildConfigTakesTheTokenFromTheConfigFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	data, err := json.Marshal(map[string]string{"token": "hf_file_token"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if err := os.WriteFile(configFile, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1062,9 +1017,7 @@ func TestBuildConfigTakesTheTokenFromTheConfigFile(t *testing.T) {
 	// service-owned config file is the only source.
 	t.Setenv("HF_TOKEN", "hf_environment_token")
 	cfg, err := buildConfig(RunOptions{Paths: model}, "127.0.0.1", 8080)
-	if err != nil {
-		t.Fatalf("buildConfig() = %v, want nil", err)
-	}
+	assertNoError(t, err, "buildConfig() = %v, want nil", err)
 	if cfg.Token != "hf_file_token" {
 		t.Errorf("Token = %q, want the token of the config file", cfg.Token)
 	}
@@ -1089,9 +1042,7 @@ func TestServiceBindsLoopbackWhileTheInteractiveServerKeepsItsDefault(t *testing
 
 	// The default listen address of a service instance is loopback.
 	host, port, err := ParseListen(DefaultListen)
-	if err != nil {
-		t.Fatalf("ParseListen(%q) = %v, want nil", DefaultListen, err)
-	}
+	assertNoError(t, err, "ParseListen(%q) = %v, want nil", DefaultListen, err)
 	if host != "127.0.0.1" {
 		t.Errorf("the host of the default listen address %q = %q, want %q", DefaultListen, host, "127.0.0.1")
 	}
@@ -1111,9 +1062,7 @@ func TestServiceBindsLoopbackWhileTheInteractiveServerKeepsItsDefault(t *testing
 	// The configuration a service instance builds binds loopback, even
 	// though the interactive default of the server binds every interface.
 	cfg, err := buildConfig(RunOptions{Paths: model}, host, port)
-	if err != nil {
-		t.Fatalf("buildConfig() = %v, want nil", err)
-	}
+	assertNoError(t, err, "buildConfig() = %v, want nil", err)
 	if cfg.Addr != "127.0.0.1" {
 		t.Errorf("the address of the service configuration = %q, want %q", cfg.Addr, "127.0.0.1")
 	}
@@ -1168,18 +1117,14 @@ var processLaunchMarkers = []string{`"os/exec"`, "exec.Command"}
 // without changing this test.
 func TestServiceLayerNeverLaunchesAGUI(t *testing.T) {
 	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	for _, entry := range entries {
 		name := entry.Name()
 		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
 		}
 		data, err := os.ReadFile(name)
-		if err != nil {
-			t.Fatal(err)
-		}
+		assertNoError(t, err, "")
 		src := stripComments(string(data))
 		if !isPlatformFile(name) {
 			for _, marker := range processLaunchMarkers {
@@ -1254,9 +1199,7 @@ func TestRunInstanceReportsItsOwnListenerOnlyWhenItBinds(t *testing.T) {
 		// The address belongs to another process: the bind of this
 		// instance fails, so the signal of its listener must stay open.
 		occupied, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("occupy an address: %v", err)
-		}
+		assertNoError(t, err, "occupy an address: %v", err)
 		defer occupied.Close()
 		addr := occupied.Addr().String()
 
@@ -1315,9 +1258,7 @@ func runServiceWith(t *testing.T, opts RunOptions, run func(context.Context, Run
 func freePort(t *testing.T) int {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve a port: %v", err)
-	}
+	assertNoError(t, err, "reserve a port: %v", err)
 	defer listener.Close()
 	return listener.Addr().(*net.TCPAddr).Port
 }

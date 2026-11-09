@@ -131,9 +131,7 @@ func systemdUnresolvableAccount(t *testing.T) *user.User {
 func systemdOwner(t *testing.T, path string) (string, string) {
 	t.Helper()
 	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat %q: %v", path, err)
-	}
+	assertNoError(t, err, "stat %q: %v", path, err)
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		t.Skipf("skipping: the file system of the test does not report an owner: %v", info.Sys())
@@ -154,9 +152,8 @@ func systemdTraversableTempDir(t *testing.T) string {
 	// The mode of a create call is filtered by the umask of the process,
 	// so the mode is set explicitly.
 	for _, path := range []string{root, filepath.Dir(root)} {
-		if err := os.Chmod(path, 0o711); err != nil {
-			t.Fatalf("make %q traversable: %v", path, err)
-		}
+		err := os.Chmod(path, 0o711)
+		assertNoError(t, err, "make %q traversable: %v", path, err)
 	}
 	return root
 }
@@ -234,9 +231,7 @@ func TestSystemdInstallRefusesAMissingServiceAccount(t *testing.T) {
 
 	m := &systemdManager{scope: ScopeSystem}
 	path, err := m.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath() = %v, want nil", err)
-	}
+	assertNoError(t, err, "unitPath() = %v, want nil", err)
 	// The unit file of the machine scope lives in a fixed place of the
 	// machine. The test never writes it: the refusal happens before the
 	// unit file is written. The state of the file is compared before and
@@ -302,9 +297,7 @@ func TestSystemdAccountValidationUsesTheLoadedIdentityOfAnExistingUnit(t *testin
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", systemdTestExecutable(t))
 	exe := os.Getenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE")
 	current, err := user.Current()
-	if err != nil {
-		t.Fatalf("user.Current() = %v", err)
-	}
+	assertNoError(t, err, "user.Current() = %v", err)
 
 	for _, tc := range []struct {
 		name        string
@@ -445,9 +438,8 @@ func TestSystemdGrantInstanceDirs(t *testing.T) {
 	cacheOwner, cacheGroup := systemdOwner(t, cache)
 
 	m := &systemdManager{scope: ScopeSystem}
-	if err := m.grantInstanceDirs(opts, account, created); err != nil {
-		t.Fatalf("grantInstanceDirs() = %v, want nil", err)
-	}
+	err := m.grantInstanceDirs(opts, account, created)
+	assertNoError(t, err, "grantInstanceDirs() = %v, want nil", err)
 
 	// Every directory the installation created belongs to the account: the
 	// parents it created for the directories of the instance belong to it
@@ -561,9 +553,8 @@ func TestSystemdGrantInstanceDirsKeepsAWritablePreExistingDirectory(t *testing.T
 		if err := os.MkdirAll(dir.path, 0o700); err != nil {
 			t.Fatalf("create the %s %q: %v", dir.name, dir.path, err)
 		}
-		if err := os.Chmod(dir.path, 0o777); err != nil {
-			t.Fatalf("make the %s %q writable: %v", dir.name, dir.path, err)
-		}
+		err := os.Chmod(dir.path, 0o777)
+		assertNoError(t, err, "make the %s %q writable: %v", dir.name, dir.path, err)
 		uid, gid := systemdOwner(t, dir.path)
 		owners[dir.path] = [2]string{uid, gid}
 	}
@@ -574,9 +565,8 @@ func TestSystemdGrantInstanceDirsKeepsAWritablePreExistingDirectory(t *testing.T
 	}
 
 	m := &systemdManager{scope: ScopeSystem}
-	if err := m.grantInstanceDirs(opts, account, created); err != nil {
-		t.Fatalf("grantInstanceDirs() = %v, want nil for a pre-existing directory the account can write into", err)
-	}
+	err := m.grantInstanceDirs(opts, account, created)
+	assertNoError(t, err, "grantInstanceDirs() = %v, want nil for a pre-existing directory the account can write into", err)
 
 	// The directories still belong to their owner: the installation grants
 	// only the directories it created itself.
@@ -615,9 +605,7 @@ func TestSystemdInstallRefusesAPreExistingDirectory(t *testing.T) {
 
 	m := &systemdManager{scope: ScopeSystem}
 	path, err := m.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath() = %v, want nil", err)
-	}
+	assertNoError(t, err, "unitPath() = %v, want nil", err)
 	before, existedBefore, err := readUnitFile(path)
 	if err != nil {
 		t.Logf("the unit file %q cannot be read: %v", path, err)
@@ -715,9 +703,7 @@ func TestSystemdGrantInstanceDirsRefusesADirectoryOfTheMachine(t *testing.T) {
 // directories of the test belong to it.
 func TestSystemdCheckServiceAccountAccess(t *testing.T) {
 	account, err := user.Current()
-	if err != nil {
-		t.Fatalf("Current() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Current() = %v, want nil", err)
 	other := systemdSecondAccount(t)
 
 	root := t.TempDir()
@@ -979,15 +965,11 @@ func TestSystemdCheckServiceAccountAccessChecksAnExistingDirectoryInsideTheState
 			// The refusal names the directory, the account and the
 			// access that is missing.
 			message := err.Error()
-			for _, want := range []string{
+			assertNames(t, message, "checkServiceAccountAccess()", []string{
 				"the service account " + strconv.Quote(other.Username),
 				strconv.Quote(tc.cache),
 				"cannot write",
-			} {
-				if !strings.Contains(message, want) {
-					t.Errorf("checkServiceAccountAccess() = %q, want a message that mentions %q", message, want)
-				}
-			}
+			})
 		})
 	}
 }
@@ -1094,15 +1076,11 @@ func TestSystemdCheckServiceAccountAccessUsesTheRealLocationOfTheDirectory(t *te
 				t.Fatalf("checkServiceAccountAccess() = nil, want the refusal of the directory %q", tc.cache)
 			}
 			message := err.Error()
-			for _, want := range []string{
+			assertNames(t, message, "checkServiceAccountAccess()", []string{
 				"the service account " + strconv.Quote(other.Username),
 				strconv.Quote(tc.cache),
 				"cannot write",
-			} {
-				if !strings.Contains(message, want) {
-					t.Errorf("checkServiceAccountAccess() = %q, want a message that mentions %q", message, want)
-				}
-			}
+			})
 		})
 	}
 
@@ -1423,9 +1401,7 @@ func TestSystemdAccessCheckUsesTheSupplementaryGroups(t *testing.T) {
 		t.Fatalf("create the directory: %v", err)
 	}
 	gid, err := strconv.Atoi(group)
-	if err != nil {
-		t.Fatalf("the group id %q is not a number: %v", group, err)
-	}
+	assertNoError(t, err, "the group id %q is not a number: %v", group, err)
 	// The directory belongs to the group of the account, not to the
 	// account itself.
 	if err := os.Chown(dir, os.Getuid(), gid); err != nil {
@@ -1469,13 +1445,9 @@ func TestSystemdGrantInstanceDirsUsesLoadedNativeUserAndGroup(t *testing.T) {
 	}
 	base, loadedUser := systemdCurrentAccount(t), systemdSecondAccount(t)
 	loadedUID, err := strconv.Atoi(loadedUser.Uid)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	loadedGID, err := strconv.Atoi(loadedUser.Gid)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	root := systemdTraversableTempDir(t)
 	configDir := filepath.Join(root, "config")
 	if err := os.Mkdir(configDir, 0o700); err != nil {
@@ -1497,9 +1469,7 @@ func TestSystemdGrantInstanceDirsUsesLoadedNativeUserAndGroup(t *testing.T) {
 	}
 	properties := systemdTypedProperties(opts.Executable, []string{opts.Executable}, nil, root, loadedUser.Username, loadedUser.Gid, nil)
 	loaded, err := loadedConfigFromProperties(properties)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	effective := systemdAccessIdentityForInstall(ScopeSystem, InstallOptions{Scope: ScopeSystem}, true, loaded, true, base)
 	if effective.access == nil || effective.accountName != loadedUser.Username || effective.owner == nil {
 		t.Fatalf("projected identity = %+v, want the loaded user rather than the base account", effective)
@@ -1575,9 +1545,9 @@ func TestSystemdInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T) {
 	if err.Error() != want {
 		t.Errorf("Install() = %q, want %q", err, want)
 	}
-	if strings.Contains(err.Error(), " or ") {
-		t.Errorf("Install() = %q, want no alternative to the named action", err)
-	}
+	assertNamesWithout(t, err.Error(), "Install()", nil, []string{
+		" or ",
+	})
 	// The refusal names the directory, the account and the missing write
 	// access.
 	for _, part := range []string{account.Username, cache, "cannot write to"} {
@@ -1620,9 +1590,7 @@ func TestSystemdUserScopeNeedsNoServiceAccount(t *testing.T) {
 	m := &systemdManager{scope: ScopeUser}
 
 	account, err := m.serviceAccount(opts)
-	if err != nil {
-		t.Fatalf("serviceAccount() = %v, want nil for a user scope instance", err)
-	}
+	assertNoError(t, err, "serviceAccount() = %v, want nil for a user scope instance", err)
 	if account != nil {
 		t.Errorf("a user scope instance resolved the account %q, want none", account.Username)
 	}
@@ -1636,9 +1604,7 @@ func TestSystemdUserScopeNeedsNoServiceAccount(t *testing.T) {
 	// The unit of a user scope instance names no account, even when the
 	// command line named one.
 	unit, err := renderUnit(opts, nil)
-	if err != nil {
-		t.Fatalf("renderUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderUnit() = %v, want nil", err)
 	for _, directive := range unitDirectives(unit) {
 		if strings.HasPrefix(directive, "User=") || strings.HasPrefix(directive, "Group=") {
 			t.Errorf("a user scope unit names an account: %q", directive)
@@ -1738,9 +1704,7 @@ func TestSystemdFailedInstallKeepsADirectoryThatExistedBefore(t *testing.T) {
 	// The directory that existed before the installation is still there,
 	// with the owner and the permissions it had.
 	info, err := os.Stat(config)
-	if err != nil {
-		t.Fatalf("the config directory %q is gone after the failed installation: %v", config, err)
-	}
+	assertNoError(t, err, "the config directory %q is gone after the failed installation: %v", config, err)
 	if info.Mode().Perm() != 0o750 {
 		t.Errorf("the mode of the config directory %q = %v, want %v", config, info.Mode().Perm(), os.FileMode(0o750))
 	}
@@ -1904,9 +1868,7 @@ func TestSystemdDirectoryCleanupRequiresKnownEmptyDropIns(t *testing.T) {
 				delete(properties, "DropInPaths")
 			}
 			loaded, err := loadedConfigFromProperties(properties)
-			if err != nil {
-				t.Fatal(err)
-			}
+			assertNoError(t, err, "")
 			previous.loaded = loaded
 			if systemdCreatedDirsSafeToRemove(previous, created) {
 				t.Fatal("cleanup was allowed without proof that the previous loaded unit has no drop-ins")

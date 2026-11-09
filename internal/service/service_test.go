@@ -321,9 +321,8 @@ func TestValidateInstallOptionsAcceptsValidInstallation(t *testing.T) {
 		HubDir:   filepath.Join(root, "cache", "hub"),
 		LocalDir: filepath.Join(root, "models"),
 	}
-	if err := ValidateInstallOptions(opts); err != nil {
-		t.Fatalf("ValidateInstallOptions() = %v, want nil", err)
-	}
+	err := ValidateInstallOptions(opts)
+	assertNoError(t, err, "ValidateInstallOptions() = %v, want nil", err)
 }
 
 func TestValidateInstallOptionsRejectsInvalidInstallation(t *testing.T) {
@@ -458,9 +457,7 @@ func TestPrepareDirsLeavesTheModeOfAnExistingDirectoryAlone(t *testing.T) {
 	}
 
 	info, err := os.Stat(stateDir)
-	if err != nil {
-		t.Fatalf("stat %s: %v", stateDir, err)
-	}
+	assertNoError(t, err, "stat %s: %v", stateDir, err)
 	if info.Mode().Perm() != 0o755 {
 		t.Errorf("the mode of %s is %v, want the untouched 0755", stateDir, info.Mode().Perm())
 	}
@@ -493,25 +490,19 @@ func TestPrepareDirsLeavesUnrelatedPathsAlone(t *testing.T) {
 
 	if runtime.GOOS != "windows" {
 		info, err := os.Stat(unrelatedDir)
-		if err != nil {
-			t.Fatalf("stat %s: %v", unrelatedDir, err)
-		}
+		assertNoError(t, err, "stat %s: %v", unrelatedDir, err)
 		if info.Mode().Perm() != 0o755 {
 			t.Errorf("%s mode = %v, want the untouched 0755", unrelatedDir, info.Mode().Perm())
 		}
 	}
 	data, err := os.ReadFile(unrelatedFile)
-	if err != nil {
-		t.Fatalf("read %s: %v", unrelatedFile, err)
-	}
+	assertNoError(t, err, "read %s: %v", unrelatedFile, err)
 	if string(data) != "keep" {
 		t.Errorf("%s = %q, want the untouched content", unrelatedFile, data)
 	}
 
 	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	var names []string
 	for _, entry := range entries {
 		names = append(names, entry.Name())
@@ -658,9 +649,8 @@ func TestEffectiveCacheDir(t *testing.T) {
 
 	// A path that cannot be read: a directory is not a config file.
 	unreadable := filepath.Join(etc, "unreadable.json")
-	if err := os.Mkdir(unreadable, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	err := os.Mkdir(unreadable, 0o700)
+	assertNoError(t, err, "")
 
 	cases := []struct {
 		name       string
@@ -751,9 +741,7 @@ func TestHoldDesktopSingletonWithoutADesktopHostHoldsNothing(t *testing.T) {
 		t.Skip("the singleton object exists on Windows; its hold is proven by the Windows tests")
 	}
 	release, err := HoldDesktopSingleton("")
-	if err != nil {
-		t.Fatalf("a mutation would refuse although this platform has no singleton object: %v", err)
-	}
+	assertNoError(t, err, "a mutation would refuse although this platform has no singleton object: %v", err)
 	if release == nil {
 		t.Fatal("the hold returned no release")
 	}
@@ -808,5 +796,46 @@ func TestAppendActionIfUnnamedIsTheSingleActionRule(t *testing.T) {
 	}
 	if !strings.Contains(plain.Error(), hint) {
 		t.Errorf("AppendActionErrorIfUnnamed() = %q, want the diagnostic action appended", plain)
+	}
+}
+
+// assertNoError fails the test when the call it wraps reported a failure,
+// with the diagnostic the inline check printed.
+func assertNoError(t *testing.T, err error, format string, a ...any) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	if format == "" {
+		t.Fatal(err)
+		return
+	}
+	if len(a) == 0 {
+		t.Fatal(format)
+		return
+	}
+	t.Fatalf(format, a...)
+}
+
+// assertNames proves that a message names every fragment of the standard
+// the test pins, one diagnostic per missing fragment.
+func assertNames(t *testing.T, message, context string, wants []string) {
+	t.Helper()
+	for _, want := range wants {
+		if !strings.Contains(message, want) {
+			t.Errorf("%s = %q, want a message that mentions %q", context, message, want)
+		}
+	}
+}
+
+// assertNamesWithout proves the named fragments AND the absent ones: the
+// message keeps its standard and offers no second route.
+func assertNamesWithout(t *testing.T, message, context string, wants, forbidden []string) {
+	t.Helper()
+	assertNames(t, message, context, wants)
+	for _, unwanted := range forbidden {
+		if strings.Contains(message, unwanted) {
+			t.Errorf("%s = %q, must not mention %q", context, message, unwanted)
+		}
 	}
 }

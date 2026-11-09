@@ -112,9 +112,7 @@ func TestLoadedConfigDecodesTypedExecStartArguments(t *testing.T) {
 		"EnvironmentFiles": dbus.MakeVariant([]systemdEnvironmentFile{{Path: "/etc/hfdesk/cache file.env", IgnoreErrors: true}}),
 	}
 	got, err := loadedConfigFromProperties(properties)
-	if err != nil {
-		t.Fatalf("loadedConfigFromProperties() = %v", err)
-	}
+	assertNoError(t, err, "loadedConfigFromProperties() = %v", err)
 	if !got.loaded || got.execPath != wantArgs[0] || !slices.Equal(got.execArgs, wantArgs) || !slices.Equal(got.execFlags, []string{"full-privileges"}) {
 		t.Errorf("loaded ExecStart = %+v, want the typed argv and flags", got)
 	}
@@ -140,9 +138,7 @@ func TestLoadedConfigDecodesLegacyTypedExecStart(t *testing.T) {
 		"EnvironmentFiles": dbus.MakeVariant([]systemdEnvironmentFile{}),
 	}
 	got, err := loadedConfigFromProperties(properties)
-	if err != nil {
-		t.Fatalf("loadedConfigFromProperties() = %v", err)
-	}
+	assertNoError(t, err, "loadedConfigFromProperties() = %v", err)
 	if got.execPath != want[0] || !slices.Equal(got.execArgs, want) || got.ignoreErrors {
 		t.Errorf("legacy loaded ExecStart = %+v, want the lossless typed argv", got)
 	}
@@ -185,9 +181,7 @@ func TestDBusPropertiesFromCallPreservesTypedValues(t *testing.T) {
 		t.Fatalf("fixture signatures changed: ExecStartEx=%s EnvironmentFiles=%s", raw["ExecStartEx"].Signature(), raw["EnvironmentFiles"].Signature())
 	}
 	properties, err := dbusPropertiesFromCall(call)
-	if err != nil {
-		t.Fatalf("dbusPropertiesFromCall() = %v", err)
-	}
+	assertNoError(t, err, "dbusPropertiesFromCall() = %v", err)
 	if properties["ExecStartEx"].Signature().String() != "a(sasasttttuii)" || properties["EnvironmentFiles"].Signature().String() != "a(sb)" {
 		t.Errorf("production extraction changed signatures: ExecStartEx=%s EnvironmentFiles=%s", properties["ExecStartEx"].Signature(), properties["EnvironmentFiles"].Signature())
 	}
@@ -215,9 +209,8 @@ func TestSessionBusAddressUsesCurrentContextWithoutMutatingEnvironment(t *testin
 		t.Fatal(err)
 	}
 	const discovered = "unix:abstract=/tmp/hfdesk-test-session"
-	if err := os.WriteFile(filepath.Join(runtimeDir, "dbus-session"), []byte("DBUS_SESSION_BUS_ADDRESS="+discovered+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(filepath.Join(runtimeDir, "dbus-session"), []byte("DBUS_SESSION_BUS_ADDRESS="+discovered+"\n"), 0o600)
+	assertNoError(t, err, "")
 	if got := sessionBusAddress(); got != discovered {
 		t.Errorf("sessionBusAddress() = %q, want dbus-session-file address %q", got, discovered)
 	}
@@ -356,14 +349,10 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 	content := []byte(canonicalGoldenSystemUnitText)
 	t.Setenv("HOME", "/home/golden")
 	facts, err := readCanonicalUnit(content, ScopeSystem)
-	if err != nil {
-		t.Fatalf("readCanonicalUnit() = %v, want the facts of the golden machine-wide unit", err)
-	}
+	assertNoError(t, err, "readCanonicalUnit() = %v, want the facts of the golden machine-wide unit", err)
 
 	matching, err := loadedConfigFromProperties(systemdTestPropertiesFromUnit(string(content)))
-	if err != nil {
-		t.Fatalf("decode the matching typed configuration: %v", err)
-	}
+	assertNoError(t, err, "decode the matching typed configuration: %v", err)
 	if err := detectExecStartOverride(matching, facts, ScopeSystem); err != nil {
 		t.Errorf("detectExecStartOverride() over the matching command = %v, want nil", err)
 	}
@@ -395,18 +384,15 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 	writeDropIn := func(t *testing.T, name, body string) string {
 		t.Helper()
 		path := filepath.Join(t.TempDir(), name)
-		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-			t.Fatalf("write the drop-in: %v", err)
-		}
+		err := os.WriteFile(path, []byte(body), 0o644)
+		assertNoError(t, err, "write the drop-in: %v", err)
 		return path
 	}
 
 	t.Run("drop-in owns the effective command", func(t *testing.T) {
 		dropIn := writeDropIn(t, "local.conf", "[Service]\nExecStart="+strings.Join(override, " ")+"\n")
 		loaded, err := loadedConfigFromProperties(driftedProperties([]string{dropIn}))
-		if err != nil {
-			t.Fatalf("decode the typed override: %v", err)
-		}
+		assertNoError(t, err, "decode the typed override: %v", err)
 		err = detectExecStartOverride(loaded, facts, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the refusal of an overridden command")
@@ -424,9 +410,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		decoy := writeDropIn(t, "00-other.conf", "[Service]\nEnvironment=HF_HUB_CACHE=/operator/hub\n")
 		owner := writeDropIn(t, "local.conf", "[Service]\nExecStart="+strings.Join(override, " ")+"\n")
 		loaded, err := loadedConfigFromProperties(driftedProperties([]string{decoy, owner}))
-		if err != nil {
-			t.Fatalf("decode the typed override: %v", err)
-		}
+		assertNoError(t, err, "decode the typed override: %v", err)
 		err = detectExecStartOverride(loaded, facts, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the refusal of an overridden command")
@@ -443,9 +427,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		first := writeDropIn(t, "00-first.conf", "[Service]\nExecStart=/usr/bin/first --config /one.json\n")
 		last := writeDropIn(t, "local.conf", "[Service]\nExecStart="+strings.Join(override, " ")+"\n")
 		loaded, err := loadedConfigFromProperties(driftedProperties([]string{first, last}))
-		if err != nil {
-			t.Fatalf("decode the typed override: %v", err)
-		}
+		assertNoError(t, err, "decode the typed override: %v", err)
 		err = detectExecStartOverride(loaded, facts, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the refusal of an overridden command")
@@ -456,20 +438,15 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		// drop-ins no longer decides what the action covers), offers
 		// no alternative and stays a single action.
 		message := err.Error()
-		for _, want := range []string{
+		assertNamesWithout(t, message, "the refusal", []string{
 			"the update was refused and the registration was not changed",
 			"the drop-ins carrying the override: \"" + first + "\", \"" + last + "\"",
 			`Remove the "ExecStart=" override from each of them`,
 			"reload the unit files with \"",
 			`run "hfdesk service install" again`,
-		} {
-			if !strings.Contains(message, want) {
-				t.Errorf("the refusal %q does not contain %q", message, want)
-			}
-		}
-		if strings.Contains(message, " or ") {
-			t.Errorf("the refusal %q offers an alternative instead of one action", message)
-		}
+		}, []string{
+			" or ",
+		})
 		if got := strings.Count(message, `Remove the "ExecStart=" override`); got != 1 {
 			t.Errorf("the refusal %q states %d removal actions, want exactly one", message, got)
 		}
@@ -481,9 +458,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 	t.Run("a drop-in without an override names the reload", func(t *testing.T) {
 		custom := writeDropIn(t, "local.conf", "[Service]\nEnvironment=HF_HUB_CACHE=/operator/hub\n")
 		loaded, err := loadedConfigFromProperties(driftedProperties([]string{custom}))
-		if err != nil {
-			t.Fatalf("decode the typed override: %v", err)
-		}
+		assertNoError(t, err, "decode the typed override: %v", err)
 		err = detectExecStartOverride(loaded, facts, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the refusal of a drifted command")
@@ -496,9 +471,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 
 	t.Run("drift without a reported drop-in", func(t *testing.T) {
 		loaded, err := loadedConfigFromProperties(driftedProperties([]string{}))
-		if err != nil {
-			t.Fatalf("decode the typed override: %v", err)
-		}
+		assertNoError(t, err, "decode the typed override: %v", err)
 		err = detectExecStartOverride(loaded, facts, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the fail-closed refusal of a drifted command")
@@ -520,9 +493,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		t.Cleanup(func() { _ = os.Chmod(dropIn, 0o644) })
 
 		loaded, err := loadedConfigFromProperties(driftedProperties([]string{dropIn}))
-		if err != nil {
-			t.Fatalf("decode the typed override: %v", err)
-		}
+		assertNoError(t, err, "decode the typed override: %v", err)
 		err = detectExecStartOverride(loaded, facts, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the refusal over an unreadable drop-in")
@@ -531,15 +502,11 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		// override, so no command is named — a reload or a retry could
 		// not clear that state — and the refusal says it repeats until
 		// the override is removed.
-		for _, want := range []string{
+		assertNames(t, err.Error(), "the refusal", []string{
 			"cannot read every drop-in the supervisor reports",
 			"names no command",
 			"the refusal repeats until the ExecStart= override is removed",
-		} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("the refusal %q does not mention %q", err, want)
-			}
-		}
+		})
 		for _, unwanted := range []string{
 			`Reload the unit files with`,
 			`run "hfdesk service install"`,
@@ -564,9 +531,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		owner := writeDropIn(t, "local.conf", "[Service]\nExecStart="+strings.Join(override, " ")+"\n")
 
 		loaded, err := loadedConfigFromProperties(driftedProperties([]string{decoy, owner}))
-		if err != nil {
-			t.Fatalf("decode the typed override: %v", err)
-		}
+		assertNoError(t, err, "decode the typed override: %v", err)
 		err = detectExecStartOverride(loaded, facts, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the refusal over a partially unreadable drop-in set")
@@ -579,15 +544,11 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		// expectation FLIPS the earlier rule that named the readable
 		// holder beside an unreadable drop-in: there the named action
 		// did not clear the cause.
-		for _, want := range []string{
+		assertNames(t, err.Error(), "the refusal", []string{
 			"cannot read every drop-in the supervisor reports",
 			"names no command",
 			"the refusal repeats until the ExecStart= override is removed",
-		} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("the refusal %q does not mention %q", err, want)
-			}
-		}
+		})
 		for _, unwanted := range []string{
 			`Reload the unit files with`,
 			`run "hfdesk service install"`,
@@ -613,9 +574,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		owner := writeDropIn(t, "local.conf", "[Service]\nExecStart="+strings.Join(override, " ")+"\n")
 
 		loaded, err := loadedConfigFromProperties(driftedProperties([]string{vanished, owner}))
-		if err != nil {
-			t.Fatalf("decode the typed override: %v", err)
-		}
+		assertNoError(t, err, "decode the typed override: %v", err)
 		err = detectExecStartOverride(loaded, facts, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the refusal over a vanished drop-in")
@@ -632,9 +591,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		vanished := filepath.Join(t.TempDir(), "00-vanished.conf")
 
 		loaded, err := loadedConfigFromProperties(driftedProperties([]string{vanished}))
-		if err != nil {
-			t.Fatalf("decode the typed override: %v", err)
-		}
+		assertNoError(t, err, "decode the typed override: %v", err)
 		err = detectExecStartOverride(loaded, facts, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the refusal over a vanished drop-in")
@@ -654,9 +611,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		owner := writeDropIn(t, "local.conf", "[Service]\nExecStart="+strings.Join(override, " ")+"\n")
 
 		loaded, err := loadedConfigFromProperties(driftedProperties([]string{dirEntry, owner}))
-		if err != nil {
-			t.Fatalf("decode the typed override: %v", err)
-		}
+		assertNoError(t, err, "decode the typed override: %v", err)
 		err = detectExecStartOverride(loaded, facts, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the refusal over a directory entry")
@@ -668,9 +623,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		properties := systemdTestPropertiesFromUnit(string(content))
 		properties["ExecStartEx"] = dbus.MakeVariant([]systemdExecStartExEntry{{Path: argv[0], Argv: argv, Flags: []string{"full-privileges"}}})
 		loaded, err := loadedConfigFromProperties(properties)
-		if err != nil {
-			t.Fatalf("decode the typed command: %v", err)
-		}
+		assertNoError(t, err, "decode the typed command: %v", err)
 		err = detectExecStartOverride(loaded, facts, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the refusal of a command the file does not describe")
@@ -688,9 +641,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 func systemdLoadedFromDiskSeam(t *testing.T, manager *systemdManager) {
 	t.Helper()
 	path, err := manager.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath(): %v", err)
-	}
+	assertNoError(t, err, "unitPath(): %v", err)
 	manager.readServiceProperties = func(_ context.Context, name string) (map[string]dbus.Variant, error) {
 		if name != unitName {
 			return nil, fmt.Errorf("unexpected unit %q", name)
@@ -789,16 +740,12 @@ func TestSystemdDetectForeignRegistration(t *testing.T) {
 func assertNamesNoClearingCommand(t *testing.T, err error) {
 	t.Helper()
 	message := err.Error()
-	for _, want := range []string{
+	assertNames(t, message, "the refusal", []string{
 		"the update was refused and the registration was not changed",
 		"No file names where this registration comes from",
 		"whatever loaded it must remove it",
 		"refuses again until the supervisor no longer loads it",
-	} {
-		if !strings.Contains(message, want) {
-			t.Errorf("the refusal %q does not contain %q", message, want)
-		}
-	}
+	})
 	for _, unwanted := range []string{
 		"hfdesk service install",
 		"Move your customizations into",
@@ -835,9 +782,7 @@ func TestLoadedServicePropertiesRetriesALostReply(t *testing.T) {
 		}
 
 		properties, err := m.loadedServiceProperties(context.Background(), unitName)
-		if err != nil {
-			t.Fatalf("loadedServiceProperties() = %v, want the recovered read", err)
-		}
+		assertNoError(t, err, "loadedServiceProperties() = %v, want the recovered read", err)
 		if calls != loadedPropertiesReadAttempts {
 			t.Errorf("the read was attempted %d times, want the bounded %d", calls, loadedPropertiesReadAttempts)
 		}

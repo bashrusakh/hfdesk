@@ -14,9 +14,8 @@ import (
 func TestPublishStateRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "desktop-state.json")
 
-	if err := PublishState(path, "http://127.0.0.1:8080"); err != nil {
-		t.Fatalf("publish the state: %v", err)
-	}
+	err := PublishState(path, "http://127.0.0.1:8080")
+	assertNoError(t, err, "publish the state: %v", err)
 
 	state, ok := ReadPublishedState(path)
 	if !ok {
@@ -38,9 +37,8 @@ func TestPublishStateCreatesTheDirectory(t *testing.T) {
 	if err := PublishState(path, "http://127.0.0.1:8080"); err != nil {
 		t.Fatalf("publish the state: %v", err)
 	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("the published state is missing: %v", err)
-	}
+	_, err := os.Stat(path)
+	assertNoError(t, err, "the published state is missing: %v", err)
 }
 
 // TestReadPublishedStateToleratesAMissingOrBrokenFile proves that a state
@@ -63,9 +61,8 @@ func TestReadPublishedStateToleratesAMissingOrBrokenFile(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			path := filepath.Join(dir, c.name+".json")
 			if c.write {
-				if err := os.WriteFile(path, []byte(c.content), 0o600); err != nil {
-					t.Fatalf("write the state file: %v", err)
-				}
+				err := os.WriteFile(path, []byte(c.content), 0o600)
+				assertNoError(t, err, "write the state file: %v", err)
 			}
 			if _, ok := ReadPublishedState(path); ok {
 				t.Error("the unusable state file was accepted")

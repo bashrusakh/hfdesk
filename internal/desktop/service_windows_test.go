@@ -50,13 +50,9 @@ const testGateSingleton = `Local\HFDesk.Test.Gate.1`
 func requireFreeSingleton(t *testing.T) string {
 	t.Helper()
 	name, err := instanceMutexName()
-	if err != nil {
-		t.Fatalf("read the per-session singleton name: %v", err)
-	}
+	assertNoError(t, err, "read the per-session singleton name: %v", err)
 	probe, err := acquireInstanceLock()
-	if err != nil {
-		t.Fatalf("probe the per-session singleton: %v", err)
-	}
+	assertNoError(t, err, "probe the per-session singleton: %v", err)
 	if probe.Exists() {
 		probe.Release()
 		t.Skip("another desktop test or app owns the per-session singleton")
@@ -88,9 +84,7 @@ func recordMessagesWithSingletonProbe(t *testing.T) (*[]shownMessage, *[]bool) {
 func requireSingletonReleased(t *testing.T) {
 	t.Helper()
 	after, err := acquireInstanceLock()
-	if err != nil {
-		t.Fatalf("probe the per-session singleton after the action: %v", err)
-	}
+	assertNoError(t, err, "probe the per-session singleton after the action: %v", err)
 	if after.Exists() {
 		after.Release()
 		t.Fatal("the singleton survived the end of the action: a later launch would be refused as already running")
@@ -124,9 +118,8 @@ func testPEImage(t *testing.T, machine uint16) string {
 	binary.LittleEndian.PutUint16(optional, 0x20B) // PE32+
 	binary.LittleEndian.PutUint32(optional[16:], 1)
 	path := filepath.Join(t.TempDir(), "hfdesk.exe")
-	if err := os.WriteFile(path, image, 0o644); err != nil {
-		t.Fatalf("write the PE fixture: %v", err)
-	}
+	err := os.WriteFile(path, image, 0o644)
+	assertNoError(t, err, "write the PE fixture: %v", err)
 	return path
 }
 
@@ -358,9 +351,7 @@ func TestLaunchWithARunningServiceNeverStartsItsOwnServer(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("the launch with an installed service failed: %v", err)
-		}
+		assertNoError(t, err, "the launch with an installed service failed: %v", err)
 	case <-time.After(20 * time.Second):
 		t.Fatal("the launch with an installed service did not end: it started a server of its own")
 	}
@@ -423,9 +414,7 @@ func TestLaunchWithAnUnreadableServiceStartsNoServer(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("the launch with an unreadable service failed: %v", err)
-		}
+		assertNoError(t, err, "the launch with an unreadable service failed: %v", err)
 	case <-time.After(20 * time.Second):
 		t.Fatal("the launch with an unreadable service did not end: it started a server of its own")
 	}
@@ -496,7 +485,7 @@ func TestServiceGateEndsTheLaunchWhenTheRegistrationCannotBeRead(t *testing.T) {
 	if icon := uint32(windows.MB_ICONERROR); (*messages)[0].icon != icon {
 		t.Errorf("the icon is %d, want the error icon %d", (*messages)[0].icon, icon)
 	}
-	for _, want := range []string{
+	assertNames(t, (*messages)[0].text, "the notice", []string{
 		"the service control manager did not answer",
 		"may be installed and running",
 		"started no server",
@@ -504,11 +493,7 @@ func TestServiceGateEndsTheLaunchWhenTheRegistrationCannotBeRead(t *testing.T) {
 		"elevated shell",
 		"can then be started again",
 		"leaves the state unknown",
-	} {
-		if !strings.Contains((*messages)[0].text, want) {
-			t.Errorf("the notice %q does not mention %q", (*messages)[0].text, want)
-		}
-	}
+	})
 	// The read is the single action: the notice promises no relaunch that
 	// would show the same notice again when the read fails persistently.
 	if strings.Contains((*messages)[0].text, "then start the desktop app again") {
@@ -990,16 +975,12 @@ func TestTrayServiceInstallLaunchesTheHelperAfterTheConfirmation(t *testing.T) {
 		t.Fatal("the tray action did not hand the installation over to the helper")
 	}
 	t.Cleanup(handover.close)
-	for _, want := range []string{
+	assertNames(t, confirmed, "the confirmation", []string{
 		"starts at boot",
 		"administrator rights",
 		"its own data in ",
 		"do not appear in the service",
-	} {
-		if !strings.Contains(confirmed, want) {
-			t.Errorf("the confirmation %q does not mention %q", confirmed, want)
-		}
-	}
+	})
 	if len(launches) != 1 {
 		t.Fatalf("the tray action launched %d helpers, want one installation", len(launches))
 	}
@@ -1183,16 +1164,12 @@ func TestServiceHandoverFailureReportNamesTheStateCommand(t *testing.T) {
 		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 	}
 	text := (*messages)[0].text
-	for _, want := range []string{
+	assertNames(t, text, "the report", []string{
 		"could not confirm the graceful service handover",
 		"a successful completion signal and the desktop exits",
 		reason.Error(),
 		`"hfdesk service status"`,
-	} {
-		if !strings.Contains(text, want) {
-			t.Errorf("the report %q does not mention %q", text, want)
-		}
-	}
+	})
 	for _, unwanted := range []string{"Read the current service state", "before trying again"} {
 		if strings.Contains(text, unwanted) {
 			t.Errorf("the report %q asks for %q without naming the command", text, unwanted)
@@ -1243,15 +1220,11 @@ func TestTrayServiceInstallReadinessFailureKeepsRetryAvailable(t *testing.T) {
 	if firstAttempt.caption != serviceHelperNotReadyCaption {
 		t.Errorf("the caption is %q, want %q", firstAttempt.caption, serviceHelperNotReadyCaption)
 	}
-	for _, want := range []string{
+	assertNames(t, firstAttempt.text, "the first attempt report", []string{
 		"exited before it became ready",
 		"No service action was performed",
 		"shows its own message with the reason",
-	} {
-		if !strings.Contains(firstAttempt.text, want) {
-			t.Errorf("the first attempt report %q does not mention %q", firstAttempt.text, want)
-		}
-	}
+	})
 	if strings.Contains(firstAttempt.text, "could not start its administrator helper") {
 		t.Errorf("the first attempt report %q claims the helper could not be started although it was started",
 			firstAttempt.text)
@@ -1358,9 +1331,8 @@ func TestServiceHelperUpdateNeverStartsAStoppedService(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if err := RunServiceAction(ServiceActionOptions{Action: "update", Version: "1.3.0"}); err != nil {
-		t.Fatalf("the update of a stopped service failed: %v", err)
-	}
+	err := RunServiceAction(ServiceActionOptions{Action: "update", Version: "1.3.0"})
+	assertNoError(t, err, "the update of a stopped service failed: %v", err)
 
 	if manager.starts != 0 {
 		t.Fatalf("the update started the stopped service %d times, want it to stay stopped", manager.starts)
@@ -1408,9 +1380,8 @@ func TestServiceHelperUpdateKeepsARunningServiceRunning(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if err := RunServiceAction(ServiceActionOptions{Action: "update", Version: "1.3.0"}); err != nil {
-		t.Fatalf("the update of a running service failed: %v", err)
-	}
+	err := RunServiceAction(ServiceActionOptions{Action: "update", Version: "1.3.0"})
+	assertNoError(t, err, "the update of a running service failed: %v", err)
 	if manager.starts != 0 {
 		t.Errorf("the update started the running service itself, want the service layer to restart it")
 	}
@@ -1462,9 +1433,8 @@ func TestServiceHelperRendersOnlyTheManagerVersionResult(t *testing.T) {
 			})
 			messages := recordMessages(t)
 
-			if err := RunServiceAction(ServiceActionOptions{Action: "update", Version: tc.version}); err != nil {
-				t.Fatalf("the update failed: %v", err)
-			}
+			err := RunServiceAction(ServiceActionOptions{Action: "update", Version: tc.version})
+			assertNoError(t, err, "the update failed: %v", err)
 			if len(manager.installs) != 1 {
 				t.Fatalf("the update installed %d times, want one registration", len(manager.installs))
 			}
@@ -1519,9 +1489,8 @@ func TestServiceHelperUpdateKeepsTheRunningFactOfABrokenRegistration(t *testing.
 			})
 			messages := recordMessages(t)
 
-			if err := RunServiceAction(ServiceActionOptions{Action: "update", Version: "1.3.0"}); err != nil {
-				t.Fatalf("the update of the %s service failed: %v", tc.name, err)
-			}
+			err := RunServiceAction(ServiceActionOptions{Action: "update", Version: "1.3.0"})
+			assertNoError(t, err, "the update of the %s service failed: %v", tc.name, err)
 			if manager.starts != 0 {
 				t.Errorf("the update started the service %d times, want the service layer to decide", manager.starts)
 			}
@@ -1601,9 +1570,8 @@ func TestServiceHelperInstallStartsTheServiceAndReportsTheAddress(t *testing.T) 
 	})
 	messages := recordMessages(t)
 
-	if err := runHelperInstallForTest("1.3.0"); err != nil {
-		t.Fatalf("the installation failed: %v", err)
-	}
+	err := runHelperInstallForTest("1.3.0")
+	assertNoError(t, err, "the installation failed: %v", err)
 	if manager.starts != 1 {
 		t.Fatalf("the installation started the service %d times, want one start", manager.starts)
 	}
@@ -1740,15 +1708,11 @@ func TestHandoverFailureCarriesTheStateCommand(t *testing.T) {
 	reporter := &serviceActionReporter{action: serviceActionInstall}
 	reporter.handoverFailure(errors.New("the handover was not confirmed"))
 
-	for _, want := range []string{
+	assertNames(t, shown, "the report", []string{
 		"No service action was performed",
 		"the handover was not confirmed",
 		serviceStatusCommandText,
-	} {
-		if !strings.Contains(shown, want) {
-			t.Errorf("the report %q does not mention %q", shown, want)
-		}
-	}
+	})
 	if got := strings.Count(shown, "hfdesk service status"); got != 1 {
 		t.Errorf("the report %q names the state command %d times, want exactly one", shown, got)
 	}
@@ -1774,9 +1738,8 @@ func TestServiceHelperPassesTheVersionExpectationToTheServiceOwner(t *testing.T)
 	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) { return manager, nil })
 	recordMessages(t)
 
-	if err := runHelperInstallForTest("1.4.0"); err != nil {
-		t.Fatalf("the first installation failed: %v", err)
-	}
+	err := runHelperInstallForTest("1.4.0")
+	assertNoError(t, err, "the first installation failed: %v", err)
 	if len(manager.installs) != 1 || manager.installs[0].ExpectedVersion != "1.4.0" {
 		t.Fatalf("the service-owned install options are %+v, want expected version 1.4.0", manager.installs)
 	}
@@ -1845,9 +1808,7 @@ func TestServiceHelperKeepsAnUnconfirmedCleanupResult(t *testing.T) {
 func stubConsoleProgram(t *testing.T) {
 	t.Helper()
 	self, err := os.Executable()
-	if err != nil {
-		t.Fatalf("read the test executable: %v", err)
-	}
+	assertNoError(t, err, "read the test executable: %v", err)
 	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) { return self, nil })
 }
 
@@ -1888,9 +1849,8 @@ func TestServiceHelperRequiresBothSuccessfulShutdownAndDesktopExit(t *testing.T)
 	if err := windows.SetEvent(handover.parent); err != nil {
 		t.Fatalf("signal desktop exit: %v", err)
 	}
-	if err := <-done; err != nil {
-		t.Fatalf("the authorized installation failed: %v", err)
-	}
+	err := <-done
+	assertNoError(t, err, "the authorized installation failed: %v", err)
 	if len(manager.steps) != 1 || manager.steps[0] != "install-start" {
 		t.Fatalf("the helper used service steps %v, want one install after both signals", manager.steps)
 	}
@@ -1961,9 +1921,8 @@ func TestServiceHelperDoesNotReviveAfterHandoverTimeout(t *testing.T) {
 	if err := windows.SetEvent(lateSuccess); err != nil {
 		t.Fatalf("signal a late completion: %v", err)
 	}
-	if err := windows.SetEvent(lateParent); err != nil {
-		t.Fatalf("signal a late parent exit: %v", err)
-	}
+	err := windows.SetEvent(lateParent)
+	assertNoError(t, err, "signal a late parent exit: %v", err)
 	if len(manager.steps) != 0 {
 		t.Errorf("late handover signals revived service actions: %v", manager.steps)
 	}
@@ -2201,9 +2160,8 @@ func TestServiceHelperStartReportsTheAddress(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if err := RunServiceAction(ServiceActionOptions{Action: "start"}); err != nil {
-		t.Fatalf("the start of the service failed: %v", err)
-	}
+	err := RunServiceAction(ServiceActionOptions{Action: "start"})
+	assertNoError(t, err, "the start of the service failed: %v", err)
 	if manager.starts != 1 {
 		t.Fatalf("the helper started the service %d times, want one start", manager.starts)
 	}
@@ -2335,9 +2293,8 @@ func TestServiceHelperUpdateHoldsTheDesktopSingletonThroughItsMutation(t *testin
 	})
 	messages, existedAtNotice := recordMessagesWithSingletonProbe(t)
 
-	if err := RunServiceAction(ServiceActionOptions{Action: "update", InstanceMutex: name}); err != nil {
-		t.Fatalf("the update that holds the singleton failed: %v", err)
-	}
+	err := RunServiceAction(ServiceActionOptions{Action: "update", InstanceMutex: name})
+	assertNoError(t, err, "the update that holds the singleton failed: %v", err)
 	if len(manager.existedDuringMutation) != 1 || !manager.existedDuringMutation[0] {
 		t.Fatalf("the singleton existed during the mutation = %v, want [true]: a desktop launched in that window would start a second server",
 			manager.existedDuringMutation)
@@ -2369,9 +2326,8 @@ func TestServiceHelperStartHoldsTheDesktopSingletonThroughItsMutation(t *testing
 	})
 	messages, existedAtNotice := recordMessagesWithSingletonProbe(t)
 
-	if err := RunServiceAction(ServiceActionOptions{Action: "start", InstanceMutex: name}); err != nil {
-		t.Fatalf("the start that holds the singleton failed: %v", err)
-	}
+	err := RunServiceAction(ServiceActionOptions{Action: "start", InstanceMutex: name})
+	assertNoError(t, err, "the start that holds the singleton failed: %v", err)
 	if manager.starts != 1 {
 		t.Fatalf("the helper started the service %d times, want one start", manager.starts)
 	}
@@ -2466,9 +2422,8 @@ func TestServiceHelperComputesTheSingletonWhenTheFlagIsAbsent(t *testing.T) {
 			})
 			messages, existedAtNotice := recordMessagesWithSingletonProbe(t)
 
-			if err := RunServiceAction(ServiceActionOptions{Action: string(tc.action)}); err != nil {
-				t.Fatalf("the %s without a singleton argument failed: %v", tc.action, err)
-			}
+			err := RunServiceAction(ServiceActionOptions{Action: string(tc.action)})
+			assertNoError(t, err, "the %s without a singleton argument failed: %v", tc.action, err)
 			if len(manager.existedDuringMutation) != 1 || !manager.existedDuringMutation[0] {
 				t.Fatalf("the singleton existed during the mutation = %v, want [true] for the computed name %q: a launch in that window would start a second server",
 					manager.existedDuringMutation, name)
@@ -2514,13 +2469,9 @@ func TestServiceHelperRefusesWhenTheSingletonCannotBeEstablished(t *testing.T) {
 			if len(*messages) != 1 {
 				t.Fatalf("the helper showed %d message boxes, want the refusal of the action", len(*messages))
 			}
-			for _, want := range []string{
+			assertNames(t, (*messages)[0].text, "the report", []string{
 				tc.result, "No service action was performed", "cannot be named", "hfdesk service status",
-			} {
-				if !strings.Contains((*messages)[0].text, want) {
-					t.Errorf("the report %q does not mention %q", (*messages)[0].text, want)
-				}
-			}
+			})
 		})
 	}
 }
@@ -2603,9 +2554,8 @@ func TestServiceHelperProceedsWhenTheSingletonGrantsOnlyReadControl(t *testing.T
 	})
 	messages, existedAtNotice := recordMessagesWithSingletonProbe(t)
 
-	if err := RunServiceAction(ServiceActionOptions{Action: "update"}); err != nil {
-		t.Fatalf("the update refused although its descriptor grants this identity read control: %v", err)
-	}
+	err := RunServiceAction(ServiceActionOptions{Action: "update"})
+	assertNoError(t, err, "the update refused although its descriptor grants this identity read control: %v", err)
 	if len(manager.existedDuringMutation) != 1 || !manager.existedDuringMutation[0] {
 		t.Fatalf("the singleton existed during the mutation = %v, want [true]: the read-control open of the hold must keep the object alive",
 			manager.existedDuringMutation)
@@ -2630,9 +2580,7 @@ func TestServiceHoldBehavesLikeTheDesktopInstanceLock(t *testing.T) {
 	name := requireFreeSingleton(t)
 
 	release, err := service.HoldDesktopSingleton(name)
-	if err != nil {
-		t.Fatalf("hold the singleton through the service layer: %v", err)
-	}
+	assertNoError(t, err, "hold the singleton through the service layer: %v", err)
 
 	lock, err := acquireInstanceLock()
 	if err != nil {
@@ -2698,9 +2646,7 @@ func TestServiceHoldBehavesLikeTheDesktopInstanceLock(t *testing.T) {
 	release()
 
 	probe, err := acquireInstanceLock()
-	if err != nil {
-		t.Fatalf("probe the singleton after the hold ended: %v", err)
-	}
+	assertNoError(t, err, "probe the singleton after the hold ended: %v", err)
 	if probe.Exists() {
 		probe.Release()
 		t.Fatal("the singleton survived the end of the hold: a later launch would be refused as already running")
@@ -2721,17 +2667,13 @@ func createDeniedDesktopSingleton(t *testing.T, name string) {
 	descriptor, err := windows.SecurityDescriptorFromString(
 		fmt.Sprintf("D:P(D;;0x%08X;;;S-1-3-4)(A;;0x%08X;;;S-1-3-4)(A;;0x%08X;;;SY)",
 			uint32(windows.READ_CONTROL), uint32(windows.SYNCHRONIZE), uint32(windows.MUTEX_ALL_ACCESS)))
-	if err != nil {
-		t.Fatalf("build the denying descriptor: %v", err)
-	}
+	assertNoError(t, err, "build the denying descriptor: %v", err)
 	attrs := &windows.SecurityAttributes{
 		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
 		SecurityDescriptor: descriptor,
 	}
 	namePtr, err := windows.UTF16PtrFromString(name)
-	if err != nil {
-		t.Fatalf("encode the singleton name: %v", err)
-	}
+	assertNoError(t, err, "encode the singleton name: %v", err)
 	handle, err := windows.CreateMutex(attrs, false, namePtr)
 	if handle == 0 {
 		if err == nil {
@@ -2756,22 +2698,16 @@ func createDeniedDesktopSingleton(t *testing.T, name string) {
 func createReadControlDesktopSingleton(t *testing.T, name string) windows.Handle {
 	t.Helper()
 	sid, err := currentUserSID()
-	if err != nil {
-		t.Fatalf("read the user of the process: %v", err)
-	}
+	assertNoError(t, err, "read the user of the process: %v", err)
 	descriptor, err := windows.SecurityDescriptorFromString(
 		fmt.Sprintf("D:P(A;;0x%08X;;;%s)", uint32(windows.READ_CONTROL), sid))
-	if err != nil {
-		t.Fatalf("build the read-control descriptor: %v", err)
-	}
+	assertNoError(t, err, "build the read-control descriptor: %v", err)
 	attrs := &windows.SecurityAttributes{
 		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
 		SecurityDescriptor: descriptor,
 	}
 	namePtr, err := windows.UTF16PtrFromString(name)
-	if err != nil {
-		t.Fatalf("encode the singleton name: %v", err)
-	}
+	assertNoError(t, err, "encode the singleton name: %v", err)
 	handle, err := windows.CreateMutex(attrs, false, namePtr)
 	if handle == 0 {
 		if err == nil {
@@ -2879,18 +2815,14 @@ func TestServiceGateRechecksTheStateBeforeDesktopMode(t *testing.T) {
 	if caption := serviceGateChangedCaption; (*messages)[0].caption != caption {
 		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 	}
-	for _, want := range []string{
+	assertNames(t, (*messages)[0].text, "the notice", []string{
 		"changed while the dialog was open",
 		"running now",
 		"started no server",
 		"hfdesk service status",
 		"can then be started again",
 		"leaves the state unknown",
-	} {
-		if !strings.Contains((*messages)[0].text, want) {
-			t.Errorf("the notice %q does not mention %q", (*messages)[0].text, want)
-		}
-	}
+	})
 	// The read is the single action of the changed-state notice as well:
 	// no imperative relaunch may promise a retry that shows this notice
 	// again when the state keeps changing or stays unreadable.
@@ -2991,9 +2923,8 @@ func TestServiceHelperInstallRejectsABadImageBeforeReady(t *testing.T) {
 			name: "not a Windows program",
 			image: func(t *testing.T) string {
 				path := filepath.Join(t.TempDir(), "hfdesk.exe")
-				if err := os.WriteFile(path, []byte(strings.Repeat("this is not a program\n", 8)), 0o644); err != nil {
-					t.Fatalf("write the fixture: %v", err)
-				}
+				err := os.WriteFile(path, []byte(strings.Repeat("this is not a program\n", 8)), 0o644)
+				assertNoError(t, err, "write the fixture: %v", err)
 				return path
 			},
 			want: "no MZ signature",
@@ -3002,9 +2933,8 @@ func TestServiceHelperInstallRejectsABadImageBeforeReady(t *testing.T) {
 			name: "truncated image",
 			image: func(t *testing.T) string {
 				path := filepath.Join(t.TempDir(), "hfdesk.exe")
-				if err := os.WriteFile(path, []byte("MZ"), 0o644); err != nil {
-					t.Fatalf("write the fixture: %v", err)
-				}
+				err := os.WriteFile(path, []byte("MZ"), 0o644)
+				assertNoError(t, err, "write the fixture: %v", err)
 				return path
 			},
 			want: "read the DOS header",
@@ -3092,9 +3022,8 @@ func TestServiceHelperInstallSignalsReadyAfterAPassedPreflight(t *testing.T) {
 	if err := windows.SetEvent(handover.parent); err != nil {
 		t.Fatalf("signal desktop exit: %v", err)
 	}
-	if err := <-done; err != nil {
-		t.Fatalf("the authorized installation failed: %v", err)
-	}
+	err := <-done
+	assertNoError(t, err, "the authorized installation failed: %v", err)
 	if len(manager.steps) != 1 || manager.steps[0] != "install-start" {
 		t.Fatalf("the helper used service steps %v, want one install after authorization", manager.steps)
 	}
@@ -3120,9 +3049,7 @@ func TestServiceHelperRefusesAStartBesideAServingDesktop(t *testing.T) {
 	// The desktop instance of this session keeps the singleton held, so the
 	// probe around the hold of the action finds the object alive.
 	lock, err := acquireInstanceLock()
-	if err != nil {
-		t.Fatalf("acquire the desktop singleton of this session: %v", err)
-	}
+	assertNoError(t, err, "acquire the desktop singleton of this session: %v", err)
 
 	stopped := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
 	manager := &fakeServiceManager{statuses: []service.Status{stopped}}
@@ -3148,14 +3075,10 @@ func TestServiceHelperRefusesAStartBesideAServingDesktop(t *testing.T) {
 		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 	}
 	text := (*messages)[0].text
-	for _, want := range []string{
+	assertNames(t, text, "the report", []string{
 		"could not start", "No service action was performed",
 		"serves its local server", "notification-area icon",
-	} {
-		if !strings.Contains(text, want) {
-			t.Errorf("the report %q does not mention %q", text, want)
-		}
-	}
+	})
 	if strings.Contains(text, "hfdesk service status") {
 		t.Errorf("the report %q carries a second next action next to the quit of the desktop", text)
 	}
@@ -3176,9 +3099,7 @@ func TestServiceHelperRefusesAnUpdateOfARunningServiceBesideAServingDesktop(t *t
 	}
 
 	lock, err := acquireInstanceLock()
-	if err != nil {
-		t.Fatalf("acquire the desktop singleton of this session: %v", err)
-	}
+	assertNoError(t, err, "acquire the desktop singleton of this session: %v", err)
 	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
@@ -3207,14 +3128,10 @@ func TestServiceHelperRefusesAnUpdateOfARunningServiceBesideAServingDesktop(t *t
 		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 	}
 	text := (*messages)[0].text
-	for _, want := range []string{
+	assertNames(t, text, "the report", []string{
 		"could not update", "No service action was performed",
 		"serves its local server", "notification-area icon",
-	} {
-		if !strings.Contains(text, want) {
-			t.Errorf("the report %q does not mention %q", text, want)
-		}
-	}
+	})
 	if strings.Contains(text, "hfdesk service status") {
 		t.Errorf("the report %q carries a second next action next to the quit of the desktop", text)
 	}
@@ -3238,9 +3155,7 @@ func TestServiceHelperUpdateOfAStoppedServiceProceedsBesideAServingDesktop(t *te
 	// probe around the hold of the action finds the object alive: both
 	// facts of the serving-desktop check are true in this test.
 	lock, err := acquireInstanceLock()
-	if err != nil {
-		t.Fatalf("acquire the desktop singleton of this session: %v", err)
-	}
+	assertNoError(t, err, "acquire the desktop singleton of this session: %v", err)
 	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
 		return `C:\portable\hfdesk.exe`, nil
 	})
@@ -3289,9 +3204,8 @@ func TestServiceHelperStartProceedsWhenNoDesktopHoldsTheSingleton(t *testing.T) 
 	})
 	messages := recordMessages(t)
 
-	if err := RunServiceAction(ServiceActionOptions{Action: "start"}); err != nil {
-		t.Fatalf("the start refused although no process of this session holds the singleton: %v", err)
-	}
+	err := RunServiceAction(ServiceActionOptions{Action: "start"})
+	assertNoError(t, err, "the start refused although no process of this session holds the singleton: %v", err)
 	if manager.starts != 1 {
 		t.Errorf("the helper started the service %d times, want one start", manager.starts)
 	}

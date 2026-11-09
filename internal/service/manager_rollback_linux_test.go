@@ -148,9 +148,8 @@ func TestSystemdFailedRestartRestoresThePreviousRegistration(t *testing.T) {
 	previous := systemdExistingOptions(t, oldExecutable, root)
 	previous.Listen = "127.0.0.1:" + strconv.Itoa(freePort(t))
 	for _, dir := range []string{filepath.Dir(previous.Paths.ConfigFile), previous.Paths.StateDir, previous.Paths.LogDir} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		err := os.MkdirAll(dir, 0o700)
+		assertNoError(t, err, "")
 	}
 
 	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
@@ -220,9 +219,7 @@ func TestSystemdRollbackReloadFailureDoesNotRestartOrClaimRecovery(t *testing.T)
 	// value and an environment file the base file does not; the snapshot
 	// below is what the update has to preserve.
 	home, err := unitHomeDir(previous)
-	if err != nil {
-		t.Fatalf("unitHomeDir() = %v", err)
-	}
+	assertNoError(t, err, "unitHomeDir() = %v", err)
 	oldEnvironment := []string{"HF_HUB_CACHE=/operator/hub", "HOME=" + home}
 	oldProperties := systemdTestPropertiesFromUnit(previousUnit)
 	oldProperties["Environment"] = dbus.MakeVariant(oldEnvironment)
@@ -230,9 +227,7 @@ func TestSystemdRollbackReloadFailureDoesNotRestartOrClaimRecovery(t *testing.T)
 	// proof never runs here because V1 fails first.
 	oldProperties["MainPID"] = dbus.MakeVariant(uint32(4242))
 	oldConfig, err := loadedConfigFromProperties(oldProperties)
-	if err != nil {
-		t.Fatalf("decode the previous typed manager properties: %v", err)
-	}
+	assertNoError(t, err, "decode the previous typed manager properties: %v", err)
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_DAEMON_RELOAD_FAIL_AT", "2")
 
@@ -274,9 +269,7 @@ func TestSystemdRollbackReloadFailureDoesNotRestartOrClaimRecovery(t *testing.T)
 		t.Errorf("the supervisor-loaded command does not distinguish the failed update: %+v", loaded)
 	}
 	loadedConfig, err := loadedConfigFromProperties(updatedProperties)
-	if err != nil {
-		t.Fatalf("decode the still-loaded typed manager properties: %v", err)
-	}
+	assertNoError(t, err, "decode the still-loaded typed manager properties: %v", err)
 	if loadedConfig.execPath != executable || runArgValue(loadedConfig.execArgs[1:], "--listen") != previous.Listen || runArgValue(loadedConfig.execArgs[1:], "--config") == previous.Paths.ConfigFile || slices.Equal(loadedConfig.environment, oldConfig.environment) {
 		t.Errorf("typed loaded state = %+v, want same executable/listen but changed config and environment", loadedConfig)
 	}
@@ -336,16 +329,12 @@ func TestSystemdActiveUnitThatDoesNotServeIsAFailedUpdate(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want the failure of the verification of the instance that does not serve")
 	}
-	for _, want := range []string{
+	assertNames(t, err.Error(), "Install()", []string{
 		"does not answer on",
 		previous.Listen,
 		"the previous registration was restored",
 		"the previous instance was started again",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
-		}
-	}
+	})
 
 	content, readErr := os.ReadFile(unitPath)
 	if readErr != nil {
@@ -456,15 +445,11 @@ func TestSystemdRestoreThatIsNotConfirmedIsNotReportedAsStartedAgain(t *testing.
 	if err == nil {
 		t.Fatal("Install() = nil, want the unconfirmed state of the new executable")
 	}
-	for _, want := range []string{
+	assertNames(t, err.Error(), "Install()", []string{
 		"the registration was restored",
 		"the restart of the previous instance was issued",
 		"but the restart was not confirmed",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
-		}
-	}
+	})
 	if strings.Contains(err.Error(), "the previous instance was started again") {
 		t.Errorf("Install() = %q, want no claim that the previous instance was started again", err)
 	}
@@ -508,9 +493,8 @@ show)
 esac
 exit 0
 `
-	if err := os.WriteFile(filepath.Join(dir, "systemctl"), []byte(script), 0o755); err != nil {
-		t.Fatalf("write the scripted supervisor: %v", err)
-	}
+	err := os.WriteFile(filepath.Join(dir, "systemctl"), []byte(script), 0o755)
+	assertNoError(t, err, "write the scripted supervisor: %v", err)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("HFDESK_TEST_ROLLBACK_LOG", logPath)
 	return logPath
@@ -535,9 +519,7 @@ func TestSystemdRollbackReportsWhyTheRestoredStateIsUnknown(t *testing.T) {
 	canonicalFacts := func(t *testing.T, opts InstallOptions) canonicalUnit {
 		t.Helper()
 		facts, err := canonicalUnitForInstall(opts, nil)
-		if err != nil {
-			t.Fatalf("canonicalUnitForInstall() = %v, want nil", err)
-		}
+		assertNoError(t, err, "canonicalUnitForInstall() = %v, want nil", err)
 		return facts
 	}
 
@@ -545,14 +527,10 @@ func TestSystemdRollbackReportsWhyTheRestoredStateIsUnknown(t *testing.T) {
 		logPath := systemdRollbackScriptedSupervisor(t)
 		m := &systemdManager{scope: ScopeUser}
 		path, err := m.unitPath()
-		if err != nil {
-			t.Fatalf("unitPath() = %v, want nil", err)
-		}
+		assertNoError(t, err, "unitPath() = %v, want nil", err)
 		opts := previousOptions(t)
 		content, err := renderCanonicalUnit(canonicalFacts(t, opts))
-		if err != nil {
-			t.Fatalf("renderCanonicalUnit() = %v, want nil", err)
-		}
+		assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
 		// The file existed and was not loaded before the update, and the
 		// supervisor still does not know the unit after the rollback
 		// reload: the restored registration is not established.
@@ -566,14 +544,10 @@ func TestSystemdRollbackReportsWhyTheRestoredStateIsUnknown(t *testing.T) {
 		if !errors.Is(err, failure) {
 			t.Errorf("reportUnitRollback() = %v, want the original failure preserved", err)
 		}
-		for _, want := range []string{
+		assertNames(t, err.Error(), "reportUnitRollback()", []string{
 			"could not be restored or verified",
 			"the restored unit remains unknown to systemd",
-		} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("reportUnitRollback() = %q, want the cause %q", err, want)
-			}
-		}
+		})
 		if strings.Contains(err.Error(), "started again") || strings.Contains(err.Error(), "were restored") {
 			t.Errorf("reportUnitRollback() = %q, must not claim a restore it could not prove", err)
 		}
@@ -594,14 +568,10 @@ func TestSystemdRollbackReportsWhyTheRestoredStateIsUnknown(t *testing.T) {
 		logPath := systemdRollbackScriptedSupervisor(t)
 		m := &systemdManager{scope: ScopeUser}
 		path, err := m.unitPath()
-		if err != nil {
-			t.Fatalf("unitPath() = %v, want nil", err)
-		}
+		assertNoError(t, err, "unitPath() = %v, want nil", err)
 		opts := previousOptions(t)
 		content, err := renderCanonicalUnit(canonicalFacts(t, opts))
-		if err != nil {
-			t.Fatalf("renderCanonicalUnit() = %v, want nil", err)
-		}
+		assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
 		// The supervisor loads a unit again after the rollback reload, but
 		// the typed command it reports is not the command of the restored
 		// file, so the restore is not established.
@@ -620,14 +590,10 @@ func TestSystemdRollbackReportsWhyTheRestoredStateIsUnknown(t *testing.T) {
 		if !errors.Is(err, failure) {
 			t.Errorf("reportUnitRollback() = %v, want the original failure preserved", err)
 		}
-		for _, want := range []string{
+		assertNames(t, err.Error(), "reportUnitRollback()", []string{
 			"could not be restored or verified",
 			"its command did not load",
-		} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("reportUnitRollback() = %q, want the cause %q", err, want)
-			}
-		}
+		})
 		if strings.Contains(err.Error(), "started again") || strings.Contains(err.Error(), "were restored") {
 			t.Errorf("reportUnitRollback() = %q, must not claim a restore it could not prove", err)
 		}
@@ -643,9 +609,7 @@ func TestSystemdRollbackReportsWhyTheRestoredStateIsUnknown(t *testing.T) {
 		_ = systemdRollbackScriptedSupervisor(t)
 		m := &systemdManager{scope: ScopeUser}
 		path, err := m.unitPath()
-		if err != nil {
-			t.Fatalf("unitPath() = %v, want nil", err)
-		}
+		assertNoError(t, err, "unitPath() = %v, want nil", err)
 		opts := previousOptions(t)
 		// The failed first installation had removed its file, but the
 		// supervisor loaded a fragment before it: after the rollback the
@@ -653,9 +617,7 @@ func TestSystemdRollbackReportsWhyTheRestoredStateIsUnknown(t *testing.T) {
 		t.Setenv("HFDESK_TEST_ROLLBACK_LOAD_STATE", "not-found")
 		previousProps := systemdTestPropertiesFromUnit(mustRenderCanonical(t, opts))
 		loaded, err := loadedConfigFromProperties(previousProps)
-		if err != nil {
-			t.Fatalf("decode the captured fragment: %v", err)
-		}
+		assertNoError(t, err, "decode the captured fragment: %v", err)
 		if !loaded.loaded {
 			t.Fatal("the captured fragment fixture is not a loaded registration")
 		}
@@ -665,14 +627,10 @@ func TestSystemdRollbackReportsWhyTheRestoredStateIsUnknown(t *testing.T) {
 		if !errors.Is(err, failure) {
 			t.Errorf("reportUnitRollback() = %v, want the original failure preserved", err)
 		}
-		for _, want := range []string{
+		assertNames(t, err.Error(), "reportUnitRollback()", []string{
 			"could not be restored or verified",
 			"systemd did not restore the loaded fragment after the override was removed",
-		} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("reportUnitRollback() = %q, want the cause %q", err, want)
-			}
-		}
+		})
 		if strings.Contains(err.Error(), "started again") {
 			t.Errorf("reportUnitRollback() = %q, must not claim a restarted instance", err)
 		}
@@ -688,9 +646,7 @@ func TestSystemdRollbackReportsWhyTheRestoredStateIsUnknown(t *testing.T) {
 		_ = systemdRollbackScriptedSupervisor(t)
 		m := &systemdManager{scope: ScopeUser}
 		path, err := m.unitPath()
-		if err != nil {
-			t.Fatalf("unitPath() = %v, want nil", err)
-		}
+		assertNoError(t, err, "unitPath() = %v, want nil", err)
 		// The failed first installation knew no loaded registration, its
 		// file is removed again, and yet the supervisor reports a loaded
 		// unit: the removal did not take effect and that is the cause.
@@ -706,14 +662,10 @@ func TestSystemdRollbackReportsWhyTheRestoredStateIsUnknown(t *testing.T) {
 		if !errors.Is(err, failure) {
 			t.Errorf("reportUnitRollback() = %v, want the original failure preserved", err)
 		}
-		for _, want := range []string{
+		assertNames(t, err.Error(), "reportUnitRollback()", []string{
 			"could not be restored or verified",
 			"the failed unit is still loaded after its file was removed",
-		} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("reportUnitRollback() = %q, want the cause %q", err, want)
-			}
-		}
+		})
 		if strings.Contains(err.Error(), "started again") {
 			t.Errorf("reportUnitRollback() = %q, must not claim a restarted instance", err)
 		}
@@ -731,12 +683,8 @@ func TestSystemdRollbackReportsWhyTheRestoredStateIsUnknown(t *testing.T) {
 func mustRenderCanonical(t *testing.T, opts InstallOptions) string {
 	t.Helper()
 	facts, err := canonicalUnitForInstall(opts, nil)
-	if err != nil {
-		t.Fatalf("canonicalUnitForInstall() = %v, want nil", err)
-	}
+	assertNoError(t, err, "canonicalUnitForInstall() = %v, want nil", err)
 	content, err := renderCanonicalUnit(facts)
-	if err != nil {
-		t.Fatalf("renderCanonicalUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
 	return content
 }

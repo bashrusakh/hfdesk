@@ -82,9 +82,8 @@ func unitDirective(unit, key string) string {
 func systemdTestExecutable(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "hfdesk")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
-		t.Fatalf("write the program: %v", err)
-	}
+	err := os.WriteFile(path, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755)
+	assertNoError(t, err, "write the program: %v", err)
 	return path
 }
 
@@ -329,9 +328,8 @@ restart)
 esac
 exit 0
 `
-	if err := os.WriteFile(filepath.Join(dir, "systemctl"), []byte(script), 0o755); err != nil {
-		t.Fatalf("write the fake supervisor: %v", err)
-	}
+	err := os.WriteFile(filepath.Join(dir, "systemctl"), []byte(script), 0o755)
+	assertNoError(t, err, "write the fake supervisor: %v", err)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_LOG", logPath)
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT", filepath.Join(dir, "loaded-unit"))
@@ -352,9 +350,7 @@ func systemdSupervisorCalls(t *testing.T, logPath string) []string {
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
-	if err != nil {
-		t.Fatalf("read the supervisor log: %v", err)
-	}
+	assertNoError(t, err, "read the supervisor log: %v", err)
 	return strings.Split(strings.TrimSuffix(string(content), "\n"), "\n")
 }
 

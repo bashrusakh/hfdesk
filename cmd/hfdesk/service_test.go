@@ -125,9 +125,8 @@ func writePublishedDesktopState(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(state), 0o755); err != nil {
 		t.Fatalf("create the temporary configuration directory: %v", err)
 	}
-	if err := os.WriteFile(state, []byte(`{"url":"http://127.0.0.1:1","pid":1}`), 0o600); err != nil {
-		t.Fatalf("publish the desktop state: %v", err)
-	}
+	err := os.WriteFile(state, []byte(`{"url":"http://127.0.0.1:1","pid":1}`), 0o600)
+	assertNoError(t, err, "publish the desktop state: %v", err)
 }
 
 // platformFactsByName holds the facts of the platforms of the service
@@ -183,9 +182,7 @@ func scopeOfPlatform(t *testing.T, goos string) service.Scope {
 
 	usePlatform(t, goos)
 	scope, err := resolveScope(false, false)
-	if err != nil {
-		t.Fatalf("the default scope of %s must resolve: %v", goos, err)
-	}
+	assertNoError(t, err, "the default scope of %s must resolve: %v", goos, err)
 	return scope
 }
 
@@ -206,9 +203,7 @@ func personalCacheRoot(t *testing.T) string {
 func writeConfigFile(t *testing.T, path, cacheRoot string) {
 	t.Helper()
 	data, err := json.Marshal(map[string]string{"cache-dir": cacheRoot})
-	if err != nil {
-		t.Fatalf("encode the config file: %v", err)
-	}
+	assertNoError(t, err, "encode the config file: %v", err)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write the config file: %v", err)
 	}
@@ -474,9 +469,7 @@ func TestBuildInstallOptionsCarriesTheServiceUser(t *testing.T) {
 			usePlatform(t, tc.goos)
 
 			opts, err := buildInstallOptions(service.ScopeSystem, installFlags{}, executable)
-			if err != nil {
-				t.Fatalf("build the install options: %v", err)
-			}
+			assertNoError(t, err, "build the install options: %v", err)
 			if opts.ServiceUser != "" {
 				t.Errorf("the service account is %q, want it to be unset", opts.ServiceUser)
 			}
@@ -494,9 +487,7 @@ func TestBuildInstallOptionsCarriesTheServiceUser(t *testing.T) {
 				}
 				return
 			}
-			if err != nil {
-				t.Fatalf("build the install options: %v", err)
-			}
+			assertNoError(t, err, "build the install options: %v", err)
 			if opts.ServiceUser != "hfdesk-svc" {
 				t.Errorf("the service account is %q, want %q", opts.ServiceUser, "hfdesk-svc")
 			}
@@ -546,9 +537,7 @@ func TestBuildInstallOptionsKeepsTheServiceUserOnLinuxAndMacOS(t *testing.T) {
 			usePlatform(t, goos)
 
 			opts, err := buildInstallOptions(service.ScopeSystem, installFlags{serviceUser: "hfdesk-svc"}, "/usr/local/bin/hfdesk")
-			if err != nil {
-				t.Fatalf("build the install options: %v", err)
-			}
+			assertNoError(t, err, "build the install options: %v", err)
 			if opts.ServiceUser != "hfdesk-svc" {
 				t.Errorf("the service account is %q, want %q", opts.ServiceUser, "hfdesk-svc")
 			}
@@ -1035,17 +1024,13 @@ func TestServiceScopeDefaults(t *testing.T) {
 			usePlatform(t, tc.goos)
 
 			scope, err := resolveScope(false, false)
-			if err != nil {
-				t.Fatalf("the default scope must resolve: %v", err)
-			}
+			assertNoError(t, err, "the default scope must resolve: %v", err)
 			if scope != tc.scope {
 				t.Errorf("the default scope on %s is %q, want %q", tc.goos, scope, tc.scope)
 			}
 
 			system, err := resolveScope(false, true)
-			if err != nil {
-				t.Fatalf("the system scope must resolve: %v", err)
-			}
+			assertNoError(t, err, "the system scope must resolve: %v", err)
 			if system != service.ScopeSystem {
 				t.Errorf("the system scope is %q, want %q", system, service.ScopeSystem)
 			}
@@ -1063,9 +1048,7 @@ func TestServiceScopeDefaults(t *testing.T) {
 				}
 				return
 			}
-			if err != nil {
-				t.Fatalf("the user scope must resolve: %v", err)
-			}
+			assertNoError(t, err, "the user scope must resolve: %v", err)
 			if user != service.ScopeUser {
 				t.Errorf("the user scope is %q, want %q", user, service.ScopeUser)
 			}
@@ -1085,9 +1068,7 @@ func TestServiceListenValidation(t *testing.T) {
 	}
 
 	listen, err := validateListen("127.0.0.1:9090")
-	if err != nil {
-		t.Fatalf("a loopback address must be accepted: %v", err)
-	}
+	assertNoError(t, err, "a loopback address must be accepted: %v", err)
 	if listen != "127.0.0.1:9090" {
 		t.Errorf("the listen address is %q, want %q", listen, "127.0.0.1:9090")
 	}
@@ -1150,9 +1131,7 @@ func TestBuildInstallOptionsUsesTheDefaultsOfTheScope(t *testing.T) {
 			cacheRoot, hubDir := service.DefaultCacheDirs(scope, defaults)
 
 			opts, err := buildInstallOptions(scope, installFlags{}, executable)
-			if err != nil {
-				t.Fatalf("build the install options: %v", err)
-			}
+			assertNoError(t, err, "build the install options: %v", err)
 
 			if opts.Scope != scope {
 				t.Errorf("the scope is %q, want %q", opts.Scope, scope)
@@ -1193,9 +1172,7 @@ func TestBuildInstallOptionsAppliesTheOverrides(t *testing.T) {
 	}
 
 	opts, err := buildInstallOptions(service.ScopeSystem, flags, executable)
-	if err != nil {
-		t.Fatalf("build the install options: %v", err)
-	}
+	assertNoError(t, err, "build the install options: %v", err)
 
 	if opts.Scope != service.ScopeSystem {
 		t.Errorf("the scope is %q, want %q", opts.Scope, service.ScopeSystem)
@@ -1295,9 +1272,7 @@ func TestBuildInstallOptionsKeepsTheCacheLayoutTogether(t *testing.T) {
 			} {
 				t.Run(c.name, func(t *testing.T) {
 					opts, err := buildInstallOptions(scope, c.flags, executable)
-					if err != nil {
-						t.Fatalf("build the install options: %v", err)
-					}
+					assertNoError(t, err, "build the install options: %v", err)
 					if opts.CacheDir != c.wantRoot {
 						t.Errorf("the cache root is %q, want %q", opts.CacheDir, c.wantRoot)
 					}
@@ -1822,9 +1797,8 @@ func TestServiceInstallAcceptsAnExistingExecutable(t *testing.T) {
 	program := filepath.Join(dir, "hfdesk")
 	// The file carries no execute bit: the command line does not look at
 	// the permission bits.
-	if err := os.WriteFile(program, []byte("not a program\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(program, []byte("not a program\n"), 0o644)
+	assertNoError(t, err, "")
 
 	var stdout, stderr bytes.Buffer
 	code := runServiceCommand([]string{"install", "--system", "--executable", program}, &stdout, &stderr)
@@ -1861,9 +1835,7 @@ func TestResolveExecutableKeepsTheStableNameOfTheInvocation(t *testing.T) {
 	}
 
 	got, err := resolveExecutable("", stable)
-	if err != nil {
-		t.Fatalf("resolveExecutable() = %v, want nil", err)
-	}
+	assertNoError(t, err, "resolveExecutable() = %v, want nil", err)
 	if got != stable {
 		t.Errorf("the registered executable is %q, want the invoked path %q", got, stable)
 	}
@@ -1893,9 +1865,7 @@ func TestUpgradeWarningStaysQuietForAStableName(t *testing.T) {
 	}
 
 	registered, err := resolveExecutable("", stable)
-	if err != nil {
-		t.Fatalf("resolveExecutable() = %v, want nil", err)
-	}
+	assertNoError(t, err, "resolveExecutable() = %v, want nil", err)
 	if registered != stable {
 		t.Fatalf("the registered executable is %q, want the invoked path %q", registered, stable)
 	}
@@ -1937,9 +1907,7 @@ func TestResolveExecutablePrefersTheInvocationPath(t *testing.T) {
 	}
 
 	got, err := resolveExecutable("", bin)
-	if err != nil {
-		t.Fatalf("resolveExecutable() = %v, want nil", err)
-	}
+	assertNoError(t, err, "resolveExecutable() = %v, want nil", err)
 	if got != bin {
 		t.Errorf("the registered executable is %q, want the invoked path %q", got, bin)
 	}
@@ -1959,30 +1927,22 @@ func TestResolveExecutableFallsBackToTheRunningBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	previous, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if err := os.Chdir(root); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(previous) })
 
 	got, err := resolveExecutable("", "hfdesk")
-	if err != nil {
-		t.Fatalf("resolveExecutable() = %v, want nil", err)
-	}
+	assertNoError(t, err, "resolveExecutable() = %v, want nil", err)
 	if got == filepath.Join(root, "hfdesk") {
 		t.Errorf("the registered executable is %q, want the path of the running binary", got)
 	}
 
 	running, err := os.Executable()
-	if err != nil {
-		t.Fatalf("the path of the running binary: %v", err)
-	}
+	assertNoError(t, err, "the path of the running binary: %v", err)
 	want, err := filepath.Abs(running)
-	if err != nil {
-		t.Fatalf("the absolute path of the running binary: %v", err)
-	}
+	assertNoError(t, err, "the absolute path of the running binary: %v", err)
 	if got != want {
 		t.Errorf("the registered executable is %q, want the path of the running binary %q", got, want)
 	}
@@ -2038,9 +1998,7 @@ func TestResolveExecutableAcceptsAnExistingFile(t *testing.T) {
 	}
 
 	got, err := resolveExecutable(plain, "")
-	if err != nil {
-		t.Fatalf("resolveExecutable(%q) = %v, want nil", plain, err)
-	}
+	assertNoError(t, err, "resolveExecutable(%q) = %v, want nil", plain, err)
 	if got != plain {
 		t.Errorf("the registered executable is %q, want %q", got, plain)
 	}
@@ -2056,9 +2014,7 @@ func TestResolveExecutableUsesTheExplicitPath(t *testing.T) {
 	}
 
 	got, err := resolveExecutable(program, filepath.Join(root, "other"))
-	if err != nil {
-		t.Fatalf("resolveExecutable() = %v, want nil", err)
-	}
+	assertNoError(t, err, "resolveExecutable() = %v, want nil", err)
 	if got != program {
 		t.Errorf("the registered executable is %q, want the explicit path %q", got, program)
 	}
@@ -2098,9 +2054,7 @@ func TestRunPathReturnsAfterTheContextIsCancelled(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("the host returned an error: %v", err)
-		}
+		assertNoError(t, err, "the host returned an error: %v", err)
 	case <-time.After(30 * time.Second):
 		t.Fatal("the host did not return after the context was cancelled")
 	}
@@ -2151,9 +2105,8 @@ func TestServiceRunReportsTheBuildVersionOnTheHealthEndpoint(t *testing.T) {
 				lastErr = fmt.Errorf("the health endpoint does not report the build version: %s", body)
 			default:
 				cancel()
-				if err := <-done; err != nil {
-					t.Fatalf("runServiceHost() = %v, want nil", err)
-				}
+				err := <-done
+				assertNoError(t, err, "runServiceHost() = %v, want nil", err)
 				return
 			}
 		}
@@ -2174,9 +2127,7 @@ func TestServiceRunReportsTheBuildVersionOnTheHealthEndpoint(t *testing.T) {
 func freeLoopbackPort(t *testing.T) int {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve a loopback port: %v", err)
-	}
+	assertNoError(t, err, "reserve a loopback port: %v", err)
 	defer func() { _ = listener.Close() }()
 
 	addr, ok := listener.Addr().(*net.TCPAddr)
@@ -2228,9 +2179,8 @@ func TestInteractiveFlagsAreUnchanged(t *testing.T) {
 	// The defaults are the part of the contract that matters most: a host
 	// that is started without an argument has to behave exactly as it
 	// behaved before the service mode was added.
-	if err := fs.Parse(nil); err != nil {
-		t.Fatalf("parse the interactive flags: %v", err)
-	}
+	err := fs.Parse(nil)
+	assertNoError(t, err, "parse the interactive flags: %v", err)
 	if opts.Port != 8080 {
 		t.Errorf("the default port is %d, want 8080", opts.Port)
 	}
@@ -2554,9 +2504,7 @@ func TestServiceDefaultScopeFollowsThePlatformFacts(t *testing.T) {
 			usePlatform(t, goos)
 
 			scope, err := resolveScope(false, false)
-			if err != nil {
-				t.Fatalf("the default scope must resolve: %v", err)
-			}
+			assertNoError(t, err, "the default scope must resolve: %v", err)
 			if want := platformFactsByName[goos].defaultScope; scope != want {
 				t.Errorf("the default scope on %s is %q, want %q", goos, scope, want)
 			}
@@ -2583,9 +2531,7 @@ func TestServiceUserScopeRefusalFollowsThePlatformFacts(t *testing.T) {
 
 			scope, err := resolveScope(true, false)
 			if !tc.wantError {
-				if err != nil {
-					t.Fatalf("the per-user scope must resolve on %s: %v", tc.goos, err)
-				}
+				assertNoError(t, err, "the per-user scope must resolve on %s: %v", tc.goos, err)
 				if scope != service.ScopeUser {
 					t.Errorf("the scope on %s is %q, want %q", tc.goos, scope, service.ScopeUser)
 				}
@@ -2633,9 +2579,7 @@ func TestServiceUserRefusalKeepsItsMessage(t *testing.T) {
 // command line name the platform they talk about.
 func TestServiceCommandHasNoOperatingSystemComparison(t *testing.T) {
 	source, err := os.ReadFile("service.go")
-	if err != nil {
-		t.Fatalf("read service.go: %v", err)
-	}
+	assertNoError(t, err, "read service.go: %v", err)
 
 	text := string(source)
 	for _, forbidden := range []string{"runtime.GOOS", "platformGOOS", "isWindows"} {
@@ -2656,9 +2600,7 @@ func platformFactOf(t *testing.T, file, name string) string {
 
 	path := filepath.Join("..", "..", "internal", "service", file)
 	parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
-	if err != nil {
-		t.Fatalf("parse %s: %v", path, err)
-	}
+	assertNoError(t, err, "parse %s: %v", path, err)
 
 	for _, decl := range parsed.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
@@ -2777,9 +2719,8 @@ func TestInstallExplicitFieldsMarksOnlyTheNamedFlags(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			flags := installFlags{}
 			fs := newInstallFlagSet(&flags)
-			if err := fs.Parse(tc.args); err != nil {
-				t.Fatalf("parse %v: %v", tc.args, err)
-			}
+			err := fs.Parse(tc.args)
+			assertNoError(t, err, "parse %v: %v", tc.args, err)
 
 			if got := installExplicitFields(fs); got != tc.want {
 				t.Errorf("installExplicitFields() = %+v, want %+v", got, tc.want)
@@ -2823,9 +2764,8 @@ func (m recordingInstallManager) Install(_ context.Context, opts service.Install
 func TestServiceInstallPassesTheNamedFieldsToTheManager(t *testing.T) {
 	usePlatform(t, "linux")
 	program := filepath.Join(t.TempDir(), "hfdesk")
-	if err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 	cacheRoot := filepath.Join(t.TempDir(), "cache")
 
 	var got service.InstallOptions
@@ -2891,9 +2831,8 @@ func TestServiceInstallPassesTheVersionOfTheRunningProgram(t *testing.T) {
 			version: "1.2.3",
 			executable: func(t *testing.T) string {
 				path := filepath.Join(t.TempDir(), "hfdesk")
-				if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o755); err != nil {
-					t.Fatal(err)
-				}
+				err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o755)
+				assertNoError(t, err, "")
 				return path
 			},
 			want: "",
@@ -2958,9 +2897,7 @@ func TestExpectedInstallVersionFollowsTheRunningImage(t *testing.T) {
 	t.Cleanup(func() { Version = previousVersion })
 
 	exe, err := os.Executable()
-	if err != nil {
-		t.Fatalf("os.Executable() = %v", err)
-	}
+	assertNoError(t, err, "os.Executable() = %v", err)
 	if got := expectedInstallVersion(exe); got != "1.2.3" {
 		t.Fatalf("expectedInstallVersion() = %q for the untouched running image, want %q", got, "1.2.3")
 	}
@@ -2974,9 +2911,7 @@ func TestExpectedInstallVersionFollowsTheRunningImage(t *testing.T) {
 	// replacement below unlinks the executed inode, which is exactly how an
 	// update lands a new file at a path a running program keeps using.
 	original, err := os.ReadFile(exe)
-	if err != nil {
-		t.Fatalf("read the running image %q: %v", exe, err)
-	}
+	assertNoError(t, err, "read the running image %q: %v", exe, err)
 	if err := os.WriteFile(backup, original, 0o755); err != nil {
 		t.Fatalf("write the backup file: %v", err)
 	}
@@ -3009,9 +2944,7 @@ func TestExpectedInstallVersionWithholdsAnUnknownImage(t *testing.T) {
 	t.Cleanup(func() { Version = previousVersion })
 
 	exe, err := os.Executable()
-	if err != nil {
-		t.Fatalf("os.Executable() = %v", err)
-	}
+	assertNoError(t, err, "os.Executable() = %v", err)
 	if got := expectedInstallVersion(exe); got != "" {
 		t.Errorf("expectedInstallVersion() = %q with an unknown running image, want no version claim", got)
 	}
@@ -3026,9 +2959,8 @@ func TestExpectedInstallVersionWithholdsAnUnknownImage(t *testing.T) {
 // path or cache layout was reset to the default of the scope.
 func TestServiceInstallSummaryReportsTheEffectiveRegistration(t *testing.T) {
 	program := filepath.Join(t.TempDir(), "hfdesk")
-	if err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 
 	root := t.TempDir()
 	effective := service.InstallOptions{
@@ -3171,9 +3103,8 @@ func (m *refusingHoldManager) Restart(context.Context) error {
 func temporaryServiceProgram(t *testing.T) string {
 	t.Helper()
 	program := filepath.Join(t.TempDir(), "hfdesk")
-	if err := os.WriteFile(program, []byte("not a program\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(program, []byte("not a program\n"), 0o644)
+	assertNoError(t, err, "")
 	return program
 }
 
@@ -3498,4 +3429,22 @@ func TestServiceMutationProceedsWhenNoDesktopInstanceServes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// assertNoError fails the test when the call it wraps reported a failure,
+// with the diagnostic the inline check printed.
+func assertNoError(t *testing.T, err error, format string, a ...any) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	if format == "" {
+		t.Fatal(err)
+		return
+	}
+	if len(a) == 0 {
+		t.Fatal(format)
+		return
+	}
+	t.Fatalf(format, a...)
 }

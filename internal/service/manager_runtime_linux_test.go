@@ -155,9 +155,7 @@ func TestSystemdSystemInstallRefusesTheHomeOfTheUser(t *testing.T) {
 
 	m := &systemdManager{scope: ScopeSystem}
 	path, err := m.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath() = %v, want nil", err)
-	}
+	assertNoError(t, err, "unitPath() = %v, want nil", err)
 	// The unit file of the machine scope lives in a fixed place of the
 	// machine. The test never writes it: the refusal happens before the
 	// unit file is written. The state of the file is compared before and
@@ -220,9 +218,8 @@ func TestSystemdStatusReportsTheCacheRoot(t *testing.T) {
 	registered := filepath.Join(root, "cache")
 
 	t.Run("the registered cache dir", func(t *testing.T) {
-		if err := os.WriteFile(configFile, []byte(`{"local-dir":"/srv/hfdesk/models"}`), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		err := os.WriteFile(configFile, []byte(`{"local-dir":"/srv/hfdesk/models"}`), 0o600)
+		assertNoError(t, err, "")
 		status := systemdStatus(t, "--config", configFile, "--cache-dir", registered)
 		if status.CacheDir != registered {
 			t.Errorf("the cache root = %q, want the registered %q", status.CacheDir, registered)
@@ -231,9 +228,8 @@ func TestSystemdStatusReportsTheCacheRoot(t *testing.T) {
 
 	t.Run("the cache dir of the config file of the instance", func(t *testing.T) {
 		configured := filepath.Join(root, "configured")
-		if err := os.WriteFile(configFile, []byte(`{"cache-dir":"`+configured+`"}`), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		err := os.WriteFile(configFile, []byte(`{"cache-dir":"`+configured+`"}`), 0o600)
+		assertNoError(t, err, "")
 		status := systemdStatus(t, "--config", configFile, "--cache-dir", registered)
 		if status.CacheDir != configured {
 			t.Errorf("the cache root = %q, want the cache dir %q of the config file of the instance", status.CacheDir, configured)
@@ -241,9 +237,8 @@ func TestSystemdStatusReportsTheCacheRoot(t *testing.T) {
 	})
 
 	t.Run("no cache dir at all", func(t *testing.T) {
-		if err := os.WriteFile(configFile, []byte(`{}`), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		err := os.WriteFile(configFile, []byte(`{}`), 0o600)
+		assertNoError(t, err, "")
 		status := systemdStatus(t, "--config", configFile)
 		if status.CacheDir != "" {
 			t.Errorf("the cache root = %q, want none", status.CacheDir)
@@ -301,9 +296,7 @@ func TestSystemdStatusReportsAMissingExecutable(t *testing.T) {
 		// describes is the unit of the temporary unit directory, and it
 		// holds no program at all.
 		content, err := os.ReadFile(status.UnitPath)
-		if err != nil {
-			t.Fatalf("read the unit file %q: %v", status.UnitPath, err)
-		}
+		assertNoError(t, err, "read the unit file %q: %v", status.UnitPath, err)
 		if !strings.Contains(string(content), "ExecStart=") {
 			t.Errorf("the unit file holds no ExecStart directive:\n%s", content)
 		}
@@ -338,9 +331,7 @@ func TestSystemdStatusKeepsTheRunningFactOfABrokenRegistration(t *testing.T) {
 			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", tc.active)
 
 			status, err := m.Status(context.Background())
-			if err != nil {
-				t.Fatalf("Status() = %v, want nil", err)
-			}
+			assertNoError(t, err, "Status() = %v, want nil", err)
 			if status.State != StateBroken {
 				t.Errorf("the state = %q, want the diagnosis %q of the registration", status.State, StateBroken)
 			}
@@ -396,9 +387,7 @@ func systemdStatusOf(t *testing.T, words ...string) Status {
 
 	m := &systemdManager{scope: ScopeUser}
 	path, err := m.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath() = %v, want nil", err)
-	}
+	assertNoError(t, err, "unitPath() = %v, want nil", err)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("create the unit directory: %v", err)
 	}
@@ -443,20 +432,14 @@ func TestSystemdPreflightProjectsNativeGroupAndSupplementaryGroupAccess(t *testi
 		t.Skip("the test process has no group outside the target account's group database")
 	}
 	groupID, err := strconv.Atoi(extraGroup)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 
 	root := systemdTraversableTempDir(t)
 	candidate := filepath.Join(root, "candidate")
 	running, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	contents, err := os.ReadFile(running)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if err := os.WriteFile(candidate, contents, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -464,9 +447,7 @@ func TestSystemdPreflightProjectsNativeGroupAndSupplementaryGroupAccess(t *testi
 		t.Fatal(err)
 	}
 	info, err := os.Stat(candidate)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	localDir := filepath.Join(root, "group-only-local")
 	if err := os.Mkdir(localDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -502,9 +483,7 @@ func TestSystemdPreflightProjectsNativeGroupAndSupplementaryGroupAccess(t *testi
 			properties := systemdTypedProperties(candidate, []string{candidate}, nil, root, target.Username, tc.group, nil)
 			properties["SupplementaryGroups"] = dbus.MakeVariant(tc.supplement)
 			loaded, err := loadedConfigFromProperties(properties)
-			if err != nil {
-				t.Fatalf("loadedConfigFromProperties() = %v", err)
-			}
+			assertNoError(t, err, "loadedConfigFromProperties() = %v", err)
 			effective := systemdAccessIdentityForInstall(ScopeSystem, InstallOptions{Scope: ScopeSystem}, true, loaded, true, nil)
 			identity := effective.access
 			if identity == nil || effective.accountName != target.Username || effective.owner == nil {
@@ -544,9 +523,7 @@ func TestSystemdPreflightProjectsNativeGroupAndSupplementaryGroupAccess(t *testi
 		properties := systemdTypedProperties(candidate, []string{candidate}, nil, root, target.Username, extraGroup, nil)
 		properties["SupplementaryGroups"] = dbus.MakeVariant([]string{extraGroup})
 		loaded, err := loadedConfigFromProperties(properties)
-		if err != nil {
-			t.Fatal(err)
-		}
+		assertNoError(t, err, "")
 		requested := InstallOptions{Scope: ScopeSystem}
 		requested.Explicit.ServiceUser = true
 		requestedAccount := systemdCurrentAccount(t)
@@ -598,9 +575,7 @@ func TestSystemdStatusUsesAcceptedRegistrationFlagSyntax(t *testing.T) {
 	systemdTempInstallEnvironment(t)
 	manager := &systemdManager{scope: ScopeUser}
 	path, err := manager.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath() = %v", err)
-	}
+	assertNoError(t, err, "unitPath() = %v", err)
 	root := t.TempDir()
 	unit := fmt.Sprintf(`[Service]
 ExecStart=/bin/true service run -config=%s --config=%s -state-dir=%s --state-dir=%s -log-dir=%s -listen=127.0.0.1:8181 --listen=127.0.0.1:9191 -cache-dir=%s --cache-dir=%s -hub-dir=%s --hub-dir=%s -local-dir=%s --local-dir=%s
@@ -609,14 +584,11 @@ ExecStart=/bin/true service run -config=%s --config=%s -state-dir=%s --state-dir
 		t.Fatalf("create the unit directory: %v", err)
 	}
 	for _, name := range []string{path, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
-		if err := os.WriteFile(name, []byte(unit), 0o644); err != nil {
-			t.Fatalf("write the unit file %q: %v", name, err)
-		}
+		err := os.WriteFile(name, []byte(unit), 0o644)
+		assertNoError(t, err, "write the unit file %q: %v", name, err)
 	}
 	status, err := manager.Status(context.Background())
-	if err != nil {
-		t.Fatalf("Status() = %v", err)
-	}
+	assertNoError(t, err, "Status() = %v", err)
 	wantPaths := runtimepaths.Paths{
 		ConfigFile: filepath.Join(root, "current.json"),
 		StateDir:   filepath.Join(root, "state"),
@@ -672,9 +644,7 @@ func TestSystemdCheckExecutableAccessUsesKernelPermissions(t *testing.T) {
 				t.Fatal(err)
 			}
 			got, err := checkExecutableAccess(context.Background(), executable, identity, tc.bits, "")
-			if err != nil {
-				t.Fatal(err)
-			}
+			assertNoError(t, err, "")
 			if got != tc.want {
 				t.Errorf("checkExecutableAccess(%04o, %03o) = %v, want %v", tc.mode, tc.bits, got, tc.want)
 			}
@@ -697,9 +667,7 @@ func TestSystemdCheckExecutableAccessUsesKernelPermissions(t *testing.T) {
 			t.Fatal(err)
 		}
 		got, err := checkExecutableAccess(context.Background(), blocked, identity, unix.X_OK, "")
-		if err != nil {
-			t.Fatal(err)
-		}
+		assertNoError(t, err, "")
 		if got != executableAccessDenied {
 			t.Errorf("checkExecutableAccess through a non-searchable parent = %v, want denied", got)
 		}
@@ -717,9 +685,7 @@ func TestSystemdCheckExecutableAccessUsesKernelPermissions(t *testing.T) {
 			t.Fatal(err)
 		}
 		got, err := checkExecutableAccess(context.Background(), link, identity, unix.X_OK, "")
-		if err != nil {
-			t.Fatal(err)
-		}
+		assertNoError(t, err, "")
 		if got != executableAccessAllowed {
 			t.Errorf("checkExecutableAccess through a symlink = %v, want allowed", got)
 		}
@@ -728,21 +694,15 @@ func TestSystemdCheckExecutableAccessUsesKernelPermissions(t *testing.T) {
 
 func TestLinuxExecutableAccessIdentityCarriesSupplementaryGroups(t *testing.T) {
 	account, err := user.Current()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	identity, err := linuxExecutableAccessIdentity(account)
 	if err != nil {
 		t.Skipf("could not resolve account groups: %v", err)
 	}
 	uid, err := strconv.Atoi(account.Uid)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	gid, err := strconv.Atoi(account.Gid)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if identity.UID != uid || identity.GID != gid {
 		t.Fatalf("identity = %+v, want uid=%d gid=%d", identity, uid, gid)
 	}
@@ -756,17 +716,13 @@ func TestLinuxExecutableAccessIdentityCarriesSupplementaryGroups(t *testing.T) {
 	}
 	for _, groupID := range accountGroups {
 		group, err := strconv.Atoi(groupID)
-		if err != nil {
-			t.Fatalf("parse account group %q: %v", groupID, err)
-		}
+		assertNoError(t, err, "parse account group %q: %v", groupID, err)
 		if !got[group] {
 			t.Errorf("identity groups %v omit account group %d", identity.Groups, group)
 		}
 	}
 	credential, err := accessCredential(identity)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if int(credential.Uid) != uid || int(credential.Gid) != gid {
 		t.Errorf("credential = %+v, want uid=%d gid=%d", credential, uid, gid)
 	}
@@ -811,9 +767,7 @@ func TestAccessCredentialPreservesAndRejectsNativeIntegerBoundaries(t *testing.T
 	maxUint32 := uint64(math.MaxUint32)
 	maxID := int(maxUint32 - 1)
 	credential, err := accessCredential(accessAccount{UID: maxID, GID: maxID, Groups: []int{maxID}})
-	if err != nil {
-		t.Fatalf("accessCredential(max uint32 bit pattern) = %v", err)
-	}
+	assertNoError(t, err, "accessCredential(max uint32 bit pattern) = %v", err)
 	maxLegalID := uint32(maxUint32 - 1)
 	if credential.Uid != maxLegalID || credential.Gid != maxLegalID || !slices.Contains(credential.Groups, maxLegalID) {
 		t.Errorf("credential did not preserve the largest mapped Linux ID: %+v", credential)
@@ -843,9 +797,8 @@ func TestInternalAccessProbeReportsKernelDenialSeparatelyFromUnknown(t *testing.
 	if err := os.WriteFile(file, []byte("content"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(file, 0o100); err != nil {
-		t.Fatal(err)
-	}
+	err := os.Chmod(file, 0o100)
+	assertNoError(t, err, "")
 	code, handled := RunInternalAccessProbe([]string{internalAccessProbeCommand, file, strconv.Itoa(unix.X_OK), ""})
 	if !handled || code != accessProbeAllowedCode {
 		t.Errorf("execute-only X_OK probe = (%d, %t), want allowed", code, handled)
@@ -866,13 +819,9 @@ func TestInternalAccessProbeReportsKernelDenialSeparatelyFromUnknown(t *testing.
 
 func TestSystemdExecuteOnlyNativeCandidateRunsAndInstalls(t *testing.T) {
 	current, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	contents, err := os.ReadFile(current)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	native := filepath.Join(t.TempDir(), "hfdesk")
 	if err := os.WriteFile(native, contents, 0o700); err != nil {
 		t.Fatal(err)
@@ -904,9 +853,7 @@ func TestSystemdExecuteOnlyNativeCandidateRunsAndInstalls(t *testing.T) {
 	}
 	opts.Executable = link
 	effective, err := manager.Install(context.Background(), opts)
-	if err != nil {
-		t.Fatalf("Install() refused the execute-only native symlink: %v", err)
-	}
+	assertNoError(t, err, "Install() refused the execute-only native symlink: %v", err)
 	if effective.Executable != link {
 		t.Errorf("registered executable = %q, want preserved symlink path %q", effective.Executable, link)
 	}
@@ -926,9 +873,8 @@ func TestSystemdPreflightAcceptsReadableShebang(t *testing.T) {
 	if err := exec.Command(opts.Executable).Run(); err != nil {
 		t.Fatalf("readable shebang control did not run: %v", err)
 	}
-	if err := (&systemdManager{scope: ScopeUser}).preflight(context.Background(), opts, nil); err != nil {
-		t.Fatalf("preflight refused a readable runnable script: %v", err)
-	}
+	err := (&systemdManager{scope: ScopeUser}).preflight(context.Background(), opts, nil)
+	assertNoError(t, err, "preflight refused a readable runnable script: %v", err)
 }
 
 func TestSystemdPreflightUsesLoadedWorkingDirectoryForRelativeInterpreters(t *testing.T) {
@@ -942,16 +888,13 @@ func TestSystemdPreflightUsesLoadedWorkingDirectoryForRelativeInterpreters(t *te
 	systemdTempInstallEnvironment(t)
 	identity := currentExecutableAccessIdentity()
 	account, err := user.Current()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	root := t.TempDir()
 	workingDirectory := filepath.Join(root, "native-working-directory")
 	stateDirectory := filepath.Join(root, "application-state")
 	for _, directory := range []string{workingDirectory, stateDirectory} {
-		if err := os.MkdirAll(directory, 0o755); err != nil {
-			t.Fatal(err)
-		}
+		err := os.MkdirAll(directory, 0o755)
+		assertNoError(t, err, "")
 	}
 
 	cases := []struct {
@@ -966,9 +909,8 @@ func TestSystemdPreflightUsesLoadedWorkingDirectoryForRelativeInterpreters(t *te
 					t.Fatal(err)
 				}
 				candidate := filepath.Join(root, "shebang-candidate")
-				if err := os.WriteFile(candidate, []byte("#!./runner\nexit 0\n"), 0o700); err != nil {
-					t.Fatal(err)
-				}
+				err := os.WriteFile(candidate, []byte("#!./runner\nexit 0\n"), 0o700)
+				assertNoError(t, err, "")
 				return candidate, nil
 			},
 		},
@@ -983,9 +925,8 @@ func TestSystemdPreflightUsesLoadedWorkingDirectoryForRelativeInterpreters(t *te
 				if err := os.WriteFile(candidate, image, 0o700); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.Symlink(originalInterpreter, filepath.Join(dir, "elf-loader")); err != nil {
-					t.Fatal(err)
-				}
+				err := os.Symlink(originalInterpreter, filepath.Join(dir, "elf-loader"))
+				assertNoError(t, err, "")
 				return candidate, []string{"-test.run=^$"}
 			},
 		},
@@ -1018,9 +959,7 @@ func TestSystemdPreflightUsesLoadedWorkingDirectoryForRelativeInterpreters(t *te
 			opts.Paths.StateDir = stateDirectory
 			properties := systemdTypedProperties(candidate, []string{candidate}, nil, workingDirectory, account.Username, account.Gid, nil)
 			loaded, err := loadedConfigFromProperties(properties)
-			if err != nil {
-				t.Fatalf("loadedConfigFromProperties() = %v", err)
-			}
+			assertNoError(t, err, "loadedConfigFromProperties() = %v", err)
 			projectedCWD := systemdWorkingDirectoryForPreflight(opts, true, loaded, true)
 			if projectedCWD != workingDirectory || projectedCWD == opts.Paths.StateDir {
 				t.Fatalf("preflight cwd = %q, want loaded native WorkingDirectory %q, distinct from StateDir %q", projectedCWD, workingDirectory, opts.Paths.StateDir)
@@ -1111,9 +1050,8 @@ func writeBinfmtMiscState(t *testing.T, active bool) string {
 		t.Fatal(err)
 	}
 	if active {
-		if err := os.WriteFile(filepath.Join(dir, "custom"), []byte("enabled\ninterpreter /usr/bin/qemu\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		err := os.WriteFile(filepath.Join(dir, "custom"), []byte("enabled\ninterpreter /usr/bin/qemu\n"), 0o600)
+		assertNoError(t, err, "")
 	}
 	return dir
 }
@@ -1121,13 +1059,9 @@ func writeBinfmtMiscState(t *testing.T, active bool) string {
 func elfWithMissingInterpreter(t *testing.T) ([]byte, bool) {
 	t.Helper()
 	running, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	content, err := os.ReadFile(running)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	parsed, err := elf.NewFile(bytes.NewReader(content))
 	if err != nil {
 		return nil, false
@@ -1163,13 +1097,9 @@ func elfWithMissingInterpreter(t *testing.T) ([]byte, bool) {
 func elfWithInterpreterPath(t *testing.T, interpreterPath string) ([]byte, string, bool) {
 	t.Helper()
 	running, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	content, err := os.ReadFile(running)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	parsed, err := elf.NewFile(bytes.NewReader(content))
 	if err != nil {
 		return nil, "", false
@@ -1212,9 +1142,8 @@ func makeInterpreterSymlinkTree(t *testing.T, root, target string, atLexicalPath
 	if atLexicalPath {
 		interpreter = filepath.Join(root, "runner")
 	}
-	if err := os.Symlink(target, interpreter); err != nil {
-		t.Fatal(err)
-	}
+	err := os.Symlink(target, interpreter)
+	assertNoError(t, err, "")
 }
 
 func TestSystemdInterpreterPathsPreserveKernelSymlinkDotDotResolution(t *testing.T) {
@@ -1358,9 +1287,8 @@ func TestSystemdInspectExecutableUsesHostEvidence(t *testing.T) {
 	write := func(t *testing.T, name string, content []byte, mode os.FileMode) string {
 		t.Helper()
 		path := filepath.Join(t.TempDir(), name)
-		if err := os.WriteFile(path, content, mode); err != nil {
-			t.Fatal(err)
-		}
+		err := os.WriteFile(path, content, mode)
+		assertNoError(t, err, "")
 		return path
 	}
 
@@ -1390,9 +1318,7 @@ func TestSystemdInspectExecutableUsesHostEvidence(t *testing.T) {
 	missingInterpreter := filepath.Join(t.TempDir(), "missing-interpreter")
 	script := write(t, "script", []byte("#!"+missingInterpreter+"\nexit 0\n"), 0o700)
 	inspection, err = inspectExecutable(script, t.TempDir(), emptyHandlers)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if inspection.format != executableFormatScript || inspection.interpreter != missingInterpreter {
 		t.Fatalf("script inspection = %+v, want interpreter %q", inspection, missingInterpreter)
 	}
@@ -1415,9 +1341,7 @@ func TestSystemdInspectExecutableUsesHostEvidence(t *testing.T) {
 	if dynamicELF, ok := elfWithMissingInterpreter(t); ok {
 		candidate := write(t, "missing-elf-interpreter", dynamicELF, 0o700)
 		inspection, err := inspectExecutable(candidate, t.TempDir(), emptyHandlers)
-		if err != nil {
-			t.Fatal(err)
-		}
+		assertNoError(t, err, "")
 		if inspection.format != executableFormatELF || inspection.interpreter == "" {
 			t.Fatalf("ELF PT_INTERP inspection = %+v, want a discovered interpreter", inspection)
 		}
@@ -1430,9 +1354,7 @@ func TestSystemdInspectExecutableUsesHostEvidence(t *testing.T) {
 	// A structurally complete ELF with another machine identity is not
 	// refused by a GOARCH table; the kernel/host remains the format owner.
 	running, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	elf, err := os.ReadFile(running)
 	if err != nil || len(elf) < 64 || !bytes.HasPrefix(elf, []byte{0x7f, 'E', 'L', 'F'}) {
 		t.Fatalf("read the running ELF fixture: %v", err)
@@ -1487,9 +1409,8 @@ func TestSystemdInstallRefusesKnownUnusableBeforeRestart(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			candidate := filepath.Join(t.TempDir(), "hfdesk")
-			if err := os.WriteFile(candidate, tc.data, 0o700); err != nil {
-				t.Fatal(err)
-			}
+			err := os.WriteFile(candidate, tc.data, 0o700)
+			assertNoError(t, err, "")
 			assertSystemdInstallRefusedBeforeRestart(t, candidate, "")
 		})
 	}
@@ -1538,9 +1459,7 @@ func TestSystemdPreflightWarnsRatherThanRejectingInconclusiveAccess(t *testing.T
 	log.SetOutput(&logs)
 	t.Cleanup(func() { log.SetOutput(previousWriter) })
 	account, err := user.Current()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	accountCopy := *account
 	accountCopy.Uid = strconv.Itoa(os.Geteuid() + 1)
 	opts := systemdTempInstallOptions(t, t.TempDir())
@@ -1548,16 +1467,12 @@ func TestSystemdPreflightWarnsRatherThanRejectingInconclusiveAccess(t *testing.T
 	manager := &systemdManager{scope: ScopeSystem}
 
 	err = manager.preflight(context.Background(), opts, &accountCopy)
-	if err != nil {
-		t.Fatalf("preflight() = %v, want unknown access to remain unclassified", err)
-	}
+	assertNoError(t, err, "preflight() = %v, want unknown access to remain unclassified", err)
 	if !strings.Contains(logs.String(), "inconclusive") || strings.Contains(logs.String(), "not usable") {
 		t.Errorf("access warning = %q, want an inconclusive warning without a denial claim", logs.String())
 	}
 	path, err := manager.unitPath()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("inconclusive preflight wrote the registration %q: %v", path, err)
 	}
@@ -1575,9 +1490,8 @@ func TestSystemdPreflightLeavesUnknownFormatUnclassified(t *testing.T) {
 	if err := os.WriteFile(opts.Executable, []byte("MZ\x90\x00"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := (&systemdManager{scope: ScopeUser}).preflight(context.Background(), opts, nil); err != nil {
-		t.Fatalf("preflight refused an unclassified format: %v", err)
-	}
+	err := (&systemdManager{scope: ScopeUser}).preflight(context.Background(), opts, nil)
+	assertNoError(t, err, "preflight refused an unclassified format: %v", err)
 }
 
 func TestSystemdDynamicListenUpdateUsesTheRunningProcessArgv(t *testing.T) {
@@ -1603,16 +1517,12 @@ func TestSystemdDynamicListenUpdateUsesTheRunningProcessArgv(t *testing.T) {
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_RESTART_COUNT", filepath.Join(root, "restart-count"))
 
 	loaded, err := manager.registrationUnitConfig(context.Background())
-	if err != nil {
-		t.Fatalf("registrationUnitConfig() = %v", err)
-	}
+	assertNoError(t, err, "registrationUnitConfig() = %v", err)
 	if got := runArgValue(loaded.execArgs[1:], "--listen"); got != "${HF_LISTEN}" {
 		t.Fatalf("loaded ExecStartEx Listen = %q, want unresolved source expression", got)
 	}
 	runtimeOptions, _, err := manager.runtimeRunOptions(context.Background())
-	if err != nil {
-		t.Fatalf("runtimeRunOptions() = %v", err)
-	}
+	assertNoError(t, err, "runtimeRunOptions() = %v", err)
 	if runtimeOptions.Listen != listen {
 		t.Fatalf("runtime argv Listen = %q, want effective process address %q", runtimeOptions.Listen, listen)
 	}
@@ -1626,9 +1536,7 @@ func TestSystemdDynamicListenUpdateUsesTheRunningProcessArgv(t *testing.T) {
 		}
 	}
 	installed, err := os.ReadFile(unitPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if !strings.Contains(string(installed), "${HF_LISTEN}") || !strings.Contains(string(installed), "Environment=HF_LISTEN="+listen) {
 		t.Errorf("the refused update changed the dynamic Listen source:\n%s", installed)
 	}
@@ -1811,9 +1719,8 @@ func TestSystemdReadinessAcceptsLiveScriptWrapperWithHFDeskArgs(t *testing.T) {
 		LogDir:     filepath.Join(root, "logs"),
 	}
 	for _, dir := range []string{filepath.Dir(paths.ConfigFile), paths.StateDir, paths.LogDir} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		err := os.MkdirAll(dir, 0o700)
+		assertNoError(t, err, "")
 	}
 	serviceOptions := InstallOptions{Scope: ScopeUser, Executable: os.Args[0], Listen: listen, Paths: paths}
 	args := append([]string{"-test.run=^TestSystemdRuntimeListenProcessFixture$"}, RunArgs(serviceOptions)...)
@@ -1917,9 +1824,7 @@ func TestSystemdRuntimeListenProcessFixture(t *testing.T) {
 			continue
 		}
 		runOptions, err := ParseRunArgs(args[i:])
-		if err != nil {
-			t.Fatalf("ParseRunArgs() = %v", err)
-		}
+		assertNoError(t, err, "ParseRunArgs() = %v", err)
 		runOptions.Version = os.Getenv("HFDESK_TEST_SYSTEMD_RUNTIME_VERSION")
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 		defer stop()
@@ -1944,9 +1849,8 @@ func startSystemdRuntimeProcess(t *testing.T, root, listen, version string) *exe
 func startSystemdRegisteredProcess(t *testing.T, opts InstallOptions, version string) *exec.Cmd {
 	t.Helper()
 	for _, dir := range []string{filepath.Dir(opts.Paths.ConfigFile), opts.Paths.StateDir, opts.Paths.LogDir} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			t.Fatalf("prepare standalone HFDesk paths: %v", err)
-		}
+		err := os.MkdirAll(dir, 0o700)
+		assertNoError(t, err, "prepare standalone HFDesk paths: %v", err)
 	}
 	return startSystemdServiceProcess(t, RunOptions{
 		Paths:    opts.Paths,
@@ -2021,9 +1925,8 @@ func systemdDynamicListenUnit(t *testing.T, unitPath, unit, staticListen, enviro
 	if err := os.WriteFile(unitPath, []byte(dynamic), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT"), []byte(dynamic), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT"), []byte(dynamic), 0o644)
+	assertNoError(t, err, "")
 	return dynamic
 }
 

@@ -56,15 +56,11 @@ func TestSystemdUserIntegrationCycle(t *testing.T) {
 	}
 
 	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatalf("UserHomeDir() = %v, want nil", err)
-	}
+	assertNoError(t, err, "UserHomeDir() = %v, want nil", err)
 
 	m := &systemdManager{scope: ScopeUser}
 	unitPath, err := m.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath() = %v, want nil", err)
-	}
+	assertNoError(t, err, "unitPath() = %v, want nil", err)
 	// The user manager of the machine loads the units of the
 	// configuration directory of the user. When the two do not agree, the
 	// supervisor would never see the unit of the test.
@@ -78,9 +74,7 @@ func TestSystemdUserIntegrationCycle(t *testing.T) {
 
 	root := t.TempDir()
 	testBinary, err := os.Executable()
-	if err != nil {
-		t.Fatalf("Executable() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Executable() = %v, want nil", err)
 	// Three programs, one wrapper each: the update names a new executable
 	// path while the process behind it stays the probe-answering test
 	// binary.
@@ -93,9 +87,8 @@ func TestSystemdUserIntegrationCycle(t *testing.T) {
 		script := "#!/bin/sh\n" +
 			"export HFDESK_TEST_SYSTEMD_RUNTIME_PROCESS_FIXTURE=1\n" +
 			"exec \"" + testBinary + "\" '-test.run=^TestSystemdRuntimeListenProcessFixture$' \"$@\"\n"
-		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-			t.Fatal(err)
-		}
+		err := os.WriteFile(path, []byte(script), 0o755)
+		assertNoError(t, err, "")
 		return path
 	}
 	programA := writeProgram("hfdesk-a")
@@ -133,9 +126,7 @@ func TestSystemdUserIntegrationCycle(t *testing.T) {
 	assertEnabledForBoot := func(stage string) {
 		t.Helper()
 		out, err := m.runSystemctl(ctx, "is-enabled", unitName)
-		if err != nil {
-			t.Fatalf("%s: is-enabled failed: %v", stage, err)
-		}
+		assertNoError(t, err, "%s: is-enabled failed: %v", stage, err)
 		if got := strings.TrimSpace(out); got != "enabled" {
 			t.Errorf("%s: the printed is-enabled = %q, want %q", stage, got, "enabled")
 		}
@@ -149,24 +140,18 @@ func TestSystemdUserIntegrationCycle(t *testing.T) {
 	assertEnabledForBoot("after the first installation")
 
 	info, err := os.Stat(unitPath)
-	if err != nil {
-		t.Fatalf("the unit file was not written: %v", err)
-	}
+	assertNoError(t, err, "the unit file was not written: %v", err)
 	if info.Mode().Perm() != 0o644 {
 		t.Errorf("the mode of the unit file = %v, want 0644", info.Mode().Perm())
 	}
 	content, err := os.ReadFile(unitPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if !strings.Contains(string(content), "Type=simple") {
 		t.Errorf("the unit is not a simple service:\n%s", content)
 	}
 
 	status, err := m.Status(ctx)
-	if err != nil {
-		t.Fatalf("Status() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Status() = %v, want nil", err)
 	if status.State != StateStopped {
 		t.Errorf("the state after the installation = %q, want %q", status.State, StateStopped)
 	}
@@ -195,9 +180,7 @@ func TestSystemdUserIntegrationCycle(t *testing.T) {
 	assertEnabledForBoot("after the repeat installation")
 
 	status, err = m.Status(ctx)
-	if err != nil {
-		t.Fatalf("Status() after the repeat installation = %v, want nil", err)
-	}
+	assertNoError(t, err, "Status() after the repeat installation = %v, want nil", err)
 	if status.State != StateStopped {
 		t.Errorf("the state after the update of the stopped instance = %q, want %q", status.State, StateStopped)
 	}
@@ -205,9 +188,7 @@ func TestSystemdUserIntegrationCycle(t *testing.T) {
 		t.Errorf("the registered executable = %q, want the updated program %q", status.Executable, programB)
 	}
 	updatedContent, err := os.ReadFile(unitPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if !strings.Contains(string(updatedContent), programB) {
 		t.Errorf("the unit file does not register the new program %q:\n%s", programB, updatedContent)
 	}
@@ -236,9 +217,7 @@ func TestSystemdUserIntegrationCycle(t *testing.T) {
 		t.Fatalf("Install() over the running registration = %v, want the verified restart onto %q", err, programC)
 	}
 	status, err = m.Status(ctx)
-	if err != nil {
-		t.Fatalf("Status() after the update of the running instance = %v, want nil", err)
-	}
+	assertNoError(t, err, "Status() after the update of the running instance = %v, want nil", err)
 	if status.State != StateRunning {
 		t.Errorf("the state after the update of the running instance = %q, want %q", status.State, StateRunning)
 	}
@@ -246,9 +225,7 @@ func TestSystemdUserIntegrationCycle(t *testing.T) {
 		t.Errorf("the running instance registers %q, want the new program %q", status.Executable, programC)
 	}
 	runningContent, err := os.ReadFile(unitPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if !strings.Contains(string(runningContent), programC) {
 		t.Errorf("the unit file does not register the new program %q:\n%s", programC, runningContent)
 	}
@@ -277,9 +254,7 @@ func TestSystemdUserIntegrationCycle(t *testing.T) {
 	}
 
 	status, err = m.Status(ctx)
-	if err != nil {
-		t.Fatalf("Status() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Status() = %v, want nil", err)
 	if status.State != StateNotInstalled {
 		t.Errorf("the state after the uninstallation = %q, want %q", status.State, StateNotInstalled)
 	}
@@ -335,9 +310,7 @@ func TestSystemdInstallRefusesAControlCharacterInAPath(t *testing.T) {
 		}
 	}
 	path, err := m.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath() = %v, want nil", err)
-	}
+	assertNoError(t, err, "unitPath() = %v, want nil", err)
 	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("the refused installation wrote the unit file %q: %v", path, err)
 	}
@@ -381,9 +354,8 @@ fi
 echo "the fake supervisor refuses the command" >&2
 exit 1
 `
-	if err := os.WriteFile(filepath.Join(dir, "systemctl"), []byte(script), 0o755); err != nil {
-		t.Fatalf("write the fake supervisor: %v", err)
-	}
+	err := os.WriteFile(filepath.Join(dir, "systemctl"), []byte(script), 0o755)
+	assertNoError(t, err, "write the fake supervisor: %v", err)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
@@ -427,9 +399,7 @@ func TestSystemdInstallUsesLoadedVendorFragmentAndRetainsItsPaths(t *testing.T) 
 	root := t.TempDir()
 	previous := systemdExistingOptions(t, systemdTestExecutable(t), root)
 	vendorUnit, err := renderUnit(previous, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	vendorPath := filepath.Join(root, "lib", "systemd", "user", unitName)
 	if err := os.MkdirAll(filepath.Dir(vendorPath), 0o700); err != nil {
 		t.Fatal(err)
@@ -439,9 +409,7 @@ func TestSystemdInstallUsesLoadedVendorFragmentAndRetainsItsPaths(t *testing.T) 
 	}
 	manager := &systemdManager{scope: ScopeUser}
 	unitPath, err := manager.unitPath()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	loadedPath := os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")
 	if err := os.WriteFile(loadedPath, []byte(vendorUnit), 0o600); err != nil {
 		t.Fatal(err)
@@ -524,9 +492,7 @@ func TestSystemdInstallDoesNotTreatUnknownLoadedFragmentAsFirstInstall(t *testin
 	opts := systemdTempInstallOptions(t, root)
 	manager := &systemdManager{scope: ScopeUser}
 	unitPath, err := manager.unitPath()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", opts.Executable)
 	manager.readServiceProperties = func(context.Context, string) (map[string]dbus.Variant, error) {
 		properties := systemdTypedProperties(opts.Executable, RunArgs(opts), nil, opts.Paths.StateDir, "", "", nil)
@@ -555,9 +521,7 @@ func TestDefaultInstallOptionsNamesNothing(t *testing.T) {
 	for _, scope := range []Scope{ScopeUser, ScopeSystem} {
 		t.Run(string(scope), func(t *testing.T) {
 			paths, err := DefaultPaths(scope)
-			if err != nil {
-				t.Fatalf("DefaultPaths(%q) = %v, want nil", scope, err)
-			}
+			assertNoError(t, err, "DefaultPaths(%q) = %v, want nil", scope, err)
 			cacheRoot, hubDir := DefaultCacheDirs(scope, paths)
 
 			opts := DefaultInstallOptions(scope, "/usr/local/bin/hfdesk")
@@ -697,17 +661,11 @@ func systemdExistingInstallation(t *testing.T, opts InstallOptions) (*systemdMan
 	m := &systemdManager{scope: ScopeUser}
 	setSystemdTestPropertyReader(t, m)
 	path, err := m.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath() = %v, want nil", err)
-	}
+	assertNoError(t, err, "unitPath() = %v, want nil", err)
 	facts, err := canonicalUnitForInstall(opts, nil)
-	if err != nil {
-		t.Fatalf("canonicalUnitForInstall() = %v, want nil", err)
-	}
+	assertNoError(t, err, "canonicalUnitForInstall() = %v, want nil", err)
 	unit, err := renderCanonicalUnit(facts)
-	if err != nil {
-		t.Fatalf("renderCanonicalUnit() = %v, want nil", err)
-	}
+	assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("create the unit directory: %v", err)
 	}
@@ -752,9 +710,8 @@ func TestSystemdReinstallOfARunningUnitSwitchesTheExecutable(t *testing.T) {
 	previous := systemdExistingOptions(t, oldExecutable, root)
 	previous.Listen = "127.0.0.1:" + strconv.Itoa(freePort(t))
 	for _, dir := range []string{filepath.Dir(previous.Paths.ConfigFile), previous.Paths.StateDir, previous.Paths.LogDir} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		err := os.MkdirAll(dir, 0o700)
+		assertNoError(t, err, "")
 	}
 
 	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
@@ -781,9 +738,7 @@ func TestSystemdReinstallOfARunningUnitSwitchesTheExecutable(t *testing.T) {
 
 	requested := DefaultInstallOptions(ScopeUser, newExecutable)
 	effective, err := m.Install(context.Background(), requested)
-	if err != nil {
-		t.Fatalf("Install() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Install() = %v, want nil", err)
 	if !slices.Equal(probedListen, []string{previous.Listen}) {
 		t.Errorf("static readiness probes = %v, want the registered address %q", probedListen, previous.Listen)
 	}
@@ -797,9 +752,7 @@ func TestSystemdReinstallOfARunningUnitSwitchesTheExecutable(t *testing.T) {
 	}
 
 	content, err := os.ReadFile(unitPath)
-	if err != nil {
-		t.Fatalf("read the unit file: %v", err)
-	}
+	assertNoError(t, err, "read the unit file: %v", err)
 	unit := parseUnit(string(content))
 	if unit.Program != newExecutable {
 		t.Errorf("the registered executable is %q, want %q", unit.Program, newExecutable)
@@ -850,9 +803,7 @@ func TestSystemdReinstallOfAStoppedUnitDoesNotStartIt(t *testing.T) {
 	}
 
 	content, err := os.ReadFile(unitPath)
-	if err != nil {
-		t.Fatalf("read the unit file: %v", err)
-	}
+	assertNoError(t, err, "read the unit file: %v", err)
 	if got := parseUnit(string(content)).Program; got != newExecutable {
 		t.Errorf("the registered executable is %q, want %q", got, newExecutable)
 	}
@@ -904,9 +855,7 @@ func TestSystemdReinstallPreservesUnrelatedUnitSettings(t *testing.T) {
 	// file plus the drop-in layer, and it is read the same way before and
 	// after the write: the drop-in layer itself never changes.
 	home, err := unitHomeDir(previous)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	loadedEnvironment := []string{"HF_HUB_CACHE=/operator/hub", "HOME=" + home}
 	loadedEnvironmentFiles := []systemdEnvironmentFile{{Path: "/etc/hfdesk/service.env", IgnoreErrors: true}}
 	m.readServiceProperties = func(_ context.Context, name string) (map[string]dbus.Variant, error) {
@@ -927,9 +876,7 @@ func TestSystemdReinstallPreservesUnrelatedUnitSettings(t *testing.T) {
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 
 	effective, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
-	if err != nil {
-		t.Fatalf("Install() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Install() = %v, want nil", err)
 	want := previous
 	want.Executable = newExecutable
 	if !reflect.DeepEqual(effective, want) {
@@ -979,18 +926,14 @@ func TestSystemdUpdateOfStoredButUnloadedUnitStaysStopped(t *testing.T) {
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 
 	effective, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
-	if err != nil {
-		t.Fatalf("Install() = %v, want an update of the stored unit", err)
-	}
+	assertNoError(t, err, "Install() = %v, want an update of the stored unit", err)
 	want := previous
 	want.Executable = newExecutable
 	if !reflect.DeepEqual(effective, want) {
 		t.Errorf("Install() = %+v, want the previous stored options with the new executable %+v", effective, want)
 	}
 	content, err := os.ReadFile(unitPath)
-	if err != nil {
-		t.Fatalf("read the updated unit: %v", err)
-	}
+	assertNoError(t, err, "read the updated unit: %v", err)
 	if got := parseUnit(string(content)).Program; got != newExecutable {
 		t.Errorf("stored executable = %q, want %q", got, newExecutable)
 	}
@@ -1012,16 +955,12 @@ func TestSystemdUpdateUsesTypedArgvForSpacesQuotesEmptyArgsAndEnvironment(t *tes
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 
 	effective, err := fixture.manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, fixture.updated.Executable))
-	if err != nil {
-		t.Fatalf("Install() = %v, want a full update with typed argv", err)
-	}
+	assertNoError(t, err, "Install() = %v, want a full update with typed argv", err)
 	if !reflect.DeepEqual(effective, fixture.updated) {
 		t.Errorf("Install() = %+v, want %+v", effective, fixture.updated)
 	}
 	content, err := os.ReadFile(fixture.unitPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	registered := parseUnit(string(content))
 	if registered.Program != fixture.updated.Executable || registered.flagValue("--config") != fixture.previous.Paths.ConfigFile {
 		t.Errorf("updated registration = %+v; config path with spaces/quotes was not preserved", registered)
@@ -1086,9 +1025,8 @@ func TestSystemdFreshInstallNeverStartsTheInstance(t *testing.T) {
 
 	m := &systemdManager{scope: ScopeUser}
 	systemdLoadedFromDiskSeam(t, m)
-	if _, err := m.Install(context.Background(), systemdTempInstallOptions(t, root)); err != nil {
-		t.Fatalf("Install() = %v, want nil", err)
-	}
+	_, err := m.Install(context.Background(), systemdTempInstallOptions(t, root))
+	assertNoError(t, err, "Install() = %v, want nil", err)
 
 	calls := systemdSupervisorCalls(t, logPath)
 	if got := systemdSupervisorCallsTo(calls, "enable", unitName); got != 1 {
@@ -1158,9 +1096,8 @@ func TestSystemdReinstallKeepsTheAutostartStateOfTheUnit(t *testing.T) {
 			t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", newExecutable)
 			t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLED_STATE", tc.state)
 
-			if _, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable)); err != nil {
-				t.Fatalf("Install() = %v, want nil for a unit that was %q before", err, tc.state)
-			}
+			_, err := m.Install(context.Background(), DefaultInstallOptions(ScopeUser, newExecutable))
+			assertNoError(t, err, "Install() = %v, want nil for a unit that was %q before", err, tc.state)
 
 			calls := systemdSupervisorCalls(t, logPath)
 			if got := systemdSupervisorCallsTo(calls, "enable", unitName); got != 0 {
@@ -1261,16 +1198,12 @@ func TestSystemdInstallRefusesAMaskedUnit(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of an installation over a masked unit")
 	}
-	for _, want := range []string{
+	assertNames(t, err.Error(), "Install()", []string{
 		unitName,
 		"is masked",
 		"does not replace the mask",
 		"systemctl --user unmask " + unitName,
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
-		}
-	}
+	})
 	// The one named action must clear a persistent mask, and `unmask
 	// --runtime` does not remove a file mask: a refusal naming it would send
 	// the administrator into a retry loop.
@@ -1341,16 +1274,12 @@ func TestSystemdInstallRefusesARuntimeMaskedUnit(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of an installation over a runtime masked unit")
 	}
-	for _, want := range []string{
+	assertNames(t, err.Error(), "Install()", []string{
 		unitName,
 		"is masked",
 		"does not replace the mask",
 		"systemctl --user unmask --runtime " + unitName,
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
-		}
-	}
+	})
 
 	// No unit file was created: the runtime mask left no file at the path,
 	// and the refused installation writes none. The directory of the unit
@@ -1448,16 +1377,12 @@ func TestSystemdInstallRefusesAPersistentMaskWithoutTheSupervisorAnswer(t *testi
 		if err == nil {
 			t.Fatal("Install() = nil, want the refusal of the masked unit without a supervisor answer")
 		}
-		for _, want := range []string{
+		assertNames(t, err.Error(), "Install()", []string{
 			unitName,
 			"is masked",
 			"does not replace the mask",
 			"systemctl --user unmask " + unitName,
-		} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("Install() = %q, want an error that mentions %q", err, want)
-			}
-		}
+		})
 		if strings.Contains(err.Error(), "--runtime") {
 			t.Errorf("Install() = %q, want the plain unmask command for a persistent mask", err)
 		}
@@ -1555,9 +1480,8 @@ func TestUnitPathPersistentMask(t *testing.T) {
 		t.Fatalf("mask the unit: %v", err)
 	}
 	linked := filepath.Join(dir, "linked.service")
-	if err := os.Symlink(regular, linked); err != nil {
-		t.Fatalf("link the unit: %v", err)
-	}
+	err := os.Symlink(regular, linked)
+	assertNoError(t, err, "link the unit: %v", err)
 	missing := filepath.Join(dir, "missing.service")
 
 	cases := []struct {
@@ -1633,9 +1557,7 @@ func TestSystemdFirstInstallRefusesADropInThatOwnsTheCommand(t *testing.T) {
 	requested := systemdTempInstallOptions(t, root)
 	m := &systemdManager{scope: ScopeUser}
 	unitPath, err := m.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath(): %v", err)
-	}
+	assertNoError(t, err, "unitPath(): %v", err)
 	dropIn := unitDropInPath(unitPath)
 	if err := os.MkdirAll(filepath.Dir(dropIn), 0o755); err != nil {
 		t.Fatalf("create the drop-in directory: %v", err)
@@ -1648,20 +1570,15 @@ func TestSystemdFirstInstallRefusesADropInThatOwnsTheCommand(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of the drop-in that owns the command")
 	}
-	for _, want := range []string{
+	assertNamesWithout(t, err.Error(), "Install()", []string{
 		"the update was refused and the registration was not changed",
 		dropIn,
 		`Remove the "ExecStart=" override from "` + dropIn + `"`,
 		"reload the unit files with \"systemctl --user daemon-reload\"",
 		`run "hfdesk service install" again`,
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Install() = %q, want a message that mentions %q", err, want)
-		}
-	}
-	if strings.Contains(err.Error(), " or ") {
-		t.Errorf("Install() = %q, offers an alternative instead of one action", err)
-	}
+	}, []string{
+		" or ",
+	})
 
 	// The refusal happened before any mutation: no unit file, no
 	// directory of the instance, and the supervisor was asked for the
@@ -1694,9 +1611,7 @@ func TestSystemdFirstInstallOverACleanDropInSucceeds(t *testing.T) {
 	m := &systemdManager{scope: ScopeUser}
 	systemdLoadedFromDiskSeam(t, m)
 	unitPath, err := m.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath(): %v", err)
-	}
+	assertNoError(t, err, "unitPath(): %v", err)
 	dropIn := unitDropInPath(unitPath)
 	if err := os.MkdirAll(filepath.Dir(dropIn), 0o755); err != nil {
 		t.Fatalf("create the drop-in directory: %v", err)
@@ -1734,9 +1649,7 @@ func TestSystemdFirstInstallVerifiesTheLoadedCommand(t *testing.T) {
 	requested := systemdTempInstallOptions(t, root)
 	m := &systemdManager{scope: ScopeUser}
 	unitPath, err := m.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath(): %v", err)
-	}
+	assertNoError(t, err, "unitPath(): %v", err)
 	// A loaded command that differs from the one the installation writes:
 	// what a drop-in with ExecStart= would compose over the canonical unit.
 	drifted := append([]string{requested.Executable}, RunArgs(requested)...)
@@ -1752,15 +1665,11 @@ func TestSystemdFirstInstallVerifiesTheLoadedCommand(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want the verification failure of the loaded command")
 	}
-	for _, want := range []string{
+	assertNames(t, err.Error(), "Install()", []string{
 		"did not load the canonical command that was written",
 		"(the failed registration was removed from disk and the supervisor)",
 		`run "hfdesk service status" to read the current state of the service`,
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Install() = %q, want a message that mentions %q", err, want)
-		}
-	}
+	})
 	// The rollback removed the registration of the failed verification
 	// again: nothing of the attempt is left on disk.
 	if _, statErr := os.Stat(unitPath); !errors.Is(statErr, fs.ErrNotExist) {
@@ -1806,20 +1715,15 @@ func TestSystemdPreWriteScanRefusesTheDropInOverrideOnAnUpdate(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want the pre-write refusal of the drop-in that owns the command")
 	}
-	for _, want := range []string{
+	assertNamesWithout(t, err.Error(), "Install()", []string{
 		"the update was refused and the registration was not changed",
 		`the drop-in "` + dropIn + `" carries an ExecStart= override`,
 		`Remove the "ExecStart=" override from "` + dropIn + `"`,
 		"reload the unit files with \"systemctl --user daemon-reload\"",
 		`run "hfdesk service install" again`,
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Install() = %q, want a message that mentions %q", err, want)
-		}
-	}
-	if strings.Contains(err.Error(), " or ") {
-		t.Errorf("Install() = %q, offers an alternative instead of one action", err)
-	}
+	}, []string{
+		" or ",
+	})
 	// Before any change: the unit file kept its bytes, no directory of
 	// the instance exists, and the supervisor saw the mask read and
 	// nothing else — no write, no reload, no enable.
@@ -1858,9 +1762,8 @@ func TestSystemdInstallHandlesTheHandEditedBaseFileOnBothSides(t *testing.T) {
 			t.Fatal("the canonical fixture no longer holds Type=simple")
 		}
 		for _, name := range []string{unitPath, os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT")} {
-			if err := os.WriteFile(name, []byte(edited), 0o644); err != nil {
-				t.Fatalf("write the hand-edited unit %q: %v", name, err)
-			}
+			err := os.WriteFile(name, []byte(edited), 0o644)
+			assertNoError(t, err, "write the hand-edited unit %q: %v", name, err)
 		}
 		t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
 
@@ -1903,9 +1806,7 @@ func TestSystemdInstallHandlesTheHandEditedBaseFileOnBothSides(t *testing.T) {
 		requested.Listen = "127.0.0.1:19233"
 		requested.Explicit.Listen = true
 		effective, err := m.Install(context.Background(), requested)
-		if err != nil {
-			t.Fatalf("Install() = %v, want the canonical update accepted", err)
-		}
+		assertNoError(t, err, "Install() = %v, want the canonical update accepted", err)
 		want := previous
 		want.Executable = newExecutable
 		want.Listen = requested.Listen
@@ -1951,9 +1852,8 @@ func TestSystemdUpdateThatKeepsTheMainPIDFailsVerification(t *testing.T) {
 	previous := systemdExistingOptions(t, oldExecutable, root)
 	previous.Listen = "127.0.0.1:" + strconv.Itoa(freePort(t))
 	for _, dir := range []string{filepath.Dir(previous.Paths.ConfigFile), previous.Paths.StateDir, previous.Paths.LogDir} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		err := os.MkdirAll(dir, 0o700)
+		assertNoError(t, err, "")
 	}
 
 	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
@@ -1974,15 +1874,11 @@ func TestSystemdUpdateThatKeepsTheMainPIDFailsVerification(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want the own-PID verification failure")
 	}
-	for _, want := range []string{
+	assertNames(t, err.Error(), "Install()", []string{
 		"kept the previous MainPID",
 		"the previous registration was restored",
 		"the previous instance was started again",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
-		}
-	}
+	})
 
 	content, readErr := os.ReadFile(unitPath)
 	if readErr != nil {
@@ -2018,9 +1914,7 @@ func TestSystemdUpdateRefusesACommandTheReloadDoesNotLoad(t *testing.T) {
 	m, unitPath, previousUnit := systemdExistingInstallation(t, previous)
 
 	home, err := unitHomeDir(previous)
-	if err != nil {
-		t.Fatalf("unitHomeDir() = %v, want nil", err)
-	}
+	assertNoError(t, err, "unitHomeDir() = %v, want nil", err)
 	// The snapshot the update reads before it writes: the typed
 	// configuration of the canonical file on disk.
 	oldProperties := systemdTestPropertiesFromUnit(previousUnit)
@@ -2040,15 +1934,11 @@ func TestSystemdUpdateRefusesACommandTheReloadDoesNotLoad(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want the V1 failure of a loaded command that is not the written canonical command")
 	}
-	for _, want := range []string{
+	assertNames(t, err.Error(), "Install()", []string{
 		"did not load the canonical command that was written",
 		"the previous registration and captured loaded command/launch settings were restored",
 		`run "hfdesk service status" to read the current state of the service`,
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
-		}
-	}
+	})
 	// The composite carries exactly one action: the command line prints
 	// this text as it is, so the diagnostic is the manager's to name.
 	if got := strings.Count(err.Error(), "hfdesk service status"); got != 1 {
@@ -2187,14 +2077,10 @@ func TestSystemdUpdateVerifiesThePreservedAndRequestedFields(t *testing.T) {
 			if err == nil {
 				t.Fatalf("Install() = nil, want the verification failure %q", tc.cause)
 			}
-			for _, want := range []string{
+			assertNames(t, err.Error(), "Install()", []string{
 				tc.cause,
 				"the previous registration and captured loaded command/launch settings were restored",
-			} {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("Install() = %q, want an error that mentions %q", err, want)
-				}
-			}
+			})
 			if strings.Contains(err.Error(), "started again") {
 				t.Errorf("Install() = %q, must not claim a restarted instance of a stopped update", err)
 			}
@@ -2297,9 +2183,7 @@ func TestSystemdUpdateFailsClosedOnAnUnconfirmableSupplementaryGroupsSnapshot(t 
 
 			_, err := m.Install(context.Background(), requested)
 			if tc.cause == "" {
-				if err != nil {
-					t.Fatalf("Install() = %v, want the verification to accept the answer that shows no drift", err)
-				}
+				assertNoError(t, err, "Install() = %v, want the verification to accept the answer that shows no drift", err)
 				content, readErr := os.ReadFile(unitPath)
 				if readErr != nil || string(content) == previousUnit || parseUnit(string(content)).Program != newExecutable {
 					t.Errorf("the updated unit (error %v) =\n%s\nwant the canonical write of %s", readErr, content, newExecutable)
@@ -2312,14 +2196,10 @@ func TestSystemdUpdateFailsClosedOnAnUnconfirmableSupplementaryGroupsSnapshot(t 
 			if err == nil {
 				t.Fatalf("Install() = nil, want the verification failure %q", tc.cause)
 			}
-			for _, want := range []string{
+			assertNames(t, err.Error(), "Install()", []string{
 				tc.cause,
 				"the previous registration and captured loaded command/launch settings were restored",
-			} {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("Install() = %q, want an error that mentions %q", err, want)
-				}
-			}
+			})
 			if strings.Contains(err.Error(), "started again") {
 				t.Errorf("Install() = %q, must not claim a restarted instance of a stopped update", err)
 			}
@@ -2347,9 +2227,7 @@ func TestSystemdInstallRefusesTheRegistrationWhoseOwnFragmentVanished(t *testing
 	requested := systemdTempInstallOptions(t, root)
 	m := &systemdManager{scope: ScopeUser}
 	unitPath, err := m.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath() = %v, want nil", err)
-	}
+	assertNoError(t, err, "unitPath() = %v, want nil", err)
 	if _, err := os.Stat(unitPath); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("the fixture starts with a unit file at %q: %v", unitPath, err)
 	}
@@ -2368,19 +2246,14 @@ func TestSystemdInstallRefusesTheRegistrationWhoseOwnFragmentVanished(t *testing
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of a loaded registration whose own file vanished")
 	}
-	for _, want := range []string{
+	assertNamesWithout(t, err.Error(), "Install()", []string{
 		unitPath,
 		"but the file was absent when the update read it",
 		`Reload the unit files with "systemctl --user daemon-reload"`,
 		`run "hfdesk service install" again`,
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
-		}
-	}
-	if strings.Contains(err.Error(), " or ") {
-		t.Errorf("Install() = %q, offers an alternative instead of one action", err)
-	}
+	}, []string{
+		" or ",
+	})
 
 	// The refusal happened before any mutation: no unit file, no directory
 	// of the instance, no supervisor change beyond the reads.
@@ -2447,15 +2320,11 @@ func TestSystemdInstallRefusesAnUpdateWhoseUnitChangesDuringTheUpdate(t *testing
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of a unit file that changed during the update")
 	}
-	for _, want := range []string{
+	assertNames(t, err.Error(), "Install()", []string{
 		unitPath,
 		"changed while the update was running",
 		`Run "hfdesk service install" again`,
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
-		}
-	}
+	})
 
 	// The seam fired: the file carries exactly the concurrent line. The
 	// installation never wrote its canonical rendering over it.

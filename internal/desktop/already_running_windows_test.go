@@ -45,9 +45,8 @@ func TestSecondLaunchReportsAFailedBrowserOpen(t *testing.T) {
 	}))
 	defer running.Close()
 
-	if err := service.PublishState(service.PublishedStatePath(), running.URL); err != nil {
-		t.Fatalf("publish the state of the running instance: %v", err)
-	}
+	err := service.PublishState(service.PublishedStatePath(), running.URL)
+	assertNoError(t, err, "publish the state of the running instance: %v", err)
 
 	// The browser cannot be opened.
 	previousBrowser := openBrowser
@@ -121,9 +120,8 @@ func TestSecondLaunchOpensTheWebUIOfTheRunningInstance(t *testing.T) {
 	}))
 	defer running.Close()
 
-	if err := service.PublishState(service.PublishedStatePath(), running.URL); err != nil {
-		t.Fatalf("publish the state of the running instance: %v", err)
-	}
+	err := service.PublishState(service.PublishedStatePath(), running.URL)
+	assertNoError(t, err, "publish the state of the running instance: %v", err)
 
 	// The browser records the URL it opens.
 	var opened []string
@@ -171,13 +169,9 @@ func TestSecondLaunchOpensTheWebUIOfTheRunningInstance(t *testing.T) {
 // the notice of a running instance it never reached.
 func TestSecondLaunchReportsAnIdentityItCannotAccess(t *testing.T) {
 	name, err := instanceMutexName()
-	if err != nil {
-		t.Fatalf("read the per-session singleton name: %v", err)
-	}
+	assertNoError(t, err, "read the per-session singleton name: %v", err)
 	probe, err := acquireInstanceLock()
-	if err != nil {
-		t.Fatalf("probe the per-session singleton: %v", err)
-	}
+	assertNoError(t, err, "probe the per-session singleton: %v", err)
 	if probe.Exists() {
 		probe.Release()
 		t.Skip("another desktop test or app owns the per-session singleton")
@@ -195,17 +189,13 @@ func TestSecondLaunchReportsAnIdentityItCannotAccess(t *testing.T) {
 	}
 
 	text := instanceLockStartupText(err)
-	for _, want := range []string{
+	assertNames(t, text, "the report", []string{
 		"single instance object",
 		"cannot access it",
 		"different Windows account",
 		"starts no server",
 		"start HFDesk again",
-	} {
-		if !strings.Contains(text, want) {
-			t.Errorf("the report %q does not mention %q", text, want)
-		}
-	}
+	})
 	// The identity refusal is distinct from the notice of a launch that
 	// found a running instance: this launch never reached that check.
 	if strings.Contains(text, alreadyRunningCaption) || strings.Contains(text, "HFDesk is already running") {

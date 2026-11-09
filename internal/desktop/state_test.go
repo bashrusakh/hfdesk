@@ -99,9 +99,8 @@ func TestPublishServingStateStopsTheHostWhenThePublishFails(t *testing.T) {
 func TestPublishServingStatePublishesAndKeepsServing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "desktop-state.json")
 	stopped := false
-	if err := publishServingState(path, "http://127.0.0.1:8080", func() { stopped = true }); err != nil {
-		t.Fatalf("publishServingState() = %v, want nil", err)
-	}
+	err := publishServingState(path, "http://127.0.0.1:8080", func() { stopped = true })
+	assertNoError(t, err, "publishServingState() = %v, want nil", err)
 	if stopped {
 		t.Error("the host was stopped although its state was published")
 	}

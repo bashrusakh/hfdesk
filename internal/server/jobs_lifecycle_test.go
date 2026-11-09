@@ -49,9 +49,8 @@ func TestJobManagerQuiesceFencesAlreadyDispatchedRunner(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := m.Close(ctx); err != nil {
-		t.Fatal(err)
-	}
+	err := m.Close(ctx)
+	assertNoError(t, err, "")
 	got, ok := m.GetJob(job.ID)
 	if !ok || got.Status != JobStatusQueued || got.starting {
 		t.Fatalf("starting runner crossed fence: %#v", got)
@@ -71,9 +70,7 @@ func TestJobManagerClosePausesRealRunnerAndPreservesPartials(t *testing.T) {
 	defer server.Close()
 	m := newLifecycleTestManager(t, Config{CacheDir: t.TempDir(), Endpoint: server.URL, MaxActive: 1})
 	job, _, err := m.CreateJob(DownloadRequest{Repo: "owner/model"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
@@ -132,9 +129,7 @@ func TestJobManagerCompletionDuringQuiesceDoesNotDispatchQueue(t *testing.T) {
 	updates := m.Subscribe()
 	defer m.Unsubscribe(updates)
 	first, _, err := m.CreateJob(DownloadRequest{Repo: "owner/active"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if _, _, err := m.CreateJob(DownloadRequest{Repo: "owner/queued"}); err != nil {
 		t.Fatal(err)
 	}
@@ -220,9 +215,7 @@ func TestJobManagerCloseDrainsAcceptedMutationAndSharesResult(t *testing.T) {
 		t.Fatalf("persistence calls = %d, want mutation + final snapshot", calls)
 	}
 	loaded, err := loadJobsState(m.statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if len(loaded) != 1 || loaded[0].Status != JobStatusCancelled {
 		t.Fatalf("final snapshot omitted accepted mutation: %#v", loaded)
 	}
@@ -297,9 +290,7 @@ func TestJobManagerFinalSnapshotAndNoWritesAfterClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	loaded, err := loadJobsState(m.statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if len(loaded) != 1 || loaded[0].Status != JobStatusPaused {
 		t.Fatalf("final snapshot did not include unsaved mutation: %#v", loaded)
 	}
@@ -365,9 +356,8 @@ func TestJobManagerCloseTimeoutDoesNotCancelFinalPersistence(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("close did not complete after persistence returned")
 	}
-	if err := m.Close(context.Background()); err != nil {
-		t.Fatalf("repeated Close result = %v", err)
-	}
+	err := m.Close(context.Background())
+	assertNoError(t, err, "repeated Close result = %v", err)
 }
 
 func TestJobManagerCloseWaitsForTerminalHistoryAndReportsWriteFailures(t *testing.T) {
@@ -398,9 +388,7 @@ func TestJobManagerCloseWaitsForTerminalHistoryAndReportsWriteFailures(t *testin
 				return realAppend(terminal)
 			}
 			job, _, err := m.CreateJob(DownloadRequest{Repo: "owner/model"})
-			if err != nil {
-				t.Fatal(err)
-			}
+			assertNoError(t, err, "")
 			select {
 			case <-entered:
 			case <-time.After(10 * time.Second):
@@ -443,9 +431,7 @@ func TestJobManagerCloseWaitsForTerminalHistoryAndReportsWriteFailures(t *testin
 				t.Fatalf("Close after successful history persistence: %v", closeErr)
 			}
 			entries, err := LoadHistory()
-			if err != nil {
-				t.Fatal(err)
-			}
+			assertNoError(t, err, "")
 			if len(entries) != 1 || entries[0].ID != job.ID || entries[0].Status != tc.status {
 				t.Fatalf("persisted terminal history = %#v, want job %s with status %s", entries, job.ID, tc.status)
 			}

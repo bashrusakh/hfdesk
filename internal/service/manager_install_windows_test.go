@@ -97,25 +97,19 @@ func TestSCMDisabledRunningRefusalRefusesBeforeItStopsTheInstance(t *testing.T) 
 			running := scmInstanceRan(tc.present, tc.state)
 			err := scmDisabledRunningRefusal(tc.present, running, tc.startType)
 			if !tc.refused {
-				if err != nil {
-					t.Fatalf("scmDisabledRunningRefusal(%v, %v, %d) = %v, want nil", tc.present, running, tc.startType, err)
-				}
+				assertNoError(t, err, "scmDisabledRunningRefusal(%v, %v, %d) = %v, want nil", tc.present, running, tc.startType, err)
 				return
 			}
 			if err == nil {
 				t.Fatalf("scmDisabledRunningRefusal(%v, %v, %d) = nil, want the refusal of the installation", tc.present, running, tc.startType)
 			}
-			for _, want := range []string{
+			assertNames(t, err.Error(), "the refusal", []string{
 				"is running, but its start type is disabled",
 				"Windows will not start it again after the installation stops it",
 				"Set the start type to manual or automatic",
 				`"sc config hfdesk start= demand"`,
 				"run the installation again",
-			} {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("the refusal %q does not mention %q", err, want)
-				}
-			}
+			})
 		})
 	}
 }
@@ -167,17 +161,13 @@ func TestSCMServiceAccountRefusalRefusesOnlyAChangedIdentity(t *testing.T) {
 			if !errors.Is(err, ErrServiceAccountMismatch) {
 				t.Errorf("the refusal %v is not classified as ErrServiceAccountMismatch", err)
 			}
-			for _, want := range []string{
+			assertNames(t, err.Error(), "the refusal", []string{
 				fmt.Sprintf("runs as \"%s\"", tc.shown),
 				"an HFDesk update keeps the supported identity " + scmLocalServiceAccount,
 				"nothing was changed and the service was not stopped",
 				`sc config hfdesk obj= "NT AUTHORITY\LocalService" password= ""`,
 				"run the installation again",
-			} {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("the refusal %q does not mention %q", err, want)
-				}
-			}
+			})
 		})
 	}
 }
@@ -384,9 +374,7 @@ func TestSCMCommandLineCarriesNoCredential(t *testing.T) {
 	// The command line holds the executable and the canonical argument
 	// vector of the shared contract, nothing else.
 	parts, err := windows.DecomposeCommandLine(commandLine)
-	if err != nil {
-		t.Fatalf("DecomposeCommandLine(%q) = %v, want nil", commandLine, err)
-	}
+	assertNoError(t, err, "DecomposeCommandLine(%q) = %v, want nil", commandLine, err)
 	want := append([]string{opts.Executable}, RunArgs(opts)...)
 	if !reflect.DeepEqual(parts, want) {
 		t.Errorf("the command line = %q, want %q", parts, want)
@@ -556,9 +544,7 @@ func TestSCMFailedInstallKeepsADirectoryThatExistedBefore(t *testing.T) {
 	// The directory the installation reuses is still there, with the
 	// owner and the permissions it had.
 	info, err := os.Stat(opts.LocalDir)
-	if err != nil {
-		t.Fatalf("the local directory %q is gone after the failed installation: %v", opts.LocalDir, err)
-	}
+	assertNoError(t, err, "the local directory %q is gone after the failed installation: %v", opts.LocalDir, err)
 	if !info.IsDir() {
 		t.Errorf("the path %q is not a directory after the failed installation", opts.LocalDir)
 	}
@@ -823,9 +809,7 @@ func TestSCMRegistrationOptionsDefaultsListenForAParseableBrokenRegistration(t *
 		state:       svc.Stopped,
 		commandLine: commandLine,
 	})
-	if err != nil {
-		t.Fatalf("scmStatusFrom() = %v, want a readable broken registration", err)
-	}
+	assertNoError(t, err, "scmStatusFrom() = %v, want a readable broken registration", err)
 	if status.State != StateBroken || status.Listen != DefaultListen {
 		t.Errorf("status = %+v, want broken with parser-default listen %q", status, DefaultListen)
 	}
@@ -1066,9 +1050,8 @@ func TestSCMConfigureRecoveryUsesOnlyEstablishedMissingPolicy(t *testing.T) {
 					actions: custom, resetPeriod: 17, nonCrash: nonCrash,
 					command: "custom recovery command", rebootMessage: "custom reboot message",
 				}
-				if err := configureSCMRecoveryWith(config); err != nil {
-					t.Fatalf("configureSCMRecoveryWith() = %v, want the custom policy preserved", err)
-				}
+				err := configureSCMRecoveryWith(config)
+				assertNoError(t, err, "configureSCMRecoveryWith() = %v, want the custom policy preserved", err)
 				if !slices.Equal(config.actions, custom) || config.nonCrash != nonCrash {
 					t.Errorf("the custom policy became actions=%v nonCrash=%v, want actions=%v nonCrash=%v",
 						config.actions, config.nonCrash, custom, nonCrash)
@@ -1086,9 +1069,8 @@ func TestSCMConfigureRecoveryUsesOnlyEstablishedMissingPolicy(t *testing.T) {
 		config := &scmTestRecoveryConfig{
 			resetPeriod: 17, command: "custom recovery command", rebootMessage: "custom reboot message",
 		}
-		if err := configureSCMRecoveryWith(config); err != nil {
-			t.Fatalf("configureSCMRecoveryWith() = %v, want defaults configured", err)
-		}
+		err := configureSCMRecoveryWith(config)
+		assertNoError(t, err, "configureSCMRecoveryWith() = %v, want defaults configured", err)
 		if !slices.Equal(config.actions, scmRecoveryActions()) || config.resetPeriod != scmRecoveryResetPeriod || !config.nonCrash {
 			t.Errorf("configured recovery = %+v, want defaults and non-crash failure recovery", config)
 		}
@@ -1101,9 +1083,8 @@ func TestSCMConfigureRecoveryUsesOnlyEstablishedMissingPolicy(t *testing.T) {
 	})
 	t.Run("does not rewrite an already-enabled non-crash flag", func(t *testing.T) {
 		config := &scmTestRecoveryConfig{nonCrash: true}
-		if err := configureSCMRecoveryWith(config); err != nil {
-			t.Fatalf("configureSCMRecoveryWith() = %v, want defaults configured", err)
-		}
+		err := configureSCMRecoveryWith(config)
+		assertNoError(t, err, "configureSCMRecoveryWith() = %v, want defaults configured", err)
 		if len(config.flagWrites) != 0 {
 			t.Errorf("non-crash flag writes = %v, want none", config.flagWrites)
 		}
@@ -1141,9 +1122,8 @@ func TestSCMConfigureRecoveryDoesNotWriteAfterUnreadableEvidence(t *testing.T) {
 		config := &scmTestRecoveryConfig{
 			actions: custom, nonCrash: false, nonCrashReadErr: readErr,
 		}
-		if err := configureSCMRecoveryWith(config); err != nil {
-			t.Fatalf("configureSCMRecoveryWith() = %v, want the custom policy untouched", err)
-		}
+		err := configureSCMRecoveryWith(config)
+		assertNoError(t, err, "configureSCMRecoveryWith() = %v, want the custom policy untouched", err)
 		if !slices.Equal(config.actions, custom) || config.nonCrash || len(config.actionWrites) != 0 || len(config.flagWrites) != 0 {
 			t.Errorf("the unreadable custom policy changed: %+v", config)
 		}
@@ -1468,9 +1448,7 @@ func TestSCMFailedUpdateConfigKeepsASuccessfulWrite(t *testing.T) {
 
 	m := &scmManager{scope: ScopeSystem}
 	dirsSafe, err := m.updateRegistrationConfig(registration, requestedConfig, previousSCMRegistration{present: true, config: previousConfig})
-	if err != nil {
-		t.Fatalf("updateRegistrationConfig() = %v, want nil", err)
-	}
+	assertNoError(t, err, "updateRegistrationConfig() = %v, want nil", err)
 	if dirsSafe {
 		t.Error("a successful update says newly created directories are safe to remove")
 	}
@@ -1565,9 +1543,7 @@ func (t *scmTestFirstInstallTarget) Delete() error {
 func scmTestHealthEndpoint(t *testing.T, version string, challenge bool) string {
 	t.Helper()
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen for the real health probe: %v", err)
-	}
+	assertNoError(t, err, "listen for the real health probe: %v", err)
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != serviceProbePath {
 			http.NotFound(w, r)
@@ -1590,9 +1566,7 @@ func scmTestHealthEndpoint(t *testing.T, version string, challenge bool) string 
 func scmTestProbeResponse(t *testing.T, status int, body, challenge string) (string, *atomic.Int32) {
 	t.Helper()
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen for the readiness response: %v", err)
-	}
+	assertNoError(t, err, "listen for the readiness response: %v", err)
 	var requests atomic.Int32
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests.Add(1)
@@ -1612,9 +1586,7 @@ func scmTestProbeResponse(t *testing.T, status int, body, challenge string) (str
 func scmTestClosedProbeAddress(t *testing.T) string {
 	t.Helper()
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen for the closed readiness address: %v", err)
-	}
+	assertNoError(t, err, "listen for the closed readiness address: %v", err)
 	address := listener.Addr().String()
 	if err := listener.Close(); err != nil {
 		t.Fatalf("close the readiness listener: %v", err)
@@ -1625,9 +1597,7 @@ func scmTestClosedProbeAddress(t *testing.T) string {
 func scmTestFirstInstallOptions(t *testing.T, listen, expectedVersion string) InstallOptions {
 	t.Helper()
 	executable, err := os.Executable()
-	if err != nil {
-		t.Fatalf("read the actual Windows test executable: %v", err)
-	}
+	assertNoError(t, err, "read the actual Windows test executable: %v", err)
 	root := t.TempDir()
 	return InstallOptions{
 		Scope:           ScopeSystem,
@@ -1749,9 +1719,7 @@ func TestSCMFirstInstallUsesTheRealImageAccessAndHealthProbePaths(t *testing.T) 
 				}
 				return
 			}
-			if err != nil {
-				t.Fatalf("startFirstRegistration() = %v, want success", err)
-			}
+			assertNoError(t, err, "startFirstRegistration() = %v, want success", err)
 			if starts != 1 || controls != 0 || deletes != 0 {
 				t.Errorf("successful first launch starts=%d controls=%d deletes=%d", starts, controls, deletes)
 			}
@@ -1818,9 +1786,7 @@ func TestSCMRunningUpdateKeepsReadinessSeparateFromImageAndVersionProof(t *testi
 
 			image, verified, err := (&scmManager{scope: ScopeSystem}).startAndVerifyVersion(
 				context.Background(), handle, opts.Executable, listen, tc.expected)
-			if err != nil {
-				t.Fatalf("startAndVerifyVersion() = %v, want readiness success", err)
-			}
+			assertNoError(t, err, "startAndVerifyVersion() = %v, want readiness success", err)
 			if *starts != 1 || image != scmImageUnverified || verified != tc.wantVerify {
 				t.Errorf("start=%d image=%v versionVerified=%v, want one start, inaccessible image and versionVerified=%v",
 					*starts, image, verified, tc.wantVerify)
@@ -1884,13 +1850,9 @@ func TestSCMRunningUpdateDoesNotHideReadinessFailuresBehindAnUnreadableImage(t *
 
 func TestSCMFirstInstallCleanupDoesNotTouchAChangedRegistrationOrProcess(t *testing.T) {
 	executable, err := os.Executable()
-	if err != nil {
-		t.Fatalf("read the actual Windows test executable: %v", err)
-	}
+	assertNoError(t, err, "read the actual Windows test executable: %v", err)
 	other, err := os.Executable()
-	if err != nil {
-		t.Fatalf("read the actual Windows test executable: %v", err)
-	}
+	assertNoError(t, err, "read the actual Windows test executable: %v", err)
 	listen := scmTestHealthEndpoint(t, "1.3.0", false)
 	cases := []struct {
 		name   string

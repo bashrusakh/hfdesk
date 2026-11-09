@@ -39,9 +39,7 @@ func TestSubsystemReadsThePE32OptionalHeader(t *testing.T) {
 	image := buildPEImage(SubsystemWindowsGUI, magicPE32, testOptionalHeaderSize32)
 
 	subsystem, err := SubsystemOf(bytes.NewReader(image))
-	if err != nil {
-		t.Fatalf("SubsystemOf: %v", err)
-	}
+	assertNoError(t, err, "SubsystemOf: %v", err)
 	if subsystem != SubsystemWindowsGUI {
 		t.Errorf("subsystem = %d, want %d", subsystem, SubsystemWindowsGUI)
 	}
@@ -54,9 +52,7 @@ func TestSubsystemReadsThePE32PlusOptionalHeader(t *testing.T) {
 	image := buildPEImage(SubsystemWindowsCUI, magicPE32Plus, testOptionalHeaderSize64)
 
 	subsystem, err := SubsystemOf(bytes.NewReader(image))
-	if err != nil {
-		t.Fatalf("SubsystemOf: %v", err)
-	}
+	assertNoError(t, err, "SubsystemOf: %v", err)
 	if subsystem != SubsystemWindowsCUI {
 		t.Errorf("subsystem = %d, want %d", subsystem, SubsystemWindowsCUI)
 	}
@@ -72,9 +68,7 @@ func TestSubsystemReadsTheFile(t *testing.T) {
 	}
 
 	subsystem, err := Subsystem(path)
-	if err != nil {
-		t.Fatalf("Subsystem: %v", err)
-	}
+	assertNoError(t, err, "Subsystem: %v", err)
 	if subsystem != SubsystemWindowsCUI {
 		t.Errorf("subsystem = %d, want %d", subsystem, SubsystemWindowsCUI)
 	}
@@ -193,9 +187,7 @@ func TestMachineReadsTheCOFFHeader(t *testing.T) {
 			image := buildPEImageWithMachine(SubsystemWindowsCUI, tc.magic, tc.size, tc.machine)
 
 			machine, err := MachineOf(bytes.NewReader(image))
-			if err != nil {
-				t.Fatalf("MachineOf: %v", err)
-			}
+			assertNoError(t, err, "MachineOf: %v", err)
 			if machine != tc.machine {
 				t.Errorf("machine = 0x%04X, want 0x%04X", machine, tc.machine)
 			}
@@ -213,9 +205,7 @@ func TestMachineReadsTheFile(t *testing.T) {
 	}
 
 	machine, err := Machine(path)
-	if err != nil {
-		t.Fatalf("Machine: %v", err)
-	}
+	assertNoError(t, err, "Machine: %v", err)
 	if machine != MachineAMD64 {
 		t.Errorf("machine = 0x%04X, want 0x%04X", machine, MachineAMD64)
 	}
@@ -298,9 +288,7 @@ func TestMachineReadsTheArchitectureOfAnUnknownOptionalHeader(t *testing.T) {
 		t.Fatal("SubsystemOf accepted an unknown optional header")
 	}
 	machine, err := MachineOf(bytes.NewReader(image))
-	if err != nil {
-		t.Fatalf("MachineOf: %v", err)
-	}
+	assertNoError(t, err, "MachineOf: %v", err)
 	if machine != MachineI386 {
 		t.Errorf("machine = 0x%04X, want 0x%04X", machine, MachineI386)
 	}
@@ -355,9 +343,7 @@ func TestExecutableMachineAcceptsOptionalHeadersWithFewerDeclaredDirectories(t *
 		t.Run(tc.name, func(t *testing.T) {
 			image := buildPEImageWithMachine(SubsystemWindowsCUI, tc.magic, tc.size, tc.machine)
 			got, err := ExecutableMachineOf(bytes.NewReader(image))
-			if err != nil {
-				t.Fatalf("ExecutableMachineOf: %v", err)
-			}
+			assertNoError(t, err, "ExecutableMachineOf: %v", err)
 			if got != tc.machine {
 				t.Errorf("machine = 0x%04X, want 0x%04X", got, tc.machine)
 			}
@@ -393,9 +379,7 @@ func TestExecutableMachineRejectsTruncatedOrOutOfBoundsDataDirectories(t *testin
 func TestExecutableMachineReadsStructurallyCompleteImage(t *testing.T) {
 	image := buildPEImageWithMachine(SubsystemWindowsCUI, magicPE32Plus, testOptionalHeaderSize64, MachineAMD64)
 	machine, err := ExecutableMachineOf(bytes.NewReader(image))
-	if err != nil {
-		t.Fatalf("ExecutableMachineOf: %v", err)
-	}
+	assertNoError(t, err, "ExecutableMachineOf: %v", err)
 	if machine != MachineAMD64 {
 		t.Errorf("machine = 0x%04X, want 0x%04X", machine, MachineAMD64)
 	}
@@ -484,4 +468,22 @@ func buildPEImageWithMachine(subsystem int, magic uint16, optionalHeaderSize int
 	image := buildPEImage(subsystem, magic, optionalHeaderSize)
 	binary.LittleEndian.PutUint16(image[testPeHeaderOffset+machineOffset:], machine)
 	return image
+}
+
+// assertNoError fails the test when the call it wraps reported a failure,
+// with the diagnostic the inline check printed.
+func assertNoError(t *testing.T, err error, format string, a ...any) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	if format == "" {
+		t.Fatal(err)
+		return
+	}
+	if len(a) == 0 {
+		t.Fatal(format)
+		return
+	}
+	t.Fatalf(format, a...)
 }

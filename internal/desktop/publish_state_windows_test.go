@@ -91,15 +91,11 @@ func TestDesktopHostStopsServingWhenTheStateCannotBePublished(t *testing.T) {
 	if report == "" {
 		t.Fatalf("no startup failure was reported, want one over the unpublished state: %v", messages)
 	}
-	for _, want := range []string{
+	assertNames(t, report, "report", []string{
 		"HFDesk is not serving",
 		"could not publish the effective URL",
 		"the state directory is read-only",
-	} {
-		if !strings.Contains(report, want) {
-			t.Errorf("report = %q, want it to mention %q", report, want)
-		}
-	}
+	})
 	if got := strings.Count(report, "start HFDesk again"); got != 1 {
 		t.Errorf("the number of next actions in the report = %d, want exactly 1: %q", got, report)
 	}

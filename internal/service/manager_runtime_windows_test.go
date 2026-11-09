@@ -55,9 +55,8 @@ func TestSCMStopRetriesTheControlOfAnInstanceThatIsStillStarting(t *testing.T) {
 	handle := &scmTestServiceControl{state: svc.StartPending, refusals: 2}
 
 	manager := &scmManager{scope: ScopeSystem}
-	if _, err := manager.stopService(context.Background(), handle); err != nil {
-		t.Fatalf("stopService() = %v, want nil: the refusal of a starting instance is not the end of the stop", err)
-	}
+	_, err := manager.stopService(context.Background(), handle)
+	assertNoError(t, err, "stopService() = %v, want nil: the refusal of a starting instance is not the end of the stop", err)
 	if handle.controls < 3 {
 		t.Errorf("the stop control was delivered %d times, want it delivered again after every refusal", handle.controls)
 	}
@@ -168,9 +167,7 @@ func TestSCMVerifyWaitCoversTheReadinessWait(t *testing.T) {
 func TestSCMVerifyRunningExecutableKeepsTheProbeCause(t *testing.T) {
 	processID := uint32(os.Getpid())
 	executable, err := queryProcessImageName(processID)
-	if err != nil {
-		t.Fatalf("the image of the test process: %v", err)
-	}
+	assertNoError(t, err, "the image of the test process: %v", err)
 
 	previousQuery := scmQueryStatus
 	t.Cleanup(func() { scmQueryStatus = previousQuery })
@@ -251,9 +248,8 @@ func TestSCMStopOfAnInstanceThatIsStoppedIsACleanNoOp(t *testing.T) {
 	handle := &scmTestServiceControl{state: svc.Stopped}
 
 	manager := &scmManager{scope: ScopeSystem}
-	if _, err := manager.stopService(context.Background(), handle); err != nil {
-		t.Fatalf("stopService() = %v, want nil for an instance that does not run", err)
-	}
+	_, err := manager.stopService(context.Background(), handle)
+	assertNoError(t, err, "stopService() = %v, want nil for an instance that does not run", err)
 	if handle.controls != 0 {
 		t.Errorf("the stop control was delivered %d times, want none for an instance that does not run", handle.controls)
 	}

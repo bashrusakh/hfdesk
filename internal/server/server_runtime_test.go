@@ -56,9 +56,7 @@ func installCapturingPipeline(t *testing.T) *capturedLog {
 	t.Helper()
 	captured := &capturedLog{}
 	pipeline, err := logging.New(logging.Options{Console: true, ConsoleWriter: captured})
-	if err != nil {
-		t.Fatalf("build logging pipeline: %v", err)
-	}
+	assertNoError(t, err, "build logging pipeline: %v", err)
 	previousLogger := slog.Default()
 	previousWriter := log.Writer()
 	previousFlags := log.Flags()
@@ -81,9 +79,7 @@ func TestServeUsesCallerListener(t *testing.T) {
 	s := &Server{jobs: m}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	serveDone := make(chan error, 1)
@@ -92,14 +88,10 @@ func TestServeUsesCallerListener(t *testing.T) {
 	waitForServerBoundAddr(t, s, listener.Addr().String())
 
 	resp, err := http.Get("http://" + listener.Addr().String() + "/api/health")
-	if err != nil {
-		t.Fatalf("health request failed: %v", err)
-	}
+	assertNoError(t, err, "health request failed: %v", err)
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if err != nil {
-		t.Fatalf("read health response: %v", err)
-	}
+	assertNoError(t, err, "read health response: %v", err)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("health status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
@@ -123,9 +115,7 @@ func TestServeUsesCallerListener(t *testing.T) {
 	cancel()
 	select {
 	case err := <-serveDone:
-		if err != nil {
-			t.Fatalf("Serve returned %v", err)
-		}
+		assertNoError(t, err, "Serve returned %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not return after the context was cancelled")
 	}
@@ -150,9 +140,7 @@ func TestServeBrowserURLUsesLoopbackForWildcardBind(t *testing.T) {
 	s := &Server{jobs: m}
 
 	listener, err := net.Listen("tcp", "0.0.0.0:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	serveDone := make(chan error, 1)
@@ -172,9 +160,7 @@ func TestServeBrowserURLUsesLoopbackForWildcardBind(t *testing.T) {
 	cancel()
 	select {
 	case err := <-serveDone:
-		if err != nil {
-			t.Fatalf("Serve returned %v", err)
-		}
+		assertNoError(t, err, "Serve returned %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not return after the context was cancelled")
 	}
@@ -195,9 +181,7 @@ func TestStartupRecordUsesTheBrowserURL(t *testing.T) {
 		s := &Server{jobs: m}
 
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
+		assertNoError(t, err, "")
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		serveDone := make(chan error, 1)
@@ -225,9 +209,7 @@ func TestStartupRecordUsesTheBrowserURL(t *testing.T) {
 		cancel()
 		select {
 		case err := <-serveDone:
-			if err != nil {
-				t.Fatalf("Serve returned %v", err)
-			}
+			assertNoError(t, err, "Serve returned %v", err)
 		case <-time.After(5 * time.Second):
 			t.Fatal("Serve did not return after the context was cancelled")
 		}
@@ -396,9 +378,7 @@ func TestServeBrowserURLReachesAnIPv6OnlyWildcardListener(t *testing.T) {
 	cancel()
 	select {
 	case err := <-serveDone:
-		if err != nil {
-			t.Fatalf("Serve returned %v", err)
-		}
+		assertNoError(t, err, "Serve returned %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not return after the context was cancelled")
 	}
@@ -410,9 +390,7 @@ func TestServeBrowserURLReachesAnIPv6OnlyWildcardListener(t *testing.T) {
 // reachable.
 func TestServeBrowserURLKeepsTheDualStackWildcardReachable(t *testing.T) {
 	listener, err := net.Listen("tcp", ":0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	only, known := listenerIPv6Only(listener.Addr(), listener)
 	if !known {
 		listener.Close()
@@ -447,9 +425,7 @@ func TestServeBrowserURLKeepsTheDualStackWildcardReachable(t *testing.T) {
 	cancel()
 	select {
 	case err := <-serveDone:
-		if err != nil {
-			t.Fatalf("Serve returned %v", err)
-		}
+		assertNoError(t, err, "Serve returned %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not return after the context was cancelled")
 	}
@@ -618,9 +594,7 @@ func installRequestLogPipeline(t *testing.T, level slog.Level) *logging.Pipeline
 	t.Helper()
 
 	pipeline, err := logging.New(logging.Options{Level: level, RingCapacity: 64})
-	if err != nil {
-		t.Fatalf("build logging pipeline: %v", err)
-	}
+	assertNoError(t, err, "build logging pipeline: %v", err)
 	previous := slog.Default()
 	slog.SetDefault(pipeline.Logger())
 	t.Cleanup(func() { slog.SetDefault(previous) })

@@ -49,9 +49,7 @@ func TestParseSCMCommandLineReadsTheRegisteredExecutableAndAddress(t *testing.T)
 	opts.Executable = filepath.Join("C:\\Program Files", "HFDesk", "hfdesk.exe")
 
 	registration, err := parseSCMCommandLine(scmCommandLine(opts))
-	if err != nil {
-		t.Fatalf("parseSCMCommandLine() = %v, want nil", err)
-	}
+	assertNoError(t, err, "parseSCMCommandLine() = %v, want nil", err)
 	if registration.executable != opts.Executable {
 		t.Errorf("the registered executable = %q, want %q", registration.executable, opts.Executable)
 	}
@@ -76,9 +74,7 @@ func TestNewPlatformManagerRejectsTheUserScope(t *testing.T) {
 	}
 
 	manager, err = newPlatformManager(ScopeSystem)
-	if err != nil {
-		t.Fatalf("newPlatformManager(ScopeSystem) = %v, want nil", err)
-	}
+	assertNoError(t, err, "newPlatformManager(ScopeSystem) = %v, want nil", err)
 	if _, ok := manager.(*scmManager); !ok {
 		t.Errorf("newPlatformManager(ScopeSystem) = %T, want a *scmManager", manager)
 	}
@@ -396,13 +392,9 @@ func scmTestDACLProtected(t *testing.T, path string) bool {
 		windows.SE_FILE_OBJECT,
 		windows.DACL_SECURITY_INFORMATION,
 	)
-	if err != nil {
-		t.Fatalf("the security descriptor of %q cannot be read: %v", path, err)
-	}
+	assertNoError(t, err, "the security descriptor of %q cannot be read: %v", path, err)
 	control, _, err := sd.Control()
-	if err != nil {
-		t.Fatalf("the control bits of %q cannot be read: %v", path, err)
-	}
+	assertNoError(t, err, "the control bits of %q cannot be read: %v", path, err)
 	return control&windows.SE_DACL_PROTECTED != 0
 }
 
@@ -412,13 +404,9 @@ func scmTestDACLProtected(t *testing.T, path string) bool {
 func scmTestSetDACL(t *testing.T, path, sddl string) {
 	t.Helper()
 	sd, err := windows.SecurityDescriptorFromString(sddl)
-	if err != nil {
-		t.Fatalf("SecurityDescriptorFromString(%q) = %v, want nil", sddl, err)
-	}
+	assertNoError(t, err, "SecurityDescriptorFromString(%q) = %v, want nil", sddl, err)
 	dacl, _, err := sd.DACL()
-	if err != nil {
-		t.Fatalf("the access control list of %q cannot be read: %v", sddl, err)
-	}
+	assertNoError(t, err, "the access control list of %q cannot be read: %v", sddl, err)
 	if err := windows.SetNamedSecurityInfo(
 		path,
 		windows.SE_FILE_OBJECT,
@@ -486,13 +474,9 @@ func scmTestSecurity(t *testing.T, path string) (string, string) {
 		windows.SE_FILE_OBJECT,
 		windows.DACL_SECURITY_INFORMATION|windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION,
 	)
-	if err != nil {
-		t.Fatalf("the security descriptor of %q cannot be read: %v", path, err)
-	}
+	assertNoError(t, err, "the security descriptor of %q cannot be read: %v", path, err)
 	owner, _, err := sd.Owner()
-	if err != nil {
-		t.Fatalf("the owner of %q cannot be read: %v", path, err)
-	}
+	assertNoError(t, err, "the owner of %q cannot be read: %v", path, err)
 	if owner == nil {
 		t.Fatalf("the owner of %q is unknown", path)
 	}
@@ -510,20 +494,14 @@ func scmTestOwnerAndMode(t *testing.T, path string) (string, os.FileMode) {
 		windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION,
 	)
-	if err != nil {
-		t.Fatalf("the owner of %q cannot be read: %v", path, err)
-	}
+	assertNoError(t, err, "the owner of %q cannot be read: %v", path, err)
 	owner, _, err := sd.Owner()
-	if err != nil {
-		t.Fatalf("the owner of %q cannot be read: %v", path, err)
-	}
+	assertNoError(t, err, "the owner of %q cannot be read: %v", path, err)
 	if owner == nil {
 		t.Fatalf("the owner of %q is unknown", path)
 	}
 	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("the mode of %q cannot be read: %v", path, err)
-	}
+	assertNoError(t, err, "the mode of %q cannot be read: %v", path, err)
 	return owner.String(), info.Mode().Perm()
 }
 

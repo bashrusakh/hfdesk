@@ -26,9 +26,7 @@ import (
 
 func TestSCMStatusUsesAcceptedFlagSyntaxAndLastValue(t *testing.T) {
 	executable, err := os.Executable()
-	if err != nil {
-		t.Fatalf("Executable() = %v", err)
-	}
+	assertNoError(t, err, "Executable() = %v", err)
 	root := t.TempDir()
 	configFile := filepath.Join(root, "new", "hfdesk.json")
 	stateDir := filepath.Join(root, "new", "state")
@@ -55,9 +53,7 @@ func TestSCMStatusUsesAcceptedFlagSyntaxAndLastValue(t *testing.T) {
 		commandLine: commandLine,
 	}
 	status, err := scmStatusFrom(ScopeSystem, facts)
-	if err != nil {
-		t.Fatalf("scmStatusFrom() = %v", err)
-	}
+	assertNoError(t, err, "scmStatusFrom() = %v", err)
 	if status.Executable != executable || status.Listen != "127.0.0.1:9191" || status.Paths != (runtimepaths.Paths{ConfigFile: configFile, StateDir: stateDir, LogDir: logDir}) || status.CacheDir != cacheDir {
 		t.Errorf("status = %+v, want the last values of the registered command", status)
 	}
@@ -373,9 +369,7 @@ func TestSCMLifecycle(t *testing.T) {
 	scmTestCheckRecoveryActions(t)
 
 	status, err := service.Status(ctx)
-	if err != nil {
-		t.Fatalf("Status() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Status() = %v, want nil", err)
 	if status.State != StateStopped {
 		t.Errorf("the state = %q, want %q", status.State, StateStopped)
 	}
@@ -408,9 +402,7 @@ func TestSCMLifecycle(t *testing.T) {
 	// after a crash either.
 	scmTestCheckRecoveryActions(t)
 	status, err = service.Status(ctx)
-	if err != nil {
-		t.Fatalf("Status() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Status() = %v, want nil", err)
 	if status.Executable != opts.Executable {
 		t.Errorf("the registered executable = %q, want %q", status.Executable, opts.Executable)
 	}
@@ -426,9 +418,7 @@ func TestSCMLifecycle(t *testing.T) {
 		Listen:     "127.0.0.1:18080",
 	}
 	effective, err := service.Install(ctx, named)
-	if err != nil {
-		t.Fatalf("the Install() of a named listen address = %v, want nil", err)
-	}
+	assertNoError(t, err, "the Install() of a named listen address = %v, want nil", err)
 	if effective.Listen != named.Listen {
 		t.Errorf("the effective listen address = %q, want the named one %q", effective.Listen, named.Listen)
 	}
@@ -436,9 +426,7 @@ func TestSCMLifecycle(t *testing.T) {
 		t.Errorf("the effective paths = %+v, want the kept ones %+v", effective.Paths, opts.Paths)
 	}
 	status, err = service.Status(ctx)
-	if err != nil {
-		t.Fatalf("Status() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Status() = %v, want nil", err)
 	if status.Listen != named.Listen {
 		t.Errorf("the registered listen address = %q, want the named one %q", status.Listen, named.Listen)
 	}
@@ -456,9 +444,7 @@ func TestSCMLifecycle(t *testing.T) {
 		t.Fatalf("Uninstall() = %v, want nil", err)
 	}
 	status, err = service.Status(ctx)
-	if err != nil {
-		t.Fatalf("Status() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Status() = %v, want nil", err)
 	if status.State != StateNotInstalled {
 		t.Errorf("the state = %q, want %q", status.State, StateNotInstalled)
 	}
@@ -484,34 +470,24 @@ func TestSCMLifecycle(t *testing.T) {
 func scmTestCheckRecoveryActions(t *testing.T) {
 	t.Helper()
 	manager, err := mgr.Connect()
-	if err != nil {
-		t.Fatalf("mgr.Connect() = %v, want nil", err)
-	}
+	assertNoError(t, err, "mgr.Connect() = %v, want nil", err)
 	defer manager.Disconnect()
 	handle, err := manager.OpenService(ServiceName)
-	if err != nil {
-		t.Fatalf("OpenService(%q) = %v, want nil", ServiceName, err)
-	}
+	assertNoError(t, err, "OpenService(%q) = %v, want nil", ServiceName, err)
 	defer handle.Close()
 
 	actions, err := handle.RecoveryActions()
-	if err != nil {
-		t.Fatalf("RecoveryActions() = %v, want nil", err)
-	}
+	assertNoError(t, err, "RecoveryActions() = %v, want nil", err)
 	if !reflect.DeepEqual(actions, scmRecoveryActions()) {
 		t.Errorf("the recovery actions of the registration = %v, want %v", actions, scmRecoveryActions())
 	}
 	period, err := handle.ResetPeriod()
-	if err != nil {
-		t.Fatalf("ResetPeriod() = %v, want nil", err)
-	}
+	assertNoError(t, err, "ResetPeriod() = %v, want nil", err)
 	if period != scmRecoveryResetPeriod {
 		t.Errorf("the reset period of the registration = %d seconds, want %d", period, scmRecoveryResetPeriod)
 	}
 	nonCrash, err := handle.RecoveryActionsOnNonCrashFailures()
-	if err != nil {
-		t.Fatalf("RecoveryActionsOnNonCrashFailures() = %v, want nil", err)
-	}
+	assertNoError(t, err, "RecoveryActionsOnNonCrashFailures() = %v, want nil", err)
 	if !nonCrash {
 		t.Error("the registration recovers a crash only, want the recovery of a non-crash failure as well: an instance that reports its failure has to be restarted")
 	}
@@ -539,9 +515,7 @@ func TestSCMStatusFromRegistrationReportsTheStateAndTheCommandLine(t *testing.T)
 	}
 
 	status, err := scmStatusFrom(ScopeSystem, facts)
-	if err != nil {
-		t.Fatalf("scmStatusFrom() = %v, want nil", err)
-	}
+	assertNoError(t, err, "scmStatusFrom() = %v, want nil", err)
 	if status.State != StateRunning {
 		t.Errorf("the state = %q, want %q", status.State, StateRunning)
 	}
@@ -576,9 +550,7 @@ func TestSCMStatusFromRegistrationReportsTheStateAndTheCommandLine(t *testing.T)
 // error.
 func TestSCMStatusFromAnAbsentRegistrationIsNotInstalled(t *testing.T) {
 	status, err := scmStatusFrom(ScopeSystem, scmRegistrationFacts{})
-	if err != nil {
-		t.Fatalf("scmStatusFrom() = %v, want nil for an absent registration", err)
-	}
+	assertNoError(t, err, "scmStatusFrom() = %v, want nil for an absent registration", err)
 	if status.State != StateNotInstalled {
 		t.Errorf("the state = %q, want %q", status.State, StateNotInstalled)
 	}
@@ -613,9 +585,7 @@ func TestSCMStatusFromABrokenRegistrationNamesTheMissingExecutable(t *testing.T)
 	}
 
 	status, err := scmStatusFrom(ScopeSystem, facts)
-	if err != nil {
-		t.Fatalf("scmStatusFrom() = %v, want nil", err)
-	}
+	assertNoError(t, err, "scmStatusFrom() = %v, want nil", err)
 	if status.State != StateBroken {
 		t.Errorf("the state = %q, want %q", status.State, StateBroken)
 	}
@@ -649,9 +619,7 @@ func TestSCMStatusFromABrokenRegistrationThatRunsKeepsTheRunningFact(t *testing.
 	}
 
 	status, err := scmStatusFrom(ScopeSystem, facts)
-	if err != nil {
-		t.Fatalf("scmStatusFrom() = %v, want nil", err)
-	}
+	assertNoError(t, err, "scmStatusFrom() = %v, want nil", err)
 	if status.State != StateBroken {
 		t.Errorf("the state = %q, want the diagnosis %q of the registration", status.State, StateBroken)
 	}
@@ -689,9 +657,7 @@ func TestSCMStatusFromAFailedInstanceIsFailedAndNamesTheExitCode(t *testing.T) {
 	}
 
 	status, err := scmStatusFrom(ScopeSystem, facts)
-	if err != nil {
-		t.Fatalf("scmStatusFrom() = %v, want nil", err)
-	}
+	assertNoError(t, err, "scmStatusFrom() = %v, want nil", err)
 	if status.State != StateFailed {
 		t.Errorf("the state = %q, want %q", status.State, StateFailed)
 	}
@@ -720,9 +686,7 @@ func TestSCMStatusFromACleanlyStoppedInstanceIsStopped(t *testing.T) {
 	}
 
 	status, err := scmStatusFrom(ScopeSystem, facts)
-	if err != nil {
-		t.Fatalf("scmStatusFrom() = %v, want nil", err)
-	}
+	assertNoError(t, err, "scmStatusFrom() = %v, want nil", err)
 	if status.State != StateStopped {
 		t.Errorf("the state = %q, want %q", status.State, StateStopped)
 	}
@@ -755,9 +719,7 @@ func TestSCMStatusFromANeverStartedInstanceIsStopped(t *testing.T) {
 	}
 
 	status, err := scmStatusFrom(ScopeSystem, facts)
-	if err != nil {
-		t.Fatalf("scmStatusFrom() = %v, want nil", err)
-	}
+	assertNoError(t, err, "scmStatusFrom() = %v, want nil", err)
 	if status.State != StateStopped {
 		t.Errorf("the state = %q, want %q", status.State, StateStopped)
 	}
@@ -803,9 +765,7 @@ func TestSCMStatusFromKeepsTheOtherSupervisorStates(t *testing.T) {
 			}
 
 			status, err := scmStatusFrom(ScopeSystem, facts)
-			if err != nil {
-				t.Fatalf("scmStatusFrom() = %v, want nil", err)
-			}
+			assertNoError(t, err, "scmStatusFrom() = %v, want nil", err)
 			if status.State != tc.want {
 				t.Errorf("the state = %q, want %q", status.State, tc.want)
 			}
@@ -862,9 +822,7 @@ func TestSCMLookupRegistrationReportsAnAbsentRegistration(t *testing.T) {
 	}
 
 	status, err := scmStatusFrom(ScopeSystem, facts)
-	if err != nil {
-		t.Fatalf("scmStatusFrom() = %v, want nil for an absent registration", err)
-	}
+	assertNoError(t, err, "scmStatusFrom() = %v, want nil for an absent registration", err)
 	if status.State != StateNotInstalled {
 		t.Errorf("the state = %q, want %q", status.State, StateNotInstalled)
 	}
@@ -881,9 +839,7 @@ func TestSCMLookupRegistrationReportsAnAbsentRegistration(t *testing.T) {
 func TestSCMLookupRegistrationReadsARegisteredService(t *testing.T) {
 	name := scmTestFindReadableService(t)
 	facts, err := scmLookupRegistration(name)
-	if err != nil {
-		t.Fatalf("scmLookupRegistration(%q) = %v, want nil", name, err)
-	}
+	assertNoError(t, err, "scmLookupRegistration(%q) = %v, want nil", name, err)
 	if !facts.present {
 		t.Errorf("scmLookupRegistration(%q) = an absent registration, want a registered one", name)
 	}
@@ -916,9 +872,7 @@ func TestSCMLookupRegistrationNeedsNoElevatedShell(t *testing.T) {
 
 	name := scmTestFindReadableService(t)
 	facts, err := scmLookupRegistration(name)
-	if err != nil {
-		t.Fatalf("scmLookupRegistration(%q) = %v, want nil", name, err)
-	}
+	assertNoError(t, err, "scmLookupRegistration(%q) = %v, want nil", name, err)
 	if !facts.present {
 		t.Errorf("scmLookupRegistration(%q) = an absent registration, want a registered one", name)
 	}
@@ -963,9 +917,7 @@ func TestSCMStatusOfAnAbsentRegistrationIsNotInstalled(t *testing.T) {
 
 	manager := &scmManager{scope: ScopeSystem}
 	status, err := manager.Status(context.Background())
-	if err != nil {
-		t.Fatalf("Status() = %v, want nil for an absent registration", err)
-	}
+	assertNoError(t, err, "Status() = %v, want nil for an absent registration", err)
 	if status.State != StateNotInstalled {
 		t.Errorf("the state = %q, want %q", status.State, StateNotInstalled)
 	}
@@ -983,9 +935,8 @@ func TestSCMStatusOfAnAbsentRegistrationIsNotInstalled(t *testing.T) {
 func TestSCMBrokenRegistration(t *testing.T) {
 	root := t.TempDir()
 	existing := filepath.Join(root, "hfdesk.exe")
-	if err := os.WriteFile(existing, []byte("not a program"), 0o600); err != nil {
-		t.Fatalf("WriteFile() = %v, want nil", err)
-	}
+	err := os.WriteFile(existing, []byte("not a program"), 0o600)
+	assertNoError(t, err, "WriteFile() = %v, want nil", err)
 	missing := filepath.Join(root, "gone", "hfdesk.exe")
 
 	// A registered program that is gone is a broken registration, and the
@@ -1032,9 +983,7 @@ func TestApplyRegistrationReportsTheEffectiveCacheDir(t *testing.T) {
 	opts.CacheDir = registered
 
 	registration, err := parseSCMCommandLine(scmCommandLine(opts))
-	if err != nil {
-		t.Fatalf("parseSCMCommandLine() = %v, want nil", err)
-	}
+	assertNoError(t, err, "parseSCMCommandLine() = %v, want nil", err)
 
 	status := Status{}
 	applyRegistration(&status, registration)
@@ -1060,9 +1009,7 @@ func TestApplyRegistrationReportsTheEffectiveCacheDir(t *testing.T) {
 	opts.CacheDir = ""
 	opts.Paths.ConfigFile = filepath.Join(root, "without-cache.json")
 	registration, err = parseSCMCommandLine(scmCommandLine(opts))
-	if err != nil {
-		t.Fatalf("parseSCMCommandLine() = %v, want nil", err)
-	}
+	assertNoError(t, err, "parseSCMCommandLine() = %v, want nil", err)
 	status = Status{}
 	applyRegistration(&status, registration)
 	if status.CacheDir != "" {

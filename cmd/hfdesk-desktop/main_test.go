@@ -139,16 +139,12 @@ func TestParseHostOptionsRejectsUnconsumedArguments(t *testing.T) {
 // that reports its own usage.
 func TestParseHostOptionsAcceptsTheLegitimateInvocations(t *testing.T) {
 	opts, _, err := parseHostOptions(nil)
-	if err != nil {
-		t.Fatalf("an empty command line was rejected: %v", err)
-	}
+	assertNoError(t, err, "an empty command line was rejected: %v", err)
 	if opts.Port != 8080 {
 		t.Errorf("the default port is %d, want 8080", opts.Port)
 	}
 	opts, _, err = parseHostOptions([]string{"--port", "9090", "--no-open"})
-	if err != nil {
-		t.Fatalf("an ordinary command line was rejected: %v", err)
-	}
+	assertNoError(t, err, "an ordinary command line was rejected: %v", err)
 	if opts.Port != 9090 || !opts.NoOpen {
 		t.Errorf("parsed options = %+v, want port 9090 and no-open", opts)
 	}
@@ -159,4 +155,22 @@ func TestParseHostOptionsAcceptsTheLegitimateInvocations(t *testing.T) {
 	if !strings.Contains(usage, "Usage: hfdesk-desktop") {
 		t.Errorf("the usage %q does not carry the usage text of the flag error", usage)
 	}
+}
+
+// assertNoError fails the test when the call it wraps reported a failure,
+// with the diagnostic the inline check printed.
+func assertNoError(t *testing.T, err error, format string, a ...any) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	if format == "" {
+		t.Fatal(err)
+		return
+	}
+	if len(a) == 0 {
+		t.Fatal(format)
+		return
+	}
+	t.Fatalf(format, a...)
 }

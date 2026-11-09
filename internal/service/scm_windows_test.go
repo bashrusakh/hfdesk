@@ -125,9 +125,7 @@ func TestSCMHandlerWaitsForTheHostWhenTheReadinessFails(t *testing.T) {
 	// HTTP server of the instance: the readiness of the instance fails and
 	// it fails for sure, because the port belongs to the test.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Listen() = %v, want nil", err)
 	defer listener.Close()
 	go func() {
 		for {
@@ -388,9 +386,7 @@ func TestResolveOptionsFallsBackToTheHandedOverOptions(t *testing.T) {
 	handler := newSCMHandler(RunOptions{Paths: model, Listen: "127.0.0.1:8080"})
 
 	opts, err := handler.resolveOptions([]string{ServiceName})
-	if err != nil {
-		t.Fatalf("resolveOptions() = %v, want nil", err)
-	}
+	assertNoError(t, err, "resolveOptions() = %v, want nil", err)
 	if opts.Paths != model {
 		t.Errorf("the paths = %+v, want %+v", opts.Paths, model)
 	}
@@ -416,9 +412,7 @@ func TestResolveOptionsReadsTheRegisteredArguments(t *testing.T) {
 		"--log-dir", model.LogDir,
 		"--listen", "127.0.0.1:9090",
 	})
-	if err != nil {
-		t.Fatalf("resolveOptions() = %v, want nil", err)
-	}
+	assertNoError(t, err, "resolveOptions() = %v, want nil", err)
 	if opts.Paths != model {
 		t.Errorf("the paths = %+v, want %+v", opts.Paths, model)
 	}
@@ -435,9 +429,7 @@ func TestResolveOptionsReadsTheRegisteredArguments(t *testing.T) {
 func scmTestServe(t *testing.T, addr string) {
 	t.Helper()
 	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		t.Fatalf("Listen(%q) = %v, want nil", addr, err)
-	}
+	assertNoError(t, err, "Listen(%q) = %v, want nil", addr, err)
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// The probe of an instance proves the server and not merely a
 		// listener: an answer that is not the health document of HFDesk is
@@ -533,9 +525,7 @@ func TestSCMHandlerReportsACleanStopWhenTheShutdownFails(t *testing.T) {
 // status is read.
 func TestSCMHandlerReportsAFailureExitCodeWhenTheStartFails(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen() = %v, want nil", err)
-	}
+	assertNoError(t, err, "Listen() = %v, want nil", err)
 	defer listener.Close()
 	go func() {
 		for {

@@ -244,9 +244,7 @@ func TestServiceGateChoiceForButtonMapsTheFirstButtonOntoItsLabel(t *testing.T) 
 			}
 
 			choice, err := serviceGateChoiceForButton(prompt, serviceGateOpenButtonID)
-			if err != nil {
-				t.Fatalf("the first button of the %s service returned an error: %v", tc.name, err)
-			}
+			assertNoError(t, err, "the first button of the %s service returned an error: %v", tc.name, err)
 			if choice != tc.want {
 				t.Errorf("the first button of the %s service performs %v, want %v", tc.name, choice, tc.want)
 			}
@@ -381,9 +379,7 @@ func TestServiceGateButtonLayoutPerState(t *testing.T) {
 					t.Errorf("the button %d has the id %d, want %d", i, button.id, tc.wantIDs[i])
 				}
 				choice, err := serviceGateChoiceForButton(tc.prompt, button.id)
-				if err != nil {
-					t.Fatalf("the button %d returned an error: %v", i, err)
-				}
+				assertNoError(t, err, "the button %d returned an error: %v", i, err)
 				if choice != tc.wantChoices[i] {
 					t.Errorf("the button %d performs %v, want %v", i, choice, tc.wantChoices[i])
 				}
