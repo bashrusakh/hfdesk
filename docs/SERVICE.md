@@ -14,7 +14,9 @@ The supervisor owns the lifecycle completely:
   icon.
 - The supervisor starts the instance at boot of its scope when the registration
   is set to do so — a first installation writes that autostart, and a repeat
-  installation keeps the autostart state it finds (see
+  installation keeps the autostart state it finds when its property list can
+  be read (a property list that is missing or unreadable leaves no state to
+  keep and gets the default that starts the instance; see
   [Upgrades](#upgrades)) — and restarts it when it fails.
 
 Service mode is a **separate command family**. `hfdesk` without a `service`
@@ -295,7 +297,7 @@ directory of the instance is the real log sink on macOS.
 
 | Command | Effect | A service that is not installed |
 |---|---|---|
-| `install` | Registers the service with the supervisor and enables it for the boot of the scope on a **first** installation; a **repeat** installation keeps the autostart state the registration already has — it never runs `enable` at all, so an enabled systemd unit stays enabled, a unit enabled with `systemctl enable --runtime` stays runtime-only instead of being made permanent, and a disabled one stays disabled — while a masked unit (persistent or `--runtime`) refuses the installation, and a Windows registration keeps its start type and its delayed-auto-start flag, a macOS registration keeps the `RunAtLoad` value of its property list, while a running Windows service with a disabled start type refuses the installation. A macOS first installation registers the property list with `RunAtLoad`, so launchd starts the instance as soon as it is registered; a repeat installation starts nothing that did not run. A systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is updated in place on every platform — the settings the command does not name again are kept, a running instance is restarted on the new program, and a stopped one stays stopped (see [Upgrades](#upgrades)). | It creates the registration. |
+| `install` | Registers the service with the supervisor and enables it for the boot of the scope on a **first** installation; a **repeat** installation keeps the autostart state the registration already has — it never runs `enable` at all, so an enabled systemd unit stays enabled, a unit enabled with `systemctl enable --runtime` stays runtime-only instead of being made permanent, and a disabled one stays disabled — while a masked unit (persistent or `--runtime`) refuses the installation, and a Windows registration keeps its start type and its delayed-auto-start flag, a macOS registration keeps the `RunAtLoad` value of its property list, while a running Windows service with a disabled start type refuses the installation. A macOS first installation — no property list and no job launchd holds — registers the property list with `RunAtLoad`, so launchd starts the instance as soon as it is registered; a repeat installation, a job launchd holds without its property list included, starts nothing that did not run. A systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is updated in place on every platform — the settings the command does not name again are kept, a running instance is restarted on the new program, and a stopped one stays stopped (see [Upgrades](#upgrades)). | It creates the registration. |
 | `uninstall` | Removes the **registration only**. | Clean success: the registration is already gone. |
 | `start` | Starts the registered service. | **Error** that says the service is not installed. |
 | `stop` | Stops the registered service. | Clean success: there is nothing running to stop. |
@@ -1056,8 +1058,15 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   is not the canonical unit HFDesk generates — a hand edit, a specifier or
   variable operand, an `env`-wrapped command — a loaded command a drop-in
   owns, and a loaded fragment HFDesk did not write each refuse the update
-  before anything changes, whether the instance runs or not, with the drop-in
-  beside the unit as the single next action. If systemd's loaded command
+  before anything changes, whether the instance runs or not, and each names
+  its own single next action: the hand-edited file is reset by moving the
+  customizations into the drop-in, removing the unit file and reloading the
+  unit files; a drop-in-owned command is removed from the exact drop-in that
+  carries it before that reload, while a loaded command no reported drop-in
+  explains names the reload alone; a foreign fragment is removed at the path
+  systemd reports before the reload — a fragment file that is already gone
+  names only that reload — and a loaded registration with no readable
+  fragment names no command at all. If systemd's loaded command
   differs from the unit file, the update is refused rather than editing an
   administrator-owned drop-in or claiming that a shadowed base-file edit took
   effect. On Windows, the
@@ -1089,11 +1098,16 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   type and the delayed-auto-start flag are written back as they are, so a manual
   or a disabled start stays manual or disabled and a delayed automatic start
   stays delayed. On macOS the property list keeps the `RunAtLoad` value it
-  carries — a first installation writes the default that starts the instance,
-  a repeat installation keeps the found value — and a repeat installation
+  carries — a first installation (no property list and no job launchd holds)
+  writes the default that starts the instance, a repeat installation with a
+  readable property list keeps the found value, and a repeat installation
+  over a property list that is missing or unreadable has no found value to
+  keep and writes that default as well (the repair of the unreadable
+  property list above) — and a repeat installation
   never runs `enable`, so the `launchctl disable` flag of the label survives
   every update, whether or not the attempt loads the job. Only a **first**
-  installation enables the registration it writes for the boot of its scope.
+  installation — no property list and no job launchd holds — enables the
+  registration it writes for the boot of its scope.
 - **A state the installation cannot update is refused.** A masked systemd unit
   is refused before the unit file is written, whether the mask is persistent or
   was placed at runtime with `systemctl mask --runtime`: a persistent mask is a
