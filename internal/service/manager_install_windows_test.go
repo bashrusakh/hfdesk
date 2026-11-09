@@ -912,6 +912,49 @@ func TestSCMRegistrationParsedFlagDecidesTheMergeSource(t *testing.T) {
 	}
 }
 
+// TestSCMInstallOverAnUnreadableRegistrationKeepsTheRequestDefaults drives
+// the merge through the INSTALL wiring itself, not through the merge
+// function: an existing registration whose command line cannot be read must
+// leave the request's cache and hub defaults standing all the way into the
+// effective options of scmManager.install. A regression that passes the
+// mere presence of the registration as the merge source would clear the
+// optional cache layout here and point the instance at another tree.
+//
+// The lookup supplies the registration fixture (the zero-behavior seam of
+// the read-only lookup), and an unusable executable ends the installation
+// at its validation — the first check after the merge — so the test needs no
+// elevation, no control manager and no write: the returned options are the
+// merged ones, read before anything is mutated.
+func TestSCMInstallOverAnUnreadableRegistrationKeepsTheRequestDefaults(t *testing.T) {
+	previousLookup := scmLookupRegistration
+	scmLookupRegistration = func(name string) (scmRegistrationFacts, error) {
+		if name != ServiceName {
+			t.Errorf("scmLookupRegistration(%q) = fixture, want the lookup of %q", name, ServiceName)
+		}
+		return scmRegistrationFacts{present: true, commandLine: "   "}, nil
+	}
+	t.Cleanup(func() { scmLookupRegistration = previousLookup })
+
+	requested := InstallOptions{
+		Scope:      ScopeSystem,
+		Executable: filepath.Join(t.TempDir(), "missing", "hfdesk.exe"),
+		Listen:     DefaultListen,
+		CacheDir:   filepath.Join("C:\\ProgramData", "HFDesk", "cache"),
+		HubDir:     filepath.Join("C:\\ProgramData", "HFDesk", "cache", "hub"),
+	}
+
+	effective, _, err := (&scmManager{}).install(context.Background(), requested, false)
+	if err == nil {
+		t.Fatal("the installation over a missing executable succeeded, want the validation to end it")
+	}
+	if !strings.Contains(err.Error(), "is not usable") {
+		t.Errorf("the installation error = %v, want the executable validation that follows the merge", err)
+	}
+	if !reflect.DeepEqual(effective, requested) {
+		t.Errorf("the options of the installation over an unreadable registration =\n%+v\nwant the request defaults\n%+v", effective, requested)
+	}
+}
+
 // TestSCMRegistrationFlagValueAcceptsBothArgumentForms pins that the SCM
 // registration reader recovers a setting from both forms a registered
 // argument vector may carry: the paired words of a canonical write and the

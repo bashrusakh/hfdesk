@@ -2411,6 +2411,41 @@ func TestSystemdCanonicalUnitForInstallKeepsTheGroupOfTheWrittenUser(t *testing.
 		}
 	})
 
+	t.Run("an unnamed update keeps the previous absence of Group=", func(t *testing.T) {
+		opts := systemdTestOptions(t, ScopeSystem)
+		opts.ServiceUser = baseUser
+		// The resolved account of the installation carries a known
+		// primary group — the fallback a regression would inject into
+		// the unit beside the preserved User=.
+		loadedIdentity := &user.User{
+			Username: "operator",
+			Uid:      "4294967294",
+			Gid:      current.Gid,
+		}
+		previousWithoutGroup := previousRegistration{
+			existed: true,
+			facts:   canonicalUnit{scope: ScopeSystem, user: baseUser},
+		}
+
+		facts, factErr := canonicalUnitForInstall(opts, &unitWriteIdentity{account: loadedIdentity, previous: previousWithoutGroup})
+		assertNoError(t, factErr, "canonicalUnitForInstall() = %v, want nil", factErr)
+		if facts.user != baseUser {
+			t.Errorf("the written User= = %q, want the base account %q", facts.user, baseUser)
+		}
+		if facts.group != "" {
+			t.Errorf("the written Group= = %q, want no group: the previous unit carries none and the resolved account's primary group (%q) is not the group of the written User=",
+				facts.group, currentGroup.Name)
+		}
+		content, renderErr := renderCanonicalUnit(facts)
+		assertNoError(t, renderErr, "renderCanonicalUnit() = %v, want nil", renderErr)
+		if got := unitDirective(content, "Group"); got != "" {
+			t.Errorf("Group= of the rendered base unit = %q, want the directive to be absent", got)
+		}
+		if got := unitDirective(content, "User"); got != baseUser {
+			t.Errorf("User= of the rendered base unit = %q, want %q", got, baseUser)
+		}
+	})
+
 	t.Run("a named update writes the named account's group", func(t *testing.T) {
 		opts := systemdTestOptions(t, ScopeSystem)
 		opts.ServiceUser = current.Username

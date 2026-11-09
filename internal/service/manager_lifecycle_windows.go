@@ -230,7 +230,13 @@ type scmRegistrationFacts struct {
 // about, and it is reported as such. A registration the caller may not
 // look at is reported as the elevation requirement it is: the raw access
 // denied error of the platform does not tell the user what to do.
-func scmLookupRegistration(name string) (scmRegistrationFacts, error) {
+//
+// The variable below is a zero-behavior indirection: the installation-level
+// tests drive the merge wiring with a registration fixture instead of
+// registering a damaged service in the control manager of the test machine.
+var scmLookupRegistration = readSCMRegistration
+
+func readSCMRegistration(name string) (scmRegistrationFacts, error) {
 	facts := scmRegistrationFacts{}
 
 	manager, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
