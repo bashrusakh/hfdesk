@@ -114,7 +114,7 @@ func (a *Analyzer) analyzeWithRevision(ctx context.Context, repo string, isDatas
 
 	// Fetch file tree - auto-detect model vs dataset unless the caller forced a
 	// namespace or explicitly selected a dataset.
-	files, detectedIsDataset, commit, err := a.fetchFileTreeAutoDetect(ctx, repo, isDataset, forceModel, revision)
+	files, detectedIsDataset, commit, probeDegrade, err := a.fetchFileTreeAutoDetect(ctx, repo, isDataset, forceModel, revision)
 	if err != nil {
 		return nil, fmt.Errorf("fetch file tree: %w", err)
 	}
@@ -143,6 +143,22 @@ func (a *Analyzer) analyzeWithRevision(ctx context.Context, repo string, isDatas
 		info.TotalSize += f.Size
 	}
 	info.TotalSizeHuman = humanSize(info.TotalSize)
+
+	// The optional probe failed, so ErrBothExist detection is unverified:
+	// report the degradation instead of dropping it — caller context first,
+	// so cancellation or a caller deadline never becomes a warning cause.
+	if probeDegrade != nil && ctx.Err() == nil {
+		cause := "probe_unavailable"
+		if errors.Is(probeDegrade, hubtree.ErrPageFetchTimeout) {
+			cause = "probe_timeout"
+		}
+		info.AnalysisWarnings = append(info.AnalysisWarnings, AnalysisWarning{
+			Code:      bothNamespaceDetectionWarningCode,
+			Message:   fmt.Sprintf("Both-namespaces (ErrBothExist) detection was degraded: the dataset-namespace existence probe failed, so this repository was not checked for also existing as a dataset (cause: %v). Retry analysis to try again.", probeDegrade),
+			Causes:    []string{cause},
+			Retryable: true,
+		})
+	}
 
 	info.Type = a.detectType(files, isDataset)
 	info.TypeDescription = info.Type.Description()
@@ -209,6 +225,8 @@ type hfTreeNode struct {
 
 // ErrBothExist is returned when a repo exists as both model and dataset.
 var ErrBothExist = fmt.Errorf("repository exists as both model and dataset")
+
+const bothNamespaceDetectionWarningCode = "both_namespace_detection_degraded"
 
 // GatedRepoError reports that the Hub requires the user to accept an access
 // agreement or obtain approval before the repository can be read. It carries
@@ -335,18 +353,20 @@ func (a *Analyzer) newGatedRepoError(repo string, isDataset bool, message string
 // error. If both model and dataset exist, returns ErrBothExist. When forceModel
 // is true, only the model namespace is fetched and no dataset probe follows; a
 // missing model is reported as an error instead of falling back.
-func (a *Analyzer) fetchFileTreeAutoDetect(ctx context.Context, repo string, isDataset, forceModel bool, revision string) ([]FileInfo, bool, string, error) {
+// probeDegrade, when non-nil, is the failure of the optional post-success
+// dataset probe (the ErrBothExist check); it is never returned as err.
+func (a *Analyzer) fetchFileTreeAutoDetect(ctx context.Context, repo string, isDataset, forceModel bool, revision string) ([]FileInfo, bool, string, error, error) {
 	// If explicitly marked as dataset, fetch as dataset directly
 	if isDataset {
 		files, commit, err := a.fetchFileTree(ctx, repo, true, revision)
-		return files, true, commit, err
+		return files, true, commit, nil, err
 	}
 
 	// A forced model analyze must not auto-detect: probing the dataset
 	// namespace here would turn a valid model selection back into ErrBothExist.
 	if forceModel {
 		files, commit, err := a.fetchFileTree(ctx, repo, false, revision)
-		return files, false, commit, err
+		return files, false, commit, nil, err
 	}
 
 	modelFiles, modelCommit, modelErr := a.fetchFileTree(ctx, repo, false, revision)
@@ -371,26 +391,31 @@ func (a *Analyzer) fetchFileTreeAutoDetect(ctx context.Context, repo string, isD
 	if isModelNotFound(modelErr) {
 		datasetFiles, datasetCommit, datasetErr := a.fetchFileTree(ctx, repo, true, revision)
 		if datasetErr == nil {
-			return datasetFiles, true, datasetCommit, nil
+			return datasetFiles, true, datasetCommit, nil, nil
 		}
 		// If dataset also fails with not found/unauthorized, return helpful error
 		if isModelNotFound(datasetErr) {
-			return nil, false, "", fmt.Errorf("repository not found as model or dataset: %s", repo)
+			return nil, false, "", nil, fmt.Errorf("repository not found as model or dataset: %s", repo)
 		}
 		// Dataset failed with different error (actual auth issue, network, etc.)
-		return nil, false, "", datasetErr
+		return nil, false, "", nil, datasetErr
 	}
 
 	if modelErr == nil {
 		_, _, datasetErr := a.fetchFileTree(ctx, repo, true, revision)
 		if datasetErr == nil {
-			return nil, false, "", ErrBothExist
+			return nil, false, "", nil, ErrBothExist
 		}
-		return modelFiles, false, modelCommit, nil
+		// An authoritative namespace miss (401/404) is a completed probe with
+		// a negative answer; only an unanswerable probe degrades detection.
+		if !isModelNotFound(datasetErr) {
+			return modelFiles, false, modelCommit, datasetErr, nil
+		}
+		return modelFiles, false, modelCommit, nil, nil
 	}
 
 	// Return original error for other failures (network, etc.)
-	return nil, false, "", modelErr
+	return nil, false, "", nil, modelErr
 }
 
 // treeHTTPStatusError preserves the existing status diagnostic while retaining
@@ -437,23 +462,70 @@ func (a *Analyzer) fetchFileTree(ctx context.Context, repo string, isDataset boo
 	return files, commit, err
 }
 
+// treePageFetchTimeout is the per-fetch TOTAL cap (dial + response headers +
+// one JSON page body) on every tree-page request the analyze flow issues
+// through the shared hubtree walker. The single source of the family value is
+// pkg/hfdownloader/client.go's metadataFetchTimeout: required Hub metadata
+// fetched from the same endpoints over the same transport windows is one
+// policy, so both packages carry the same 2-minute value — this mirror exists
+// only because that variable is unexported and pkg/smartdl must not gain a
+// production dependency on pkg/hfdownloader just to read one duration; change
+// the two together. The non-tree analyze fetches (refs, file content,
+// safetensors header reads, model info) carry the same value as
+// metadataFetchTimeout below, so this whole family changes together. The cap
+// is deliberately generous so slow-but-working
+// endpoints keep working: the transport HFDesk builds may already spend up to
+// 30s connecting and 60s awaiting response headers, so two minutes still
+// leaves at least ~30 seconds for the body read on the slowest endpoint that
+// satisfies those transport windows, while ending body waits that previously
+// had no bound of their own. It is a package variable (not a const) so tests
+// can lower it deterministically, mirroring hfdownloader's
+// metadataFetchTimeout.
+var treePageFetchTimeout = 2 * time.Minute
+
+// metadataFetchTimeout is the per-fetch TOTAL cap (dial + response headers +
+// body) on every remaining analyze-flow Hub metadata fetch the analyzer
+// issues directly: the refs API, config/metadata file content (fetchFile and
+// its /resolve/ retry), safetensors ranged header reads, and the model-info
+// lineage lookup. It carries the same value as treePageFetchTimeout above and
+// pkg/hfdownloader/client.go's metadataFetchTimeout — one policy for metadata
+// fetched from the same endpoints over the same transport windows (up to 30s
+// dialing and 60s awaiting response headers), so change the whole family
+// together. The smaller payloads inside the family (the 10 MiB metadata size
+// cap, the 1 MiB safetensors header) need no separate value: each still
+// leaves at least ~30 seconds for its body after the slowest transport
+// windows, and the production analyze caller (one shared 60s per analysis)
+// is stricter than this cap, so the cap is defense in depth and the bound for
+// longer-deadline callers. A caller deadline still wins. It is a package
+// variable (not a const) so tests can lower it deterministically, mirroring
+// treePageFetchTimeout and hfdownloader's metadataFetchTimeout.
+var metadataFetchTimeout = 2 * time.Minute
+
 // walkTree walks the repository tree through the shared hubtree walker
 // (issue #96): recursive=true with Link rel="next" pagination, per-directory
 // fallback for mirrors that ignore recursive, bounded malformed listings,
 // and bounded Retry-After/RateLimit-aware retries of 429/5xx/network errors.
+// Each page request runs under the per-fetch analysis metadata cap
+// (treePageFetchTimeout: dial + response headers + JSON body); its expiry
+// fails every analyze-flow tree fetch with the actionable budget error below,
+// while retry waits between attempts and the request budget stay under their
+// own hubtree bounds on the caller's context, never charged to that
+// per-request deadline.
 // When commitOut is non-nil and still empty, the resolved commit SHA is
 // captured from the X-Repo-Commit response header that HuggingFace returns
 // for the requested revision — from the first response that carries it, as
 // before. Terminal statuses fail immediately with the historical error
-// messages below.
+// messages below; expiry of the per-page budget fails with the actionable
+// timeout error naming the budget.
 func (a *Analyzer) walkTree(ctx context.Context, repo string, isDataset bool, revision, prefix string, commitOut *string, fn func(hfTreeNode) error) error {
 	w := &hubtree.Walker{
 		TreeURL: func(p string) string {
 			return a.treeURL(repo, isDataset, revision, p)
 		},
-		Token:     a.token,
-		UserAgent: "hfdownloader/3",
-		Client:    a.client,
+		Token:            a.token,
+		UserAgent:        "hfdownloader/3",
+		Client:           a.client,
+		PageFetchTimeout: treePageFetchTimeout,
 		StatusErr: func(resp *http.Response) error {
 			// The walker closes the body before calling this mapper, so only
 			// the status and headers are available for the diagnostic.
@@ -482,9 +554,48 @@ func (a *Analyzer) walkTree(ctx context.Context, repo string, isDataset bool, re
 			}
 		},
 	}
-	return w.Walk(ctx, prefix, func(n hubtree.Node) error {
+	if err := w.Walk(ctx, prefix, func(n hubtree.Node) error {
 		return fn(toTreeNode(n))
-	})
+	}); err != nil {
+		if errors.Is(err, hubtree.ErrPageFetchTimeout) {
+			return shapeTreePageTimeout(repo, err)
+		}
+		return err
+	}
+	return nil
+}
+
+// shapeTreePageTimeout reports an expired per-page budget as the analysis
+// failure it is: required file-list data did not arrive, so the result must
+// never look complete. The message mirrors pkg/hfdownloader's planning
+// tree-page timeout (what timed out, for which repo, and the remedy), but
+// wraps with %w instead of %v: hubtree carries the underlying context expiry
+// as text only, so preserving the chain keeps classifiers seeing
+// hubtree.ErrPageFetchTimeout as a FAILURE while errors.Is never reports
+// context.DeadlineExceeded or context.Canceled for an internal budget expiry.
+func shapeTreePageTimeout(repo string, err error) error {
+	return fmt.Errorf("tree page API timed out after %s for %q: analysis needs this file list and the endpoint did not respond in time; check the endpoint, proxy, or network and retry (last error: %w)", treePageFetchTimeout, repo, err)
+}
+
+// shapeMetadataFetchTimeout reports an expired per-fetch metadata budget
+// (metadataFetchTimeout) in the established actionable shape — what timed
+// out, the budget, and the remedy — and returns nil when the cap did not
+// fire. The caller's own context is checked first, so caller cancellation
+// and caller deadlines stay the caller's context error and are never
+// re-shaped into a budget expiry. The underlying error is carried as text
+// only (%v), so an internal expiry is a FAILURE for classifiers while
+// errors.Is never reports context.DeadlineExceeded or context.Canceled for
+// it — the same rule as shapeTreePageTimeout. Sites that treat an ordinary
+// failure of this fetch as optional keep that handling unchanged: the shape
+// only makes the bounded stall readable, it never strengthens the site.
+func shapeMetadataFetchTimeout(ctx, fetchCtx context.Context, subject string, err error) error {
+	if ctx.Err() != nil {
+		return nil
+	}
+	if errors.Is(fetchCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%s timed out after %s: the endpoint did not respond in time; check the endpoint, proxy, or network and retry (last error: %v)", subject, metadataFetchTimeout, err)
+	}
+	return nil
 }
 
 // toTreeNode converts a shared hubtree node to the analyzer's node type
@@ -550,7 +661,9 @@ type hfRef struct {
 	TargetCommit string `json:"targetCommit"`
 }
 
-// fetchRefs fetches available branches and tags from the repository.
+// fetchRefs fetches available branches and tags from the repository. The
+// fetch runs under the per-fetch metadata budget (metadataFetchTimeout); its
+// caller treats any failure of it, including that cap's expiry, as non-fatal.
 func (a *Analyzer) fetchRefs(ctx context.Context, repo string, isDataset bool) ([]RepoRef, error) {
 	var apiPath string
 	if isDataset {
@@ -558,8 +671,11 @@ func (a *Analyzer) fetchRefs(ctx context.Context, repo string, isDataset bool) (
 	} else {
 		apiPath = fmt.Sprintf("%s/api/models/%s/refs", a.endpoint, repo)
 	}
+	subject := fmt.Sprintf("refs API for %q", repo)
 
-	req, err := http.NewRequestWithContext(ctx, "GET", apiPath, nil)
+	fetchCtx, cancel := context.WithTimeout(ctx, metadataFetchTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(fetchCtx, "GET", apiPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -567,6 +683,9 @@ func (a *Analyzer) fetchRefs(ctx context.Context, repo string, isDataset bool) (
 
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if shaped := shapeMetadataFetchTimeout(ctx, fetchCtx, subject, err); shaped != nil {
+			return nil, shaped
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -577,6 +696,9 @@ func (a *Analyzer) fetchRefs(ctx context.Context, repo string, isDataset bool) (
 
 	var refsResp hfRefsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&refsResp); err != nil {
+		if shaped := shapeMetadataFetchTimeout(ctx, fetchCtx, subject, err); shaped != nil {
+			return nil, shaped
+		}
 		return nil, fmt.Errorf("decode refs: %w", err)
 	}
 
@@ -796,9 +918,20 @@ func (a *Analyzer) fetchFile(ctx context.Context, repo string, isDataset bool, r
 	return content, err
 }
 
-// fetchFileFrom reads one file's content under the metadata size bound.
+// fetchFileFrom reads one file's content under the metadata size bound and
+// the per-fetch metadata budget (metadataFetchTimeout): one TOTAL cap over
+// dial + headers + body per request, so a stalled endpoint cannot hang a
+// deadline-less caller. The caller's own context still wins; only the
+// internal cap expiry is shaped into the actionable budget error, and it
+// stays in this read's existing failure class — a body read cut by the cap
+// is still a metadataReadError, so required metadata keeps its explicit
+// named-file failure while an ordinary transport failure keeps the optional
+// handling its callers already apply.
 func (a *Analyzer) fetchFileFrom(ctx context.Context, reqURL, path string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	subject := fmt.Sprintf("file content fetch for %q", path)
+	fetchCtx, cancel := context.WithTimeout(ctx, metadataFetchTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(fetchCtx, "GET", reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -806,6 +939,9 @@ func (a *Analyzer) fetchFileFrom(ctx context.Context, reqURL, path string) ([]by
 
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if shaped := shapeMetadataFetchTimeout(ctx, fetchCtx, subject, err); shaped != nil {
+			return nil, shaped
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -816,6 +952,9 @@ func (a *Analyzer) fetchFileFrom(ctx context.Context, reqURL, path string) ([]by
 
 	content, err := io.ReadAll(io.LimitReader(resp.Body, maxMetadataSize+1))
 	if err != nil {
+		if shaped := shapeMetadataFetchTimeout(ctx, fetchCtx, subject, err); shaped != nil {
+			return nil, &metadataReadError{shaped}
+		}
 		return nil, &metadataReadError{err}
 	}
 	if len(content) > maxMetadataSize {
@@ -828,7 +967,10 @@ const maxSafeTensorHeaderSize = 1 << 20
 
 // fetchSafetensorsHeader reads only the safetensors prefix and JSON header. It
 // prefers exact byte ranges, but can read the same bounded prefix from a
-// complete 200 response when the server ignores Range.
+// complete 200 response when the server ignores Range. Each ranged read runs
+// under the per-fetch metadata budget (metadataFetchTimeout); a cap expiry
+// surfaces as an ordinary probe failure for the caller's existing optional
+// handling, never as a cancellation.
 func (a *Analyzer) fetchSafetensorsHeader(ctx context.Context, repo, revision string, file FileInfo) ([]byte, error) {
 	reqURL := a.rawURL(repo, false, revision, file.Path)
 	if file.IsLFS {
@@ -852,13 +994,20 @@ func (a *Analyzer) fetchSafetensorsHeader(ctx context.Context, repo, revision st
 	return a.fetchSafetensorsRange(ctx, reqURL, file.Path, 8, headerEnd, file.Size)
 }
 
+// fetchSafetensorsRange issues one ranged header read under the per-fetch
+// metadata budget (metadataFetchTimeout): one TOTAL cap over dial + headers +
+// body, so a stalled mirror cannot hang the probe pass even when the caller's
+// context carries no earlier deadline. A cap expiry keeps this read's
+// failure class (a body read cut by the cap stays a metadataReadError) and is
+// shaped into the actionable budget error instead of a caller cancellation.
 func (a *Analyzer) fetchSafetensorsRange(ctx context.Context, reqURL, path string, start, end, fileSize int64) ([]byte, error) {
 	if start < 0 || end < start || (fileSize > 0 && end >= fileSize) {
 		return nil, fmt.Errorf("invalid safetensors range for %s", path)
 	}
-	requestCtx, cancel := context.WithCancel(ctx)
+	subject := fmt.Sprintf("safetensors header range fetch for %q", path)
+	fetchCtx, cancel := context.WithTimeout(ctx, metadataFetchTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, reqURL, nil)
+	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -870,6 +1019,9 @@ func (a *Analyzer) fetchSafetensorsRange(ctx context.Context, reqURL, path strin
 	// cross-host, and Authorization must not be replayed to that host.
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if shaped := shapeMetadataFetchTimeout(ctx, fetchCtx, subject, err); shaped != nil {
+			return nil, shaped
+		}
 		return nil, err
 	}
 	defer func() {
@@ -897,6 +1049,9 @@ func (a *Analyzer) fetchSafetensorsRange(ctx context.Context, reqURL, path strin
 		}
 		if start > 0 {
 			if _, err := io.CopyN(io.Discard, resp.Body, start); err != nil {
+				if shaped := shapeMetadataFetchTimeout(ctx, fetchCtx, subject, err); shaped != nil {
+					return nil, &metadataReadError{shaped}
+				}
 				return nil, &metadataReadError{err}
 			}
 		}
@@ -905,6 +1060,9 @@ func (a *Analyzer) fetchSafetensorsRange(ctx context.Context, reqURL, path strin
 	}
 	content := make([]byte, expected)
 	if _, err := io.ReadFull(resp.Body, content); err != nil {
+		if shaped := shapeMetadataFetchTimeout(ctx, fetchCtx, subject, err); shaped != nil {
+			return nil, &metadataReadError{shaped}
+		}
 		return nil, &metadataReadError{err}
 	}
 	return content, nil
@@ -1233,10 +1391,15 @@ type hfModelInfo struct {
 }
 
 // fetchModelInfo calls GET /api/models/{repo} and returns the relevant fields.
-// Non-fatal: callers should treat errors as "no metadata available".
+// Non-fatal: callers should treat errors as "no metadata available". The
+// fetch itself runs under the per-fetch metadata budget (metadataFetchTimeout)
+// so a stalled lineage lookup ends at the cap and degrades the same way.
 func (a *Analyzer) fetchModelInfo(ctx context.Context, repo string) (*hfModelInfo, error) {
 	reqURL := fmt.Sprintf("%s/api/models/%s", a.endpoint, repo)
-	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	subject := fmt.Sprintf("model info API for %q", repo)
+	fetchCtx, cancel := context.WithTimeout(ctx, metadataFetchTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(fetchCtx, "GET", reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1244,6 +1407,9 @@ func (a *Analyzer) fetchModelInfo(ctx context.Context, repo string) (*hfModelInf
 
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if shaped := shapeMetadataFetchTimeout(ctx, fetchCtx, subject, err); shaped != nil {
+			return nil, shaped
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -1254,6 +1420,9 @@ func (a *Analyzer) fetchModelInfo(ctx context.Context, repo string) (*hfModelInf
 
 	var info hfModelInfo
 	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		if shaped := shapeMetadataFetchTimeout(ctx, fetchCtx, subject, err); shaped != nil {
+			return nil, shaped
+		}
 		return nil, fmt.Errorf("decode model info %s: %w", repo, err)
 	}
 	return &info, nil

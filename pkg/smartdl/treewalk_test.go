@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/hubtree"
 )
@@ -765,4 +766,125 @@ func TestFetchFileTree_BackslashDirectoryTraversal(t *testing.T) {
 	if got := reqs.Load(); got != 2 {
 		t.Errorf("requests = %d, want 2", got)
 	}
+}
+
+// TestAnalyze_StalledTreePageFailsWithinPageFetchBudget pins the per-fetch
+// metadata cap on the analyze flow's tree pages: a server that sends response
+// headers and a partial JSON body and then stalls — the exact phase the
+// transport's response-header window cannot bound — must fail the analysis
+// within cap+slack with the actionable budget error, never a silently partial
+// result and never classified as caller cancellation. The caller-deadline
+// sub-case pins the opposite direction: when the caller's own deadline wins,
+// the failure stays the caller's context error and is never re-shaped into a
+// budget expiry.
+func TestAnalyze_StalledTreePageFailsWithinPageFetchBudget(t *testing.T) {
+	var treeReqs atomic.Int64
+	stalled := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/tree/") {
+			// The stalled tree must fail analysis before any other endpoint
+			// (namespace probe, refs, auth-check) is reached.
+			t.Errorf("unexpected request after the stalled tree: %s", r.URL)
+			http.NotFound(w, r)
+			return
+		}
+		treeReqs.Add(1)
+		// Headers and a partial JSON body arrive, then the body stalls: the
+		// phase the transport's ResponseHeaderTimeout cannot bound.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`[{"type":"file","path":"stalled.txt"`))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+		case <-stalled:
+		}
+	}))
+	t.Cleanup(srv.Close)
+	defer close(stalled)
+
+	t.Run("budget expiry is an analysis failure", func(t *testing.T) {
+		const testBudget = 500 * time.Millisecond
+		oldBudget := treePageFetchTimeout
+		treePageFetchTimeout = testBudget
+		defer func() { treePageFetchTimeout = oldBudget }()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		type result struct {
+			info *RepoInfo
+			err  error
+		}
+		done := make(chan result, 1)
+		start := time.Now()
+		go func() {
+			info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).Analyze(ctx, "owner/repo", false)
+			done <- result{info, err}
+		}()
+
+		// Deliberately asymmetric bounds: the asserted bound carries runner
+		// starvation headroom, while the watchdog fires well beyond it, where
+		// an unbounded read and a severely starved runner are honestly
+		// indistinguishable.
+		const (
+			slack         = 10 * time.Second // asserted-bound headroom (starvation tolerance)
+			watchdogSlack = 30 * time.Second // watchdog fires well beyond the asserted bound
+		)
+		select {
+		case res := <-done:
+			if res.info != nil || res.err == nil {
+				t.Fatalf("stalled tree page info=%v err=%v, want an analysis timeout failure and no partial result", res.info, res.err)
+			}
+			if elapsed := time.Since(start); elapsed > testBudget+slack {
+				t.Errorf("analysis returned after %v, want within cap+slack %v", elapsed, testBudget+slack)
+			}
+			for _, want := range []string{
+				"tree page API timed out after 500ms",
+				`for "owner/repo"`,
+				"analysis needs this file list",
+				"check the endpoint, proxy, or network and retry",
+			} {
+				if !strings.Contains(res.err.Error(), want) {
+					t.Errorf("timeout error = %q, want it to contain %q", res.err, want)
+				}
+			}
+			if strings.Contains(res.err.Error(), "repository not found as model or dataset") {
+				t.Errorf("timeout error = %q; a budget expiry must not collapse into the namespace not-found classifier", res.err)
+			}
+			// The budget expiry stays a FAILURE for error classifiers and
+			// must never read as caller cancellation.
+			if !errors.Is(res.err, hubtree.ErrPageFetchTimeout) {
+				t.Errorf("timeout error %v does not match hubtree.ErrPageFetchTimeout", res.err)
+			}
+			if errors.Is(res.err, context.DeadlineExceeded) || errors.Is(res.err, context.Canceled) {
+				t.Errorf("timeout error %v must not classify as caller cancellation", res.err)
+			}
+			if got := treeReqs.Load(); got != 1 {
+				t.Errorf("tree requests = %d, want 1 (an expired page budget is terminal, with no retry or namespace probe)", got)
+			}
+		case <-time.After(testBudget + watchdogSlack):
+			cancel()
+			t.Fatalf("analysis did not complete within the watchdog (cap %v + slack %v): unbounded tree-page body read or a starved runner", testBudget, watchdogSlack)
+		}
+	})
+
+	t.Run("caller deadline stays caller cancellation", func(t *testing.T) {
+		// The default 2-minute cap is untouched here: the caller's own
+		// deadline fires first and must surface as the caller's context
+		// failure, never re-shaped into a budget expiry.
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).Analyze(ctx, "owner/repo", false)
+		if info != nil || err == nil {
+			t.Fatalf("info=%v err=%v, want the caller-deadline failure", info, err)
+		}
+		if errors.Is(err, hubtree.ErrPageFetchTimeout) || strings.Contains(err.Error(), "tree page API timed out after") {
+			t.Errorf("caller-deadline error %v must not be reported as a budget expiry", err)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("caller-deadline error %v must surface as the caller's context failure, matching context.DeadlineExceeded", err)
+		}
+	})
 }
