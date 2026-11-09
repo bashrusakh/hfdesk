@@ -49,6 +49,17 @@ type RunOptions struct {
 // server fails. It never opens a browser and never creates a tray icon: the
 // instance is supervised, there is no desktop session to interact with.
 func Run(ctx context.Context, opts RunOptions) error {
+	return runInstance(ctx, opts, nil)
+}
+
+// runInstance performs the start of the headless host.
+//
+// listening, when it is not nil, is the own-liveness signal of this start: it
+// is closed once the listener of THIS instance is bound and before the serve
+// loop runs. The Windows service handler combines that fact with the probe of
+// the address, so a start is never reported ready from the probe alone, which
+// would accept another HFDesk on the address.
+func runInstance(ctx context.Context, opts RunOptions, listening chan<- struct{}) error {
 	// The runtime path model is installed first: the config file, the job
 	// state, the download history and the mirror targets are all resolved
 	// from it, so no server state may be read or written before it is in
@@ -106,8 +117,18 @@ func Run(ctx context.Context, opts RunOptions) error {
 	}
 
 	// The server owns the graceful shutdown path (quiesce, HTTP drain, job
-	// manager close); the host only waits for it.
-	return server.New(cfg).ListenAndServe(ctx)
+	// manager close); the host only waits for it. The bind happens here
+	// instead of inside ListenAndServe so the host can report its own
+	// listener before it serves.
+	srv := server.New(cfg)
+	listener, err := srv.Listen()
+	if err != nil {
+		return err
+	}
+	if listening != nil {
+		close(listening)
+	}
+	return srv.Serve(ctx, listener)
 }
 
 // destinations are the storage locations of a service instance.

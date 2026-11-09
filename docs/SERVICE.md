@@ -321,6 +321,17 @@ stopped (or cannot be read) fails closed with the same refusal. Every
 refusal changes nothing and names the one step that ends it: quit HFDesk
 from its notification-area icon and repeat the command.
 
+The guard's reach is **per user and per session**: the singleton and the
+published state of a desktop belong to one Windows session, so a desktop of
+another user or session on the same address stays outside it. A start that
+cannot claim its own instance degrades honestly instead of hiding: after this
+release it never reports readiness from a foreign answer, so the collision
+surfaces as a **failed start** — the instance never reports running, its bind
+failure is written to the Windows Event Log of the service — the command
+changes nothing, and the desktop that holds the address keeps serving. A
+desktop host that cannot publish its own state stops serving instead, so a
+serving desktop is never invisible to the guard.
+
 **Uninstall never deletes user data.** It removes the registration and nothing
 else: not the models, not the cache, not the config file, not the jobs or the
 history, not the logs. Removing the state of an instance is a separate,

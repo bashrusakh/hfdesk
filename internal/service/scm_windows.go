@@ -125,8 +125,10 @@ type scmHandler struct {
 	// The field is the seam of the test: the handler runs the host of the
 	// service layer, and a test can drive the lifecycle of the handler
 	// with a host of its own, so the wait for the shutdown can be
-	// observed without a server of its own.
-	run func(context.Context, RunOptions) error
+	// observed without a server of its own. The third argument is the
+	// own-liveness signal of the start: the host closes it once its own
+	// listener is bound, and a host that never binds never closes it.
+	run func(context.Context, RunOptions, chan<- struct{}) error
 
 	// readinessTimeout bounds the wait for the HTTP server.
 	readinessTimeout time.Duration
@@ -149,7 +151,7 @@ type scmHandler struct {
 func newSCMHandler(opts RunOptions) *scmHandler {
 	return &scmHandler{
 		opts:              opts,
-		run:               Run,
+		run:               runInstance,
 		readinessTimeout:  scmReadinessTimeout,
 		readinessInterval: scmReadinessInterval,
 		shutdownTimeout:   ShutdownBudget,
@@ -286,6 +288,11 @@ func (h *scmHandler) Execute(args []string, r <-chan svc.ChangeRequest, changes 
 // wait for a value that was consumed somewhere else, and it would block
 // until the budget of the wait is over.
 type scmHost struct {
+	// listening is the own-liveness signal of the start: it is closed
+	// when the listener of THIS instance is bound, and a host that ends
+	// before its bind leaves it open. It is written once.
+	listening chan struct{}
+
 	// done is closed when the host ended.
 	done chan struct{}
 
@@ -299,13 +306,13 @@ type scmHost struct {
 // The goroutine ends with the host: it keeps the error of the host and it
 // closes the signal of the end of the host when the host returned.
 func (h *scmHandler) startHost(ctx context.Context, opts RunOptions) *scmHost {
-	host := &scmHost{done: make(chan struct{})}
+	host := &scmHost{listening: make(chan struct{}), done: make(chan struct{})}
 	run := h.run
 	if run == nil {
-		run = Run
+		run = runInstance
 	}
 	go func() {
-		host.err = run(ctx, opts)
+		host.err = run(ctx, opts, host.listening)
 		close(host.done)
 	}()
 	return host
@@ -431,11 +438,16 @@ func scmArgumentCandidates(args []string, processArgs []string) [][]string {
 //
 // The wait is bounded and it watches three things:
 //
-//   - the host: an instance that fails while it starts is a failed start
-//     and not a start that timed out;
+//   - the own host: a start counts only when this instance reports its own
+//     listener bound and its host alive, combined with the probe answer —
+//     the probe alone accepts any HFDesk on the address, so another
+//     instance that answers there must never report this start ready;
 //   - the control requests: a stop request that arrives while the instance
 //     starts must not wait for the startup to finish;
 //   - the context of the instance.
+//
+// A host that ends before its listener is up is a failed start with its own
+// cause, and not a start that timed out.
 //
 // The first result reports whether the manager asked the instance to stop
 // while it was starting.
@@ -450,13 +462,14 @@ func (h *scmHandler) waitForReady(ctx context.Context, listen string, host *scmH
 	}
 	deadline := time.Now().Add(timeout)
 	for {
-		if err := serviceReadinessProbe(listen); err == nil {
+		if ownInstanceReady(host.listening, host.done, listen) {
 			return false, nil
 		}
 		select {
 		case <-host.done:
-			// The host ended before the HTTP server answered: the
-			// instance failed to start.
+			// The host ended before its own instance answered: the
+			// instance failed to start, and the failure of the host
+			// is the cause of this start.
 			err := host.err
 			if err == nil {
 				return false, errors.New("the instance ended before the HTTP server answered")

@@ -1203,6 +1203,87 @@ func isPlatformFile(name string) bool {
 	return strings.HasPrefix(name, "manager_") || strings.HasPrefix(name, "process_")
 }
 
+// TestRunInstanceReportsItsOwnListenerOnlyWhenItBinds proves the
+// own-liveness signal of a start: the host closes the signal once its own
+// listener is bound, and a host whose bind fails never closes it.
+//
+// The Windows service handler combines this signal with the probe of the
+// address, so the signal is the fact that separates the own instance from
+// another HFDesk that answers on the same address.
+func TestRunInstanceReportsItsOwnListenerOnlyWhenItBinds(t *testing.T) {
+	root := t.TempDir()
+	model := runtimepaths.Paths{
+		ConfigFile: filepath.Join(root, "etc", "hfdesk.json"),
+		StateDir:   filepath.Join(root, "var"),
+		LogDir:     filepath.Join(root, "var", "logs"),
+	}
+	t.Cleanup(runtimepaths.Reset)
+
+	t.Run("the own listener is reported once it is bound", func(t *testing.T) {
+		addr := "127.0.0.1:" + strconv.Itoa(freePort(t))
+		listening := make(chan struct{})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		ended := make(chan error, 1)
+		go func() { ended <- runInstance(ctx, RunOptions{Paths: model, Listen: addr}, listening) }()
+
+		select {
+		case <-listening:
+		case <-time.After(60 * time.Second):
+			t.Fatal("the host did not report its own listener")
+		}
+
+		// The own listener is bound, so the readiness probe of the
+		// address answers as the server of this instance.
+		if err := serviceReadinessProbe(addr); err != nil {
+			t.Errorf("the probe does not answer although the own listener is bound: %v", err)
+		}
+
+		cancel()
+		select {
+		case err := <-ended:
+			if err != nil {
+				t.Errorf("runInstance() = %v, want nil after the cancelled context", err)
+			}
+		case <-time.After(60 * time.Second):
+			t.Fatal("the host did not stop after its context was cancelled")
+		}
+	})
+
+	t.Run("a failed bind reports no own listener", func(t *testing.T) {
+		// The address belongs to another process: the bind of this
+		// instance fails, so the signal of its listener must stay open.
+		occupied, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("occupy an address: %v", err)
+		}
+		defer occupied.Close()
+		addr := occupied.Addr().String()
+
+		listening := make(chan struct{})
+		ended := make(chan error, 1)
+		go func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ended <- runInstance(ctx, RunOptions{Paths: model, Listen: addr}, listening)
+		}()
+
+		select {
+		case err := <-ended:
+			if err == nil || !strings.Contains(err.Error(), "listen on "+addr) {
+				t.Errorf("runInstance() = %v, want the failure of its own bind", err)
+			}
+		case <-time.After(60 * time.Second):
+			t.Fatal("the host did not report the failure of its bind")
+		}
+		select {
+		case <-listening:
+			t.Error("the host reported its own listener although its bind failed")
+		default:
+		}
+	})
+}
+
 // runService starts the headless host with an already cancelled context and
 // returns its error. A cancelled context is the normal shutdown path of a
 // supervised instance, so the host must return without an error.

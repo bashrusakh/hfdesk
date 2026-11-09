@@ -65,6 +65,43 @@ const (
 // then.
 var serviceReadinessProbe = probeServiceReady
 
+// ownInstanceReady reports whether the start of THIS instance is proven: the
+// own host must report its listener bound and must not have ended, and the
+// readiness probe must answer on the address.
+//
+// Only the pair may report a ready start. The probe alone proves nothing
+// about the instance: it accepts every HFDesk that answers on the address
+// (see probeServiceReady), so another instance that already owns the address
+// would report the start ready while the own host failed to bind or had not
+// bound yet. The own fact is read around the probe as well, so a host that
+// ends during the probe does not turn into a ready start either.
+func ownInstanceReady(listening, done <-chan struct{}, listen string) bool {
+	if !ownListenerUp(listening, done) {
+		return false
+	}
+	if err := serviceReadinessProbe(listen); err != nil {
+		return false
+	}
+	return ownListenerUp(listening, done)
+}
+
+// ownListenerUp reports the own-liveness facts alone: the listener of this
+// instance is bound and the host has not ended. Both signals are written
+// once, so the facts never go backwards.
+func ownListenerUp(listening, done <-chan struct{}) bool {
+	select {
+	case <-listening:
+	default:
+		return false
+	}
+	select {
+	case <-done:
+		return false
+	default:
+		return true
+	}
+}
+
 // serviceProbeTransport keeps the same-machine probe off the environment proxy.
 var serviceProbeTransport = &http.Transport{
 	Proxy:           nil,

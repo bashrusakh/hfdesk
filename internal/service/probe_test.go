@@ -502,3 +502,47 @@ func TestProbeServiceReadyReachesAWildcardListener(t *testing.T) {
 		})
 	}
 }
+
+// TestOwnInstanceReadyNeedsTheOwnInstanceAndTheProbe checks the readiness
+// rule of a start: only the own-liveness evidence of the host combined with
+// the probe answer may report the start ready.
+//
+// The probe accepts any HFDesk that answers on the address, so every case in
+// which the own host did not bind or already ended stays not ready although
+// the probe answers, and the probe answer itself stays required: without it
+// the own listener alone is no proof that HFDesk serves the address.
+func TestOwnInstanceReadyNeedsTheOwnInstanceAndTheProbe(t *testing.T) {
+	previous := serviceReadinessProbe
+	t.Cleanup(func() { serviceReadinessProbe = previous })
+
+	probeAnswers := func(string) error { return nil }
+	probeRefuses := func(string) error { return errors.New("the address does not answer as the HFDesk server") }
+
+	up := make(chan struct{})
+	close(up)
+	ended := make(chan struct{})
+	close(ended)
+	pending := make(chan struct{})
+
+	cases := []struct {
+		name      string
+		listening <-chan struct{}
+		done      <-chan struct{}
+		probe     func(string) error
+		want      bool
+	}{
+		{"the own listener is up, the host runs, the probe answers", up, pending, probeAnswers, true},
+		{"the own listener is up, the host runs, the probe fails", up, pending, probeRefuses, false},
+		{"the own bind is pending while the probe answers", pending, pending, probeAnswers, false},
+		{"the own host failed to bind while the probe answers", pending, ended, probeAnswers, false},
+		{"the own host ended although its listener was up", up, ended, probeAnswers, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			serviceReadinessProbe = tc.probe
+			if got := ownInstanceReady(tc.listening, tc.done, "127.0.0.1:8080"); got != tc.want {
+				t.Errorf("ownInstanceReady() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}

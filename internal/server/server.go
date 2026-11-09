@@ -278,14 +278,30 @@ func New(cfg Config) *Server {
 // It binds the configured address and serves the listener through Serve, so
 // the effective bound address is known as soon as the listener exists.
 func (s *Server) ListenAndServe(ctx context.Context) error {
+	listener, err := s.Listen()
+	if err != nil {
+		return err
+	}
+	return s.Serve(ctx, listener)
+}
+
+// Listen binds the configured address and returns the listener.
+//
+// It exists for a host that runs the serve path itself: the return of Listen
+// is the own-liveness fact of that host — its own listener is bound — which
+// the readiness of a start has to combine with the probe of the address. A
+// bind that fails closes the job manager within the shutdown budget and
+// returns the failure joined with the result of that cleanup, exactly as the
+// bind of ListenAndServe always did.
+func (s *Server) Listen() (net.Listener, error) {
 	cfg := s.snapshotConfig()
 	addr := fmt.Sprintf("%s:%d", cfg.Addr, cfg.Port)
 
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		return s.closeJobsAfterListenError(fmt.Errorf("listen on %s: %w", addr, err), ShutdownPhaseTimeout)
+		return nil, s.closeJobsAfterListenError(fmt.Errorf("listen on %s: %w", addr, err), ShutdownPhaseTimeout)
 	}
-	return s.Serve(ctx, listener)
+	return listener, nil
 }
 
 // Serve runs the HFDesk HTTP server on a caller-provided listener.
