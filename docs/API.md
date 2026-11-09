@@ -1013,8 +1013,13 @@ Hub items use `H/.hfdesk-control/v1`, derived only from `HubDir` H, and
 friendly-view items use `R/.hfdesk-control/v1`, derived from cache root R. They
 are independent when H and R are independent; a cache link operation admits its
 actual snapshot and friendly paths under the corresponding roots. Clients
-sharing H converge without a per-user ownership setting. `OwnershipDir` is a
-library `hfdownloader.Settings` option for flat `OutputDir` mode only; cache-mode
+sharing H converge without a per-user ownership setting — that statement is
+cache-scoped: cache keys derive from the control tree persisted under H, not
+from the destination path spelling. `OwnershipDir` is a
+library `hfdownloader.Settings` option for flat `OutputDir` mode only, where
+cross-host convergence is governed by the realm-relative conditions stated
+under selected deletion below and is not implied by resolving the same
+directory alone; cache-mode
 use of a non-empty value is rejected rather than selecting another control
 namespace. It is not an HTTP setting. Cache node IDs and profiles persist in a
 typed control tree whose `metadata/` branches are separate from user components
@@ -1303,10 +1308,49 @@ location kind gets the same protection through the flat ownership realm: entry
 admission over the exact member paths is taken before any identity pin or
 unlink and held through the deletion, so a flat-mode writer in another process
 holding any member refuses with the same `409`. As for flat writers generally,
-two participants exclude each other only when both resolve the same
-`Settings.OwnershipDir` (defaulting to the per-user `DefaultOwnershipDir()`);
-that is the flat realm's existing coordination boundary, not a new
-restriction. Local selected-delete admission uses complete frozen plan
+the flat realm's identity is an opaque ID persisted inside the shared
+`Settings.OwnershipDir` (defaulting to the per-user `DefaultOwnershipDir()`;
+`<OwnershipDir>/realm-id`) and created atomically under an exclusive
+bootstrap gate on first use, so every participant resolving one `OwnershipDir`
+reads the same realm ID. That first creation belongs to a single participant:
+the bootstrap gate is an advisory lock of the same class as the cross-host
+locks described below, so on a filesystem whose advisory locks are not
+effective across clients — the same limitation that already bounds those
+locks — two hosts can each mint their own ID on first use and will then never
+exclude each other, silently, because their lock filenames differ; no safety is
+claimed for this mechanism on such filesystems. Path-derived flat keys derive
+from that realm ID and the item's path relative to the realm root, so
+participants whose
+`OwnershipDir` and items sit under one common shared mount exclude each other
+across hosts regardless of where that shared root is mounted; resolving the
+same `OwnershipDir` is necessary for that exclusion but is not on its own a
+complete sufficient condition. The true boundary: a split topology (the
+`OwnershipDir` and the items rooted under different mounts) requires
+identical rel-token input on every host — the same structure below the lowest
+common ancestor and the same descending component spellings — so
+independently mounted split topologies that preserve that structure still
+converge (the documented residual), and a
+target on another volume keeps its absolute-spelling derivation, so same-host
+behavior is unaffected in every shape; separately, the dev:ino alias keys
+(`item-entry` and the other entry/object keys) and tree-validation identity
+stay host-local on purpose for same-host bind-mount aliasing, so a foreign
+host's staged `OwnershipFence` never reads as current proof there. The
+record's fate follows the claim's two branches, not a blanket re-download: an
+UNPROVEN record (a foreign host — the host mismatch defeats death evidence —
+or a same-host live or mixed-version owner that cannot be reclaimed) is
+preserved and refused with `ErrStagingOwnershipUnproven`; nothing is
+re-downloaded automatically, its bytes are never silently reused, and the
+operator removes the named staging pair and retries. A RECLAIMABLE record
+(the owner proven dead or this process, including one fenced under the former
+flat keys) is taken over with its fence re-bound to the current proof and its
+committed ranges inherited — resumed, not re-downloaded — and only a version,
+range, size or identity mismatch discards it and restarts from zero. That
+shared directory is the flat realm's coordination boundary, not
+a new restriction. Lock files derived from
+the former host-local (device/inode) realm identity, or from the former
+absolute-path-spelling flat keys, are harmless residue and
+are never unlinked; mixed-version writers deriving either identity remain
+unsupported. Local selected-delete admission uses complete frozen plan
 destinations when available. A matching run activity with a known and complete plan is
 authoritative: if none of its frozen destinations overlaps the selected entry
 (including revalidated raw alias spellings), that activity cannot write the

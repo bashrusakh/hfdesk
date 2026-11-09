@@ -561,7 +561,8 @@ LOOP:
 				dlErr = pathErr
 			} else {
 				domain, dlErr = acquireBlobDomainScoped(fileCtx, key, domainDst, ownership, ownershipPaths, proofPath)
-				if errors.Is(dlErr, errStagingOwnershipBusy) || errors.Is(dlErr, errStagingOwnershipUncertain) {
+				if errors.Is(dlErr, errStagingOwnershipBusy) || errors.Is(dlErr, errStagingOwnershipUncertain) ||
+					errors.Is(dlErr, errStagingOwnershipSameProcess) {
 					dlErr = blobOwnershipScopeError(it.SHA256, finalRel, dlErr)
 				} else if dlErr != nil {
 					dlErr = fmt.Errorf("acquire the ownership domain of %s: %w", finalRel, dlErr)

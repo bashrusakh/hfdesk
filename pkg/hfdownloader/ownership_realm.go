@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,9 +24,118 @@ var (
 	errOwnershipUnavailable = errors.New("OS ownership locking is unavailable")
 )
 
-const ownershipRetryDelay = 20 * time.Millisecond
+const (
+	// ownershipRetryDelay is the first retry pause after a refused
+	// acquisition. Attempts back off exponentially (capped) with per-attempt
+	// jitter so contended waiters decorrelate instead of re-contending in
+	// fixed-quantum waves.
+	ownershipRetryDelay    = 2 * time.Millisecond
+	ownershipRetryDelayMax = 200 * time.Millisecond
+)
 
-var ownershipLockOpen = openOwnershipLock
+// ownershipRetryNonce decorrelates the jitter of concurrent waiters.
+var ownershipRetryNonce uint64
+
+func ownershipRetryPause(attempt int) time.Duration {
+	window := ownershipRetryDelay
+	for i := 0; i < attempt && window < ownershipRetryDelayMax; i++ {
+		window *= 2
+	}
+	if window > ownershipRetryDelayMax {
+		window = ownershipRetryDelayMax
+	}
+	half := window / 2
+	if half <= 0 {
+		return window
+	}
+	jitter := time.Duration(atomic.AddUint64(&ownershipRetryNonce, 1) % uint64(half+1))
+	return half + jitter
+}
+
+// ownershipConflictError identifies the exact lock a refused acquisition
+// collided on so callers can classify the holder. It preserves the
+// errOwnershipBusy identity for every existing busy check.
+type ownershipConflictError struct {
+	key  string
+	path string
+	err  error
+}
+
+func (e *ownershipConflictError) Error() string {
+	return fmt.Sprintf("ownership lock %q is busy: %v", e.path, e.err)
+}
+
+func (e *ownershipConflictError) Unwrap() error { return e.err }
+
+// ownershipHeldLocks records the lock paths THIS process holds exclusively so
+// a refusal can be classified as same-process contention. It is process-local
+// diagnostic state that never participates in exclusion: an entry is added
+// before the OS lock attempt and dropped only after the OS lock is released,
+// so it may over-claim holds (softening a classification) but can never miss
+// one and falsely claim a foreign holder.
+var ownershipHeldLocks = struct {
+	sync.Mutex
+	exclusive map[string]int
+}{exclusive: map[string]int{}}
+
+// ownershipHeldExclusivelyHere reports whether this process is a proven
+// exclusive holder of path.
+func ownershipHeldExclusivelyHere(path string) bool {
+	clean := filepath.Clean(path)
+	ownershipHeldLocks.Lock()
+	defer ownershipHeldLocks.Unlock()
+	return ownershipHeldLocks.exclusive[clean] > 0
+}
+
+type ownershipRegisteredLock struct {
+	handle ownershipLockHandle
+	path   string
+	mode   ownershipLockMode
+}
+
+func (l *ownershipRegisteredLock) release() {
+	l.handle.release()
+	if l.mode != ownershipExclusive {
+		return
+	}
+	unregisterExclusiveOwnershipLock(filepath.Clean(l.path))
+}
+
+// openRegisteredOwnershipLock is the production ownershipLockOpen: the
+// platform primitive plus the process-local held-lock record. The record is
+// written before the OS lock attempt and rolled back on refusal, so the
+// record can only ever over-claim this process's holds — a classification can
+// soften to same-process during the attempt window but can never miss a
+// same-process holder and falsely claim a foreign one.
+func openRegisteredOwnershipLock(path string, mode ownershipLockMode) (ownershipLockHandle, error) {
+	registered := mode == ownershipExclusive
+	clean := filepath.Clean(path)
+	if registered {
+		ownershipHeldLocks.Lock()
+		ownershipHeldLocks.exclusive[clean]++
+		ownershipHeldLocks.Unlock()
+	}
+	handle, err := openOwnershipLock(path, mode)
+	if err != nil {
+		if registered {
+			unregisterExclusiveOwnershipLock(clean)
+		}
+		return nil, err
+	}
+	return &ownershipRegisteredLock{handle: handle, path: path, mode: mode}, nil
+}
+
+func unregisterExclusiveOwnershipLock(clean string) {
+	ownershipHeldLocks.Lock()
+	if ownershipHeldLocks.exclusive[clean] <= 1 {
+		delete(ownershipHeldLocks.exclusive, clean)
+	} else {
+		ownershipHeldLocks.exclusive[clean]--
+	}
+	ownershipHeldLocks.Unlock()
+}
+
+var ownershipLockOpen = openRegisteredOwnershipLock
 
 var ownershipWriterProbe = func(ctx context.Context, realm *ownershipRealm, paths []string) (*ownershipLease, error) {
 	return realm.probeWriterLease(ctx, paths)
@@ -70,18 +180,56 @@ type ownershipLease struct {
 	mu       sync.Mutex
 	released bool
 	validate func() error
+	// onRelease runs once, after this lease's handles are closed:
+	// whole-tree admission attaches the file-descriptor-limit hold here so
+	// the raised soft limit covers every held lock handle through the
+	// caller's removal and is restored only afterwards.
+	onRelease func()
 }
 
-// newOwnershipRealm retains the established local/external realm identity used
-// by flat-mode callers.
+// ownershipStatIdentity, when non-nil, replaces the platform directory-identity
+// primitive so a test can model two participants that resolve one shared
+// directory but see divergent host-local stat identity (as two hosts mounting
+// shared storage do). Production leaves it nil and behavior is unchanged.
+var ownershipStatIdentity func(path string) (string, error)
+
+// statDirectoryIdentity is the entry point flat-realm code uses to read
+// host-local directory identity, routed through ownershipStatIdentity for
+// tests. Flat keys that must converge across hosts derive from the persisted
+// realm ID and realm-relative path tokens, not from this value.
+func statDirectoryIdentity(path string) (string, error) {
+	if ownershipStatIdentity != nil {
+		return ownershipStatIdentity(path)
+	}
+	return ownershipDirectoryIdentity(path)
+}
+
+// ownershipPathSpelling, when non-nil, replaces the path spelling that flat
+// realm-anchored key derivation reads (the two sides of the realm-relative
+// comparison), so a test can model hosts that mount one shared realm+item
+// topology under different prefix spellings. It must map a real path to a
+// same-volume prefix spelling of it; filesystem operations keep using the real
+// path. Production leaves it nil and behavior is unchanged.
+var ownershipPathSpelling func(path string) string
+
+// ownershipSpelledPath returns the spelling flat realm-anchored key derivation
+// reads for path: the test seam when set, the real path otherwise.
+func ownershipSpelledPath(path string) string {
+	if ownershipPathSpelling != nil {
+		return ownershipPathSpelling(path)
+	}
+	return path
+}
+
+// newOwnershipRealm resolves the flat external realm with the shared identity
+// persisted inside it (see initializeFlatRealmID).
 func newOwnershipRealm(root string) (*ownershipRealm, error) {
 	realm, err := newOwnershipRealmBase(root)
 	if err != nil {
 		return nil, err
 	}
-	realm.id = "path:" + filepath.Clean(realm.root)
-	if realm.rootObjectID != "" {
-		realm.id = "object:" + realm.rootObjectID
+	if err := realm.initializeFlatRealmID(); err != nil {
+		return nil, err
 	}
 	return realm, nil
 }
@@ -109,18 +257,65 @@ func newOwnershipRealmBase(root string) (*ownershipRealm, error) {
 		return nil, fmt.Errorf("ownership realm %q is not a directory", resolved)
 	}
 
-	rootObjectID, _ := ownershipDirectoryIdentity(resolved)
+	rootObjectID, _ := statDirectoryIdentity(resolved)
 	lockDir := filepath.Join(resolved, "v1")
 	if err := os.MkdirAll(lockDir, 0o777); err != nil {
 		return nil, fmt.Errorf("create ownership lock directory: %w", err)
 	}
-	lockDirObjectID, _ := ownershipDirectoryIdentity(lockDir)
+	lockDirObjectID, _ := statDirectoryIdentity(lockDir)
 	return &ownershipRealm{root: resolved, lockDir: lockDir, rootObjectID: rootObjectID, lockDirObjectID: lockDirObjectID}, nil
 }
 
-// loadOrCreateOwnershipNodeID is called only while metadataDir/bootstrap.lock
-// is exclusively held. A full ID is published by same-directory rename from a
-// synced temp; a crash leaves no partial final file.
+const (
+	// Flat-realm identity file and bootstrap gate, siblings of the v1 lock dir
+	// so the hashed item-lock namespace under v1 stays untouched.
+	ownershipRealmIDFile        = "realm-id"
+	ownershipRealmBootstrapFile = "realm-bootstrap.lock"
+)
+
+// ownershipRealmIDBootstrapWait bounds the exclusive first-creation gate before
+// the operation fails closed.
+const ownershipRealmIDBootstrapWait = 30 * time.Second
+
+// initializeFlatRealmID reads the shared realm ID, creating it on first use
+// under an exclusive bootstrap gate, so racing first users converge on one ID
+// while that gate's advisory lock is effective across clients — the same
+// condition that already bounds the cross-host locks themselves; where
+// advisory locks are not effective across clients, racing first users can each
+// mint their own ID on first use. A published ID is read without the gate (an
+// atomic rename makes it complete or absent, never partial), and a crash
+// creation temp is discarded, never migrated. Flat keys that must converge
+// across hosts derive from this ID, not from host-local stat identity.
+func (r *ownershipRealm) initializeFlatRealmID() error {
+	idPath := filepath.Join(r.root, ownershipRealmIDFile)
+	if id, err := readOwnershipNodeID(idPath); err == nil {
+		r.id = id
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read flat ownership realm ID: %w", err)
+	}
+	bootstrap, err := acquireOwnershipFileLock(context.Background(),
+		filepath.Join(r.root, ownershipRealmBootstrapFile),
+		ownershipExclusive, ownershipRealmIDBootstrapWait)
+	if err != nil {
+		return fmt.Errorf("acquire flat ownership realm ID gate: %w", err)
+	}
+	defer bootstrap.Release()
+	id, err := loadOrCreateOwnershipNodeID(r.root, ownershipRealmIDFile)
+	if err != nil {
+		return fmt.Errorf("initialize flat ownership realm ID: %w", err)
+	}
+	r.id = id
+	return nil
+}
+
+// loadOrCreateOwnershipNodeID is called only while the caller holds the
+// relevant exclusive bootstrap gate for the directory being initialized: the
+// cache node's metadata bootstrap lock (metadata/bootstrap.lock for the root,
+// or the parent's metadata/child-bootstrap.lock for a child), or the flat
+// realm's own realm-bootstrap.lock (see initializeFlatRealmID). A full ID is
+// published by same-directory rename from a synced temp; a crash leaves no
+// partial final file.
 func loadOrCreateOwnershipNodeID(metadataDir, name string) (string, error) {
 	final := filepath.Join(metadataDir, name)
 	if raw, err := os.ReadFile(final); err == nil {
@@ -261,6 +456,9 @@ func (r *ownershipRealm) tryAcquire(ctx context.Context, requests []ownershipLoc
 		handle, err := ownershipLockOpen(lockPath, request.mode)
 		if err != nil {
 			lease.Release()
+			if errors.Is(err, errOwnershipBusy) {
+				return nil, &ownershipConflictError{key: request.key, path: lockPath, err: err}
+			}
 			return nil, err
 		}
 		lease.handles[request.key] = handle
@@ -341,9 +539,14 @@ func (l *ownershipLease) Release() {
 		l.order = nil
 		l.modes = nil
 		l.validate = nil
+		onRelease := l.onRelease
+		l.onRelease = nil
 		l.mu.Unlock()
 		for i := len(order) - 1; i >= 0; i-- {
 			handles[order[i]].release()
+		}
+		if onRelease != nil {
+			onRelease()
 		}
 	})
 }
@@ -428,7 +631,7 @@ func retryOwnershipNotify(ctx context.Context, wait time.Duration, attempt func(
 		wait = 0
 	}
 	deadline := time.Now().Add(wait)
-	for {
+	for try := 0; ; try++ {
 		lease, err := attempt()
 		if err == nil {
 			return lease, nil
@@ -437,7 +640,7 @@ func retryOwnershipNotify(ctx context.Context, wait time.Duration, attempt func(
 			return nil, err
 		}
 		if wait == 0 {
-			return nil, errOwnershipBusy
+			return nil, err
 		}
 		if onWait != nil {
 			onWait()
@@ -449,7 +652,7 @@ func retryOwnershipNotify(ctx context.Context, wait time.Duration, attempt func(
 		if remaining <= 0 {
 			return nil, fmt.Errorf("ownership wait exceeded %s: %w", wait, errOwnershipBusy)
 		}
-		pause := ownershipRetryDelay
+		pause := ownershipRetryPause(try)
 		if pause > remaining {
 			pause = remaining
 		}
@@ -475,16 +678,28 @@ func (r *ownershipRealm) probeWriterLease(ctx context.Context, paths []string) (
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	requests, _, err := r.probeWriterRequests(paths)
+	if err != nil {
+		return nil, err
+	}
+	return r.tryAcquire(ctx, requests)
+}
+
+// probeWriterRequests builds the established non-owning shared probe set for
+// paths and reports the item's own scope keys so a refusal can be classified.
+func (r *ownershipRealm) probeWriterRequests(paths []string) ([]ownershipLockRequest, map[string]bool, error) {
 	requests := make([]ownershipLockRequest, 0, len(paths)*4)
+	ownScope := make(map[string]bool, len(paths)*2)
 	for _, path := range paths {
 		resolved, err := r.resolveOwnershipPath(path, false)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, dir := range resolved.directories {
 			requests = append(requests, ownershipDirectoryRequests(dir, ownershipShared)...)
 		}
 		for _, key := range resolved.itemKeys {
+			ownScope[key] = true
 			requests = append(requests, ownershipLockRequest{key: key, mode: ownershipShared})
 		}
 		for _, request := range resolved.itemRequests {
@@ -492,7 +707,42 @@ func (r *ownershipRealm) probeWriterLease(ctx context.Context, paths []string) (
 			requests = append(requests, request)
 		}
 	}
-	return r.tryAcquire(ctx, requests)
+	return requests, ownScope, nil
+}
+
+// probeWriterClassified performs the shared probe and classifies a refusal:
+// nil/nil means granted; a classified error names the holder class (the
+// foreign class, errStagingOwnershipSameProcess for a shared key this
+// process holds, or errStagingOwnershipUncertain when unidentifiable); any
+// other probe failure is returned as the error.
+func (r *ownershipRealm) probeWriterClassified(ctx context.Context, paths []string) (error, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	requests, ownScope, err := r.probeWriterRequests(paths)
+	if err != nil {
+		if !errors.Is(err, errOwnershipBusy) {
+			return nil, err
+		}
+		var conflict *ownershipConflictError
+		if !errors.As(err, &conflict) || conflict == nil {
+			return errStagingOwnershipUncertain, nil
+		}
+		return classifyOwnershipConflict(conflict, ownScope), nil
+	}
+	lease, err := r.tryAcquire(ctx, requests)
+	if err == nil {
+		lease.Release()
+		return nil, nil
+	}
+	if !errors.Is(err, errOwnershipBusy) {
+		return nil, err
+	}
+	var conflict *ownershipConflictError
+	if !errors.As(err, &conflict) || conflict == nil {
+		return errStagingOwnershipUncertain, nil
+	}
+	return classifyOwnershipConflict(conflict, ownScope), nil
 }
 
 func (r *ownershipRealm) fenceProof(path string) (string, error) {

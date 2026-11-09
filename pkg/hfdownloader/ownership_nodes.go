@@ -468,9 +468,20 @@ func (r *ownershipRealm) ensureOwnershipNode(parent ownershipNode, component, da
 	if !validOwnershipComponent(component) {
 		return ownershipNode{}, fmt.Errorf("invalid ownership path component %q", component)
 	}
+	// An already-published node needs no creation gate: validate it read-only,
+	// as held-lease verification does. Any failure falls through to the gated
+	// path, which re-runs full initialization and still refuses a broken node.
+	if child, err := r.readOwnershipNode(parent, component, dataPath, requireDirectory); err == nil {
+		return child, nil
+	}
 	bootstrapPath := filepath.Join(parent.control, "metadata", "child-bootstrap.lock")
 	bootstrap, err := ownershipLockOpen(bootstrapPath, ownershipExclusive)
 	if err != nil {
+		if errors.Is(err, errOwnershipBusy) {
+			return ownershipNode{}, &ownershipConflictError{
+				key: r.resourceKey("node-child-bootstrap", parent.id), path: bootstrapPath, err: err,
+			}
+		}
 		return ownershipNode{}, fmt.Errorf("bootstrap cache node %q: %w", dataPath, err)
 	}
 	defer bootstrap.release()
@@ -589,6 +600,26 @@ func (r *ownershipRealm) cacheWriterPreparationRequests(paths []string) ([]owner
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
+		if len(missingDirs) == 0 {
+			// One item resolution supplies the ancestor and item gates; the
+			// parent chain is not re-walked as a second view.
+			resolved, err := r.resolveCacheOwnershipPath(canonicalPath, false)
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
+			for _, dir := range resolved.directories {
+				dirRequests := ownershipDirectoryRequests(dir, ownershipShared)
+				requests = append(requests, dirRequests...)
+				for _, request := range dirRequests {
+					keep[request.key] = true
+				}
+			}
+			requests = append(requests, resolved.itemRequests...)
+			for _, request := range resolved.itemRequests {
+				keep[request.key] = true
+			}
+			continue
+		}
 		parentResolved, err := r.resolveCacheOwnershipPath(existingParent, true)
 		if err != nil {
 			return nil, nil, nil, nil, err
@@ -603,17 +634,6 @@ func (r *ownershipRealm) cacheWriterPreparationRequests(paths []string) ([]owner
 			if dir.nodeID != "" {
 				parentNode = ownershipNode{control: dir.controlPath, data: dir.path, id: dir.nodeID, nodeIDs: append([]string(nil), dir.nodeIDs...)}
 			}
-		}
-		if len(missingDirs) == 0 {
-			resolved, err := r.resolveCacheOwnershipPath(canonicalPath, false)
-			if err != nil {
-				return nil, nil, nil, nil, err
-			}
-			requests = append(requests, resolved.itemRequests...)
-			for _, request := range resolved.itemRequests {
-				keep[request.key] = true
-			}
-			continue
 		}
 		bootstrapKey := r.resourceKey("node-child-bootstrap", parentNode.id)
 		bootstrapPath := filepath.Join(parentNode.control, "metadata", "child-bootstrap.lock")
@@ -666,8 +686,30 @@ func (r *ownershipRealm) initializeCachePathSuffix(plan cacheOwnershipPrepPlan, 
 	}
 	parent := plan.parent
 	for i, component := range plan.components {
+		// The lease gates only the first component; each deeper node must be
+		// created under ITS immediate parent's gate — the resolver's gate for
+		// that node — or plan-init and a resolution initialize it twice and
+		// one creator's temp cleanup unlinks the other's rename source. Gates
+		// nest parent-before-child; a busy gate fails the attempt for the retry.
 		dataPath := filepath.Join(parent.data, component)
+		var gate ownershipLockHandle
+		if i > 0 {
+			bootstrapPath := filepath.Join(parent.control, "metadata", "child-bootstrap.lock")
+			handle, err := ownershipLockOpen(bootstrapPath, ownershipExclusive)
+			if err != nil {
+				if errors.Is(err, errOwnershipBusy) {
+					return &ownershipConflictError{
+						key: r.resourceKey("node-child-bootstrap", parent.id), path: bootstrapPath, err: err,
+					}
+				}
+				return fmt.Errorf("bootstrap cache node %q: %w", dataPath, err)
+			}
+			gate = handle
+		}
 		child, err := r.ensureOwnershipNodeLocked(parent, component, dataPath, i < plan.dirCount)
+		if gate != nil {
+			gate.release()
+		}
 		if err != nil {
 			return err
 		}

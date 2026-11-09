@@ -246,7 +246,7 @@ func (r *ownershipRealm) resolveOwnershipPath(name string, directory bool) (owne
 		return ownershipResolvedPath{}, err
 	}
 	root, parts := ownershipPathParts(canonical)
-	rootID, err := ownershipDirectoryIdentity(root)
+	rootID, err := statDirectoryIdentity(root)
 	if err != nil {
 		return ownershipResolvedPath{}, fmt.Errorf("identify ownership root %q: %w", root, err)
 	}
@@ -254,6 +254,18 @@ func (r *ownershipRealm) resolveOwnershipPath(name string, directory bool) (owne
 	parentToken := "object:" + rootID
 	parentPath := root
 	pathToken := rootPathKey
+	// Flat path-derived identity is anchored to the realm: when the target is
+	// on the realm's volume, its path tokens derive from the path RELATIVE to
+	// the realm root, so any common-prefix movement of the whole realm+item
+	// topology cancels out and hosts mounting one shared tree at different
+	// prefixes derive identical keys and lock filenames. A target on another
+	// volume (Windows cross-drive) has no relative form and keeps the
+	// absolute-spelling chain — unchanged same-host behavior for split
+	// topologies. The alias dimension (entry and object keys) never uses this
+	// and stays host-local on purpose.
+	relBase := ownershipSpelledPath(r.root)
+	targetRel, relErr := filepath.Rel(relBase, ownershipSpelledPath(canonical))
+	anchored := relErr == nil
 	resolved := ownershipResolvedPath{canonical: canonical}
 	missing := false
 	limit := len(parts)
@@ -266,8 +278,19 @@ func (r *ownershipRealm) resolveOwnershipPath(name string, directory bool) (owne
 			return ownershipResolvedPath{}, fmt.Errorf("canonicalize ownership component %q: %w", parts[i], keyErr)
 		}
 		entryID := parentToken + "\x00" + nameKey
-		pathToken += "\x00" + nameKey
 		current := filepath.Join(parentPath, parts[i])
+		if anchored {
+			rel, relWalkErr := filepath.Rel(relBase, ownershipSpelledPath(current))
+			if relWalkErr != nil {
+				return ownershipResolvedPath{}, fmt.Errorf("derive realm-relative ownership path for %q: %w", current, relWalkErr)
+			}
+			pathToken, keyErr = r.ownershipRelPathToken(rel)
+			if keyErr != nil {
+				return ownershipResolvedPath{}, fmt.Errorf("key realm-relative ownership path for %q: %w", current, keyErr)
+			}
+		} else {
+			pathToken += "\x00" + nameKey
+		}
 		keys := ownershipDirectoryKeys{
 			path:     current,
 			pathKey:  r.resourceKey("directory-path", pathToken),
@@ -280,7 +303,7 @@ func (r *ownershipRealm) resolveOwnershipPath(name string, directory bool) (owne
 				if !info.IsDir() {
 					return ownershipResolvedPath{}, fmt.Errorf("ownership component %q is not a directory", current)
 				}
-				objectID, idErr := ownershipDirectoryIdentity(current)
+				objectID, idErr := statDirectoryIdentity(current)
 				if idErr != nil {
 					return ownershipResolvedPath{}, fmt.Errorf("identify ownership directory %q: %w", current, idErr)
 				}
@@ -302,9 +325,16 @@ func (r *ownershipRealm) resolveOwnershipPath(name string, directory bool) (owne
 
 	if directory {
 		if len(parts) == 0 {
+			rootPathToken := rootPathKey
+			if anchored {
+				rootPathToken, err = r.ownershipRelPathToken(targetRel)
+				if err != nil {
+					return ownershipResolvedPath{}, fmt.Errorf("key realm-relative ownership path for %q: %w", root, err)
+				}
+			}
 			resolved.directories = append(resolved.directories, ownershipDirectoryKeys{
 				path:      root,
-				pathKey:   r.resourceKey("directory-path", rootPathKey),
+				pathKey:   r.resourceKey("directory-path", rootPathToken),
 				entryKey:  r.resourceKey("directory-entry", "root\x00"+rootPathKey),
 				objectID:  rootID,
 				objectKey: r.resourceKey("directory-object", rootID),
@@ -325,12 +355,50 @@ func (r *ownershipRealm) resolveOwnershipPath(name string, directory bool) (owne
 		return ownershipResolvedPath{}, fmt.Errorf("canonicalize ownership entry %q: %w", parts[len(parts)-1], err)
 	}
 	itemPathToken := pathToken + "\x00" + nameKey
+	if anchored {
+		itemPathToken, err = r.ownershipRelPathToken(targetRel)
+		if err != nil {
+			return ownershipResolvedPath{}, fmt.Errorf("key realm-relative ownership path for %q: %w", canonical, err)
+		}
+	}
 	entryID := parentToken + "\x00" + nameKey
 	resolved.itemKeys = []string{
 		r.resourceKey("item-path", itemPathToken),
 		r.resourceKey("item-entry", entryID),
 	}
 	return resolved, nil
+}
+
+// ownershipRelPathToken converts a path relative to the realm root into the
+// flat path-derived identity material. The token is anchored at the realm (the
+// persisted realm ID joins it in resourceKey), so a common-prefix movement of
+// the realm+item topology cancels out; ".." steps toward paths outside the
+// realm stay raw markers, and real components keep the platform component rule
+// against their real parents. The rel-to-target direction is well defined: a
+// relative path determines exactly one target under one realm root. The
+// reverse direction is NOT injective on Windows: filepath.Rel folds case
+// aliases unconditionally (EqualFold element matching), so two distinct
+// targets in a case-SENSITIVE directory can map to one token — spurious
+// mutual exclusion between distinct items, in the safe direction only:
+// over-locking, never data mixing; staging/destination paths, entry/object
+// keys, fences and resume identities stay distinct.
+func (r *ownershipRealm) ownershipRelPathToken(rel string) (string, error) {
+	token := "realm-rel-v1"
+	current := r.root
+	for _, component := range splitOwnershipRelativePath(rel) {
+		if component == ".." {
+			token += "\x00.."
+			current = filepath.Dir(current)
+			continue
+		}
+		key, err := ownershipComponentKey(current, component)
+		if err != nil {
+			return "", err
+		}
+		token += "\x00" + key
+		current = filepath.Join(current, component)
+	}
+	return token, nil
 }
 
 func ownershipDirectoryRequests(keys ownershipDirectoryKeys, mode ownershipLockMode) []ownershipLockRequest {
@@ -757,7 +825,25 @@ func (r *ownershipRealm) acquireTreeRemovals(ctx context.Context, targets []stri
 	})
 }
 
-func (r *ownershipRealm) tryTreeRemovals(ctx context.Context, targets []string) (*ownershipLease, error) {
+func (r *ownershipRealm) tryTreeRemovals(ctx context.Context, targets []string) (lease *ownershipLease, err error) {
+	// Whole-tree admission holds two open lock files per directory in the
+	// cache realm (entry and children locks) and three per existing
+	// directory in the flat realm (path, entry and object keys) from the
+	// first exclusive acquisition until the caller's removal finishes (the
+	// walk below), so the process soft file-descriptor limit is raised
+	// toward the hard limit for exactly this window and restored with this
+	// lease's release. An exhaustion that even the hard limit cannot cover
+	// surfaces below as the actionable limit error, never a raw EMFILE.
+	releaseFileLimit := holdOwnershipFileLimit()
+	nodes := make([]ownershipTreeNode, 0)
+	defer func() {
+		if lease == nil {
+			releaseFileLimit()
+		}
+		if err != nil && ownershipFileDescriptorPressure(err) {
+			err = ownershipTreeFileLimitError(r.cacheOwned, len(nodes), err)
+		}
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -806,11 +892,11 @@ func (r *ownershipRealm) tryTreeRemovals(ctx context.Context, targets []string) 
 		}
 		roots = append(roots, root{path: resolved.canonical, keys: resolved.directories})
 	}
-	lease, err := r.tryAcquire(ctx, requests)
+	lease, err = r.tryAcquire(ctx, requests)
 	if err != nil {
 		return nil, err
 	}
-	nodes := make([]ownershipTreeNode, 0)
+	lease.onRelease = releaseFileLimit
 	visited := make(map[string]bool)
 	// Each parent is EX before it is read; every real child directory is EX
 	// before descent, including objects reached through another path view.
@@ -887,7 +973,7 @@ func validateOwnershipTree(nodes []ownershipTreeNode) error {
 		if current.Mode()&os.ModeSymlink != 0 || !current.IsDir() {
 			return fmt.Errorf("%w: %s", errOwnershipPathChanged, node.path)
 		}
-		objectID, err := ownershipDirectoryIdentity(node.path)
+		objectID, err := statDirectoryIdentity(node.path)
 		if err != nil {
 			return fmt.Errorf("reidentify ownership directory %q: %w", node.path, err)
 		}
@@ -1075,8 +1161,14 @@ type FlatAdmission struct {
 // OpenFlatAdmission resolves ownershipDir exactly the way flat writers resolve
 // it — the per-user DefaultOwnershipDir when empty — and opens that realm with
 // the same identity, so both sides hash their locks into the same key space.
-// Participants exclude each other only when they resolve the same OwnershipDir:
-// that is the flat writers' existing coordination boundary, not a rule added here.
+// Participants genuinely exclude each other when they read the same realm id
+// from one shared OwnershipDir AND their realm-relative path keys converge:
+// under one common shared mount, common-prefix movement cancels; on a split
+// topology the rel-token input must match — the same structure below the
+// lowest common ancestor and the same descending component spellings; the
+// alias (dev:ino) dimension stays host-local. Resolving the same OwnershipDir
+// is the necessary boundary of that exclusion, not a complete sufficient
+// condition on its own; the full conditions live in doc.go.
 func OpenFlatAdmission(ctx context.Context, ownershipDir string) (*FlatAdmission, error) {
 	if ctx == nil {
 		ctx = context.Background()

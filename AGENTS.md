@@ -143,8 +143,12 @@ or job ownership behavior. This section is the agent-level summary; when it and
   (`OpenCacheAdmission`, `AdmitTreeRemoval`/`AdmitFileWrite`), and selected
   deletion's local-root branch through the same API against the flat
   `OwnershipDir` realm (`OpenFlatAdmission`, `AdmitFileWrites`) — as strong as
-  the flat writers' existing coordination: both sides must resolve the same
-  `OwnershipDir` (default per-user). Tree removals admit the tree first and
+  the flat writers' existing coordination: one shared `OwnershipDir` (default
+  per-user) reads the same realm id, and realm-relative keys converge when the
+  rel-token input matches — one common shared mount cancels prefix movement,
+  and split topologies need the same structure below the lowest common
+  ancestor and the same descending component spellings (documented residual).
+  Tree removals admit the tree first and
   treat a missing target as gone only after re-verifying the vanish while
   holding its creator-side keys; an admission that establishes neither fails
   closed. Shared H clients converge without per-user `OwnershipDir` setup.

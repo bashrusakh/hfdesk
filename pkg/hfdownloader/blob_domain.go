@@ -29,6 +29,10 @@ var (
 	// whether a live writer owns the lock; callers must fail closed.
 	errStagingOwnershipUncertain = errors.New("staging ownership lock could not be acquired: the holder is not a proven live writer")
 
+	// errStagingOwnershipSameProcess reports a wait expired against a shared
+	// key this process provably holds: in-process, never a foreign owner.
+	errStagingOwnershipSameProcess = errors.New("ownership scope is contended within this process")
+
 	// stagingOwnershipAcquireWait is the base unit for the destination wait budget.
 	stagingOwnershipAcquireWait = 5 * time.Second
 )
@@ -53,10 +57,28 @@ func blobOwnershipScopeError(sha, rel string, cause error) error {
 	if sha != "" {
 		name = "blob " + sha
 	}
+	if errors.Is(cause, errStagingOwnershipSameProcess) {
+		return fmt.Errorf("ownership scope for %s is contended by a concurrent operation in this process; retry later: %w", name, cause)
+	}
 	if errors.Is(cause, errStagingOwnershipBusy) {
 		return fmt.Errorf("ownership scope for %s remains exclusively held; try again later: %w", name, cause)
 	}
 	return fmt.Errorf("ownership scope for %s could not be proven free; retry later: %w", name, cause)
+}
+
+// classifyOwnershipConflict maps a refused probe's conflict to its holder
+// class; doc.go carries the contract.
+func classifyOwnershipConflict(conflict *ownershipConflictError, ownScope map[string]bool) error {
+	if conflict == nil {
+		return errStagingOwnershipUncertain
+	}
+	if ownScope[conflict.key] {
+		return errStagingOwnershipBusy
+	}
+	if ownershipHeldExclusivelyHere(conflict.path) {
+		return errStagingOwnershipSameProcess
+	}
+	return errStagingOwnershipBusy
 }
 
 // stagingUnprovenOwnerError reports a record whose owner cannot be proven live
@@ -185,15 +207,15 @@ func acquireBlobDomainScopedWithin(ctx context.Context, key, dst string, realm *
 		scope, err := realm.acquireWriterWithWait(ctx, paths, lockWait, beginWait)
 		if err != nil {
 			if errors.Is(err, errOwnershipBusy) {
-				busy, probeErr := realm.probeWriter(ctx, paths)
+				classified, probeErr := realm.probeWriterClassified(ctx, paths)
 				if probeErr != nil {
 					if ctxErr := ctx.Err(); ctxErr != nil {
 						return blobDomainFence{}, ctxErr
 					}
 					return blobDomainFence{}, fmt.Errorf("%w: observe external ownership scope: %v", errStagingOwnershipUncertain, probeErr)
 				}
-				if busy {
-					return blobDomainFence{}, errStagingOwnershipBusy
+				if classified != nil {
+					return blobDomainFence{}, classified
 				}
 				return blobDomainFence{}, errStagingOwnershipUncertain
 			}
@@ -287,8 +309,8 @@ func acquireBlobDomainUsing(ctx context.Context, key, dst string, slotWait time.
 			}
 			return nil, ctx.Err()
 		case <-timeout:
-			// Leave the holder and its artifacts untouched on timeout.
-			return nil, errStagingOwnershipBusy
+			// The keyed waiter map is process-local: the holder is this process.
+			return nil, errStagingOwnershipSameProcess
 		}
 	}
 

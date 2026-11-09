@@ -197,13 +197,90 @@ selected-GGUF deletion takes `AdmitFileWrites` entry admission over exactly the
 member paths it unlinks, against the flat `Settings.OwnershipDir` realm that
 flat writers resolve the same way (`DefaultOwnershipDir()` when unset). Both
 selected-delete branches therefore exclude writers in other processes; local
-exclusion is exactly as strong as the flat realm's existing writer
-coordination — two participants exclude each other only when both resolve the
-same `OwnershipDir`. A tree-removal admission whose target is missing must
+exclusion is exactly as strong as the flat realm's writer coordination — on
+one host that means every participant resolving the same `OwnershipDir`, and
+across hosts the conditions stated below. The flat realm's identity is an
+opaque ID persisted inside the shared `OwnershipDir`
+(`<OwnershipDir>/realm-id`), created atomically under an exclusive bootstrap
+gate on first use, so every participant resolving one `OwnershipDir` reads the
+same realm ID. That ID must be minted once by a single participant: the
+bootstrap gate is an advisory lock of the same class as the cross-host locks
+themselves, so on a filesystem whose advisory locks are not effective across
+clients — the same limitation that already bounds cross-host lock exclusion —
+two hosts can each mint their own ID on first use and will then never exclude
+each other, silently, because their lock filenames differ; no safety is
+claimed for this mechanism on such filesystems. Flat path-derived keys (the
+`item-path`/`directory-path`
+dimension) derive from that realm ID and the item path RELATIVE to the realm
+root, so when the `OwnershipDir` and the coordinated items sit under one
+common shared mount, any common-prefix movement of that topology cancels out:
+both sides derive identical resource keys and lock filenames regardless of
+where the shared root is mounted and genuinely exclude each other, and
+resolving the same `OwnershipDir` is the necessary boundary of that exclusion,
+not a complete sufficient condition on its own. What it does not alone promise
+is stated plainly: on a SPLIT topology — `OwnershipDir` and the items rooted
+under different mounts — the relative path carries the diverging prefixes, so
+cross-host convergence there requires identical rel-token input: the same
+structure below the lowest common ancestor and the same descending component
+spellings — independently mounted split topologies that preserve that
+structure still converge (the documented residual of this design; same-host
+behavior is unaffected there, and a target on another volume, such as a
+Windows drive other than the realm's, keeps its absolute-spelling derivation);
+and the ALIAS dimension —
+the `item-entry`/`directory-entry`/`directory-object` (dev:ino) keys and
+tree-validation identity — stays host-local on purpose, modelling same-host
+bind-mount aliasing, so it never converges across hosts. One exotic
+configuration carries a safe caveat: on a Windows directory configured
+case-sensitive, `filepath.Rel`'s unconditional case folding (EqualFold element
+matching) can map two lookalike distinct targets to one rel token, so the two
+distinct items spuriously exclude each other — over-locking only, never data
+mixing; staging/destination paths, entry/object keys, fences and resume
+identities stay distinct. A staged record's
+`OwnershipFence` covers both dimensions, so a foreign host's staged record
+never reads as a current proof. Consequences follow the claim's two branches,
+not a blanket re-download: an UNPROVEN record — a foreign host, whose host
+mismatch defeats death evidence, or a same-host live or mixed-version owner
+that cannot be reclaimed — is preserved and refused with
+`ErrStagingOwnershipUnproven`; there is no automatic re-download: the item
+fails with the documented operator recovery (remove the named staging pair to
+retry) and its bytes are never silently reused. A RECLAIMABLE record — the
+owner proven dead or this process, the normal upgrade leftover — is taken over
+with its fence re-bound to the current proof and its committed ranges
+inherited: bytes are reused by resume, not re-downloaded, and only a version,
+range, size or identity mismatch discards the pair and restarts from zero. A
+record fenced under the former flat keys follows these same two branches. Lock
+files derived from the
+former host-local (device/inode) realm identity, and lock files derived from
+the former absolute-path-spelling flat keys, are harmless residue and are
+never unlinked; mixed-version writers that still derive either identity
+remain unsupported. A tree-removal admission whose target is missing must
 re-verify the vanish while holding the missing target's creator-side keys — a
 bare or wrapped ENOENT from resolution is not proof that the target is gone —
 and an admission that can establish neither a live-writer conflict nor a
 re-verified vanish fails closed instead of admitting.
+
+Whole-tree admission keeps open lock files for every directory in the tree
+from the first exclusive acquisition until the caller's removal finishes: two
+per directory in the cache realm (the entry and children locks, after the
+directory's requests are normalized and deduplicated) and three per existing
+directory in the flat realm (the path, entry and object keys).
+On Unix it therefore raises the process soft file-descriptor limit toward the
+hard limit for exactly that window and
+restores it when the admission's release runs; the raise is process-wide for
+that window, so an ordinary operation that grew past the original soft limit
+meanwhile may transiently fail new opens after the restore until its
+descriptors drain (an extreme-concurrency edge that self-heals). Windows has
+no such soft limit to raise and holds handles under the growing per-process
+handle quota instead. A repository whose directory count still cannot be
+covered — beyond the raiseable hard limit or the OS per-process file cap such
+as `kern.maxfilesperproc` — fails admission with an actionable error naming
+the observed soft/hard limits and the remedy (`ulimit -n`, or `LimitNOFILE=`
+for a service, raising the hard limit first when needed), never a raw
+per-process descriptor-exhaustion (EMFILE) error — system-wide ENFILE keeps
+its raw identity — and nothing is removed. The exclusion guarantee does not
+change with the limit: the whole tree is still exclusively admitted before
+any removal, and a live writer anywhere in the tree still refuses the
+admission.
 
 The `path-` prefix separates digest-less destination domains from content-addressed
 blob domains and their staging names. Without it, digest-named files whose contents
@@ -227,7 +304,22 @@ Ownership waits use an internal five-minute budget in the item's
 goroutine. In-process waits are bounded by the item context. Both release the
 transfer slot while waiting and reacquire it before transfer. An exclusive
 scope holder is waited for; unresolved contention fails with a retry instruction,
-never successful completion.
+never successful completion. Resolution of an already-published cache node is
+read-only validation and takes no lock; the parent's exclusive child-bootstrap
+gate belongs to the node-creation path only, and node creation remains gated
+behind it. Retried acquisitions back off exponentially with jitter so
+contended waiters decorrelate instead of re-contending in fixed-quantum
+waves. A refused acquisition is classified before it surfaces: a shared
+ownership key outside the item's own scope keys that this process is proven
+to hold exclusively fails as
+same-process contention (and the keyed in-process waiter times out the same
+way), so download contention within one process never surfaces the
+external/live-owner class — same-key in-process download writers are
+serialized by the keyed waiter before any OS lock is touched. Other same-item
+surfaces, such as tree-removal admission or the claim gate holding the item's
+scope, keep the established claim semantics: their contention may report the
+external/live-owner class, and a shared key this process does not hold also
+remains external.
 
 If a cache-owned or flat-mode lock cannot be acquired (unsupported, denied, or
 filesystem error), the operation fails before mutating claims or payloads and
