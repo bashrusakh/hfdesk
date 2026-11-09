@@ -377,12 +377,13 @@ func detectExecStartOverride(loaded systemdLoadedConfig, unit canonicalUnit, sco
 // execStartOverrideRefusal states the result, the cause with the DropInPaths
 // the supervisor reports, and the one next action of the ownership contract.
 //
-// The action must clear the cause: an ExecStart= override a drop-in carries
-// is removed from the exact drop-in file that carries it — moving
-// customizations into local.conf cannot clear an override that already lives
-// in that very file — and a loaded command no reported drop-in explains
-// comes from a configuration the supervisor loaded earlier, which only a
-// reload reads again.
+// The action must clear the cause and make the next attempt succeed: an
+// ExecStart= override a drop-in carries is removed from the exact drop-in
+// file that carries it — moving customizations into local.conf cannot clear
+// an override that already lives there — and the unit files are reloaded
+// after the edit, because the supervisor holds the loaded command in memory
+// until that reload reads the file again; a loaded command no reported
+// drop-in explains only a reload reads again.
 func execStartOverrideRefusal(loaded systemdLoadedConfig, scope Scope) error {
 	cause := fmt.Sprintf("the command systemd loads for %s is not the command in its unit file", unitName)
 	if loaded.dropInPathsKnown && len(loaded.dropInPaths) > 0 {
@@ -393,12 +394,13 @@ func execStartOverrideRefusal(loaded systemdLoadedConfig, scope Scope) error {
 		cause += fmt.Sprintf(" (drop-ins: %s)", strings.Join(quoted, ", "))
 	}
 	install := "hfdesk service install"
+	reload := scopeSupervisorHint(scope) + " daemon-reload"
 	if owner := execStartOverrideDropIn(loaded.dropInPaths); owner != "" {
-		return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Remove the %q override from %q and run %q again",
-			cause, "ExecStart=", owner, install)
+		return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Remove the %q override from %q, reload the unit files with %q, and run %q again",
+			cause, "ExecStart=", owner, reload, install)
 	}
 	return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Reload the unit files with %q and run %q again",
-		cause, scopeSupervisorHint(scope)+" daemon-reload", install)
+		cause, reload, install)
 }
 
 // execStartOverrideDropIn returns the drop-in that carries an ExecStart=
@@ -435,7 +437,7 @@ func dropInHoldsExecStart(content []byte) bool {
 // not come from the unit file HFDesk writes: a vendor or generated fragment
 // under our unit name is not our registration and is never adopted, while a
 // unit systemd did not load has nothing to refuse.
-func detectForeignRegistration(unitPath string, loaded systemdLoadedConfig) error {
+func detectForeignRegistration(unitPath string, loaded systemdLoadedConfig, scope Scope) error {
 	if !loaded.loaded {
 		return nil
 	}
@@ -443,18 +445,32 @@ func detectForeignRegistration(unitPath string, loaded systemdLoadedConfig) erro
 		filepath.Clean(loaded.fragmentPath) == filepath.Clean(unitPath) {
 		return nil
 	}
-	return foreignRegistrationRefusal(unitPath, loaded)
+	return foreignRegistrationRefusal(unitPath, loaded, scope)
 }
 
 // foreignRegistrationRefusal states the result, the cause with the fragment
 // systemd loaded, and the one next action of the ownership contract.
-func foreignRegistrationRefusal(unitPath string, loaded systemdLoadedConfig) error {
+//
+// The action must clear the loaded foreign registration: the supervisor
+// keeps a loaded fragment in memory — even a removed one — until a reload
+// reads the file system again, so a fragment file that is there is removed
+// and the unit files reloaded before the retry, a fragment file that is
+// already gone needs only that reload, and a registration with no readable
+// fragment has no file to remove — that state names no command and says so
+// instead of promising a retry that would refuse again.
+func foreignRegistrationRefusal(unitPath string, loaded systemdLoadedConfig, scope Scope) error {
 	cause := fmt.Sprintf("the loaded registration of %s has no readable fragment of its own", unitName)
-	if loaded.fragmentPathKnown && filepath.IsAbs(loaded.fragmentPath) {
-		cause = fmt.Sprintf("systemd loads %s from %q, not from its unit file %q", unitName, loaded.fragmentPath, unitPath)
+	if !loaded.fragmentPathKnown || !filepath.IsAbs(loaded.fragmentPath) {
+		return fmt.Errorf("service: the update was refused and the registration was not changed: %s. No file names where this registration comes from, so HFDesk names no command that removes it: whatever loaded it must remove it, and an installation refuses again until the supervisor no longer loads it", cause)
 	}
-	return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Move your customizations into %q and run %q again",
-		cause, unitDropInPath(unitPath), "hfdesk service install")
+	cause = fmt.Sprintf("systemd loads %s from %q, not from its unit file %q", unitName, loaded.fragmentPath, unitPath)
+	reload := scopeSupervisorHint(scope) + " daemon-reload"
+	if _, err := os.Stat(loaded.fragmentPath); err == nil || !os.IsNotExist(err) {
+		return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Move your customizations into %q, remove the unit fragment %q, reload the unit files with %q, and run %q again",
+			cause, unitDropInPath(unitPath), loaded.fragmentPath, reload, "hfdesk service install")
+	}
+	return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Reload the unit files with %q and run %q again",
+		cause, reload, "hfdesk service install")
 }
 
 func sameSystemdLoadedConfig(a, b systemdLoadedConfig) bool {

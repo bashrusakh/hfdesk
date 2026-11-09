@@ -145,12 +145,16 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 		// Detector C: systemd loads a fragment HFDesk did not write under
 		// the unit name. A foreign registration is refused and never
 		// adopted, so there are no registration facts to merge.
-		if detectErr := detectForeignRegistration(path, initialLoaded); detectErr != nil {
+		if detectErr := detectForeignRegistration(path, initialLoaded, m.scope); detectErr != nil {
 			return opts, detectErr
 		}
 		// The fragment is our own unit path although the read found no
 		// file: the registration changed underneath this installation.
-		return opts, fmt.Errorf("service: the update was refused and the registration was not changed: systemd loads %s from %q, but the file was absent when the update read it. Run %q again", unitName, path, "hfdesk service install")
+		// The supervisor holds the vanished file in memory until a
+		// reload reads the file system again, so the instruction
+		// reloads before the retry — a plain retry reads the same
+		// stale load and refuses the same way.
+		return opts, fmt.Errorf("service: the update was refused and the registration was not changed: systemd loads %s from %q, but the file was absent when the update read it. Reload the unit files with %q and run %q again", unitName, path, m.supervisorHint()+" daemon-reload", "hfdesk service install")
 	}
 
 	// Step 3: the loaded configuration of an existing registration, read

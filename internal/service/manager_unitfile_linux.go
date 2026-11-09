@@ -738,23 +738,30 @@ func unitDropInPath(unitPath string) string {
 func detectHandEditedUnit(unitPath string, content []byte, scope Scope) (canonicalUnit, error) {
 	unit, err := readCanonicalUnit(content, scope)
 	if err != nil {
-		return canonicalUnit{}, handEditedUnitRefusal(unitPath, err)
+		return canonicalUnit{}, handEditedUnitRefusal(unitPath, err, scope)
 	}
 	rendered, err := renderCanonicalUnit(unit)
 	if err != nil {
-		return canonicalUnit{}, handEditedUnitRefusal(unitPath, err)
+		return canonicalUnit{}, handEditedUnitRefusal(unitPath, err, scope)
 	}
 	if rendered != string(content) {
-		return canonicalUnit{}, handEditedUnitRefusal(unitPath, errUnitNotRendered)
+		return canonicalUnit{}, handEditedUnitRefusal(unitPath, errUnitNotRendered, scope)
 	}
 	return unit, nil
 }
 
 // handEditedUnitRefusal states the result, the cause with the round-trip
 // reason, and the one next action of the ownership contract.
-func handEditedUnitRefusal(unitPath string, reason error) error {
-	return fmt.Errorf("service: the update was refused and the registration was not changed: the unit file %q is not the unit HFDesk generates: %v. Move your customizations into %q and run %q again",
-		unitPath, reason, unitDropInPath(unitPath), "hfdesk service install")
+//
+// The action must make the next attempt succeed in every state of this
+// refusal: the move preserves the customizations, the removal of the unit
+// file makes the next installation the first one that writes the canonical
+// rendering again (an edit the move alone cannot undo would otherwise refuse
+// forever), and the reload clears the supervisor's in-memory copy of the
+// removed file.
+func handEditedUnitRefusal(unitPath string, reason error, scope Scope) error {
+	return fmt.Errorf("service: the update was refused and the registration was not changed: the unit file %q is not the unit HFDesk generates: %v. Move your customizations into %q, remove the unit file %q, reload the unit files with %q, and run %q again",
+		unitPath, reason, unitDropInPath(unitPath), unitPath, scopeSupervisorHint(scope)+" daemon-reload", "hfdesk service install")
 }
 
 // unitFileUnchanged is the TOCTOU guard of the atomic write: the file

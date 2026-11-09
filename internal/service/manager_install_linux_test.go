@@ -464,7 +464,7 @@ func TestSystemdInstallUsesLoadedVendorFragmentAndRetainsItsPaths(t *testing.T) 
 	if !strings.Contains(err.Error(), vendorPath) || !strings.Contains(err.Error(), unitPath) {
 		t.Errorf("Install() = %q, want the refusal to name the loaded fragment and our unit path", err)
 	}
-	assertSingleDropInAction(t, err, unitPath)
+	assertSingleForeignFragmentAction(t, err, unitPath, vendorPath)
 	if _, err := os.Stat(unitPath); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("the refused installation wrote an override at %q (stat error: %v)", unitPath, err)
 	}
@@ -484,6 +484,26 @@ func TestSystemdInstallUsesLoadedVendorFragmentAndRetainsItsPaths(t *testing.T) 
 		if got := systemdSupervisorCallsTo(calls, command...); got != 0 {
 			t.Errorf("the refused installation called %q %d times:\n%s", strings.Join(command, " "), got, strings.Join(calls, "\n"))
 		}
+	}
+
+	// Simulated retry: the named action clears this state. The fragment is
+	// removed and the unit files are reloaded — the fake answers from its
+	// loaded-unit record, so dropping that record together with the loaded
+	// executable stands in for the reload that makes the real supervisor
+	// forget the removed fragment. The retry must then install as a first
+	// installation instead of refusing again.
+	if removeErr := os.Remove(vendorPath); removeErr != nil {
+		t.Fatalf("remove the foreign fragment (the named action): %v", removeErr)
+	}
+	if removeErr := os.Remove(loadedPath); removeErr != nil {
+		t.Fatalf("drop the loaded-unit record of the fake: %v", removeErr)
+	}
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", "")
+	if _, retryErr := manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, systemdTestExecutable(t))); retryErr != nil {
+		t.Fatalf("the retry after the named action = %v, want the successful first installation the action promises", retryErr)
+	}
+	if _, statErr := os.Stat(unitPath); statErr != nil {
+		t.Errorf("the retried installation wrote no unit file at %q: %v", unitPath, statErr)
 	}
 }
 
@@ -2112,7 +2132,8 @@ func TestSystemdInstallRefusesTheRegistrationWhoseOwnFragmentVanished(t *testing
 	for _, want := range []string{
 		unitPath,
 		"but the file was absent when the update read it",
-		`Run "hfdesk service install" again`,
+		`Reload the unit files with "systemctl --user daemon-reload"`,
+		`run "hfdesk service install" again`,
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
@@ -2143,6 +2164,22 @@ func TestSystemdInstallRefusesTheRegistrationWhoseOwnFragmentVanished(t *testing
 		if got := systemdSupervisorCallsTo(calls, command...); got != 0 {
 			t.Errorf("the refused installation called %q %d times:\n%s", strings.Join(command, " "), got, strings.Join(calls, "\n"))
 		}
+	}
+
+	// Simulated retry: the one named action clears this state. The reload
+	// runs — the fake records it the way the named command would — and the
+	// fixture flag that forced the stale in-memory load is dropped, which
+	// is what that reload does to the real supervisor. The retry must then
+	// install as a first installation instead of refusing again.
+	if _, reloadErr := m.runSystemctl(context.Background(), "daemon-reload"); reloadErr != nil {
+		t.Fatalf("reload the unit files (the named action): %v", reloadErr)
+	}
+	t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", "")
+	if _, retryErr := m.Install(context.Background(), requested); retryErr != nil {
+		t.Fatalf("the retry after the named action = %v, want the successful first installation the action promises", retryErr)
+	}
+	if _, statErr := os.Stat(unitPath); statErr != nil {
+		t.Errorf("the retried installation wrote no unit file at %q: %v", unitPath, statErr)
 	}
 }
 

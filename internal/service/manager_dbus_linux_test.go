@@ -502,54 +502,109 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 func TestSystemdDetectForeignRegistration(t *testing.T) {
 	unitPath := "/etc/systemd/system/hfdesk.service"
 
-	if err := detectForeignRegistration(unitPath, systemdLoadedConfig{}); err != nil {
+	if err := detectForeignRegistration(unitPath, systemdLoadedConfig{}, ScopeSystem); err != nil {
 		t.Errorf("detectForeignRegistration() over an unloaded unit = %v, want nil", err)
 	}
 	ours := systemdLoadedConfig{loaded: true, fragmentPathKnown: true, fragmentPath: unitPath}
-	if err := detectForeignRegistration(unitPath, ours); err != nil {
+	if err := detectForeignRegistration(unitPath, ours, ScopeSystem); err != nil {
 		t.Errorf("detectForeignRegistration() over our own fragment = %v, want nil", err)
 	}
 
-	t.Run("vendor fragment under our name", func(t *testing.T) {
+	t.Run("an existing foreign fragment under our name", func(t *testing.T) {
+		fragment := filepath.Join(t.TempDir(), unitName)
+		if err := os.WriteFile(fragment, []byte("[Unit]\nDescription=foreign\n"), 0o644); err != nil {
+			t.Fatalf("write the foreign fragment: %v", err)
+		}
 		loaded := systemdLoadedConfig{
 			loaded: true, fragmentPathKnown: true,
-			fragmentPath: "/usr/lib/systemd/system/hfdesk.service",
+			fragmentPath: fragment,
 		}
-		err := detectForeignRegistration(unitPath, loaded)
+		err := detectForeignRegistration(unitPath, loaded, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectForeignRegistration() = nil, want the refusal of a foreign fragment")
 		}
-		for _, want := range []string{"/usr/lib/systemd/system/hfdesk.service", unitPath} {
+		for _, want := range []string{fragment, unitPath} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("the refusal %q does not name %q", err, want)
 			}
 		}
-		assertSingleDropInAction(t, err, unitPath)
+		// The fragment file exists: the action removes it, reloads the
+		// unit files (the supervisor holds the removed fragment until
+		// that reload) and only then retries the installation.
+		assertSingleForeignFragmentAction(t, err, unitPath, fragment)
 	})
 
-	t.Run("unreadable fragment", func(t *testing.T) {
+	t.Run("a foreign fragment whose file is already gone names only the reload", func(t *testing.T) {
+		fragment := filepath.Join(t.TempDir(), unitName)
+		loaded := systemdLoadedConfig{
+			loaded: true, fragmentPathKnown: true,
+			fragmentPath: fragment,
+		}
+		err := detectForeignRegistration(unitPath, loaded, ScopeSystem)
+		if err == nil {
+			t.Fatal("detectForeignRegistration() = nil, want the refusal of a stale foreign load")
+		}
+		// The removal the existence branch names would find no file: this
+		// state needs only the reload that drops the stale load, and the
+		// message must not ask for a removal that cannot be performed.
+		assertSingleReloadAction(t, err, "systemctl")
+		if strings.Contains(err.Error(), "remove the unit fragment") {
+			t.Errorf("the refusal %q names a removal of a file that is already gone", err)
+		}
+	})
+
+	t.Run("unreadable fragment names no command", func(t *testing.T) {
 		loaded := systemdLoadedConfig{loaded: true}
-		err := detectForeignRegistration(unitPath, loaded)
+		err := detectForeignRegistration(unitPath, loaded, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectForeignRegistration() = nil, want the fail-closed refusal of an unproved source")
 		}
 		if !strings.Contains(err.Error(), "no readable fragment") {
 			t.Errorf("the refusal %q does not state the unreadable fragment", err)
 		}
-		assertSingleDropInAction(t, err, unitPath)
+		assertNamesNoClearingCommand(t, err)
 	})
 
-	t.Run("relative fragment", func(t *testing.T) {
+	t.Run("relative fragment names no command", func(t *testing.T) {
 		loaded := systemdLoadedConfig{loaded: true, fragmentPathKnown: true, fragmentPath: "hfdesk.service"}
-		err := detectForeignRegistration(unitPath, loaded)
+		err := detectForeignRegistration(unitPath, loaded, ScopeSystem)
 		if err == nil {
 			t.Fatal("detectForeignRegistration() = nil, want the refusal of a fragment outside our unit path")
 		}
 		if !strings.Contains(err.Error(), "no readable fragment") {
 			t.Errorf("the refusal %q does not state the unproved fragment", err)
 		}
-		assertSingleDropInAction(t, err, unitPath)
+		assertNamesNoClearingCommand(t, err)
 	})
+}
+
+// assertNamesNoClearingCommand proves the honesty standard for the state of
+// a refusal that no command HFDesk can name clears: the message promises no
+// retry, offers no alternative and states that whatever loaded the
+// registration must remove it before an installation can pass.
+func assertNamesNoClearingCommand(t *testing.T, err error) {
+	t.Helper()
+	message := err.Error()
+	for _, want := range []string{
+		"the update was refused and the registration was not changed",
+		"No file names where this registration comes from",
+		"whatever loaded it must remove it",
+		"refuses again until the supervisor no longer loads it",
+	} {
+		if !strings.Contains(message, want) {
+			t.Errorf("the refusal %q does not contain %q", message, want)
+		}
+	}
+	for _, unwanted := range []string{
+		"hfdesk service install",
+		"Move your customizations into",
+		"daemon-reload",
+		" or ",
+	} {
+		if strings.Contains(message, unwanted) {
+			t.Errorf("the refusal %q names %q, want no command for a state no command clears", message, unwanted)
+		}
+	}
 }
 
 // A fresh manager connection occasionally gets no reply at all, and that

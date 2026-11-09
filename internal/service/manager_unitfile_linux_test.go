@@ -2154,9 +2154,13 @@ func TestSystemdReadCanonicalUnitRejectsNonCanonicalShapes(t *testing.T) {
 
 // assertSingleDropInAction proves the refusal standard of the ownership
 // contract on one error: the result (refused, nothing changed), the path of
-// the refused state and exactly one real next action — the administrator
-// drop-in beside the unit and the installation command — with no
-// alternative offered.
+// the refused state and exactly one real next action — the customizations
+// move into the administrator drop-in, the removal of the refused unit file
+// itself, the reload that clears the supervisor's copy of the removed file
+// and the installation command — with no alternative offered. Every step is
+// required: a move alone leaves the non-generated file in place, and a
+// removal without the reload leaves the supervisor holding the removed file
+// until a reload reads the file system again.
 func assertSingleDropInAction(t *testing.T, err error, unitPath string) {
 	t.Helper()
 	if err == nil {
@@ -2166,7 +2170,10 @@ func assertSingleDropInAction(t *testing.T, err error, unitPath string) {
 	for _, want := range []string{
 		"the update was refused and the registration was not changed",
 		unitPath,
-		unitDropInPath(unitPath),
+		`Move your customizations into "` + unitDropInPath(unitPath) + `"`,
+		`remove the unit file "` + unitPath + `"`,
+		"reload the unit files with \"",
+		`daemon-reload"`,
 		`run "hfdesk service install" again`,
 	} {
 		if !strings.Contains(message, want) {
@@ -2179,13 +2186,52 @@ func assertSingleDropInAction(t *testing.T, err error, unitPath string) {
 	if got := strings.Count(message, "Move your customizations into"); got != 1 {
 		t.Errorf("the refusal %q states %d customization actions, want exactly one", message, got)
 	}
+	if got := strings.Count(message, "remove the unit file"); got != 1 {
+		t.Errorf("the refusal %q states %d removals of the unit file, want exactly one", message, got)
+	}
+}
+
+// assertSingleForeignFragmentAction proves the refusal standard of the
+// ownership contract for a foreign fragment that still exists at the path
+// systemd reports: the customizations worth keeping move into the drop-in,
+// the fragment itself is removed there, the unit files are reloaded — the
+// supervisor keeps a loaded fragment, even a removed one, until that reload —
+// and only then the installation runs again, with no alternative offered.
+func assertSingleForeignFragmentAction(t *testing.T, err error, unitPath, fragment string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("the refusal = nil, want a refusal")
+	}
+	message := err.Error()
+	for _, want := range []string{
+		"the update was refused and the registration was not changed",
+		fragment,
+		unitPath,
+		`Move your customizations into "` + unitDropInPath(unitPath) + `"`,
+		`remove the unit fragment "` + fragment + `"`,
+		"reload the unit files with \"",
+		`daemon-reload"`,
+		`run "hfdesk service install" again`,
+	} {
+		if !strings.Contains(message, want) {
+			t.Errorf("the refusal %q does not contain %q", message, want)
+		}
+	}
+	if strings.Contains(message, " or ") {
+		t.Errorf("the refusal %q offers an alternative instead of one action", message)
+	}
+	if got := strings.Count(message, "remove the unit fragment"); got != 1 {
+		t.Errorf("the refusal %q states %d fragment removals, want exactly one", message, got)
+	}
 }
 
 // assertSingleRemoveOverrideAction proves the refusal standard of the
 // ownership contract for an ExecStart= override a drop-in owns: the one
 // named action must clear the cause, so it removes the override from the
 // exact drop-in that carries it — the move into local.conf cannot clear an
-// override that already lives there — and it offers no alternative.
+// override that already lives there — and reloads the unit files after the
+// edit, because the supervisor holds the overridden command in memory until
+// a reload reads the file again; it offers no alternative.
 func assertSingleRemoveOverrideAction(t *testing.T, err error, dropIn string) {
 	t.Helper()
 	if err == nil {
@@ -2195,6 +2241,8 @@ func assertSingleRemoveOverrideAction(t *testing.T, err error, dropIn string) {
 	for _, want := range []string{
 		"the update was refused and the registration was not changed",
 		`Remove the "ExecStart=" override from "` + dropIn + `"`,
+		"reload the unit files with \"",
+		`daemon-reload"`,
 		`run "hfdesk service install" again`,
 	} {
 		if !strings.Contains(message, want) {
