@@ -299,13 +299,20 @@ func (m *systemdManager) preflightWithContext(ctx context.Context, opts InstallO
 	if accountName == "" {
 		accountName = "the native service identity"
 	}
+	// The rerun names the scope of this manager: the command line defaults
+	// to the user scope on Linux, so the machine-wide refusal must name the
+	// flag that reproduces it — the other scope would loop the retry.
+	rerun := "hfdesk service install --user"
+	if m.scope == ScopeSystem {
+		rerun = "hfdesk service install --system"
+	}
 	switch access {
 	case executableAccessDenied:
 		reason := errExecutableNotUsable
 		if inspection.format == executableFormatScript && accessMode&unix.R_OK != 0 {
 			reason = errExecutableNotReadable
 		}
-		return fmt.Errorf("service: executable %q is not usable by the account %q: %w", opts.Executable, accountName, reason)
+		return fmt.Errorf("service: executable %q is not usable by the account %q: %w. Grant the account access to the program and its folders, then run %q again", opts.Executable, accountName, reason, rerun)
 	case executableAccessUnknown:
 		log.Printf("service: execute access for %q by %s is inconclusive; it is not treated as a denial or as verified", opts.Executable, accountName)
 	}
@@ -324,7 +331,7 @@ func (m *systemdManager) preflightWithContext(ctx context.Context, opts InstallO
 		}
 		switch interpreterAccess {
 		case executableAccessDenied:
-			return fmt.Errorf("service: executable %q names an interpreter the account %q cannot use: %q", opts.Executable, accountName, inspection.interpreter)
+			return fmt.Errorf("service: executable %q names an interpreter the account %q cannot use: %q. Grant the account execute access to the interpreter, then run %q again", opts.Executable, accountName, inspection.interpreter, rerun)
 		case executableAccessUnknown:
 			log.Printf("service: interpreter access for %q by %s is inconclusive; it is not treated as a denial or as verified", inspection.interpreter, accountName)
 		}

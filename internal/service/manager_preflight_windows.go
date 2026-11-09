@@ -68,7 +68,7 @@ func preflightExecutableAccess(executable string, pathAccess ...scmPathAccess) e
 	access, reason := scmCheckExecutableAccess(executable, effective)
 	switch access {
 	case scmExecutableAccessDenied:
-		return fmt.Errorf("service: executable %q is not usable by the account the instance runs as (%s): %s: grant the account execute access to the program, or choose a program the account can use", executable, scmServiceIdentityName, reason)
+		return fmt.Errorf("service: executable %q is not usable by the account the instance runs as (%s): %s: grant the account execute access to the program in its Properties > Security tab, then run %q from an elevated shell again", executable, scmServiceIdentityName, reason, "hfdesk service install")
 	case scmExecutableAccessInconclusive:
 		log.Printf("service: effective access to executable %q for %s is inconclusive (%s)", executable, scmServiceIdentityName, reason)
 	}
@@ -359,8 +359,8 @@ func checkServiceCreateAccess(label, path string, pathAccess ...scmPathAccess) e
 		// ancestor, and the name of the ancestor is what makes the
 		// guidance actionable.
 		return fmt.Errorf(
-			"service: the %s %q does not exist and the account %s cannot create it: %s: the nearest existing ancestor %q has to grant the account read and write access: the installation never creates a directory the user named, the instance creates it when it runs, as the account the instance runs as: grant the account read and write access to the ancestor directory, or install the instance without this path",
-			label, path, scmServiceIdentityName, reason, ancestor,
+			"service: the %s %q does not exist and the account %s cannot create it: %s: the nearest existing ancestor %q has to grant the account read and write access: the installation never creates a directory the user named, the instance creates it when it runs, as the account the instance runs as: grant the account read and write access to the ancestor directory in its Properties > Security tab, then run %q from an elevated shell again",
+			label, path, scmServiceIdentityName, reason, ancestor, "hfdesk service install",
 		)
 	}
 	if decision == scmExecutableAccessInconclusive {
@@ -433,7 +433,7 @@ func checkServiceAccess(label, path string, pathAccess ...scmPathAccess) error {
 	decision, reason := scmCheckPathAccess(path, windows.GENERIC_READ|windows.GENERIC_WRITE, access)
 	switch decision {
 	case scmExecutableAccessDenied:
-		return fmt.Errorf("service: the %s %q is not usable by the account the instance runs as (%s): %s: grant the account read and write access to the path, or install the instance without this path", label, path, scmServiceIdentityName, reason)
+		return fmt.Errorf("service: the %s %q is not usable by the account the instance runs as (%s): %s: grant the account read and write access to the path in its Properties > Security tab, then run %q from an elevated shell again", label, path, scmServiceIdentityName, reason, "hfdesk service install")
 	case scmExecutableAccessInconclusive:
 		log.Printf("service: effective access to %s %q for %s is inconclusive (%s)", label, path, scmServiceIdentityName, reason)
 	}

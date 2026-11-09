@@ -277,9 +277,16 @@ func TestServiceGatePendingTextNamesTheTransitionAndTheUnchangedLaunch(t *testin
 		{state: service.StateStopping, want: "still stopping"},
 	} {
 		text := serviceGatePendingText(tc.state)
-		for _, want := range []string{tc.want, "changes nothing", "starts no server"} {
+		for _, want := range []string{tc.want, "changes nothing", "starts no server", "Start the desktop app again when the service has settled"} {
 			if !strings.Contains(text, want) {
 				t.Errorf("the notice of %q is %q, want it to mention %q", tc.state, text, want)
+			}
+		}
+		// The notice carries one next action: the relaunch of the
+		// desktop app, never an alternative way to read the state.
+		for _, unwanted := range []string{" or ", "hfdesk service status"} {
+			if strings.Contains(text, unwanted) {
+				t.Errorf("the notice of %q is %q, want no alternative action %q", tc.state, text, unwanted)
 			}
 		}
 		if strings.Contains(text, "Open HFDesk") || strings.Contains(text, "Start service") {

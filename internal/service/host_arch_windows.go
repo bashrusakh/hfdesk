@@ -79,14 +79,14 @@ func preflightExecutableImageUsing(executable string, readMachine func(string) (
 			log.Printf("service: PE structure inspection of %q is inconclusive (%v); the installer did not classify the executable as invalid", executable, err)
 			return nil
 		}
-		return fmt.Errorf("service: executable %q is not a Windows executable: %w", executable, err)
+		return fmt.Errorf("service: executable %q is not a Windows executable: %w. Use the Windows build of the hfdesk program, then run %q from an elevated shell again", executable, err, "hfdesk service install")
 	}
 	if support == nil {
 		return nil
 	}
 	switch support(machine) {
 	case scmExecutableUnsupported:
-		return fmt.Errorf("service: executable %q has PE machine 0x%04X, which Windows reports this host cannot execute", executable, machine)
+		return fmt.Errorf("service: executable %q has PE machine 0x%04X, which Windows reports this host cannot execute. Use the hfdesk build for this machine's architecture, then run %q from an elevated shell again", executable, machine, "hfdesk service install")
 	case scmExecutableSupportUnknown:
 		log.Printf("service: Windows execution support for PE machine 0x%04X of %q cannot be determined; the installer did not infer incompatibility", machine, executable)
 	}

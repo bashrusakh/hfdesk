@@ -250,6 +250,15 @@ func TestPreflightDataPathsRefuseAMissingNamedDirectory(t *testing.T) {
 			if !strings.Contains(err.Error(), "grant the account read and write access to the ancestor directory") {
 				t.Errorf("preflightDataPaths() = %v, want an error that tells the user what to do", err)
 			}
+			// The refusal is one action path: grant the access, then
+			// rerun the installation — never an alternative that skips
+			// the named directory.
+			if !strings.Contains(err.Error(), "hfdesk service install") {
+				t.Errorf("preflightDataPaths() = %v, want an error that names the rerun command", err)
+			}
+			if strings.Contains(err.Error(), "or install the instance") {
+				t.Errorf("preflightDataPaths() = %v, want no alternative to granting the access", err)
+			}
 			// The refused directory was not created behind the back of
 			// the user.
 			if _, statErr := os.Stat(path); !errors.Is(statErr, fs.ErrNotExist) {
@@ -369,6 +378,15 @@ func TestSCMPreflightDataPathsRefuseAnExistingDirectoryInsideTheStateRoot(t *tes
 	}
 	if !strings.Contains(err.Error(), scmServiceIdentityName) {
 		t.Errorf("preflightDataPaths() = %v, want an error that names the account of the instance", err)
+	}
+	// The refusal of an existing path is one action path: grant the
+	// access, then rerun the installation — never an alternative that
+	// drops the named path.
+	if !strings.Contains(err.Error(), "hfdesk service install") {
+		t.Errorf("preflightDataPaths() = %v, want an error that names the rerun command", err)
+	}
+	if strings.Contains(err.Error(), "or install the instance") {
+		t.Errorf("preflightDataPaths() = %v, want no alternative to granting the access", err)
 	}
 }
 
@@ -537,6 +555,12 @@ func TestPreflightDataPathRefusesAPathTheIdentityCannotReach(t *testing.T) {
 	if !strings.Contains(err.Error(), "grant the account read and write access to the ancestor directory") {
 		t.Errorf("preflightDataPath(%q) = %v, want an error that tells the user what to do", path, err)
 	}
+	if !strings.Contains(err.Error(), "hfdesk service install") {
+		t.Errorf("preflightDataPath(%q) = %v, want an error that names the rerun command", path, err)
+	}
+	if strings.Contains(err.Error(), "or install the instance") {
+		t.Errorf("preflightDataPath(%q) = %v, want no alternative to granting the access", path, err)
+	}
 	// The refused directory is not created behind the back of the user.
 	if _, statErr := os.Stat(path); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Errorf("the refused directory %q exists: %v", path, statErr)
@@ -610,12 +634,12 @@ func TestSCMPreflightExecutableAccess(t *testing.T) {
 			if !scmTestNamesPath(err.Error(), executable) {
 				t.Errorf("preflightExecutableAccess() = %v, want the refused executable path %q", err, executable)
 			}
-			for _, want := range []string{scmServiceIdentityName, tc.reason, "grant the account execute access"} {
+			for _, want := range []string{scmServiceIdentityName, tc.reason, "grant the account execute access", "hfdesk service install"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("preflightExecutableAccess() = %v, want %q in the refusal", err, want)
 				}
 			}
-			for _, unwanted := range []string{"read and execute", "grant the account read"} {
+			for _, unwanted := range []string{"read and execute", "grant the account read", "or choose a program"} {
 				if strings.Contains(err.Error(), unwanted) {
 					t.Errorf("preflightExecutableAccess() = %v, want no demand to grant %q for a native program", err, unwanted)
 				}
@@ -1137,6 +1161,11 @@ func TestPreflightExecutableImageRefusesAFileThatIsNotAProgram(t *testing.T) {
 	if !strings.Contains(err.Error(), "not a Windows executable") {
 		t.Errorf("preflightExecutableImage(%q) = %v, want an error that says the file is not a Windows executable", path, err)
 	}
+	// The refusal names the one recovery: the Windows build of the
+	// program, then the rerun of the installation.
+	if !strings.Contains(err.Error(), "hfdesk service install") {
+		t.Errorf("preflightExecutableImage(%q) = %v, want an error that names the rerun command", path, err)
+	}
 }
 
 // TestPreflightExecutableImageRefusesATruncatedProgram proves that a program
@@ -1192,6 +1221,11 @@ func TestPreflightExecutableImageUsesTheHostSupportResult(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "reports this host cannot execute") {
 				t.Errorf("preflightExecutableImageWithSupport(%q) = %v, want a known host incompatibility", path, err)
+			}
+			// The refusal names the one recovery: the build for this
+			// machine, then the rerun of the installation.
+			if !strings.Contains(err.Error(), "hfdesk service install") {
+				t.Errorf("preflightExecutableImageWithSupport(%q) = %v, want an error that names the rerun command", path, err)
 			}
 		})
 	}

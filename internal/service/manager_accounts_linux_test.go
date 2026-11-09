@@ -1567,10 +1567,16 @@ func TestSystemdInstallRefusesACacheDirTheAccountCannotWrite(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want the refusal of the cache directory")
 	}
-	want := fmt.Sprintf("service: the service account %q cannot write to the cache directory %q: grant it access and install again (for example add the account to the group that owns the directory, or give the directory itself to the account with %q; for a directory that holds a lot of data, granting group access is preferable to changing the owner)",
-		account.Username, cache, "chown "+account.Username+" "+cache)
+	// The refusal names exactly one action path: the command that gives
+	// the directory itself to the account and the scope-correct rerun of
+	// the installation — no alternative remedy, no recursive change.
+	want := fmt.Sprintf("service: the service account %q cannot write to the cache directory %q: give the directory itself to the account (never the tree inside it) with %q, then run %q again",
+		account.Username, cache, "chown "+account.Username+" "+cache, "hfdesk service install --system")
 	if err.Error() != want {
 		t.Errorf("Install() = %q, want %q", err, want)
+	}
+	if strings.Contains(err.Error(), " or ") {
+		t.Errorf("Install() = %q, want no alternative to the named action", err)
 	}
 	// The refusal names the directory, the account and the missing write
 	// access.

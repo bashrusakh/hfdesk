@@ -1028,8 +1028,17 @@ func TestSystemdPreflightUsesLoadedWorkingDirectoryForRelativeInterpreters(t *te
 			if err := manager.preflightWithContext(context.Background(), opts, account.Username, &identity, projectedCWD); err != nil {
 				t.Fatalf("preflight with loaded WorkingDirectory refused the runnable candidate: %v", err)
 			}
-			if err := manager.preflightWithContext(context.Background(), opts, account.Username, &identity, stateDirectory); err == nil {
+			err = manager.preflightWithContext(context.Background(), opts, account.Username, &identity, stateDirectory)
+			if err == nil {
 				t.Fatal("preflight using application StateDir accepted an interpreter absent from that cwd")
+			}
+			// The refusal names the interpreter as its cause and the
+			// one action path: grant the account access to it, then
+			// rerun the installation in this manager's scope.
+			for _, want := range []string{"names an interpreter the account", `run "hfdesk service install --user" again`} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the interpreter refusal %q does not mention %q", err, want)
+				}
 			}
 			unknownCWD := systemdWorkingDirectoryForPreflight(opts, true, systemdLoadedConfig{}, false)
 			if unknownCWD != "" {
@@ -1064,7 +1073,10 @@ func TestSystemdInstallRefusesAnExecutableTheAccountCannotRun(t *testing.T) {
 		t.Fatal("Install() = nil, want the refusal of a program the account cannot run")
 	}
 	account := systemdCurrentAccount(t)
-	for _, want := range []string{opts.Executable, account.Username, "not usable by the account"} {
+	// The refusal names the one action path: grant the account access,
+	// then rerun the installation in the scope this manager runs — the
+	// test installs the user scope, which the rerun command names.
+	for _, want := range []string{opts.Executable, account.Username, "not usable by the account", `run "hfdesk service install --user" again`} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Install() = %v, want %q in the refusal", err, want)
 		}

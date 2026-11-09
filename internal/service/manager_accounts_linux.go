@@ -329,11 +329,12 @@ func (m *systemdManager) checkServiceAccountAccessWithIdentity(opts InstallOptio
 			// The guidance never names a recursive ownership change:
 			// the tree of a model or a cache directory belongs to the
 			// user who named it, and the installation never walks it.
-			// The account is either made a member of the group that
-			// owns the directory, or the directory itself is given to
-			// the account.
-			return fmt.Errorf("service: the service account %q cannot write to the %s directory %q: grant it access and install again (for example add the account to the group that owns the directory, or give the directory itself to the account with %q; for a directory that holds a lot of data, granting group access is preferable to changing the owner)",
-				accountName, dir.kind, dir.path, "chown "+accountName+" "+dir.path)
+			// The message names the one repair of this refusal with the
+			// command that performs it, and the rerun names the
+			// machine-wide scope: the command line defaults to the
+			// user scope on Linux.
+			return fmt.Errorf("service: the service account %q cannot write to the %s directory %q: give the directory itself to the account (never the tree inside it) with %q, then run %q again",
+				accountName, dir.kind, dir.path, "chown "+accountName+" "+dir.path, "hfdesk service install --system")
 		}
 	}
 	return nil

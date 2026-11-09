@@ -168,7 +168,7 @@ func serviceGatePendingText(state service.State) string {
 	}
 	return "The HFDesk service is still " + transition + " and did not reach a settled state in time.\n\n" +
 		"This launch changes nothing: it starts no server of its own, so two instances never compete for the same address.\n\n" +
-		"Start the desktop app again when the service has settled, or read its state with \"hfdesk service status\"."
+		"Start the desktop app again when the service has settled."
 }
 
 // serviceGateUnreadableText returns the text of the notice of a launch that
