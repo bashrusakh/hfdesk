@@ -283,8 +283,15 @@ func installWindowsService(reporter *serviceActionReporter, version string) erro
 	}
 
 	// The installation starts the first instance: a desktop instance that
-	// already serves the address ends the action here, before any step.
-	if service.LiveServingDesktop(reporter.singletonPreExisting) {
+	// already serves the address ends the action here, before any step —
+	// and so does a claim the guard cannot read, which may be the claim
+	// of that desktop; the cause comes from the same read that decided
+	// the refusal.
+	serving, unreadableClaim := service.CheckLiveServingDesktop(reporter.singletonPreExisting)
+	if serving {
+		if unreadableClaim {
+			return reporter.unreadableClaimRefused()
+		}
 		return reporter.servingDesktopRefused()
 	}
 
@@ -353,7 +360,11 @@ func updateWindowsService(reporter *serviceActionReporter, version string) error
 	// that desktop; every state that is not positively stopped fails
 	// closed.
 	positivelyStopped := before.State == service.StateStopped && !wasRunning
-	if !positivelyStopped && service.LiveServingDesktop(reporter.singletonPreExisting) {
+	serving, unreadableClaim := service.CheckLiveServingDesktop(reporter.singletonPreExisting)
+	if !positivelyStopped && serving {
+		if unreadableClaim {
+			return reporter.unreadableClaimRefused()
+		}
 		return reporter.servingDesktopRefused()
 	}
 
@@ -422,8 +433,14 @@ func startWindowsService(reporter *serviceActionReporter) error {
 	}
 	// The start moves the service out of its stopped state onto the
 	// address: a desktop instance of this session that already serves it
-	// ends the action here, before the start.
-	if service.LiveServingDesktop(reporter.singletonPreExisting) {
+	// ends the action here, before the start — and so does a claim the
+	// guard cannot read, which may be the claim of that desktop; the
+	// cause comes from the same read that decided the refusal.
+	serving, unreadableClaim := service.CheckLiveServingDesktop(reporter.singletonPreExisting)
+	if serving {
+		if unreadableClaim {
+			return reporter.unreadableClaimRefused()
+		}
 		return reporter.servingDesktopRefused()
 	}
 	if err := manager.Start(ctx); err != nil {
@@ -591,6 +608,35 @@ func (r *serviceActionReporter) servingDesktopRefused() error {
 	r.message(serviceFailureCaption(r.action),
 		serviceServingDesktopRefusedText(r.action), windows.MB_ICONERROR)
 	return errors.New("a running HFDesk desktop instance of this session serves its local server: no service action was performed")
+}
+
+// unreadableClaimRefused reports a mutation that stopped before its first
+// service step because the published claim the guard must read exists but
+// cannot be read: whether a desktop serves is undetermined, so the action
+// refuses instead of proceeding beside a desktop it cannot see.
+//
+// The report is an honest terminal — it names no next action, because no
+// single step is guaranteed to clear a file the guard cannot inspect:
+// quitting the desktop clears it only while one runs, and deleting the
+// claim could make a live desktop invisible to the guard.
+func (r *serviceActionReporter) unreadableClaimRefused() error {
+	claim := service.ClaimStatePath()
+	desktopLog.Error("the service action refused on a published claim that cannot be read",
+		"action", string(r.action), "claim", claim)
+	r.message(serviceFailureCaption(r.action),
+		serviceUnreadableClaimRefusedText(r.action, claim), windows.MB_ICONERROR)
+	return fmt.Errorf("the published claim of the desktop at %q cannot be read: no service action was performed", claim)
+}
+
+// serviceUnreadableClaimRefusedText returns the report of a mutation that
+// refused over a published claim it could not read: the result (no service
+// action was performed) and the cause (the claim cannot be read, so whether
+// a desktop of this session serves cannot be determined). The report
+// carries no next action: no single step clears a file the guard cannot
+// inspect, so it stays an honest terminal.
+func serviceUnreadableClaimRefusedText(action serviceAction, claim string) string {
+	return serviceActionFailureHeadline(action) + "\n\n" +
+		fmt.Sprintf("No service action was performed: the published claim of the desktop at %q cannot be read, so whether a desktop of this session serves its local server cannot be determined.", claim)
 }
 
 // serviceServingDesktopRefusedText returns the report of a mutation that

@@ -116,15 +116,24 @@ func useTemporaryConfigDir(t *testing.T) {
 	t.Setenv("LOCALAPPDATA", root)
 }
 
+// desktopStatePath points the guard at a claim file inside the temporary
+// configuration directory of the test: the path the command family really
+// reads (session scope included), not a hand-built one.
+func desktopStatePath(t *testing.T) string {
+	t.Helper()
+	useTemporaryConfigDir(t)
+	path := service.PublishedStatePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create the temporary configuration directory: %v", err)
+	}
+	return path
+}
+
 // writePublishedDesktopState publishes a desktop state in the temporary
 // configuration directory of the test.
 func writePublishedDesktopState(t *testing.T) {
 	t.Helper()
-	useTemporaryConfigDir(t)
-	state := filepath.Join(server.AppConfigDir(), "desktop-state.json")
-	if err := os.MkdirAll(filepath.Dir(state), 0o755); err != nil {
-		t.Fatalf("create the temporary configuration directory: %v", err)
-	}
+	state := desktopStatePath(t)
 	// The claim names the process that published it: the process of this
 	// test run, which is alive on every platform. A fixed id such as 1
 	// lives on Linux (it is init) but does not exist on Windows, where the
@@ -3465,6 +3474,170 @@ func TestServiceMutationProceedsWhenNoDesktopInstanceServes(t *testing.T) {
 					record.acquired, record.released)
 			}
 		})
+	}
+}
+
+// TestServiceMutationRefusesOnAClaimItCannotRead proves the CLI side of
+// the indeterminable claim: a claim file that exists but cannot be read or
+// parsed is never the absent claim — with a probe that found a holder every
+// mutation that starts or restarts the service refuses before the first
+// service step, with that single cause, the unchanged result and NO next
+// action (no single step clears a file the guard cannot inspect), and the
+// service is never touched. An absent claim and a stale claim proceed
+// exactly as before, and an installation over a positively stopped
+// registration stays the pure rewrite it is beside a serving desktop: it
+// starts nothing, so the undetermined claim cannot make it start anything.
+func TestServiceMutationRefusesOnAClaimItCannotRead(t *testing.T) {
+	program := temporaryServiceProgram(t)
+
+	for _, tc := range []struct {
+		name      string
+		fixture   func(t *testing.T, path string)
+		args      []string
+		status    service.Status
+		statusErr error
+	}{
+		{"start over an unparsable claim", writeUnparsableDesktopState,
+			[]string{"start"}, service.Status{State: service.StateStopped}, nil},
+		{"restart over an unparsable claim", writeUnparsableDesktopState,
+			[]string{"restart"}, service.Status{State: service.StateStopped}, nil},
+		{"first install over an unparsable claim", writeUnparsableDesktopState,
+			[]string{"install", "--system", "--executable", program},
+			service.Status{State: service.StateNotInstalled}, nil},
+		{"install over a running instance beside an unparsable claim", writeUnparsableDesktopState,
+			[]string{"install", "--system", "--executable", program},
+			service.Status{State: service.StateRunning, Running: true}, nil},
+		{"install beside an unreadable claim", writeUnreadableDesktopState,
+			[]string{"install", "--system", "--executable", program},
+			service.Status{State: service.StateRunning, Running: true}, nil},
+		{"start beside an unreadable claim", writeUnreadableDesktopState,
+			[]string{"start"}, service.Status{State: service.StateStopped}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useFakeManager(t, &untouchedServiceManager{
+				fakeManager: fakeManager{status: tc.status, err: tc.statusErr},
+				t:           t,
+			})
+			useSingletonProbe(t, true)
+			tc.fixture(t, desktopStatePath(t))
+
+			var stdout, stderr bytes.Buffer
+			code := runServiceCommand(tc.args, &stdout, &stderr)
+			if code != serviceFailureExitCode {
+				t.Fatalf("the refused command must exit with %d, got %d:\n%s", serviceFailureExitCode, code, stderr.String())
+			}
+			for _, want := range []string{
+				"nothing was changed",
+				"cannot be read",
+				"cannot be determined",
+			} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("the refusal does not mention %q:\n%s", want, stderr.String())
+				}
+			}
+			// The honest terminal names no next action: no single
+			// step clears a file the guard cannot inspect.
+			for _, unwanted := range []string{"notification-area icon", "run the command again", "hfdesk service status"} {
+				if strings.Contains(stderr.String(), unwanted) {
+					t.Errorf("the refusal carries a next action (%q) although no single action clears its cause:\n%s", unwanted, stderr.String())
+				}
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("a refused command must not report a result:\n%s", stdout.String())
+			}
+		})
+	}
+
+	t.Run("a positively stopped installation beside an unreadable claim is still the pure rewrite", func(t *testing.T) {
+		manager := &holdObservingManager{
+			fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+		}
+		useFakeManager(t, manager)
+		record := useRecordedHold(t)
+		manager.hold = record
+		useSingletonProbe(t, true)
+		writeUnparsableDesktopState(t, desktopStatePath(t))
+
+		var stdout, stderr bytes.Buffer
+		code := runServiceCommand([]string{"install", "--system", "--executable", program}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("the rewrite of a stopped registration must exit with 0, got %d:\n%s", code, stderr.String())
+		}
+		if !manager.observed["install"] {
+			t.Errorf("the installation did not run, observations: %v", manager.observed)
+		}
+		for _, operation := range []string{"start", "restart"} {
+			if _, ran := manager.observed[operation]; ran {
+				t.Errorf("the rewrite ran a %s beside a claim the guard could not read", operation)
+			}
+		}
+	})
+
+	t.Run("an absent claim proceeds although the probe found a holder", func(t *testing.T) {
+		manager := &holdObservingManager{
+			fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+		}
+		useFakeManager(t, manager)
+		record := useRecordedHold(t)
+		manager.hold = record
+		useSingletonProbe(t, true)
+		useTemporaryConfigDir(t)
+
+		var stdout, stderr bytes.Buffer
+		if code := runServiceCommand([]string{"start"}, &stdout, &stderr); code != 0 {
+			t.Fatalf("the command must exit with 0, got %d:\n%s", code, stderr.String())
+		}
+		if !manager.observed["start"] {
+			t.Errorf("the start did not run, observations: %v", manager.observed)
+		}
+	})
+
+	t.Run("a stale claim proceeds although the probe found a holder", func(t *testing.T) {
+		manager := &holdObservingManager{
+			fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+		}
+		useFakeManager(t, manager)
+		record := useRecordedHold(t)
+		manager.hold = record
+		useSingletonProbe(t, true)
+		writeStaleDesktopState(t, desktopStatePath(t))
+
+		var stdout, stderr bytes.Buffer
+		if code := runServiceCommand([]string{"start"}, &stdout, &stderr); code != 0 {
+			t.Fatalf("the command must exit with 0, got %d:\n%s", code, stderr.String())
+		}
+		if !manager.observed["start"] {
+			t.Errorf("the start did not run, observations: %v", manager.observed)
+		}
+	})
+}
+
+// writeUnparsableDesktopState leaves a claim file the guard cannot parse.
+func writeUnparsableDesktopState(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("write the unparsable claim: %v", err)
+	}
+}
+
+// writeUnreadableDesktopState leaves a claim the guard cannot read: a
+// directory at the claim path fails the read deterministically (EISDIR),
+// even for a test run as root, where chmod 0 would not deny the read.
+func writeUnreadableDesktopState(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatalf("put a directory at the claim path: %v", err)
+	}
+}
+
+// writeStaleDesktopState writes a readable claim whose process is gone: the
+// stale claim of a desktop that crashed.
+func writeStaleDesktopState(t *testing.T, path string) {
+	t.Helper()
+	// No process of any platform runs with this id: it is far above the
+	// pid limits of Linux and Windows alike.
+	if err := os.WriteFile(path, []byte(`{"url":"","pid":999999999}`), 0o600); err != nil {
+		t.Fatalf("write the stale claim: %v", err)
 	}
 }
 

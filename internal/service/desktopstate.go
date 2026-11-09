@@ -73,24 +73,62 @@ func PublishState(path, url string) error {
 	return nil
 }
 
-// ReadPublishedState reads the published state.
+// ReadPublishedState reads the published state, tolerantly: it reports false
+// when the file is missing, unreadable or corrupt.
 //
-// It reports false when the file is missing or corrupt. The url is not a
-// condition: it is display data that fills in once the server bound its
-// address, and the presence of a claim is decided by the liveness of its
-// process (PublishedStateLive), not by the url it carries. A state file
-// that cannot be read is never a reason to fail a launch: the state is
-// only a convenience.
+// The url is not a condition: it is display data that fills in once the
+// server bound its address, and the presence of a claim is decided by the
+// liveness of its process (PublishedStateLive), not by the url it carries.
+// A state file that cannot be read is never a reason to fail a launch: the
+// state is only a convenience.
+//
+// The mutation guard does not decide from this tolerant read: a claim that
+// exists but cannot be read or parsed is an indeterminable fact for it —
+// the unreadableClaim answer of CheckLiveServingDesktop, never an absent
+// one.
 func ReadPublishedState(path string) (PublishedState, bool) {
+	state, presence := readPublishedClaim(path)
+	return state, presence == claimReadable
+}
+
+// claimPresence classifies the claim file of the guard: absent, present but
+// unreadable or unparsable, or readable.
+type claimPresence int
+
+const (
+	claimAbsent claimPresence = iota
+	claimUnreadable
+	claimReadable
+)
+
+// readPublishedClaim reads the claim file once and classifies the answer.
+//
+// Absence is reported only for a path the platform proves is not there: any
+// other read failure (a permission this identity does not have, a directory
+// where the file should be) and any parse failure reports the claim as
+// present-but-unreadable, the state in which whether a desktop serves cannot
+// be determined.
+func readPublishedClaim(path string) (PublishedState, claimPresence) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return PublishedState{}, false
+		if os.IsNotExist(err) {
+			return PublishedState{}, claimAbsent
+		}
+		return PublishedState{}, claimUnreadable
 	}
 	var state PublishedState
 	if err := json.Unmarshal(data, &state); err != nil {
-		return PublishedState{}, false
+		return PublishedState{}, claimUnreadable
 	}
-	return state, true
+	return state, claimReadable
+}
+
+// ClaimStatePath returns the claim file the mutation guard reads right now:
+// the claim file of this session by default, the claim of the desktop that
+// launched the current mutation once UsePublishedStatePath pointed it there.
+// The refusal over a claim that cannot be read names this very file.
+func ClaimStatePath() string {
+	return claimStatePath()
 }
 
 // RemovePublishedState removes the published state file.
@@ -155,26 +193,57 @@ func claimProcessAliveBySignal(pid int) bool {
 	return errors.Is(signalErr, syscall.EPERM)
 }
 
-// PublishedStateLive reports whether a desktop instance published a claim
-// that is still live: the file exists, parses, and the process it names
-// still runs.
+// PublishedStateLive reports the two facts of the published claim in ONE
+// read of the file: live (a readable claim whose process it names still
+// runs) and unreadable (the file exists but cannot be read or parsed).
 //
 // A claim whose process died is the file a crashed desktop left behind —
-// stale, and counted as absent, so no mutation is refused for a tray app
-// that is not there. A claim whose process runs is live in both phases of
-// the desktop: the starting window before the server bound its address and
-// the serving desktop after it, because the claim is published before the
-// launch opens the window in which it binds the address.
+// stale, counted as absent: neither fact answers true, so no mutation is
+// refused for a tray app that is not there. A claim whose process runs is
+// live in both phases of the desktop: the starting window before the server
+// bound its address and the serving desktop after it, because the claim is
+// published before the launch opens the window in which it binds the
+// address.
+//
+// The unreadable answer fails closed at the conjunction that decides the
+// guard (CheckLiveServingDesktop): absence is only absence when the file is
+// provably not there, and a guard that could not inspect the claim never
+// proceeds beside a desktop it cannot see. The two answers come from one
+// read, so the cause a refusal names cannot contradict the state that
+// triggered it — the message layer never re-reads the file.
 //
 // The variable is the seam of the tests: a test drives both sides of
 // LiveServingDesktop without writing into the configuration directory of
 // the user that runs it.
-var PublishedStateLive = func() bool {
-	state, ok := ReadPublishedState(claimStatePath())
-	if !ok {
-		return false
+var PublishedStateLive = func() (live bool, unreadable bool) {
+	state, presence := readPublishedClaim(claimStatePath())
+	switch presence {
+	case claimReadable:
+		return claimProcessAlive(state.PID), false
+	case claimUnreadable:
+		return false, true
+	default:
+		return false, false
 	}
-	return claimProcessAlive(state.PID)
+}
+
+// CheckLiveServingDesktop classifies the mutation guard from ONE read of
+// the claim: serving is the two-fact conjunction — the caller's probe found
+// a pre-existing holder AND the claim is live or unreadable — and
+// unreadableClaim tells the caller which cause the refusal must name (the
+// honest terminal of a claim the guard could not read, or nothing when the
+// claim proved live). Both answers derive from the same read, so the named
+// cause can never contradict the state that triggered the refusal.
+//
+// A caller whose probe found no holder gets (false, false): no desktop of
+// this session held the singleton, so the claim cannot belong to a serving
+// desktop of this session and there is no refusal to name a cause for.
+func CheckLiveServingDesktop(singletonPreExisting bool) (serving bool, unreadableClaim bool) {
+	live, unreadable := PublishedStateLive()
+	if !singletonPreExisting {
+		return false, false
+	}
+	return live || unreadable, unreadable
 }
 
 // LiveServingDesktop reports whether a desktop instance that can still
@@ -195,6 +264,12 @@ var PublishedStateLive = func() bool {
 //     reads the ORIGINATING desktop's claim and never the (empty) claim
 //     directory of the approving account.
 //
+// A claim that exists but cannot be read or parsed meets the second fact
+// fail-closed: the conjunction refuses — a guard that could not inspect the
+// claim never proceeds beside a desktop it cannot see — and the caller
+// reports that indeterminable cause (through CheckLiveServingDesktop, from
+// the same read that decided the refusal) instead of the serving one.
+//
 // singletonPreExisting is the caller's ProbeDesktopSingleton result. The
 // kernel object dies with the processes that hold it, so the two facts
 // together decide both directions: a claim that outlived a crashed desktop
@@ -204,5 +279,6 @@ var PublishedStateLive = func() bool {
 // process ended counts as absent — never refuses the mutation it launched
 // itself.
 func LiveServingDesktop(singletonPreExisting bool) bool {
-	return singletonPreExisting && PublishedStateLive()
+	serving, _ := CheckLiveServingDesktop(singletonPreExisting)
+	return serving
 }

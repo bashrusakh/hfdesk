@@ -2649,7 +2649,7 @@ func TestServiceHelperProceedsWhenTheSingletonGrantsOnlyReadControl(t *testing.T
 	// fact of the serving-desktop check would have to come from the live
 	// published claim: no desktop runs in this test, and that claim must
 	// not be read from the configuration directory of the user.
-	replaceSeam(t, &service.PublishedStateLive, func() bool { return false })
+	replaceSeam(t, &service.PublishedStateLive, func() (bool, bool) { return false, false })
 	stopped := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
 	manager := &readControlObservingManager{fakeServiceManager: &fakeServiceManager{
 		statuses: []service.Status{stopped, stopped},
@@ -3365,6 +3365,36 @@ func TestServiceHelperStartFromTheGateDoesNotRefuseOverAStaleClaim(t *testing.T)
 		t.Fatalf("the helper showed %v, want the report of the started service", *messages)
 	}
 	requireSingletonReleased(t)
+}
+
+// TestUnreadableClaimRefusedTextIsAnHonestTerminal pins the message rule of
+// the helper-side unreadable-claim refusal for every action the helper
+// performs: the report carries the result (no service action was
+// performed), the cause (the claim at this path cannot be read, so whether
+// a desktop of this session serves cannot be determined) and NO next
+// action — no single step clears a file the guard cannot inspect, so the
+// terminal stays honest instead of naming a route that may not clear the
+// cause, and it never collates two routes.
+func TestUnreadableClaimRefusedTextIsAnHonestTerminal(t *testing.T) {
+	claim := "C:/Users/alice/AppData/Roaming/HFDesk/desktop-state.S-1-5-21-1.2.json"
+	for _, action := range []serviceAction{serviceActionInstall, serviceActionUpdate, serviceActionStart} {
+		t.Run(string(action), func(t *testing.T) {
+			text := serviceUnreadableClaimRefusedText(action, claim)
+			assertNamesWithout(t, text, "the report", []string{
+				"No service action was performed",
+				"cannot be read",
+				"cannot be determined",
+				claim,
+			}, []string{
+				"notification-area icon",
+				"perform the action again",
+				"Quit HFDesk",
+				"run the command again",
+				"hfdesk service status",
+				" or ",
+			})
+		})
+	}
 }
 
 // TestServiceHelperReadsTheClaimOfTheDesktopThatLaunchedIt proves the

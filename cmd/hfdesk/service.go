@@ -217,6 +217,21 @@ func servingDesktopRefusal() error {
 	return errors.New("a running HFDesk desktop instance of this session serves its local server, so nothing was changed: quit HFDesk from the notification-area icon and run the command again")
 }
 
+// unreadableDesktopClaimRefusal is the refusal of a mutation whose guard
+// cannot read the published claim: a claim that exists but cannot be read
+// or parsed leaves whether a desktop serves undetermined, so the mutation
+// refuses before the first service step instead of proceeding beside a
+// desktop it cannot see.
+//
+// The message is an honest terminal and names no next action: no single
+// step is guaranteed to clear a file the guard cannot inspect — quitting
+// the desktop clears it only while one runs, and deleting the claim could
+// make a live desktop invisible to the guard — so the refusal states the
+// cause and the unchanged result and stops there.
+func unreadableDesktopClaimRefusal() error {
+	return fmt.Errorf("the published claim of the desktop at %q cannot be read, so whether a desktop of this session serves its local server cannot be determined: nothing was changed", service.ClaimStatePath())
+}
+
 // versionLikeSegment matches a "digit.digit" segment of a file name.
 //
 // The heuristic is deliberately simple: a release artifact carries its
@@ -846,9 +861,16 @@ func serviceInstall(args []string, stdout io.Writer) error {
 	// installation writes a registration its supervisor may start, a
 	// running instance is restarted on the new program, and a state
 	// that is not positively stopped cannot prove that nothing starts.
-	if service.LiveServingDesktop(singletonPreExisting) {
+	// A claim the guard cannot read refuses the same way — with its own
+	// cause, from the same read that decided the refusal — because it
+	// may be the claim of the serving desktop.
+	serving, unreadableClaim := service.CheckLiveServingDesktop(singletonPreExisting)
+	if serving {
 		status, statusErr := mgr.Status(ctx)
 		if statusErr != nil || status.State != service.StateStopped || status.Running {
+			if unreadableClaim {
+				return unreadableDesktopClaimRefusal()
+			}
 			return servingDesktopRefusal()
 		}
 	}
@@ -1272,8 +1294,14 @@ func serviceStart(args []string, stdout io.Writer) error {
 	defer holdRelease()
 	// The command is about to start or restart the service: a desktop
 	// instance of this session that already serves the address ends the
-	// command here, before the first service step.
-	if service.LiveServingDesktop(singletonPreExisting) {
+	// command here, before the first service step — and so does a claim
+	// the guard cannot read, which may be the claim of that desktop; the
+	// cause comes from the same read that decided the refusal.
+	serving, unreadableClaim := service.CheckLiveServingDesktop(singletonPreExisting)
+	if serving {
+		if unreadableClaim {
+			return unreadableDesktopClaimRefusal()
+		}
 		return servingDesktopRefusal()
 	}
 
@@ -1325,7 +1353,11 @@ func serviceRestart(args []string, stdout io.Writer) error {
 		return err
 	}
 	defer holdRelease()
-	if service.LiveServingDesktop(singletonPreExisting) {
+	serving, unreadableClaim := service.CheckLiveServingDesktop(singletonPreExisting)
+	if serving {
+		if unreadableClaim {
+			return unreadableDesktopClaimRefusal()
+		}
 		return servingDesktopRefusal()
 	}
 

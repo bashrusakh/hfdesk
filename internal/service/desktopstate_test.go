@@ -143,9 +143,46 @@ func TestLiveServingDesktopNeedsBothFacts(t *testing.T) {
 		{name: "nothing at all", preExisting: false, claimLive: false, wantServing: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			PublishedStateLive = func() bool { return tc.claimLive }
+			PublishedStateLive = func() (bool, bool) { return tc.claimLive, false }
 			if got := LiveServingDesktop(tc.preExisting); got != tc.wantServing {
 				t.Errorf("LiveServingDesktop(preExisting=%t) = %t, want %t",
+					tc.preExisting, got, tc.wantServing)
+			}
+		})
+	}
+}
+
+// TestCheckLiveServingDesktopNamesTheCauseFromTheSameRead pins the
+// single-read contract behind the refusal messages: the decision and the
+// named cause are both derived from ONE seam answer, and a caller whose
+// probe found no holder receives neither — there is no refusal to name a
+// cause for. The message layer must never re-read the file: with one read
+// the named cause cannot contradict the state that triggered the refusal.
+func TestCheckLiveServingDesktopNamesTheCauseFromTheSameRead(t *testing.T) {
+	previous := PublishedStateLive
+	t.Cleanup(func() { PublishedStateLive = previous })
+
+	for _, tc := range []struct {
+		name                string
+		preExisting         bool
+		live, unreadable    bool
+		wantServing         bool
+		wantUnreadableCause bool
+	}{
+		{"a live claim beside a holder", true, true, false, true, false},
+		{"an unreadable claim beside a holder", true, false, true, true, true},
+		{"a claim neither live nor readable beside a holder", true, false, false, false, false},
+		{"an unreadable claim beside a probe that found no holder", false, false, true, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			PublishedStateLive = func() (bool, bool) { return tc.live, tc.unreadable }
+			serving, unreadableClaim := CheckLiveServingDesktop(tc.preExisting)
+			if serving != tc.wantServing || unreadableClaim != tc.wantUnreadableCause {
+				t.Errorf("CheckLiveServingDesktop(preExisting=%t) = (%t, %t), want (%t, %t)",
+					tc.preExisting, serving, unreadableClaim, tc.wantServing, tc.wantUnreadableCause)
+			}
+			if got := LiveServingDesktop(tc.preExisting); got != tc.wantServing {
+				t.Errorf("LiveServingDesktop(preExisting=%t) = %t, want %t (the wrapper agrees with the tuple)",
 					tc.preExisting, got, tc.wantServing)
 			}
 		})
@@ -236,3 +273,103 @@ func exitedProcessPID(t *testing.T) int {
 	}
 	return cmd.Process.Pid
 }
+
+// TestLiveServingDesktopFailsClosedOnAClaimItCannotRead pins the
+// indeterminable state of the guard: a claim that exists but cannot be
+// read or parsed is never the absent claim — with a singleton holder the
+// conjunction refuses (the mutation must not proceed beside a desktop the
+// guard cannot see), and without a holder the two-fact model is unchanged
+// and proceeds. CheckLiveServingDesktop reports the refusal and the cause
+// together, from one read, and reports the unreadable cause for nothing
+// else: an absent, stale or readable claim carries no such cause.
+func TestLiveServingDesktopFailsClosedOnAClaimItCannotRead(t *testing.T) {
+	claimFile := filepath.Join(t.TempDir(), "desktop-state.json")
+	previous := claimStatePath
+	claimStatePath = func() string { return claimFile }
+	t.Cleanup(func() { claimStatePath = previous })
+
+	for _, tc := range []struct {
+		name    string
+		fixture func(t *testing.T)
+	}{
+		{"an unparsable claim", func(t *testing.T) {
+			if err := os.WriteFile(claimFile, []byte("{not json"), 0o600); err != nil {
+				t.Fatalf("write the unparsable claim: %v", err)
+			}
+		}},
+		{"an unreadable claim", func(t *testing.T) {
+			// A directory at the claim path fails the read
+			// deterministically (EISDIR), even for a test run as
+			// root, where chmod 0 would not deny the read.
+			if err := os.Mkdir(claimFile, 0o755); err != nil {
+				t.Fatalf("put a directory at the claim path: %v", err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.RemoveAll(claimFile); err != nil {
+				t.Fatalf("empty the claim path: %v", err)
+			}
+			tc.fixture(t)
+			t.Cleanup(func() { _ = os.RemoveAll(claimFile) })
+
+			// The refusal and its named cause come from ONE read:
+			// this tuple is the fact the message layer receives.
+			serving, unreadable := CheckLiveServingDesktop(true)
+			if !serving || !unreadable {
+				t.Errorf("CheckLiveServingDesktop(true) = (%t, %t), want (true, true): a refusal whose cause is the unreadable claim", serving, unreadable)
+			}
+			if !LiveServingDesktop(true) {
+				t.Error("a claim the guard could not read did not fail closed: the mutation would proceed beside a desktop it cannot see")
+			}
+			if serving, unreadable := CheckLiveServingDesktop(false); serving || unreadable {
+				t.Errorf("CheckLiveServingDesktop(false) = (%t, %t), want (false, false): although no process of the session holds the singleton", serving, unreadable)
+			}
+			if LiveServingDesktop(false) {
+				t.Error("the unreadable claim refused although no process of the session holds the singleton")
+			}
+		})
+	}
+
+	t.Run("only the unreadable presence reports unreadable", func(t *testing.T) {
+		// Perturbation: only the file at the claim path changes —
+		// absent, stale (its process is gone), readable and live —
+		// and the unreadable fact stays false while the conjunction
+		// keeps its documented states.
+		if err := os.RemoveAll(claimFile); err != nil {
+			t.Fatalf("empty the claim path: %v", err)
+		}
+		if _, unreadable := CheckLiveServingDesktop(true); unreadable {
+			t.Error("an absent claim carries the unreadable cause")
+		}
+		if LiveServingDesktop(true) {
+			t.Error("an absent claim refused the mutation: the directory the guard reads holds no claim")
+		}
+
+		dead := exitedProcessPID(t)
+		stale := `{"url":"","pid":` + strconv.Itoa(dead) + `}`
+		if err := os.WriteFile(claimFile, []byte(stale), 0o600); err != nil {
+			t.Fatalf("write the stale claim: %v", err)
+		}
+		if _, unreadable := CheckLiveServingDesktop(true); unreadable {
+			t.Error("a stale but readable claim carries the unreadable cause")
+		}
+		if LiveServingDesktop(true) {
+			t.Error("a claim of a dead process refused the mutation: the guard named a tray app that is not there")
+		}
+
+		if err := PublishState(claimFile, "http://127.0.0.1:8080"); err != nil {
+			t.Fatalf("publish the claim of a live desktop: %v", err)
+		}
+		// The live claim refuses with the SERVING cause: the tuple
+		// keeps the unreadable cause out of a readable claim, so the
+		// message layer names the right variant from the same read.
+		if serving, unreadable := CheckLiveServingDesktop(true); !serving || unreadable {
+			t.Errorf("CheckLiveServingDesktop(true) = (%t, %t), want (true, false): a readable live claim refuses with the serving cause", serving, unreadable)
+		}
+		if !LiveServingDesktop(true) {
+			t.Error("the live claim of the same file was not seen by the guard")
+		}
+	})
+}
+
