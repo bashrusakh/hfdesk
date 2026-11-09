@@ -295,7 +295,7 @@ directory of the instance is the real log sink on macOS.
 
 | Command | Effect | A service that is not installed |
 |---|---|---|
-| `install` | Registers the service with the supervisor and enables it for the boot of the scope on a **first** installation; a **repeat** installation keeps the autostart state the registration already has, including a runtime-only enablement — an enabled systemd unit stays enabled (and a unit enabled with `systemctl enable --runtime` is enabled at runtime again instead of being made permanent), a disabled one is not enabled again, a masked unit (persistent or `--runtime`) refuses the installation, and a Windows registration keeps its start type and its delayed-auto-start flag, while a running Windows service with a disabled start type refuses the installation. A macOS LaunchAgent starts the instance as soon as it is registered (`RunAtLoad`); a systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is updated in place on Windows and Linux — the settings the command does not name again are kept, a running instance is restarted on the new program, and a stopped one stays stopped — and replaced on macOS (see [Upgrades](#upgrades)). | It creates the registration. |
+| `install` | Registers the service with the supervisor and enables it for the boot of the scope on a **first** installation; a **repeat** installation keeps the autostart state the registration already has — it never runs `enable` at all, so an enabled systemd unit stays enabled, a unit enabled with `systemctl enable --runtime` stays runtime-only instead of being made permanent, and a disabled one stays disabled — while a masked unit (persistent or `--runtime`) refuses the installation, and a Windows registration keeps its start type and its delayed-auto-start flag, while a running Windows service with a disabled start type refuses the installation. A macOS LaunchAgent starts the instance as soon as it is registered (`RunAtLoad`); a systemd unit is only registered and enabled. The `State` line of the summary reports the state the supervisor reached. An existing registration is updated in place on Windows and Linux — the settings the command does not name again are kept, a running instance is restarted on the new program, and a stopped one stays stopped — and replaced on macOS (see [Upgrades](#upgrades)). | It creates the registration. |
 | `uninstall` | Removes the **registration only**. | Clean success: the registration is already gone. |
 | `start` | Starts the registered service. | **Error** that says the service is not installed. |
 | `stop` | Stops the registered service. | Clean success: there is nothing running to stop. |
@@ -479,119 +479,152 @@ only then is it started again on the current binary.
 - The unit keeps the process in the foreground (`Type=simple`) and restarts it
   on failure. It holds no access data.
 
-#### The supported unit-file subset
+#### Unit ownership: the HFDesk unit and administrator drop-ins
 
-HFDesk implements only the subset of the systemd unit-file syntax described
-here — it is not a general systemd unit editor. A directive outside the subset
-is either refused before the unit file is changed or preserved exactly as
-written, without interpretation. The subset grows only by an explicit
-amendment with regression tests; it never grows by accumulating "one more
-exception" on demand.
+Two parties touch the systemd registration, and each owns its own files:
 
-**`ExecStart=` forms.** An update works on the `ExecStart=` line of the
-`[Service]` section and recognizes exactly these shapes:
+- **HFDesk owns the unit file** — `hfdesk.service` in the unit directory of
+  the scope (`~/.config/systemd/user/hfdesk.service`, or
+  `$XDG_CONFIG_HOME/systemd/user/hfdesk.service`, for the user scope;
+  `/etc/systemd/system/hfdesk.service` for the machine-wide scope). Every
+  installation regenerates this file as a whole, byte deterministically, in
+  exactly one shape: the canonical command `<program> service run --config …
+  --state-dir … --log-dir … --listen …` with `--cache-dir`, `--hub-dir` and
+  `--local-dir` behind it when the registration holds them, plus the fixed
+  settings of the template (`Type=simple`, `Restart=on-failure`,
+  `TimeoutStopSec=`, `Environment="HOME=…"` and the rest). The header carries
+  a `# format: 1` marker that pins the rendering version. An update replaces
+  the file with the rendering of the merged settings instead of editing it in
+  place, so across an update only the location of the program and the options
+  the command named again differ from the previous bytes: every unnamed
+  setting keeps its registered value, and an optional directory that was
+  never registered stays absent.
+- **The administrator owns the drop-ins** — every `*.conf` file in
+  `hfdesk.service.d/` beside the unit; `<unit directory>/hfdesk.service.d/local.conf`
+  is the path the error messages name. HFDesk never writes, moves or deletes
+  a drop-in, and it does not create the directory or the file — the
+  administrator does, once. systemd composes the unit file and its drop-ins
+  into the configuration it loads, and HFDesk judges its result by that
+  loaded configuration. Every customization belongs there instead of into the
+  unit file: environment values, environment files, supplementary groups, a
+  working directory or account, restart policy, hardening, limits.
 
-- the program alone;
-- the program followed by `service run` and its run flags — directly, or
-  behind an `env` prefix. The prefix accepts exactly these words: `-i` and
-  `--ignore-environment` (no value); `-u NAME` and `--unset NAME`, whose
-  separated word is consumed as the option's value; an attached
-  `--option=value` form such as `--unset=NAME`, which carries its own value
-  and consumes no following word; and `NAME=VALUE` assignments. The program
-  sits behind the prefix and `service run` behind the program, so
-  `env -u NAME /path/to/hfdesk service run ...` is recognized with `-u`
-  consuming `NAME` and the path as the program.
+**What an update preserves.** An installation over an existing registration
+keeps everything the command does not name again:
 
-A command of any other shape is refused before anything is changed, with an
-error that names the line:
+- the settings of the registration — bind address, config/state/log paths,
+  cache root, hub directory, output directory, service account — and the
+  absence of an optional directory that was never registered;
+- the running state: a running (or starting) instance is stopped, restarted
+  on the new program and verified; a stopped, failed or never-started
+  registration is never started by `install` — starting stays an explicit
+  `service start`;
+- the autostart state: `enable` runs **only at a first installation**. A
+  repeat installation never runs `enable` at all, so the enablement the
+  supervisor reports survives by non-interference: an enabled unit stays
+  enabled, `enabled-runtime` stays runtime-only instead of becoming
+  permanent, a disabled unit stays disabled;
+- a masked unit — persistent or placed with `systemctl mask --runtime` —
+  refuses the installation and is never unmasked: the error names `systemctl
+  unmask hfdesk.service` with the scope prefix of the command;
+- the data of the instance: an update writes the unit file and, at most, the
+  directories of the instance. It never touches the config file, the jobs,
+  the history, the logs, the models or the cache, it never changes the
+  ownership of a model or cache tree, and ownership is granted only to
+  directories the installation created itself.
 
-- a shell-string wrapper (`sh -c "..."`), an unknown wrapper, or an `env`
-  prefix word outside the list above — `env --debug /path/to/hfdesk service
-  run ...` names an option of unknown arity, so nothing is guessed and the
-  line is refused before anything changes; the same refusal takes
-  `env -u NAME service run ...`, where `-u` consumes `NAME` and no program
-  remains behind it;
-- for an update that must verify a running start: a command without the
-  `service run` vector carrying all three required flags `--config`,
-  `--state-dir` and `--log-dir`. The refusal happens before the running
-  service is stopped and before the unit is rewritten; the same command still
-  updates while its service is stopped, because a stopped instance has no
-  start to verify.
+**The three refusals.** An update proceeds only over the registration HFDesk
+owns. Three states refuse it **before anything changes** — nothing is
+stopped, nothing is written, no directory is created — and each refusal says
+first that the update was refused and the registration was not changed, then
+names the cause, and then states exactly one next action:
 
-Line-level states follow the same spirit: more than one `ExecStart=` line in
-`[Service]`, or a unit with no `[Service]` section at all, is refused before
-the unit file is written; a `[Service]` section whose `ExecStart=` line is
-missing or empty receives the canonical command of the installation.
+> Move your customizations into "<unit directory>/hfdesk.service.d/local.conf"
+> and run "hfdesk service install" again.
 
-When the line is rewritten, only the program slot changes: a recognized `env`
-prefix stays exactly as written in front of the new program, the words behind
-the program keep their order, and a run flag named explicitly on the command
-line is merged into the run vector, replacing the occurrence the line already
-carries — flags the command does not name are left alone.
+1. **A hand-edited base file.** The bytes of `hfdesk.service` must be the
+   canonical unit HFDesk generates. Any deviation refuses the update instead
+   of being repaired or edited around: a changed, added or removed line or
+   comment, a specifier or variable operand such as `%h` or `$NAME`, a second
+   `ExecStart=`, a command that is the program alone or carries words the
+   canonical vector does not — and an `env`-wrapped command such as `env -u
+   NAME /path/to/hfdesk service run …` as well, which is refused as a hand
+   edit of HFDesk's file rather than rewritten.
+2. **A drop-in that owns the command.** `ExecStart=` is the field HFDesk
+   owns. When systemd loads a command that differs from the one in the unit
+   file — because a drop-in overrides it — the update refuses before any
+   change and names the drop-in paths the supervisor reports. The command of
+   the instance is changed by naming the install flags again, never by a
+   drop-in.
+3. **A foreign or vendor fragment.** When systemd loads a unit under the
+   HFDesk name from a file HFDesk did not write — a packaged or generated
+   fragment — the update refuses instead of adopting it or writing over it.
 
-**Directives HFDesk reads — and what it preserves.** From the unit file,
-HFDesk takes exactly these registration facts — `ExecStart`,
-`WorkingDirectory`, `User`, `Group` and `Environment` — and reads them only
-inside `[Service]`. `EnvironmentFile=` is read only as systemd reports it in
-the loaded configuration: HFDesk never opens the file it names and never
-interprets its contents. An update rewrites `ExecStart=`
-always, `WorkingDirectory=` only when `--state-dir` is named again, and
-`User=`/`Group=` only when `--service-user` is named again; every other line
-is preserved exactly as written — directives HFDesk does not interpret,
-comments, blank lines, section headers, and the whole physical form
-(indentation, line ending, continuation) of any line it does not change. A
-line it does change keeps its indentation and line ending and replaces its
-whole, possibly continued, value with the new one.
+**What a drop-in may do.** Everything except the command. A drop-in that sets
+`Environment=`, `EnvironmentFile=`, `SupplementaryGroups=`, `WorkingDirectory=`
+or `User=` survives an update byte for byte — HFDesk never writes the file —
+and systemd keeps following those values as the effective configuration. The
+installation verifies after its write that exactly these effective values
+came through unchanged unless the matching flag named a new one, and the
+account and access checks of a later installation use the identity and the
+working directory the supervisor really loads. Fields outside that
+verification — restart policy, hardening, resource limits — are the
+administrator's responsibility: HFDesk neither rewrites nor checks them, and
+they stay in force as written.
 
-After the rewrite the installation proves through systemd that the loaded
-command, environment, environment files, working directory and service
-identity came through unchanged unless the matching flag was named, and a
-rollback that cannot load the previous environment and environment files
-again fails instead of claiming restoration. HFDesk never rewrites an
-administrator-owned drop-in: it writes only its own unit file, and an update
-whose effective command systemd reports differently from the unit file —
-because a drop-in or another override owns it — is refused rather than edited
-around.
+**What an update proves — and what it promises when it fails.** Rewriting the
+file is not success. After the write and the supervisor's reload, the
+installation holds the loaded configuration against these proofs:
 
-**Variables, specifiers and unexpandable values.** A value HFDesk cannot
-expand itself stays uninterpreted: it is preserved as written, checked
-against what systemd actually loaded, and never guessed. A word is dynamic
-when it carries a specifier such as `%h` or a variable reference such as
-`$NAME` or `${NAME}` — a doubled `%%` or `$$` is the literal character
-instead. A dynamic run flag the update does not name keeps its source text,
-and the update fails if the value systemd loaded for that flag changed across
-the write. Where a decision needs the expanded value — the listen address of a
-verification, for example — HFDesk reads the argv of the live service process
-instead of expanding the expression itself. A value the target directive
-cannot carry faithfully is refused by name instead of written altered: a state
-directory that ends in a space, for instance, cannot be written as
-`WorkingDirectory=`, because systemd strips the trailing space. When HFDesk
-writes a value itself, it doubles a literal `%` in every directive and a
-literal `$` in command words, because systemd expands specifiers everywhere
-and unit variables only in the command line.
+- the loaded command is exactly the canonical command that was written,
+  compared as the typed argument vector the supervisor stores, not as a
+  joined display string;
+- every launch field HFDesk did not name — environment, environment files,
+  supplementary groups, working directory, service identity — equals what
+  the supervisor reported before the write;
+- a restarted instance is proven to be the new one: the supervisor reports
+  the unit running with the registered program, the argv of the live main
+  process parses as the canonical `service run` vector, that very process
+  answers the readiness probe at its effective listen address — the health
+  document of HFDesk or its Basic-auth challenge, asked directly on the
+  machine, without a credential and without following redirects — the
+  instance reports the expected version when the build version is known, and
+  the main process after the restart is a different process than the one
+  snapshotted before it.
 
-**Lines, quotes and words.** A directive is a logical line: a physical line
-whose trailing backslashes are an odd number continues onto the next physical
-line, comment lines in between are skipped, and a carriage return before the
-newline is not part of the value. A section header is `[Name]`, a directive is
-`Key=value` split at the first `=`, and blank lines and lines starting with
-`#` or `;` are comments. Inside a value, whitespace separates words, `'` and
-`"` group characters into one word and may open and close inside a word,
-backslash escapes are decoded in the C style (`\a \b \f \n \r \t \v \\ \" \'
-\s`, `\xNN`, `\uNNNN`, `\UNNNNNNNN` and three octal digits), an escape the
-decoder does not know stays in the text literally, a decoded escape never
-splits the word again, and `%%` is a literal percent sign. A shape or word
-boundary these rules cannot prove is treated conservatively — refused with the
-line named, or preserved exactly as written — never turned into a guess.
+A failure of any proof restores the previous registration: the saved unit
+bytes are written back and read back, the supervisor reloads them, and the
+loaded configuration is read again and compared with the pre-update snapshot.
+Only when that verification passes — and only when the instance was running
+before — is the previous instance started again. The failure report keeps the
+original cause and states only what was proved: that the previous
+registration and its loaded settings were restored, or that the restoration
+could not be confirmed. An unconfirmed rollback is never reported as a
+recovery.
 
-**Why the subset exists.** An update of a running instance is only accepted
-where it can be verified: after the restart HFDesk reads the argv of the live
-service process and accepts it only when it parses as the canonical
-`service run` vector carrying every required flag — the same list the parser
-enforces when a service starts. A command outside that vector can start but
-can never be proven after a restart, so the accepted update domain is
-deliberately the verifiable domain: what HFDesk can rewrite it can also prove,
-and what it cannot prove it refuses while the instance still runs.
+**Never `StateDirectory=`.** HFDesk never writes `StateDirectory=`,
+`LogsDirectory=` or `RuntimeDirectory=` into its unit: the directories of the
+instance are created and granted explicitly by the installation, and a
+systemd directory directive may recursively hand the ownership of an existing
+tree to the supervisor. The rule extends to drop-ins as a contract warning:
+such a directive in `hfdesk.service.d/*.conf` may re-own existing directory
+trees behind the back of HFDesk, and the ownership of user data — models,
+cache, jobs, logs — is never changed automatically. A drop-in that asks
+systemd to manage those directories takes that risk outside what HFDesk can
+preserve or verify.
+
+**`status` describes, it does not refuse.** `hfdesk service status` reads
+the registration as it finds it: a hand-edited unit is described as far as it
+can be read — program, bind address, runtime paths, state — while the refusal
+belongs to `install` and its update. The tolerant reading of `status` never
+makes an update acceptable, and a refused update never changes what `status`
+reports.
+
+**Why the canonical form.** The canonical unit is deliberately the
+verifiable domain: what HFDesk regenerates it can also prove after a restart,
+and what it cannot prove — a command it can never read back from the live
+process — it refuses up front instead of accepting an update it could never
+confirm.
 
 ### macOS (launchd)
 
@@ -960,26 +993,24 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   or `--executable`. A flag named again changes that setting, and `--cache-dir`
   without `--hub-dir` moves the hub directory with the cache root, exactly as it
   does on a first installation.
-- **Native settings are kept too.** On Linux, an update changes the unit command
-  and changes the working directory or service identity only when the matching
-  install flag is named. Other unit directives, including environment settings
-  and environment files, stay in place. If systemd's loaded command differs from
-  the unit file (for example because an override owns it), the update is refused
-  rather than editing an administrator-owned drop-in or claiming that a
-  shadowed base-file edit took effect. The command itself must be rewritable
-  too: only an `ExecStart=` that is the program alone, or the program
-  followed by `service run` — directly or behind an `env` prefix, which is
-  kept — is rewritten, and any other form (a shell-wrapped script, an unknown
-  wrapper) is refused before anything is changed, with an error that names
-  the line. See [The supported unit-file subset](#the-supported-unit-file-subset)
-  for the exact syntax an update handles. A command without the `service run`
-  vector and its required flags (`--config`, `--state-dir`, `--log-dir`) can
-  be updated only while its service is stopped: an update that must verify a
-  running start requires that canonical vector, and a running service
-  registered with a command that
-  lacks it is refused before anything is changed — the unit is not rewritten
-  and the service is not stopped — with an error that names the line and the
-  vector to set. On Windows, the
+- **Native settings are kept too.** On Linux, an update regenerates the unit
+  file HFDesk owns as its canonical rendering: the program always comes from
+  the request, and a run option, the working directory or the service
+  identity changes only when the matching install flag is named — every other
+  registered value, including the absence of an optional directory, is
+  rendered unchanged. Settings an administrator put in a drop-in are not part
+  of that file at all: the drop-in survives the write and keeps being followed
+  as the effective configuration (see
+  [Unit ownership: the HFDesk unit and administrator drop-ins](#unit-ownership-the-hfdesk-unit-and-administrator-drop-ins)).
+  An update proceeds only over the registration HFDesk owns: a base file that
+  is not the canonical unit HFDesk generates — a hand edit, a specifier or
+  variable operand, an `env`-wrapped command — a loaded command a drop-in
+  owns, and a loaded fragment HFDesk did not write each refuse the update
+  before anything changes, whether the instance runs or not, with the drop-in
+  beside the unit as the single next action. If systemd's loaded command
+  differs from the unit file, the update is refused rather than editing an
+  administrator-owned drop-in or claiming that a shadowed base-file edit took
+  effect. On Windows, the
   readable SCM settings
   that HFDesk does not own are written back with the new command line. The
   Windows identity remains the fixed `LocalService` account, and an SCM password
@@ -994,13 +1025,14 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   joined display. If the loaded properties cannot be read, an existing update
   stops before changing the unit.
 - **The autostart state is kept.** The start at boot is a setting of the
-  registration and not of the command: a repeat installation writes the
-  autostart state the registration already has, so a reinstall with a new binary
-  never undoes a decision of an administrator. An enabled systemd unit stays
-  enabled, and a unit that is disabled is not enabled again; a unit enabled with
-  `systemctl enable --runtime` keeps exactly that runtime-only enablement and is
-  enabled again with `--runtime`, so a repeat installation never turns it into a
-  permanent one. On Windows the start
+  registration and not of the command: only a **first** installation enables
+  the registration it writes, and a repeat installation never runs `enable`
+  at all, so a reinstall with a new binary never undoes a decision of an
+  administrator. The enablement the supervisor reports survives by
+  non-interference: an enabled systemd unit stays enabled, a unit an
+  administrator disabled stays disabled, and a unit enabled with `systemctl
+  enable --runtime` keeps exactly that runtime-only enablement instead of
+  being turned into a permanent one. On Windows the start
   type and the delayed-auto-start flag are written back as they are, so a manual
   or a disabled start stays manual or disabled and a delayed automatic start
   stays delayed. Only a **first** installation enables the registration it

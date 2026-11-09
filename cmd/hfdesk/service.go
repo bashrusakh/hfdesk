@@ -957,6 +957,27 @@ func writeInstallSummary(w io.Writer, ctx context.Context, mgr service.Manager, 
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "The service was registered.")
 	writeInstallState(w, scope, status, statusErr)
+	if dropIn := systemdDropInPath(status.UnitPath); dropIn != "" {
+		fmt.Fprintf(w, "Unit customizations belong in: %s\n", dropIn)
+	}
+}
+
+// systemdDropInPath returns the administrator drop-in beside a systemd unit
+// registration, or the empty string for a registration that has no drop-in
+// layer.
+//
+// An installation regenerates the systemd unit as a whole, so a
+// customization has to live in the drop-in beside it to survive the next
+// update — that is the path the summary points at. The property list of
+// macOS and the registration of Windows have no drop-in directory, and a
+// summary must not point at a path that does not exist there; the unit file
+// of a systemd registration is the only registration path that ends in
+// ".service".
+func systemdDropInPath(unitPath string) string {
+	if !strings.HasSuffix(unitPath, ".service") {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(unitPath), filepath.Base(unitPath)+".d", "local.conf")
 }
 
 // installAccount returns the account the registered instance runs as.

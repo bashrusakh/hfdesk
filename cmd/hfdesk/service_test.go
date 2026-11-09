@@ -672,6 +672,71 @@ func TestInstallSummaryReportsTheDefaultAccountOfThePlatform(t *testing.T) {
 	}
 }
 
+// TestInstallSummaryPointsCustomizationsAtTheDropIn checks that the success
+// summary of an installation names the administrator drop-in beside a
+// systemd unit registration.
+//
+// The drop-in is the one place a customization survives an update that
+// regenerates the unit as a whole, so the command that wrote the unit points
+// at it. A registration without a drop-in layer — the property list of macOS
+// and the registration of Windows — must not be pointed at a path that does
+// not exist there.
+func TestInstallSummaryPointsCustomizationsAtTheDropIn(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		unitPath string
+		want     string
+	}{
+		{
+			name:     "machine-wide systemd unit",
+			unitPath: "/etc/systemd/system/hfdesk.service",
+			want:     filepath.Join("/etc/systemd/system", "hfdesk.service.d", "local.conf"),
+		},
+		{
+			name:     "user scope systemd unit",
+			unitPath: "/home/user/.config/systemd/user/hfdesk.service",
+			want:     filepath.Join("/home/user/.config/systemd/user", "hfdesk.service.d", "local.conf"),
+		},
+		{
+			name:     "launchd property list",
+			unitPath: "/Users/user/Library/LaunchAgents/com.hfdesk.hfdesk.plist",
+		},
+		{
+			name:     "windows registration",
+			unitPath: `HKLM\SYSTEM\CurrentControlSet\Services\hfdesk`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := service.InstallOptions{
+				Scope:      service.ScopeUser,
+				Executable: "/usr/local/bin/hfdesk",
+				Listen:     "127.0.0.1:8080",
+				Paths: runtimepaths.Paths{
+					ConfigFile: "/home/user/.config/HFDesk/service/hfdesk.json",
+					StateDir:   "/home/user/.config/HFDesk/service",
+					LogDir:     "/home/user/.config/HFDesk/service/logs",
+				},
+			}
+
+			var buf bytes.Buffer
+			mgr := fakeManager{status: service.Status{State: service.StateStopped, UnitPath: tc.unitPath}}
+			writeInstallSummary(&buf, context.Background(), mgr, service.ScopeUser, opts)
+
+			out := buf.String()
+			const marker = "Unit customizations belong in: "
+			if tc.want == "" {
+				if strings.Contains(out, marker) {
+					t.Errorf("the summary points at a drop-in of a registration without one:\n%s", out)
+				}
+				return
+			}
+			if !strings.Contains(out, marker+tc.want) {
+				t.Errorf("the summary does not point at %q:\n%s", tc.want, out)
+			}
+		})
+	}
+}
+
 // TestServiceUsageDescribesTheServiceUserOption checks that the usage
 // block of the family says where the account of a machine-wide instance
 // can be named.
