@@ -141,15 +141,19 @@ func headForETag(parentCtx context.Context, httpc *http.Client, token string, it
 // recursive, bounds malformed listings, and retries 429/5xx/network errors
 // with Retry-After/RateLimit-aware, context-cancellable waits. 401/403 (and
 // every other terminal status) fail immediately with the historical error
-// messages below.
+// messages below. Each page request runs under the per-fetch planning
+// metadata cap (dial + response headers + JSON body); its expiry surfaces as
+// an error matching hubtree.ErrPageFetchTimeout for the planning layer to
+// shape into the actionable timeout failure.
 func walkTree(ctx context.Context, httpc *http.Client, token, endpoint string, job Job, prefix string, fn func(hfNode) error) error {
 	w := &hubtree.Walker{
 		TreeURL: func(p string) string {
 			return treeURL(endpoint, job, p)
 		},
-		Token:     token,
-		UserAgent: "hfdesk/1",
-		Client:    httpc,
+		Token:            token,
+		UserAgent:        "hfdesk/1",
+		Client:           httpc,
+		PageFetchTimeout: metadataFetchTimeout,
 		StatusErr: func(resp *http.Response) error {
 			switch resp.StatusCode {
 			case http.StatusUnauthorized:
@@ -232,17 +236,21 @@ type RepoInfo struct {
 	LastModified string `json:"lastModified"` // ISO timestamp
 }
 
-// repoInfoFetchTimeout is the per-fetch TOTAL cap (dial + response headers +
-// JSON body) on one REQUIRED planning metadata fetch when the planning context
-// carries no earlier deadline. It is deliberately generous so slow-but-working
-// endpoints keep working: the transport may already spend up to
-// defaultDialTimeout (30s) connecting and defaultResponseHeaderTimeout (60s)
-// awaiting headers, so two minutes still leaves at least ~30 seconds for the
-// body read on the slowest endpoint that satisfies those transport windows,
-// while ending the body wait that previously had no bound of its own. It is a
-// package variable (not a public API) so tests can lower it deterministically,
-// mirroring headForETagTimeout, maxAttemptsPerRetry and socksHandshakeNanos.
-var repoInfoFetchTimeout = 2 * time.Minute
+// metadataFetchTimeout is the per-fetch TOTAL cap (dial + response headers +
+// JSON body) on one REQUIRED planning metadata fetch when the planning
+// context carries no earlier deadline. The repo-info lookup and every
+// tree-page request (delivered through Walker.PageFetchTimeout) are one
+// policy: required planning data from the same endpoint over the same
+// transport windows, so one honest value bounds both. It is deliberately
+// generous so slow-but-working endpoints keep working: the transport may
+// already spend up to defaultDialTimeout (30s) connecting and
+// defaultResponseHeaderTimeout (60s) awaiting headers, so two minutes still
+// leaves at least ~30 seconds for the body read on the slowest endpoint that
+// satisfies those transport windows, while ending body waits that previously
+// had no bound of their own. It is a package variable (not a public API) so
+// tests can lower it deterministically, mirroring headForETagTimeout,
+// maxAttemptsPerRetry and socksHandshakeNanos.
+var metadataFetchTimeout = 2 * time.Minute
 
 // fetchRepoInfo fetches repository metadata including the commit SHA for a given revision.
 func fetchRepoInfo(ctx context.Context, httpc *http.Client, token, endpoint string, job Job) (*RepoInfo, error) {

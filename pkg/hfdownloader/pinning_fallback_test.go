@@ -26,7 +26,13 @@ type pinningFixture struct {
 	missingPinned     string
 	redirectPinned    string
 	missingPinnedTree bool
-	revisionStatus    int
+	// stallBranchTree makes the branch-revision tree page send response
+	// headers and a partial JSON body, then stall until the client's request
+	// context ends, standing in for the previously unbounded tree-page body
+	// read during the fallback-rebuild walk (false keeps every existing
+	// fixture behavior).
+	stallBranchTree bool
+	revisionStatus  int
 	// hangRevisionAfter, when > 0, makes /revision/ requests from that call
 	// number onward hang until the client gives up, standing in for a stalled
 	// metadata response (0 disables the stall). revisionCalls counts them.
@@ -92,6 +98,18 @@ func newPinningFixture(t *testing.T, commitFiles, branchFiles map[string]string,
 			revision := requestPath[strings.Index(requestPath, "/tree/")+len("/tree/"):]
 			if revision == pinningFixtureCommit && f.missingPinnedTree {
 				http.NotFound(w, r)
+				return
+			}
+			if f.stallBranchTree && revision == "main" {
+				// Headers and a partial JSON body arrive, then the body
+				// stalls: the exact phase no response-header window bounds.
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`[{"type":"file","path":"config.json"`))
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				<-r.Context().Done()
 				return
 			}
 			nodes, ok := trees[revision]

@@ -367,23 +367,31 @@ the mutable branch is not accepted as pinned. Transport, cancellation,
 authentication, throttling, server, decode, redirect, or other inconclusive
 errors never authorize fallback. Branch variants never fall back.
 
-Planning bounds exactly two metadata lookup classes instead of waiting
-indefinitely on them: the required repo-info lookup under the per-fetch
-total cap, and the fallback confirmation under the addressing-probe budget.
-The required repo-info lookup runs under a per-fetch total deadline covering
-response headers and the JSON body, set generously above the transport's
-response-header window so slow-but-working endpoints keep working; expiry
-fails the plan with an actionable timeout error naming the elapsed budget,
-while a caller-supplied context deadline still surfaces as cancellation. A
-received custom-endpoint 404 response remains authoritative even when the
-fetch cap also expired; the cap's failure branch applies only when no
-authoritative response arrived. The fallback confirmation lookup is bounded
-by the addressing-probe budget family that already bounds the addressing
+Planning bounds exactly three metadata lookup classes instead of waiting
+indefinitely on them: the required repo-info lookup and every tree-page
+request under the per-fetch total cap, and the fallback confirmation under
+the addressing-probe budget. The required repo-info lookup runs under a
+per-fetch total deadline covering response headers and the JSON body, set
+generously above the transport's response-header window so slow-but-working
+endpoints keep working; expiry fails the plan with an actionable timeout
+error naming the elapsed budget, while a caller-supplied context deadline
+still surfaces as cancellation. A received custom-endpoint 404 response
+remains authoritative even when the fetch cap also expired; the cap's
+failure branch applies only when no authoritative response arrived. Every
+page request the tree walk makes — the initial pinned walk and the
+fallback-rebuild walk alike — runs under that same per-fetch total cap,
+applied per request inside the shared hubtree walker as a deadline over
+dial, response headers and the JSON body read, derived under the caller's
+context so caller cancellation keeps precedence. Expiry fails planning with
+the same actionable timeout shape naming the budget, repository and remedy:
+the file list is required data, so the failure is never classified as
+caller cancellation and never an authoritative response — it can never
+enable the branch fallback. hubtree's own retry-wait cap and request count
+remain the bounds between requests and are not charged to the per-page
+deadline. The fallback confirmation lookup is bounded by the
+addressing-probe budget family that already bounds the addressing
 preflight; its expiry is inconclusive and, like every other inconclusive
-outcome, never enables the branch fallback. Neither cap covers the
-tree-page body read inside the tree walk (the internal hubtree JSON page
-decode behind `walkTree`): its headers wait only under the transport's
-response-header window and its body only under the caller's context.
+outcome, never enables the branch fallback.
 
 Mode selection finishes before `OnPlanComplete` or `plan_item` events. On a
 qualifying incompatibility the complete candidate is rebuilt from the branch

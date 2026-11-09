@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/datasetselection"
+	"github.com/bashrusakh/hfdesk/internal/hubtree"
 )
 
 // unsafeRepoPath reports whether a relative path returned by the repo tree API
@@ -299,7 +300,7 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 		// below preserves cancellation semantics); only this internal cap
 		// expiry is reported as an actionable planning failure, in the same
 		// branch and shape as the other repo-info errors.
-		fetchCtx, cancelFetch := context.WithTimeout(ctx, repoInfoFetchTimeout)
+		fetchCtx, cancelFetch := context.WithTimeout(ctx, metadataFetchTimeout)
 		repoInfo, infoErr := fetchRepoInfo(fetchCtx, httpc, token, cfg.Endpoint, job)
 		fetchTimedOut := errors.Is(fetchCtx.Err(), context.DeadlineExceeded)
 		cancelFetch()
@@ -311,7 +312,7 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 				// Established custom-endpoint 404 exemption: the response was
 				// actually received, so it stays authoritative over the cap.
 			} else if fetchTimedOut {
-				return nil, fmt.Errorf("repo info API timed out after %s for %q: planning needs this metadata and the endpoint did not respond in time; check the endpoint, proxy, or network and retry (last error: %v)", repoInfoFetchTimeout, job.Repo, infoErr)
+				return nil, fmt.Errorf("repo info API timed out after %s for %q: planning needs this metadata and the endpoint did not respond in time; check the endpoint, proxy, or network and retry (last error: %v)", metadataFetchTimeout, job.Repo, infoErr)
 			} else {
 				return nil, infoErr
 			}
@@ -368,6 +369,23 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 		return nil
 	})
 	if err != nil {
+		// Caller cancellation keeps its established surface: the caller's
+		// own context error, unchanged, classified as cancellation — never
+		// reshaped into an internal budget expiry.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if errors.Is(err, hubtree.ErrPageFetchTimeout) {
+			// REQUIRED data (the plan's file list): a per-request budget
+			// expiry fails planning in the same class and shape as the
+			// repo-info timeout above. The underlying context expiry is
+			// formatted with %v so the failure classifier never reads this
+			// as caller cancellation, and an expired budget is not an
+			// authoritative response — it must never reach the branch
+			// fallback confirmation below (pinned rule: uncertainty never
+			// enables the fallback).
+			return nil, fmt.Errorf("tree page API timed out after %s for %q: planning needs this file list and the endpoint did not respond in time; check the endpoint, proxy, or network and retry (last error: %v)", metadataFetchTimeout, job.Repo, err)
+		}
 		if forced == nil && custom && !job.BranchVariant && mode.pinned && isEndpointStatus(err, http.StatusNotFound) {
 			// This confirmation is the same class of compatibility check as
 			// the addressing preflight, so it shares that family's total
