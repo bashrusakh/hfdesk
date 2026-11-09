@@ -2203,6 +2203,220 @@ func TestPreWriteExecStartOverrideClassifiesTheDirectory(t *testing.T) {
 	})
 }
 
+// TestSystemdDropInSearchDirsCoversTheReportedUnitPaths pins the scan's
+// directory set to the unit paths the systemd of this machine enumerates:
+// `systemd-analyze unit-paths` reports for the system scope /etc, /run and
+// the two lib directories, and `systemd-analyze --user unit-paths` reports
+// for the user scope /etc, the session runtime directory, /run/systemd/user,
+// the XDG data directories and the two lib directories. Every one of them
+// can hold a drop-in that owns the command, so every one of them is scanned;
+// the previous user scope listed only /etc and /usr/lib, which let an
+// override in /run/systemd/user escape the refusal-before-write. The
+// perturbation: drop any expected entry and the containment check fails —
+// exactly the escape the blocking residue described.
+func TestSystemdDropInSearchDirsCoversTheReportedUnitPaths(t *testing.T) {
+	unitPath := filepath.Join("/tmp", "somewhere", unitName)
+	name := unitName + ".d"
+	containment := func(t *testing.T, got []string, want []string) {
+		t.Helper()
+		have := make(map[string]bool, len(got))
+		for _, dir := range got {
+			have[dir] = true
+		}
+		for _, dir := range want {
+			if !have[dir] {
+				t.Errorf("the drop-in search dirs =\n%v\ndo not cover %q", got, dir)
+			}
+		}
+	}
+
+	t.Run("the user scope covers every reported directory", func(t *testing.T) {
+		got := systemdDropInSearchDirs(unitPath, ScopeUser)
+		if len(got) == 0 || got[0] != filepath.Dir(unitDropInPath(unitPath)) {
+			t.Errorf("the first drop-in search dir = %v, want the unit's own directory %q first", got[:1], filepath.Dir(unitDropInPath(unitPath)))
+		}
+		want := []string{
+			"/etc/systemd/user/" + name,
+			userScopeRuntimeSystemdDir() + "/" + name,
+			"/run/systemd/user/" + name,
+			"/usr/local/lib/systemd/user/" + name,
+			"/usr/lib/systemd/user/" + name,
+		}
+		// The XDG data directories resolve by environment, the way
+		// systemd resolves them: the home directory of the user or
+		// $XDG_DATA_HOME, then $XDG_DATA_DIRS or its default pair.
+		dataHome := os.Getenv("XDG_DATA_HOME")
+		if dataHome == "" {
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				dataHome = filepath.Join(home, ".local", "share")
+			}
+		}
+		if dataHome != "" {
+			want = append(want, dataHome+"/systemd/user/"+name)
+		}
+		dataList := os.Getenv("XDG_DATA_DIRS")
+		if dataList == "" {
+			dataList = "/usr/local/share:/usr/share"
+		}
+		for _, dir := range filepath.SplitList(dataList) {
+			if dir != "" {
+				want = append(want, dir+"/systemd/user/"+name)
+			}
+		}
+		containment(t, got, want)
+	})
+
+	t.Run("the system scope covers every reported directory", func(t *testing.T) {
+		got := systemdDropInSearchDirs(unitPath, ScopeSystem)
+		containment(t, got, []string{
+			"/etc/systemd/system/" + name,
+			"/run/systemd/system/" + name,
+			"/usr/local/lib/systemd/system/" + name,
+			"/usr/lib/systemd/system/" + name,
+		})
+	})
+}
+
+// TestDropInHoldsExecStartParsesTheSystemdAssignmentGrammar pins the
+// directive grammar against systemd's own parsing: `ExecStart =/bin/true`
+// and `ExecStart  =  /bin/true` are the ExecStart setting (verified with
+// `systemd-analyze verify`), so a drop-in that writes the directive with
+// whitespace around the "=" still owns the command — while commented lines
+// and other keys never do. The perturbation is the space: the previous
+// literal-prefix match missed every spaced row.
+func TestDropInHoldsExecStartParsesTheSystemdAssignmentGrammar(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{name: "the plain form", content: "[Service]\nExecStart=/bin/true\n", want: true},
+		{name: "space before the equals", content: "ExecStart =/bin/true\n", want: true},
+		{name: "spaces on both sides", content: "ExecStart  =  /bin/true\n", want: true},
+		{name: "indented with a trailing comment", content: "  ExecStart = /bin/true ; the operator's note\n", want: true},
+		{name: "after another directive", content: "[Service]\nEnvironment=HF_HUB_CACHE=/x\n\tExecStart = \"/path with spaces\"\n", want: true},
+		{name: "a commented directive", content: ";ExecStart=/bin/false\n", want: false},
+		{name: "a hash-commented directive", content: "  #ExecStart=/bin/false\n", want: false},
+		{name: "a longer key that starts with the name", content: "ExecStartX=/bin/false\n", want: false},
+		{name: "the name inside another value", content: "Environment=ExecStart=/bin/false\n", want: false},
+		{name: "a line without an assignment", content: "plain prose about ExecStart\n", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dropInHoldsExecStart([]byte(tc.content)); got != tc.want {
+				t.Errorf("dropInHoldsExecStart(%q) = %v, want %v", tc.content, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPreWriteScanCoversTheDropInSearchPath pins the scope-wide scan: an
+// override in ANOTHER directory of the standard drop-in search path is
+// refused before any write (the previous single-directory scan missed it —
+// and its content carried the whitespace form of the directive as well),
+// and files in several directories are all named in the one instruction.
+func TestPreWriteScanCoversTheDropInSearchPath(t *testing.T) {
+	previousDirs := systemdDropInSearchDirs
+	t.Cleanup(func() { systemdDropInSearchDirs = previousDirs })
+
+	unitPath := filepath.Join(t.TempDir(), unitName)
+	ownDir := filepath.Dir(unitDropInPath(unitPath))
+	otherDir := t.TempDir() // stand-in for a standard search-path directory
+	systemdDropInSearchDirs = func(string, Scope) []string {
+		return []string{ownDir, otherDir}
+	}
+
+	t.Run("an override in another search-path directory refuses", func(t *testing.T) {
+		otherFile := filepath.Join(otherDir, "local.conf")
+		if err := os.WriteFile(otherFile, []byte("ExecStart  =  /bin/false --other-dir\n"), 0o644); err != nil {
+			t.Fatalf("write the drop-in: %v", err)
+		}
+		err := preWriteExecStartOverride(unitPath, ScopeUser)
+		if err == nil {
+			t.Fatal("preWriteExecStartOverride() = nil, want the refusal of the other directory's override")
+		}
+		for _, want := range []string{
+			"the update was refused and the registration was not changed",
+			otherFile,
+			`Remove the "ExecStart=" override from "` + otherFile + `"`,
+			`run "hfdesk service install" again`,
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal %q does not mention %q", err, want)
+			}
+		}
+		if strings.Contains(err.Error(), " or ") {
+			t.Errorf("the refusal %q offers an alternative instead of one action", err)
+		}
+	})
+
+	t.Run("every directory that carries the directive is named", func(t *testing.T) {
+		if err := os.MkdirAll(ownDir, 0o755); err != nil {
+			t.Fatalf("create the own drop-in directory: %v", err)
+		}
+		ownFile := unitDropInPath(unitPath)
+		if err := os.WriteFile(ownFile, []byte("ExecStart=/bin/true\n"), 0o644); err != nil {
+			t.Fatalf("write the own drop-in: %v", err)
+		}
+		err := preWriteExecStartOverride(unitPath, ScopeUser)
+		if err == nil {
+			t.Fatal("preWriteExecStartOverride() = nil, want the refusal that names both files")
+		}
+		for _, want := range []string{
+			"the drop-ins",
+			ownFile,
+			filepath.Join(otherDir, "local.conf"),
+			`Remove the "ExecStart=" override from each of them`,
+			`run "hfdesk service install" again`,
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal %q does not mention %q", err, want)
+			}
+		}
+		if strings.Contains(err.Error(), " or ") {
+			t.Errorf("the refusal %q offers an alternative instead of one action", err)
+		}
+	})
+}
+
+// TestHandEditedUnitRefusalNamesNoRouteForAnUnknownHome pins the honest
+// terminal of the home-unknown cause: an unresolvable HOME of the invoking
+// user cannot be cleared by moving, removing or reloading files, so the
+// refusal names no editing route and promises no retry. The perturbation is
+// the cause: every other reason of this refusal keeps the established
+// move/remove/reload instruction (the table above).
+func TestHandEditedUnitRefusalNamesNoRouteForAnUnknownHome(t *testing.T) {
+	t.Setenv("HOME", "")
+	unitPath := filepath.Join(t.TempDir(), unitName)
+	_, err := detectHandEditedUnit(unitPath, []byte(canonicalGoldenUserUnitText), ScopeUser)
+	if err == nil {
+		t.Fatal("detectHandEditedUnit() = nil, want the refusal of the unresolvable home")
+	}
+	for _, want := range []string{
+		"the update was refused and the registration was not changed",
+		"the home directory of the user is unknown",
+		"names no file-editing route",
+		"nothing of the registration was changed",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal %q does not mention %q", err, want)
+		}
+	}
+	for _, unwanted := range []string{
+		"Move your customizations into",
+		"remove the unit file",
+		// The refusal prints the reload instruction lowercase ("reload
+		// the unit files with …"): the capital spelling could never
+		// match it, which made this negative assertion inert.
+		"reload the unit files",
+		`run "hfdesk service install"`,
+		" or ",
+	} {
+		if strings.Contains(err.Error(), unwanted) {
+			t.Errorf("the refusal %q names %q, want the honest terminal of this cause", err, unwanted)
+		}
+	}
+}
+
 // assertSingleDropInAction proves the refusal standard of the ownership
 // contract on one error: the result (refused, nothing changed), the path of
 // the refused state and exactly one real next action — the customizations

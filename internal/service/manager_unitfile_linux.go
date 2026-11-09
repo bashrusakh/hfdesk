@@ -498,7 +498,7 @@ func readCanonicalUnit(content []byte, scope Scope) (canonicalUnit, error) {
 	if scope != ScopeSystem {
 		var err error
 		if home, err = os.UserHomeDir(); err != nil || home == "" {
-			return canonicalUnit{}, errors.New("the home directory of the user is unknown, the HOME of the unit cannot be proven")
+			return canonicalUnit{}, fmt.Errorf("%w, the HOME of the unit cannot be proven", errUserHomeUnknown)
 		}
 	}
 	if u.home != home {
@@ -725,6 +725,12 @@ func decodeCanonicalCommand(value string) ([]string, error) {
 // canonical form.
 var errUnitNotRendered = errors.New("the file bytes are not the rendering of the settings they hold")
 
+// errUserHomeUnknown classifies the refusal whose cause is an unresolvable
+// home directory of the invoking user: the canonical unit cannot be read
+// without it, and no file-editing route clears that cause — the refusal
+// names no move/remove/reload for it (honest terminal).
+var errUserHomeUnknown = errors.New("the home directory of the user is unknown")
+
 // unitDropInPath returns the drop-in the ownership contract gives the
 // administrator beside the unit HFDesk writes; HFDesk never writes it.
 func unitDropInPath(unitPath string) string {
@@ -760,51 +766,160 @@ func detectHandEditedUnit(unitPath string, content []byte, scope Scope) (canonic
 // forever), and the reload clears the supervisor's in-memory copy of the
 // removed file.
 func handEditedUnitRefusal(unitPath string, reason error, scope Scope) error {
+	if errors.Is(reason, errUserHomeUnknown) {
+		// Honest terminal: moving, removing and reloading files cannot
+		// resolve an unresolvable home directory of the invoking user —
+		// the unit stays unreadable until it resolves, so no route is
+		// named and no retry is promised.
+		return fmt.Errorf("service: the update was refused and the registration was not changed: %v. HFDesk names no file-editing route for this cause: the unit file cannot be read until the home directory of the invoking user resolves, and nothing of the registration was changed", reason)
+	}
 	return fmt.Errorf("service: the update was refused and the registration was not changed: the unit file %q is not the unit HFDesk generates: %v. Move your customizations into %q, remove the unit file %q, reload the unit files with %q, and run %q again",
 		unitPath, reason, unitDropInPath(unitPath), unitPath, scopeSupervisorHint(scope)+" daemon-reload", "hfdesk service install")
+}
+
+// systemdDropInSearchDirs lists the drop-in directories systemd merges for
+// the unit of the scope — the unit's own directory first, then every
+// directory of the scope's unit search path that can hold a drop-in, the
+// enumeration the systemd of the machine reports (`systemd-analyze
+// unit-paths` and `systemd-analyze --user unit-paths`): the system scope
+// searches /etc, /run and the two lib directories, and the user scope
+// searches /etc, the session runtime directory, /run/systemd/user, the XDG
+// data directories and the two lib directories — a drop-in in any of them
+// takes part in the merge (systemd.unit(5): /etc outweighs /run, which
+// outweighs /usr/lib). The scan names every override file instead of
+// claiming an effective order, so the message stays true whichever file
+// wins the merge. A home-derived data directory is listed only where the
+// home resolves; an unresolvable home refuses the installation before any
+// write elsewhere. Tests redirect this seam to temporary directories.
+var systemdDropInSearchDirs = func(unitPath string, scope Scope) []string {
+	name := filepath.Base(unitPath) + ".d"
+	own := filepath.Dir(unitDropInPath(unitPath))
+	dirs := []string{own}
+	if scope == ScopeSystem {
+		dirs = append(dirs,
+			"/etc/systemd/system/"+name,
+			"/run/systemd/system/"+name,
+			"/usr/lib/systemd/system/"+name,
+			"/usr/local/lib/systemd/system/"+name)
+	} else {
+		dirs = append(dirs,
+			"/etc/systemd/user/"+name,
+			userScopeRuntimeSystemdDir()+"/"+name,
+			"/run/systemd/user/"+name)
+		for _, dataDir := range userScopeDataSystemdDirs() {
+			dirs = append(dirs, dataDir+"/systemd/user/"+name)
+		}
+		dirs = append(dirs,
+			"/usr/local/lib/systemd/user/"+name,
+			"/usr/lib/systemd/user/"+name)
+	}
+	return dirs
+}
+
+// userScopeRuntimeSystemdDir is the systemd/user directory of the session
+// runtime directory of the user scope, resolved the way systemd resolves
+// it — $XDG_RUNTIME_DIR, else /run/user/<uid> — the user scope's
+// counterpart of /run/systemd/system.
+func userScopeRuntimeSystemdDir() string {
+	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
+		return filepath.Join(dir, "systemd", "user")
+	}
+	return filepath.Join("/run/user", strconv.Itoa(os.Getuid()), "systemd", "user")
+}
+
+// userScopeDataSystemdDirs are the roots whose systemd/user subdirectory
+// the user scope searches, in the XDG resolution systemd applies:
+// $XDG_DATA_HOME (else ~/.local/share of the invoking user) followed by
+// the entries of $XDG_DATA_DIRS (else /usr/local/share and /usr/share).
+// Roots that cannot be resolved are left out: a directory the environment
+// does not name cannot hold a drop-in the supervisor would read either.
+func userScopeDataSystemdDirs() []string {
+	dirs := make([]string, 0, 4)
+	dataHome := os.Getenv("XDG_DATA_HOME")
+	if dataHome == "" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			dataHome = filepath.Join(home, ".local", "share")
+		}
+	}
+	if dataHome != "" {
+		dirs = append(dirs, dataHome)
+	}
+	dataList := os.Getenv("XDG_DATA_DIRS")
+	if dataList == "" {
+		dataList = "/usr/local/share:/usr/share"
+	}
+	for _, dir := range filepath.SplitList(dataList) {
+		if dir != "" {
+			dirs = append(dirs, dir)
+		}
+	}
+	return dirs
 }
 
 // preWriteExecStartOverride refuses an installation over a drop-in
 // directory that already carries an ExecStart= directive, on a first
 // installation and on an update alike: after the write systemd composes
 // the drop-in over the canonical unit, so the command of the registration
-// would come from the drop-in and not from the install flags. The one
-// action is the established removal of the override, the reload that
-// makes the supervisor read the files again and the retry; a file that
-// cannot be read proves nothing and is left to the loaded-command
-// verification after the write. A directory that cannot be read —
-// permission-denied on an existing one included — refuses with the access
-// as its cause instead of passing for an empty one, so the promise to
-// refuse before it writes anything holds in that state as well.
+// would come from the drop-in and not from the install flags. The scan
+// covers the whole drop-in search path of the scope and names every file
+// that carries the directive — each of them takes part in the merge that
+// would own the command. The one action is the established removal of the
+// override from those files, the reload that makes the supervisor read the
+// files again and the retry; a file that cannot be read proves nothing and
+// is left to the loaded-command verification after the write. A directory
+// that cannot be read — permission-denied on an existing one included —
+// refuses with the access as its cause instead of passing for an empty
+// one, so the promise to refuse before it writes anything holds in that
+// state as well.
 func preWriteExecStartOverride(unitPath string, scope Scope) error {
-	dir := filepath.Dir(unitDropInPath(unitPath))
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// No drop-in directory: no drop-in can own the command.
-			return nil
-		}
-		// An unread directory could hold the override: the scan cannot
-		// prove its absence, and the verification after the write would
-		// only reach it with a mutation and a rollback behind it.
-		return fmt.Errorf("service: the update was refused and the registration was not changed: the drop-in directory %q cannot be read: %v. Restore this user's read access to the directory — HFDesk never changes it — and run %q again",
-			dir, err, "hfdesk service install")
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".conf") {
+	holders := make([]string, 0, 1)
+	seenDirs := make(map[string]bool, len(systemdDropInSearchDirs(unitPath, scope)))
+	for _, dir := range systemdDropInSearchDirs(unitPath, scope) {
+		if seenDirs[dir] {
 			continue
 		}
-		path := filepath.Join(dir, entry.Name())
-		content, readErr := os.ReadFile(path)
-		if readErr != nil {
-			continue
+		seenDirs[dir] = true
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// No drop-in directory: no drop-in can own the command.
+				continue
+			}
+			// An unread directory could hold the override: the scan
+			// cannot prove its absence, and the verification after the
+			// write would only reach it with a mutation and a rollback
+			// behind it.
+			return fmt.Errorf("service: the update was refused and the registration was not changed: the drop-in directory %q cannot be read: %v. Restore this user's read access to the directory — HFDesk never changes it — and run %q again",
+				dir, err, "hfdesk service install")
 		}
-		if dropInHoldsExecStart(content) {
-			return fmt.Errorf("service: the update was refused and the registration was not changed: the drop-in %q carries an %s override, which would own the command of the registration HFDesk writes. Remove the %q override from %q, reload the unit files with %q, and run %q again",
-				path, "ExecStart=", "ExecStart=", path, scopeSupervisorHint(scope)+" daemon-reload", "hfdesk service install")
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".conf") {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			content, readErr := os.ReadFile(path)
+			if readErr != nil {
+				continue
+			}
+			if dropInHoldsExecStart(content) {
+				holders = append(holders, path)
+			}
 		}
 	}
-	return nil
+	switch len(holders) {
+	case 0:
+		return nil
+	case 1:
+		return fmt.Errorf("service: the update was refused and the registration was not changed: the drop-in %q carries an %s override, which would own the command of the registration HFDesk writes. Remove the %q override from %q, reload the unit files with %q, and run %q again",
+			holders[0], "ExecStart=", "ExecStart=", holders[0], scopeSupervisorHint(scope)+" daemon-reload", "hfdesk service install")
+	default:
+		quoted := make([]string, len(holders))
+		for i, path := range holders {
+			quoted[i] = fmt.Sprintf("%q", path)
+		}
+		return fmt.Errorf("service: the update was refused and the registration was not changed: the drop-ins %s carry an %s override, one of which owns the command of the registration HFDesk writes. Remove the %q override from each of them, reload the unit files with %q, and run %q again",
+			strings.Join(quoted, ", "), "ExecStart=", "ExecStart=", scopeSupervisorHint(scope)+" daemon-reload", "hfdesk service install")
+	}
 }
 
 // unitFileUnchanged is the TOCTOU guard of the atomic write: the file

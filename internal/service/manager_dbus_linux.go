@@ -434,12 +434,20 @@ func execStartOverrideDropIn(paths []string) (owner string, unreadable bool) {
 	return owner, unreadable
 }
 
-// dropInHoldsExecStart reports whether a drop-in carries an ExecStart=
-// directive, the one directive of a drop-in that changes the command the
-// supervisor loads.
+// dropInHoldsExecStart reports whether a drop-in carries the ExecStart
+// directive — parsed with systemd's assignment grammar: optional
+// whitespace around the `=` and a trimmed, case-sensitive key (systemd
+// accepts `ExecStart = /bin/true` and `ExecStart  =  /bin/true` as the
+// same setting; verified against `systemd-analyze verify`). Commented lines
+// (`;`/`#` after the leading whitespace) are not directives, and only the
+// key decides — the value never matters to ownership.
 func dropInHoldsExecStart(content []byte) bool {
 	for _, line := range strings.Split(string(content), "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "ExecStart=") {
+		key, _, found := strings.Cut(strings.TrimSpace(line), "=")
+		if !found {
+			continue
+		}
+		if strings.TrimSpace(key) == "ExecStart" {
 			return true
 		}
 	}
