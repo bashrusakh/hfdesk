@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -485,4 +486,122 @@ func TestSystemdDetectForeignRegistration(t *testing.T) {
 		}
 		assertSingleDropInAction(t, err, unitPath)
 	})
+}
+
+// A fresh manager connection occasionally gets no reply at all, and that
+// connection never answers again: the read has to re-roll on a fresh
+// connection with a fresh deadline instead of burning its whole budget on
+// the lost one.
+func TestLoadedServicePropertiesRetriesALostReply(t *testing.T) {
+	t.Run("a lost reply is retried until the manager answers", func(t *testing.T) {
+		m := &systemdManager{scope: ScopeUser}
+		calls := 0
+		var deadlines []time.Time
+		m.readServiceProperties = func(ctx context.Context, name string) (map[string]dbus.Variant, error) {
+			calls++
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Errorf("attempt %d ran without a deadline", calls)
+			} else {
+				deadlines = append(deadlines, deadline)
+			}
+			if calls < loadedPropertiesReadAttempts {
+				return nil, context.DeadlineExceeded
+			}
+			return map[string]dbus.Variant{"Marker": dbus.MakeVariant("read")}, nil
+		}
+
+		properties, err := m.loadedServiceProperties(context.Background(), unitName)
+		if err != nil {
+			t.Fatalf("loadedServiceProperties() = %v, want the recovered read", err)
+		}
+		if calls != loadedPropertiesReadAttempts {
+			t.Errorf("the read was attempted %d times, want the bounded %d", calls, loadedPropertiesReadAttempts)
+		}
+		for i := 1; i < len(deadlines); i++ {
+			if !deadlines[i].After(deadlines[i-1]) {
+				t.Errorf("attempt %d reused the deadline of attempt %d, want a fresh deadline per attempt", i+1, i)
+			}
+		}
+		if got := properties["Marker"].Value(); got != "read" {
+			t.Errorf("the recovered properties = %v, want the manager's answer", got)
+		}
+	})
+
+	t.Run("a healthy read costs one attempt", func(t *testing.T) {
+		m := &systemdManager{scope: ScopeUser}
+		calls := 0
+		m.readServiceProperties = func(context.Context, string) (map[string]dbus.Variant, error) {
+			calls++
+			return map[string]dbus.Variant{"Marker": dbus.MakeVariant("read")}, nil
+		}
+
+		if _, err := m.loadedServiceProperties(context.Background(), unitName); err != nil {
+			t.Fatalf("loadedServiceProperties() = %v, want nil", err)
+		}
+		if calls != 1 {
+			t.Errorf("the healthy read was attempted %d times, want exactly one", calls)
+		}
+	})
+}
+
+// The retries are bounded: a read the manager never answers keeps failing
+// closed with its original error after the attempts, so a persistent
+// failure can never turn into silent success.
+func TestLoadedServicePropertiesRefusesWhenTheReadKeepsFailing(t *testing.T) {
+	m := &systemdManager{scope: ScopeUser}
+	calls := 0
+	m.readServiceProperties = func(context.Context, string) (map[string]dbus.Variant, error) {
+		calls++
+		return nil, context.DeadlineExceeded
+	}
+
+	_, err := m.loadedServiceProperties(context.Background(), unitName)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("loadedServiceProperties() = %v, want the original deadline error of the read", err)
+	}
+	if calls != loadedPropertiesReadAttempts {
+		t.Errorf("the failing read was attempted %d times, want exactly the bounded %d", calls, loadedPropertiesReadAttempts)
+	}
+}
+
+// A caller that gave up cancels its context; the read stops with that
+// cancellation instead of spending further attempts.
+func TestLoadedServicePropertiesDoesNotRetryAfterTheCallerGaveUp(t *testing.T) {
+	m := &systemdManager{scope: ScopeUser}
+	calls := 0
+	m.readServiceProperties = func(ctx context.Context, _ string) (map[string]dbus.Variant, error) {
+		calls++
+		return nil, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := m.loadedServiceProperties(ctx, unitName)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("loadedServiceProperties() = %v, want the cancellation of the caller", err)
+	}
+	if calls != 1 {
+		t.Errorf("the canceled read was attempted %d times, want it to stop after one", calls)
+	}
+}
+
+// A semantic answer of the manager is a refusal, not a lost reply: it is
+// reported after the first attempt instead of being asked again.
+func TestLoadedServicePropertiesDoesNotRetryASemanticAnswer(t *testing.T) {
+	m := &systemdManager{scope: ScopeUser}
+	semantic := errors.New("systemd returned an invalid object path for hfdesk.service")
+	calls := 0
+	m.readServiceProperties = func(context.Context, string) (map[string]dbus.Variant, error) {
+		calls++
+		return nil, semantic
+	}
+
+	_, err := m.loadedServiceProperties(context.Background(), unitName)
+	if !errors.Is(err, semantic) {
+		t.Fatalf("loadedServiceProperties() = %v, want the semantic answer of the manager", err)
+	}
+	if calls != 1 {
+		t.Errorf("the semantic answer was asked %d times, want exactly one", calls)
+	}
 }

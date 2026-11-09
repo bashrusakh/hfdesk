@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/user"
@@ -110,7 +111,44 @@ func (m *systemdManager) currentMainPID(ctx context.Context) (uint32, error) {
 	return systemdMainPIDFromProperties(properties)
 }
 
+// A fresh manager connection occasionally gets no reply and never recovers,
+// so every attempt uses its own connection and deadline, and a read that
+// still fails after the attempts fails closed with its original error: a
+// persistently unreadable loaded state is never reported as read.
+const (
+	loadedPropertiesReadAttempts = 3
+	loadedPropertiesReadTimeout  = 3 * time.Second
+)
+
+// transientLoadedPropertiesError reports whether err is the transport class
+// of a lost or broken reply, which a fresh connection can answer again, as
+// opposed to a semantic answer of the manager or a caller that gave up.
+func transientLoadedPropertiesError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, dbus.ErrClosed) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	return false
+}
+
 func (m *systemdManager) loadedServiceProperties(ctx context.Context, name string) (map[string]dbus.Variant, error) {
+	var lastErr error
+	for attempt := 1; attempt <= loadedPropertiesReadAttempts; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, loadedPropertiesReadTimeout)
+		properties, err := m.loadedServicePropertiesOnce(attemptCtx, name)
+		cancel()
+		if err == nil {
+			return properties, nil
+		}
+		lastErr = err
+		if attempt == loadedPropertiesReadAttempts || ctx.Err() != nil || !transientLoadedPropertiesError(err) {
+			return nil, lastErr
+		}
+	}
+	return nil, lastErr
+}
+
+func (m *systemdManager) loadedServicePropertiesOnce(ctx context.Context, name string) (map[string]dbus.Variant, error) {
 	if m.readServiceProperties != nil {
 		return m.readServiceProperties(ctx, name)
 	}
