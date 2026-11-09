@@ -293,12 +293,26 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 	if forced != nil {
 		mode = *forced
 	} else {
-		repoInfo, infoErr := fetchRepoInfo(ctx, httpc, token, cfg.Endpoint, job)
+		// REQUIRED metadata: one per-fetch TOTAL cap over headers + body, so a
+		// stalled endpoint can never hang planning under a deadline-less
+		// parent context. A caller deadline still wins (the ctx.Err() check
+		// below preserves cancellation semantics); only this internal cap
+		// expiry is reported as an actionable planning failure, in the same
+		// branch and shape as the other repo-info errors.
+		fetchCtx, cancelFetch := context.WithTimeout(ctx, repoInfoFetchTimeout)
+		repoInfo, infoErr := fetchRepoInfo(fetchCtx, httpc, token, cfg.Endpoint, job)
+		fetchTimedOut := errors.Is(fetchCtx.Err(), context.DeadlineExceeded)
+		cancelFetch()
 		if infoErr != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			if !custom || !isEndpointStatus(infoErr, http.StatusNotFound) {
+			if custom && isEndpointStatus(infoErr, http.StatusNotFound) {
+				// Established custom-endpoint 404 exemption: the response was
+				// actually received, so it stays authoritative over the cap.
+			} else if fetchTimedOut {
+				return nil, fmt.Errorf("repo info API timed out after %s for %q: planning needs this metadata and the endpoint did not respond in time; check the endpoint, proxy, or network and retry (last error: %v)", repoInfoFetchTimeout, job.Repo, infoErr)
+			} else {
 				return nil, infoErr
 			}
 		} else if repoInfo != nil {
@@ -354,10 +368,18 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 		return nil
 	})
 	if err != nil {
-		if forced == nil && custom && !job.BranchVariant && mode.pinned && isEndpointStatus(err, http.StatusNotFound) &&
-			confirmedRevisionStillResolves(ctx, httpc, token, cfg.Endpoint, job, mode.commit) {
-			fallback := planAddressingMode{revision: job.Revision, commit: job.Revision}
-			return scanRepoMode(ctx, httpc, token, job, cfg, &fallback)
+		if forced == nil && custom && !job.BranchVariant && mode.pinned && isEndpointStatus(err, http.StatusNotFound) {
+			// This confirmation is the same class of compatibility check as
+			// the addressing preflight, so it shares that family's total
+			// budget (addressingProbeBudget). Expiry is inconclusive: the
+			// lookup returns false and can never enable the branch fallback.
+			confirmCtx, cancelConfirm := context.WithTimeout(ctx, addressingProbeBudget)
+			confirmed := confirmedRevisionStillResolves(confirmCtx, httpc, token, cfg.Endpoint, job, mode.commit)
+			cancelConfirm()
+			if confirmed {
+				fallback := planAddressingMode{revision: job.Revision, commit: job.Revision}
+				return scanRepoMode(ctx, httpc, token, job, cfg, &fallback)
+			}
 		}
 		return nil, err
 	}

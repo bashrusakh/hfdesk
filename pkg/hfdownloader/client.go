@@ -232,6 +232,18 @@ type RepoInfo struct {
 	LastModified string `json:"lastModified"` // ISO timestamp
 }
 
+// repoInfoFetchTimeout is the per-fetch TOTAL cap (dial + response headers +
+// JSON body) on one REQUIRED planning metadata fetch when the planning context
+// carries no earlier deadline. It is deliberately generous so slow-but-working
+// endpoints keep working: the transport may already spend up to
+// defaultDialTimeout (30s) connecting and defaultResponseHeaderTimeout (60s)
+// awaiting headers, so two minutes still leaves at least ~30 seconds for the
+// body read on the slowest endpoint that satisfies those transport windows,
+// while ending the body wait that previously had no bound of its own. It is a
+// package variable (not a public API) so tests can lower it deterministically,
+// mirroring headForETagTimeout, maxAttemptsPerRetry and socksHandshakeNanos.
+var repoInfoFetchTimeout = 2 * time.Minute
+
 // fetchRepoInfo fetches repository metadata including the commit SHA for a given revision.
 func fetchRepoInfo(ctx context.Context, httpc *http.Client, token, endpoint string, job Job) (*RepoInfo, error) {
 	ep := getEndpoint(endpoint)

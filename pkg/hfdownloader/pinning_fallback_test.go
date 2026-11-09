@@ -27,6 +27,11 @@ type pinningFixture struct {
 	redirectPinned    string
 	missingPinnedTree bool
 	revisionStatus    int
+	// hangRevisionAfter, when > 0, makes /revision/ requests from that call
+	// number onward hang until the client gives up, standing in for a stalled
+	// metadata response (0 disables the stall). revisionCalls counts them.
+	hangRevisionAfter int
+	revisionCalls     int
 }
 
 type pinningRequest struct {
@@ -67,6 +72,16 @@ func newPinningFixture(t *testing.T, commitFiles, branchFiles map[string]string,
 		requestPath := r.URL.Path
 		switch {
 		case strings.Contains(requestPath, "/revision/"):
+			f.mu.Lock()
+			f.revisionCalls++
+			revisionCall := f.revisionCalls
+			f.mu.Unlock()
+			if f.hangRevisionAfter > 0 && revisionCall >= f.hangRevisionAfter {
+				// Stall the metadata response until the client's request
+				// context expires; httptest.Server.Close waits for handlers.
+				<-r.Context().Done()
+				return
+			}
 			if f.revisionStatus != 0 {
 				w.WriteHeader(f.revisionStatus)
 				return

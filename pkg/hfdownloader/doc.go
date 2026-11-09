@@ -367,6 +367,24 @@ the mutable branch is not accepted as pinned. Transport, cancellation,
 authentication, throttling, server, decode, redirect, or other inconclusive
 errors never authorize fallback. Branch variants never fall back.
 
+Planning bounds exactly two metadata lookup classes instead of waiting
+indefinitely on them: the required repo-info lookup under the per-fetch
+total cap, and the fallback confirmation under the addressing-probe budget.
+The required repo-info lookup runs under a per-fetch total deadline covering
+response headers and the JSON body, set generously above the transport's
+response-header window so slow-but-working endpoints keep working; expiry
+fails the plan with an actionable timeout error naming the elapsed budget,
+while a caller-supplied context deadline still surfaces as cancellation. A
+received custom-endpoint 404 response remains authoritative even when the
+fetch cap also expired; the cap's failure branch applies only when no
+authoritative response arrived. The fallback confirmation lookup is bounded
+by the addressing-probe budget family that already bounds the addressing
+preflight; its expiry is inconclusive and, like every other inconclusive
+outcome, never enables the branch fallback. Neither cap covers the
+tree-page body read inside the tree walk (the internal hubtree JSON page
+decode behind `walkTree`): its headers wait only under the transport's
+response-header window and its body only under the caller's context.
+
 Mode selection finishes before `OnPlanComplete` or `plan_item` events. On a
 qualifying incompatibility the complete candidate is rebuilt from the branch
 tree and all final URLs use that same branch mode; transfer errors never switch
