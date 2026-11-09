@@ -559,7 +559,8 @@ func TestServiceActionFailureTextIsTheResultTheCauseAndOneAction(t *testing.T) {
 //
 // The sentence states the requirement and does not tell the user to move the
 // program: the Windows service runs as LocalService, so that account must be able
-// to read the program and to traverse its folder. An update and a start report
+// to execute the program and to traverse its folder; read access is demanded only
+// where a handler genuinely needs it. An update and a start report
 // leave the folder out: they describe a registration that already ran, so the
 // folder of the program is not the likely cause there.
 func TestServiceActionFailureTextNamesTheFolderOfTheProgram(t *testing.T) {
@@ -567,7 +568,7 @@ func TestServiceActionFailureTextNamesTheFolderOfTheProgram(t *testing.T) {
 	const program = `C:\portable\hfdesk.exe`
 
 	text := serviceActionFailureText(serviceActionInstall, reason, program)
-	for _, want := range []string{program, `NT AUTHORITY\LocalService`, "must be able to read", "traverse the folder"} {
+	for _, want := range []string{program, `NT AUTHORITY\LocalService`, "must be able to execute", "traverse the folder"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("the report of the installation is %q, want it to mention %q", text, want)
 		}
@@ -585,7 +586,7 @@ func TestServiceActionFailureTextNamesTheFolderOfTheProgram(t *testing.T) {
 	// A caller that does not know the program still names the requirement: the
 	// guidance is not withheld because one path of the action has no program.
 	unknown := serviceActionFailureText(serviceActionInstall, reason, "")
-	if !strings.Contains(unknown, "must be able to read the program and to traverse the folder that holds it") {
+	if !strings.Contains(unknown, "must be able to execute the program and to traverse the folder that holds it") {
 		t.Errorf("the report without a program is %q, want the general form of the guidance", unknown)
 	}
 }

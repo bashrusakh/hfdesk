@@ -729,6 +729,13 @@ replaces the other.
   own server through the graceful shutdown and ends. The helper starts the
   service only after that process has exited, so the desktop app and the service
   never bind the same address.
+- **Persistence blocks a failed handover.** The desktop authorizes the service
+  installation only for persistence that completed: a final history write that
+  fails — or does not finish inside the handover budget — blocks the handover
+  and with it the installation, by design. The strictness includes
+  persistence: the jobs data itself is saved, yet a final write that cannot be
+  confirmed still ends the attempt as a failure instead of authorizing the
+  installation.
 - **Separate data.** The service keeps its own data under `%ProgramData%\HFDesk`
   — its own config file, jobs, history and cache. The settings, jobs and models
   of the desktop app are **not** migrated and do not appear in the service.
@@ -758,6 +765,17 @@ replaces the other.
   **Start service**. A service that is still starting or
   stopping when the wait ends is reported with a short notice that the launch
   changes nothing, and the launch starts no server of its own.
+
+  The gate never treats `failed` or `broken` as a positively confirmed
+  stopped service: those rows offer **Start service**, **Update service**
+  and **Cancel** only (a broken registration whose instance still runs
+  offers **Open HFDesk** instead of **Start service**), never **Work in
+  desktop mode**. Returning to desktop mode after a failed first
+  installation is covered by the normal cleanup path of that installation,
+  which removes the registration it created when the machine had none
+  before; when a registration remains after the attempt, remove it with
+  `hfdesk service uninstall` from an elevated shell, and the next launch
+  starts the desktop app normally.
 
   A registration that cannot be read is not a machine without one: an installed
   service may be running and bind the address this launch would bind. The

@@ -567,19 +567,22 @@ func serviceInstallStartFailureText(err error, program string, cleanup *service.
 // serviceFolderAccessText returns the sentence that names the access the folder
 // of the program needs.
 //
-// A machine-wide service runs under its own account, so the program in a folder
-// only the installing user can read is not reachable for the instance. The
-// sentence names the program the action tried to put into service and states
-// the requirement: that account must be able to read the program and to
-// traverse its folder. It is a statement and not an instruction, because the
-// repair belongs to the user. It belongs to the reports of an installation only:
-// an update and a start describe a registration that already ran.
+// A machine-wide service runs under its own account, so a program that
+// account cannot execute is not usable for the instance. The sentence names
+// the program the action tried to put into service and states the rule the
+// preflight checks: that account must be able to execute the program and to
+// traverse its folder; read access to the program is demanded only where a
+// handler genuinely needs it, never as a blanket requirement — the image is
+// executed without being read. It is a statement and not an instruction,
+// because the repair belongs to the user. It belongs to the reports of an
+// installation only: an update and a start describe a registration that
+// already ran.
 func serviceFolderAccessText(program string) string {
 	subject := "the program"
 	if program != "" {
 		subject = program
 	}
-	return `The Windows service runs as NT AUTHORITY\LocalService, so that account must be able to read ` + subject + ` and to traverse the folder that holds it.`
+	return `The Windows service runs as NT AUTHORITY\LocalService, so that account must be able to execute ` + subject + ` and to traverse the folder that holds it; it needs read access to ` + subject + ` only where a handler genuinely needs it.`
 }
 
 // helperNotReadyError reports that the elevated helper was started but never
