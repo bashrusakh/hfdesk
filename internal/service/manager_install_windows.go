@@ -244,6 +244,22 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 			result.createdDirsSafeToRemove = false
 			return result, fmt.Errorf("service: %s appeared during the first installation; no existing registration was changed%w", ServiceName, ErrAlreadyRegistered)
 		}
+		if !previous.present {
+			// A registration appeared after the read-only lookup during an
+			// update: the merge ran against the absent state, so proceeding
+			// would write the defaults of this request over the settings the
+			// appeared registration runs with. The attempt refuses here,
+			// before it reads or changes a single value of it, and names the
+			// one action that resolves the cause: a repeat run reads the
+			// registration first and merges what it finds. The directories
+			// this attempt created are kept — the appeared registration
+			// may reference them — so the report states that
+			// retained-note beside the unchanged registration; it is a
+			// statement, and the repeat run stays the one action.
+			_ = handle.Close()
+			result.createdDirsSafeToRemove = false
+			return result, fmt.Errorf("service: %s appeared during the installation; nothing was changed: run %q again to take a fresh snapshot (installation-created directories were retained because the appeared registration may still reference them)", ServiceName, "hfdesk service install")
+		}
 		// The service is registered already: the registration is updated
 		// instead of a second one being created.
 	case errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST):
@@ -271,31 +287,12 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 	if !created {
 		// The configuration of the registration is read before it is
 		// changed, so a failure after the write can put it back as it was.
+		// previous.present is established above: a registration that
+		// appeared during the attempt refuses before this block, so the
+		// registration read here is the one the merge snapshot describes.
 		previousConfig, err := scmQueryServiceConfig(handle)
 		if err != nil {
-			if !previous.present {
-				// A registration appeared after the read-only lookup. Its
-				// command line is unknown, so these paths are not safe to
-				// remove even though this attempt has not written yet.
-				result.createdDirsSafeToRemove = false
-			}
 			return result, fmt.Errorf("service: read the registration of %s: %w", ServiceName, err)
-		}
-		if !previous.present {
-			// Keep paths until this newly observed registration is either
-			// restored by a verified rollback or left untouched on success.
-			result.createdDirsSafeToRemove = false
-			// The registration appeared between the read-only lookup and
-			// this handle: it is the registration the installation
-			// replaces, and its state decides whether it has to be
-			// restarted.
-			status, err := scmQueryStatus(handle)
-			if err != nil {
-				return result, scmRefused("an installation", fmt.Errorf("service: query the state of %s: %w", ServiceName, err))
-			}
-			previous.present = true
-			previous.running = scmInstanceRan(true, status.State)
-			previous.processID = status.ProcessId
 		}
 		previous.config = previousConfig
 

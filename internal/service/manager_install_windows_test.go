@@ -258,14 +258,15 @@ func TestSCMSupportedServiceAccountComparesIdentitiesNotNameLiterals(t *testing.
 }
 
 // TestSCMServiceAccountRefusalKeepsTheCleanupDecisionOfItsInterleave checks
-// both sides of the cleanup decision at the refusal call site of register.
+// both sides of the cleanup decision at the refusal call sites of register.
 //
 // The refusal happens before any write of this attempt. For a registration
 // that already existed when the attempt looked it up, the directories the
-// attempt created are its own and stay safe to remove. A registration that
+// attempt created are its own and stay safe to remove; a registration that
 // appeared between the read-only lookup and the open may reference those
-// very directories, so the refusal keeps the keep-paths decision of that
-// interleave instead of overriding it.
+// very directories, and the appearance refusal of the update path — which
+// now ends the attempt before the registration is even read — keeps the
+// same keep-paths decision for the same interleave.
 func TestSCMServiceAccountRefusalKeepsTheCleanupDecisionOfItsInterleave(t *testing.T) {
 	replaceSCMTestSeam(t, &scmOpenService, func(*mgr.Mgr, string) (*mgr.Service, error) {
 		return new(mgr.Service), nil
@@ -305,8 +306,17 @@ func TestSCMServiceAccountRefusalKeepsTheCleanupDecisionOfItsInterleave(t *testi
 		t.Run(tc.name, func(t *testing.T) {
 			m := &scmManager{}
 			result, err := m.register(context.Background(), nil, scmTestOptions(), tc.previous, false)
-			if !errors.Is(err, ErrServiceAccountMismatch) {
-				t.Fatalf("register() = %v, want the refusal over the account of the registration", err)
+			if err == nil {
+				t.Fatal("register() = nil, want a refusal before any write")
+			}
+			if tc.appeared {
+				// The appearance refusal ends the attempt before the account
+				// of the appeared registration is read at all.
+				if !strings.Contains(err.Error(), "appeared during the installation") {
+					t.Errorf("register() = %v, want the refusal of the registration that appeared", err)
+				}
+			} else if !errors.Is(err, ErrServiceAccountMismatch) {
+				t.Errorf("register() = %v, want the refusal over the account of the registration", err)
 			}
 			if result.created {
 				t.Error("the refusal reported a created registration: it returns before any write")
@@ -315,6 +325,56 @@ func TestSCMServiceAccountRefusalKeepsTheCleanupDecisionOfItsInterleave(t *testi
 				t.Errorf("createdDirsSafeToRemove = %v, want %v: %s", got, want, tc.wantSafe)
 			}
 		})
+	}
+}
+
+// TestSCMRefusesARegistrationThatAppearedDuringTheInstallation checks that an
+// update whose first read found no registration refuses when the registration
+// exists at the write handle — before it reads or changes a single value of it.
+//
+// The merge ran against the absent state, so the attempt would overwrite the
+// settings of the appeared registration with the defaults of its request. The
+// refusal reads nothing of the registration (the query seams prove it),
+// reports the result, the cause and the one action that resolves both — a
+// repeat run takes a fresh snapshot and merges — and keeps the directories
+// this attempt created, which the appeared registration may reference.
+func TestSCMRefusesARegistrationThatAppearedDuringTheInstallation(t *testing.T) {
+	var opened, configReads, statusReads int
+	replaceSCMTestSeam(t, &scmOpenService, func(*mgr.Mgr, string) (*mgr.Service, error) {
+		opened++
+		return new(mgr.Service), nil
+	})
+	replaceSCMTestSeam(t, &scmQueryServiceConfig, func(*mgr.Service) (mgr.Config, error) {
+		configReads++
+		return mgr.Config{}, errors.New("the appeared registration must not be read")
+	})
+	replaceSCMTestSeam(t, &scmQueryStatus, func(*mgr.Service) (svc.Status, error) {
+		statusReads++
+		return svc.Status{}, errors.New("the appeared registration must not be read")
+	})
+
+	m := &scmManager{}
+	result, err := m.register(context.Background(), nil, scmTestOptions(), previousSCMRegistration{}, false)
+	if err == nil {
+		t.Fatal("register() = nil, want the refusal of the registration that appeared")
+	}
+	assertNames(t, err.Error(), "the appearance refusal", []string{
+		"appeared during the installation",
+		"nothing was changed",
+		`run "hfdesk service install" again to take a fresh snapshot`,
+		"installation-created directories were retained because the appeared registration may still reference them",
+	})
+	if opened != 1 {
+		t.Errorf("the registration was opened %d times, want exactly the lookup of the attempt", opened)
+	}
+	if configReads != 0 || statusReads != 0 {
+		t.Errorf("the appeared registration was read before the refusal (config %d, status %d), want no read at all", configReads, statusReads)
+	}
+	if result.created {
+		t.Error("the refusal reported a created registration: it returns before any write")
+	}
+	if result.createdDirsSafeToRemove {
+		t.Error("createdDirsSafeToRemove = true, want false: the appeared registration may reference the directories this attempt created")
 	}
 }
 
