@@ -95,11 +95,12 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	// whose read could describe it — that read must not turn the refusal
 	// into a generic read error without the unmask action. The printed state
 	// decides; a masked unit refuses the installation instead of being
-	// replaced and is never unmasked. A fresh machine answers "not-found",
+	// replaced, is never unmasked, and its refusal names the unmask command
+	// of the observed mask kind. A fresh machine answers "not-found",
 	// which is no mask.
 	enablement := m.registrationEnablement(ctx)
 	if enablement.masked {
-		return opts, m.maskedUnitRefusal()
+		return opts, m.maskedUnitRefusal(enablement.maskedRuntime)
 	}
 
 	// The loaded registration of a first installation is read before the
@@ -343,6 +344,12 @@ type registrationEnablement struct {
 	// the unit path, so the installation would register a unit that stays
 	// masked and cannot start.
 	masked bool
+	// maskedRuntime reports whether that mask is a runtime mask. The kind
+	// names the unmask command of the refusal: a plain `systemctl unmask`
+	// removes a persistent mask only, and `systemctl unmask --runtime`
+	// removes a runtime mask only, so naming the wrong form leaves the mask
+	// in place after the administrator follows the error and retries.
+	maskedRuntime bool
 }
 
 // enablementMode is the autostart state of a unit, as far as an installation is
@@ -379,8 +386,10 @@ func enablementOf(state string) registrationEnablement {
 		return registrationEnablement{mode: enablementPersistent}
 	case "enabled-runtime":
 		return registrationEnablement{mode: enablementRuntime}
-	case "masked", "masked-runtime":
+	case "masked":
 		return registrationEnablement{masked: true}
+	case "masked-runtime":
+		return registrationEnablement{masked: true, maskedRuntime: true}
 	default:
 		// "disabled", "not-found", "static", "indirect", "alias",
 		// "linked", an empty answer and a state a later release adds all
@@ -415,10 +424,19 @@ func (m *systemdManager) registrationEnablement(ctx context.Context) registratio
 //
 // The installation never replaces the mask: writing the unit file would unmask
 // the unit silently, so the administrator who masked it would lose that
-// decision without noticing. The error names the unit, the refusal and the
-// command that unmask it, with the scope prefix the manager uses for systemctl.
-func (m *systemdManager) maskedUnitRefusal() error {
-	return fmt.Errorf("service: the unit %s is masked: an installation does not replace the mask. Unmask it with %q and run the installation again", unitName, m.supervisorHint()+" unmask "+unitName)
+// decision without noticing. The error names the unit, the refusal and the one
+// unmask command that clears the observed kind of mask, with the scope prefix
+// the manager uses for systemctl. The kind matters because each form clears
+// only its own mask: a plain "systemctl unmask" exits zero but leaves a
+// runtime mask in place, and "systemctl unmask --runtime" does not remove a
+// persistent mask — naming the form that does not work would send the
+// administrator into a retry loop.
+func (m *systemdManager) maskedUnitRefusal(maskedRuntime bool) error {
+	unmask := "unmask"
+	if maskedRuntime {
+		unmask = "unmask --runtime"
+	}
+	return fmt.Errorf("service: the unit %s is masked: an installation does not replace the mask. Unmask it with %q and run the installation again", unitName, m.supervisorHint()+" "+unmask+" "+unitName)
 }
 
 // systemdRegisterResult distinguishes a successful version check from proof

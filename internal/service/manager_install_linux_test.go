@@ -1200,9 +1200,9 @@ func TestSystemdEnablementOfThePrintedState(t *testing.T) {
 // it would unmask the unit silently: the administrator who masked it would lose
 // that decision without noticing. The installation therefore refuses before it
 // writes the unit file and before it touches the supervisor, the unit path keeps
-// the mask, and the error names the command that unmask the unit in the scope of
-// the manager. See TestSystemdInstallRefusesARuntimeMaskedUnit for a mask that
-// leaves no unit file at all.
+// the mask, and the error names the plain unmask command of this mask kind in
+// the scope of the manager. See TestSystemdInstallRefusesARuntimeMaskedUnit
+// for a mask that leaves no unit file at all.
 func TestSystemdInstallRefusesAMaskedUnit(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	root := t.TempDir()
@@ -1239,6 +1239,12 @@ func TestSystemdInstallRefusesAMaskedUnit(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
 		}
+	}
+	// The one named action must clear a persistent mask, and `unmask
+	// --runtime` does not remove a file mask: a refusal naming it would send
+	// the administrator into a retry loop.
+	if strings.Contains(err.Error(), "--runtime") {
+		t.Errorf("Install() = %q, want the plain unmask command for a persistent mask", err)
 	}
 
 	// The unit path is untouched: it still holds the mask.
@@ -1290,7 +1296,9 @@ func TestSystemdInstallRefusesAMaskedUnit(t *testing.T) {
 // enablement is read whether or not a unit file exists. The refusal happens
 // before any directory is created, before the unit file is written and before the
 // supervisor is reloaded, enabled, restarted or asked to stop anything, and the
-// error names the command that removes the mask.
+// error names the unmask command of this mask kind: a plain `systemctl unmask`
+// exits zero but leaves a runtime mask in place, so only `unmask --runtime`
+// removes it.
 func TestSystemdInstallRefusesARuntimeMaskedUnit(t *testing.T) {
 	logPath := systemdRecordingSupervisor(t)
 	systemdTempInstallEnvironment(t)
@@ -1306,7 +1314,7 @@ func TestSystemdInstallRefusesARuntimeMaskedUnit(t *testing.T) {
 		unitName,
 		"is masked",
 		"does not replace the mask",
-		"systemctl --user unmask " + unitName,
+		"systemctl --user unmask --runtime " + unitName,
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Install() = %q, want an error that mentions %q", err, want)

@@ -525,8 +525,10 @@ keeps everything the command does not name again:
   enabled, `enabled-runtime` stays runtime-only instead of becoming
   permanent, a disabled unit stays disabled;
 - a masked unit — persistent or placed with `systemctl mask --runtime` —
-  refuses the installation and is never unmasked: the error names `systemctl
-  unmask hfdesk.service` with the scope prefix of the command;
+  refuses the installation and is never unmasked: the error names the unmask
+  command of the observed mask kind — `systemctl unmask hfdesk.service` for a
+  persistent mask, `systemctl unmask --runtime hfdesk.service` for a runtime
+  one — with the scope prefix of the command;
 - the data of the instance: an update writes the unit file and, at most, the
   directories of the instance. It never touches the config file, the jobs,
   the history, the logs, the models or the cache, it never changes the
@@ -1043,7 +1045,9 @@ hfdesk service install --executable /opt/hfdesk-new/hfdesk
   link to `/dev/null`, and writing the unit file would replace the mask, while a
   runtime mask lives in `/run` and leaves no file at the unit path, so the
   installation would register a unit that stays masked and cannot start. The
-  error names `systemctl unmask hfdesk.service` with the scope prefix of the
+  error names the unmask command of the observed mask kind — `systemctl unmask
+  hfdesk.service` for a persistent mask, `systemctl unmask --runtime
+  hfdesk.service` for a runtime one — with the scope prefix of the
   command. A Windows service that is running while its start type is disabled is
   refused as well, before it is stopped: Windows will not start a disabled
   service again, so stopping it would leave the machine without the service that
