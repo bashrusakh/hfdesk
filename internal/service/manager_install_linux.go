@@ -105,6 +105,17 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	if enablement.masked || unitPathPersistentMask(path) {
 		return opts, m.maskedUnitRefusal(enablement.maskedRuntime)
 	}
+	// A drop-in that already carries the ExecStart= directive HFDesk owns
+	// would own the command of a first registration after the write — the
+	// last drop-in wins over the canonical unit — so the ownership of
+	// ExecStart= holds before every installation writes anything: the
+	// scan of the drop-in directory refuses here, before the loaded read
+	// and before any directory or file of the instance exists.
+	if !existed {
+		if refusal := firstInstallExecStartOverride(path, m.scope); refusal != nil {
+			return opts, refusal
+		}
+	}
 
 	// The loaded registration of a first installation is read before the
 	// file is judged: a missing writable override is still an existing
@@ -524,19 +535,33 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 	// the previous unit restored or the new unit removed, its directories stay.
 	result.createdDirsSafeToRemove = false
 	// The reload always happens; the enable is asked for by a first
-	// installation only. A repeat installation never runs enable at all:
-	// the enablement it found is preserved by non-interference, so a
-	// runtime-only enablement never becomes permanent and a disabled unit
-	// stays disabled. A masked unit was refused before this point.
-	if err := m.reloadAndEnable(ctx, !previous.registrationPresent()); err != nil {
+	// installation only, and it runs after the loaded-command
+	// verification below: a verification that fails rolls the
+	// registration back before anything was enabled, so a failed first
+	// installation leaves no enablement behind. A repeat installation
+	// never runs enable at all: the enablement it found is preserved by
+	// non-interference, so a runtime-only enablement never becomes
+	// permanent and a disabled unit stays disabled. A masked unit was
+	// refused before this point.
+	if err := m.reloadUnit(ctx); err != nil {
 		result.createdDirsSafeToRemove, err = m.reportUnitRollback(ctx, previous, created, err)
 		return result, err
 	}
-	if previous.registrationPresent() {
-		if err := m.verifyUpdatedUnit(ctx, opts, account, previous, facts); err != nil {
-			result.createdDirsSafeToRemove, err = m.reportUnitRollback(ctx, previous, created, err)
-			return result, err
-		}
+	// The loaded command must be the canonical command that was written —
+	// on a first installation as well: a drop-in composition the
+	// pre-write scan could not see would own the command of the new
+	// registration, and the ownership promise (the instance command comes
+	// only from the install flags) fails closed here, before any claim of
+	// success. For a first installation there is no previous loaded state
+	// to compare the launch fields against, so only the command is
+	// verified; the field comparisons run for an update as before.
+	if err := m.verifyUpdatedUnit(ctx, opts, account, previous, facts); err != nil {
+		result.createdDirsSafeToRemove, err = m.reportUnitRollback(ctx, previous, created, err)
+		return result, err
+	}
+	if err := m.enableFirstRegistration(ctx, !previous.registrationPresent()); err != nil {
+		result.createdDirsSafeToRemove, err = m.reportUnitRollback(ctx, previous, created, err)
+		return result, err
 	}
 	if !previous.running {
 		// A first installation and a stopped instance stay stopped:
@@ -560,36 +585,35 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 	}
 	if err != nil {
 		if restoreErr := m.restorePreviousRegistration(ctx, previous); restoreErr != nil {
-			return result, fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration could not be put back into service: %v)", err, restoreErr)
+			return result, fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration could not be put back into service: %v); %s", err, restoreErr, statusReadHint)
 		}
 		result.createdDirsSafeToRemove = systemdCreatedDirsSafeToRemove(previous, created)
-		return result, fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration was restored and the previous instance was started again)", err)
+		return result, fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration was restored and the previous instance was started again); %s", err, statusReadHint)
 	}
 	result.versionVerified = verified
 	return result, nil
 }
 
-// reloadAndEnable makes the supervisor aware of the unit file, and enables
-// the unit for the boot of the scope only when this installation is the
-// first registration of it.
-//
-// The reload always happens. The enable never runs on a repeat
-// installation — neither `enable` nor `enable --runtime` — so the
-// textual enablement the installation found is preserved untouched: a unit
-// an administrator disabled stays disabled, and a unit enabled for this
-// boot only ("systemctl enable --runtime") never becomes permanent. A
-// first installation enables the registration it writes, persistently. A
-// masked unit is refused before this point, so it never reaches the reload.
-func (m *systemdManager) reloadAndEnable(ctx context.Context, firstInstallation bool) error {
-	if _, err := m.runSystemctl(ctx, "daemon-reload"); err != nil {
-		return err
+// reloadUnit makes the supervisor aware of the unit file that was written.
+// The reload always runs, on a first installation and on an update alike.
+func (m *systemdManager) reloadUnit(ctx context.Context) error {
+	_, err := m.runSystemctl(ctx, "daemon-reload")
+	return err
+}
+
+// enableFirstRegistration enables the registration of a first installation
+// and touches nothing on an update: the enablement a repeat installation
+// found is preserved by non-interference, so neither `enable` nor
+// `enable --runtime` runs on it. The caller runs it only after the
+// loaded-command verification proved what the supervisor loads, so a
+// first installation that fails verification is rolled back before
+// anything was enabled. A masked unit was refused before this point.
+func (m *systemdManager) enableFirstRegistration(ctx context.Context, firstInstallation bool) error {
+	if !firstInstallation {
+		return nil
 	}
-	if firstInstallation {
-		if _, err := m.runSystemctl(ctx, "enable", unitName); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err := m.runSystemctl(ctx, "enable", unitName)
+	return err
 }
 
 // validateUnitPaths checks paths whose source bytes the operation will emit

@@ -160,7 +160,13 @@ func (m *systemdManager) loadedServicePropertiesOnce(ctx context.Context, name s
 
 	manager := conn.Object("org.freedesktop.systemd1", "/org/freedesktop/systemd1")
 	var objectPath dbus.ObjectPath
-	if err := manager.CallWithContext(ctx, "org.freedesktop.systemd1.Manager.GetUnit", dbus.FlagNoAutoStart, name).Store(&objectPath); err != nil {
+	// LoadUnit, not GetUnit: GetUnit only answers for a unit already in
+	// the loaded set of the manager, and a first registration whose unit
+	// file just came in through a reload is not reliably one — the
+	// manager collects an inactive unreferenced unit again. LoadUnit
+	// loads on demand and returns the object to read, which is what the
+	// loaded-command verification of every installation needs.
+	if err := manager.CallWithContext(ctx, "org.freedesktop.systemd1.Manager.LoadUnit", dbus.FlagNoAutoStart, name).Store(&objectPath); err != nil {
 		return nil, fmt.Errorf("service: read the loaded object path of %s: %w", name, err)
 	}
 	if !objectPath.IsValid() {
@@ -383,7 +389,10 @@ func detectExecStartOverride(loaded systemdLoadedConfig, unit canonicalUnit, sco
 // an override that already lives there — and the unit files are reloaded
 // after the edit, because the supervisor holds the loaded command in memory
 // until that reload reads the file again; a loaded command no reported
-// drop-in explains only a reload reads again.
+// drop-in explains only a reload reads again. A reported drop-in this
+// process cannot read may be the one that carries the override, so no
+// command is named for that state: the refusal says it repeats until the
+// override is removed instead of promising a reload that cannot clear it.
 func execStartOverrideRefusal(loaded systemdLoadedConfig, scope Scope) error {
 	cause := fmt.Sprintf("the command systemd loads for %s is not the command in its unit file", unitName)
 	if loaded.dropInPathsKnown && len(loaded.dropInPaths) > 0 {
@@ -395,9 +404,11 @@ func execStartOverrideRefusal(loaded systemdLoadedConfig, scope Scope) error {
 	}
 	install := "hfdesk service install"
 	reload := scopeSupervisorHint(scope) + " daemon-reload"
-	if owner := execStartOverrideDropIn(loaded.dropInPaths); owner != "" {
+	if owner, unreadable := execStartOverrideDropIn(loaded.dropInPaths); owner != "" {
 		return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Remove the %q override from %q, reload the unit files with %q, and run %q again",
 			cause, "ExecStart=", owner, reload, install)
+	} else if unreadable {
+		return fmt.Errorf("service: the update was refused and the registration was not changed: %s. HFDesk cannot read every drop-in the supervisor reports, so it names no command: the refusal repeats until the ExecStart= override is removed from the drop-in that carries it", cause)
 	}
 	return fmt.Errorf("service: the update was refused and the registration was not changed: %s. Reload the unit files with %q and run %q again",
 		cause, reload, install)
@@ -405,20 +416,22 @@ func execStartOverrideRefusal(loaded systemdLoadedConfig, scope Scope) error {
 
 // execStartOverrideDropIn returns the drop-in that carries an ExecStart=
 // override: the last path the supervisor reports whose file holds such a
-// directive, because the last drop-in loaded wins. A file that cannot be
-// read proves nothing and returns the empty string.
-func execStartOverrideDropIn(paths []string) string {
-	owner := ""
+// directive, because the last drop-in loaded wins, and whether a reported
+// drop-in could not be read. A file that cannot be read proves nothing: it
+// may be the drop-in that carries the override, and the caller must not
+// promise an action that cannot clear that state.
+func execStartOverrideDropIn(paths []string) (owner string, unreadable bool) {
 	for _, path := range paths {
 		content, err := os.ReadFile(path)
 		if err != nil {
+			unreadable = true
 			continue
 		}
 		if dropInHoldsExecStart(content) {
 			owner = path
 		}
 	}
-	return owner
+	return owner, unreadable
 }
 
 // dropInHoldsExecStart reports whether a drop-in carries an ExecStart=

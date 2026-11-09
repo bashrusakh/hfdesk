@@ -2152,6 +2152,54 @@ func TestSystemdReadCanonicalUnitRejectsNonCanonicalShapes(t *testing.T) {
 	}
 }
 
+// TestFirstInstallExecStartOverrideClassifiesTheDirectory pins both sides
+// of the pre-write scan's directory read: an absent directory proves that
+// no drop-in exists and refuses nothing, while any other read error — a
+// permission-denied on an existing directory included — refuses before
+// anything is written instead of being read as an empty directory.
+func TestFirstInstallExecStartOverrideClassifiesTheDirectory(t *testing.T) {
+	t.Run("a missing directory proves nothing and refuses nothing", func(t *testing.T) {
+		unitPath := filepath.Join(t.TempDir(), unitName)
+		if err := firstInstallExecStartOverride(unitPath, ScopeUser); err != nil {
+			t.Errorf("firstInstallExecStartOverride() = %v, want nil for a missing drop-in directory", err)
+		}
+	})
+
+	t.Run("an unreadable directory refuses before anything is written", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root reads every directory; the unreadable state needs an unprivileged reader")
+		}
+		unitPath := filepath.Join(t.TempDir(), unitName)
+		dir := filepath.Dir(unitDropInPath(unitPath))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("create the drop-in directory: %v", err)
+		}
+		if err := os.Chmod(dir, 0); err != nil {
+			t.Fatalf("make the drop-in directory unreadable: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+		err := firstInstallExecStartOverride(unitPath, ScopeUser)
+		if err == nil {
+			t.Fatal("firstInstallExecStartOverride() = nil, want the refusal of the unreadable drop-in directory")
+		}
+		for _, want := range []string{
+			"the installation was refused and the registration was not changed",
+			dir,
+			"cannot be read",
+			"Restore this user's read access to the directory",
+			`run "hfdesk service install" again`,
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal %q does not mention %q", err, want)
+			}
+		}
+		if strings.Contains(err.Error(), " or ") {
+			t.Errorf("the refusal %q offers an alternative instead of one action", err)
+		}
+	})
+}
+
 // assertSingleDropInAction proves the refusal standard of the ownership
 // contract on one error: the result (refused, nothing changed), the path of
 // the refused state and exactly one real next action — the customizations

@@ -446,11 +446,21 @@ func TestSystemdInstallUsesLoadedVendorFragmentAndRetainsItsPaths(t *testing.T) 
 	if err := os.WriteFile(loadedPath, []byte(vendorUnit), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The typed read answers from the unit file the fake supervisor keeps:
+	// the fixture seeds it with the foreign fragment, and the reload of the
+	// retried installation replaces it with the canonical unit, so the
+	// loaded-command verification of the retry compares against the command
+	// systemd really holds then. The fragment path stays the foreign one
+	// for the refusal of the first attempt.
 	manager.readServiceProperties = func(_ context.Context, name string) (map[string]dbus.Variant, error) {
 		if name != unitName {
 			return nil, fmt.Errorf("unexpected unit %q", name)
 		}
-		properties := systemdTestPropertiesFromUnit(vendorUnit)
+		content, err := os.ReadFile(loadedPath)
+		if err != nil {
+			return nil, err
+		}
+		properties := systemdTestPropertiesFromUnit(string(content))
 		properties["FragmentPath"] = dbus.MakeVariant(vendorPath)
 		return properties, nil
 	}
@@ -1075,6 +1085,7 @@ func TestSystemdFreshInstallNeverStartsTheInstance(t *testing.T) {
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLED_STATE", "not-found")
 
 	m := &systemdManager{scope: ScopeUser}
+	systemdLoadedFromDiskSeam(t, m)
 	if _, err := m.Install(context.Background(), systemdTempInstallOptions(t, root)); err != nil {
 		t.Fatalf("Install() = %v, want nil", err)
 	}
@@ -1584,6 +1595,7 @@ func TestSystemdEnablementFailureIsAFailedInstallation(t *testing.T) {
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLE_FAIL", "1")
 
 	m := &systemdManager{scope: ScopeUser}
+	systemdLoadedFromDiskSeam(t, m)
 	_, err := m.Install(context.Background(), systemdTempInstallOptions(t, root))
 	if err == nil {
 		t.Fatal("Install() = nil, want the failure of the enable")
@@ -1604,6 +1616,161 @@ func TestSystemdEnablementFailureIsAFailedInstallation(t *testing.T) {
 	if got := systemdSupervisorCallsTo(calls, "enable", unitName); got != 1 {
 		t.Errorf("the unit was enabled %d times, want the one enable the installation attempted:\n%s", got, strings.Join(calls, "\n"))
 	}
+}
+
+// TestSystemdFirstInstallRefusesADropInThatOwnsTheCommand pins the
+// ExecStart= ownership on the first-install path: a pre-created local.conf
+// carrying the directive would own the command of the registration after
+// the write — the last drop-in wins over the canonical unit — so the scan
+// of the drop-in directory refuses before anything is written: no unit
+// file, no directory of the instance, no supervisor command beyond the
+// mask read. The fixture is exactly the file the documentation tells the
+// administrator to create.
+func TestSystemdFirstInstallRefusesADropInThatOwnsTheCommand(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	root := t.TempDir()
+	requested := systemdTempInstallOptions(t, root)
+	m := &systemdManager{scope: ScopeUser}
+	unitPath, err := m.unitPath()
+	if err != nil {
+		t.Fatalf("unitPath(): %v", err)
+	}
+	dropIn := unitDropInPath(unitPath)
+	if err := os.MkdirAll(filepath.Dir(dropIn), 0o755); err != nil {
+		t.Fatalf("create the drop-in directory: %v", err)
+	}
+	if err := os.WriteFile(dropIn, []byte("[Service]\nExecStart=/bin/false --owned-by-the-drop-in\n"), 0o644); err != nil {
+		t.Fatalf("write the drop-in: %v", err)
+	}
+
+	_, err = m.Install(context.Background(), requested)
+	if err == nil {
+		t.Fatal("Install() = nil, want the refusal of the drop-in that owns the command")
+	}
+	for _, want := range []string{
+		"the installation was refused and the registration was not changed",
+		dropIn,
+		`Remove the "ExecStart=" override from "` + dropIn + `"`,
+		"reload the unit files with \"systemctl --user daemon-reload\"",
+		`run "hfdesk service install" again`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Install() = %q, want a message that mentions %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), " or ") {
+		t.Errorf("Install() = %q, offers an alternative instead of one action", err)
+	}
+
+	// The refusal happened before any mutation: no unit file, no
+	// directory of the instance, and the supervisor was asked for the
+	// mask and nothing else.
+	if _, statErr := os.Stat(unitPath); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("the refused installation wrote the unit file %q: %v", unitPath, statErr)
+	}
+	for _, dir := range instanceDirs(requested) {
+		if _, statErr := os.Stat(dir.path); !errors.Is(statErr, fs.ErrNotExist) {
+			t.Errorf("the refused installation created the %s %q: %v", dir.name, dir.path, statErr)
+		}
+	}
+	for _, call := range systemdSupervisorCalls(t, logPath) {
+		if got := strings.TrimPrefix(call, "--user "); got != "is-enabled "+unitName {
+			t.Errorf("the refused installation called the supervisor with unexpected command %q: %s", call,
+				strings.Join(systemdSupervisorCalls(t, logPath), "\n"))
+		}
+	}
+}
+
+// TestSystemdFirstInstallOverACleanDropInSucceeds pins the other side of the
+// scan: a documented drop-in without an ExecStart= directive does not
+// refuse — the installation writes the registration, enables it and
+// verifies that the supervisor loads the command it wrote.
+func TestSystemdFirstInstallOverACleanDropInSucceeds(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	root := t.TempDir()
+	requested := systemdTempInstallOptions(t, root)
+	m := &systemdManager{scope: ScopeUser}
+	systemdLoadedFromDiskSeam(t, m)
+	unitPath, err := m.unitPath()
+	if err != nil {
+		t.Fatalf("unitPath(): %v", err)
+	}
+	dropIn := unitDropInPath(unitPath)
+	if err := os.MkdirAll(filepath.Dir(dropIn), 0o755); err != nil {
+		t.Fatalf("create the drop-in directory: %v", err)
+	}
+	if err := os.WriteFile(dropIn, []byte("[Service]\nEnvironment=HF_HUB_CACHE=/operator/hub\n"), 0o644); err != nil {
+		t.Fatalf("write the drop-in: %v", err)
+	}
+
+	if _, err := m.Install(context.Background(), requested); err != nil {
+		t.Fatalf("Install() over a clean drop-in = %v, want the successful first installation", err)
+	}
+	if _, statErr := os.Stat(unitPath); statErr != nil {
+		t.Errorf("the installation wrote no unit file at %q: %v", unitPath, statErr)
+	}
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "daemon-reload"); got != 1 {
+		t.Errorf("daemon-reload ran %d times, want once:\n%s", got, strings.Join(calls, "\n"))
+	}
+	if got := systemdSupervisorCallsTo(calls, "enable", unitName); got != 1 {
+		t.Errorf("enable ran %d times, want once:\n%s", got, strings.Join(calls, "\n"))
+	}
+}
+
+// TestSystemdFirstInstallVerifiesTheLoadedCommand pins the second line of
+// the ExecStart= ownership: a command the supervisor does not load as
+// written — a drop-in composition the pre-write scan could not see — fails
+// the first installation after the reload, and the rollback removes the
+// registration again instead of reporting success. The perturbation is the
+// seam answer: the canonical command passes (the test above and every other
+// first installation), the drifted command fails here.
+func TestSystemdFirstInstallVerifiesTheLoadedCommand(t *testing.T) {
+	logPath := systemdRecordingSupervisor(t)
+	systemdTempInstallEnvironment(t)
+	root := t.TempDir()
+	requested := systemdTempInstallOptions(t, root)
+	m := &systemdManager{scope: ScopeUser}
+	unitPath, err := m.unitPath()
+	if err != nil {
+		t.Fatalf("unitPath(): %v", err)
+	}
+	// A loaded command that differs from the one the installation writes:
+	// what a drop-in with ExecStart= would compose over the canonical unit.
+	drifted := append([]string{requested.Executable}, RunArgs(requested)...)
+	drifted = append(drifted, "--drifted-by-a-drop-in")
+	m.readServiceProperties = func(_ context.Context, name string) (map[string]dbus.Variant, error) {
+		if name != unitName {
+			return nil, fmt.Errorf("unexpected unit %q", name)
+		}
+		return systemdTypedProperties(requested.Executable, drifted, nil, requested.Paths.StateDir, "", "", nil), nil
+	}
+
+	_, err = m.Install(context.Background(), requested)
+	if err == nil {
+		t.Fatal("Install() = nil, want the verification failure of the loaded command")
+	}
+	for _, want := range []string{
+		"did not load the canonical command that was written",
+		"(the failed registration was removed from disk and the supervisor)",
+		`run "hfdesk service status" to read the current state of the service`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Install() = %q, want a message that mentions %q", err, want)
+		}
+	}
+	// The rollback removed the registration of the failed verification
+	// again: nothing of the attempt is left on disk.
+	if _, statErr := os.Stat(unitPath); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("the failed verification left the unit file %q behind: %v", unitPath, statErr)
+	}
+	calls := systemdSupervisorCalls(t, logPath)
+	if got := systemdSupervisorCallsTo(calls, "enable", unitName); got != 0 {
+		t.Errorf("the failed verification enabled the unit %d times, want none:\n%s", got, strings.Join(calls, "\n"))
+	}
+	_ = logPath
 }
 
 // TestSystemdInstallHandlesTheHandEditedBaseFileOnBothSides pins both sides
@@ -1810,10 +1977,16 @@ func TestSystemdUpdateRefusesACommandTheReloadDoesNotLoad(t *testing.T) {
 	for _, want := range []string{
 		"did not load the canonical command that was written",
 		"the previous registration and captured loaded command/launch settings were restored",
+		`run "hfdesk service status" to read the current state of the service`,
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Install() = %q, want an error that mentions %q", err, want)
 		}
+	}
+	// The composite carries exactly one action: the command line prints
+	// this text as it is, so the diagnostic is the manager's to name.
+	if got := strings.Count(err.Error(), "hfdesk service status"); got != 1 {
+		t.Errorf("Install() = %q, names the state command %d times, want exactly one", err, got)
 	}
 	if strings.Contains(err.Error(), "started again") {
 		t.Errorf("Install() = %q, must not claim a restarted instance of a stopped update", err)

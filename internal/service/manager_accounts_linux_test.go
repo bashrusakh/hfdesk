@@ -1926,6 +1926,7 @@ func TestSystemdSuccessfulInstallKeepsItsDirectories(t *testing.T) {
 
 	opts := systemdTempInstallOptions(t, root)
 	m := &systemdManager{scope: ScopeUser}
+	systemdLoadedFromDiskSeam(t, m)
 	if _, err := m.Install(context.Background(), opts); err != nil {
 		t.Fatalf("Install() = %v, want nil", err)
 	}

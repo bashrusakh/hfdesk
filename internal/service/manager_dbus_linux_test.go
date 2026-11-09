@@ -484,6 +484,73 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		assertSingleReloadAction(t, err, "systemctl")
 	})
 
+	t.Run("an unreadable drop-in names no clearing command", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root reads every file; the unreadable state needs an unprivileged reader")
+		}
+		dropIn := writeDropIn(t, "local.conf", "[Service]\nExecStart="+strings.Join(override, " ")+"\n")
+		if err := os.Chmod(dropIn, 0); err != nil {
+			t.Fatalf("make the drop-in unreadable: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dropIn, 0o644) })
+
+		loaded, err := loadedConfigFromProperties(driftedProperties([]string{dropIn}))
+		if err != nil {
+			t.Fatalf("decode the typed override: %v", err)
+		}
+		err = detectExecStartOverride(loaded, facts, ScopeSystem)
+		if err == nil {
+			t.Fatal("detectExecStartOverride() = nil, want the refusal over an unreadable drop-in")
+		}
+		// Honest terminal: this unreadable drop-in may carry the
+		// override, so no command is named — a reload or a retry could
+		// not clear that state — and the refusal says it repeats until
+		// the override is removed.
+		for _, want := range []string{
+			"cannot read every drop-in the supervisor reports",
+			"names no command",
+			"the refusal repeats until the ExecStart= override is removed",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal %q does not mention %q", err, want)
+			}
+		}
+		for _, unwanted := range []string{
+			`Reload the unit files with`,
+			`run "hfdesk service install"`,
+			`Remove the "ExecStart=" override`,
+			" or ",
+		} {
+			if strings.Contains(err.Error(), unwanted) {
+				t.Errorf("the refusal %q names %q, want no command that cannot clear this state", err, unwanted)
+			}
+		}
+	})
+
+	t.Run("a readable holder is named even beside an unreadable drop-in", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root reads every file; the unreadable state needs an unprivileged reader")
+		}
+		decoy := writeDropIn(t, "00-unreadable.conf", "[Service]\nEnvironment=HF_HUB_CACHE=/decoy\n")
+		if err := os.Chmod(decoy, 0); err != nil {
+			t.Fatalf("make the decoy unreadable: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(decoy, 0o644) })
+		owner := writeDropIn(t, "local.conf", "[Service]\nExecStart="+strings.Join(override, " ")+"\n")
+
+		loaded, err := loadedConfigFromProperties(driftedProperties([]string{decoy, owner}))
+		if err != nil {
+			t.Fatalf("decode the typed override: %v", err)
+		}
+		err = detectExecStartOverride(loaded, facts, ScopeSystem)
+		if err == nil {
+			t.Fatal("detectExecStartOverride() = nil, want the refusal that names the carrying drop-in")
+		}
+		// The readable holder proves where the override lives: the one
+		// action clears it, so the removal is named.
+		assertSingleRemoveOverrideAction(t, err, owner)
+	})
+
 	t.Run("command with loaded flags", func(t *testing.T) {
 		properties := systemdTestPropertiesFromUnit(string(content))
 		properties["ExecStartEx"] = dbus.MakeVariant([]systemdExecStartExEntry{{Path: argv[0], Argv: argv, Flags: []string{"full-privileges"}}})
@@ -497,6 +564,30 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		}
 		assertSingleReloadAction(t, err, "systemctl")
 	})
+}
+
+// systemdLoadedFromDiskSeam answers the typed read of the loaded
+// configuration from the unit file on disk: after the reload of the fake
+// supervisor that file is what systemd holds, so the loaded-command
+// verification of a first installation compares the written unit against
+// the command on disk — the clean state the test asserts. A test that
+// models a drift overrides the seam with its own answer.
+func systemdLoadedFromDiskSeam(t *testing.T, manager *systemdManager) {
+	t.Helper()
+	path, err := manager.unitPath()
+	if err != nil {
+		t.Fatalf("unitPath(): %v", err)
+	}
+	manager.readServiceProperties = func(_ context.Context, name string) (map[string]dbus.Variant, error) {
+		if name != unitName {
+			return nil, fmt.Errorf("unexpected unit %q", name)
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		return systemdTestPropertiesFromUnit(string(content)), nil
+	}
 }
 
 func TestSystemdDetectForeignRegistration(t *testing.T) {

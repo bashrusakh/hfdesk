@@ -889,6 +889,7 @@ func TestSystemdExecuteOnlyNativeCandidateRunsAndInstalls(t *testing.T) {
 	opts := systemdTempInstallOptions(t, t.TempDir())
 	opts.Executable = native
 	manager := &systemdManager{scope: ScopeUser}
+	systemdLoadedFromDiskSeam(t, manager)
 	if _, err := manager.Install(context.Background(), opts); err != nil {
 		t.Fatalf("Install() refused the execute-only native candidate: %v", err)
 	}
