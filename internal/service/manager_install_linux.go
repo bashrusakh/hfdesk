@@ -122,11 +122,6 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 		// prove the supervisor knew nothing before the write.
 		loaded: initialLoaded, loadedKnown: initialLoadedKnown,
 	}
-	// Detector A refuses dynamic operands, so an update over a canonical
-	// registration carries no dynamic fields; this plumbing stays alive
-	// only until the grammar it belongs to is deleted.
-	dynamicFields := map[string]bool{}
-	previous.dynamicFields = dynamicFields
 	registered := existed
 	if registered {
 		// Detector A: the base file must be the canonical unit HFDesk
@@ -166,7 +161,7 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 		loadedKnown = true
 	}
 	if registered && loaded.loaded {
-		if err := detectExecStartOverride(path, loaded, content); err != nil {
+		if err := detectExecStartOverride(path, loaded, previous.facts); err != nil {
 			return opts, err
 		}
 	}
@@ -206,19 +201,17 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 
 	// The merged registration is validated as well: its values are the
 	// ones the write will emit.
-	validationOpts := systemdValidationOptions(opts, dynamicFields)
-	if err := ValidateInstallOptions(validationOpts); err != nil {
+	if err := ValidateInstallOptions(opts); err != nil {
 		return opts, err
 	}
 	// The check runs before the root requirement, before any directory is
 	// created and before the unit file is written: a refused installation
 	// leaves nothing behind.
-	if err := validateUnitPaths(validationOpts, registered); err != nil {
+	if err := validateUnitPaths(opts, registered); err != nil {
 		return opts, err
 	}
 	// A machine-wide instance must not adopt the state of the user who
 	// runs the install command.
-	filesystemOpts := systemdFilesystemOptions(opts, dynamicFields)
 	if err := m.checkSystemPaths(opts); err != nil {
 		return opts, err
 	}
@@ -234,7 +227,7 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 		return opts, err
 	}
 	identity := systemdAccessIdentityForInstall(opts.Scope, requested, registered, loaded, loadedKnown, account)
-	if err := m.checkServiceAccountAccessWithIdentity(filesystemOpts, identity.accountName, identity.access); err != nil {
+	if err := m.checkServiceAccountAccessWithIdentity(opts, identity.accountName, identity.access); err != nil {
 		return opts, err
 	}
 	// The root requirement is checked before any directory is created: a
@@ -247,8 +240,8 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	// Step 5: preflight the new program — format, machine identity and
 	// account access — before any stop or write, so a refused program
 	// creates no directory, rewrites no unit and stops no instance.
-	workingDirectory := systemdWorkingDirectoryForPreflight(validationOpts, registered, loaded, loadedKnown)
-	if err := m.preflightWithContext(ctx, validationOpts, identity.accountName, identity.access, workingDirectory); err != nil {
+	workingDirectory := systemdWorkingDirectoryForPreflight(opts, registered, loaded, loadedKnown)
+	if err := m.preflightWithContext(ctx, opts, identity.accountName, identity.access, workingDirectory); err != nil {
 		return opts, err
 	}
 
@@ -257,7 +250,7 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	// identity is given ownership of exactly those and of nothing else.
 	// Existing directories belong to their current owner and are left
 	// alone. The list is also what a failed installation removes again.
-	instanceDirectories := systemdInstanceDirs(opts, dynamicFields)
+	instanceDirectories := instanceDirs(opts)
 	created := make(map[string][]string, len(instanceDirectories))
 	for _, dir := range instanceDirectories {
 		created[dir.path] = createdDirs(dir.path)
@@ -269,7 +262,7 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 			}
 		}
 	}
-	if err := prepareSystemdInstanceDirs(opts, instanceDirectories, dynamicFields); err != nil {
+	if err := PrepareDirs(opts); err != nil {
 		// The preparation may have created some of the directories
 		// before it failed. A previous unit may still reference those
 		// paths even though this attempt did not write a registration.
@@ -325,63 +318,10 @@ type previousRegistration struct {
 	// loadedKnown reports that loaded was read successfully for an existing
 	// registration. A first installation expects no loaded registration.
 	loadedKnown bool
-	// dynamicFields are untouched ExecStart options whose source uses
-	// systemd specifiers or environment references. Detector A refuses such
-	// units, so the map stays empty; the plumbing belongs to the grammar
-	// that is deleted together with the editor.
-	dynamicFields map[string]bool
 }
 
 func (p previousRegistration) registrationPresent() bool {
 	return p.existed || (p.loadedKnown && p.loaded.loaded)
-}
-
-func systemdValidationOptions(opts InstallOptions, dynamic map[string]bool) InstallOptions {
-	defaults := DefaultInstallOptions(opts.Scope, opts.Executable)
-	if dynamic["config"] {
-		opts.Paths.ConfigFile = defaults.Paths.ConfigFile
-	}
-	if dynamic["state-dir"] {
-		opts.Paths.StateDir = defaults.Paths.StateDir
-	}
-	if dynamic["log-dir"] {
-		opts.Paths.LogDir = defaults.Paths.LogDir
-	}
-	if dynamic["listen"] {
-		opts.Listen = defaults.Listen
-	}
-	if dynamic["cache-dir"] {
-		opts.CacheDir = ""
-	}
-	if dynamic["hub-dir"] {
-		opts.HubDir = ""
-	}
-	if dynamic["local-dir"] {
-		opts.LocalDir = ""
-	}
-	return opts
-}
-
-func systemdFilesystemOptions(opts InstallOptions, dynamic map[string]bool) InstallOptions {
-	if dynamic["config"] {
-		opts.Paths.ConfigFile = ""
-	}
-	if dynamic["state-dir"] {
-		opts.Paths.StateDir = ""
-	}
-	if dynamic["log-dir"] {
-		opts.Paths.LogDir = ""
-	}
-	if dynamic["cache-dir"] {
-		opts.CacheDir = ""
-	}
-	if dynamic["hub-dir"] {
-		opts.HubDir = ""
-	}
-	if dynamic["local-dir"] {
-		opts.LocalDir = ""
-	}
-	return opts
 }
 
 // registrationEnablement is what the supervisor reports about the enablement of
@@ -513,7 +453,7 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 	result := systemdRegisterResult{createdDirsSafeToRemove: systemdCreatedDirsSafeToRemove(previous, created)}
 	// The instance runs as the service account, so the directories it owns
 	// belong to it.
-	if err := m.grantInstanceDirsForDirsWithIdentity(opts, identity, created, systemdInstanceDirs(opts, previous.dynamicFields)); err != nil {
+	if err := m.grantInstanceDirsForDirsWithIdentity(opts, identity, created, instanceDirs(opts)); err != nil {
 		return result, err
 	}
 

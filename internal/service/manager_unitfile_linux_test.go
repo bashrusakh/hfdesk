@@ -63,11 +63,11 @@ func TestSystemdRenderUnitUserScope(t *testing.T) {
 	}
 
 	parsed := parseUnit(unit)
-	if !filepath.IsAbs(parsed.ExecStart) {
-		t.Errorf("ExecStart = %q, want an absolute path", parsed.ExecStart)
+	if !filepath.IsAbs(parsed.Program) {
+		t.Errorf("ExecStart = %q, want an absolute path", parsed.Program)
 	}
-	if parsed.ExecStart != opts.Executable {
-		t.Errorf("ExecStart = %q, want %q", parsed.ExecStart, opts.Executable)
+	if parsed.Program != opts.Executable {
+		t.Errorf("ExecStart = %q, want %q", parsed.Program, opts.Executable)
 	}
 	if parsed.WorkingDirectory != opts.Paths.StateDir {
 		t.Errorf("WorkingDirectory = %q, want the state dir %q", parsed.WorkingDirectory, opts.Paths.StateDir)
@@ -200,8 +200,8 @@ func TestSystemdRenderUnitQuotesPathsWithSpaces(t *testing.T) {
 	}
 
 	parsed := parseUnit(unit)
-	if parsed.ExecStart != opts.Executable {
-		t.Errorf("ExecStart = %q, want %q", parsed.ExecStart, opts.Executable)
+	if parsed.Program != opts.Executable {
+		t.Errorf("ExecStart = %q, want %q", parsed.Program, opts.Executable)
 	}
 	if got := parsed.flagValue("--state-dir"); got != opts.Paths.StateDir {
 		t.Errorf("--state-dir = %q, want %q", got, opts.Paths.StateDir)
@@ -247,8 +247,8 @@ func TestSystemdRenderUnitEscapesTheDollarSign(t *testing.T) {
 
 	// The supervisor reconstructs the paths the process sees.
 	parsed := parseUnit(unit)
-	if parsed.ExecStart != opts.Executable {
-		t.Errorf("ExecStart = %q, want %q", parsed.ExecStart, opts.Executable)
+	if parsed.Program != opts.Executable {
+		t.Errorf("ExecStart = %q, want %q", parsed.Program, opts.Executable)
 	}
 	wantArgs := RunArgs(opts)
 	if len(parsed.ExecArgs) != len(wantArgs) {
@@ -318,8 +318,8 @@ func TestSystemdParseUnitRecoversTheRegistration(t *testing.T) {
 	}
 	parsed := parseUnit(unit)
 
-	if parsed.ExecStart != opts.Executable {
-		t.Errorf("the registered executable = %q, want %q", parsed.ExecStart, opts.Executable)
+	if parsed.Program != opts.Executable {
+		t.Errorf("the registered executable = %q, want %q", parsed.Program, opts.Executable)
 	}
 	if parsed.WorkingDirectory != opts.Paths.StateDir {
 		t.Errorf("the registered working directory = %q, want %q", parsed.WorkingDirectory, opts.Paths.StateDir)
@@ -378,50 +378,6 @@ func TestSplitSystemdWordsDecodesDocumentedCEscapes(t *testing.T) {
 				t.Errorf("splitSystemdWords(%q) = %#v, want %#v", test.line, got, test.want)
 			}
 		})
-	}
-}
-
-func TestSystemdParseAndReplaceContinuedExecStart(t *testing.T) {
-	content := `[Unit]
-Description=HFDesk
-
-[Service]
-ExecStart=/bin/true \
-# ignored comment in continued value
-  service run -config=/srv/config\x20one/hfdesk.json -state-dir=/srv/state -log-dir=/srv/log --cache-dir=
-WorkingDirectory=/operator/cwd
-Environment=HF_HOME=/operator/home
-Restart=on-failure
-`
-	unit := parseUnit(content)
-	wantArgs := []string{
-		"/bin/true", "service", "run", "-config=/srv/config one/hfdesk.json",
-		"-state-dir=/srv/state", "-log-dir=/srv/log", "--cache-dir=",
-	}
-	if unit.ExecStartRaw != wantArgs[0] || !slices.Equal(append([]string{unit.ExecStartRaw}, unit.ExecArgsRaw...), wantArgs) {
-		t.Fatalf("continued ExecStart = %q %#v, want %#v", unit.ExecStartRaw, unit.ExecArgsRaw, wantArgs)
-	}
-	loaded := systemdLoadedConfig{loaded: true, execPath: wantArgs[0], execArgs: wantArgs}
-	if err := loadedMatchesUnit(loaded, unit); err != nil {
-		t.Fatalf("loadedMatchesUnit() rejected the native parsed vector: %v", err)
-	}
-
-	updated, err := updateSystemdServiceDirectives(content, map[string]systemdDirectiveChange{
-		"ExecStart": {value: `"/bin/echo" service run --config=/new`},
-	})
-	if err != nil {
-		t.Fatalf("updateSystemdServiceDirectives() = %v", err)
-	}
-	if strings.Contains(updated, "ignored comment in continued value") || strings.Contains(updated, "-state-dir=/srv/state") {
-		t.Errorf("replacing ExecStart left part of its old continuation behind:\n%s", updated)
-	}
-	for _, kept := range []string{"WorkingDirectory=/operator/cwd", "Environment=HF_HOME=/operator/home", "Restart=on-failure"} {
-		if !strings.Contains(updated, kept) {
-			t.Errorf("continued command replacement lost unrelated directive %q:\n%s", kept, updated)
-		}
-	}
-	if got := parseUnit(updated).ExecStart; got != "/bin/echo" {
-		t.Errorf("updated executable = %q, want /bin/echo", got)
 	}
 }
 
@@ -500,52 +456,6 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 		t.Fatalf("native raw-value control selected %q, want %q", got, stateDir)
 	}
 
-	explicitStateDir := filepath.Join(root, `updated state with spaces\and%literal"quoted`)
-	if err := os.MkdirAll(explicitStateDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	updated := opts
-	updated.Paths.StateDir = explicitStateDir
-	updated.Explicit.StateDir = true
-	unit, err = updateUnit(unit, updated, nil)
-	if err != nil {
-		t.Fatalf("updateUnit() = %v, want nil", err)
-	}
-	if got := parseUnit(unit).WorkingDirectory; got != explicitStateDir {
-		t.Errorf("explicit StateDir update WorkingDirectory = %q, want literal path %q", got, explicitStateDir)
-	}
-	if got := verify("explicit StateDir update", unit); got != explicitStateDir {
-		t.Errorf("native explicit-update WorkingDirectory = %q, want requested path %q", got, explicitStateDir)
-	}
-
-	adminWorkingDirectory := "WorkingDirectory=%h"
-	workingDirectoryValue, err := systemdWorkingDirectoryValue(explicitStateDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	previousWorkingDirectory := "WorkingDirectory=" + workingDirectoryValue
-	if !strings.Contains(unit, previousWorkingDirectory) {
-		t.Fatalf("explicit update lost its WorkingDirectory directive:\n%s", unit)
-	}
-	unit = strings.Replace(unit, previousWorkingDirectory, adminWorkingDirectory, 1)
-	execOnly := updated
-	execOnly.Executable = "/bin/true"
-	execOnly.Explicit.StateDir = false
-	unit, err = updateUnit(unit, execOnly, nil)
-	if err != nil {
-		t.Fatalf("executable-only updateUnit() = %v, want nil", err)
-	}
-	if !strings.Contains(unit, adminWorkingDirectory) {
-		t.Fatalf("executable-only update changed the administrator's WorkingDirectory source:\n%s", unit)
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := verify("executable-only update preserving admin WorkingDirectory", unit); got != home {
-		t.Errorf("native executable-only WorkingDirectory = %q, want the native %%h path %q", got, home)
-	}
-
 	trailingStateDir := filepath.Join(root, "state with trailing backslash\\")
 	if err := os.MkdirAll(trailingStateDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -559,20 +469,6 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 	if got := verify("first install with terminal backslash", trailingUnit); got != trailingStateDir {
 		t.Errorf("native terminal-backslash WorkingDirectory = %q, want %q", got, trailingStateDir)
 	}
-	updatedTrailingStateDir := filepath.Join(root, "updated state with trailing backslash\\")
-	if err := os.MkdirAll(updatedTrailingStateDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	trailingOpts.Paths.StateDir = updatedTrailingStateDir
-	trailingOpts.Explicit.StateDir = true
-	trailingUnit, err = updateUnit(trailingUnit, trailingOpts, nil)
-	if err != nil {
-		t.Fatalf("updateUnit() for terminal backslash = %v", err)
-	}
-	if got := verify("explicit StateDir update with terminal backslash", trailingUnit); got != updatedTrailingStateDir {
-		t.Errorf("native updated terminal-backslash WorkingDirectory = %q, want %q", got, updatedTrailingStateDir)
-	}
-
 	pairedBackslashes := filepath.Join(root, "state with paired trailing backslashes\\\\")
 	if err := os.MkdirAll(pairedBackslashes, 0o700); err != nil {
 		t.Fatal(err)
@@ -603,63 +499,6 @@ func TestSystemdWorkingDirectoryRejectsUnrepresentableTrailingSpace(t *testing.T
 	opts.Explicit.StateDir = true
 	if err := validateUnitPaths(opts, true); err == nil || !strings.Contains(err.Error(), "trailing spaces are stripped") {
 		t.Fatalf("explicit StateDir validation = %v, want refusal of an unrepresentable WorkingDirectory", err)
-	}
-	unit := "[Service]\nExecStart=/bin/true service run --config /srv/config.json --state-dir /srv/state --log-dir /srv/log\nWorkingDirectory=/srv/state\n"
-	if _, err := updateUnit(unit, opts, nil); err == nil || !strings.Contains(err.Error(), "trailing spaces are stripped") {
-		t.Fatalf("updateUnit() = %v, want refusal of an unrepresentable WorkingDirectory", err)
-	}
-}
-
-func TestSystemdRunFlagEditorFollowsFlagSetSemantics(t *testing.T) {
-	source := "/bin/true service run -config=/srv/config.json --state-dir /srv/state -log-dir=/srv/logs -listen=127.0.0.1:18080 --listen 127.0.0.1:18081 --cache-dir=/srv/cache --"
-	words := splitSystemdWordTokens(source)
-	updated := replaceSystemdRunFlag(words, "listen", "127.0.0.1:19222", true)
-	updatedSource := make([]string, len(updated))
-	for i, word := range updated {
-		updatedSource[i] = word.source
-	}
-	gotSource := strings.Join(updatedSource, " ")
-	wantSource := "/bin/true service run -config=/srv/config.json --state-dir /srv/state -log-dir=/srv/logs --listen 127.0.0.1:19222 --cache-dir=/srv/cache --"
-	if gotSource != wantSource {
-		t.Fatalf("source update = %q, want %q", gotSource, wantSource)
-	}
-	before, err := ParseRunArgs(parseUnit("[Service]\nExecStart=" + source).ExecArgs)
-	if err != nil {
-		t.Fatalf("baseline ParseRunArgs() = %v", err)
-	}
-	after, err := ParseRunArgs(parseUnit("[Service]\nExecStart=" + gotSource).ExecArgs)
-	if err != nil {
-		t.Fatalf("updated ParseRunArgs() = %v", err)
-	}
-	before.Listen = after.Listen
-	if after.Listen != "127.0.0.1:19222" || !reflect.DeepEqual(after, before) {
-		t.Errorf("updated parsed options = %+v, want only Listen changed from %+v", after, before)
-	}
-}
-
-func TestSystemdRunFlagEditorTreatsOptionValueAsDistinctFromTerminator(t *testing.T) {
-	source := "/bin/true service run --config -- --state-dir /srv/state --log-dir /srv/log --"
-	words := splitSystemdWordTokens(source)
-	layout := scanSystemdRunArgs(words, true)
-	if layout.terminator != len(words)-1 {
-		t.Fatalf("terminator index = %d, want final standalone -- at %d", layout.terminator, len(words)-1)
-	}
-	if len(layout.options) != 3 || layout.options[0].name != "config" || words[layout.options[0].end-1].value != "--" {
-		t.Fatalf("option layout = %+v, want config to consume the first -- as its value", layout)
-	}
-	updated := replaceSystemdRunFlag(words, "listen", "127.0.0.1:19222", true)
-	var sourceWords []string
-	for _, word := range updated {
-		sourceWords = append(sourceWords, word.source)
-	}
-	got := strings.Join(sourceWords, " ")
-	want := "/bin/true service run --config -- --state-dir /srv/state --log-dir /srv/log --listen 127.0.0.1:19222 --"
-	if got != want {
-		t.Fatalf("updated source = %q, want %q", got, want)
-	}
-	_, err := ParseRunArgs(parseUnit("[Service]\nExecStart=" + got).ExecArgs)
-	if err == nil || !strings.Contains(err.Error(), "absolute path") || strings.Contains(err.Error(), "unexpected argument") {
-		t.Fatalf("ParseRunArgs() error = %v, want the consumed -- value to fail path validation, not terminate parsing", err)
 	}
 }
 
@@ -1035,68 +874,6 @@ func TestSystemdStopTimeoutCoversTheShutdownOfTheServer(t *testing.T) {
 	}
 }
 
-// TestSystemdRegistrationOptionsRecoversTheRegistration checks that the
-// options of an existing registration are read back from the unit file the
-// supervisor holds: the argument vector carries the paths and the bind
-// address, the identity directive carries the account of a machine-wide
-// instance.
-func TestSystemdRegistrationOptionsRecoversTheRegistration(t *testing.T) {
-	opts := systemdTestOptions(t, ScopeSystem)
-	opts.ServiceUser = "hfdesk-svc"
-
-	unit, err := renderUnit(opts, nil)
-	if err != nil {
-		t.Fatalf("renderUnit() = %v, want nil", err)
-	}
-
-	got := registrationOptions(parseUnit(unit), ScopeSystem)
-	want := opts
-	want.Executable = opts.Executable
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("registrationOptions() =\n%+v\nwant\n%+v", got, want)
-	}
-}
-
-func TestSystemdRegistrationOptionsUsesAcceptedFlagSyntaxAndLastValue(t *testing.T) {
-	unit := `[Service]
-ExecStart=/opt/hfdesk/hfdesk service run -config=/old/hfdesk.json --config=/new/hfdesk.json -state-dir /old/state --state-dir=/new/state -log-dir=/new/logs -listen=127.0.0.1:8181 --listen 127.0.0.1:9191 -cache-dir=/old/cache --cache-dir=/new/cache -hub-dir=/old/hub --hub-dir=/new/hub -local-dir=/old/models --local-dir=/new/models
-`
-	got := registrationOptions(parseUnit(unit), ScopeUser)
-	want := InstallOptions{
-		Scope:      ScopeUser,
-		Executable: "/opt/hfdesk/hfdesk",
-		Listen:     "127.0.0.1:9191",
-		Paths: runtimepaths.Paths{
-			ConfigFile: "/new/hfdesk.json",
-			StateDir:   "/new/state",
-			LogDir:     "/new/logs",
-		},
-		CacheDir: "/new/cache",
-		HubDir:   "/new/hub",
-		LocalDir: "/new/models",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("registrationOptions() =\n%+v\nwant\n%+v", got, want)
-	}
-}
-
-// TestSystemdRegistrationOptionsNameNoAccountForAUserScope checks that a
-// user scope registration never recovers an account: the instance runs as the
-// user of the session, whatever an old command line named.
-func TestSystemdRegistrationOptionsNameNoAccountForAUserScope(t *testing.T) {
-	opts := systemdTestOptions(t, ScopeUser)
-	opts.ServiceUser = "hfdesk-svc"
-
-	unit, err := renderUnit(opts, nil)
-	if err != nil {
-		t.Fatalf("renderUnit() = %v, want nil", err)
-	}
-
-	if got := registrationOptions(parseUnit(unit), ScopeUser).ServiceUser; got != "" {
-		t.Errorf("the account of a user scope registration = %q, want none", got)
-	}
-}
-
 // TestSystemdExecStartPath checks the program path of the ExecStart property
 // the supervisor reports.
 func TestSystemdExecStartPath(t *testing.T) {
@@ -1297,7 +1074,7 @@ func TestSystemdUpdatePreservesEscapedDollarArguments(t *testing.T) {
 		t.Errorf("the updated unit did not escape literal dollar signs:\n%s", content)
 	}
 	parsed := parseUnit(string(content))
-	if parsed.ExecStart != newExecutable || parsed.flagValue("--config") != requested.Paths.ConfigFile {
+	if parsed.Program != newExecutable || parsed.flagValue("--config") != requested.Paths.ConfigFile {
 		t.Errorf("the parsed registration = %+v, want the literal dollar config path", parsed)
 	}
 }
@@ -1326,135 +1103,6 @@ func systemdWrapExecStart(t *testing.T, unit, executable, value string) string {
 	t.Helper()
 	program, tail, start := splitRenderedExecStart(t, unit, executable)
 	return unit[:start] + "ExecStart=" + value + unit[start+len(program)+len(tail):]
-}
-
-// TestSystemdExecStartUpdateRewritesOnlyRewritableCommands checks the merge
-// of the unit command: the program slot takes the new program while a
-// recognized wrapper and its arguments stay, and a form the merge cannot
-// rewrite is refused by name instead of being corrupted.
-func TestSystemdExecStartUpdateRewritesOnlyRewritableCommands(t *testing.T) {
-	const executable = "/opt/hfdesk-new/hfdesk"
-	const tail = "service run --listen 127.0.0.1:19090"
-	opts := InstallOptions{Scope: ScopeUser, Executable: executable}
-
-	for _, tc := range []struct {
-		name  string
-		value string
-		want  string
-	}{
-		{
-			name:  "the program with its run vector",
-			value: "/opt/hfdesk-old/hfdesk " + tail,
-			want:  `"` + executable + `" ` + tail,
-		},
-		{
-			name:  "the program alone",
-			value: "/opt/hfdesk-old/hfdesk",
-			want:  `"` + executable + `"`,
-		},
-		{
-			name:  "an env wrapper",
-			value: "/usr/bin/env hfdesk " + tail,
-			want:  `/usr/bin/env "` + executable + `" ` + tail,
-		},
-		{
-			name:  "an env wrapper with options and assignments",
-			value: "/usr/bin/env -i HF_HOME=/srv/hfdesk hfdesk " + tail,
-			want:  `/usr/bin/env -i HF_HOME=/srv/hfdesk "` + executable + `" ` + tail,
-		},
-		{
-			name:  "an env wrapper whose separated option value is kept",
-			value: "/usr/bin/env -u NAME /path/to/hfdesk " + tail,
-			want:  `/usr/bin/env -u NAME "` + executable + `" ` + tail,
-		},
-		{
-			name:  "an env wrapper with the value-less -i option",
-			value: "/usr/bin/env -i /path/to/hfdesk " + tail,
-			want:  `/usr/bin/env -i "` + executable + `" ` + tail,
-		},
-		{
-			name:  "an env wrapper with an assignment before the program",
-			value: "/usr/bin/env FOO=bar /path/to/hfdesk " + tail,
-			want:  `/usr/bin/env FOO=bar "` + executable + `" ` + tail,
-		},
-		{
-			name:  "an env wrapper with an attached option value",
-			value: "/usr/bin/env --unset=NAME /path/to/hfdesk " + tail,
-			want:  `/usr/bin/env --unset=NAME "` + executable + `" ` + tail,
-		},
-		{
-			name:  "a dynamic program source",
-			value: "%h/bin/hfdesk " + tail,
-			want:  `"` + executable + `" ` + tail,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			content := "[Unit]\nDescription=HFDesk\n\n[Service]\nExecStart=" + tc.value + "\nWorkingDirectory=/srv/state\n"
-			got, err := updateSystemdExecStartSource(content, opts)
-			if err != nil {
-				t.Fatalf("updateSystemdExecStartSource() = %v, want nil", err)
-			}
-			if got != tc.want {
-				t.Errorf("updateSystemdExecStartSource() = %q, want %q", got, tc.want)
-			}
-			if err := validateSystemdExecStartUpdate(content, executable); err != nil {
-				t.Errorf("validateSystemdExecStartUpdate() = %v, want nil for a rewritable form", err)
-			}
-		})
-	}
-
-	for _, tc := range []struct {
-		name  string
-		value string
-		form  string
-	}{
-		{
-			name:  "a shell script string",
-			value: `/bin/sh -c "exec hfdesk ` + tail + `"`,
-			form:  "/bin/sh -c",
-		},
-		{
-			name:  "an unknown wrapper",
-			value: "/usr/bin/timeout 30 hfdesk " + tail,
-			form:  "timeout 30",
-		},
-		{
-			name:  "an env wrapper whose option value leaves no program",
-			value: "/usr/bin/env -u NAME " + tail,
-			form:  "env -u NAME",
-		},
-		{
-			name:  "an env wrapper with an option word outside the subset",
-			value: "/usr/bin/env --debug /path/to/hfdesk " + tail,
-			form:  "--debug",
-		},
-		{
-			name:  "a command without the run vector",
-			value: "/opt/hfdesk-old/hfdesk --serve",
-			form:  "--serve",
-		},
-		{
-			name:  "a command whose vector is not the run vector",
-			value: "/opt/hfdesk-old/hfdesk service status",
-			form:  "service status",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			content := "[Service]\nExecStart=" + tc.value + "\n"
-			if _, err := updateSystemdExecStartSource(content, opts); err == nil {
-				t.Fatal("updateSystemdExecStartSource() = nil, want the refusal of the unrewritable form")
-			}
-			err := validateSystemdExecStartUpdate(content, executable)
-			if err == nil {
-				t.Fatal("validateSystemdExecStartUpdate() = nil, want the refusal of the unrewritable form")
-			}
-			for _, want := range []string{"ExecStart=", tc.form, "not changed", executable} {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("validateSystemdExecStartUpdate() = %q, want it to contain %q", err, want)
-				}
-			}
-		})
-	}
 }
 
 // TestSystemdInstallRefusesUnrewritableExecStartBeforeChangingTheUnit checks
@@ -1751,44 +1399,29 @@ func TestSystemdUpdateOfARunningEnvWrappedExecStartRefusesBeforeTheRestart(t *te
 }
 
 // TestSystemdWrapperRegistrationReportsPreservedRunFlags checks that the
-// options read back from a recognized wrapper form are the flags the
-// instance really runs with: registrationOptions and the effective options
-// of an update report the values behind the "env" prefix, the words of the
-// prefix itself are never mistaken for run flags, and a dynamic run flag
-// behind the wrapper is still reported as dynamic.
+// facts read back from a recognized wrapper form are the flags the instance
+// really runs with: the Status of a wrapped registration reports the values
+// behind the "env" prefix, the words of the prefix itself are never
+// mistaken for run flags, and a dynamic run flag behind the wrapper is
+// still reported as dynamic.
 func TestSystemdWrapperRegistrationReportsPreservedRunFlags(t *testing.T) {
-	t.Run("registrationOptions reads the run flags behind the wrapper", func(t *testing.T) {
-		unit := `[Service]
-ExecStart=/usr/bin/env -i HF_ARGS=--listen HF_HOME=/srv/hfdesk /opt/hfdesk/hfdesk service run --config /srv/etc/hfdesk.json --state-dir /srv/state --log-dir /srv/log --listen 127.0.0.1:19090 --cache-dir /srv/cache --hub-dir /srv/cache/hub --local-dir /srv/models
-WorkingDirectory=/srv/state
-`
-		got := registrationOptions(parseUnit(unit), ScopeUser)
-		if got.Listen != "127.0.0.1:19090" {
-			t.Errorf("listen = %q, want the registered 127.0.0.1:19090; the --listen-shaped word of the env prefix must not be read as a run flag", got.Listen)
+	t.Run("the status reads the run flags behind the wrapper", func(t *testing.T) {
+		status := systemdStatusOf(t, "/usr/bin/env", "-i", "HF_ARGS=--listen", "HF_HOME=/srv/hfdesk", "/opt/hfdesk/hfdesk",
+			"service", "run", "--config", "/srv/etc/hfdesk.json", "--state-dir", "/srv/state", "--log-dir", "/srv/log",
+			"--listen", "127.0.0.1:19090", "--cache-dir", "/srv/cache", "--hub-dir", "/srv/cache/hub", "--local-dir", "/srv/models")
+		if status.Listen != "127.0.0.1:19090" {
+			t.Errorf("listen = %q, want the registered 127.0.0.1:19090; the --listen-shaped word of the env prefix must not be read as a run flag", status.Listen)
 		}
 		wantPaths := runtimepaths.Paths{
 			ConfigFile: "/srv/etc/hfdesk.json",
 			StateDir:   "/srv/state",
 			LogDir:     "/srv/log",
 		}
-		if got.Paths != wantPaths {
-			t.Errorf("paths = %+v, want the registered %+v", got.Paths, wantPaths)
+		if status.Paths != wantPaths {
+			t.Errorf("paths = %+v, want the registered %+v", status.Paths, wantPaths)
 		}
-		for _, pair := range []struct {
-			name string
-			got  string
-			want string
-		}{
-			{"cache root", got.CacheDir, "/srv/cache"},
-			{"hub dir", got.HubDir, "/srv/cache/hub"},
-			{"local dir", got.LocalDir, "/srv/models"},
-		} {
-			if pair.got != pair.want {
-				t.Errorf("%s = %q, want the registered %q", pair.name, pair.got, pair.want)
-			}
-		}
-		if got.Executable != "/opt/hfdesk/hfdesk" {
-			t.Errorf("executable = %q, want the program of the wrapped command, not the wrapper token", got.Executable)
+		if status.Executable != "/opt/hfdesk/hfdesk" {
+			t.Errorf("executable = %q, want the program of the wrapped command, not the wrapper token", status.Executable)
 		}
 	})
 
@@ -1801,7 +1434,7 @@ WorkingDirectory=/srv/state
 		if parsed.DynamicRunArgs["listen"] {
 			t.Errorf("DynamicRunArgs = %v, want the static --listen not marked dynamic", parsed.DynamicRunArgs)
 		}
-		if got := registrationOptions(parsed, ScopeUser).Listen; got != "127.0.0.1:19090" {
+		if got := parsed.listen(); got != "127.0.0.1:19090" {
 			t.Errorf("listen = %q, want the static address registered next to the dynamic flag", got)
 		}
 	})
@@ -2154,7 +1787,7 @@ func TestSystemdReinstallRefusesAShadowedLoadedCommand(t *testing.T) {
 		t.Errorf("the simulated loaded unit changed after refusal (error %v):\n%s\nwant\n%s", readErr, loaded, loadedUnit)
 	}
 	registered := parseUnit(string(loaded))
-	if registered.ExecStart != oldExecutable || registered.listen() != previous.Listen || registered.flagValue("--config") != overrideConfig || registered.Environment["HF_HUB_CACHE"] != "/operator/hub" {
+	if registered.Program != oldExecutable || registered.listen() != previous.Listen || registered.flagValue("--config") != overrideConfig || registered.Environment["HF_HUB_CACHE"] != "/operator/hub" {
 		t.Errorf("the loaded override does not retain its distinct config/environment: %+v", registered)
 	}
 	typed, err := loadedConfigFromProperties(loadedProperties)

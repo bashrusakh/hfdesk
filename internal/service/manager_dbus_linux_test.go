@@ -243,12 +243,7 @@ func setSystemdTestPropertyReader(t *testing.T, manager *systemdManager) {
 }
 
 func systemdTestPropertiesFromUnit(content string) map[string]dbus.Variant {
-	unit := parseUnit(content)
 	var commands []systemdExecStartExEntry
-	if unit.ExecStartRaw != "" {
-		argv := append([]string{unit.ExecStartRaw}, unit.ExecArgsRaw...)
-		commands = append(commands, systemdExecStartExEntry{Path: unit.ExecStartRaw, Argv: argv})
-	}
 	var environment []string
 	var environmentFiles []systemdEnvironmentFile
 	var supplementaryGroups []string
@@ -267,6 +262,13 @@ func systemdTestPropertiesFromUnit(content string) map[string]dbus.Variant {
 			continue
 		}
 		switch strings.TrimSpace(key) {
+		case "ExecStart":
+			// The typed projection the supervisor stores is the word
+			// vector of the directive the way the file carries it.
+			argv := splitSystemdWords(value)
+			if len(argv) > 0 {
+				commands = []systemdExecStartExEntry{{Path: argv[0], Argv: argv}}
+			}
 		case "Environment":
 			environment = append(environment, splitSystemdWords(value)...)
 		case "SupplementaryGroups":
@@ -287,6 +289,7 @@ func systemdTestPropertiesFromUnit(content string) map[string]dbus.Variant {
 			}
 		}
 	}
+	unit := parseUnit(content)
 	return map[string]dbus.Variant{
 		"ExecStartEx":         dbus.MakeVariant(commands),
 		"WorkingDirectory":    dbus.MakeVariant(unit.WorkingDirectory),
@@ -351,20 +354,24 @@ func setSystemdTypedPropertySequence(t *testing.T, manager *systemdManager, prop
 func TestSystemdDetectExecStartOverride(t *testing.T) {
 	unitPath := "/etc/systemd/system/hfdesk.service"
 	content := []byte(canonicalGoldenSystemUnitText)
+	t.Setenv("HOME", "/home/golden")
+	facts, err := readCanonicalUnit(content, ScopeSystem)
+	if err != nil {
+		t.Fatalf("readCanonicalUnit() = %v, want the facts of the golden machine-wide unit", err)
+	}
 
 	matching, err := loadedConfigFromProperties(systemdTestPropertiesFromUnit(string(content)))
 	if err != nil {
 		t.Fatalf("decode the matching typed configuration: %v", err)
 	}
-	if err := detectExecStartOverride(unitPath, matching, content); err != nil {
+	if err := detectExecStartOverride(unitPath, matching, facts); err != nil {
 		t.Errorf("detectExecStartOverride() over the matching command = %v, want nil", err)
 	}
-	if err := detectExecStartOverride(unitPath, systemdLoadedConfig{}, content); err != nil {
+	if err := detectExecStartOverride(unitPath, systemdLoadedConfig{}, facts); err != nil {
 		t.Errorf("detectExecStartOverride() over an unloaded unit = %v, want nil", err)
 	}
 
-	parsed := parseUnit(string(content))
-	argv := append([]string{parsed.ExecStartRaw}, parsed.ExecArgsRaw...)
+	argv := splitSystemdWords(systemdExecStart(facts.installOptions()))
 	override := slices.Clone(argv)
 	for i, arg := range override {
 		if arg == "--config" {
@@ -387,7 +394,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode the typed override: %v", err)
 		}
-		err = detectExecStartOverride(unitPath, loaded, content)
+		err = detectExecStartOverride(unitPath, loaded, facts)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the refusal of an overridden command")
 		}
@@ -402,7 +409,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode the typed override: %v", err)
 		}
-		err = detectExecStartOverride(unitPath, loaded, content)
+		err = detectExecStartOverride(unitPath, loaded, facts)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the fail-closed refusal of a drifted command")
 		}
@@ -419,7 +426,7 @@ func TestSystemdDetectExecStartOverride(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode the typed command: %v", err)
 		}
-		err = detectExecStartOverride(unitPath, loaded, content)
+		err = detectExecStartOverride(unitPath, loaded, facts)
 		if err == nil {
 			t.Fatal("detectExecStartOverride() = nil, want the refusal of a command the file does not describe")
 		}

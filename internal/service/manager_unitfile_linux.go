@@ -13,38 +13,12 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 )
-
-// registrationOptions returns the installation options a unit registers.
-//
-// The values come from the argument vector and the identity directives of the
-// unit, so an installation over an existing registration keeps what the
-// instance really runs with instead of what a command line would default to.
-// The executable names the program of the registered command, not the
-// wrapper token a recognized "env" prefix starts with.
-func registrationOptions(unit parsedUnit, scope Scope) InstallOptions {
-	opts := InstallOptions{
-		Scope:      scope,
-		Executable: unit.Program,
-		Listen:     unit.listen(),
-		Paths:      unit.paths(),
-		CacheDir:   unit.flagValue("--cache-dir"),
-		HubDir:     unit.flagValue("--hub-dir"),
-		LocalDir:   unit.flagValue("--local-dir"),
-	}
-	// A user scope unit names no account: it runs as the user of the
-	// session, and an account of the request never applies to it.
-	if scope == ScopeSystem {
-		opts.ServiceUser = unit.User
-	}
-	return opts
-}
 
 // execStartPath returns the program path of the ExecStart property, which the
 // supervisor reports as a structure:
@@ -99,7 +73,7 @@ func execStartProgram(output string) (program string, readable bool) {
 	path := execStartPath(output)
 	tokens := execStartArgvWords(output)
 	if len(tokens) == 0 {
-		tokens = []systemdWord{{source: path, value: path}}
+		tokens = []systemdWord{{value: path}}
 	}
 	slot, ok := systemdExecStartSlot(tokens)
 	if !ok {
@@ -133,7 +107,7 @@ func execStartArgvWords(output string) []systemdWord {
 		rest = strings.TrimSuffix(rest, "}")
 		var words []systemdWord
 		for _, word := range strings.Fields(rest) {
-			words = append(words, systemdWord{source: word, value: word})
+			words = append(words, systemdWord{value: word})
 		}
 		return words
 	}
@@ -850,144 +824,6 @@ func unitChangedDuringUpdateRefusal(unitPath string) error {
 		unitPath, "hfdesk service install")
 }
 
-type systemdDirectiveChange struct {
-	value  string
-	remove bool
-}
-
-// updateUnit changes only native directives that carry options explicitly
-// named by an update. Every other line, including directives HFDesk does not
-// interpret, stays intact.
-func updateUnit(content string, opts InstallOptions, account *user.User) (string, error) {
-	execStart, err := updateSystemdExecStartSource(content, opts)
-	if err != nil {
-		return "", err
-	}
-	changes := map[string]systemdDirectiveChange{
-		"ExecStart": {value: execStart},
-	}
-	if opts.Explicit.StateDir {
-		workingDirectory, err := systemdWorkingDirectoryValue(opts.Paths.StateDir)
-		if err != nil {
-			return "", err
-		}
-		changes["WorkingDirectory"] = systemdDirectiveChange{value: workingDirectory}
-	}
-	if opts.Explicit.ServiceUser {
-		identity, err := unitIdentity(opts, account)
-		if err != nil {
-			return "", err
-		}
-		changes["User"] = systemdDirectiveChange{value: systemdQuote(opts.ServiceUser)}
-		changes["Group"] = systemdDirectiveChange{remove: true}
-		for _, line := range strings.Split(identity, "\n") {
-			key, value, ok := strings.Cut(line, "=")
-			if ok {
-				changes[key] = systemdDirectiveChange{value: value}
-			}
-		}
-	}
-	return updateSystemdServiceDirectives(content, changes)
-}
-
-func updateSystemdExecStartSource(content string, opts InstallOptions) (string, error) {
-	value, ok := systemdExecStartValue(content)
-	if !ok {
-		return systemdExecStart(opts), nil
-	}
-	tokens := splitSystemdWordTokens(strings.TrimSpace(value))
-	if len(tokens) == 0 {
-		return systemdExecStart(opts), nil
-	}
-	slot, err := systemdExecStartProgramSlot(tokens, opts.Executable)
-	if err != nil {
-		return "", err
-	}
-	// Only the program slot changes: a recognized wrapper prefix before it
-	// and the canonical arguments behind it stay exactly as they are.
-	prefix, command := tokens[:slot], tokens[slot:]
-	command[0] = systemdSourceWord(systemdCommandPrefix(command[0].source) + systemdQuoteCommandAlways(opts.Executable))
-	for _, option := range []struct {
-		name     string
-		value    string
-		explicit bool
-		present  bool
-	}{
-		{"config", opts.Paths.ConfigFile, opts.Explicit.Config, opts.Paths.ConfigFile != ""},
-		{"state-dir", opts.Paths.StateDir, opts.Explicit.StateDir, opts.Paths.StateDir != ""},
-		{"log-dir", opts.Paths.LogDir, opts.Explicit.LogDir, opts.Paths.LogDir != ""},
-		{"listen", listenArg(opts.Listen), opts.Explicit.Listen, listenArg(opts.Listen) != ""},
-		{"cache-dir", opts.CacheDir, opts.Explicit.CacheDir, opts.CacheDir != ""},
-		{"hub-dir", opts.HubDir, opts.Explicit.HubDir, opts.HubDir != ""},
-		{"local-dir", opts.LocalDir, opts.Explicit.LocalDir, opts.LocalDir != ""},
-	} {
-		if !option.explicit {
-			continue
-		}
-		command = replaceSystemdRunFlag(command, option.name, option.value, option.present)
-	}
-	words := make([]string, 0, len(prefix)+len(command))
-	for _, token := range prefix {
-		words = append(words, token.source)
-	}
-	for _, token := range command {
-		words = append(words, token.source)
-	}
-	return strings.Join(words, " "), nil
-}
-
-// systemdExecStartValue returns the value of the first ExecStart= directive
-// of the [Service] section, exactly as the line carries it.
-func systemdExecStartValue(content string) (string, bool) {
-	section := ""
-	for _, line := range systemdLogicalLines(content) {
-		trimmed := strings.TrimSpace(line.text)
-		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-			section = strings.ToLower(strings.TrimSpace(trimmed[1 : len(trimmed)-1]))
-			continue
-		}
-		if section != "service" {
-			continue
-		}
-		key, value, ok := strings.Cut(trimmed, "=")
-		if !ok || strings.TrimSpace(key) != "ExecStart" {
-			continue
-		}
-		return value, true
-	}
-	return "", false
-}
-
-// validateSystemdExecStartUpdate reports an ExecStart= form the directive
-// editor cannot rewrite into the new program. The installation itself no
-// longer reaches the editor — detector A refuses every base file the
-// renderer did not write — so this rule now guards only the editor helpers
-// their grammar tests still exercise, until the editor is deleted.
-func validateSystemdExecStartUpdate(content, executable string) error {
-	value, ok := systemdExecStartValue(content)
-	if !ok {
-		return nil
-	}
-	tokens := splitSystemdWordTokens(strings.TrimSpace(value))
-	if len(tokens) == 0 {
-		return nil
-	}
-	_, err := systemdExecStartProgramSlot(tokens, executable)
-	return err
-}
-
-// systemdExecStartProgramSlot returns the index of the token an ExecStart
-// update replaces with the new program, or refuses a command whose shape
-// systemdExecStartSlot does not recognize: those forms are refused instead
-// of being turned into a command that cannot start.
-func systemdExecStartProgramSlot(tokens []systemdWord, executable string) (int, error) {
-	slot, ok := systemdExecStartSlot(tokens)
-	if !ok {
-		return 0, systemdExecStartRefusal(tokens, executable)
-	}
-	return slot, nil
-}
-
 // systemdExecStartSlot returns the index of the program token of a command
 // and whether the command has a recognized shape: the program alone, or the
 // program followed by the canonical "service run" vector, optionally behind
@@ -1100,126 +936,51 @@ func systemdEnvAssignmentWord(word string) bool {
 	return true
 }
 
-// systemdExecStartRefusal reports an ExecStart= form the update refuses to
-// rewrite. The error states the result (nothing was changed), the cause (the
-// command it found, named in the message) and the next action.
-func systemdExecStartRefusal(tokens []systemdWord, executable string) error {
-	return fmt.Errorf("service: the update was refused and the registration was not changed: the existing ExecStart=%q is not a command an installation can rewrite. Set the ExecStart= line to start with the program %q followed by \"service run\" (an \"env\" prefix before the program is kept) and run the installation again",
-		shownSystemdCommand(tokens), executable)
-}
-
-// shownSystemdCommand renders the command of an ExecStart= line for an error
-// message: the source words the line carries, truncated after a few words so
-// a long vector stays readable.
-func shownSystemdCommand(tokens []systemdWord) string {
-	const shownWords = 6
-	shown := make([]string, 0, shownWords+1)
-	for i, token := range tokens {
-		if i == shownWords {
-			shown = append(shown, "...")
-			break
-		}
-		shown = append(shown, token.source)
-	}
-	return strings.Join(shown, " ")
-}
-
-func systemdSourceWord(source string) systemdWord {
-	if words := splitSystemdWordTokens(source); len(words) == 1 {
-		return words[0]
-	}
-	return systemdWord{source: source, value: source}
-}
-
-func systemdCommandPrefix(source string) string {
-	for i := 0; i < len(source); i++ {
-		if strings.ContainsRune("-@:+!", rune(source[i])) {
-			continue
-		}
-		return source[:i]
-	}
-	return source
-}
-
-func replaceSystemdRunFlag(words []systemdWord, name, value string, present bool) []systemdWord {
-	layout := scanSystemdRunArgs(words, true)
-	occurrences := make(map[int]int)
-	insertAt := layout.insertionPoint
-	for _, option := range layout.options {
-		if option.name == name {
-			occurrences[option.start] = option.end
-			insertAt = option.start
-		}
-	}
-	var updated []systemdWord
-	for i := 0; i < len(words); {
-		if i == insertAt && present {
-			updated = append(updated, systemdSourceWord("--"+name), systemdSourceWord(systemdQuoteCommand(value)))
-		}
-		if occurrence, ok := occurrences[i]; ok {
-			i = occurrence
-			continue
-		}
-		updated = append(updated, words[i])
-		i++
-	}
-	if insertAt == len(words) && present {
-		updated = append(updated, systemdSourceWord("--"+name), systemdSourceWord(systemdQuoteCommand(value)))
-	}
-	return updated
-}
-
+// systemdRunOption is one recognized run flag occurrence of a command: the
+// flag name and whether its source carries a specifier or environment
+// reference the supervisor expands.
 type systemdRunOption struct {
-	name       string
-	start, end int
-	dynamic    bool
-}
-
-type systemdRunArgLayout struct {
-	options        []systemdRunOption
-	terminator     int
-	insertionPoint int
+	name    string
+	dynamic bool
 }
 
 // scanSystemdRunArgs follows the option/value consumption used by Go's
-// flag.FlagSet: a separate option consumes its next word even when it is "--".
-func scanSystemdRunArgs(words []systemdWord, executableIncluded bool) systemdRunArgLayout {
+// flag.FlagSet: a separate option consumes its next word even when it is
+// "--", and a standalone "--" ends the flags. The words behind the program
+// and the "service run" vector are scanned, so the run flags are found
+// exactly where the canonical vector writes them; a word the flag grammar
+// does not recognize ends the scan instead of being guessed.
+func scanSystemdRunArgs(words []systemdWord) []systemdRunOption {
 	start := 0
-	if executableIncluded && len(words) > 0 {
-		start = 1
-	}
 	if len(words) >= start+2 && words[start].value == "service" && words[start+1].value == "run" {
 		start += 2
 	} else if len(words) > start && words[start].value == "run" {
 		start++
 	}
 
-	layout := systemdRunArgLayout{terminator: -1, insertionPoint: len(words)}
+	var options []systemdRunOption
 	for i := start; i < len(words); {
 		if words[i].value == "--" {
-			layout.terminator = i
-			layout.insertionPoint = i
-			return layout
+			return options
 		}
 		name, hasInlineValue, ok := parseSystemdRunOption(words[i].value)
 		if !ok {
-			layout.insertionPoint = i
-			return layout
+			return options
 		}
 		end := i + 1
 		dynamic := words[i].dynamic
 		if !hasInlineValue {
 			if end == len(words) {
-				layout.options = append(layout.options, systemdRunOption{name: name, start: i, end: end, dynamic: dynamic})
-				return layout
+				options = append(options, systemdRunOption{name: name, dynamic: dynamic})
+				return options
 			}
 			dynamic = words[end].dynamic
 			end++
 		}
-		layout.options = append(layout.options, systemdRunOption{name: name, start: i, end: end, dynamic: dynamic})
+		options = append(options, systemdRunOption{name: name, dynamic: dynamic})
 		i = end
 	}
-	return layout
+	return options
 }
 
 func parseSystemdRunOption(word string) (name string, hasInlineValue, ok bool) {
@@ -1241,84 +1002,6 @@ func parseSystemdRunOption(word string) (name string, hasInlineValue, ok bool) {
 		return "", false, false
 	}
 	return name, hasInlineValue, true
-}
-
-func updateSystemdServiceDirectives(content string, changes map[string]systemdDirectiveChange) (string, error) {
-	lines := strings.Split(content, "\n")
-	logicalLines := systemdLogicalLines(content)
-	section := ""
-	serviceHeader := -1
-	counts := make(map[string]int, len(changes))
-	for _, line := range logicalLines {
-		trimmed := strings.TrimSpace(line.text)
-		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-			section = strings.ToLower(strings.TrimSpace(trimmed[1 : len(trimmed)-1]))
-			if section == "service" && serviceHeader < 0 {
-				serviceHeader = line.start
-			}
-			continue
-		}
-		if section != "service" || trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
-			continue
-		}
-		key, _, ok := strings.Cut(trimmed, "=")
-		key = strings.TrimSpace(key)
-		if _, changing := changes[key]; ok && changing {
-			counts[key]++
-		}
-	}
-	if serviceHeader < 0 {
-		return "", errors.New("service: the existing unit has no [Service] section to update")
-	}
-	if counts["ExecStart"] > 1 {
-		return "", errors.New("service: the existing unit has multiple ExecStart directives; refusing to replace an ambiguous command")
-	}
-
-	ordered := []string{"ExecStart", "WorkingDirectory", "User", "Group"}
-	var updated []string
-	section = ""
-	appendOriginal := func(line systemdLogicalLine) {
-		updated = append(updated, lines[line.start:line.end+1]...)
-	}
-	for _, line := range logicalLines {
-		trimmed := strings.TrimSpace(line.text)
-		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-			section = strings.ToLower(strings.TrimSpace(trimmed[1 : len(trimmed)-1]))
-			appendOriginal(line)
-			if line.start == serviceHeader {
-				for _, key := range ordered {
-					change, changing := changes[key]
-					if changing && !change.remove && counts[key] == 0 {
-						updated = append(updated, key+"="+change.value)
-					}
-				}
-			}
-			continue
-		}
-		if section == "service" {
-			key, _, ok := strings.Cut(trimmed, "=")
-			key = strings.TrimSpace(key)
-			if change, changing := changes[key]; ok && changing {
-				if change.remove {
-					continue
-				}
-				updated = append(updated, replaceUnitDirective(lines[line.start], key, change.value))
-				continue
-			}
-		}
-		appendOriginal(line)
-	}
-	return strings.Join(updated, "\n"), nil
-}
-
-func replaceUnitDirective(line, key, value string) string {
-	ending := ""
-	if strings.HasSuffix(line, "\r") {
-		ending = "\r"
-		line = strings.TrimSuffix(line, "\r")
-	}
-	indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
-	return indent + key + "=" + value + ending
 }
 
 // systemdStopTimeout returns the value of the TimeoutStopSec directive of a
@@ -1526,19 +1209,12 @@ func systemdQuoteCommandAlways(value string) string {
 
 // parsedUnit holds the registration facts of a unit file.
 type parsedUnit struct {
-	// ExecStart is the executable of the unit.
-	ExecStart string
-	// ExecStartRaw and ExecArgsRaw retain the systemd-parsed, pre-environment-
-	// expansion values reported by D-Bus. The resolved fields below are for
-	// interpreting the options the running process receives.
-	ExecStartRaw string
-	ExecArgsRaw  []string
-	// Dynamic marks source words that systemd expands as specifiers or
-	// environment references. Those source expressions are kept separate from
-	// the manager's typed loaded values.
-	ExecStartDynamic bool
-	ExecArgsDynamic  []bool
-	DynamicRunArgs   map[string]bool
+	// DynamicRunArgs marks the run flags whose source systemd expands as
+	// a specifier or an environment reference. The source expressions are
+	// kept separate from the manager's typed loaded values, so a rollback
+	// can stay conservative about paths such a prior registration may
+	// reference.
+	DynamicRunArgs map[string]bool
 	// ExecArgs are the arguments of the executable.
 	ExecArgs []string
 	// Program is the program of the registered command: the token at the
@@ -1624,28 +1300,20 @@ func parseUnit(content string) parsedUnit {
 		switch strings.TrimSpace(key) {
 		case "ExecStart":
 			tokens := splitSystemdWordTokens(value)
-			rawWords := make([]string, len(tokens))
-			for i, token := range tokens {
-				rawWords[i] = token.value
-			}
-			if len(rawWords) == 0 {
+			if len(tokens) == 0 {
 				continue
 			}
-			words := resolveSystemdDollars(slices.Clone(rawWords))
-			unit.ExecStartRaw = rawWords[0]
-			unit.ExecArgsRaw = append([]string(nil), rawWords[1:]...)
-			unit.ExecStartDynamic = tokens[0].dynamic
-			unit.ExecArgsDynamic = make([]bool, len(tokens)-1)
-			for i := 1; i < len(tokens); i++ {
-				unit.ExecArgsDynamic[i-1] = tokens[i].dynamic
+			values := make([]string, len(tokens))
+			for i, token := range tokens {
+				values[i] = token.value
 			}
+			words := resolveSystemdDollars(values)
 			// The run flags follow the program token, behind a
 			// recognized wrapper prefix; an unrecognized command
 			// keeps reading from the first argument, as before.
 			runOffset, _ := systemdExecStartSlot(tokens)
 			unit.RunOffset = runOffset
 			unit.DynamicRunArgs = dynamicRunArgValues(tokens[1+runOffset:])
-			unit.ExecStart = words[0]
 			unit.ExecArgs = words[1:]
 			// The program of the command sits at the same slot; an
 			// unrecognized shape keeps the first token.
@@ -1729,7 +1397,6 @@ func hasSystemdLineContinuation(line string) bool {
 }
 
 type systemdWord struct {
-	source  string
 	value   string
 	dynamic bool
 }
@@ -1752,28 +1419,25 @@ func splitSystemdWordTokens(line string) []systemdWord {
 		words     []systemdWord
 		word      strings.Builder
 		expansion strings.Builder
-		start     = -1
 		quote     byte
+		inWord    bool
 	)
-	flush := func(end int) {
-		if start < 0 {
+	flush := func() {
+		if !inWord {
 			return
 		}
 		words = append(words, systemdWord{
-			source:  line[start:end],
 			value:   word.String(),
 			dynamic: hasSystemdExpansion(expansion.String()),
 		})
 		word.Reset()
 		expansion.Reset()
-		start = -1
+		inWord = false
 	}
 	for i := 0; i < len(line); {
 		c := line[i]
 		if c == '\\' {
-			if start < 0 {
-				start = i
-			}
+			inWord = true
 			value, next := unescapeSystemdSequence(line, i)
 			word.WriteString(value)
 			expansion.WriteString(value)
@@ -1781,9 +1445,7 @@ func splitSystemdWordTokens(line string) []systemdWord {
 			continue
 		}
 		if c == '%' && i+1 < len(line) && line[i+1] == '%' {
-			if start < 0 {
-				start = i
-			}
+			inWord = true
 			word.WriteByte('%')
 			expansion.WriteString("%%")
 			i += 2
@@ -1801,22 +1463,18 @@ func splitSystemdWordTokens(line string) []systemdWord {
 		}
 		switch c {
 		case '\'', '"':
-			if start < 0 {
-				start = i
-			}
+			inWord = true
 			quote = c
 		case ' ', '\t', '\n', '\r':
-			flush(i)
+			flush()
 		default:
-			if start < 0 {
-				start = i
-			}
+			inWord = true
 			word.WriteByte(c)
 			expansion.WriteByte(c)
 		}
 		i++
 	}
-	flush(len(line))
+	flush()
 	return words
 }
 
@@ -1850,7 +1508,7 @@ func isSystemdVariableNameStart(c byte) bool {
 
 func dynamicRunArgValues(args []systemdWord) map[string]bool {
 	values := make(map[string]bool)
-	for _, option := range scanSystemdRunArgs(args, false).options {
+	for _, option := range scanSystemdRunArgs(args) {
 		values[option.name] = option.dynamic
 	}
 	return values

@@ -463,41 +463,6 @@ func instanceDirs(opts InstallOptions) []instanceDir {
 	return unique
 }
 
-func systemdInstanceDirs(opts InstallOptions, dynamic map[string]bool) []instanceDir {
-	dirs := instanceDirs(opts)
-	filtered := make([]instanceDir, 0, len(dirs))
-	for _, dir := range dirs {
-		if dir.name == "config dir" && dynamic["config"] ||
-			dir.name == "state dir" && dynamic["state-dir"] ||
-			dir.name == "log dir" && dynamic["log-dir"] {
-			continue
-		}
-		filtered = append(filtered, dir)
-	}
-	return filtered
-}
-
-func prepareSystemdInstanceDirs(opts InstallOptions, dirs []instanceDir, dynamic map[string]bool) error {
-	if !dynamic["config"] && !dynamic["state-dir"] && !dynamic["log-dir"] {
-		return PrepareDirs(opts)
-	}
-	for _, dir := range dirs {
-		if dir.path == "" || dir.path == "." {
-			return fmt.Errorf("service: %s path is required", dir.name)
-		}
-		if !filepath.IsAbs(dir.path) {
-			return fmt.Errorf("service: %s path %q must be an absolute path", dir.name, dir.path)
-		}
-		if isRootDir(dir.path) {
-			return fmt.Errorf("service: %s path %q is the filesystem root and must not be tightened", dir.name, dir.path)
-		}
-		if err := ensureDir(dir.path, dirMode); err != nil {
-			return fmt.Errorf("service: %s %q: %w", dir.name, dir.path, err)
-		}
-	}
-	return nil
-}
-
 // createdDirs returns the directories that do not exist yet on the way to
 // the path, from the top down.
 //

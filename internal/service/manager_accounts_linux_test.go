@@ -1526,12 +1526,12 @@ func TestSystemdGrantInstanceDirsUsesLoadedNativeUserAndGroup(t *testing.T) {
 	if effective.owner.UID == baseUID || effective.owner.UID != loadedUID || effective.owner.GID != loadedGID {
 		t.Fatalf("projected owner = %+v, want loaded User/Group %d:%d rather than request account %q", effective.owner, loadedUID, loadedGID, base.Username)
 	}
-	dirs := systemdInstanceDirs(opts, nil)
+	dirs := instanceDirs(opts)
 	created := make(map[string][]string, len(dirs))
 	for _, dir := range dirs {
 		created[dir.path] = createdDirs(dir.path)
 	}
-	if err := prepareSystemdInstanceDirs(opts, dirs, nil); err != nil {
+	if err := PrepareDirs(opts); err != nil {
 		t.Fatal(err)
 	}
 	manager := &systemdManager{scope: ScopeSystem}

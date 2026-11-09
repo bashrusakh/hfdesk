@@ -771,8 +771,8 @@ func TestSystemdReinstallOfARunningUnitSwitchesTheExecutable(t *testing.T) {
 		t.Fatalf("read the unit file: %v", err)
 	}
 	unit := parseUnit(string(content))
-	if unit.ExecStart != newExecutable {
-		t.Errorf("the registered executable is %q, want %q", unit.ExecStart, newExecutable)
+	if unit.Program != newExecutable {
+		t.Errorf("the registered executable is %q, want %q", unit.Program, newExecutable)
 	}
 	for _, kept := range []struct {
 		name string
@@ -823,7 +823,7 @@ func TestSystemdReinstallOfAStoppedUnitDoesNotStartIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the unit file: %v", err)
 	}
-	if got := parseUnit(string(content)).ExecStart; got != newExecutable {
+	if got := parseUnit(string(content)).Program; got != newExecutable {
 		t.Errorf("the registered executable is %q, want %q", got, newExecutable)
 	}
 
@@ -961,7 +961,7 @@ func TestSystemdUpdateOfStoredButUnloadedUnitStaysStopped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the updated unit: %v", err)
 	}
-	if got := parseUnit(string(content)).ExecStart; got != newExecutable {
+	if got := parseUnit(string(content)).Program; got != newExecutable {
 		t.Errorf("stored executable = %q, want %q", got, newExecutable)
 	}
 	if string(content) == previousUnit {
@@ -993,7 +993,7 @@ func TestSystemdUpdateUsesTypedArgvForSpacesQuotesEmptyArgsAndEnvironment(t *tes
 		t.Fatal(err)
 	}
 	registered := parseUnit(string(content))
-	if registered.ExecStart != fixture.updated.Executable || registered.flagValue("--config") != fixture.previous.Paths.ConfigFile {
+	if registered.Program != fixture.updated.Executable || registered.flagValue("--config") != fixture.previous.Paths.ConfigFile {
 		t.Errorf("updated registration = %+v; config path with spaces/quotes was not preserved", registered)
 	}
 	// The base file is the canonical rendering of the merged facts: the

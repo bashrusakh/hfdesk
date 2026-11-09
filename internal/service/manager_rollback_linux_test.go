@@ -270,7 +270,7 @@ func TestSystemdRollbackReloadFailureDoesNotRestartOrClaimRecovery(t *testing.T)
 		t.Fatalf("read the supervisor-loaded unit: %v", readErr)
 	}
 	loaded := parseUnit(string(loadedBytes))
-	if loaded.ExecStart != executable || loaded.listen() != previous.Listen || loaded.flagValue("--config") == previous.Paths.ConfigFile {
+	if loaded.Program != executable || loaded.listen() != previous.Listen || loaded.flagValue("--config") == previous.Paths.ConfigFile {
 		t.Errorf("the supervisor-loaded command does not distinguish the failed update: %+v", loaded)
 	}
 	loadedConfig, err := loadedConfigFromProperties(updatedProperties)
@@ -739,72 +739,4 @@ func mustRenderCanonical(t *testing.T, opts InstallOptions) string {
 		t.Fatalf("renderCanonicalUnit() = %v, want nil", err)
 	}
 	return content
-}
-
-// TestSystemdRestoreOfAUnitWithoutAProgramIsNotReportedAsRunning checks that
-// active metadata without a live HFDesk MainPID is not treated as a verified
-// restored instance.
-func TestSystemdRestoreOfAUnitWithoutAProgramIsNotReportedAsRunning(t *testing.T) {
-	logPath := systemdRecordingSupervisor(t)
-	root := t.TempDir()
-	systemdTempInstallEnvironment(t)
-	m := &systemdManager{scope: ScopeUser}
-	path, err := m.unitPath()
-	if err != nil {
-		t.Fatalf("unitPath() = %v", err)
-	}
-	// A registration whose command line cannot be read: the section holds
-	// no ExecStart, so the restored registration names no program.
-	content := []byte("[Unit]\nDescription=HFDesk\n\n[Service]\nWorkingDirectory=" + root + "\n")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("create the unit directory: %v", err)
-	}
-	if err := os.WriteFile(path, content, 0o644); err != nil {
-		t.Fatalf("write the unit file: %v", err)
-	}
-	if err := os.WriteFile(os.Getenv("HFDESK_TEST_SYSTEMCTL_LOADED_UNIT"), content, 0o644); err != nil {
-		t.Fatalf("write the loaded unit: %v", err)
-	}
-	m.readServiceProperties = func(context.Context, string) (map[string]dbus.Variant, error) {
-		return systemdTypedProperties("", []string{}, []string{}, root, "", "", []systemdEnvironmentFile{}), nil
-	}
-
-	m.restartWait = 250 * time.Millisecond
-	loaded, err := m.registrationUnitConfig(context.Background())
-	if err != nil {
-		t.Fatalf("registrationUnitConfig() = %v", err)
-	}
-	previous := previousRegistration{path: path, content: content, existed: true, running: true, loaded: loaded, loadedKnown: true}
-
-	// The supervisor reports the unit active, but the typed service MainPID is
-	// zero and the registration names no HFDesk process.
-	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "active")
-	err = m.restorePreviousRegistration(context.Background(), previous)
-	if err == nil {
-		t.Fatal("restorePreviousRegistration() succeeded with no live HFDesk MainPID")
-	} else if !strings.Contains(err.Error(), "service process could not be verified") {
-		t.Errorf("restorePreviousRegistration() = %v, want an explicit process-evidence failure", err)
-	}
-	if strings.Contains(err.Error(), "the previous instance was started again") {
-		t.Errorf("restorePreviousRegistration() = %v, must not claim a started instance", err)
-	}
-
-	// The state is verified and not assumed: a unit the supervisor does not
-	// report active is a restore that was not confirmed.
-	t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
-	err = m.restorePreviousRegistration(context.Background(), previous)
-	if err == nil {
-		t.Fatal("restorePreviousRegistration() = nil, want the unconfirmed state of the restored unit")
-	}
-	if !strings.Contains(err.Error(), "is not active") {
-		t.Errorf("restorePreviousRegistration() = %q, want an error that names the state it verified", err)
-	}
-	if !strings.Contains(err.Error(), "the restart of the previous instance was issued") {
-		t.Errorf("restorePreviousRegistration() = %q, want an error that reports the issued restart", err)
-	}
-
-	calls := systemdSupervisorCalls(t, logPath)
-	if got := systemdSupervisorCallsTo(calls, "restart", unitName); got != 2 {
-		t.Errorf("the unit was restarted %d times, want the restore of each call:\n%s", got, strings.Join(calls, "\n"))
-	}
 }

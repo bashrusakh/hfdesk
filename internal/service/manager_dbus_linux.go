@@ -291,30 +291,6 @@ func sessionBusAddress() string {
 	return address
 }
 
-// loadedMatchesUnit rejects an update when a drop-in or another loaded source
-// already makes the effective command differ from the unit file being edited.
-func loadedMatchesUnit(loaded systemdLoadedConfig, unit parsedUnit) error {
-	var expected []string
-	if unit.ExecStartRaw != "" {
-		expected = append([]string{unit.ExecStartRaw}, unit.ExecArgsRaw...)
-	}
-	if !loaded.loaded || len(loaded.execArgs) != len(expected) || loaded.ignoreErrors || len(loaded.execFlags) != 0 {
-		return errors.New("the effective ExecStart is not the command in the unit file")
-	}
-	if !unit.ExecStartDynamic && loaded.execPath != unit.ExecStartRaw {
-		return errors.New("the effective executable is not the command in the unit file")
-	}
-	for i, arg := range expected {
-		if i == 0 && unit.ExecStartDynamic || i > 0 && i-1 < len(unit.ExecArgsDynamic) && unit.ExecArgsDynamic[i-1] {
-			continue
-		}
-		if loaded.execArgs[i] != arg {
-			return errors.New("the effective ExecStart is not the command in the unit file")
-		}
-	}
-	return nil
-}
-
 // loadedMatchesCanonicalCommand holds the loaded command to the canonical
 // command of the unit that was written. ExecStart is the strict-owned field
 // of the ownership contract: the typed loaded vector must be exactly the
@@ -323,10 +299,10 @@ func loadedMatchesUnit(loaded systemdLoadedConfig, unit parsedUnit) error {
 // configuration.
 //
 // The expectation is the source word vector of the command the writer
-// emitted — the same projection parseUnit reports as ExecStartRaw, so the
-// escape forms the file carries (the doubled dollar sign of a literal
-// dollar sign, the doubled percent sign of a literal percent sign) are the
-// ones the supervisor stores before it spawns the process.
+// emitted, with the escape forms resolved the way the supervisor stores
+// them before it spawns the process: the doubled dollar sign of a literal
+// dollar sign stays doubled, the doubled percent sign becomes the literal
+// percent sign.
 func loadedMatchesCanonicalCommand(loaded systemdLoadedConfig, unit canonicalUnit) error {
 	expected := splitSystemdWords(systemdExecStart(unit.installOptions()))
 	if !loaded.loaded || len(loaded.execArgs) != len(expected) || loaded.ignoreErrors || len(loaded.execFlags) != 0 {
@@ -345,16 +321,16 @@ func loadedMatchesCanonicalCommand(loaded systemdLoadedConfig, unit canonicalUni
 
 // detectExecStartOverride refuses an installation whose effective command a
 // drop-in owns: ExecStart is the field HFDesk owns, so a typed loaded
-// command that differs from the command of our own unit file is an override
-// in force, and HFDesk refuses before any change instead of overwriting it.
-// The file side is read like every unit file, the loaded side is the typed
-// D-Bus projection of registrationUnitConfig, and an unloaded unit has no
-// effective command to defend.
-func detectExecStartOverride(unitPath string, loaded systemdLoadedConfig, content []byte) error {
+// command that differs from the canonical command of the file that passed
+// detector A is an override in force, and HFDesk refuses before any change
+// instead of overwriting it. The loaded side is the typed D-Bus projection
+// of registrationUnitConfig, and an unloaded unit has no effective command
+// to defend.
+func detectExecStartOverride(unitPath string, loaded systemdLoadedConfig, unit canonicalUnit) error {
 	if !loaded.loaded {
 		return nil
 	}
-	if err := loadedMatchesUnit(loaded, parseUnit(string(content))); err != nil {
+	if err := loadedMatchesCanonicalCommand(loaded, unit); err != nil {
 		return execStartOverrideRefusal(unitPath, loaded)
 	}
 	return nil
