@@ -2232,6 +2232,34 @@ func (m *singletonObservingManager) Start(ctx context.Context) error {
 	return m.fakeServiceManager.Start(ctx)
 }
 
+// readControlObservingManager reports whether the singleton object exists at
+// the moment the service mutation runs, through the same limited read-control
+// open the hold itself uses: the full-access probe of the plain observing
+// manager would be denied by exactly the descriptor this fixture pins, and a
+// denied probe cannot tell the object apart from a gone one.
+type readControlObservingManager struct {
+	*fakeServiceManager
+	existedDuringMutation []bool
+}
+
+func (m *readControlObservingManager) Install(ctx context.Context, opts service.InstallOptions) (service.InstallOptions, error) {
+	m.observe()
+	return m.fakeServiceManager.Install(ctx, opts)
+}
+
+func (m *readControlObservingManager) observe() {
+	existed := false
+	if name, err := instanceMutexName(); err == nil {
+		if namePtr, err := windows.UTF16PtrFromString(name); err == nil {
+			if handle, err := windows.OpenMutex(windows.READ_CONTROL, false, namePtr); err == nil {
+				existed = true
+				_ = windows.CloseHandle(handle)
+			}
+		}
+	}
+	m.existedDuringMutation = append(m.existedDuringMutation, existed)
+}
+
 // TestServiceHelperUpdateHoldsTheDesktopSingletonThroughItsMutation proves
 // both sides of the update window: while the mutation runs, the per-session
 // singleton exists — a desktop launched in that window finds the running
@@ -2447,8 +2475,9 @@ func TestServiceHelperRefusesWhenTheSingletonCannotBeEstablished(t *testing.T) {
 // TestServiceHelperRefusesAnIdentityThatCannotAccessTheSingleton proves the
 // refusal of an object another Windows identity owns: a hand-typed update
 // computes the real per-session name, meets an object this identity cannot
-// access and refuses before the mutation. The report names the identity
-// problem and its own step, and carries no second command.
+// access — not even through the limited read-control open of the hold — and
+// refuses before the mutation. The report names the identity problem and its
+// own step, and carries no second command.
 func TestServiceHelperRefusesAnIdentityThatCannotAccessTheSingleton(t *testing.T) {
 	name := requireFreeSingleton(t)
 	createDeniedDesktopSingleton(t, name)
@@ -2476,6 +2505,65 @@ func TestServiceHelperRefusesAnIdentityThatCannotAccessTheSingleton(t *testing.T
 	}
 	if strings.Contains(text, "hfdesk service status") {
 		t.Errorf("the report %q carries a second next action next to the step of the identity refusal", text)
+	}
+}
+
+// TestServiceHelperProceedsWhenTheSingletonGrantsOnlyReadControl proves the
+// other side of the identity model at the helper level: a descriptor that
+// grants this identity read control only denies the full-access create of
+// the hold, and the hold still succeeds through its limited open — any
+// handle keeps the object alive, which is all a hold needs — so a hand-typed
+// update runs past the hold instead of refusing. The creator's handle is
+// closed inside the mutation, so the singleton can only still exist there
+// when that limited open really holds it, and the object is gone again
+// before the final notice, like every other hold: without the fallback the
+// update would refuse here, and without a real hold the object would die
+// with its creator.
+func TestServiceHelperProceedsWhenTheSingletonGrantsOnlyReadControl(t *testing.T) {
+	name := requireFreeSingleton(t)
+	fixture := createReadControlDesktopSingleton(t, name)
+	defer func() {
+		if fixture != 0 {
+			_ = windows.CloseHandle(fixture)
+		}
+	}()
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return `C:\portable\hfdesk.exe`, nil
+	})
+	// The probe of the hold finds the fixture object, so the only other
+	// fact of the serving-desktop check would have to come from the
+	// published state: no desktop runs in this test, and that state must
+	// not be read from the configuration directory of the user.
+	replaceSeam(t, &publishedStatePresent, func() bool { return false })
+	stopped := runningServiceStatus(service.StateStopped, "127.0.0.1:18080")
+	manager := &readControlObservingManager{fakeServiceManager: &fakeServiceManager{
+		statuses: []service.Status{stopped, stopped},
+	}}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		// The creator leaves the object here: only the hold of the
+		// action can keep the singleton alive from this point on.
+		if fixture != 0 {
+			_ = windows.CloseHandle(fixture)
+			fixture = 0
+		}
+		return manager, nil
+	})
+	messages, existedAtNotice := recordMessagesWithSingletonProbe(t)
+
+	if err := RunServiceAction(ServiceActionOptions{Action: "update"}); err != nil {
+		t.Fatalf("the update refused although its descriptor grants this identity read control: %v", err)
+	}
+	if len(manager.existedDuringMutation) != 1 || !manager.existedDuringMutation[0] {
+		t.Fatalf("the singleton existed during the mutation = %v, want [true]: the read-control open of the hold must keep the object alive",
+			manager.existedDuringMutation)
+	}
+	if len(*existedAtNotice) != 1 || (*existedAtNotice)[0] {
+		t.Fatalf("the singleton existed when the final notice was shown = %v, want [false]: the hold must end before the notice",
+			*existedAtNotice)
+	}
+	requireSingletonReleased(t)
+	if len(*messages) != 1 || (*messages)[0].caption != serviceUpdatedCaption {
+		t.Fatalf("the helper showed %v, want the report of the finished update", *messages)
 	}
 }
 
@@ -2568,14 +2656,18 @@ func TestServiceHoldBehavesLikeTheDesktopInstanceLock(t *testing.T) {
 }
 
 // createDeniedDesktopSingleton creates the per-session singleton under a
-// descriptor that grants it to SYSTEM only: this identity then meets it the
-// way a relaunch meets an object another Windows account created. The
-// fixture handle is closed when the test ends, and the object dies with its
-// last handle.
+// descriptor that grants it to SYSTEM only and denies this identity — the
+// owner of the object — its owner rights: an owner is granted READ_CONTROL
+// implicitly unless the descriptor carries an owner-rights entry, so without
+// that entry this very identity could open the object through the
+// limited-access fallback of the hold and the fixture could not model an
+// identity that cannot access it at all. The fixture handle is closed when
+// the test ends, and the object dies with its last handle.
 func createDeniedDesktopSingleton(t *testing.T, name string) {
 	t.Helper()
 	descriptor, err := windows.SecurityDescriptorFromString(
-		fmt.Sprintf("D:P(A;;0x%08X;;;SY)", uint32(windows.MUTEX_ALL_ACCESS)))
+		fmt.Sprintf("D:P(D;;0x%08X;;;S-1-3-4)(A;;0x%08X;;;S-1-3-4)(A;;0x%08X;;;SY)",
+			uint32(windows.READ_CONTROL), uint32(windows.SYNCHRONIZE), uint32(windows.MUTEX_ALL_ACCESS)))
 	if err != nil {
 		t.Fatalf("build the denying descriptor: %v", err)
 	}
@@ -2599,6 +2691,46 @@ func createDeniedDesktopSingleton(t *testing.T, name string) {
 		t.Fatal("the fixture object already exists: the test would deny a real singleton")
 	}
 	t.Cleanup(func() { _ = windows.CloseHandle(handle) })
+}
+
+// createReadControlDesktopSingleton creates the per-session singleton under a
+// descriptor that grants this identity read control only: the shape the
+// object has for a hold that requested full mutex access and fell back to
+// the limited open — the create request is denied, while that access opens
+// the object, which is all a hold needs. The caller owns the returned
+// handle: closing it early proves that only the hold keeps the object
+// alive, and the object dies with its last handle.
+func createReadControlDesktopSingleton(t *testing.T, name string) windows.Handle {
+	t.Helper()
+	sid, err := currentUserSID()
+	if err != nil {
+		t.Fatalf("read the user of the process: %v", err)
+	}
+	descriptor, err := windows.SecurityDescriptorFromString(
+		fmt.Sprintf("D:P(A;;0x%08X;;;%s)", uint32(windows.READ_CONTROL), sid))
+	if err != nil {
+		t.Fatalf("build the read-control descriptor: %v", err)
+	}
+	attrs := &windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: descriptor,
+	}
+	namePtr, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		t.Fatalf("encode the singleton name: %v", err)
+	}
+	handle, err := windows.CreateMutex(attrs, false, namePtr)
+	if handle == 0 {
+		if err == nil {
+			err = errors.New("the operating system returned no handle")
+		}
+		t.Fatalf("create the read-control fixture object: %v", err)
+	}
+	if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		_ = windows.CloseHandle(handle)
+		t.Fatal("the fixture object already exists: the test would limit a real singleton")
+	}
+	return handle
 }
 
 // TestServiceHelperUpdateRejectsAVanishedRegistration proves a stopped-service
