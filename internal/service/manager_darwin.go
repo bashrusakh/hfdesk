@@ -1151,11 +1151,12 @@ type launchdInstallPlan struct {
 //     list and touches the supervisor not at all: the stopped instance stays
 //     stopped, and starting stays an explicit command.
 //
-// The disabled flag of the override database is cleared only by a first
-// installation: the job it loads must be able to start, and a repeat
-// installation never runs enable, so an administrator's `launchctl disable`
-// survives every update whether or not the attempt loaded the job. The
-// rollback below still restores the flag state it captured.
+// The disable flag of the override database is cleared only by a first
+// installation and by the two dances that must load a disabled label —
+// restarting a running disabled job above and the rollback below restoring
+// a loaded disabled registration — each of which restores the flag in the
+// same operation. Every other state is left as observed, so a repeat
+// installation never leaves an administrator's `launchctl disable` cleared.
 //
 // The report tells a rollback what the attempt did to the supervisor: the
 // state the registration had before it and whether that state was captured,
@@ -1204,13 +1205,39 @@ func (m *launchdManager) load(ctx context.Context, path string, plan launchdInst
 		// restart restores the previous property list and loads it
 		// again.
 		state.replaced = true
+		if previous.disabled {
+			// launchd refuses to load a disabled label, so the restart
+			// of a running disabled job runs the dance: enable for the
+			// load, and restore the flag before this attempt returns —
+			// the running state is preserved without leaving the
+			// disable flag cleared. A failed `enable` leaves the flag
+			// untouched, so only the exits below this point restore.
+			if _, err := m.launchctl(ctx, "enable", m.target()); err != nil {
+				return state, fmt.Errorf("service: enable %s: %w", m.target(), err)
+			}
+		}
+		// Once the dance enabled, every exit restores the flag — the
+		// rollback that follows a failed restart restores it again
+		// anyway, and the restore is a harmless re-assertion where
+		// nothing cleared it.
 		if err := m.Stop(ctx); err != nil {
+			if previous.disabled {
+				err = m.restoreDisableFlag(ctx, err)
+			}
 			return state, err
 		}
 		if err := m.Start(ctx); err != nil {
+			if previous.disabled {
+				err = m.restoreDisableFlag(ctx, err)
+			}
 			return state, err
 		}
 		state.bootstrapped = true
+		if previous.disabled {
+			if _, err := m.launchctl(ctx, "disable", m.target()); err != nil {
+				return state, fmt.Errorf("the disable flag could not be restored after the restart of %s: %w", m.target(), err)
+			}
+		}
 	case firstRegistration:
 		if _, err := m.launchctl(ctx, "bootstrap", m.domain(), path); err != nil {
 			return state, fmt.Errorf("service: bootstrap %s: %w", m.target(), err)
@@ -1231,11 +1258,11 @@ func (m *launchdManager) load(ctx context.Context, path string, plan launchdInst
 		state.replaced = true
 	}
 
-	// The first registration enables the job it registered: that is the
-	// only installation that runs enable, so the flag is cleared for a job
-	// the supervisor did not hold yet and never for a job it already held —
-	// an administrator's `launchctl disable` survives every update — and
-	// clearing the flag never starts anything by itself.
+	// A first registration enables the job it registered. The only other
+	// enable of an installation is the dance of a running disabled job
+	// above, which restores the flag in the same operation: every other
+	// state is left exactly as the supervisor reports it, so an
+	// administrator's `launchctl disable` is never left cleared.
 	if firstRegistration {
 		if _, err := m.launchctl(ctx, "enable", m.target()); err != nil {
 			return state, fmt.Errorf("service: enable %s: %w", m.target(), err)
@@ -1292,9 +1319,13 @@ func (m *launchdManager) supervisorState(ctx context.Context) (launchdSupervisor
 	if err != nil {
 		return launchdSupervisorState{}, err
 	}
+	disabled, disableErr := m.jobDisabled(ctx)
+	if disableErr != nil {
+		return launchdSupervisorState{}, disableErr
+	}
 	state := launchdSupervisorState{
 		loaded:   loaded,
-		disabled: m.jobDisabled(ctx),
+		disabled: disabled,
 		// A job that is not loaded never runs: the fact is known
 		// without an output to read it from.
 		runningKnown: !loaded,
@@ -1311,24 +1342,28 @@ func (m *launchdManager) supervisorState(ctx context.Context) (launchdSupervisor
 // override database of launchd.
 //
 // The database of the domain is asked, because that is where the disabled
-// flag of a job lives. The question is best effort: a supervisor that cannot
-// answer it is treated as one that knows no disabled job, so an installation
-// never fails because of it.
-func (m *launchdManager) jobDisabled(ctx context.Context) bool {
+// flag of a job lives. The answer is required, not best effort: a
+// supervisor that cannot answer leaves the enablement state unknown, and an
+// unknown state is never decided into an enable — the caller fails with the
+// read error instead, which preserves the flag by non-interference.
+func (m *launchdManager) jobDisabled(ctx context.Context) (bool, error) {
 	output, err := m.launchctl(ctx, "print-disabled", m.domain())
 	if err != nil {
-		return false
+		return false, fmt.Errorf("service: print-disabled %s: %w", m.domain(), err)
 	}
-	return launchdDisabledLabel(output, launchdLabel())
+	return launchdDisabledLabel(output, launchdLabel()), nil
 }
 
 // launchdDisabledLabel reports whether the output of "launchctl
 // print-disabled" says that the job of the given label is disabled.
 //
 // The output of launchd is not an API: a disabled job is listed as
-// "<label> => disabled", and a job that carries further overrides is listed
-// as a block that names the disabled flag. Both forms are read. A job that
-// is not listed at all is not disabled.
+// "<label> => disabled" on the releases that print the word, as
+// "<label> => true" on the releases that print the boolean (where "false"
+// names an enabled job), and a job that carries further overrides is listed
+// as a block that names the disabled flag. All forms are read, because a
+// boolean format this parser missed would report a disabled job as enabled.
+// A job that is not listed at all is not disabled.
 func launchdDisabledLabel(output, label string) bool {
 	lines := strings.Split(output, "\n")
 	for i, line := range lines {
@@ -1345,7 +1380,12 @@ func launchdDisabledLabel(output, label string) bool {
 			// block are read.
 			return launchdDisabledBlock(lines[i+1:])
 		}
-		return strings.Contains(strings.ToLower(value), "disabled")
+		switch strings.ToLower(value) {
+		case "disabled", "true":
+			return true
+		default:
+			return false
+		}
 	}
 	return false
 }
@@ -1485,6 +1525,21 @@ func (e *stopTimeoutError) Error() string {
 // failure of the installation never hides the failure of the rollback and a
 // success is never claimed from the write alone.
 func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, state launchdLoadState, cause error) error {
+	// The disable flag may be cleared at every point of this rollback:
+	// the attempt's restart dance may have cleared it before the attempt
+	// failed, and this rollback clears it again for its own bootstrap.
+	// Every exit therefore restores it when the flag was observed
+	// disabled — a restore is a re-assertion, so it is harmless where
+	// nothing cleared the flag — and keeps the established shape of the
+	// report: result and cause, the restore note when the restore itself
+	// fails, and the one action last.
+	restore := func(inner string, args ...interface{}) error {
+		base := fmt.Errorf("%w %s", cause, fmt.Sprintf(inner, args...))
+		if state.previous.disabled {
+			base = m.restoreDisableFlag(ctx, base)
+		}
+		return fmt.Errorf("%w; %s", base, statusReadHint)
+	}
 	// The registration of the failed attempt is unloaded when the attempt
 	// loaded the job or took over the registration of a job that was
 	// loaded already: launchd must not keep the registration of an
@@ -1493,18 +1548,29 @@ func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, stat
 	unload := state.replaced || (state.bootstrapped && !state.previous.loaded)
 	if unload {
 		if _, err := m.launchctl(ctx, "bootout", m.target()); err != nil && !isServiceMissing(err) {
-			return fmt.Errorf("%w (the registration could not be unloaded: %v)", cause, err)
+			return restore("(the registration could not be unloaded: %v)", err)
 		}
 	}
 	if err := backup.restore(); err != nil {
-		return fmt.Errorf("%w (the property list could not be restored: %v)", cause, err)
+		return restore("(the property list could not be restored: %v)", err)
 	}
 	if state.replaced {
+		if state.previous.disabled {
+			// launchd refuses to load a disabled label: the restore of
+			// a loaded disabled registration runs the dance — enable
+			// for the bootstrap, and the restore on every exit below
+			// and at the end of this function — so the rollback gives
+			// the loaded state back without leaving the disable flag
+			// cleared, whichever step of it fails.
+			if _, err := m.launchctl(ctx, "enable", m.target()); err != nil {
+				return restore("(the restored registration could not be enabled for the load: %v)", err)
+			}
+		}
 		// The attempt took over the registration of a job that was
 		// loaded before it: the restored file is loaded again, so the
 		// instance runs like it did before.
 		if _, err := m.launchctl(ctx, "bootstrap", m.domain(), backup.path); err != nil {
-			return fmt.Errorf("%w (the restored registration could not be loaded: %v)", cause, err)
+			return restore("(the restored registration could not be loaded: %v)", err)
 		}
 		// The instance ran before the attempt. A restored property list
 		// whose RunAtLoad is false is loaded by that bootstrap but not
@@ -1516,23 +1582,33 @@ func (m *launchdManager) rollback(ctx context.Context, backup *plistBackup, stat
 		if state.previous.running {
 			if restored, parseErr := parsePlist(backup.content); parseErr == nil && !restored.RunAtLoad {
 				if _, err := m.launchctl(ctx, "kickstart", m.target()); err != nil {
-					return fmt.Errorf("%w (the restored registration could not be started: %v)", cause, err)
+					return restore("(the restored registration could not be started: %v)", err)
 				}
 			}
 		}
 	}
-	// The enable state of the registration is restored: the failed
-	// attempt may have enabled a job that was disabled before it.
+	// The disable flag of the registration is restored: the dance above
+	// cleared it for the bootstrap, and a failed attempt may have cleared
+	// it another way. An attempt never disables a job that was not
+	// disabled, so no enable runs here — the flag is restored only as
+	// observed, and a job that was not disabled needs nothing back.
 	if state.previous.disabled {
 		if _, err := m.launchctl(ctx, "disable", m.target()); err != nil {
-			return fmt.Errorf("%w (the restored registration could not be disabled: %v)", cause, err)
-		}
-	} else if state.previous.loaded {
-		if _, err := m.launchctl(ctx, "enable", m.target()); err != nil {
-			return fmt.Errorf("%w (the restored registration could not be enabled: %v)", cause, err)
+			return fmt.Errorf("%w (the disable flag could not be restored: %v); %s", cause, err, statusReadHint)
 		}
 	}
 	return m.verifyRestoredRegistration(ctx, state, cause)
+}
+
+// restoreDisableFlag re-asserts the observed disable flag after a dance
+// cleared it, on a context of its own so a cancelled attempt cannot
+// degrade the restore; a restore that fails is named in the error it
+// wraps instead of being hidden.
+func (m *launchdManager) restoreDisableFlag(ctx context.Context, err error) error {
+	if _, derr := m.launchctl(context.WithoutCancel(ctx), "disable", m.target()); derr != nil {
+		return fmt.Errorf("%w (the disable flag could not be restored: %v)", err, derr)
+	}
+	return err
 }
 
 // verifyRestoredRegistration reads the restored registration back and turns
@@ -1552,19 +1628,19 @@ func (m *launchdManager) verifyRestoredRegistration(ctx context.Context, state l
 		// The attempt failed before it captured the state of the
 		// registration: there is nothing to compare a read back
 		// against, and the rollback claims only what it did itself.
-		return fmt.Errorf("%w (the property list was restored; the previous state of the registration was not captured)", cause)
+		return fmt.Errorf("%w (the property list was restored; the previous state of the registration was not captured); %s", cause, statusReadHint)
 	}
 	readback, err := m.supervisorState(context.WithoutCancel(ctx))
 	if err != nil {
-		return fmt.Errorf("%w (the state of the restored registration could not be read back: %v)", cause, err)
+		return fmt.Errorf("%w (the state of the restored registration could not be read back: %v); %s", cause, err, statusReadHint)
 	}
 	if readback.loaded != state.previous.loaded || readback.disabled != state.previous.disabled {
-		return fmt.Errorf("%w (the registration does not hold the previous state again)", cause)
+		return fmt.Errorf("%w (the registration does not hold the previous state again); %s", cause, statusReadHint)
 	}
 	if state.previous.running && !readback.running {
-		return fmt.Errorf("%w (the registration was restored, but the instance was not confirmed running)", cause)
+		return fmt.Errorf("%w (the registration was restored, but the instance was not confirmed running); %s", cause, statusReadHint)
 	}
-	return fmt.Errorf("%w (the registration was restored)", cause)
+	return fmt.Errorf("%w (the registration was restored); %s", cause, statusReadHint)
 }
 
 // plistBackup is the state of a property list before it was overwritten.

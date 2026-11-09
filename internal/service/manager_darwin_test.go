@@ -3498,6 +3498,10 @@ type darwinFakeLaunchd struct {
 	// coming up: bootstrap and kickstart succeed, but the instance never
 	// runs, the way a registration whose program fails to start behaves.
 	startIgnored bool
+	// printDisabledBoolean makes the fake answer "print-disabled" in the
+	// boolean format of the releases before Ventura ("label" => true/
+	// false) instead of the word format.
+	printDisabledBoolean bool
 	// dying marks the window between the signal of a stop and the exit
 	// the supervisor then observes: while it lasts, a fixture that hides
 	// the running fact keeps hiding it for exitPolls answers, so the exit
@@ -3529,6 +3533,12 @@ func (f *darwinFakeLaunchd) run(ctx context.Context, args ...string) (string, er
 		}
 		return f.printOutput(), nil
 	case "print-disabled":
+		if f.printDisabledBoolean {
+			if f.disabled {
+				return launchdLabel() + " => true\n", nil
+			}
+			return launchdLabel() + " => false\n", nil
+		}
 		if f.disabled {
 			return launchdLabel() + " => disabled\n", nil
 		}
@@ -3794,7 +3804,6 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 		want := []string{
 			"bootout " + launchd.target(),
 			"bootstrap " + launchd.domain() + " " + path,
-			"enable " + launchd.target(),
 			"print " + launchd.target(),
 			"print-disabled " + launchd.domain(),
 		}
@@ -3824,8 +3833,13 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			t.Errorf("rollback() = %v, want the cause of the failed installation", rollbackErr)
 		}
 
+		// The dance of the restore: launchd refuses to load a disabled
+		// label, so the rollback enables for the bootstrap and restores
+		// the flag before it reads the state back — the flag never ends
+		// up cleared.
 		want := []string{
 			"bootout " + launchd.target(),
+			"enable " + launchd.target(),
 			"bootstrap " + launchd.domain() + " " + path,
 			"disable " + launchd.target(),
 			"print " + launchd.target(),
@@ -3834,8 +3848,197 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 		if !reflect.DeepEqual(fake.commands, want) {
 			t.Errorf("the commands of the manager =\n%v\nwant\n%v", fake.commands, want)
 		}
+		if !fake.disabled {
+			t.Error("the rollback left the disable flag cleared")
+		}
 		if !strings.Contains(rollbackErr.Error(), "(the registration was restored)") {
 			t.Errorf("rollback() = %v, want the outcome that names the restored registration", rollbackErr)
+		}
+	})
+
+	t.Run("the restore of a disabled registration runs the dance", func(t *testing.T) {
+		// The second dance site: launchd refuses to load a disabled
+		// label, so a rollback that gives a loaded disabled
+		// registration back enables for the bootstrap and restores the
+		// flag in the same operation. The flag must never end up
+		// cleared — an unconditional rollback enable cleared it before.
+		launchd := darwinStatusManager(t)
+		fake := &darwinFakeLaunchd{loaded: true, running: true, pid: darwinFakePID, disabled: true}
+		launchd.run = fake.run
+		backup, _ := writeRegistration(t, launchd)
+
+		cause := errors.New("service: the installation was refused: a failure of the attempt")
+		state := launchdLoadState{
+			previous:      launchdSupervisorState{loaded: true, running: true, disabled: true},
+			previousKnown: true,
+			bootstrapped:  true,
+			replaced:      true,
+		}
+		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		if !errors.Is(rollbackErr, cause) {
+			t.Errorf("rollback() = %v, want the cause of the failed installation", rollbackErr)
+		}
+		if !fake.disabled {
+			t.Errorf("the rollback left the disable flag cleared: commands %v", fake.commands)
+		}
+		// The dance runs around the bootstrap: an enable precedes it
+		// and a disable follows it, in that order.
+		bootstrapAt, enableAt, disableAt := -1, -1, -1
+		for i, command := range fake.commands {
+			switch {
+			case command == "bootstrap "+launchd.domain()+" "+backup.path:
+				bootstrapAt = i
+			case command == "enable "+launchd.target():
+				enableAt = i
+			case command == "disable "+launchd.target():
+				disableAt = i
+			}
+		}
+		if bootstrapAt < 0 {
+			t.Fatalf("the commands of the manager = %v, want the bootstrap of the restored registration", fake.commands)
+		}
+		if enableAt < 0 || enableAt > bootstrapAt {
+			t.Errorf("the commands of the manager = %v, want an enable before the bootstrap", fake.commands)
+		}
+		if disableAt < 0 || disableAt < bootstrapAt {
+			t.Errorf("the commands of the manager = %v, want a disable that restores the flag after the bootstrap", fake.commands)
+		}
+		if !strings.Contains(rollbackErr.Error(), "(the registration was restored)") {
+			t.Errorf("rollback() = %v, want the outcome that names the restored registration", rollbackErr)
+		}
+	})
+
+	t.Run("the dance restores the flag when the bootstrap fails", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		bootstrapErr := errors.New("service: launchctl bootstrap: exit status 1: the supervisor refuses the registration")
+		fake := &darwinFakeLaunchd{
+			loaded: true, running: true, pid: darwinFakePID, disabled: true,
+			failures: map[string]error{"bootstrap": bootstrapErr},
+		}
+		launchd.run = fake.run
+		backup, _ := writeRegistration(t, launchd)
+
+		cause := errors.New("service: the installation was refused: a failure of the attempt")
+		state := launchdLoadState{
+			previous:      launchdSupervisorState{loaded: true, running: true, disabled: true},
+			previousKnown: true,
+			bootstrapped:  true,
+			replaced:      true,
+		}
+		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		if !errors.Is(rollbackErr, cause) || !strings.Contains(rollbackErr.Error(), bootstrapErr.Error()) {
+			t.Errorf("rollback() = %v, want the cause with the bootstrap failure", rollbackErr)
+		}
+		// The dance enabled and the bootstrap failed: the flag must be
+		// restored on the error exit anyway. Before the fix the early
+		// return skipped the restore and left the flag cleared.
+		commands := strings.Join(fake.commands, "\n")
+		if !strings.Contains(commands, "enable "+launchd.target()) ||
+			!strings.Contains(commands, "disable "+launchd.target()) {
+			t.Errorf("the commands of the manager =\n%s, want the dance enable and the restore disable", commands)
+		}
+		if !fake.disabled {
+			t.Errorf("the failed restore dance left the disable flag cleared: %v", fake.commands)
+		}
+		if strings.Contains(rollbackErr.Error(), "the disable flag could not be restored") {
+			t.Errorf("rollback() = %v, must not claim a restore failure for a restore that succeeded", rollbackErr)
+		}
+	})
+
+	t.Run("a restore that itself fails is named instead of hidden", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		bootstrapErr := errors.New("service: launchctl bootstrap: exit status 1: the supervisor refuses the registration")
+		disableErr := errors.New("service: launchctl disable: exit status 1: the override database refuses")
+		fake := &darwinFakeLaunchd{
+			loaded: true, running: true, pid: darwinFakePID, disabled: true,
+			failures: map[string]error{"bootstrap": bootstrapErr, "disable": disableErr},
+		}
+		launchd.run = fake.run
+		backup, _ := writeRegistration(t, launchd)
+
+		cause := errors.New("service: the installation was refused: a failure of the attempt")
+		state := launchdLoadState{
+			previous:      launchdSupervisorState{loaded: true, running: true, disabled: true},
+			previousKnown: true,
+			bootstrapped:  true,
+			replaced:      true,
+		}
+		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		if rollbackErr == nil {
+			t.Fatal("rollback() = nil, want the bootstrap failure with the named restore failure")
+		}
+		for _, want := range []string{
+			bootstrapErr.Error(),
+			"the disable flag could not be restored",
+			disableErr.Error(),
+		} {
+			if !strings.Contains(rollbackErr.Error(), want) {
+				t.Errorf("rollback() = %q, want an error that mentions %q", rollbackErr, want)
+			}
+		}
+		// The restore was attempted: disable is among the commands even
+		// though it failed.
+		restored := false
+		for _, command := range fake.commands {
+			if command == "disable "+launchd.target() {
+				restored = true
+			}
+		}
+		if !restored {
+			t.Errorf("the commands of the manager = %v, want the restore attempt", fake.commands)
+		}
+	})
+
+	t.Run("the dance restores the flag when the kickstart fails", func(t *testing.T) {
+		launchd := darwinStatusManager(t)
+		kickstartErr := errors.New("service: launchctl kickstart: exit status 1: the job refuses the start")
+		fake := &darwinFakeLaunchd{
+			loaded: true, running: true, pid: darwinFakePID, disabled: true,
+			failures: map[string]error{"kickstart": kickstartErr},
+		}
+		launchd.run = fake.run
+
+		// The restored registration carries RunAtLoad false, so the
+		// rollback explicitly kickstarts it — and that kickstart is the
+		// step that fails after the dance enabled.
+		restored, err := renderPlistWithRunAtLoad(darwinTempInstallOptions(t, t.TempDir()), nil, false)
+		if err != nil {
+			t.Fatalf("renderPlistWithRunAtLoad(): %v", err)
+		}
+		path := launchd.plistPath()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("create the registration directory: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(restored), plistMode); err != nil {
+			t.Fatalf("write the registration: %v", err)
+		}
+		backup, err := backupPlist(path)
+		if err != nil {
+			t.Fatalf("backupPlist(): %v", err)
+		}
+		if err := os.WriteFile(path, []byte("<plist>the registration of the failed installation</plist>"), plistMode); err != nil {
+			t.Fatalf("write the registration of the failed installation: %v", err)
+		}
+
+		cause := errors.New("service: the installation was refused: a failure of the attempt")
+		state := launchdLoadState{
+			previous:      launchdSupervisorState{loaded: true, running: true, disabled: true},
+			previousKnown: true,
+			bootstrapped:  true,
+			replaced:      true,
+		}
+		rollbackErr := launchd.rollback(context.Background(), backup, state, cause)
+		if !errors.Is(rollbackErr, cause) || !strings.Contains(rollbackErr.Error(), kickstartErr.Error()) {
+			t.Errorf("rollback() = %v, want the cause with the kickstart failure", rollbackErr)
+		}
+		commands := strings.Join(fake.commands, "\n")
+		if !strings.Contains(commands, "enable "+launchd.target()) ||
+			!strings.Contains(commands, "kickstart "+launchd.target()) ||
+			!strings.Contains(commands, "disable "+launchd.target()) {
+			t.Errorf("the commands of the manager =\n%s, want dance enable, failing kickstart and the restore disable", commands)
+		}
+		if !fake.disabled {
+			t.Errorf("the failed kickstart dance left the disable flag cleared: %v", fake.commands)
 		}
 	})
 
@@ -3958,7 +4161,6 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			"bootout " + launchd.target(),
 			"bootstrap " + launchd.domain() + " " + path,
 			"kickstart " + launchd.target(),
-			"enable " + launchd.target(),
 			"print " + launchd.target(),
 			"print-disabled " + launchd.domain(),
 		}
@@ -4092,7 +4294,6 @@ func TestLaunchdRollbackReloadsTheRestoredRegistration(t *testing.T) {
 			"bootout " + launchd.target(),
 			"bootstrap " + launchd.domain() + " " + path,
 			"kickstart " + launchd.target(),
-			"enable " + launchd.target(),
 			"print " + launchd.target(),
 			"print-disabled " + launchd.domain(),
 		}
@@ -4152,6 +4353,14 @@ func TestLaunchdDisabledLabel(t *testing.T) {
 		{name: "an empty database", output: "", want: false},
 		{name: "a disabled job", output: label + " => disabled\n", want: true},
 		{name: "another disabled job", output: "com.example.other => disabled\n", want: false},
+		// The boolean format of the releases before Ventura: "true"
+		// names a disabled job and "false" an enabled one. A parser that
+		// misses it reports a disabled job as enabled — the fail-open
+		// hole that let a rollback enable over an administrator's
+		// disable.
+		{name: "a disabled job in the boolean format", output: label + " => true\n", want: true},
+		{name: "an enabled job in the boolean format", output: label + " => false\n", want: false},
+		{name: "another job in the boolean format", output: "com.example.other => true\n", want: false},
 		{
 			name:   "a job with a block of overrides",
 			output: label + " => {\n\t\"Disabled\" => true\n\t\"ThrottleInterval\" => 10\n}\n",
@@ -4574,6 +4783,134 @@ func TestLaunchdInstallOverALoadedJobWithoutAFileStaysStopped(t *testing.T) {
 	}
 }
 
+// TestLaunchdRestartDanceRestoresTheDisableFlag pins the first dance site:
+// launchd refuses to load a disabled label, so the update that restarts a
+// running disabled job enables for the load and restores the flag before it
+// returns — the instance ends up running on the new program and the
+// administrator's disable survives. Both print-disabled formats feed the
+// decision, because a format the parser missed would skip the dance.
+func TestLaunchdRestartDanceRestoresTheDisableFlag(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		boolean bool
+	}{
+		{name: "the word format of Ventura and later"},
+		{name: "the boolean format of the earlier releases", boolean: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			launchd := darwinStatusManager(t)
+			fake := &darwinFakeLaunchd{
+				loaded: true, running: true, pid: darwinFakePID,
+				disabled: true, printDisabledBoolean: tc.boolean,
+			}
+			launchd.run = fake.run
+			ctx := context.Background()
+			darwinWriteRegistration(t, launchd, darwinTempInstallOptions(t, t.TempDir()))
+
+			fake.commands = nil
+			if _, err := launchd.Install(ctx, darwinTempInstallOptions(t, t.TempDir())); err != nil {
+				t.Fatalf("Install() over a running disabled job: %v", err)
+			}
+			want := []string{
+				"print " + launchd.target(),
+				"print-disabled " + launchd.domain(),
+				"enable " + launchd.target(),
+				"print " + launchd.target(),
+				"kill SIGTERM " + launchd.target(),
+				"print " + launchd.target(),
+				"bootout " + launchd.target(),
+				"print " + launchd.target(),
+				"bootstrap " + launchd.domain() + " " + launchd.plistPath(),
+				"kickstart " + launchd.target(),
+				"disable " + launchd.target(),
+			}
+			if !reflect.DeepEqual(fake.commands, want) {
+				t.Errorf("the commands of the manager =\n%v\nwant (the dance around the restart)\n%v",
+					fake.commands, want)
+			}
+			if !fake.disabled {
+				t.Error("the repeat installation left the disable flag cleared")
+			}
+			if !fake.running {
+				t.Error("the restart did not bring the instance back into service")
+			}
+		})
+	}
+}
+
+// TestLaunchdRestartDanceRestoresTheFlagWhenTheStartFails pins the restore
+// of the site-(a) dance on its own failure path: the dance enabled, the
+// start of the restart fails, and the flag is restored before the error
+// propagates — the load-side restore lands between the attempt's dance
+// enable and the rollback's own dance enable. The fixture carries
+// RunAtLoad false and fails kickstart throughout, so the rollback cannot
+// rescue the flag either: only the restores can, and the flag must never
+// end up cleared.
+func TestLaunchdRestartDanceRestoresTheFlagWhenTheStartFails(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	kickstartErr := errors.New("service: launchctl kickstart: exit status 1: the job refuses the start")
+	fake := &darwinFakeLaunchd{
+		loaded: true, running: true, pid: darwinFakePID, disabled: true,
+		failures: map[string]error{"kickstart": kickstartErr},
+	}
+	launchd.run = fake.run
+	ctx := context.Background()
+	program := darwinTempInstallOptions(t, t.TempDir())
+	darwinWriteRegistrationWithRunAtLoad(t, launchd, program, false)
+
+	fake.commands = nil
+	if _, err := launchd.Install(ctx, program); err == nil {
+		t.Fatal("Install() = nil, want the failure of the start of the restart")
+	} else if !strings.Contains(err.Error(), kickstartErr.Error()) {
+		t.Errorf("Install() = %q, want the kickstart failure as the cause", err)
+	}
+
+	enables := 0
+	restoredBeforeSecondEnable := false
+	for _, command := range fake.commands {
+		if command == "enable "+launchd.target() {
+			enables++
+		}
+		if command == "disable "+launchd.target() && enables == 1 {
+			restoredBeforeSecondEnable = true
+		}
+	}
+	if enables < 2 {
+		t.Errorf("the commands of the manager = %v, want the dance enable of the attempt and of the rollback", fake.commands)
+	}
+	// Before the fix the Start failure returned without any restore: no
+	// disable appeared between the two dance enables and the flag stayed
+	// cleared — both counts of this check fail then.
+	if !restoredBeforeSecondEnable {
+		t.Errorf("the commands of the manager = %v, want the load-side restore between the two dance enables", fake.commands)
+	}
+	if !fake.disabled {
+		t.Errorf("the failed restart left the disable flag cleared: %v", fake.commands)
+	}
+}
+
+// TestLaunchdSupervisorStateFailsClosedOnAnUnreadableEnablement pins the
+// rule for an enablement the supervisor cannot report: the state stays
+// unknown and the caller gets the read error instead of a default that
+// could decide an enable — an unknown state is never decided into one.
+func TestLaunchdSupervisorStateFailsClosedOnAnUnreadableEnablement(t *testing.T) {
+	launchd := darwinStatusManager(t)
+	fake := &darwinFakeLaunchd{loaded: true, failures: map[string]error{
+		"print-disabled": errors.New("the override database cannot be read"),
+	}}
+	launchd.run = fake.run
+
+	_, err := launchd.supervisorState(context.Background())
+	if err == nil {
+		t.Fatal("supervisorState() = nil, want the read error of an unknown enablement state")
+	}
+	for _, want := range []string{"print-disabled", "the override database cannot be read"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("supervisorState() = %q, want an error that mentions %q", err, want)
+		}
+	}
+}
+
 // TestLaunchdRefusesAnUnknownRunningFactOverALoadedJobWithoutAFile pins the
 // fail-closed refusal for the same classification — a job launchd holds
 // without a property list whose running fact the supervisor does not report
@@ -4949,10 +5286,14 @@ func TestLaunchdRefusesAnUpdateThatCannotTellWhetherTheInstanceRuns(t *testing.T
 
 		// The refusal leaves the supervisor and the registration exactly
 		// as they were: the running instance is neither unloaded nor
-		// started, and the property list of the attempt is restored.
+		// started, the property list of the attempt is restored, and
+		// the enablement is untouched — the unconditional rollback
+		// enable of an un-observed flag is gone, so no enable or
+		// disable runs for this state.
 		for _, command := range fake.commands {
 			if strings.HasPrefix(command, "bootout ") || strings.HasPrefix(command, "bootstrap ") ||
-				strings.HasPrefix(command, "kickstart ") || strings.HasPrefix(command, "kill ") {
+				strings.HasPrefix(command, "kickstart ") || strings.HasPrefix(command, "kill ") ||
+				command == "enable "+launchd.target() || command == "disable "+launchd.target() {
 				t.Errorf("the refused installation issued the mutating command %q: %v", command, fake.commands)
 			}
 		}
