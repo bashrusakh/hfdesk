@@ -567,10 +567,18 @@ func TestHandoverNoticeDoesNotHoldCompletionAuthorization(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("the handover never reached the completion wait")
 	}
+	// The instant nonblocking read of the done channel cannot observe an
+	// authorization that completes after that instant, so the check is a
+	// bounded observation window instead (the established shape of
+	// jobs_lifecycle_test): the handover goroutine is provably parked in
+	// waitForCompletion — entered closed only behind the gate read — so
+	// the window cannot fail on a correct implementation, while an
+	// authorization that completed prematurely delivers to done inside it
+	// and fails the test.
 	select {
 	case err := <-done:
 		t.Fatalf("authorization finished before the completion evidence: %v", err)
-	default:
+	case <-time.After(time.Second):
 	}
 
 	close(completionGate)

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bashrusakh/hfdesk/internal/app"
 	"github.com/bashrusakh/hfdesk/internal/service"
 )
 
@@ -49,14 +50,17 @@ func TestDesktopHostStopsServingWhenTheStateCannotBePublished(t *testing.T) {
 	// The launch publishes twice (re-pinned with the claim model): first
 	// the url-less claim of the starting window, then the effective URL
 	// once the server bound its address. The claim publishes fine here —
-	// this test drives the failure of the serving publish, where the
-	// server it would describe is already running, with the established
-	// fail-closed stop; the failure of the early claim has its own test.
+	// through the REAL PublishState, so a claim really exists on disk
+	// while the launch runs and the cleanup assertion below discriminates
+	// the removal of it — and this test drives the failure of the serving
+	// publish, where the server it would describe is already running,
+	// with the established fail-closed stop; the failure of the early
+	// claim has its own test.
 	publishedURL := ""
 	replaceSeam(t, &publishState, func(path, url string) error {
 		publishedURL = url
 		if url == "" {
-			return nil
+			return service.PublishState(path, url)
 		}
 		return errors.New("the state directory is read-only")
 	})
@@ -149,10 +153,25 @@ func TestDesktopHostDoesNotStartWhenTheStartupClaimCannotBePublished(t *testing.
 		return errors.New("the state directory is read-only")
 	})
 
+	// The application — the first step that can create a server — must be
+	// created ONLY after the claim published. The creation is observed
+	// through the seam, so a startup that builds the application before
+	// attempting the url-less claim fails this test even though every
+	// publish assertion below would still pass.
+	created := 0
+	previousNewApplication := newApplication
+	replaceSeam(t, &newApplication, func(options app.Options, version string) (*app.App, error) {
+		created++
+		return previousNewApplication(options, version)
+	})
+
 	logFile := filepath.Join(t.TempDir(), "hfdesk.log")
 	err := run(Options{}, logFile)
 	if err == nil {
 		t.Fatal("run() = nil, want the failed claim publish to end the launch")
+	}
+	if created != 0 {
+		t.Errorf("the application was created %d time(s) before the startup claim published, want the claim to publish first", created)
 	}
 	if !strings.Contains(err.Error(), "publish the startup claim") {
 		t.Errorf("run() = %q, want it to name the claim that could not be published", err)

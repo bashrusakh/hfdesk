@@ -33,6 +33,13 @@ var desktopLog = logging.NewComponentLogger("desktop")
 // failed open needs a browser that fails.
 var openBrowser = app.OpenBrowser
 
+// newApplication creates the application of the host — the first step that
+// can create a server. It is a package level variable so the startup test
+// can observe WHEN it runs: the claim of the launch must publish before
+// this ever happens, and a zero-behavior indirection keeps the production
+// path unchanged.
+var newApplication = app.New
+
 // trayStartupTimeout bounds the wait for the tray.
 //
 // The tray reports that it is ready through its ready callback. Without a
@@ -230,7 +237,7 @@ func run(o Options, logPath string) (err error) {
 		return fmt.Errorf("desktop: publish the startup claim to %s: %w", statePath, err)
 	}
 
-	application, err := app.New(o.App, o.Version)
+	application, err := newApplication(o.App, o.Version)
 	if err != nil {
 		reportStartupFailure("HFDesk could not start",
 			fmt.Sprintf("HFDesk could not read its configuration.\n\n%v", err), logPath)
