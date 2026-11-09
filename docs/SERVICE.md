@@ -321,7 +321,11 @@ confirmed stopped only rewrites the registration — it starts nothing — and
 proceeds beside that desktop, while any state that is not positively
 stopped (or cannot be read) fails closed with the same refusal. Every
 refusal changes nothing and names the one step that ends it: quit HFDesk
-from its notification-area icon and repeat the command.
+from its notification-area icon and repeat the command. One further
+refusal has no such step: a published claim that exists but cannot be read
+or parsed leaves whether a desktop serves undetermined, so the command
+refuses before it changes anything and states that cause alone — no single
+step clears a file the guard cannot inspect.
 
 The guard's reach is **per user and per session**: the singleton and the
 published state of a desktop belong to one Windows session, so a desktop of
@@ -635,6 +639,12 @@ installation holds the loaded configuration against these proofs:
   instance reports the expected version when the build version is known, and
   the main process after the restart is a different process than the one
   snapshotted before it.
+
+One radius of that proof is acknowledged on Windows: the version claim opens
+the file at the executable's path, so an image that was renamed away while
+another file took its old path lies outside what it can see — Linux proves
+the identity of the executed inode itself and survives that — and an
+identity the platform cannot prove withholds the claim instead of guessing.
 
 A failure of any proof restores the previous registration: the saved unit
 bytes are written back and read back, the supervisor reloads them, and the
