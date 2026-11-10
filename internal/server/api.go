@@ -201,21 +201,13 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 	var files []PlanFile
 	var totalSize int64
 
-	progressFunc := func(evt hfdownloader.ProgressEvent) {
-		if evt.Event == "plan_item" {
-			files = append(files, PlanFile{
-				Path: evt.Path,
-				Size: evt.Total,
-				LFS:  evt.IsLFS,
-			})
-			totalSize += evt.Total
-		}
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	err := hfdownloader.ScanPlan(ctx, dlJob, settings, progressFunc)
+	// PlanRepo returns the same plan ScanPlan streams as plan_item events,
+	// plus the plan's bounded notices, which the response carries in its
+	// own field.
+	plan, err := hfdownloader.PlanRepo(ctx, dlJob, settings)
 	if err != nil {
 		// A filtered request whose filters matched no file is a client-side
 		// selection problem, not a server failure: report it as 400 so callers
@@ -239,12 +231,22 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		return
 	}
 
+	for _, item := range plan.Items {
+		files = append(files, PlanFile{
+			Path: item.RelativePath,
+			Size: item.Size,
+			LFS:  item.LFS,
+		})
+		totalSize += item.Size
+	}
+
 	resp := PlanResponse{
 		Repo:       req.Repo,
 		Revision:   revision,
 		Files:      files,
 		TotalSize:  totalSize,
 		TotalFiles: len(files),
+		Notices:    plan.Notices,
 	}
 
 	writeJSON(w, http.StatusOK, resp)

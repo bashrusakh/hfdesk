@@ -299,6 +299,13 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	if !plan.CommitPinned {
 		emit(ProgressEvent{Level: "warn", Event: "warning", Message: "revision is not pinned to an immutable commit; partial bytes will not be resumed across calls and cache metadata is revision-addressed"})
 	}
+	// Plan notices are informational diagnostics (bounded at their source,
+	// currently the split-mention exclusions of the split-precedence rule).
+	// They ride the established warning channel so the job's progress log
+	// shows them without any change to the plan or the transfer.
+	for _, notice := range plan.Notices {
+		emit(ProgressEvent{Level: "warn", Event: "warning", Message: notice})
+	}
 	var plannedBytes int64
 	for _, item := range plan.Items {
 		plannedBytes += item.Size
