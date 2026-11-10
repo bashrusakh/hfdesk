@@ -46,3 +46,21 @@ func supportsUserScope() bool {
 func supportsNamedServiceAccount() bool {
 	return true
 }
+
+// holdDesktopSingleton reports that there is nothing to hold.
+//
+// The per-session desktop singleton belongs to the Windows desktop host.
+// macOS has no desktop host, so no such object exists here and the invariant
+// it protects has no object to hold: the release ends nothing.
+func holdDesktopSingleton(string) (func(), error) {
+	return func() {}, nil
+}
+
+// probeDesktopSingleton reports that the object did not pre-exist.
+//
+// The per-session desktop singleton belongs to the Windows desktop host.
+// macOS has no desktop host, so no such object exists here and nobody can
+// hold one: the probe reports that it did not pre-exist.
+func probeDesktopSingleton(string) (func(), bool, error) {
+	return nil, false, nil
+}

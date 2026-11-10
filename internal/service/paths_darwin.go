@@ -38,6 +38,6 @@ func defaultPathsForScope(scope Scope) (runtimepaths.Paths, error) {
 			LogDir:     "/var/log/hfdesk",
 		}, nil
 	default:
-		return runtimepaths.Paths{}, fmt.Errorf("service: unknown scope %q (want %q or %q)", scope, ScopeUser, ScopeSystem)
+		return runtimepaths.Paths{}, fmt.Errorf("service: unknown scope %q (want one of %q, %q)", scope, ScopeUser, ScopeSystem)
 	}
 }

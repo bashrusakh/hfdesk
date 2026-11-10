@@ -961,6 +961,36 @@ POST /api/settings
 
 Settings include runtime paths, concurrency, verification, endpoint, proxy settings, the HF cache directory, and extra local scan folders.
 
+`POST /api/settings` is refused once settings admission is sealed, which
+happens only in the graceful desktop-to-service handover. The seal comes
+after the HTTP drain completes, so the observable contract of a normal
+handover stays what it was: every update admitted before the seal finishes
+normally, and the admitted writes drain and persist before the handover
+reports success. The `503` below is a defensive barrier rather than an
+outcome a client observes in a normal handover: it refuses anything that
+would reach the settings handler after the seal, and the guarantee behind
+it is the generation check in `CompleteHandover`, which reports the
+handover as failed when the latest settings generation was not confirmed
+persisted. A shutdown that is not a committed
+handover — a plain desktop quit or the console host stopping — does not seal
+admission: settings updates arriving during its HTTP drain are still accepted.
+The response uses the standard error format above; `503` has no dedicated
+entry in the status-to-code mapping, so `error_detail.code` is the generic
+`server_error`:
+
+```json
+{
+  "ok": false,
+  "error": "Server is shutting down",
+  "details": "settings cannot be changed during shutdown",
+  "error_detail": {
+    "code": "server_error",
+    "message": "Server is shutting down",
+    "details": "settings cannot be changed during shutdown"
+  }
+}
+```
+
 Download reliability settings:
 
 - `verify` — the post-download verification mode, applied to LFS files as well: `none` performs no post-download content hash (HTTP and ranged-response validation still apply during the transfer); `size` (the default) checks the exact expected size and complete validated transfer coverage on both the multipart and single-request paths and performs no full-file SHA-256 reread on the normal transfer path (the pre-download skip check, an inherited single-path `.part` proof, an unpinned-identity proof, and a known digest with no known expected size may still hash); `sha256` verifies the full file against the known digest with at most one full-file read, always before the destination/blob is published when a known digest exists, so a mismatch never publishes corrupt bytes and the staging data is discarded (a retry re-downloads from scratch); when `sha256` has no known digest, the HEAD-ETag fallback remains a post-publication check; `etag` proves a known SHA-256 digest with that same single pre-publication pass, while non-LFS ETag-only files keep the historical no-post-check behavior. A known digest is never hashed only after publication. Resume state from an older or unsupported format is not migrated: only a valid version-4 ranged record, or a single-request `.part` with a matching pinned identity sidecar, is resumed (an exactly-sized partial is published without a request only when clean response framing is also recorded); the file is otherwise re-downloaded from zero while already-published content is untouched, while an unfenced older/unsupported record that cannot be proven dead is refused as unproven and preserved. The detailed proof and resume rules are in `pkg/hfdownloader/doc.go`.

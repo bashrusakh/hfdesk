@@ -13,7 +13,9 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -24,6 +26,7 @@ import (
 
 	"github.com/bashrusakh/hfdesk/internal/app"
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
+	"github.com/bashrusakh/hfdesk/internal/server"
 	"github.com/bashrusakh/hfdesk/internal/service"
 )
 
@@ -40,7 +43,13 @@ type fakeManager struct {
 	opErr error
 }
 
-func (m fakeManager) Install(context.Context, service.InstallOptions) error { return m.opErr }
+func (m fakeManager) Install(_ context.Context, opts service.InstallOptions) (service.InstallOptions, error) {
+	if m.opErr != nil {
+		return service.InstallOptions{}, m.opErr
+	}
+	// Without an existing registration the request is the registration.
+	return opts, nil
+}
 
 func (m fakeManager) Uninstall(context.Context) error { return m.opErr }
 
@@ -59,12 +68,79 @@ func (m fakeManager) Status(context.Context) (service.Status, error) {
 //
 // The command family never touches the system of the test run: the manager
 // of the platform is the fake one, so a lifecycle command can be driven
-// through every answer of a supervisor.
+// through every answer of a supervisor. The desktop singleton hold is
+// neutralized with it: the tests of this package observe the hold through
+// their own recorder, and the real object belongs to the desktop package's
+// tests on the same machine — two test packages creating it in parallel
+// would make both results depend on timing.
 func useFakeManager(t *testing.T, mgr service.Manager) {
 	t.Helper()
 	previous := newServiceManager
 	newServiceManager = func(service.Scope) (service.Manager, error) { return mgr, nil }
 	t.Cleanup(func() { newServiceManager = previous })
+
+	previousHold := holdServiceMutation
+	holdServiceMutation = func(string) (func(), error) { return func() {}, nil }
+	t.Cleanup(func() { holdServiceMutation = previousHold })
+
+	// The probe reports no holder: without a holder the discriminator never
+	// reads the state file, so a test that wants a classification sets the
+	// probe itself. The real probe would create the object of this session,
+	// which the desktop package's tests of the same machine own.
+	previousProbe := probeServiceMutation
+	probeServiceMutation = func(string) (func(), bool, error) { return func() {}, false, nil }
+	t.Cleanup(func() { probeServiceMutation = previousProbe })
+}
+
+// useSingletonProbe classifies the singleton probe of the command family for
+// the duration of the test: preExisting tells the discriminator that another
+// process of the session held the object when the mutation began.
+func useSingletonProbe(t *testing.T, preExisting bool) {
+	t.Helper()
+	previous := probeServiceMutation
+	probeServiceMutation = func(string) (func(), bool, error) { return func() {}, preExisting, nil }
+	t.Cleanup(func() { probeServiceMutation = previous })
+}
+
+// useTemporaryConfigDir points the per-user configuration directory at a
+// temporary directory for the duration of the test: the discriminator reads
+// the published desktop state through the desktop package's own path, and
+// the test decides that path instead of the real configuration directory of
+// the user that runs it.
+func useTemporaryConfigDir(t *testing.T) {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	t.Setenv("HOME", root)
+	t.Setenv("AppData", root)
+	t.Setenv("LOCALAPPDATA", root)
+}
+
+// desktopStatePath points the guard at a claim file inside the temporary
+// configuration directory of the test: the path the command family really
+// reads (session scope included), not a hand-built one.
+func desktopStatePath(t *testing.T) string {
+	t.Helper()
+	useTemporaryConfigDir(t)
+	path := service.PublishedStatePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create the temporary configuration directory: %v", err)
+	}
+	return path
+}
+
+// writePublishedDesktopState publishes a desktop state in the temporary
+// configuration directory of the test.
+func writePublishedDesktopState(t *testing.T) {
+	t.Helper()
+	state := desktopStatePath(t)
+	// The claim names the process that published it: the process of this
+	// test run, which is alive on every platform. A fixed id such as 1
+	// lives on Linux (it is init) but does not exist on Windows, where the
+	// claim would be stale under the liveness model and the live-claim
+	// side of the guard would never fire.
+	err := os.WriteFile(state, []byte(fmt.Sprintf(`{"url":"http://127.0.0.1:1","pid":%d}`, os.Getpid())), 0o600)
+	assertNoError(t, err, "publish the desktop state: %v", err)
 }
 
 // platformFactsByName holds the facts of the platforms of the service
@@ -120,9 +196,7 @@ func scopeOfPlatform(t *testing.T, goos string) service.Scope {
 
 	usePlatform(t, goos)
 	scope, err := resolveScope(false, false)
-	if err != nil {
-		t.Fatalf("the default scope of %s must resolve: %v", goos, err)
-	}
+	assertNoError(t, err, "the default scope of %s must resolve: %v", goos, err)
 	return scope
 }
 
@@ -143,9 +217,7 @@ func personalCacheRoot(t *testing.T) string {
 func writeConfigFile(t *testing.T, path, cacheRoot string) {
 	t.Helper()
 	data, err := json.Marshal(map[string]string{"cache-dir": cacheRoot})
-	if err != nil {
-		t.Fatalf("encode the config file: %v", err)
-	}
+	assertNoError(t, err, "encode the config file: %v", err)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write the config file: %v", err)
 	}
@@ -411,9 +483,7 @@ func TestBuildInstallOptionsCarriesTheServiceUser(t *testing.T) {
 			usePlatform(t, tc.goos)
 
 			opts, err := buildInstallOptions(service.ScopeSystem, installFlags{}, executable)
-			if err != nil {
-				t.Fatalf("build the install options: %v", err)
-			}
+			assertNoError(t, err, "build the install options: %v", err)
 			if opts.ServiceUser != "" {
 				t.Errorf("the service account is %q, want it to be unset", opts.ServiceUser)
 			}
@@ -431,9 +501,7 @@ func TestBuildInstallOptionsCarriesTheServiceUser(t *testing.T) {
 				}
 				return
 			}
-			if err != nil {
-				t.Fatalf("build the install options: %v", err)
-			}
+			assertNoError(t, err, "build the install options: %v", err)
 			if opts.ServiceUser != "hfdesk-svc" {
 				t.Errorf("the service account is %q, want %q", opts.ServiceUser, "hfdesk-svc")
 			}
@@ -483,9 +551,7 @@ func TestBuildInstallOptionsKeepsTheServiceUserOnLinuxAndMacOS(t *testing.T) {
 			usePlatform(t, goos)
 
 			opts, err := buildInstallOptions(service.ScopeSystem, installFlags{serviceUser: "hfdesk-svc"}, "/usr/local/bin/hfdesk")
-			if err != nil {
-				t.Fatalf("build the install options: %v", err)
-			}
+			assertNoError(t, err, "build the install options: %v", err)
 			if opts.ServiceUser != "hfdesk-svc" {
 				t.Errorf("the service account is %q, want %q", opts.ServiceUser, "hfdesk-svc")
 			}
@@ -606,6 +672,71 @@ func TestInstallSummaryReportsTheDefaultAccountOfThePlatform(t *testing.T) {
 	}
 	if want := service.DefaultServiceUser(); want != "" && got != want {
 		t.Errorf("the account of the summary is %q, want the default account of the platform %q:\n%s", got, want, out)
+	}
+}
+
+// TestInstallSummaryPointsCustomizationsAtTheDropIn checks that the success
+// summary of an installation names the administrator drop-in beside a
+// systemd unit registration.
+//
+// The drop-in is the one place a customization survives an update that
+// regenerates the unit as a whole, so the command that wrote the unit points
+// at it. A registration without a drop-in layer — the property list of macOS
+// and the registration of Windows — must not be pointed at a path that does
+// not exist there.
+func TestInstallSummaryPointsCustomizationsAtTheDropIn(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		unitPath string
+		want     string
+	}{
+		{
+			name:     "machine-wide systemd unit",
+			unitPath: "/etc/systemd/system/hfdesk.service",
+			want:     filepath.Join("/etc/systemd/system", "hfdesk.service.d", "local.conf"),
+		},
+		{
+			name:     "user scope systemd unit",
+			unitPath: "/home/user/.config/systemd/user/hfdesk.service",
+			want:     filepath.Join("/home/user/.config/systemd/user", "hfdesk.service.d", "local.conf"),
+		},
+		{
+			name:     "launchd property list",
+			unitPath: "/Users/user/Library/LaunchAgents/com.hfdesk.hfdesk.plist",
+		},
+		{
+			name:     "windows registration",
+			unitPath: `HKLM\SYSTEM\CurrentControlSet\Services\hfdesk`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := service.InstallOptions{
+				Scope:      service.ScopeUser,
+				Executable: "/usr/local/bin/hfdesk",
+				Listen:     "127.0.0.1:8080",
+				Paths: runtimepaths.Paths{
+					ConfigFile: "/home/user/.config/HFDesk/service/hfdesk.json",
+					StateDir:   "/home/user/.config/HFDesk/service",
+					LogDir:     "/home/user/.config/HFDesk/service/logs",
+				},
+			}
+
+			var buf bytes.Buffer
+			mgr := fakeManager{status: service.Status{State: service.StateStopped, UnitPath: tc.unitPath}}
+			writeInstallSummary(&buf, context.Background(), mgr, service.ScopeUser, opts)
+
+			out := buf.String()
+			const marker = "Unit customizations belong in: "
+			if tc.want == "" {
+				if strings.Contains(out, marker) {
+					t.Errorf("the summary points at a drop-in of a registration without one:\n%s", out)
+				}
+				return
+			}
+			if !strings.Contains(out, marker+tc.want) {
+				t.Errorf("the summary does not point at %q:\n%s", tc.want, out)
+			}
+		})
 	}
 }
 
@@ -907,17 +1038,13 @@ func TestServiceScopeDefaults(t *testing.T) {
 			usePlatform(t, tc.goos)
 
 			scope, err := resolveScope(false, false)
-			if err != nil {
-				t.Fatalf("the default scope must resolve: %v", err)
-			}
+			assertNoError(t, err, "the default scope must resolve: %v", err)
 			if scope != tc.scope {
 				t.Errorf("the default scope on %s is %q, want %q", tc.goos, scope, tc.scope)
 			}
 
 			system, err := resolveScope(false, true)
-			if err != nil {
-				t.Fatalf("the system scope must resolve: %v", err)
-			}
+			assertNoError(t, err, "the system scope must resolve: %v", err)
 			if system != service.ScopeSystem {
 				t.Errorf("the system scope is %q, want %q", system, service.ScopeSystem)
 			}
@@ -935,9 +1062,7 @@ func TestServiceScopeDefaults(t *testing.T) {
 				}
 				return
 			}
-			if err != nil {
-				t.Fatalf("the user scope must resolve: %v", err)
-			}
+			assertNoError(t, err, "the user scope must resolve: %v", err)
 			if user != service.ScopeUser {
 				t.Errorf("the user scope is %q, want %q", user, service.ScopeUser)
 			}
@@ -957,9 +1082,7 @@ func TestServiceListenValidation(t *testing.T) {
 	}
 
 	listen, err := validateListen("127.0.0.1:9090")
-	if err != nil {
-		t.Fatalf("a loopback address must be accepted: %v", err)
-	}
+	assertNoError(t, err, "a loopback address must be accepted: %v", err)
 	if listen != "127.0.0.1:9090" {
 		t.Errorf("the listen address is %q, want %q", listen, "127.0.0.1:9090")
 	}
@@ -1022,9 +1145,7 @@ func TestBuildInstallOptionsUsesTheDefaultsOfTheScope(t *testing.T) {
 			cacheRoot, hubDir := service.DefaultCacheDirs(scope, defaults)
 
 			opts, err := buildInstallOptions(scope, installFlags{}, executable)
-			if err != nil {
-				t.Fatalf("build the install options: %v", err)
-			}
+			assertNoError(t, err, "build the install options: %v", err)
 
 			if opts.Scope != scope {
 				t.Errorf("the scope is %q, want %q", opts.Scope, scope)
@@ -1065,9 +1186,7 @@ func TestBuildInstallOptionsAppliesTheOverrides(t *testing.T) {
 	}
 
 	opts, err := buildInstallOptions(service.ScopeSystem, flags, executable)
-	if err != nil {
-		t.Fatalf("build the install options: %v", err)
-	}
+	assertNoError(t, err, "build the install options: %v", err)
 
 	if opts.Scope != service.ScopeSystem {
 		t.Errorf("the scope is %q, want %q", opts.Scope, service.ScopeSystem)
@@ -1167,9 +1286,7 @@ func TestBuildInstallOptionsKeepsTheCacheLayoutTogether(t *testing.T) {
 			} {
 				t.Run(c.name, func(t *testing.T) {
 					opts, err := buildInstallOptions(scope, c.flags, executable)
-					if err != nil {
-						t.Fatalf("build the install options: %v", err)
-					}
+					assertNoError(t, err, "build the install options: %v", err)
 					if opts.CacheDir != c.wantRoot {
 						t.Errorf("the cache root is %q, want %q", opts.CacheDir, c.wantRoot)
 					}
@@ -1694,9 +1811,8 @@ func TestServiceInstallAcceptsAnExistingExecutable(t *testing.T) {
 	program := filepath.Join(dir, "hfdesk")
 	// The file carries no execute bit: the command line does not look at
 	// the permission bits.
-	if err := os.WriteFile(program, []byte("not a program\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(program, []byte("not a program\n"), 0o644)
+	assertNoError(t, err, "")
 
 	var stdout, stderr bytes.Buffer
 	code := runServiceCommand([]string{"install", "--system", "--executable", program}, &stdout, &stderr)
@@ -1718,24 +1834,18 @@ func TestServiceInstallAcceptsAnExistingExecutable(t *testing.T) {
 func TestResolveExecutableKeepsTheStableNameOfTheInvocation(t *testing.T) {
 	root := t.TempDir()
 	release := filepath.Join(root, "hfdesk-1.2.3", "hfdesk")
-	if err := os.MkdirAll(filepath.Dir(release), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(release, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(filepath.Dir(release), 0o755)
+	assertNoError(t, err, "")
+	err = os.WriteFile(release, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 	stable := filepath.Join(root, "bin", "hfdesk")
-	if err := os.MkdirAll(filepath.Dir(stable), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(release, stable); err != nil {
-		t.Fatal(err)
-	}
+	err = os.MkdirAll(filepath.Dir(stable), 0o755)
+	assertNoError(t, err, "")
+	err = os.Symlink(release, stable)
+	assertNoError(t, err, "")
 
 	got, err := resolveExecutable("", stable)
-	if err != nil {
-		t.Fatalf("resolveExecutable() = %v, want nil", err)
-	}
+	assertNoError(t, err, "resolveExecutable() = %v, want nil", err)
 	if got != stable {
 		t.Errorf("the registered executable is %q, want the invoked path %q", got, stable)
 	}
@@ -1750,24 +1860,18 @@ func TestResolveExecutableKeepsTheStableNameOfTheInvocation(t *testing.T) {
 func TestUpgradeWarningStaysQuietForAStableName(t *testing.T) {
 	root := treeOutsideTempDir(t)
 	release := filepath.Join(root, "hfdesk-1.2.3", "hfdesk")
-	if err := os.MkdirAll(filepath.Dir(release), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(release, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(filepath.Dir(release), 0o755)
+	assertNoError(t, err, "")
+	err = os.WriteFile(release, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 	stable := filepath.Join(root, "bin", "hfdesk")
-	if err := os.MkdirAll(filepath.Dir(stable), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(release, stable); err != nil {
-		t.Fatal(err)
-	}
+	err = os.MkdirAll(filepath.Dir(stable), 0o755)
+	assertNoError(t, err, "")
+	err = os.Symlink(release, stable)
+	assertNoError(t, err, "")
 
 	registered, err := resolveExecutable("", stable)
-	if err != nil {
-		t.Fatalf("resolveExecutable() = %v, want nil", err)
-	}
+	assertNoError(t, err, "resolveExecutable() = %v, want nil", err)
 	if registered != stable {
 		t.Fatalf("the registered executable is %q, want the invoked path %q", registered, stable)
 	}
@@ -1804,14 +1908,11 @@ func treeOutsideTempDir(t *testing.T) string {
 func TestResolveExecutablePrefersTheInvocationPath(t *testing.T) {
 	root := t.TempDir()
 	bin := filepath.Join(root, "hfdesk")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 
 	got, err := resolveExecutable("", bin)
-	if err != nil {
-		t.Fatalf("resolveExecutable() = %v, want nil", err)
-	}
+	assertNoError(t, err, "resolveExecutable() = %v, want nil", err)
 	if got != bin {
 		t.Errorf("the registered executable is %q, want the invoked path %q", got, bin)
 	}
@@ -1827,34 +1928,25 @@ func TestResolveExecutablePrefersTheInvocationPath(t *testing.T) {
 func TestResolveExecutableFallsBackToTheRunningBinary(t *testing.T) {
 	root := t.TempDir()
 	// A file with the name of the command in the working directory.
-	if err := os.WriteFile(filepath.Join(root, "hfdesk"), []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(filepath.Join(root, "hfdesk"), []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 	previous, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if err := os.Chdir(root); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(previous) })
 
 	got, err := resolveExecutable("", "hfdesk")
-	if err != nil {
-		t.Fatalf("resolveExecutable() = %v, want nil", err)
-	}
+	assertNoError(t, err, "resolveExecutable() = %v, want nil", err)
 	if got == filepath.Join(root, "hfdesk") {
 		t.Errorf("the registered executable is %q, want the path of the running binary", got)
 	}
 
 	running, err := os.Executable()
-	if err != nil {
-		t.Fatalf("the path of the running binary: %v", err)
-	}
+	assertNoError(t, err, "the path of the running binary: %v", err)
 	want, err := filepath.Abs(running)
-	if err != nil {
-		t.Fatalf("the absolute path of the running binary: %v", err)
-	}
+	assertNoError(t, err, "the absolute path of the running binary: %v", err)
 	if got != want {
 		t.Errorf("the registered executable is %q, want the path of the running binary %q", got, want)
 	}
@@ -1869,9 +1961,8 @@ func TestResolveExecutableFallsBackToTheRunningBinary(t *testing.T) {
 func TestResolveExecutableRejectsAnUnusableExplicitPath(t *testing.T) {
 	root := t.TempDir()
 	program := filepath.Join(root, "hfdesk")
-	if err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 
 	cases := []struct {
 		name string
@@ -1905,14 +1996,11 @@ func TestResolveExecutableRejectsAnUnusableExplicitPath(t *testing.T) {
 func TestResolveExecutableAcceptsAnExistingFile(t *testing.T) {
 	root := t.TempDir()
 	plain := filepath.Join(root, "notes.txt")
-	if err := os.WriteFile(plain, []byte("notes\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(plain, []byte("notes\n"), 0o644)
+	assertNoError(t, err, "")
 
 	got, err := resolveExecutable(plain, "")
-	if err != nil {
-		t.Fatalf("resolveExecutable(%q) = %v, want nil", plain, err)
-	}
+	assertNoError(t, err, "resolveExecutable(%q) = %v, want nil", plain, err)
 	if got != plain {
 		t.Errorf("the registered executable is %q, want %q", got, plain)
 	}
@@ -1923,14 +2011,11 @@ func TestResolveExecutableAcceptsAnExistingFile(t *testing.T) {
 func TestResolveExecutableUsesTheExplicitPath(t *testing.T) {
 	root := t.TempDir()
 	program := filepath.Join(root, "hfdesk")
-	if err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 
 	got, err := resolveExecutable(program, filepath.Join(root, "other"))
-	if err != nil {
-		t.Fatalf("resolveExecutable() = %v, want nil", err)
-	}
+	assertNoError(t, err, "resolveExecutable() = %v, want nil", err)
 	if got != program {
 		t.Errorf("the registered executable is %q, want the explicit path %q", got, program)
 	}
@@ -1970,12 +2055,68 @@ func TestRunPathReturnsAfterTheContextIsCancelled(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("the host returned an error: %v", err)
-		}
+		assertNoError(t, err, "the host returned an error: %v", err)
 	case <-time.After(30 * time.Second):
 		t.Fatal("the host did not return after the context was cancelled")
 	}
+}
+
+// TestServiceRunReportsTheBuildVersionOnTheHealthEndpoint checks that the host
+// path the supervisor starts reports the version of its build on the health
+// endpoint, which is the version an installation compares.
+func TestServiceRunReportsTheBuildVersionOnTheHealthEndpoint(t *testing.T) {
+	previousVersion := Version
+	Version = "1.2.3"
+	t.Cleanup(func() { Version = previousVersion })
+	previousServerVersion := server.Version
+	t.Cleanup(func() { server.Version = previousServerVersion })
+
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	t.Cleanup(runtimepaths.Reset)
+
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(freeLoopbackPort(t)))
+	args := []string{
+		"--config", filepath.Join(stateDir, "hfdesk.json"),
+		"--state-dir", stateDir,
+		"--log-dir", filepath.Join(stateDir, "logs"),
+		"--listen", addr,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- runServiceHost(ctx, args) }()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	var lastErr error
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		resp, err := client.Get("http://" + addr + "/api/health")
+		if err != nil {
+			lastErr = err
+		} else {
+			body, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			switch {
+			case readErr != nil:
+				lastErr = readErr
+			case resp.StatusCode != http.StatusOK:
+				lastErr = fmt.Errorf("status %d: %s", resp.StatusCode, body)
+			case !strings.Contains(string(body), `"version":"1.2.3"`):
+				lastErr = fmt.Errorf("the health endpoint does not report the build version: %s", body)
+			default:
+				cancel()
+				err := <-done
+				assertNoError(t, err, "runServiceHost() = %v, want nil", err)
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancel()
+	<-done
+	t.Fatalf("the health endpoint never reported the build version: %v", lastErr)
 }
 
 // freeLoopbackPort returns a port of the loopback interface that is free at
@@ -1987,9 +2128,7 @@ func TestRunPathReturnsAfterTheContextIsCancelled(t *testing.T) {
 func freeLoopbackPort(t *testing.T) int {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve a loopback port: %v", err)
-	}
+	assertNoError(t, err, "reserve a loopback port: %v", err)
 	defer func() { _ = listener.Close() }()
 
 	addr, ok := listener.Addr().(*net.TCPAddr)
@@ -2041,9 +2180,8 @@ func TestInteractiveFlagsAreUnchanged(t *testing.T) {
 	// The defaults are the part of the contract that matters most: a host
 	// that is started without an argument has to behave exactly as it
 	// behaved before the service mode was added.
-	if err := fs.Parse(nil); err != nil {
-		t.Fatalf("parse the interactive flags: %v", err)
-	}
+	err := fs.Parse(nil)
+	assertNoError(t, err, "parse the interactive flags: %v", err)
 	if opts.Port != 8080 {
 		t.Errorf("the default port is %d, want 8080", opts.Port)
 	}
@@ -2367,9 +2505,7 @@ func TestServiceDefaultScopeFollowsThePlatformFacts(t *testing.T) {
 			usePlatform(t, goos)
 
 			scope, err := resolveScope(false, false)
-			if err != nil {
-				t.Fatalf("the default scope must resolve: %v", err)
-			}
+			assertNoError(t, err, "the default scope must resolve: %v", err)
 			if want := platformFactsByName[goos].defaultScope; scope != want {
 				t.Errorf("the default scope on %s is %q, want %q", goos, scope, want)
 			}
@@ -2396,9 +2532,7 @@ func TestServiceUserScopeRefusalFollowsThePlatformFacts(t *testing.T) {
 
 			scope, err := resolveScope(true, false)
 			if !tc.wantError {
-				if err != nil {
-					t.Fatalf("the per-user scope must resolve on %s: %v", tc.goos, err)
-				}
+				assertNoError(t, err, "the per-user scope must resolve on %s: %v", tc.goos, err)
 				if scope != service.ScopeUser {
 					t.Errorf("the scope on %s is %q, want %q", tc.goos, scope, service.ScopeUser)
 				}
@@ -2446,9 +2580,7 @@ func TestServiceUserRefusalKeepsItsMessage(t *testing.T) {
 // command line name the platform they talk about.
 func TestServiceCommandHasNoOperatingSystemComparison(t *testing.T) {
 	source, err := os.ReadFile("service.go")
-	if err != nil {
-		t.Fatalf("read service.go: %v", err)
-	}
+	assertNoError(t, err, "read service.go: %v", err)
 
 	text := string(source)
 	for _, forbidden := range []string{"runtime.GOOS", "platformGOOS", "isWindows"} {
@@ -2469,9 +2601,7 @@ func platformFactOf(t *testing.T, file, name string) string {
 
 	path := filepath.Join("..", "..", "internal", "service", file)
 	parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
-	if err != nil {
-		t.Fatalf("parse %s: %v", path, err)
-	}
+	assertNoError(t, err, "parse %s: %v", path, err)
 
 	for _, decl := range parsed.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
@@ -2523,4 +2653,1008 @@ func sourceLinesWith(source, text string) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// TestInstallExplicitFieldsMarksOnlyTheNamedFlags checks the marker of an
+// explicitly named field.
+//
+// Only a flag the parser saw on the command line counts: the default of a
+// flag set is a fallback for an installation without a registration, so it
+// must never be reported as a setting of the request. The --listen flag keeps
+// its default without being marked.
+//
+// An explicit cache root without a hub directory resolves the hub directory
+// to "<cache>/hub", so the resolved directory is marked as well: it is the
+// value the request asked for and not a default of the scope.
+func TestInstallExplicitFieldsMarksOnlyTheNamedFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want service.InstallFieldSet
+		// checkDefault reports whether the case checks the default of the
+		// --listen flag as well.
+		checkDefault bool
+	}{
+		{
+			name:         "no flag at all",
+			args:         nil,
+			want:         service.InstallFieldSet{},
+			checkDefault: true,
+		},
+		{
+			name: "the default listen address is not a named one",
+			args: []string{"--listen", service.DefaultListen},
+			want: service.InstallFieldSet{Listen: true},
+		},
+		{
+			name: "a named cache root moves the hub directory with it",
+			args: []string{"--cache-dir", "/srv/cache"},
+			want: service.InstallFieldSet{CacheDir: true, HubDir: true},
+		},
+		{
+			name: "a named hub directory stays a separate field",
+			args: []string{"--hub-dir", "/mnt/hub"},
+			want: service.InstallFieldSet{HubDir: true},
+		},
+		{
+			name: "both cache directories are named",
+			args: []string{"--cache-dir", "/srv/cache", "--hub-dir", "/mnt/hub"},
+			want: service.InstallFieldSet{CacheDir: true, HubDir: true},
+		},
+		{
+			name: "every path flag is named",
+			args: []string{
+				"--config", "/srv/hfdesk/hfdesk.json",
+				"--state-dir", "/srv/hfdesk/state",
+				"--log-dir", "/srv/hfdesk/log",
+				"--local-dir", "/srv/hfdesk/models",
+			},
+			want: service.InstallFieldSet{Config: true, StateDir: true, LogDir: true, LocalDir: true},
+		},
+		{
+			name: "the service account is named",
+			args: []string{"--service-user", "hfdesk-svc"},
+			want: service.InstallFieldSet{ServiceUser: true},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			flags := installFlags{}
+			fs := newInstallFlagSet(&flags)
+			err := fs.Parse(tc.args)
+			assertNoError(t, err, "parse %v: %v", tc.args, err)
+
+			if got := installExplicitFields(fs); got != tc.want {
+				t.Errorf("installExplicitFields() = %+v, want %+v", got, tc.want)
+			}
+			if tc.checkDefault && flags.listen != service.DefaultListen {
+				t.Errorf("the listen flag = %q, want its default %q", flags.listen, service.DefaultListen)
+			}
+		})
+	}
+}
+
+// recordingInstallManager records the options of the installation it is asked
+// to register and answers with the effective options of the registration.
+//
+// effective is what the manager reports as written; nil means the request is
+// written unchanged, which is what a manager without an existing registration
+// does.
+type recordingInstallManager struct {
+	fakeManager
+	options   *service.InstallOptions
+	effective *service.InstallOptions
+}
+
+func (m recordingInstallManager) Install(_ context.Context, opts service.InstallOptions) (service.InstallOptions, error) {
+	if m.options != nil {
+		*m.options = opts
+	}
+	if m.fakeManager.opErr != nil {
+		return service.InstallOptions{}, m.fakeManager.opErr
+	}
+	if m.effective != nil {
+		return *m.effective, nil
+	}
+	return opts, nil
+}
+
+// TestServiceInstallPassesTheNamedFieldsToTheManager checks that the command
+// line marks the fields it named and leaves every other field unmarked, so the
+// service layer keeps the settings of an existing registration. The resolved
+// hub directory of a named cache root is marked as well.
+func TestServiceInstallPassesTheNamedFieldsToTheManager(t *testing.T) {
+	usePlatform(t, "linux")
+	program := filepath.Join(t.TempDir(), "hfdesk")
+	err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
+	cacheRoot := filepath.Join(t.TempDir(), "cache")
+
+	var got service.InstallOptions
+	useFakeManager(t, recordingInstallManager{
+		fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+		options:     &got,
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := runServiceCommand([]string{
+		"install", "--system", "--executable", program, "--cache-dir", cacheRoot,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("the installation must be accepted, got the exit code %d:\n%s", code, stderr.String())
+	}
+
+	if got.Executable != program {
+		t.Errorf("the executable is %q, want %q", got.Executable, program)
+	}
+	if got.CacheDir != cacheRoot {
+		t.Errorf("the cache root is %q, want the named %q", got.CacheDir, cacheRoot)
+	}
+	if want := filepath.Join(cacheRoot, "hub"); got.HubDir != want {
+		t.Errorf("the hub dir is %q, want the resolved %q", got.HubDir, want)
+	}
+	want := service.InstallFieldSet{CacheDir: true, HubDir: true}
+	if got.Explicit != want {
+		t.Errorf("the explicit fields = %+v, want %+v", got.Explicit, want)
+	}
+	if got.Listen != service.DefaultListen {
+		t.Errorf("the listen address is %q, want the default %q", got.Listen, service.DefaultListen)
+	}
+}
+
+// TestServiceInstallPassesTheVersionOfTheRunningProgram checks the version
+// evidence of an installation: the running binary names its build version, while
+// an explicit other program and a local build pass no expectation.
+func TestServiceInstallPassesTheVersionOfTheRunningProgram(t *testing.T) {
+	usePlatform(t, "linux")
+
+	cases := []struct {
+		name       string
+		version    string
+		executable func(t *testing.T) string
+		want       string
+	}{
+		{
+			name:    "the running program of a release build",
+			version: "1.2.3",
+			// The version claim follows the identity of the running image on
+			// this host, not the platform seam of the command line: only a
+			// Linux host can prove the identity through procfs, so a host
+			// without it stamps no claim.
+			want: expectedRunningImageStamp("1.2.3"),
+		},
+		{
+			name:    "a local build",
+			version: "dev",
+			want:    "",
+		},
+		{
+			name:    "an explicitly named other program",
+			version: "1.2.3",
+			executable: func(t *testing.T) string {
+				path := filepath.Join(t.TempDir(), "hfdesk")
+				err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o755)
+				assertNoError(t, err, "")
+				return path
+			},
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			previousVersion := Version
+			Version = tc.version
+			t.Cleanup(func() { Version = previousVersion })
+
+			var got service.InstallOptions
+			useFakeManager(t, recordingInstallManager{
+				fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+				options:     &got,
+			})
+
+			args := []string{"install", "--system"}
+			if tc.executable != nil {
+				args = append(args, "--executable", tc.executable(t))
+			}
+			var stdout, stderr bytes.Buffer
+			if code := runServiceCommand(args, &stdout, &stderr); code != 0 {
+				t.Fatalf("the installation must be accepted, got the exit code %d:\n%s", code, stderr.String())
+			}
+			if got.Scope != service.ScopeSystem {
+				t.Errorf("the installation scope is %q, want %q", got.Scope, service.ScopeSystem)
+			}
+			if got.ExpectedVersion != tc.want {
+				t.Errorf("the expected version is %q, want %q", got.ExpectedVersion, tc.want)
+			}
+		})
+	}
+}
+
+// expectedRunningImageStamp is the version claim an installation of the
+// running release build stamps on this host: the identity of the running
+// image is provable through procfs on Linux and through the module path
+// plus the file identity of an open handle on Windows, and is not provable
+// elsewhere — a path cannot prove the image on a host that allows a
+// running image to be replaced under it.
+func expectedRunningImageStamp(version string) string {
+	if runtime.GOOS == "linux" || runtime.GOOS == "windows" {
+		return version
+	}
+	return ""
+}
+
+// TestRunningImageInfoIdentifiesTheRunningExecutable proves the platform
+// identity the version claim is built on, on the host that runs the test:
+// a platform with a proof reports the file behind the running image — the
+// same file os.Executable names, compared through os.SameFile, so a path
+// spelling difference does not matter — and a platform without one reports
+// an error instead of a file that may describe a replacement, which is the
+// fail-closed side of the claim.
+//
+// The test is independent of the order the tests run in (-count and
+// -shuffle both keep it green): the replacement dance of
+// TestExpectedInstallVersionFollowsTheRunningImage puts the original file
+// identity back at the path it renames away, so a path-based identity check
+// after it still compares the file the kernel executes.
+func TestRunningImageInfoIdentifiesTheRunningExecutable(t *testing.T) {
+	exe, err := os.Executable()
+	assertNoError(t, err, "os.Executable() = %v", err)
+	registered, err := os.Stat(exe)
+	assertNoError(t, err, "os.Stat(%q) = %v", exe, err)
+
+	info, imageErr := service.RunningImageInfo()
+	switch runtime.GOOS {
+	case "linux", "windows":
+		if imageErr != nil {
+			t.Fatalf("service.RunningImageInfo() = %v, want the file info of the running image on this host", imageErr)
+		}
+		if !os.SameFile(registered, info) {
+			t.Errorf("service.RunningImageInfo() = %v, want the same file as the running executable %q", info, exe)
+		}
+	default:
+		if imageErr == nil {
+			t.Errorf("service.RunningImageInfo() = %v, want a failure on a host that cannot prove the running image", info)
+		}
+	}
+}
+
+// TestExpectedInstallVersionFollowsTheRunningImage proves the version claim
+// names the image the kernel executes: a registered file that was replaced
+// while the image keeps running carries no claim, and the untouched
+// registration keeps its claim.
+//
+// The replacement renames the running test binary out of its path and puts
+// another file at that path, which is how an update lands a new file at an
+// old path: the executed inode loses its name and the path holds another
+// file, while the compiled-in Version still describes the old image. A claim
+// stamped for the replacement would make a verified start of the healthy new
+// program fail as a version mismatch. The original file identity is renamed
+// back at the end, so the process-wide state the test leaves behind is the
+// state it found: any later identity check in this process compares the file
+// the kernel still executes.
+func TestExpectedInstallVersionFollowsTheRunningImage(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the replacement scenario is identified through /proc/self/exe, which this host does not have")
+	}
+	previousVersion := Version
+	Version = "1.2.3"
+	t.Cleanup(func() { Version = previousVersion })
+
+	exe, err := os.Executable()
+	assertNoError(t, err, "os.Executable() = %v", err)
+	if got := expectedInstallVersion(exe); got != "1.2.3" {
+		t.Fatalf("expectedInstallVersion() = %q for the untouched running image, want %q", got, "1.2.3")
+	}
+
+	replacement := exe + ".hfdesk-test-replacement"
+	backup := exe + ".hfdesk-test-backup"
+	if err := os.WriteFile(replacement, []byte("a different program image\n"), 0o755); err != nil {
+		t.Fatalf("write the replacement file: %v", err)
+	}
+	// The executed image is renamed OUT of its path — which is exactly how
+	// an update lands a new file at a path a running program keeps using —
+	// and its original file identity is renamed back at the end. A copy
+	// instead would install a new inode at the path, so every identity
+	// check after this test in the same process would compare that copy
+	// against the file the kernel still executes and fail for the wrong
+	// reason; the rename keeps the restored path the very file the process
+	// executes.
+	if err := os.Rename(exe, backup); err != nil {
+		t.Skipf("the running image cannot be replaced on this host: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Rename(backup, exe)
+		_ = os.Remove(replacement)
+	})
+	if err := os.Rename(replacement, exe); err != nil {
+		t.Fatalf("put the replacement at the registered path %q: %v", exe, err)
+	}
+	if got := expectedInstallVersion(exe); got != "" {
+		t.Errorf("expectedInstallVersion() = %q for a replaced registered file, want no version claim", got)
+	}
+	if err := os.Rename(backup, exe); err != nil {
+		t.Fatalf("restore the registered file %q: %v", exe, err)
+	}
+}
+
+// TestExpectedInstallVersionWithholdsAnUnknownImage proves that a running
+// image the installation cannot identify yields no version claim: uncertainty
+// stays visible instead of a claim that may name the wrong program.
+func TestExpectedInstallVersionWithholdsAnUnknownImage(t *testing.T) {
+	previousImage := runningImageInfo
+	runningImageInfo = func() (os.FileInfo, error) {
+		return nil, errors.New("the running image is not identifiable")
+	}
+	t.Cleanup(func() { runningImageInfo = previousImage })
+	previousVersion := Version
+	Version = "1.2.3"
+	t.Cleanup(func() { Version = previousVersion })
+
+	exe, err := os.Executable()
+	assertNoError(t, err, "os.Executable() = %v", err)
+	if got := expectedInstallVersion(exe); got != "" {
+		t.Errorf("expectedInstallVersion() = %q with an unknown running image, want no version claim", got)
+	}
+}
+
+// TestServiceInstallSummaryReportsTheEffectiveRegistration checks that the
+// summary describes the registration the manager wrote and not the request.
+//
+// A reinstall keeps every setting the command line did not name: the manager
+// returns the merged options, and the summary has to report them. A summary
+// built from the request would tell the user that a preserved bind address,
+// path or cache layout was reset to the default of the scope.
+func TestServiceInstallSummaryReportsTheEffectiveRegistration(t *testing.T) {
+	program := filepath.Join(t.TempDir(), "hfdesk")
+	err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
+
+	root := t.TempDir()
+	effective := service.InstallOptions{
+		Scope:      service.ScopeSystem,
+		Executable: program,
+		Listen:     "127.0.0.1:19090",
+		Paths: runtimepaths.Paths{
+			ConfigFile: filepath.Join(root, "etc", "hfdesk", "hfdesk.json"),
+			StateDir:   filepath.Join(root, "var", "lib", "hfdesk"),
+			LogDir:     filepath.Join(root, "var", "log", "hfdesk"),
+		},
+		CacheDir: filepath.Join(root, "cache"),
+		HubDir:   filepath.Join(root, "cache", "hub"),
+		LocalDir: filepath.Join(root, "models"),
+	}
+	useFakeManager(t, recordingInstallManager{
+		fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+		effective:   &effective,
+	})
+
+	var stdout, stderr bytes.Buffer
+	// The command line names the executable and nothing else: every other
+	// value of the registration is one the user named in an earlier
+	// installation.
+	code := runServiceCommand([]string{"install", "--system", "--executable", program}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("the installation must be accepted, got the exit code %d:\n%s", code, stderr.String())
+	}
+
+	for _, field := range []struct {
+		name string
+		want string
+	}{
+		{"Executable", effective.Executable},
+		{"Listen", effective.Listen},
+		{"Config file", effective.Paths.ConfigFile},
+		{"State dir", effective.Paths.StateDir},
+		{"Log dir", effective.Paths.LogDir},
+		{"Cache root", effective.CacheDir},
+		{"Hub dir", effective.HubDir},
+	} {
+		if got := summaryField(stdout.String(), field.name); got != field.want {
+			t.Errorf("the summary reports %s %q, want the effective %q", field.name, got, field.want)
+		}
+	}
+}
+
+// recordedHold observes one production hold: it counts the acquisitions and
+// the releases and remembers whether the hold is currently held.
+type recordedHold struct {
+	held     bool
+	acquired int
+	released int
+}
+
+// useRecordedHold points the singleton hold of the command family at a
+// recorder for the duration of the test: the test observes when the hold is
+// taken and when it ends without creating the real object of its session,
+// which the desktop package's tests of the same machine own.
+func useRecordedHold(t *testing.T) *recordedHold {
+	t.Helper()
+	record := &recordedHold{}
+	previous := holdServiceMutation
+	holdServiceMutation = func(string) (func(), error) {
+		record.acquired++
+		record.held = true
+		return func() {
+			record.released++
+			record.held = false
+		}, nil
+	}
+	t.Cleanup(func() { holdServiceMutation = previous })
+	return record
+}
+
+// refuseSingletonHold points the singleton hold of the command family at a
+// failure for the duration of the test.
+func refuseSingletonHold(t *testing.T, reason error) {
+	t.Helper()
+	previous := holdServiceMutation
+	holdServiceMutation = func(string) (func(), error) { return nil, reason }
+	t.Cleanup(func() { holdServiceMutation = previous })
+}
+
+// holdObservingManager reports, per operation, whether the desktop singleton
+// was held at the moment the mutation ran.
+type holdObservingManager struct {
+	fakeManager
+	hold     *recordedHold
+	observed map[string]bool
+}
+
+func (m *holdObservingManager) note(operation string) {
+	if m.observed == nil {
+		m.observed = make(map[string]bool)
+	}
+	m.observed[operation] = m.hold != nil && m.hold.held
+}
+
+func (m *holdObservingManager) Install(ctx context.Context, opts service.InstallOptions) (service.InstallOptions, error) {
+	m.note("install")
+	return m.fakeManager.Install(ctx, opts)
+}
+
+func (m *holdObservingManager) Start(ctx context.Context) error {
+	m.note("start")
+	return m.fakeManager.Start(ctx)
+}
+
+func (m *holdObservingManager) Restart(ctx context.Context) error {
+	m.note("restart")
+	return m.fakeManager.Restart(ctx)
+}
+
+// refusingHoldManager fails the test when a mutation runs at all: it backs
+// the refusal case, where the failed hold must end the command before the
+// service is touched.
+type refusingHoldManager struct {
+	fakeManager
+	t *testing.T
+}
+
+func (m *refusingHoldManager) Install(context.Context, service.InstallOptions) (service.InstallOptions, error) {
+	m.t.Fatal("the installation touched the service although the singleton hold failed")
+	return service.InstallOptions{}, nil
+}
+
+func (m *refusingHoldManager) Start(context.Context) error {
+	m.t.Fatal("the start touched the service although the singleton hold failed")
+	return nil
+}
+
+func (m *refusingHoldManager) Restart(context.Context) error {
+	m.t.Fatal("the restart touched the service although the singleton hold failed")
+	return nil
+}
+
+// temporaryServiceProgram returns the path of a file the install command
+// accepts as an executable.
+func temporaryServiceProgram(t *testing.T) string {
+	t.Helper()
+	program := filepath.Join(t.TempDir(), "hfdesk")
+	err := os.WriteFile(program, []byte("not a program\n"), 0o644)
+	assertNoError(t, err, "")
+	return program
+}
+
+// TestServiceMutationsHoldTheDesktopSingleton proves the invariant for every
+// command that starts or restarts the service: install (first installation
+// and update over an existing registration alike), start and restart hold the
+// per-session desktop singleton while the mutation runs and release it when
+// the command ends. A mutation without the hold would leave the window a
+// relaunch of the desktop app could pass on a positively stopped service.
+func TestServiceMutationsHoldTheDesktopSingleton(t *testing.T) {
+	program := temporaryServiceProgram(t)
+
+	for _, tc := range []struct {
+		name      string
+		args      []string
+		operation string
+	}{
+		{"install", []string{"install", "--system", "--executable", program}, "install"},
+		{"start", []string{"start"}, "start"},
+		{"restart", []string{"restart"}, "restart"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := &holdObservingManager{
+				fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+			}
+			useFakeManager(t, manager)
+			record := useRecordedHold(t)
+			manager.hold = record
+
+			var stdout, stderr bytes.Buffer
+			code := runServiceCommand(tc.args, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("the command must exit with 0, got %d:\n%s", code, stderr.String())
+			}
+			held, ran := manager.observed[tc.operation]
+			if !ran {
+				t.Fatalf("the %s did not run, observations: %v", tc.operation, manager.observed)
+			}
+			if !held {
+				t.Errorf("the %s ran without the desktop singleton held: a relaunch in that window could start a second server",
+					tc.operation)
+			}
+			if record.acquired != 1 || record.released != 1 {
+				t.Errorf("the hold was acquired %d times and released %d times, want one of each",
+					record.acquired, record.released)
+			}
+			if record.held {
+				t.Error("the hold survived the end of the command: a later launch would be refused as already running")
+			}
+		})
+	}
+}
+
+// TestServiceMutationRefusesWhenTheSingletonCannotBeHeld proves the refusal
+// fails closed for every command that starts or restarts the service: a hold
+// that cannot be established ends the command with the reason before the
+// service is touched.
+func TestServiceMutationRefusesWhenTheSingletonCannotBeHeld(t *testing.T) {
+	program := temporaryServiceProgram(t)
+	reason := errors.New("the per-session desktop singleton cannot be named: the session of the process cannot be read")
+
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"install", []string{"install", "--system", "--executable", program}},
+		{"start", []string{"start"}},
+		{"restart", []string{"restart"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useFakeManager(t, &refusingHoldManager{fakeManager: fakeManager{
+				status: service.Status{State: service.StateStopped},
+			}, t: t})
+			refuseSingletonHold(t, reason)
+
+			var stdout, stderr bytes.Buffer
+			code := runServiceCommand(tc.args, &stdout, &stderr)
+			if code != serviceFailureExitCode {
+				t.Fatalf("the refused command must exit with %d, got %d:\n%s", serviceFailureExitCode, code, stderr.String())
+			}
+			for _, want := range []string{"nothing was changed", reason.Error(), `run "hfdesk service status"`} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("the error does not mention %q:\n%s", want, stderr.String())
+				}
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("a refused command must not report a result:\n%s", stdout.String())
+			}
+		})
+	}
+}
+
+// TestServiceMutationHoldRefusalCarriesOneNextAction proves the message
+// discipline of the refusal from its two remaining sides: a cause that
+// already names its own step (the access-denied hold of another Windows
+// identity) keeps only that step, and a hold that returns no release names
+// the command that reads the state of the instance. A report never carries
+// both commands, the rule the desktop helper notice follows.
+func TestServiceMutationHoldRefusalCarriesOneNextAction(t *testing.T) {
+	accessDenied := fmt.Errorf(
+		"the desktop singleton exists but this Windows identity cannot access it: another HFDesk process under a different Windows account created it; end that process and try again%w",
+		service.ErrSingletonAccessDenied)
+
+	t.Run("a cause that names its own step keeps only that step", func(t *testing.T) {
+		useFakeManager(t, fakeManager{status: service.Status{State: service.StateStopped}})
+		refuseSingletonHold(t, accessDenied)
+
+		var stdout, stderr bytes.Buffer
+		if code := runServiceCommand([]string{"start"}, &stdout, &stderr); code != serviceFailureExitCode {
+			t.Fatalf("the refused command must exit with %d, got %d:\n%s", serviceFailureExitCode, code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "end that process and try again") {
+			t.Errorf("the refusal does not carry the cause of the hold:\n%s", stderr.String())
+		}
+		if strings.Contains(stderr.String(), "hfdesk service status") {
+			t.Errorf("the refusal carries a second next action next to the step of its cause:\n%s", stderr.String())
+		}
+	})
+
+	t.Run("a hold without a release names the status command", func(t *testing.T) {
+		useFakeManager(t, fakeManager{status: service.Status{State: service.StateStopped}})
+		previous := holdServiceMutation
+		holdServiceMutation = func(string) (func(), error) { return nil, nil }
+		t.Cleanup(func() { holdServiceMutation = previous })
+
+		var stdout, stderr bytes.Buffer
+		if code := runServiceCommand([]string{"start"}, &stdout, &stderr); code != serviceFailureExitCode {
+			t.Fatalf("the refused command must exit with %d, got %d:\n%s", serviceFailureExitCode, code, stderr.String())
+		}
+		for _, want := range []string{"returned no release", "nothing was changed", `run "hfdesk service status"`} {
+			if !strings.Contains(stderr.String(), want) {
+				t.Errorf("the refusal does not mention %q:\n%s", want, stderr.String())
+			}
+		}
+	})
+}
+
+// TestServiceReadAndStopPathsNeverHoldTheSingleton proves the preserved side
+// of the boundary: stop, uninstall and status change nothing that starts or
+// restarts the service, and they never take the singleton hold.
+func TestServiceReadAndStopPathsNeverHoldTheSingleton(t *testing.T) {
+	useFakeManager(t, fakeManager{status: service.Status{State: service.StateStopped}})
+	record := useRecordedHold(t)
+
+	for _, args := range [][]string{{"stop"}, {"uninstall"}, {"status"}} {
+		var stdout, stderr bytes.Buffer
+		if code := runServiceCommand(args, &stdout, &stderr); code != 0 {
+			t.Fatalf("%v must exit with 0, got %d:\n%s", args, code, stderr.String())
+		}
+	}
+	if record.acquired != 0 {
+		t.Errorf("the hold was acquired %d times by read and stop paths, want none", record.acquired)
+	}
+}
+
+// untouchedServiceManager fails the test when a mutation runs at all: it
+// backs the refusal beside a serving desktop, where the command must end
+// before the service is touched.
+type untouchedServiceManager struct {
+	fakeManager
+	t *testing.T
+}
+
+func (m *untouchedServiceManager) Install(context.Context, service.InstallOptions) (service.InstallOptions, error) {
+	m.t.Fatal("the installation touched the service although a desktop instance serves the address")
+	return service.InstallOptions{}, nil
+}
+
+func (m *untouchedServiceManager) Start(context.Context) error {
+	m.t.Fatal("the start touched the service although a desktop instance serves the address")
+	return nil
+}
+
+func (m *untouchedServiceManager) Restart(context.Context) error {
+	m.t.Fatal("the restart touched the service although a desktop instance serves the address")
+	return nil
+}
+
+// TestServiceMutationRefusesWhenADesktopInstanceServes proves the CLI side
+// of the boundary for every outcome that starts or restarts the service: a
+// mutation whose probe found a singleton holder while a desktop state is
+// published refuses with the unchanged state, the cause and one next action,
+// and the service is never touched. Without the check the command would
+// start the service beside the desktop that serves the same address. A
+// first installation, an installation over a running instance (which the
+// installation restarts) and an installation whose registration state
+// cannot be read all fail closed; start and restart always start or
+// restart and always refuse.
+func TestServiceMutationRefusesWhenADesktopInstanceServes(t *testing.T) {
+	program := temporaryServiceProgram(t)
+
+	for _, tc := range []struct {
+		name      string
+		args      []string
+		status    service.Status
+		statusErr error
+	}{
+		{"first install", []string{"install", "--system", "--executable", program},
+			service.Status{State: service.StateNotInstalled}, nil},
+		{"install over a running instance", []string{"install", "--system", "--executable", program},
+			service.Status{State: service.StateRunning, Running: true}, nil},
+		{"install over an unreadable registration state", []string{"install", "--system", "--executable", program},
+			service.Status{}, errors.New("the supervisor did not answer")},
+		{"start", []string{"start"}, service.Status{State: service.StateStopped}, nil},
+		{"restart", []string{"restart"}, service.Status{State: service.StateStopped}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useFakeManager(t, &untouchedServiceManager{
+				fakeManager: fakeManager{status: tc.status, err: tc.statusErr},
+				t:           t,
+			})
+			useSingletonProbe(t, true)
+			writePublishedDesktopState(t)
+
+			var stdout, stderr bytes.Buffer
+			code := runServiceCommand(tc.args, &stdout, &stderr)
+			if code != serviceFailureExitCode {
+				t.Fatalf("the refused command must exit with %d, got %d:\n%s", serviceFailureExitCode, code, stderr.String())
+			}
+			for _, want := range []string{
+				"nothing was changed",
+				"serves its local server",
+				"notification-area icon",
+				"run the command again",
+			} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("the refusal does not mention %q:\n%s", want, stderr.String())
+				}
+			}
+			if strings.Contains(stderr.String(), "hfdesk service status") {
+				t.Errorf("the refusal carries a second next action next to the quit of the desktop:\n%s", stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("a refused command must not report a result:\n%s", stdout.String())
+			}
+		})
+	}
+}
+
+// TestServiceInstallOverAStoppedRegistrationProceedsBesideAServingDesktop
+// proves the narrowed side of the boundary: an installation over a
+// positively confirmed stopped registration is a pure registration rewrite
+// beside the desktop that serves the address — both discriminator facts of
+// the refusal are true in this test — so the rewrite proceeds with the
+// singleton held as before and never starts or restarts anything.
+func TestServiceInstallOverAStoppedRegistrationProceedsBesideAServingDesktop(t *testing.T) {
+	program := temporaryServiceProgram(t)
+
+	manager := &holdObservingManager{
+		fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+	}
+	useFakeManager(t, manager)
+	record := useRecordedHold(t)
+	manager.hold = record
+	useSingletonProbe(t, true)
+	writePublishedDesktopState(t)
+
+	var stdout, stderr bytes.Buffer
+	code := runServiceCommand([]string{"install", "--system", "--executable", program}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("the rewrite of a stopped registration must exit with 0, got %d:\n%s", code, stderr.String())
+	}
+	if !manager.observed["install"] {
+		t.Errorf("the installation did not run, observations: %v", manager.observed)
+	}
+	for _, operation := range []string{"start", "restart"} {
+		if _, ran := manager.observed[operation]; ran {
+			t.Errorf("the rewrite ran a %s beside the desktop that serves the address", operation)
+		}
+	}
+	if record.acquired != 1 || record.released != 1 {
+		t.Errorf("the hold was acquired %d times and released %d times, want one of each",
+			record.acquired, record.released)
+	}
+	if !strings.Contains(stdout.String(), "The service was registered.") {
+		t.Errorf("the rewrite did not report its registration:\n%s", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("the rewrite must not report a failure:\n%s", stderr.String())
+	}
+}
+
+// TestServiceMutationProceedsWhenNoDesktopInstanceServes proves the other
+// sides of the same discriminator: a probe that found no holder means the
+// published state outlived a crashed desktop and the command proceeds, and
+// a holder without a published state — the gate's launch, which never
+// publishes one — proceeds exactly as today. A discriminator that checked
+// only one of the two facts would refuse one of these commands.
+func TestServiceMutationProceedsWhenNoDesktopInstanceServes(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		preExisting bool
+		state       bool
+	}{
+		{name: "a stale state file of a crashed desktop", preExisting: false, state: true},
+		{name: "a gate launch that published no state", preExisting: true, state: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := &holdObservingManager{
+				fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+			}
+			useFakeManager(t, manager)
+			record := useRecordedHold(t)
+			manager.hold = record
+			useSingletonProbe(t, tc.preExisting)
+			if tc.state {
+				writePublishedDesktopState(t)
+			} else {
+				useTemporaryConfigDir(t)
+			}
+
+			var stdout, stderr bytes.Buffer
+			if code := runServiceCommand([]string{"start"}, &stdout, &stderr); code != 0 {
+				t.Fatalf("the command must exit with 0, got %d:\n%s", code, stderr.String())
+			}
+			if !manager.observed["start"] {
+				t.Errorf("the start did not run, observations: %v", manager.observed)
+			}
+			if record.acquired != 1 || record.released != 1 {
+				t.Errorf("the hold was acquired %d times and released %d times, want one of each",
+					record.acquired, record.released)
+			}
+		})
+	}
+}
+
+// TestServiceMutationRefusesOnAClaimItCannotRead proves the CLI side of
+// the indeterminable claim: a claim file that exists but cannot be read or
+// parsed is never the absent claim — with a probe that found a holder every
+// mutation that starts or restarts the service refuses before the first
+// service step, with that single cause, the unchanged result and NO next
+// action (no single step clears a file the guard cannot inspect), and the
+// service is never touched. An absent claim and a stale claim proceed
+// exactly as before, and an installation over a positively stopped
+// registration stays the pure rewrite it is beside a serving desktop: it
+// starts nothing, so the undetermined claim cannot make it start anything.
+func TestServiceMutationRefusesOnAClaimItCannotRead(t *testing.T) {
+	program := temporaryServiceProgram(t)
+
+	for _, tc := range []struct {
+		name      string
+		fixture   func(t *testing.T, path string)
+		args      []string
+		status    service.Status
+		statusErr error
+	}{
+		{"start over an unparsable claim", writeUnparsableDesktopState,
+			[]string{"start"}, service.Status{State: service.StateStopped}, nil},
+		{"restart over an unparsable claim", writeUnparsableDesktopState,
+			[]string{"restart"}, service.Status{State: service.StateStopped}, nil},
+		{"first install over an unparsable claim", writeUnparsableDesktopState,
+			[]string{"install", "--system", "--executable", program},
+			service.Status{State: service.StateNotInstalled}, nil},
+		{"install over a running instance beside an unparsable claim", writeUnparsableDesktopState,
+			[]string{"install", "--system", "--executable", program},
+			service.Status{State: service.StateRunning, Running: true}, nil},
+		{"install beside an unreadable claim", writeUnreadableDesktopState,
+			[]string{"install", "--system", "--executable", program},
+			service.Status{State: service.StateRunning, Running: true}, nil},
+		{"start beside an unreadable claim", writeUnreadableDesktopState,
+			[]string{"start"}, service.Status{State: service.StateStopped}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useFakeManager(t, &untouchedServiceManager{
+				fakeManager: fakeManager{status: tc.status, err: tc.statusErr},
+				t:           t,
+			})
+			useSingletonProbe(t, true)
+			tc.fixture(t, desktopStatePath(t))
+
+			var stdout, stderr bytes.Buffer
+			code := runServiceCommand(tc.args, &stdout, &stderr)
+			if code != serviceFailureExitCode {
+				t.Fatalf("the refused command must exit with %d, got %d:\n%s", serviceFailureExitCode, code, stderr.String())
+			}
+			for _, want := range []string{
+				"nothing was changed",
+				"cannot be read",
+				"cannot be determined",
+			} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("the refusal does not mention %q:\n%s", want, stderr.String())
+				}
+			}
+			// The honest terminal names no next action: no single
+			// step clears a file the guard cannot inspect.
+			for _, unwanted := range []string{"notification-area icon", "run the command again", "hfdesk service status"} {
+				if strings.Contains(stderr.String(), unwanted) {
+					t.Errorf("the refusal carries a next action (%q) although no single action clears its cause:\n%s", unwanted, stderr.String())
+				}
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("a refused command must not report a result:\n%s", stdout.String())
+			}
+		})
+	}
+
+	t.Run("a positively stopped installation beside an unreadable claim is still the pure rewrite", func(t *testing.T) {
+		manager := &holdObservingManager{
+			fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+		}
+		useFakeManager(t, manager)
+		record := useRecordedHold(t)
+		manager.hold = record
+		useSingletonProbe(t, true)
+		writeUnparsableDesktopState(t, desktopStatePath(t))
+
+		var stdout, stderr bytes.Buffer
+		code := runServiceCommand([]string{"install", "--system", "--executable", program}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("the rewrite of a stopped registration must exit with 0, got %d:\n%s", code, stderr.String())
+		}
+		if !manager.observed["install"] {
+			t.Errorf("the installation did not run, observations: %v", manager.observed)
+		}
+		for _, operation := range []string{"start", "restart"} {
+			if _, ran := manager.observed[operation]; ran {
+				t.Errorf("the rewrite ran a %s beside a claim the guard could not read", operation)
+			}
+		}
+	})
+
+	t.Run("an absent claim proceeds although the probe found a holder", func(t *testing.T) {
+		manager := &holdObservingManager{
+			fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+		}
+		useFakeManager(t, manager)
+		record := useRecordedHold(t)
+		manager.hold = record
+		useSingletonProbe(t, true)
+		useTemporaryConfigDir(t)
+
+		var stdout, stderr bytes.Buffer
+		if code := runServiceCommand([]string{"start"}, &stdout, &stderr); code != 0 {
+			t.Fatalf("the command must exit with 0, got %d:\n%s", code, stderr.String())
+		}
+		if !manager.observed["start"] {
+			t.Errorf("the start did not run, observations: %v", manager.observed)
+		}
+	})
+
+	t.Run("a stale claim proceeds although the probe found a holder", func(t *testing.T) {
+		manager := &holdObservingManager{
+			fakeManager: fakeManager{status: service.Status{State: service.StateStopped}},
+		}
+		useFakeManager(t, manager)
+		record := useRecordedHold(t)
+		manager.hold = record
+		useSingletonProbe(t, true)
+		writeStaleDesktopState(t, desktopStatePath(t))
+
+		var stdout, stderr bytes.Buffer
+		if code := runServiceCommand([]string{"start"}, &stdout, &stderr); code != 0 {
+			t.Fatalf("the command must exit with 0, got %d:\n%s", code, stderr.String())
+		}
+		if !manager.observed["start"] {
+			t.Errorf("the start did not run, observations: %v", manager.observed)
+		}
+	})
+}
+
+// writeUnparsableDesktopState leaves a claim file the guard cannot parse.
+func writeUnparsableDesktopState(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("write the unparsable claim: %v", err)
+	}
+}
+
+// writeUnreadableDesktopState leaves a claim the guard cannot read: a
+// directory at the claim path fails the read deterministically (EISDIR),
+// even for a test run as root, where chmod 0 would not deny the read.
+func writeUnreadableDesktopState(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatalf("put a directory at the claim path: %v", err)
+	}
+}
+
+// writeStaleDesktopState writes a readable claim whose process is gone: the
+// stale claim of a desktop that crashed.
+func writeStaleDesktopState(t *testing.T, path string) {
+	t.Helper()
+	// No process of any platform runs with this id: it is far above the
+	// pid limits of Linux and Windows alike.
+	if err := os.WriteFile(path, []byte(`{"url":"","pid":999999999}`), 0o600); err != nil {
+		t.Fatalf("write the stale claim: %v", err)
+	}
+}
+
+// assertNoError fails the test when the call it wraps reported a failure,
+// with the diagnostic the inline check printed.
+func assertNoError(t *testing.T, err error, format string, a ...any) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	if format == "" {
+		t.Fatal(err)
+		return
+	}
+	if len(a) == 0 {
+		t.Fatal(format)
+		return
+	}
+	t.Fatalf(format, a...)
 }

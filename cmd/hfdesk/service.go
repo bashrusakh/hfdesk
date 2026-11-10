@@ -130,6 +130,108 @@ func isServiceUsageError(err error) bool {
 // without touching the system of the test run.
 var newServiceManager = service.New
 
+// holdServiceMutation holds the per-session desktop singleton around one
+// service mutation that starts or restarts the service.
+//
+// The variable is the seam of the tests: a test observes the hold without
+// creating the object of its own session, which another package's tests of
+// the same machine could see.
+var holdServiceMutation = service.HoldDesktopSingleton
+
+// probeServiceMutation probes the per-session desktop singleton around the
+// hold, to learn whether the object already existed when the mutation began.
+//
+// The variable is the seam of the tests for the same reason the hold is
+// one: a test classifies a hold without creating the object of its session.
+var probeServiceMutation = service.ProbeDesktopSingleton
+
+// serviceStatusNextAction is the next action of a refusal that changed
+// nothing: the command that reads the current state of the instance. The
+// subcommand belongs to this very command family, so the refusal names a
+// real command and never a guessed one.
+const serviceStatusNextAction = `; run "hfdesk service status" to read the current state of the service`
+
+// holdRefusalNextAction returns the next action that follows a mutation
+// refused because the per-session desktop singleton could not be held — the
+// same action the desktop helper notice appends to its report of this
+// refusal. A cause that already names its own step (another Windows identity
+// owns the object, and that refusal says to end that process) keeps only
+// that step: a report carries one next action, never two.
+func holdRefusalNextAction(err error) string {
+	if errors.Is(err, service.ErrSingletonAccessDenied) {
+		return ""
+	}
+	return serviceStatusNextAction
+}
+
+// beginServiceMutationHold takes the hold that keeps a relaunch of the
+// desktop app out of the window of a mutation that starts or restarts the
+// service, or refuses the command before it changes anything, and reports
+// whether the singleton object already existed when the hold began.
+//
+// The probe runs first and keeps its own handle: the object then never
+// disappears between the probe and the hold, so "did not pre-exist" really
+// proves that no desktop of this session was alive when the window opened,
+// and no launch can slip in while the mutation runs. A probe that fails is
+// classified fail-closed — it did not rule out a live holder — while the
+// hold below stays the authority on whether the mutation may run at all.
+//
+// The hold is taken before the first change and released when the command
+// ends (together with the probe handle), so the whole mutation — including a
+// rollback and the restart of a running instance — runs with the singleton
+// held. A hold that cannot be established fails closed: the command refuses
+// with the reason instead of moving a service a relaunch could then bind.
+func beginServiceMutationHold() (release func(), singletonPreExisting bool, err error) {
+	probeRelease, preExisting, probeErr := probeServiceMutation("")
+	if probeErr != nil {
+		preExisting = true
+	}
+	holdRelease, err := holdServiceMutation("")
+	if err != nil {
+		if probeRelease != nil {
+			probeRelease()
+		}
+		return nil, false, fmt.Errorf("the per-session desktop singleton must be held before a service mutation and could not be held, so nothing was changed: %w%s", err, holdRefusalNextAction(err))
+	}
+	if holdRelease == nil {
+		if probeRelease != nil {
+			probeRelease()
+		}
+		return nil, false, errors.New("the per-session desktop singleton hold returned no release, so nothing was changed" + holdRefusalNextAction(nil))
+	}
+	return func() {
+		holdRelease()
+		if probeRelease != nil {
+			probeRelease()
+		}
+	}, preExisting, nil
+}
+
+// servingDesktopRefusal is the refusal of a mutation that is about to start
+// or restart the service while a desktop instance of this session serves
+// the address: the service would fight the desktop for it. The refusal
+// happens before the first service step, so it reports the unchanged state,
+// the cause, and the one step that ends it: quitting the desktop removes its
+// published state, and the repeat of the command then proceeds.
+func servingDesktopRefusal() error {
+	return errors.New("a running HFDesk desktop instance of this session serves its local server, so nothing was changed: quit HFDesk from the notification-area icon and run the command again")
+}
+
+// unreadableDesktopClaimRefusal is the refusal of a mutation whose guard
+// cannot read the published claim: a claim that exists but cannot be read
+// or parsed leaves whether a desktop serves undetermined, so the mutation
+// refuses before the first service step instead of proceeding beside a
+// desktop it cannot see.
+//
+// The message is an honest terminal and names no next action: no single
+// step is guaranteed to clear a file the guard cannot inspect — quitting
+// the desktop clears it only while one runs, and deleting the claim could
+// make a live desktop invisible to the guard — so the refusal states the
+// cause and the unchanged result and stops there.
+func unreadableDesktopClaimRefusal() error {
+	return fmt.Errorf("the published claim of the desktop at %q cannot be read, so whether a desktop of this session serves its local server cannot be determined: nothing was changed", service.ClaimStatePath())
+}
+
 // versionLikeSegment matches a "digit.digit" segment of a file name.
 //
 // The heuristic is deliberately simple: a release artifact carries its
@@ -518,6 +620,11 @@ type installFlags struct {
 	localDir    string
 	serviceUser string
 	executable  string
+	// explicit marks the flags the parser saw on the command line. The
+	// default of a flag set is only a fallback for an installation
+	// without a registration, so it must never overwrite the settings of
+	// an existing one.
+	explicit service.InstallFieldSet
 }
 
 // buildInstallOptions assembles the options of an installation from the
@@ -528,9 +635,10 @@ type installFlags struct {
 // directory: the parent of the config file is the directory the
 // installation prepares.
 //
-// The cache directories are derived from the runtime paths, so they are
-// resolved after the overrides: a machine-wide instance keeps its cache
-// inside its own state root even when the state root was overridden.
+// The cache directories are derived from the runtime paths of the request,
+// so a fresh machine-wide instance keeps its cache inside its own state
+// root. A reinstall that names only one path inherits the cache directory of
+// the registration, because an unnamed setting is kept.
 //
 // The cache root and the hub directory are one layout, so an explicit cache
 // root moves the hub directory with it: a registration that names a cache
@@ -595,6 +703,7 @@ func buildInstallOptions(scope service.Scope, flags installFlags, executable str
 	return service.InstallOptions{
 		Scope:       scope,
 		Executable:  executable,
+		Explicit:    flags.explicit,
 		Listen:      listen,
 		Paths:       paths,
 		CacheDir:    cacheRoot,
@@ -604,15 +713,48 @@ func buildInstallOptions(scope service.Scope, flags installFlags, executable str
 	}, nil
 }
 
-// serviceInstall registers the service with the platform supervisor of the
-// scope.
+// installExplicitFields returns the fields the command line named
+// explicitly.
 //
-// The command validates its own arguments before it touches the system. It
-// never starts the instance itself: the supervisor may start a registration
-// that asks for it (a LaunchAgent with RunAtLoad starts it), so the summary
-// reports the state that was reached instead of a fixed claim.
-func serviceInstall(args []string, stdout io.Writer) error {
-	flags := installFlags{}
+// Only a flag the parser saw on the command line counts. The default of a
+// flag is a value the request only carries as a fallback for an installation
+// without a registration, so it must never overwrite the setting of an
+// existing one: reinstalling with a new --executable alone keeps the bind
+// address, the paths, the cache layout and the account of the instance.
+//
+// The --listen flag keeps its default, so an installation without the flag
+// reports no explicit bind address while the options still carry the default
+// of the scope.
+//
+// An explicit cache root without a hub directory moves the hub directory with
+// it (see buildInstallOptions), so the hub directory counts as named as well:
+// the resolved "<cache>/hub" is the value the request asked for.
+func installExplicitFields(fs *flag.FlagSet) service.InstallFieldSet {
+	visited := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+
+	fields := service.InstallFieldSet{
+		Listen:      visited["listen"],
+		Config:      visited["config"],
+		StateDir:    visited["state-dir"],
+		LogDir:      visited["log-dir"],
+		CacheDir:    visited["cache-dir"],
+		HubDir:      visited["hub-dir"],
+		LocalDir:    visited["local-dir"],
+		ServiceUser: visited["service-user"],
+	}
+	if fields.CacheDir && !fields.HubDir {
+		fields.HubDir = true
+	}
+	return fields
+}
+
+// newInstallFlagSet registers the flags of "service install" and returns the
+// flag set that owns them.
+//
+// The flag set is built in one place, so the parser of the command line and
+// the markers of an explicit field never drift apart.
+func newInstallFlagSet(flags *installFlags) *flag.FlagSet {
 	fs := flag.NewFlagSet("hfdesk service install", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	registerScopeFlags(fs, &flags.scopeFlags)
@@ -625,6 +767,24 @@ func serviceInstall(args []string, stdout io.Writer) error {
 	fs.StringVar(&flags.localDir, "local-dir", "", "absolute path of the flat output directory")
 	fs.StringVar(&flags.serviceUser, "service-user", "", "account the machine-wide instance runs as (the machine-wide scope of Linux and macOS; the account cannot be chosen on Windows)")
 	fs.StringVar(&flags.executable, "executable", "", "absolute path of the binary to register (default: the invoked binary)")
+	return fs
+}
+
+// serviceInstall registers the service with the platform supervisor of the
+// scope.
+//
+// The command validates its own arguments before it touches the system. It
+// never starts the instance itself: the supervisor may start a registration
+// that asks for it (a LaunchAgent with RunAtLoad starts it), so the summary
+// reports the state that was reached instead of a fixed claim.
+//
+// An installation over an existing registration can stop and restart a
+// running instance, so the desktop singleton of this session is held across
+// the whole write and released when the command ends; a hold that cannot be
+// established refuses the command before the registration is touched.
+func serviceInstall(args []string, stdout io.Writer) error {
+	flags := installFlags{}
+	fs := newInstallFlagSet(&flags)
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -636,6 +796,11 @@ func serviceInstall(args []string, stdout io.Writer) error {
 	if rest := fs.Args(); len(rest) > 0 {
 		return newServiceUsageError(fmt.Errorf("unexpected argument %q, the command takes flags only", rest[0]))
 	}
+
+	// The fields the user named are read back from the parser, so a
+	// default of the flag set is never mistaken for a setting of the
+	// request.
+	flags.explicit = installExplicitFields(fs)
 
 	scope, err := resolveScope(flags.user, flags.system)
 	if err != nil {
@@ -668,6 +833,8 @@ func serviceInstall(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// A named path is another program until its health endpoint answers.
+	opts.ExpectedVersion = expectedInstallVersion(executable)
 
 	mgr, err := newServiceManager(scope)
 	if err != nil {
@@ -677,15 +844,98 @@ func serviceInstall(args []string, stdout io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := mgr.Install(ctx, opts); err != nil {
+	// The registration write may stop and restart a running instance, so
+	// the desktop singleton of this session is held across the whole
+	// mutation and released when the command ends.
+	holdRelease, singletonPreExisting, err := beginServiceMutationHold()
+	if err != nil {
+		return err
+	}
+	defer holdRelease()
+	// The refusal covers the outcomes that start or restart the
+	// service: only an installation over a positively confirmed stopped
+	// registration — the observed stopped state with no running fact,
+	// the standard the desktop gate uses as well — is a pure rewrite
+	// that starts nothing and proceeds beside the desktop that serves
+	// the address. Every other answer fails closed: a first
+	// installation writes a registration its supervisor may start, a
+	// running instance is restarted on the new program, and a state
+	// that is not positively stopped cannot prove that nothing starts.
+	// A claim the guard cannot read refuses the same way — with its own
+	// cause, from the same read that decided the refusal — because it
+	// may be the claim of the serving desktop.
+	serving, unreadableClaim := service.CheckLiveServingDesktop(singletonPreExisting)
+	if serving {
+		status, statusErr := mgr.Status(ctx)
+		if statusErr != nil || status.State != service.StateStopped || status.Running {
+			if unreadableClaim {
+				return unreadableDesktopClaimRefusal()
+			}
+			return servingDesktopRefusal()
+		}
+	}
+
+	effective, err := mgr.Install(ctx, opts)
+	if err != nil {
 		return err
 	}
 
-	writeInstallSummary(stdout, ctx, mgr, scope, opts)
+	writeInstallSummary(stdout, ctx, mgr, scope, effective)
 	return nil
 }
 
+// expectedInstallVersion returns the build version of the registered program
+// when that program is the image the kernel executes. A local build ("dev")
+// and a named --executable are not a version the installation may demand, and
+// neither is a registration whose file no longer is the running image.
+//
+// The identity of the running image is a fact of the platform
+// (service.RunningImageInfo): Linux reads the executed inode through the
+// procfs magic link /proc/self/exe, which stats the image even when its
+// path was replaced while this process kept running — os.Executable cannot
+// prove that identity there, because its documented contract does not
+// guarantee the path still points at the started executable and the
+// standard library trims the "(deleted)" suffix procfs appends to a
+// replaced image, so two stats of path names would both see the
+// replacement and stamp the old compiled-in Version against a file that
+// reports another one, which a verified start would then reject as a
+// mismatch. Windows identifies the image through its module path and the
+// identity of that file read from an open handle; a platform that cannot
+// prove the identity at all reports no file info.
+//
+// When the running image cannot be identified (a host without an answer,
+// an unreadable link, a path that no longer resolves), no version claim is
+// stamped: the uncertainty stays visible in an empty expectation instead of
+// demanding a version the registered program may not report.
+func expectedInstallVersion(executable string) string {
+	if Version == "" || Version == "dev" {
+		return ""
+	}
+	registered, err := os.Stat(executable)
+	if err != nil {
+		return ""
+	}
+	running, err := runningImageInfo()
+	if err != nil {
+		return ""
+	}
+	if !os.SameFile(registered, running) {
+		return ""
+	}
+	return Version
+}
+
+// runningImageInfo resolves the file info of the running image itself. It
+// is a variable so the tests can exercise a file replaced under a running
+// image; the default is the platform identity of the service layer.
+var runningImageInfo = service.RunningImageInfo
+
 // writeInstallSummary prints what was registered.
+//
+// The options are the effective installation the manager returned, not the
+// request: an installation over an existing registration keeps the settings
+// the request did not name, so the summary reports what the registration
+// really holds instead of what the command line asked for.
 //
 // The path of the registration and the state of the instance are known only
 // after the installation, so both are read back from the supervisor.
@@ -727,6 +977,27 @@ func writeInstallSummary(w io.Writer, ctx context.Context, mgr service.Manager, 
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "The service was registered.")
 	writeInstallState(w, scope, status, statusErr)
+	if dropIn := systemdDropInPath(status.UnitPath); dropIn != "" {
+		fmt.Fprintf(w, "Unit customizations belong in: %s\n", dropIn)
+	}
+}
+
+// systemdDropInPath returns the administrator drop-in beside a systemd unit
+// registration, or the empty string for a registration that has no drop-in
+// layer.
+//
+// An installation regenerates the systemd unit as a whole, so a
+// customization has to live in the drop-in beside it to survive the next
+// update — that is the path the summary points at. The property list of
+// macOS and the registration of Windows have no drop-in directory, and a
+// summary must not point at a path that does not exist there; the unit file
+// of a systemd registration is the only registration path that ends in
+// ".service".
+func systemdDropInPath(unitPath string) string {
+	if !strings.HasSuffix(unitPath, ".service") {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(unitPath), filepath.Base(unitPath)+".d", "local.conf")
 }
 
 // installAccount returns the account the registered instance runs as.
@@ -1001,6 +1272,11 @@ func newLifecycleManager(name string, args []string, stdout io.Writer, summary s
 }
 
 // serviceStart starts the registered service.
+//
+// The start takes the service out of a stopped state a launch may have
+// decided on, so the desktop singleton of this session is held across the
+// start and released when the command ends; a hold that cannot be
+// established refuses the command before the service is touched.
 func serviceStart(args []string, stdout io.Writer) error {
 	mgr, _, err := newLifecycleManager("hfdesk service start", args, stdout,
 		"Start the registered service.")
@@ -1010,6 +1286,24 @@ func serviceStart(args []string, stdout io.Writer) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	holdRelease, singletonPreExisting, err := beginServiceMutationHold()
+	if err != nil {
+		return err
+	}
+	defer holdRelease()
+	// The command is about to start or restart the service: a desktop
+	// instance of this session that already serves the address ends the
+	// command here, before the first service step — and so does a claim
+	// the guard cannot read, which may be the claim of that desktop; the
+	// cause comes from the same read that decided the refusal.
+	serving, unreadableClaim := service.CheckLiveServingDesktop(singletonPreExisting)
+	if serving {
+		if unreadableClaim {
+			return unreadableDesktopClaimRefusal()
+		}
+		return servingDesktopRefusal()
+	}
 
 	if err := mgr.Start(ctx); err != nil {
 		return err
@@ -1039,6 +1333,11 @@ func serviceStop(args []string, stdout io.Writer) error {
 }
 
 // serviceRestart stops and starts the registered service.
+//
+// The restart moves the service through the stopped state in one command, so
+// the desktop singleton of this session is held across the whole restart and
+// released when the command ends; a hold that cannot be established refuses
+// the command before the service is touched.
 func serviceRestart(args []string, stdout io.Writer) error {
 	mgr, _, err := newLifecycleManager("hfdesk service restart", args, stdout,
 		"Stop and start the registered service.")
@@ -1048,6 +1347,19 @@ func serviceRestart(args []string, stdout io.Writer) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	holdRelease, singletonPreExisting, err := beginServiceMutationHold()
+	if err != nil {
+		return err
+	}
+	defer holdRelease()
+	serving, unreadableClaim := service.CheckLiveServingDesktop(singletonPreExisting)
+	if serving {
+		if unreadableClaim {
+			return unreadableDesktopClaimRefusal()
+		}
+		return servingDesktopRefusal()
+	}
 
 	if err := mgr.Restart(ctx); err != nil {
 		return err
@@ -1281,5 +1593,7 @@ func runServiceHost(ctx context.Context, args []string) error {
 	if err != nil {
 		return newServiceUsageError(err)
 	}
+	// The health endpoint reports the version of this build.
+	opts.Version = Version
 	return service.RunProcess(ctx, opts)
 }

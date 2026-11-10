@@ -32,17 +32,13 @@ func TestAlreadyRunningOpenFailedTextNamesTheFailureAndTheWayOut(t *testing.T) {
 	text := alreadyRunningOpenFailedText("http://127.0.0.1:8080",
 		errors.New("the browser could not be started"))
 
-	for _, want := range []string{
+	assertNames(t, text, "text", []string{
 		"could not open the web UI",
 		"http://127.0.0.1:8080",
 		"the browser could not be started",
 		"notification area",
 		"Runtime / Logs window",
-	} {
-		if !strings.Contains(text, want) {
-			t.Errorf("text = %q, want it to mention %q", text, want)
-		}
-	}
+	})
 }
 
 // TestAlreadyRunningTextClaimsTheWebUIWasOpened proves that the notice of a
@@ -83,15 +79,11 @@ func TestBrowserOpenFailedTextNamesTheFailure(t *testing.T) {
 	text := browserOpenFailedText("http://127.0.0.1:8080",
 		errors.New("the browser could not be started"))
 
-	for _, want := range []string{
+	assertNames(t, text, "text", []string{
 		"could not open the web UI",
 		"http://127.0.0.1:8080",
 		"the browser could not be started",
-	} {
-		if !strings.Contains(text, want) {
-			t.Errorf("text = %q, want it to mention %q", text, want)
-		}
-	}
+	})
 	if strings.Contains(text, "is opened in your default browser") {
 		t.Errorf("text = %q, want it to not claim that the web UI was opened", text)
 	}
@@ -110,5 +102,42 @@ func TestAlreadyRunningOpenFailedTextUsesTheBrowserNotice(t *testing.T) {
 	if !strings.Contains(text, browserOpenFailedText("http://127.0.0.1:8080",
 		errors.New("the browser could not be started"))) {
 		t.Errorf("text = %q, want it to carry the notice of the browser failure", text)
+	}
+}
+
+// TestPublishStateStartupTextStatesTheResultTheCauseAndOneAction proves
+// the report of a launch that stopped over its unpublished state is honest:
+// it says that nothing is served, names the cause with the error, and asks
+// for exactly one next action.
+func TestPublishStateStartupTextStatesTheResultTheCauseAndOneAction(t *testing.T) {
+	text := publishStateStartupText(errors.New(
+		"desktop: publish the effective URL to /tmp/desktop-state.json: the state directory is read-only"))
+
+	assertNames(t, text, "text", []string{
+		"HFDesk is not serving",
+		"could not publish the effective URL",
+		"the state directory is read-only",
+	})
+	if got := strings.Count(text, "start HFDesk again"); got != 1 {
+		t.Errorf("the number of next actions = %d, want exactly 1: %q", got, text)
+	}
+}
+
+// TestPublishClaimStartupTextStatesTheResultTheCauseAndOneAction proves the
+// report of a launch that could not publish the claim of its startup is
+// honest in the same shape: nothing is served, the cause is named with the
+// error, and exactly one next action is asked for. The claim is the fact
+// the mutation guard reads, so this launch must not serve without it.
+func TestPublishClaimStartupTextStatesTheResultTheCauseAndOneAction(t *testing.T) {
+	text := publishClaimStartupText(errors.New(
+		"desktop: publish the startup claim to /tmp/desktop-state.json: the state directory is read-only"))
+
+	assertNames(t, text, "text", []string{
+		"HFDesk is not serving",
+		"could not publish the claim of this launch",
+		"the state directory is read-only",
+	})
+	if got := strings.Count(text, "start HFDesk again"); got != 1 {
+		t.Errorf("the number of next actions = %d, want exactly 1: %q", got, text)
 	}
 }

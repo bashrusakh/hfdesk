@@ -159,6 +159,8 @@ type JobManager struct {
 	closeOnce         sync.Once
 	closeDone         chan struct{}
 	closeErr          error
+	historyErr        error // guarded by mu; terminal history writes finish before runWG.Done
+	appendHistory     func(*Job) error
 	listeners         []chan *Job
 	listenerMu        sync.RWMutex
 	wsHub             *WSHub
@@ -217,6 +219,7 @@ func newJobManagerWithStatePath(cfg Config, wsHub *WSHub, statePath string) *Job
 		statePath:            statePath,
 		persistStateFile:     saveJobsState,
 		loadStateFile:        loadJobsState,
+		appendHistory:        AppendHistory,
 		closeDone:            make(chan struct{}),
 		wsHub:                wsHub,
 		speedLimiter:         hfdownloader.NewRateLimiter(hfdownloader.ParseSize(cfg.MaxSpeed)),
@@ -363,6 +366,7 @@ func (m *JobManager) finishClose() {
 
 	m.saveMu.Lock()
 	m.mu.RLock()
+	historyErr := m.historyErr
 	snapshot := make([]*Job, 0, len(m.jobs))
 	for _, job := range m.jobs {
 		snapshot = append(snapshot, m.cloneJobLocked(job))
@@ -372,7 +376,7 @@ func (m *JobManager) finishClose() {
 	m.persistenceClosed = true
 	m.saveMu.Unlock()
 
-	m.closeErr = err
+	m.closeErr = errors.Join(historyErr, err)
 	close(m.closeDone)
 }
 
@@ -1880,11 +1884,12 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 	// Persist state and record completed/failed jobs in history
 	m.saveStateAndLog()
 	if endSnap.Status == JobStatusCompleted || endSnap.Status == JobStatusFailed {
-		go func() {
-			if err := AppendHistory(endSnap); err != nil {
-				jobsLog.Warn("could not append history", "error", err, "job_id", endSnap.ID)
-			}
-		}()
+		if err := m.appendHistory(endSnap); err != nil {
+			jobsLog.Warn("could not append history", "error", err, "job_id", endSnap.ID)
+			m.mu.Lock()
+			m.historyErr = errors.Join(m.historyErr, fmt.Errorf("append history for job %s: %w", endSnap.ID, err))
+			m.mu.Unlock()
+		}
 	}
 }
 

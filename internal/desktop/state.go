@@ -5,16 +5,38 @@ package desktop
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/bashrusakh/hfdesk/internal/server"
+	"github.com/bashrusakh/hfdesk/internal/service"
 )
+
+// publishState writes the published state of the desktop host. It is the
+// seam of the test: the fail-closed rule needs a publish that fails on any
+// machine.
+var publishState = service.PublishState
+
+// publishServingState publishes the effective URL of a desktop host whose
+// server already runs — it completes the claim the launch published before
+// it opened its start window — and it fails closed in both directions.
+//
+// The mutation guard of this session decides whether a desktop serves from
+// the published state next to the singleton probe (service.LiveServingDesktop),
+// so a host that serves without its state would let `hfdesk service
+// install/start/restart` start the service beside it. A publish that succeeds
+// therefore lets the host serve exactly as before, and a publish that fails
+// stops the server through the graceful path (stop) and returns the failure,
+// so nothing is served and no state is ambiguous.
+func publishServingState(path, url string, stop func()) error {
+	if err := publishState(path, url); err != nil {
+		stop()
+		return fmt.Errorf("desktop: publish the effective URL to %s: %w", path, err)
+	}
+	return nil
+}
 
 // reachabilityTimeout bounds the probe of the published URL.
 //
@@ -23,80 +45,16 @@ import (
 // is not there.
 const reachabilityTimeout = 2 * time.Second
 
-// publishedState is the state the running instance publishes, so a second
-// launch can open the web UI of the instance that is already running.
-//
-// The state is a convenience, never the authority on whether HFDesk is
-// running: the single instance lock decides that.
-type publishedState struct {
-	// URL is the effective, browser-safe URL of the running server.
-	URL string `json:"url"`
-	// PID is the process id of the running instance.
-	PID int `json:"pid"`
-}
-
-// publishedStatePath returns the path of the published state file.
-//
-// The file lives in the per user configuration directory, so two users of
-// the same machine never share it.
-func publishedStatePath() string {
-	return filepath.Join(server.AppConfigDir(), "desktop-state.json")
-}
-
-// publishState writes the effective URL of the running instance.
-//
-// The file is written through a temporary file and renamed, so a reader
-// never sees a half written state.
-func publishState(path, url string) error {
-	data, err := json.Marshal(publishedState{URL: url, PID: os.Getpid()})
-	if err != nil {
-		return err
-	}
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-	}
-	temp := path + ".tmp"
-	if err := os.WriteFile(temp, data, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(temp, path); err != nil {
-		_ = os.Remove(temp)
-		return err
-	}
-	return nil
-}
-
-// readPublishedState reads the published state.
-//
-// It reports false when the file is missing or corrupt. A state file that
-// cannot be read is never a reason to fail a launch: the state is only a
-// convenience.
-func readPublishedState(path string) (publishedState, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return publishedState{}, false
-	}
-	var state publishedState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return publishedState{}, false
-	}
-	if strings.TrimSpace(state.URL) == "" {
-		return publishedState{}, false
-	}
-	return state, true
-}
-
-// removePublishedState removes the published state file.
-func removePublishedState(path string) {
-	_ = os.Remove(path)
-}
-
 // publishedURL returns the URL of the running instance, or an empty string
-// when no instance published one.
+// when no instance published one — and also when the claim it reads belongs
+// to a launch that passed the service gate but has not bound its address
+// yet: such a claim carries no URL until the server knows it.
+//
+// The published state itself is owned by the service layer beside the
+// singleton hold and probe that classify a service mutation: the desktop
+// host consumes it here for the second-launch display.
 func publishedURL() string {
-	state, ok := readPublishedState(publishedStatePath())
+	state, ok := service.ReadPublishedState(service.PublishedStatePath())
 	if !ok {
 		return ""
 	}

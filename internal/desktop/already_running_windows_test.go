@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/bashrusakh/hfdesk/internal/service"
 )
 
 // TestSecondLaunchReportsAFailedBrowserOpen proves that a second launch
@@ -43,16 +45,14 @@ func TestSecondLaunchReportsAFailedBrowserOpen(t *testing.T) {
 	}))
 	defer running.Close()
 
-	if err := publishState(publishedStatePath(), running.URL); err != nil {
-		t.Fatalf("publish the state of the running instance: %v", err)
-	}
+	err := service.PublishState(service.PublishedStatePath(), running.URL)
+	assertNoError(t, err, "publish the state of the running instance: %v", err)
 
 	// The browser cannot be opened.
 	previousBrowser := openBrowser
 	openBrowser = func(string) error { return errors.New("the browser could not be started") }
 	defer func() { openBrowser = previousBrowser }()
 
-	// The message box is recorded instead of shown.
 	var messages []shownMessage
 	previousMessage := showMessage
 	showMessage = func(caption, text string, icon uint32) {
@@ -120,9 +120,8 @@ func TestSecondLaunchOpensTheWebUIOfTheRunningInstance(t *testing.T) {
 	}))
 	defer running.Close()
 
-	if err := publishState(publishedStatePath(), running.URL); err != nil {
-		t.Fatalf("publish the state of the running instance: %v", err)
-	}
+	err := service.PublishState(service.PublishedStatePath(), running.URL)
+	assertNoError(t, err, "publish the state of the running instance: %v", err)
 
 	// The browser records the URL it opens.
 	var opened []string
@@ -159,6 +158,48 @@ func TestSecondLaunchOpensTheWebUIOfTheRunningInstance(t *testing.T) {
 	if !strings.Contains(messages[0].text, running.URL) {
 		t.Errorf("the message of the second launch is %q, want it to name the URL of the running instance",
 			messages[0].text)
+	}
+}
+
+// TestSecondLaunchReportsAnIdentityItCannotAccess proves that a relaunch
+// whose identity has no access to the singleton object gets an honest report:
+// the object exists and another Windows account created it, so the launch
+// starts no server — the safe direction — and the notice names that fact and
+// the step that ends it instead of reading like an internal failure or like
+// the notice of a running instance it never reached.
+func TestSecondLaunchReportsAnIdentityItCannotAccess(t *testing.T) {
+	name, err := instanceMutexName()
+	assertNoError(t, err, "read the per-session singleton name: %v", err)
+	probe, err := acquireInstanceLock()
+	assertNoError(t, err, "probe the per-session singleton: %v", err)
+	if probe.Exists() {
+		probe.Release()
+		t.Skip("another desktop test or app owns the per-session singleton")
+	}
+	probe.Release()
+	createDeniedDesktopSingleton(t, name)
+
+	lock, err := acquireInstanceLock()
+	if err == nil {
+		lock.Release()
+		t.Fatal("the relaunch took a singleton object that denies this identity")
+	}
+	if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		t.Fatalf("acquireInstanceLock() = %v, want the access denial of the existing object", err)
+	}
+
+	text := instanceLockStartupText(err)
+	assertNames(t, text, "the report", []string{
+		"single instance object",
+		"cannot access it",
+		"different Windows account",
+		"starts no server",
+		"start HFDesk again",
+	})
+	// The identity refusal is distinct from the notice of a launch that
+	// found a running instance: this launch never reached that check.
+	if strings.Contains(text, alreadyRunningCaption) || strings.Contains(text, "HFDesk is already running") {
+		t.Errorf("the report %q claims a running instance, want the identity refusal", text)
 	}
 }
 

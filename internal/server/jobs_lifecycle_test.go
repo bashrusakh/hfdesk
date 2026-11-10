@@ -49,9 +49,8 @@ func TestJobManagerQuiesceFencesAlreadyDispatchedRunner(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := m.Close(ctx); err != nil {
-		t.Fatal(err)
-	}
+	err := m.Close(ctx)
+	assertNoError(t, err, "")
 	got, ok := m.GetJob(job.ID)
 	if !ok || got.Status != JobStatusQueued || got.starting {
 		t.Fatalf("starting runner crossed fence: %#v", got)
@@ -71,9 +70,7 @@ func TestJobManagerClosePausesRealRunnerAndPreservesPartials(t *testing.T) {
 	defer server.Close()
 	m := newLifecycleTestManager(t, Config{CacheDir: t.TempDir(), Endpoint: server.URL, MaxActive: 1})
 	job, _, err := m.CreateJob(DownloadRequest{Repo: "owner/model"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
@@ -132,9 +129,7 @@ func TestJobManagerCompletionDuringQuiesceDoesNotDispatchQueue(t *testing.T) {
 	updates := m.Subscribe()
 	defer m.Unsubscribe(updates)
 	first, _, err := m.CreateJob(DownloadRequest{Repo: "owner/active"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if _, _, err := m.CreateJob(DownloadRequest{Repo: "owner/queued"}); err != nil {
 		t.Fatal(err)
 	}
@@ -213,16 +208,13 @@ func TestJobManagerCloseDrainsAcceptedMutationAndSharesResult(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("close coordinator did not finish after mutation drained")
 	}
-	if err := m.Close(context.Background()); err != nil {
-		t.Fatalf("repeated Close changed result: %v", err)
-	}
+	err := m.Close(context.Background())
+	assertNoError(t, err, "repeated Close changed result: %v", err)
 	if calls != 2 {
 		t.Fatalf("persistence calls = %d, want mutation + final snapshot", calls)
 	}
 	loaded, err := loadJobsState(m.statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if len(loaded) != 1 || loaded[0].Status != JobStatusCancelled {
 		t.Fatalf("final snapshot omitted accepted mutation: %#v", loaded)
 	}
@@ -293,13 +285,10 @@ func TestJobManagerFinalSnapshotAndNoWritesAfterClose(t *testing.T) {
 	if got, _ := m.GetJob("paused"); got.Status != JobStatusQueued || got.starting {
 		t.Fatalf("quiesce dispatched a resumed job: %#v", got)
 	}
-	if err := m.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	err := m.Close(context.Background())
+	assertNoError(t, err, "")
 	loaded, err := loadJobsState(m.statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if len(loaded) != 1 || loaded[0].Status != JobStatusPaused {
 		t.Fatalf("final snapshot did not include unsaved mutation: %#v", loaded)
 	}
@@ -365,8 +354,100 @@ func TestJobManagerCloseTimeoutDoesNotCancelFinalPersistence(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("close did not complete after persistence returned")
 	}
-	if err := m.Close(context.Background()); err != nil {
-		t.Fatalf("repeated Close result = %v", err)
+	err := m.Close(context.Background())
+	assertNoError(t, err, "repeated Close result = %v", err)
+}
+
+func TestJobManagerCloseWaitsForTerminalHistoryAndReportsWriteFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, first string
+		status      JobStatus
+		historyErr  error
+	}{{"completed", "", JobStatusCompleted, nil}, {"failed", "fail", JobStatusFailed, errors.New("history write failed")}} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateCacheState(t)
+			endpoint, _, _, _ := cacheDownloadFixture(t, tc.first)
+			m := newLifecycleTestManager(t, Config{CacheDir: t.TempDir(), Endpoint: endpoint.URL, MaxActive: 1})
+			entered, release := make(chan struct{}), make(chan struct{})
+			// The runner blocks in appendHistory until the test releases it.
+			// The release is idempotent and runs at the end of the test, so
+			// an assertion that fails first never leaves the runner blocked
+			// until the suite times out.
+			var releaseOnce sync.Once
+			releaseHistory := func() { releaseOnce.Do(func() { close(release) }) }
+			t.Cleanup(releaseHistory)
+			realAppend, historyErr := m.appendHistory, tc.historyErr
+			m.appendHistory = func(terminal *Job) error {
+				close(entered)
+				<-release
+				if historyErr != nil {
+					return historyErr
+				}
+				return realAppend(terminal)
+			}
+			job, _, err := m.CreateJob(DownloadRequest{Repo: "owner/model"})
+			assertNoError(t, err, "")
+			select {
+			case <-entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("terminal runner did not reach history persistence")
+			}
+			if got, _ := m.GetJob(job.ID); got.Status != tc.status {
+				t.Fatalf("terminal status = %q, want %q", got.Status, tc.status)
+			}
+
+			var finalErr error
+			if historyErr != nil {
+				finalErr = errors.New("final job snapshot failed")
+				realPersist := m.persistStateFile
+				m.persistStateFile = func(path string, jobs []*Job) error {
+					return errors.Join(realPersist(path, jobs), finalErr)
+				}
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if err := m.Close(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("Close while terminal history is blocked = %v, want context.Canceled", err)
+			}
+			// The close coordinator (finishClose) may close closeDone
+			// only after the runner releases runWG, and the runner
+			// holds runWG for the whole history write — but the check
+			// has to give the coordinator goroutine a window to run
+			// before it can observe that it waits: an instant
+			// nonblocking select could pass while the goroutine is
+			// still unscheduled, which proves nothing either way.
+			// There is no in-process signal of the coordinator before
+			// the history is released — its first actions are
+			// WaitGroup waits, and its first observable call (the
+			// final persistStateFile) happens only after the drain —
+			// so a bounded observation is the strongest evidence this
+			// test can hold without a production seam. The window
+			// cannot fail on a correct coordinator: closeDone closes
+			// only behind runWG.Wait, which the blocked runner keeps
+			// closed for the whole window.
+			select {
+			case <-m.closeDone:
+				t.Fatal("close completed before the terminal history write")
+			case <-time.After(time.Second):
+			}
+
+			releaseHistory()
+			ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+			closeErr := m.Close(ctx)
+			cancel()
+			if historyErr != nil {
+				if !errors.Is(closeErr, historyErr) || !errors.Is(closeErr, finalErr) {
+					t.Fatalf("close error = %v, want both history and final snapshot errors", closeErr)
+				}
+				return
+			}
+			assertNoError(t, closeErr, "Close after successful history persistence: %v", closeErr)
+			entries, err := LoadHistory()
+			assertNoError(t, err, "")
+			if len(entries) != 1 || entries[0].ID != job.ID || entries[0].Status != tc.status {
+				t.Fatalf("persisted terminal history = %#v, want job %s with status %s", entries, job.ID, tc.status)
+			}
+		})
 	}
 }
 

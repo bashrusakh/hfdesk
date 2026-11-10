@@ -99,19 +99,64 @@ func TestRunArgsUsesDefaultListenWhenUnset(t *testing.T) {
 	}
 }
 
+func TestMergeInstallOptionsPreservesUnsetRegistrationDestinations(t *testing.T) {
+	requested := fullInstallOptions(t)
+	existing := fullInstallOptions(t)
+	existing.CacheDir = ""
+	existing.HubDir = ""
+	existing.LocalDir = ""
+
+	got := mergeInstallOptions(requested, existing, true)
+	if got.CacheDir != "" || got.HubDir != "" || got.LocalDir != "" {
+		t.Errorf("unset destinations = %q/%q/%q, want absence from the registration", got.CacheDir, got.HubDir, got.LocalDir)
+	}
+	if got.Paths != existing.Paths || got.Listen != existing.Listen {
+		t.Errorf("merge changed the other registered settings: %+v", got)
+	}
+}
+
+func TestMergeInstallOptionsKeepsAnAbsentHubForAnExistingCache(t *testing.T) {
+	requested := fullInstallOptions(t)
+	existing := fullInstallOptions(t)
+	existing.CacheDir = "/registered/custom-cache"
+	existing.HubDir = ""
+
+	got := mergeInstallOptions(requested, existing, true)
+	if got.CacheDir != existing.CacheDir || got.HubDir != "" {
+		t.Errorf("merged cache layout = %q/%q, want custom cache with no registered hub", got.CacheDir, got.HubDir)
+	}
+}
+
+func TestMergeInstallOptionsUsesDerivedHubForAnExplicitCacheOnlyRequest(t *testing.T) {
+	requested := fullInstallOptions(t)
+	requested.CacheDir = "/new/cache"
+	requested.HubDir = filepath.Join(requested.CacheDir, "hub")
+	requested.Explicit.CacheDir = true
+	requested.Explicit.HubDir = true
+	existing := fullInstallOptions(t)
+	existing.CacheDir = "/old/cache"
+	existing.HubDir = "/separate/old-hub"
+
+	got := mergeInstallOptions(requested, existing, true)
+	if got.CacheDir != requested.CacheDir || got.HubDir != filepath.Join(requested.CacheDir, "hub") {
+		t.Errorf("cache-only request merged to %q/%q, want %q/%q", got.CacheDir, got.HubDir, requested.CacheDir, filepath.Join(requested.CacheDir, "hub"))
+	}
+}
+
 // installOptionStringFields are the string fields of InstallOptions.
 //
-// Every one of them carries the scope, a path, the bind address or the
-// account of an instance. The type carries no credential field at all, so a
-// registration can never carry one.
+// Every one of them carries the scope, a path, the bind address, the account
+// or the build version of an instance. The type carries no credential field at
+// all, so a registration can never carry one.
 var installOptionStringFields = map[string]bool{
-	"Scope":       true,
-	"Executable":  true,
-	"Listen":      true,
-	"CacheDir":    true,
-	"HubDir":      true,
-	"LocalDir":    true,
-	"ServiceUser": true,
+	"Scope":           true,
+	"Executable":      true,
+	"Listen":          true,
+	"CacheDir":        true,
+	"HubDir":          true,
+	"LocalDir":        true,
+	"ServiceUser":     true,
+	"ExpectedVersion": true,
 }
 
 // TestInstallOptionsCarryNoCredentialField checks that the options of an
@@ -276,20 +321,17 @@ func TestValidateInstallOptionsAcceptsValidInstallation(t *testing.T) {
 		HubDir:   filepath.Join(root, "cache", "hub"),
 		LocalDir: filepath.Join(root, "models"),
 	}
-	if err := ValidateInstallOptions(opts); err != nil {
-		t.Fatalf("ValidateInstallOptions() = %v, want nil", err)
-	}
+	err := ValidateInstallOptions(opts)
+	assertNoError(t, err, "ValidateInstallOptions() = %v, want nil", err)
 }
 
 func TestValidateInstallOptionsRejectsInvalidInstallation(t *testing.T) {
 	root := t.TempDir()
 	executable := filepath.Join(root, "bin", "hfdesk")
-	if err := os.MkdirAll(filepath.Dir(executable), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(filepath.Dir(executable), 0o755)
+	assertNoError(t, err, "")
+	err = os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o755)
+	assertNoError(t, err, "")
 
 	valid := func() InstallOptions {
 		return InstallOptions{
@@ -360,9 +402,8 @@ func TestPrepareDirsCreatesOwnedDirectories(t *testing.T) {
 			LogDir:     logDir,
 		},
 	}
-	if err := PrepareDirs(opts); err != nil {
-		t.Fatalf("PrepareDirs() = %v, want nil", err)
-	}
+	err := PrepareDirs(opts)
+	assertNoError(t, err, "PrepareDirs() = %v, want nil", err)
 
 	for _, dir := range []string{configDir, stateDir, logDir} {
 		info, err := os.Stat(dir)
@@ -394,12 +435,10 @@ func TestPrepareDirsLeavesTheModeOfAnExistingDirectoryAlone(t *testing.T) {
 
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "var")
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(stateDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(stateDir, 0o755)
+	assertNoError(t, err, "")
+	err = os.Chmod(stateDir, 0o755)
+	assertNoError(t, err, "")
 
 	opts := InstallOptions{
 		Paths: runtimepaths.Paths{
@@ -408,14 +447,11 @@ func TestPrepareDirsLeavesTheModeOfAnExistingDirectoryAlone(t *testing.T) {
 			LogDir:     filepath.Join(root, "logs"),
 		},
 	}
-	if err := PrepareDirs(opts); err != nil {
-		t.Fatalf("PrepareDirs() = %v, want nil", err)
-	}
+	err = PrepareDirs(opts)
+	assertNoError(t, err, "PrepareDirs() = %v, want nil", err)
 
 	info, err := os.Stat(stateDir)
-	if err != nil {
-		t.Fatalf("stat %s: %v", stateDir, err)
-	}
+	assertNoError(t, err, "stat %s: %v", stateDir, err)
 	if info.Mode().Perm() != 0o755 {
 		t.Errorf("the mode of %s is %v, want the untouched 0755", stateDir, info.Mode().Perm())
 	}
@@ -424,16 +460,13 @@ func TestPrepareDirsLeavesTheModeOfAnExistingDirectoryAlone(t *testing.T) {
 func TestPrepareDirsLeavesUnrelatedPathsAlone(t *testing.T) {
 	root := t.TempDir()
 	unrelatedDir := filepath.Join(root, "other")
-	if err := os.MkdirAll(unrelatedDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(unrelatedDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	err := os.MkdirAll(unrelatedDir, 0o755)
+	assertNoError(t, err, "")
+	err = os.Chmod(unrelatedDir, 0o755)
+	assertNoError(t, err, "")
 	unrelatedFile := filepath.Join(root, "keep.txt")
-	if err := os.WriteFile(unrelatedFile, []byte("keep"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	err = os.WriteFile(unrelatedFile, []byte("keep"), 0o644)
+	assertNoError(t, err, "")
 
 	opts := InstallOptions{
 		Paths: runtimepaths.Paths{
@@ -442,31 +475,24 @@ func TestPrepareDirsLeavesUnrelatedPathsAlone(t *testing.T) {
 			LogDir:     filepath.Join(root, "var", "logs"),
 		},
 	}
-	if err := PrepareDirs(opts); err != nil {
-		t.Fatalf("PrepareDirs() = %v, want nil", err)
-	}
+	err = PrepareDirs(opts)
+	assertNoError(t, err, "PrepareDirs() = %v, want nil", err)
 
 	if runtime.GOOS != "windows" {
 		info, err := os.Stat(unrelatedDir)
-		if err != nil {
-			t.Fatalf("stat %s: %v", unrelatedDir, err)
-		}
+		assertNoError(t, err, "stat %s: %v", unrelatedDir, err)
 		if info.Mode().Perm() != 0o755 {
 			t.Errorf("%s mode = %v, want the untouched 0755", unrelatedDir, info.Mode().Perm())
 		}
 	}
 	data, err := os.ReadFile(unrelatedFile)
-	if err != nil {
-		t.Fatalf("read %s: %v", unrelatedFile, err)
-	}
+	assertNoError(t, err, "read %s: %v", unrelatedFile, err)
 	if string(data) != "keep" {
 		t.Errorf("%s = %q, want the untouched content", unrelatedFile, data)
 	}
 
 	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	var names []string
 	for _, entry := range entries {
 		names = append(names, entry.Name())
@@ -537,6 +563,32 @@ func TestDefaultServiceUserIsStable(t *testing.T) {
 	}
 }
 
+func TestSCMExecutableSupportUsesHostNativeAndGuestCapabilities(t *testing.T) {
+	queryErr := errors.New("the host support API is unavailable")
+	cases := []struct {
+		name      string
+		candidate uint16
+		native    uint16
+		query     func(uint16) (bool, error)
+		want      scmExecutableSupport
+	}{
+		{"native image is supported without a guest query", 0xAA64, 0xAA64, nil, scmExecutableSupported},
+		{"supported emulated guest is accepted", 0x8664, 0xAA64, func(uint16) (bool, error) { return true, nil }, scmExecutableSupported},
+		{"known unsupported guest is refused", 0xAA64, 0x8664, func(uint16) (bool, error) { return false, nil }, scmExecutableUnsupported},
+		{"unavailable guest query remains unknown", 0x8664, 0xAA64, func(uint16) (bool, error) { return false, queryErr }, scmExecutableSupportUnknown},
+		{"unknown native machine remains unknown", 0x8664, 0, func(uint16) (bool, error) { return true, nil }, scmExecutableSupportUnknown},
+		{"unknown candidate remains unknown", 0, 0xAA64, func(uint16) (bool, error) { return false, nil }, scmExecutableSupportUnknown},
+		{"missing guest query remains unknown", 0x8664, 0xAA64, nil, scmExecutableSupportUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scmExecutableSupportForHost(tc.candidate, tc.native, tc.query); got != tc.want {
+				t.Errorf("scmExecutableSupportForHost(0x%04X, 0x%04X) = %v, want %v", tc.candidate, tc.native, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestNewReturnsThePlatformManager(t *testing.T) {
 	m, err := New(ScopeUser)
 	if err == nil {
@@ -587,9 +639,8 @@ func TestEffectiveCacheDir(t *testing.T) {
 
 	// A path that cannot be read: a directory is not a config file.
 	unreadable := filepath.Join(etc, "unreadable.json")
-	if err := os.Mkdir(unreadable, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	err := os.Mkdir(unreadable, 0o700)
+	assertNoError(t, err, "")
 
 	cases := []struct {
 		name       string
@@ -665,5 +716,116 @@ func setCredentialFields(opts *InstallOptions, sentinel string) {
 			continue
 		}
 		value.Field(i).SetString(sentinel)
+	}
+}
+
+// TestHoldDesktopSingletonWithoutADesktopHostHoldsNothing proves the contract
+// of the hold on a platform that has no per-session desktop singleton: the
+// hold succeeds with a release that ends nothing, so a service mutation of
+// the command line never refuses for an object that does not exist here.
+//
+// The object exists on Windows only, where its hold, name and release are
+// proven by the Windows tests of this package instead.
+func TestHoldDesktopSingletonWithoutADesktopHostHoldsNothing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the singleton object exists on Windows; its hold is proven by the Windows tests")
+	}
+	release, err := HoldDesktopSingleton("")
+	assertNoError(t, err, "a mutation would refuse although this platform has no singleton object: %v", err)
+	if release == nil {
+		t.Fatal("the hold returned no release")
+	}
+	// Releasing twice must be harmless: the command defers one release,
+	// and nothing here may close a handle that does not exist.
+	release()
+	release()
+}
+
+// TestAppendActionIfUnnamedIsTheSingleActionRule pins the shared owner of
+// the message model: every composite report appends its diagnostic action
+// only when the report carries none, in whatever shape the cause named one —
+// so both surfaces (the manager texts and the desktop notices) state
+// exactly one route, input-independently.
+func TestAppendActionIfUnnamedIsTheSingleActionRule(t *testing.T) {
+	const hint = `run "hfdesk service status" to read the current state of the service`
+	for _, tc := range []struct {
+		name   string
+		report string
+		want   string
+	}{
+		{"a plain cause gains the action", "the previous registration was restored", "the previous registration was restored; " + hint},
+		{"a quoted hfdesk command keeps its route", `the instance is stopped: run "hfdesk service stop" and run "hfdesk service install" again`, `the instance is stopped: run "hfdesk service stop" and run "hfdesk service install" again`},
+		{"a quoted supervisor command", `Unmask it with "systemctl unmask hfdesk.service" and run the installation again`, `Unmask it with "systemctl unmask hfdesk.service" and run the installation again`},
+		{"the windows repair command", "restore it: sc config hfdesk start= demand, and run the installation again", "restore it: sc config hfdesk start= demand, and run the installation again"},
+		{"the linux elevation reason", "an installation in the system scope requires root: run the command as root, HFDesk never escalates privileges itself", "an installation in the system scope requires root: run the command as root, HFDesk never escalates privileges itself"},
+		{"the macos elevation reason", "an installation in the system scope requires an elevated shell: run the command from an elevated shell", "an installation in the system scope requires an elevated shell: run the command from an elevated shell"},
+		{"the account creation instruction", `create it with "useradd -r hfdesk-svc" and install again`, `create it with "useradd -r hfdesk-svc" and install again`},
+		{"the grant then retry instruction", "give the directory itself to the account and install again", "give the directory itself to the account and install again"},
+		{"a quoted chown command", `give the directory with "chown hfdesk /var/lib/hfdesk", then run "hfdesk service install --system" again`, `give the directory with "chown hfdesk /var/lib/hfdesk", then run "hfdesk service install --system" again`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := AppendActionIfUnnamed(tc.report, hint); got != tc.want {
+				t.Errorf("AppendActionIfUnnamed() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	// The error form keeps the classification of the cause.
+	sentinel := errors.New(`the installation was refused: stop the instance with "hfdesk service stop" and run "hfdesk service install" again`)
+	wrapped := AppendActionErrorIfUnnamed(sentinel, hint)
+	if !errors.Is(wrapped, sentinel) {
+		t.Errorf("AppendActionErrorIfUnnamed() = %v, want the cause preserved", wrapped)
+	}
+	if strings.Contains(wrapped.Error(), "hfdesk service status") {
+		t.Errorf("AppendActionErrorIfUnnamed() = %q, served a second route beside the cause's own action", wrapped)
+	}
+	plainSentinel := errors.New("the state of the restored registration could not be read back")
+	plain := AppendActionErrorIfUnnamed(plainSentinel, hint)
+	if !errors.Is(plain, plainSentinel) {
+		t.Errorf("AppendActionErrorIfUnnamed() = %v, want the cause preserved", plain)
+	}
+	if !strings.Contains(plain.Error(), hint) {
+		t.Errorf("AppendActionErrorIfUnnamed() = %q, want the diagnostic action appended", plain)
+	}
+}
+
+// assertNoError fails the test when the call it wraps reported a failure,
+// with the diagnostic the inline check printed.
+func assertNoError(t *testing.T, err error, format string, a ...any) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	if format == "" {
+		t.Fatal(err)
+		return
+	}
+	if len(a) == 0 {
+		t.Fatal(format)
+		return
+	}
+	t.Fatalf(format, a...)
+}
+
+// assertNames proves that a message names every fragment of the standard
+// the test pins, one diagnostic per missing fragment.
+func assertNames(t *testing.T, message, context string, wants []string) {
+	t.Helper()
+	for _, want := range wants {
+		if !strings.Contains(message, want) {
+			t.Errorf("%s = %q, want a message that mentions %q", context, message, want)
+		}
+	}
+}
+
+// assertNamesWithout proves the named fragments AND the absent ones: the
+// message keeps its standard and offers no second route.
+func assertNamesWithout(t *testing.T, message, context string, wants, forbidden []string) {
+	t.Helper()
+	assertNames(t, message, context, wants)
+	for _, unwanted := range forbidden {
+		if strings.Contains(message, unwanted) {
+			t.Errorf("%s = %q, must not mention %q", context, message, unwanted)
+		}
 	}
 }

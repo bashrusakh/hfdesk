@@ -13,6 +13,7 @@ import (
 
 	"github.com/bashrusakh/hfdesk/internal/app"
 	"github.com/bashrusakh/hfdesk/internal/logging"
+	"github.com/bashrusakh/hfdesk/internal/service"
 )
 
 // Version is set at build time via ldflags (-X main.Version=...) from the
@@ -20,6 +21,10 @@ import (
 var Version = "dev"
 
 func main() {
+	if code, handled := service.RunInternalAccessProbe(os.Args[1:]); handled {
+		os.Exit(code)
+	}
+
 	// The service command family is a command of its own. It is dispatched
 	// before the interactive startup, so "hfdesk" without a "service" token
 	// keeps its exact behaviour: same flags, same defaults, same browser

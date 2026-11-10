@@ -14,6 +14,8 @@ type trayActions struct {
 	open func()
 	// runtime shows the Runtime / Logs window.
 	runtime func()
+	// install registers the desktop host as a Windows service.
+	install func()
 	// quit stops the host.
 	quit func()
 }
@@ -43,14 +45,20 @@ func runTray(iconBytes []byte, tooltip string, actions trayActions, ready chan s
 		systray.SetTooltip(tooltip)
 
 		// The order of the menu is the order of the actions: open the
-		// web UI, show the runtime window, then quit.
+		// web UI, show the runtime window, install the service, then quit.
+		//
+		// The installation is the last action before the separator: it is
+		// the only action that changes the machine, and the quit group
+		// stays the group a user reaches for last.
 		openItem := systray.AddMenuItem("Open HFDesk", "Open the HFDesk web UI in the default browser")
 		runtimeItem := systray.AddMenuItem("Runtime / Logs", "Show the runtime status and the log window")
+		installItem := systray.AddMenuItem("Install service...", "Register HFDesk as a Windows service that starts at boot")
 		systray.AddSeparator()
 		quitItem := systray.AddMenuItem("Quit HFDesk", "Stop HFDesk and close the local server")
 
 		openItem.Click(func() { actions.open() })
 		runtimeItem.Click(func() { actions.runtime() })
+		installItem.Click(func() { actions.install() })
 		quitItem.Click(func() { actions.quit() })
 	}, func() {
 		// The exit callback runs in the message loop of the main thread.

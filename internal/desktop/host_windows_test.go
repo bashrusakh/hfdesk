@@ -75,9 +75,7 @@ func TestDesktopTrayHostBecomesReady(t *testing.T) {
 	trayHostStarted = true
 
 	iconBytes, err := productIconBytes()
-	if err != nil {
-		t.Fatalf("build the product icon: %v", err)
-	}
+	assertNoError(t, err, "build the product icon: %v", err)
 
 	ready := make(chan struct{})
 	stopped := make(chan struct{})
@@ -94,6 +92,7 @@ func TestDesktopTrayHostBecomesReady(t *testing.T) {
 		runTray(iconBytes, "HFDesk - test", trayActions{
 			open:    func() {},
 			runtime: func() {},
+			install: func() {},
 			quit:    func() {},
 		}, ready)
 	}()
@@ -164,9 +163,7 @@ func TestDesktopRuntimeHostCreatesWindow(t *testing.T) {
 	defer page.Close()
 
 	iconBytes, err := productIconBytes()
-	if err != nil {
-		t.Fatalf("build the product icon: %v", err)
-	}
+	assertNoError(t, err, "build the product icon: %v", err)
 
 	window := newRuntimeWindow(page.URL, iconBytes)
 	// The window is closed at the end of the test in every case, so the
