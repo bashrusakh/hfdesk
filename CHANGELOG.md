@@ -211,9 +211,12 @@
   remain content. A blob key whose name belongs to the staging namespace is
   refused by `StoreDownloadedFile` and `FinalizeBlob` before placement.
 - Cleanup now participates in the destination ownership protocol (#140):
-  staging artifacts, including obsolete pre-#140 parts, are removed only while
-  the destination's domain is held, so cancelling a job no longer deletes
-  another live job's partial. The entry points collapse to one owner-checked
+  staging artifacts are removed only while the destination's domain is held, so
+  cancelling a job no longer deletes another live job's partial, and each
+  obsolete pre-#140 `<dst>.part-<digits>` file is unlinked only under that exact
+  path's entry admission in the destination realm — a residue file whose
+  admission a live holder refuses survives, and the refusal does not fail the
+  download or cleanup. The entry points collapse to one owner-checked
   removal and one record-checked removal. A route removes only the artifacts it
   creates: the multipart HEAD failure no longer removes a single-route
   `.part`/sidecar.

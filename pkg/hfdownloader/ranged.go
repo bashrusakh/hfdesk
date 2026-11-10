@@ -956,7 +956,7 @@ func (d *stagingDownload) applyCancelCleanup() {
 	// Only the obsolete pre-#140 multipart family is discarded here. The
 	// single-route <dst>.part and its sidecar are NOT this route's artifacts:
 	// the multipart route creates no .part, so that route owns their cleanup.
-	if err := removeMultipartResumeFiles(d.dst); err != nil {
+	if err := removeMultipartResumeFiles(d.dst, d.domain); err != nil {
 		downloadLog.Warn("cleanup obsolete multipart artifacts failed", "path", d.dst, "error", err)
 	}
 	removeStagingArtifactsLocked(d.stg, d.meta)
@@ -1199,7 +1199,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 				"artifacts", len(obsolete),
 			)
 		}
-		if err := removeMultipartResumeFiles(dst); err != nil {
+		if err := removeMultipartResumeFiles(dst, d.domain); err != nil {
 			// The obsolete family is ignored resume state, not a reason to
 			// fail the transfer; it is left for the existing success/cleanup
 			// path.
@@ -1435,7 +1435,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 					"its durable ProofPending flag and zero-length payload force the next run to re-prove or discard it",
 					it.RelativePath)
 			}
-			if err := removeMultipartResumeFiles(dst); err != nil {
+			if err := removeMultipartResumeFiles(dst, d.domain); err != nil {
 				log.Printf("warning: cleanup obsolete multipart artifacts for %s after a known-digest mismatch: %v", dst, err)
 			}
 			return false, fmt.Errorf("sha256 verify failed: %s: expected %s got %s", it.RelativePath, it.SHA256, sum)
@@ -1545,7 +1545,7 @@ func (d *stagingDownload) publish() error {
 	removeStagingArtifactsLocked(d.stg, d.meta)
 	// Legacy multipart cleanup is nonfatal after successful publication. Leave the
 	// single route's .part and identity sidecar to that route.
-	if err := removeMultipartResumeFiles(d.dst); err != nil {
+	if err := removeMultipartResumeFiles(d.dst, d.domain); err != nil {
 		log.Printf("warning: cleanup obsolete multipart artifacts for %s after publish: %v", d.dst, err)
 	}
 	return nil

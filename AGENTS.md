@@ -249,9 +249,13 @@ or job ownership behavior. This section is the agent-level summary; when it and
   blob keys are refused by `StoreDownloadedFile` and `FinalizeBlob` before
   placement. Cleanup runs only under the destination domain, through the
   collapsed entry points `removeStagingArtifactsLocked` and
-  `removeStagingArtifactsIfUnowned`. A route removes only the artifacts it
-  creates (B1): for example, a multipart HEAD failure leaves a single-route
-  `.part`/sidecar alone.
+  `removeStagingArtifactsIfUnowned`. The obsolete pre-#140 `<dst>.part-<digits>`
+  family is additionally covered per file: each unlink takes that exact path's
+  entry admission in the held destination domain's realm, a file whose
+  admission a live holder refuses survives without failing the operation, and
+  with no held domain the family is left alone. A route removes only the
+  artifacts it creates (B1): for example, a multipart HEAD failure leaves a
+  single-route `.part`/sidecar alone.
 - `Settings.Verify` controls LFS verification too: `none`, `size` (default, no
   normal-path full-file reread), `sha256` (at most one pre-publication pass),
   and `etag` (the same pre-publication pass for a known digest; historical

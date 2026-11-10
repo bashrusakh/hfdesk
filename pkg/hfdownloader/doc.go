@@ -846,9 +846,17 @@ wrote there.
 Under the item scope, `removeStagingArtifactsLocked` removes while the metadata
 gate is held; `removeStagingArtifactsIfUnowned` takes that gate and removes only
 a pair whose current scope/key proof or independent self/death evidence proves
-reclaimable. Versioned pairs stay record-checked; single `.part`, obsolete
-`.part-NN` and `.parts.json` retain their cleanup. A cache destination with no
-derivable scope is skipped with a warning, never removed without ownership.
+reclaimable. Versioned pairs stay record-checked; the single `.part` and
+`.parts.json` retain their cleanup under the destination scope, but the obsolete
+`<dst>.part-<digits>` family does not: those keys are in no destination scope
+path set, so every unlink of a `<dst>.part-<digits>` file happens under that
+exact file's entry admission in the held destination domain's own realm — the
+same non-waiting admission class as `AdmitFileWrite`/`AdmitFileWrites`, never a
+second realm. A residue file whose admission a live holder refuses survives, the
+refusal is logged, and the download, publish or cleanup around it keeps its
+current outcome; when no destination domain is held, no family file is removed
+at all. A cache destination with no derivable scope is skipped with a warning,
+never removed without ownership.
 
 Known limitations outside the downloader domain: a mirror file copy is still a
 non-atomic truncate-and-write performed under its entry admission, and it checks

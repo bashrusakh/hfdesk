@@ -89,15 +89,40 @@ func multipartPartFiles(dst string) ([]string, error) {
 	return files, nil
 }
 
-func removeMultipartResumeFiles(dst string) error {
+// removeMultipartResumeFiles is the single owner of the obsolete pre-#140
+// residue removal: the <dst>.part-<digits> family plus <dst>.parts.json.
+// The destination scope does not cover the family's keys, so every
+// <dst>.part-<digits> unlink happens under that exact file's entry admission
+// in the held destination domain's realm — the same non-waiting admission
+// AdmitFileWrite/AdmitFileWrites take, never a second realm. A refused
+// admission (a live holder owns the path) keeps the file, logs the refusal and
+// does not fail the caller; with no held domain nothing of the family is
+// removed (fail closed). <dst>.parts.json is covered by the caller-held
+// destination scope and is removed directly, as before. Removal errors are
+// returned; every caller treats them as non-fatal warnings.
+func removeMultipartResumeFiles(dst string, domain *blobDomain) error {
+	if domain == nil || domain.released || domain.realm == nil {
+		downloadLog.Warn("skip obsolete multipart residue cleanup: the destination ownership domain is not held",
+			"path", dst)
+		return nil
+	}
 	files, err := multipartPartFiles(dst)
 	if err != nil {
 		return err
 	}
 	for _, p := range files {
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			return err
+		// lgtm[go/path-injection]
+		release, aerr := domain.realm.acquireWriter(context.Background(), []string{p}, 0)
+		if aerr != nil {
+			downloadLog.Warn("keep obsolete multipart residue file owned by another writer",
+				"path", p, "error", aerr)
+			continue
 		}
+		if rerr := os.Remove(p); rerr != nil && !os.IsNotExist(rerr) {
+			release.Release()
+			return rerr
+		}
+		release.Release()
 	}
 	if err := os.Remove(multipartLayoutMetaPath(dst)); err != nil && !os.IsNotExist(err) {
 		return err
@@ -1153,13 +1178,14 @@ func cleanupPartialsOnCancel(cfg Settings, dst string, domain *blobDomain) {
 		return
 	}
 	// dst was confined to its destination root by SafeJoin in Download.
-	cleanupLegacyPartials(dst)
+	cleanupLegacyPartials(dst, domain)
 }
 
-// cleanupLegacyPartials removes single-request and legacy multipart artifacts.
-func cleanupLegacyPartials(dst string) {
+// cleanupLegacyPartials removes single-request and legacy multipart artifacts
+// under the caller-held destination domain.
+func cleanupLegacyPartials(dst string, domain *blobDomain) {
 	removePartialWithIdentity(dst)
-	if err := removeMultipartResumeFiles(dst); err != nil {
+	if err := removeMultipartResumeFiles(dst, domain); err != nil {
 		downloadLog.Warn("cleanup multipart resume files failed", "path", dst, "error", err)
 	}
 }
@@ -1364,43 +1390,7 @@ func removeHFCacheTemp(dst string) {
 func removePartialArtifacts(dst string, domain *blobDomain) error {
 	removePartialWithIdentity(dst)
 	removeStagingArtifactsIfUnowned(dst+".incomplete", dst+".incomplete.meta", domain)
-	return removeLegacyMultipartParts(dst)
-}
-
-// removeLegacyMultipartParts removes dst.part-NN (non-empty digit suffix)
-// and the obsolete dst.parts.json layout record.
-func removeLegacyMultipartParts(dst string) error {
-	dir := filepath.Dir(dst)
-	base := filepath.Base(dst)
-	prefix := base + ".part-"
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if !strings.HasPrefix(name, prefix) {
-			continue
-		}
-		suffix := name[len(prefix):]
-		if !isAllDigits(suffix) {
-			continue
-		}
-		full := filepath.Join(dir, name)
-		if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
-			downloadLog.Warn("cleanup partial file failed", "path", full, "error", err)
-		}
-	}
-	if err := os.Remove(dst + ".parts.json"); err != nil && !os.IsNotExist(err) {
-		downloadLog.Warn("cleanup partial file failed", "path", dst+".parts.json", "error", err)
-	}
-	return nil
+	return removeMultipartResumeFiles(dst, domain)
 }
 
 // isAllDigits reports whether s is a non-empty run of ASCII digits.
@@ -2028,8 +2018,9 @@ func finalizeSinglePartial(ctx context.Context, out *os.File, tmp, dst string, i
 	removeSinglePartIdentity(tmp + ".meta")
 	// Obsolete pre-#140 multipart artifacts for this destination must not
 	// survive a successful single-path finalization. Finalization already
-	// succeeded, so a cleanup failure is logged and does not unpublish the file.
-	if err := removeMultipartResumeFiles(dst); err != nil {
+	// succeeded, so a cleanup failure — or an admission refusal that keeps a
+	// live holder's residue file — is logged and does not unpublish the file.
+	if err := removeMultipartResumeFiles(dst, opts.Domain); err != nil {
 		downloadLog.Warn("cleanup obsolete multipart artifacts failed", "path", dst, "error", err)
 	}
 	return verified, nil
