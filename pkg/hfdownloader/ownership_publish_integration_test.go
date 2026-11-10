@@ -413,7 +413,7 @@ func TestDownload_SharedBlobSkippedPathsGetLinks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	domain, err := blobDomainAcquire(context.Background(), sharedBlob, mustDomainDst(t, repo, sharedSHA))
+	domain, err := acquireDefaultScopedBlobDomain(context.Background(), sharedBlob, mustDomainDst(t, repo, sharedSHA))
 	if err != nil {
 		t.Fatalf("pre-claim shared domain: %v", err)
 	}

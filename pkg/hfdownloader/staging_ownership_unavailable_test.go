@@ -42,7 +42,7 @@ func TestStagingOwnershipUnavailableFailsClosed(t *testing.T) {
 	}
 
 	// Domain acquisition must fail before claim or payload mutation.
-	if _, derr := blobDomainAcquire(context.Background(), flatDomainKey(filepath.Join(dir, "payload")),
+	if _, derr := acquireDefaultScopedBlobDomain(context.Background(), flatDomainKey(filepath.Join(dir, "payload")),
 		flatDomainLockSrc(filepath.Join(dir, "payload"))); !errors.Is(derr, lockErr) || !strings.Contains(derr.Error(), "ownership") {
 		t.Fatalf("domain acquisition error = %v, want actionable ownership failure", derr)
 	}

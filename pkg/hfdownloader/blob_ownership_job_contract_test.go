@@ -469,7 +469,7 @@ func TestCleanupLeavesAnotherLiveWritersPartialAlone(t *testing.T) {
 		if err := os.WriteFile(partial, live, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		domain, err := blobDomainAcquire(t.Context(), filepath.Join(blobsDir, ownedSHA), dst)
+		domain, err := acquireDefaultScopedBlobDomain(t.Context(), filepath.Join(blobsDir, ownedSHA), dst)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -882,7 +882,7 @@ func TestCleanupLeavesOldMultipartFamilyUnderLiveDomain(t *testing.T) {
 	if !ok {
 		t.Fatalf("cache destination %s has no domain key", dst)
 	}
-	live, err := blobDomainAcquire(context.Background(), key, dst)
+	live, err := acquireDefaultScopedBlobDomain(context.Background(), key, dst)
 	if err != nil {
 		t.Fatalf("acquire live domain: %v", err)
 	}

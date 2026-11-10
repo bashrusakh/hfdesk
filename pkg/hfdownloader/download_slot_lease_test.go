@@ -223,7 +223,7 @@ func TestDownloadSlotLeaseFlatMode(t *testing.T) {
 
 	// Hold both domain layers for a.bin.
 	flat := newFlatDestinationDomain(dstA)
-	owner, err := blobDomainAcquire(context.Background(), flat.key, flat.lockSrc)
+	owner, err := acquireDefaultScopedBlobDomain(context.Background(), flat.key, flat.lockSrc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +338,7 @@ func TestDownloadSlotLeaseCacheMode(t *testing.T) {
 	if !keyed {
 		t.Fatalf("the cache destination %s has no ownership-domain key", ownerDst)
 	}
-	owner, err := blobDomainAcquire(context.Background(), key, ownerDst)
+	owner, err := acquireDefaultScopedBlobDomain(context.Background(), key, ownerDst)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +412,7 @@ func TestDownloadSlotLeaseFlatModeUnknownSizeHandoff(t *testing.T) {
 	dstB := slotLeaseFlatDst(t, out, "b.bin")
 
 	flat := newFlatDestinationDomain(dstA)
-	owner, err := blobDomainAcquire(context.Background(), flat.key, flat.lockSrc)
+	owner, err := acquireDefaultScopedBlobDomain(context.Background(), flat.key, flat.lockSrc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +464,7 @@ func TestDownloadSlotLeaseCancellation(t *testing.T) {
 			name: "in-process domain slot",
 			hold: func(t *testing.T, dst string) func() {
 				flat := newFlatDestinationDomain(dst)
-				dom, err := blobDomainAcquire(context.Background(), flat.key, flat.lockSrc)
+				dom, err := acquireDefaultScopedBlobDomain(context.Background(), flat.key, flat.lockSrc)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -550,11 +550,9 @@ func TestDownloadSlotLeaseBoundsConcurrentTransfers(t *testing.T) {
 		t.Skip("this platform has no OS ownership lock primitive")
 	}
 	for _, tc := range []struct {
-		name        string
-		installSeam bool
+		name string
 	}{
 		{name: "production domain"},
-		{name: "blobDomainAcquire seam returns a wait-free domain", installSeam: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			payloadA := bytes.Repeat([]byte("a"), 4_096)
@@ -566,14 +564,6 @@ func TestDownloadSlotLeaseBoundsConcurrentTransfers(t *testing.T) {
 			out := t.TempDir()
 			dstA := slotLeaseFlatDst(t, out, "a.bin")
 			dstB := slotLeaseFlatDst(t, out, "b.bin")
-
-			if tc.installSeam {
-				oldAcquire := blobDomainAcquire
-				blobDomainAcquire = func(context.Context, string, string) (*blobDomain, error) {
-					return &blobDomain{}, nil
-				}
-				t.Cleanup(func() { blobDomainAcquire = oldAcquire })
-			}
 
 			done := make(chan string, 8)
 			result := runSlotLeaseDownload(context.Background(), slotLeaseFlatSettings(out, hub.srv.URL), done)

@@ -158,7 +158,7 @@ func TestCleanupJobPartFiles_RespectsLiveClaim(t *testing.T) {
 		if !keyed {
 			t.Fatalf("the cache destination %s has no ownership-domain key", dst)
 		}
-		owner, derr := blobDomainAcquire(context.Background(), key, dst)
+		owner, derr := acquireDefaultScopedBlobDomain(context.Background(), key, dst)
 		if derr != nil {
 			t.Fatalf("acquire the live in-process domain: %v", derr)
 		}

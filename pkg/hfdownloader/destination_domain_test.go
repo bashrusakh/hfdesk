@@ -462,7 +462,7 @@ func TestPathDerivedDestinationCleanupUsesSameNameBasedIdentity(t *testing.T) {
 	if dst == contentDst {
 		t.Fatalf("the path-derived and content-addressed destinations share the staging name %q", dst)
 	}
-	domain, err := blobDomainAcquire(context.Background(), key, dst)
+	domain, err := acquireDefaultScopedBlobDomain(context.Background(), key, dst)
 	if err != nil {
 		t.Fatal(err)
 	}

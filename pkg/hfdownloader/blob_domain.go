@@ -166,25 +166,6 @@ func acquireDefaultScopedBlobDomain(ctx context.Context, key, dst string) (*blob
 	return acquireBlobDomainScoped(ctx, key, dst, realm, paths, proofPath)
 }
 
-func acquireDefaultScopedBlobDomainForCleanup(ctx context.Context, key, dst string) (*blobDomain, error) {
-	ownerDir, err := resolveOwnershipDir("")
-	if err != nil {
-		return nil, err
-	}
-	realm, err := newOwnershipRealm(ownerDir)
-	if err != nil {
-		return nil, err
-	}
-	proofPath := key
-	paths := []string{key, dst}
-	if strings.HasPrefix(key, flatDomainKeyPrefix) {
-		proofPath = strings.TrimPrefix(key, flatDomainKeyPrefix)
-	}
-	return acquireBlobDomainScopedForCleanup(ctx, key, dst, realm, paths, proofPath)
-}
-
-var blobDomainCleanupAcquire = acquireDefaultScopedBlobDomainForCleanup
-
 func acquireBlobDomainScoped(ctx context.Context, key, dst string, realm *ownershipRealm, paths []string, proofPath string) (*blobDomain, error) {
 	return acquireBlobDomainScopedWithin(ctx, key, dst, realm, paths, proofPath, 0, blobOwnershipWaitBudget)
 }
@@ -326,8 +307,6 @@ func acquireBlobDomainUsing(ctx context.Context, key, dst string, slotWait time.
 		realm: fence.realm, scope: fence.scope, proof: fence.proof,
 	}, nil
 }
-
-var blobDomainAcquire = acquireDefaultScopedBlobDomain
 
 // blobDomainContentionHook lets tests observe in-process contention.
 var blobDomainContentionHook func(key string)

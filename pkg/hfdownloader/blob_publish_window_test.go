@@ -48,7 +48,7 @@ func runPublicationWindowScenario(t *testing.T, repo *RepoDir, sha string) windo
 	}
 
 	// Hold the blob key's domain throughout placement, as downloader publishers do.
-	domain, err := blobDomainAcquire(t.Context(), blobPath, domainDst)
+	domain, err := acquireDefaultScopedBlobDomain(t.Context(), blobPath, domainDst)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func runPublicationWindowScenario(t *testing.T, repo *RepoDir, sha string) windo
 			return
 		}
 		go func() {
-			d, derr := blobDomainAcquire(t.Context(), blobPath, domainDst)
+			d, derr := acquireDefaultScopedBlobDomain(t.Context(), blobPath, domainDst)
 			if derr != nil {
 				participantErrCh <- derr
 				close(participantPublished)

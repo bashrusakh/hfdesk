@@ -452,7 +452,7 @@ func (r *ownershipRealm) readOwnershipNode(parent ownershipNode, component, data
 			return ownershipNode{}, fmt.Errorf("case profile changed for cache directory %q", dataPath)
 		}
 		children := filepath.Join(controlPath, "children")
-		actual, err := ownershipControlDirectoryCaseProfile(children, filepath.Join(metaDir, "metadata"))
+		actual, err := ownershipControlDirectoryCaseProfile(children, metaDir)
 		if err != nil {
 			return ownershipNode{}, err
 		}
