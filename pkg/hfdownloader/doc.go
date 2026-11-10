@@ -632,10 +632,14 @@ with no state keeps the configured routing. A pre-#140 `.part-NN`/`.parts.json`
 family is NOT resume state and does not force the multipart route; it is
 discarded when the multipart route owns the staging (or left for the existing
 success/cleanup path), and the file is re-downloaded from zero. If the server or
-plan does not support ranges, the downloader emits an explicit warning,
-downloads the full file through the single path, and removes the obsolete
-versioned pair only after the final file is durable (claim-checked); the
-pre-#140 family is removed by the single-path success cleanup. If an LFS item
+plan does not support ranges, the downloader emits an explicit warning once for
+the download — after every item goroutine has finished, naming the count of
+affected files and a bounded, sorted list of their paths (at most the plan
+notice's path cap, with the remainder counted), so a repo-wide condition is one
+warning rather than one per file — downloads the full file through the single
+path, and removes the obsolete versioned pair only after the final file is
+durable (claim-checked); the pre-#140 family is removed by the single-path
+success cleanup. If an LFS item
 remains unknown-size after HEAD, Download uses the single-path temp and the
 normal cache-store path, so the blob and its snapshot/friendly entries are
 created from the completed temp file.
