@@ -38,29 +38,37 @@ const (
 
 // Job represents a download job.
 type Job struct {
-	ID                 string            `json:"id"`
-	Repo               string            `json:"repo"`
-	Revision           string            `json:"revision"`
-	IsDataset          bool              `json:"isDataset,omitempty"`
-	Filters            []string          `json:"filters,omitempty"`
-	Excludes           []string          `json:"excludes,omitempty"`
-	OutputDir          string            `json:"outputDir"`
-	HubDir             string            `json:"hubDir,omitempty"` // Exact frozen Hub; OutputDir remains the friendly/app root.
-	DestinationWarning string            `json:"destinationWarning,omitempty"`
-	LocalDir           string            `json:"localDir,omitempty"`      // Effective local-dir for this job (per-request or server-global)
-	LocalRepo          string            `json:"localRepo,omitempty"`     // Override destination folder name (used for upstream mmproj)
-	ShardRanges        string            `json:"shardRanges,omitempty"`   // Shard-range selection narrowing the filters (see hfdownloader.Job.ShardRanges)
-	BranchVariant      bool              `json:"branchVariant,omitempty"` // Whole EXL branch selected by revision
-	Flat               bool              `json:"flat,omitempty"`          // Save real files (flat mode) instead of HF cache layout
-	ExactMatch         bool              `json:"exactMatch,omitempty"`    // Match filters by whole name segment, not substring
-	Status             JobStatus         `json:"status"`
-	Phase              string            `json:"phase,omitempty"` // sub-state while running, e.g. "finalizing"
-	Progress           JobProgress       `json:"progress"`
-	Error              string            `json:"error,omitempty"`
-	CreatedAt          time.Time         `json:"createdAt"`
-	StartedAt          *time.Time        `json:"startedAt,omitempty"`
-	EndedAt            *time.Time        `json:"endedAt,omitempty"`
-	Files              []JobFileProgress `json:"files,omitempty"`
+	ID                 string      `json:"id"`
+	Repo               string      `json:"repo"`
+	Revision           string      `json:"revision"`
+	IsDataset          bool        `json:"isDataset,omitempty"`
+	Filters            []string    `json:"filters,omitempty"`
+	Excludes           []string    `json:"excludes,omitempty"`
+	OutputDir          string      `json:"outputDir"`
+	HubDir             string      `json:"hubDir,omitempty"` // Exact frozen Hub; OutputDir remains the friendly/app root.
+	DestinationWarning string      `json:"destinationWarning,omitempty"`
+	LocalDir           string      `json:"localDir,omitempty"`      // Effective local-dir for this job (per-request or server-global)
+	LocalRepo          string      `json:"localRepo,omitempty"`     // Override destination folder name (used for upstream mmproj)
+	ShardRanges        string      `json:"shardRanges,omitempty"`   // Shard-range selection narrowing the filters (see hfdownloader.Job.ShardRanges)
+	BranchVariant      bool        `json:"branchVariant,omitempty"` // Whole EXL branch selected by revision
+	Flat               bool        `json:"flat,omitempty"`          // Save real files (flat mode) instead of HF cache layout
+	ExactMatch         bool        `json:"exactMatch,omitempty"`    // Match filters by whole name segment, not substring
+	Status             JobStatus   `json:"status"`
+	Phase              string      `json:"phase,omitempty"` // sub-state while running, e.g. "finalizing"
+	Progress           JobProgress `json:"progress"`
+	Error              string      `json:"error,omitempty"`
+	// Warnings carries the typed plan warnings of this job's LAST COMPLETED
+	// plan (hfdownloader.Plan.Warnings, delivered through
+	// Settings.OnPlanComplete, which runs only once planning succeeds). They
+	// are outputs of the job's scan, not request inputs: they never
+	// participate in identity or dedup, and they stay empty until a plan
+	// completes. A plan that fails reports the failure in Error and leaves
+	// the warnings of an earlier completed plan, if any, unchanged.
+	Warnings  []hfdownloader.PlanWarning `json:"warnings,omitempty"`
+	CreatedAt time.Time                  `json:"createdAt"`
+	StartedAt *time.Time                 `json:"startedAt,omitempty"`
+	EndedAt   *time.Time                 `json:"endedAt,omitempty"`
+	Files     []JobFileProgress          `json:"files,omitempty"`
 
 	// RouteKey is the download route key requested at creation (internal/audit
 	// only). The resolved destination lives in LocalDir; this field is never a
@@ -453,6 +461,9 @@ func (m *JobManager) cloneJobLocked(j *Job) *Job {
 	}
 	if j.Files != nil {
 		clone.Files = append([]JobFileProgress(nil), j.Files...)
+	}
+	if j.Warnings != nil {
+		clone.Warnings = append([]hfdownloader.PlanWarning(nil), j.Warnings...)
 	}
 	if j.StartedAt != nil {
 		t := *j.StartedAt
@@ -1839,6 +1850,11 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		planned, frozenComplete := plannedDestinationSet(paths)
 		complete = complete && frozenComplete
 		m.mu.Lock()
+		// The job's plan warnings are outputs of this run's scan; assigning
+		// (never mutating in place) under m.mu keeps clones and state
+		// snapshots race-free. A retry/re-run replaces them with what its
+		// own plan reports.
+		job.Warnings = plan.Warnings
 		if activity := m.runActivities[activityID]; activity != nil {
 			activity.planned = planned
 			activity.planKnown = true

@@ -68,15 +68,18 @@ type PlanResponse struct {
 	// files, totalSize, or totalFiles, and it is omitted when empty.
 	Notices []string `json:"notices,omitempty"`
 	// Warnings are typed, non-fatal diagnostics about requested selectors
-	// that had no effect (currently ineffective shard ranges): objects of
+	// that had no effect (currently ineffective shard ranges and filter
+	// patterns that selected nothing): objects of
 	// {code, message, segments} where code is a stable string
-	// (shard_ranges_no_shards, shard_ranges_ineffective_segments today),
-	// message is a bounded sentence, and segments names the offending input
-	// segments when the warning is about specific ones. The surface is
-	// extensible: clients branch on code and treat unknown codes as
-	// informational. A warning never changes files, totalSize, totalFiles,
-	// or the download outcome, never replaces an error, and is omitted when
-	// empty.
+	// (shard_ranges_no_shards, shard_ranges_ineffective_segments,
+	// filters_unmatched today), message is a bounded sentence, and segments
+	// names the offending input segments when the warning is about specific
+	// ones. The surface is extensible: clients branch on code and treat
+	// unknown codes as informational. A warning never changes files,
+	// totalSize, totalFiles, or the download outcome, never replaces an
+	// error, and is omitted when empty. A real download reports the same
+	// warnings on its job snapshot (`warnings`) once its own plan
+	// completes.
 	Warnings []hfdownloader.PlanWarning `json:"warnings,omitempty"`
 }
 
