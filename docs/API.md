@@ -947,6 +947,17 @@ transfer, finalizing, completion, skipped, error, and cancellation states, and
 `file_finalizing` is emitted before the pre-publication proof. The detailed
 ownership and resume contract is in `pkg/hfdownloader/doc.go`.
 
+Job responses include `warnings`, an array of strings omitted when empty: the
+downloader's non-fatal diagnostics for that run, kept in arrival order. A
+warning reports a fact about the download without failing it and without
+changing the selection — for example a revision that is not pinned to an
+immutable commit, a plan notice such as a split-precedence exclusion, resume
+state that cannot be used without HTTP range support, or a best-effort
+metadata write (a ref, friendly directory, rebuild script or manifest) that
+failed. The list is bounded: it keeps at most 20 warnings, and once full it
+stops growing. It is distinct from `destinationWarning`, which the server
+computes once when the job is created.
+
 Cache-mode jobs include `hubDir`, the frozen exact Hub storage directory.
 `outputDir` keeps its existing meaning: the app/friendly root in cache mode,
 or the local output root in flat mode. Jobs and history record both roots;

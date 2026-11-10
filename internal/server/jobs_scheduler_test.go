@@ -4,7 +4,9 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -336,4 +338,90 @@ func TestUpdateJobETA(t *testing.T) {
 	if job.Progress.EtaSeconds != 0 {
 		t.Fatalf("ETA after completion should be 0, got %d", job.Progress.EtaSeconds)
 	}
+}
+
+// TestApplyJobProgressKeepsWarningEvents pins the job's warning list: a
+// warning event is kept in the job state and rides the Job JSON the API
+// serves (handleGetJob, handleListJobs and BroadcastJob marshal the *Job
+// itself), a job that receives no warnings carries none (the field is
+// omitted), an empty message is not stored, a non-warning event never
+// becomes one, and the list is bounded — once maxJobWarnings entries are
+// kept it stops growing while keeping the first ones.
+func TestApplyJobProgressKeepsWarningEvents(t *testing.T) {
+	now := time.Now()
+	warn := func(msg string) hfdownloader.ProgressEvent {
+		return hfdownloader.ProgressEvent{Level: "warn", Event: "warning", Message: msg}
+	}
+
+	t.Run("kept in state and in the API response shape", func(t *testing.T) {
+		job := &Job{ID: "warn-job"}
+		applyJobProgress(job, hfdownloader.ProgressEvent{Event: "plan_item", Path: "a.gguf", Total: 10}, now)
+		applyJobProgress(job, warn("revision is not pinned to an immutable commit"), now)
+
+		const want = "revision is not pinned to an immutable commit"
+		if len(job.Warnings) != 1 || job.Warnings[0] != want {
+			t.Fatalf("job.Warnings = %q, want [%q]", job.Warnings, want)
+		}
+		// The warning case folds nothing else into the job.
+		if job.Progress.TotalFiles != 1 || job.Progress.TotalBytes != 10 || len(job.Files) != 1 {
+			t.Errorf("warning disturbed progress: totalFiles=%d totalBytes=%d fileList=%d",
+				job.Progress.TotalFiles, job.Progress.TotalBytes, len(job.Files))
+		}
+
+		data, err := json.Marshal(job)
+		if err != nil {
+			t.Fatalf("marshal job: %v", err)
+		}
+		var decoded struct {
+			Warnings []string `json:"warnings"`
+		}
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("unmarshal job JSON: %v", err)
+		}
+		if len(decoded.Warnings) != 1 || decoded.Warnings[0] != want {
+			t.Errorf("response warnings = %q, want [%q]", decoded.Warnings, want)
+		}
+	})
+
+	t.Run("job without warnings carries none", func(t *testing.T) {
+		job := &Job{ID: "quiet-job"}
+		applyJobProgress(job, hfdownloader.ProgressEvent{Event: "plan_item", Path: "a.gguf", Total: 10}, now)
+		// A non-warning event carrying a message must not become a warning.
+		applyJobProgress(job, hfdownloader.ProgressEvent{Level: "error", Event: "error", Message: "boom"}, now)
+		if len(job.Warnings) != 0 {
+			t.Fatalf("job.Warnings = %q, want none", job.Warnings)
+		}
+		data, err := json.Marshal(job)
+		if err != nil {
+			t.Fatalf("marshal job: %v", err)
+		}
+		if strings.Contains(string(data), `"warnings"`) {
+			t.Errorf("job JSON must omit the warnings field when empty, got %s", data)
+		}
+	})
+
+	t.Run("empty message is not stored", func(t *testing.T) {
+		job := &Job{}
+		applyJobProgress(job, warn(""), now)
+		if len(job.Warnings) != 0 {
+			t.Fatalf("job.Warnings = %q, want none for an empty message", job.Warnings)
+		}
+	})
+
+	t.Run("list is bounded and keeps the first entries", func(t *testing.T) {
+		job := &Job{}
+		for i := 0; i < maxJobWarnings+5; i++ {
+			applyJobProgress(job, warn(fmt.Sprintf("warning %d", i)), now)
+		}
+		if len(job.Warnings) != maxJobWarnings {
+			t.Fatalf("len(job.Warnings) = %d, want the cap %d", len(job.Warnings), maxJobWarnings)
+		}
+		if job.Warnings[0] != "warning 0" {
+			t.Errorf("first kept warning = %q, want %q (the cap keeps the first entries)",
+				job.Warnings[0], "warning 0")
+		}
+		if last, wantLast := job.Warnings[maxJobWarnings-1], fmt.Sprintf("warning %d", maxJobWarnings-1); last != wantLast {
+			t.Errorf("last kept warning = %q, want %q", last, wantLast)
+		}
+	})
 }
