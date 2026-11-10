@@ -36,9 +36,17 @@ type Evidence struct {
 	InputIndex     int
 	PossibleLabels []string
 	DefiniteLabels []string
-	PossibleRoles  []EvidenceRole
-	DefiniteRole   EvidenceRole
-	Reason         EvidenceReason
+	// MentionedNotMember lists standard split names the path mentions — a
+	// directory component equal to the split or a delimiter-bounded basename
+	// token — that are NOT membership candidates for this file: the
+	// precedence rule decided its membership elsewhere. The planner keeps
+	// these names in its recognized group-label set so a filter naming one
+	// stays a membership selector instead of literal path matching, while
+	// the file's own alternatives never gain them back.
+	MentionedNotMember []string
+	PossibleRoles      []EvidenceRole
+	DefiniteRole       EvidenceRole
+	Reason             EvidenceReason
 }
 
 // EvidenceRole distinguishes dataset membership from a non-dataset companion.
@@ -94,11 +102,17 @@ func Recognize(files []File) Result {
 			continue
 		}
 
-		groups := pathGroups(lower, base)
+		groups, mentionedNotMember := pathGroups(lower, base)
 		if len(groups) > 1 {
+			// pathGroups never mixes directory-derived and basename-token-derived
+			// candidates (a split directory outranks a basename split token), so
+			// a conflict here comes from one source only: two standard-split
+			// directory components in the path (train/test/items.parquet) or two
+			// split tokens in one basename. pathGroups returns the candidates
+			// sorted, so the planner's candidate order stays deterministic for
+			// that residual.
 			r.Unresolved = append(r.Unresolved, i)
-			sort.Strings(groups)
-			r.Evidence = append(r.Evidence, Evidence{InputIndex: i, PossibleLabels: groups, PossibleRoles: []EvidenceRole{EvidenceRoleData}, Reason: EvidenceConflicting})
+			r.Evidence = append(r.Evidence, Evidence{InputIndex: i, PossibleLabels: groups, MentionedNotMember: mentionedNotMember, PossibleRoles: []EvidenceRole{EvidenceRoleData}, Reason: EvidenceConflicting})
 			continue
 		}
 		if len(groups) == 1 {
@@ -107,7 +121,7 @@ func Recognize(files []File) Result {
 			if !isStandardGroup(groups[0]) {
 				reason = EvidenceCustom
 			}
-			r.Evidence = append(r.Evidence, Evidence{InputIndex: i, PossibleLabels: []string{groups[0]}, DefiniteLabels: []string{groups[0]}, PossibleRoles: []EvidenceRole{EvidenceRoleData}, DefiniteRole: EvidenceRoleData, Reason: reason})
+			r.Evidence = append(r.Evidence, Evidence{InputIndex: i, PossibleLabels: []string{groups[0]}, DefiniteLabels: []string{groups[0]}, MentionedNotMember: mentionedNotMember, PossibleRoles: []EvidenceRole{EvidenceRoleData}, DefiniteRole: EvidenceRoleData, Reason: reason})
 			continue
 		}
 		if ext == "json" || ext == "jsonl" || ext == "txt" {
@@ -224,39 +238,70 @@ func isLicenseVariant(base string) bool {
 	return metadataTextExtension[rest]
 }
 
-func pathGroups(p, base string) []string {
+// pathGroups collects the candidate group labels for a data file together
+// with the standard split names its path mentions without the file belonging
+// to them. A directory component that names a standard split outranks a split
+// name in the file's basename: the explicit placement decides, and the
+// basename token contributes a candidate only when no directory component
+// names a standard split. The two sources are never mixed, so a remaining
+// conflict comes from one source alone — two standard-split directories
+// (train/test/items.parquet) or two split tokens in one basename. When no
+// standard split is found at all, data/<group>/ remains the custom-group
+// fallback. A split name the path mentions that the decided membership does
+// not contain — the basename token of a mixed-shape file, or a token beside a
+// conflicting directory pair — is reported as mentioned-but-not-a-member so
+// callers can keep it known without reopening candidacy.
+func pathGroups(p, base string) (groups, mentionedNotMember []string) {
 	parts := strings.Split(p, "/")
-	found := make(map[string]bool)
+	directoryGroups := make(map[string]bool)
 	for _, split := range standardGroups {
 		for _, part := range parts[:len(parts)-1] {
 			if part == split {
-				found[split] = true
+				directoryGroups[split] = true
 			}
 		}
+	}
+	tokenMentions := make(map[string]bool)
+	for _, split := range standardGroups {
 		if hasSplitToken(base, split) {
-			found[split] = true
+			tokenMentions[split] = true
 		}
 	}
+	found := directoryGroups
+	if len(found) == 0 {
+		found = tokenMentions
+	}
 	if len(found) > 0 {
-		groups := make([]string, 0, len(found))
+		groups = make([]string, 0, len(found))
 		for group := range found {
 			groups = append(groups, group)
 		}
-		return groups
+		// Candidates come from map iteration; sort them here so every caller
+		// sees the same order without its own agreement with this function.
+		sort.Strings(groups)
+		for split := range tokenMentions {
+			if !found[split] {
+				mentionedNotMember = append(mentionedNotMember, split)
+			}
+		}
+		sort.Strings(mentionedNotMember)
+		return groups, mentionedNotMember
 	}
 	// data/<group>/ is a directory convention. A leaf directly under data/
 	// (for example data/part-0000.parquet) is an unnamed/default file, not a
 	// custom group named after its filename.
 	if len(parts) > 2 && parts[0] == "data" && parts[1] != "" {
-		return []string{parts[1]}
+		return []string{parts[1]}, nil
 	}
-	return nil
+	return nil, nil
 }
 
 // hasSplitToken recognizes the conventional split marker anywhere in a
 // basename, provided it is delimiter-bounded on both sides. This retains
 // corpus_train_000.parquet and model.train.parquet without treating
-// pretrain_000.parquet as train.
+// pretrain_000.parquet as train. pathGroups consults it only when no directory
+// component names a standard split: a directory that names the split outranks
+// the basename token.
 func hasSplitToken(base, split string) bool {
 	for start := 0; ; {
 		i := strings.Index(base[start:], split)

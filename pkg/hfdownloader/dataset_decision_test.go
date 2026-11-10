@@ -154,7 +154,12 @@ func TestQueryDatasetGroupSelectionCancellationIsErrorNotNegativeProof(t *testin
 
 func TestCompileDatasetDecisionContextPreservesActualRolesAndAlternatives(t *testing.T) {
 	c := compileDecisionFixture([]hfNode{
-		{Path: "train.csv"}, {Path: "test/train.csv"}, {Path: "notes.txt"},
+		// The two-label fixture is now train_test.csv: two split tokens in one
+		// basename remain conflicting evidence under the split-directory
+		// precedence rule. test/train.csv no longer carries two labels — its
+		// directory outranks the basename token — so the conflicting shape
+		// moved to the two-token basename.
+		{Path: "train.csv"}, {Path: "train_test.csv"}, {Path: "notes.txt"},
 		{Path: "records.parquet"}, {Path: "config.json"}, {Path: "README.md"},
 	}, nil, nil)
 	checks := []struct {
@@ -209,7 +214,12 @@ func TestFeasibleDatasetDecisionWorldAgainstIndependentSmallOracle(t *testing.T)
 		nodes   []hfNode
 		filters []string
 	}{
-		{"different-groups-and-path-collisions", []hfNode{{Path: "train.csv"}, {Path: "test/train.csv"}, {Path: "test/meta.json"}}, []string{"train", "test"}},
+		// The colliding member is the two-directory shape: under the
+		// split-directory precedence rule test/train.csv is a definite test
+		// member, so it no longer carries the two-label ambiguity this case
+		// enumerates; train/test/items.parquet still collides with both
+		// recognized-label filters on both directory components.
+		{"different-groups-and-path-collisions", []hfNode{{Path: "train.csv"}, {Path: "train/test/items.parquet"}, {Path: "test/meta.json"}}, []string{"train", "test"}},
 		{"custom-group-and-shared-ordinary-token", []hfNode{{Path: "data/customdata/a.parquet"}, {Path: "data/customdata/b.parquet"}, {Path: "root.json"}, {Path: "data/customdata/README.md"}}, []string{"customdata", "a.parquet"}},
 		{"default-companion-and-repeat-filter", []hfNode{{Path: "records.parquet"}, {Path: "notes.json"}, {Path: "nested/info.md"}}, []string{"default", "DEFAULT", ".md"}},
 		{"four-files-with-shared-custom-terms", []hfNode{{Path: "data/customdata/other/one.csv"}, {Path: "data/customdata/two.csv"}, {Path: "data/other/three.csv"}, {Path: "root.json"}}, []string{"customdata", "other", "CSV"}},
@@ -800,7 +810,13 @@ func oracleWorldValid(c datasetDecisionContext, w datasetDecisionWorld, collisio
 }
 
 func TestCompileDatasetDecisionContextFilterBitsAndCollisionEvidence(t *testing.T) {
-	nodes := []hfNode{{Path: "train.csv"}, {Path: "test/train.csv"}, {Path: "data/custom/chunk.arrow"}, {Path: "dir_name/item.csv"}}
+	// The collision now rides the two-standard-split-directories shape:
+	// train/test/items.parquet literally matches both recognized labels
+	// ("train" and "test" directory components) while carrying both labels as
+	// alternatives, so both filters still collide. test/train.csv lost this
+	// property — the split directory outranks its basename token, so it is a
+	// definite test member and the "test" filter no longer collides for it.
+	nodes := []hfNode{{Path: "train.csv"}, {Path: "train/test/items.parquet"}, {Path: "data/custom/chunk.arrow"}, {Path: "dir_name/item.csv"}}
 	c := compileDecisionFixture(nodes, []string{"train", " TRAIN ", ".csv", "test"}, nil)
 	if c.Filters[0].Bit != c.Filters[1].Bit || c.Filters[0].Index == c.Filters[1].Index {
 		t.Fatalf("duplicate tokens should share a bit but retain positions: %+v", c.Filters)
@@ -943,7 +959,13 @@ func mustDecisionWorld(t *testing.T, c datasetDecisionContext, choices map[int]d
 }
 
 func TestConcreteWorldSharedCollisionAndIndependentFilter(t *testing.T) {
-	nodes := []hfNode{{Path: "test/train.csv"}, {Path: "train_dataset.csv"}}
+	// The colliding member is now the two-directory shape:
+	// train/test/items.parquet keeps "train" an actual label alternative and
+	// still literally matches the "train" directory component, so the pin and
+	// both shared-token interpretations remain admissible. test/train.csv is a
+	// definite test member under the split-directory precedence rule, so it can
+	// no longer be pinned to the "train" label here.
+	nodes := []hfNode{{Path: "train/test/items.parquet"}, {Path: "train_dataset.csv"}}
 	c := compileDecisionFixture(nodes, []string{"train", " TRAIN "}, nil)
 	bit := c.FilterBits["train"]
 	choices := map[int]datasetDecisionRoleLabel{
@@ -1310,7 +1332,12 @@ func TestDatasetDecisionQueriesRefuseOnlyWhenBothOutcomesHaveWorlds(t *testing.T
 		filters, excludes []string
 		target            int
 	}{
-		{"train-test-collision", []hfNode{{Path: "train.csv"}, {Path: "test/train_data.parquet"}}, []string{"train", "test"}, nil, 1},
+		// The two-label collision target is the two-directory shape:
+		// test/train_data.parquet is a definite test member under the
+		// split-directory precedence rule (its basename token never matched
+		// the path literally anyway), so train/test/items.parquet carries the
+		// train/test collision this case names, against both filters.
+		{"train-test-collision", []hfNode{{Path: "train.csv"}, {Path: "train/test/items.parquet"}}, []string{"train", "test"}, nil, 1},
 		{"explicit-filename-extension-directory", []hfNode{{Path: "data/train.csv"}, {Path: "data/test.csv"}, {Path: "metadata.json"}}, []string{"train", "data/train.csv", ".csv", "data/"}, nil, 0},
 		{"both-groups", []hfNode{{Path: "train.csv"}, {Path: "test.csv"}}, []string{"train", "test"}, nil, 0},
 		{"custom-and-train", []hfNode{{Path: "train.csv"}, {Path: "data/custom/chunk.parquet"}}, []string{"train", "custom"}, nil, 1},
@@ -1376,8 +1403,15 @@ func TestDatasetDecisionQueriesRefuseOnlyWhenBothOutcomesHaveWorlds(t *testing.T
 }
 
 func TestStableDirectEvaluationWithRoleAndSharedTokenAlternatives(t *testing.T) {
+	// The role/token-ambiguous member is now the two-directory shape:
+	// train/test/items.parquet carries both split labels (two directory
+	// components name splits) and literally matches both recognized-label
+	// filters, so it keeps two role alternatives and both shared-token
+	// collision bits. test/train.csv is definite under the split-directory
+	// precedence rule — its directory outranks the basename token — and no
+	// longer provides either property.
 	c := compileDecisionFixture([]hfNode{
-		{Path: "test/train.csv"},
+		{Path: "train/test/items.parquet"},
 		{Path: "notes.json"},
 	}, []string{"test", "train", ".csv", ".json"}, nil)
 	if len(c.Inputs[1].Alternatives) < 2 {
@@ -1421,13 +1455,17 @@ func TestStableDirectEvaluationWithRoleAndSharedTokenAlternatives(t *testing.T) 
 }
 
 func TestStableRoleAmbiguityDoesNotRequireEveryInputDirect(t *testing.T) {
+	// The excluded input must stay multi-alternative AND collision-bearing:
+	// the two-directory shape keeps both labels and both literal directory
+	// matches, whereas test/train.csv is a definite test member under the
+	// split-directory precedence rule and no longer carries the ambiguity.
 	c := compileDecisionFixture([]hfNode{
 		{Path: "train/data.parquet"},
 		{Path: "notes.json"},
 		{Path: "README.md"},
 		{Path: "unselected.bin"},
-		{Path: "test/train.csv"},
-	}, []string{"train", ".parquet", ".json"}, []string{"test/train.csv"})
+		{Path: "train/test/items.parquet"},
+	}, []string{"train", ".parquet", ".json"}, []string{"train/test/items.parquet"})
 	if len(c.Inputs[1].Alternatives) < 2 {
 		t.Fatalf("fixture must preserve default data/companion ambiguity: %+v", c.Inputs[1].Alternatives)
 	}
@@ -1541,16 +1579,23 @@ func TestStableEvaluationAcrossRealEnglishTokenCollisionAndImplicitCompanions(t 
 }
 
 func TestStableEvaluationRejectsGroupLabelLiteralCollision(t *testing.T) {
+	// The group-label literal collision now rides the two-directory shape:
+	// train/test/items.parquet literally matches the "train" directory
+	// component while carrying both split labels, so its direct result stays
+	// role-dependent and the evaluation cannot be certified stable.
+	// test/train.csv lost that property under the split-directory precedence
+	// rule: its directory outranks the basename token, so it is a definite
+	// test member with an invariant direct result.
 	c := compileDecisionFixture([]hfNode{
 		{Path: "train.csv"},
-		{Path: "test/train.csv"},
+		{Path: "train/test/items.parquet"},
 		{Path: "test/README.md"},
 	}, []string{"train"}, nil)
 	if len(collisionTokenBits(c)) == 0 {
 		t.Fatal("fixture must have a shared train-token collision")
 	}
-	// The conflicting file can be labelled either test or train, so its direct
-	// result is not invariant and the evaluation is not reusable as a baseline.
+	// The two-directory member can be labelled either test or train, so its
+	// direct result is not invariant and the evaluation is not reusable as a baseline.
 	if stableDatasetDecisionEvaluation(c) {
 		t.Fatal("group-label literal collision must not be treated as a stable direct selection")
 	}
@@ -1713,13 +1758,17 @@ func BenchmarkDatasetDecisionCompileAndAllQueriesMaskedRoleAmbiguity(b *testing.
 			for i := 0; i < size-4; i++ {
 				nodes = append(nodes, hfNode{Path: fmt.Sprintf("train/part-%04d.parquet", i)})
 			}
-			nodes = append(nodes, hfNode{Path: "notes.json"}, hfNode{Path: "README.md"}, hfNode{Path: "config.json"}, hfNode{Path: "test/train.csv"})
+			// The excluded input must keep the masked role ambiguity the
+			// benchmark is named for: two split tokens in one basename remain
+			// two-label conflicting evidence, whereas test/train.csv is a
+			// definite test member under the split-directory precedence rule.
+			nodes = append(nodes, hfNode{Path: "notes.json"}, hfNode{Path: "README.md"}, hfNode{Path: "config.json"}, hfNode{Path: "train_test.csv"})
 			files := make([]datasetselection.File, len(nodes))
 			for i := range nodes {
 				files[i].Path = nodes[i].Path
 			}
 			membership := datasetselection.Recognize(files)
-			filters, excludes := []string{"train", ".parquet", ".json"}, []string{"test/train.csv"}
+			filters, excludes := []string{"train", ".parquet", ".json"}, []string{"train_test.csv"}
 			for _, optimized := range []bool{false, true} {
 				name := "solver"
 				if optimized {

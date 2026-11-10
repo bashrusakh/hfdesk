@@ -309,9 +309,15 @@ func TestDatasetAnalyzerPlannerGroupRoundTrip(t *testing.T) {
 }
 
 func TestDatasetAnalyzerPlannerGroupConflictRefuses(t *testing.T) {
+	// The still-ambiguous fixture is the two-standard-split-directories shape:
+	// train/test/items.parquet carries both split labels, so the analyzer
+	// keeps it out of the train group and the planner still refuses the
+	// "train" filter rather than guessing. The former test/train.csv fixture
+	// is no longer conflicting — under the split-directory precedence rule its
+	// directory outranks the basename token — so the conflict moved here.
 	files := []map[string]any{
 		{"type": "file", "path": "train.csv", "size": 10},
-		{"type": "file", "path": "test/train.csv", "size": 20},
+		{"type": "file", "path": "train/test/items.parquet", "size": 20},
 	}
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
