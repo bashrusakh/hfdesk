@@ -180,26 +180,20 @@ func BenchmarkPlanRepoDatasetDecisionShapes(b *testing.B) {
 						// (the recognized label, the longer applicable
 						// term), and the colliding file is attributed by
 						// the filter that actually applies to it. The
-						// colliding test/train-part-%05d.csv is ambiguous,
-						// not a plain non-member: hasSplitToken
-						// (internal/datasetselection/membership.go) finds
-						// a delimiter-bounded "train" token in its
-						// basename next to the directory label "test",
-						// and that package's conflicting-evidence branch
-						// (len(groups) > 1, sort.Strings) records the
-						// candidates PossibleLabels [test, train]. The
-						// model resolves the conflict to "test"; with
-						// that resolved label, concreteDatasetFilterMatches
+						// colliding test/train-part-%05d.csv is a
+						// definite "test" member: under the documented
+						// precedence (see "Filter Matching" in this
+						// package's doc contract) its "test" directory
+						// component names the split and outranks the
+						// delimiter-bounded "train" token in its
+						// basename (internal/datasetselection/
+						// membership.go), so the recognized label
+						// "train" does not apply to that file and the
+						// extension filter ".csv" is the only
+						// applicable term — concreteDatasetFilterMatches
 						// and the attribution loop
-						// (pkg/hfdownloader/dataset_feasibility.go) find
-						// the recognized label "train" inapplicable and
-						// ".csv" the only applicable term, so
-						// Subdir = ".csv". The precedence between
-						// conflicting candidate labels is not documented
-						// anywhere: resolution follows the sorted
-						// candidate order, so this case pins the model's
-						// current deterministic outcome; a follow-up is
-						// expected to document that precedence.
+						// (pkg/hfdownloader/dataset_feasibility.go)
+						// therefore give Subdir = ".csv".
 						if i%2 == 1 {
 							wantSubdirs = append(wantSubdirs, ".csv")
 						} else {
