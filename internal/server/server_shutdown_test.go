@@ -70,9 +70,8 @@ func TestServerShutdownDrainsHandlerBeforeFinalJobSnapshot(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("accepted handler did not perform its manager mutation")
 	}
-	if err := <-clientDone; err != nil {
-		t.Fatal(err)
-	}
+	err := <-clientDone
+	assertNoError(t, err, "")
 	select {
 	case <-finalWriteStarted:
 	case <-time.After(5 * time.Second):
@@ -86,16 +85,12 @@ func TestServerShutdownDrainsHandlerBeforeFinalJobSnapshot(t *testing.T) {
 	close(allowFinalWrite)
 	select {
 	case err := <-serveDone:
-		if err != nil {
-			t.Fatal(err)
-		}
+		assertNoError(t, err, "")
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not return after final persistence completed")
 	}
 	loaded, err := loadJobsState(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	if len(loaded) != 1 || loaded[0].Repo != "owner/accepted-during-drain" || loaded[0].Status != JobStatusPaused {
 		t.Fatalf("final snapshot missed accepted handler mutation: %#v", loaded)
 	}
@@ -109,9 +104,7 @@ func TestServerPreCancelledContextAndBindErrorCleanup(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		err := s.serveHTTP(ctx, reserveServerTestAddr(t), http.NotFoundHandler(), time.Second)
-		if err != nil {
-			t.Fatalf("pre-cancelled server cleanup: %v", err)
-		}
+		assertNoError(t, err, "pre-cancelled server cleanup: %v", err)
 		select {
 		case <-m.closeDone:
 		default:
@@ -121,9 +114,7 @@ func TestServerPreCancelledContextAndBindErrorCleanup(t *testing.T) {
 
 	t.Run("bind failure is joined with final persistence error", func(t *testing.T) {
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
+		assertNoError(t, err, "")
 		defer listener.Close()
 		want := errors.New("final persistence failure")
 		m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "jobs.json"))
@@ -204,9 +195,7 @@ func TestServerHTTPShutdownTimeoutReturnsErrorAndRejectsLateMutation(t *testing.
 
 func TestServerUnexpectedServeErrorIsReturned(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	want := errors.New("accept failed")
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "jobs.json"))
 	registerTestJobManagerCleanup(t, m)
@@ -224,14 +213,20 @@ func TestServerUnexpectedServeErrorIsReturned(t *testing.T) {
 
 func TestServerReturnsFinalPersistenceTimeout(t *testing.T) {
 	addr := reserveServerTestAddr(t)
-	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "jobs.json"))
+	statePath := filepath.Join(t.TempDir(), "jobs.json")
+	m := newJobManagerWithStatePath(Config{}, nil, statePath)
 	registerTestJobManagerCleanup(t, m)
+	started := time.Now()
+	job := &Job{ID: "running", Status: JobStatusRunning, StartedAt: &started}
+	m.jobs[job.ID] = job
 	writeStarted := make(chan struct{})
 	allowWrite := make(chan struct{})
-	m.persistStateFile = func(string, []*Job) error {
+	var writes int
+	m.persistStateFile = func(path string, jobs []*Job) error {
+		writes++
 		close(writeStarted)
 		<-allowWrite
-		return nil
+		return saveJobsState(path, jobs)
 	}
 	s := &Server{jobs: m}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -255,11 +250,43 @@ func TestServerReturnsFinalPersistenceTimeout(t *testing.T) {
 		close(allowWrite)
 		t.Fatal("server did not return after final persistence timeout")
 	}
+	handoverStarted := make(chan struct{})
+	handoverDone := make(chan error, 1)
+	go func() {
+		close(handoverStarted)
+		handoverDone <- s.CompleteHandover()
+	}()
+	<-handoverStarted
+	// The goroutine is inside CompleteHandover and the final persistence is
+	// still blocked, so the handover may only be pending here: it can return
+	// within this window only by not joining the close coordinator that
+	// waits for that persistence.
+	select {
+	case err := <-handoverDone:
+		close(allowWrite)
+		t.Fatalf("handover returned while final persistence was still blocked: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
 	close(allowWrite)
 	select {
-	case <-m.closeDone:
+	case err := <-handoverDone:
+		assertNoError(t, err, "CompleteHandover after the original timeout: %v", err)
 	case <-time.After(5 * time.Second):
-		t.Fatal("manager close coordinator did not finish after release")
+		t.Fatal("handover did not join the manager close coordinator after release")
+	}
+	loaded, err := loadJobsState(statePath)
+	assertNoError(t, err, "")
+	if len(loaded) != 1 || loaded[0].ID != job.ID || loaded[0].Status != JobStatusPaused {
+		t.Fatalf("final handover snapshot = %#v, want the running job paused", loaded)
+	}
+	if writes != 1 {
+		t.Fatalf("final state writes = %d, want one real final snapshot", writes)
+	}
+	if err := s.CompleteHandover(); err != nil {
+		t.Fatalf("repeated CompleteHandover: %v", err)
+	}
+	if writes != 1 {
+		t.Fatalf("repeated handover rewrote jobs state: %d writes", writes)
 	}
 }
 
@@ -273,9 +300,7 @@ func (l failingAcceptListener) Accept() (net.Conn, error) { return nil, l.err }
 func reserveServerTestAddr(t *testing.T) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoError(t, err, "")
 	addr := listener.Addr().String()
 	if err := listener.Close(); err != nil {
 		t.Fatal(err)
@@ -313,9 +338,8 @@ func waitForServerListener(t *testing.T, addr string) {
 	for {
 		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err == nil {
-			if closeErr := conn.Close(); closeErr != nil {
-				t.Fatal(closeErr)
-			}
+			closeErr := conn.Close()
+			assertNoError(t, closeErr, "")
 			return
 		}
 		select {

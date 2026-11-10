@@ -939,6 +939,36 @@ POST /api/settings
 
 Settings include runtime paths, concurrency, verification, endpoint, proxy settings, the HF cache directory, and extra local scan folders.
 
+`POST /api/settings` is refused once settings admission is sealed, which
+happens only in the graceful desktop-to-service handover. The seal comes
+after the HTTP drain completes, so the observable contract of a normal
+handover stays what it was: every update admitted before the seal finishes
+normally, and the admitted writes drain and persist before the handover
+reports success. The `503` below is a defensive barrier rather than an
+outcome a client observes in a normal handover: it refuses anything that
+would reach the settings handler after the seal, and the guarantee behind
+it is the generation check in `CompleteHandover`, which reports the
+handover as failed when the latest settings generation was not confirmed
+persisted. A shutdown that is not a committed
+handover — a plain desktop quit or the console host stopping — does not seal
+admission: settings updates arriving during its HTTP drain are still accepted.
+The response uses the standard error format above; `503` has no dedicated
+entry in the status-to-code mapping, so `error_detail.code` is the generic
+`server_error`:
+
+```json
+{
+  "ok": false,
+  "error": "Server is shutting down",
+  "details": "settings cannot be changed during shutdown",
+  "error_detail": {
+    "code": "server_error",
+    "message": "Server is shutting down",
+    "details": "settings cannot be changed during shutdown"
+  }
+}
+```
+
 Download reliability settings:
 
 - `retries` — the non-progress retry budget per file/part request. A non-truncating attempt that advances the on-disk resume offset strictly beyond the highest offset reached refunds this budget and resets the backoff. For a single-file transfer, a response that ignores Range with `200 OK` restarts the partial and does not refund the budget, even if that attempt writes beyond the previous high-water mark; the new high-water mark is still recorded, so a later bodyless failure earns no refund. Multipart transfers still require `206 Partial Content` and do not accept `200` as a part. Progress refunds can increase the number of retries, but a separate lifetime retry-count ceiling limits retries after individual attempts return. That ceiling does not bound the duration or bytes of a single request that continues delivering data.

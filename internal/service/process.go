@@ -5,6 +5,9 @@ package service
 
 import "context"
 
+// buildVersion is the version of the running program, recorded by the entrypoint.
+var buildVersion = "dev"
+
 // RunProcess runs HFDesk as the process of a registered service.
 //
 // On most platforms the registered process is an ordinary foreground process
@@ -15,5 +18,8 @@ import "context"
 //
 // RunProcess never opens a browser and never creates a tray icon.
 func RunProcess(ctx context.Context, opts RunOptions) error {
+	if opts.Version != "" {
+		buildVersion = opts.Version
+	}
 	return runProcess(ctx, opts)
 }

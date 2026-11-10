@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -25,9 +26,7 @@ func TestNewPropagatesTheVersion(t *testing.T) {
 	useTemporaryConfigDir(t)
 
 	application, err := New(Options{Port: 8080}, "1.2.3-test")
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	assertNoError(t, err, "New: %v", err)
 	if server.Version != "1.2.3-test" {
 		t.Errorf("server version = %q, want %q", server.Version, "1.2.3-test")
 	}
@@ -52,16 +51,12 @@ func TestStartReportsBindFailure(t *testing.T) {
 	useTemporaryConfigDir(t)
 
 	occupied, err := net.Listen("tcp", "0.0.0.0:0")
-	if err != nil {
-		t.Fatalf("occupy a port: %v", err)
-	}
+	assertNoError(t, err, "occupy a port: %v", err)
 	defer occupied.Close()
 	port := occupied.Addr().(*net.TCPAddr).Port
 
 	application, err := New(Options{Port: port}, "test")
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	assertNoError(t, err, "New: %v", err)
 
 	err = application.Start(context.Background())
 	if err == nil {
@@ -79,9 +74,7 @@ func TestStartReportsTheEffectiveURL(t *testing.T) {
 	useTemporaryConfigDir(t)
 
 	application, err := New(Options{Port: 0}, "test")
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	assertNoError(t, err, "New: %v", err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -95,23 +88,17 @@ func TestStartReportsTheEffectiveURL(t *testing.T) {
 	}
 	portText := strings.TrimPrefix(url, "http://127.0.0.1:")
 	port, err := strconv.Atoi(portText)
-	if err != nil {
-		t.Fatalf("url %q carries no port: %v", url, err)
-	}
+	assertNoError(t, err, "url %q carries no port: %v", url, err)
 	if port <= 0 {
 		t.Errorf("url = %q, want the OS-assigned port", url)
 	}
 
 	// The server answers on the reported URL.
 	resp, err := http.Get(url + "/api/health")
-	if err != nil {
-		t.Fatalf("health request: %v", err)
-	}
+	assertNoError(t, err, "health request: %v", err)
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if err != nil {
-		t.Fatalf("read health response: %v", err)
-	}
+	assertNoError(t, err, "read health response: %v", err)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("health status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
@@ -135,16 +122,12 @@ func TestStartUsesTheConfiguredPort(t *testing.T) {
 	useTemporaryConfigDir(t)
 
 	probe, err := net.Listen("tcp", "0.0.0.0:0")
-	if err != nil {
-		t.Fatalf("find a free port: %v", err)
-	}
+	assertNoError(t, err, "find a free port: %v", err)
 	port := probe.Addr().(*net.TCPAddr).Port
 	probe.Close()
 
 	application, err := New(Options{Port: port}, "test")
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	assertNoError(t, err, "New: %v", err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -169,9 +152,7 @@ func TestWaitReturnsAfterGracefulShutdown(t *testing.T) {
 	useTemporaryConfigDir(t)
 
 	application, err := New(Options{Port: 0}, "test")
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	assertNoError(t, err, "New: %v", err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -191,22 +172,36 @@ func TestWaitReportsTheStartupFailure(t *testing.T) {
 	useTemporaryConfigDir(t)
 
 	occupied, err := net.Listen("tcp", "0.0.0.0:0")
-	if err != nil {
-		t.Fatalf("occupy a port: %v", err)
-	}
+	assertNoError(t, err, "occupy a port: %v", err)
 	defer occupied.Close()
 	port := occupied.Addr().(*net.TCPAddr).Port
 
 	application, err := New(Options{Port: port}, "test")
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	assertNoError(t, err, "New: %v", err)
 	if err := application.Start(context.Background()); err == nil {
 		t.Fatal("Start returned no error for an occupied port")
 	}
 
 	if err := application.Wait(); err == nil {
 		t.Error("Wait returned no error after a failed start")
+	}
+}
+
+func TestWaitForHandoverPreservesTheOriginalShutdownError(t *testing.T) {
+	useTemporaryConfigDir(t)
+	want := errors.New("initial graceful shutdown timed out")
+	done := make(chan struct{})
+	close(done)
+	application := &App{
+		server:   server.New(server.DefaultConfig()),
+		done:     done,
+		serveErr: want,
+	}
+	if err := application.Wait(); !errors.Is(err, want) {
+		t.Fatalf("initial Wait error = %v, want original timeout", err)
+	}
+	if err := application.WaitForHandover(); !errors.Is(err, want) {
+		t.Fatalf("handover result = %v, want original timeout preserved", err)
 	}
 }
 
@@ -218,16 +213,12 @@ func TestStartBindFailureLeavesNoServerBehind(t *testing.T) {
 	useTemporaryConfigDir(t)
 
 	occupied, err := net.Listen("tcp", "0.0.0.0:0")
-	if err != nil {
-		t.Fatalf("occupy a port: %v", err)
-	}
+	assertNoError(t, err, "occupy a port: %v", err)
 	defer occupied.Close()
 	port := occupied.Addr().(*net.TCPAddr).Port
 
 	application, err := New(Options{Port: port}, "test")
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	assertNoError(t, err, "New: %v", err)
 
 	err = application.Start(context.Background())
 	if err == nil {
@@ -269,4 +260,22 @@ func waitForShutdown(t *testing.T, application *App) error {
 		t.Fatal("Wait did not return after the context was cancelled")
 		return nil
 	}
+}
+
+// assertNoError fails the test when the call it wraps reported a failure,
+// with the diagnostic the inline check printed.
+func assertNoError(t *testing.T, err error, format string, a ...any) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	if format == "" {
+		t.Fatal(err)
+		return
+	}
+	if len(a) == 0 {
+		t.Fatal(format)
+		return
+	}
+	t.Fatalf(format, a...)
 }
