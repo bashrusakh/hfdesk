@@ -1604,9 +1604,11 @@ a refused removal does the same instead of deleting. The copy itself remains a
 non-atomic truncate-and-write checked only by `io.Copy`'s error contract: its
 copied byte count is discarded, an explicit size comparison happens only in the
 opt-in `verify` pass, and that verification compares size rather than content
-hashes. It does not use the downloader's no-replace publication tiers, and the
-mirror's symlink replacement of a leaf link and creation of plain directories
-take no admission. A destination repository that vanishes between scan and
+hashes. It does not use the downloader's no-replace publication tiers. The
+mirror's symlink-leaf replacement takes entry admission and its directory
+creation takes the shared admitted directory-creation class (a directory
+that already exists needs no admission because nothing is mutated). A
+destination repository that vanishes between scan and
 deletion counts as deleted (at its scan-time size), like `os.RemoveAll`, not as
 an error; `deleted`/`deletedSize` count only repositories actually removed, and
 `copied`/`copiedSize`/`repos` count only repositories whose copy (and
