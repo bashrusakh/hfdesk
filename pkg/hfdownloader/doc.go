@@ -130,6 +130,15 @@ or membership selection returns `ErrNoFilterMatch`:
 		Filters: []string{"q4_0", "q5_0", "q8_0"},
 	}
 
+When a filter names a split that files mention without belonging to it, the
+plan carries a notice naming the split label, the number of excluded files,
+the directories they live in, and their paths. The notice is informational
+only: it changes no plan item, no selection and no download outcome. It is
+bounded: the paths and directories it names are capped and the rest are
+counted, so the sentence never grows with the inventory. The notice surfaces
+as `Plan.Notices`, in the `POST /api/plan` response, and on the download's
+warning channel.
+
 With AppendFilterSubdir, matched files are organized into subdirectories:
 
 	job := hfdownloader.Job{
