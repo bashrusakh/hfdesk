@@ -828,7 +828,7 @@ never accepts a request the real download rejects.
 Ranges never fail silently. A successful plan response can carry `warnings`,
 an array of typed objects `{"code": ..., "message": ..., "segments": [...]}`
 omitted when empty. `message` is a bounded sentence and `segments` names the
-offending input segments; two codes exist today:
+offending input segments; three codes exist today:
 
 - `shard_ranges_no_shards` — the matched set contains no shard files at
   all, so the ranges narrowed nothing; `segments` lists every requested
@@ -836,11 +836,27 @@ offending input segments; two codes exist today:
 - `shard_ranges_ineffective_segments` — specific spans select no existing
   shard index (for example `9-10` against a four-shard family); `segments`
   lists exactly those spans.
+- `filters_unmatched` — the request's other filters selected files, but the
+  patterns listed in `segments` selected none; `message` names them (for
+  example `filter "q4" matched nothing`). Matching counts only selected
+  files — a direct filter match or dataset-membership selection of the
+  pattern's own label — so retained companion files never count, excludes
+  apply before the credit, and a request whose filters select nothing at
+  all still fails with `no_filter_match` instead of warning.
 
 Warnings are deterministic and non-fatal: they never change `files`,
 `totalSize`, `totalFiles`, or the download outcome, and they never replace
 an error. The surface is extensible — later warnings join the same array —
 so clients branch on `code` and treat unknown codes as informational.
+
+The same array is produced by `POST /api/plan`, by `dryRun: true` on
+`POST /api/download`, and by the plan of a real download: the job snapshot
+returned by `POST /api/download`, `GET /api/jobs`, and `GET /api/jobs/{id}`
+carries the warnings its own plan reported as `warnings` (persisted in
+`jobs_state.json`), so a client can see what a running or finished job's
+plan said. The bundled Downloads view renders them as a small warning line
+on the job card, and the bundled start flow surfaces `filters_unmatched` as
+a non-blocking warning toast right after the download is queued.
 
 ## Download
 
@@ -1017,6 +1033,11 @@ Legacy jobs without `hubDir` are resolved once on restore using their recorded
 warning explain that the historical Hub path is unknown. The resolved association
 is saved through normal state persistence. No old-cache search, file moves, or
 recovery of an unrecorded historical ENV path is performed.
+
+Job snapshots also expose `warnings`, the typed plan warnings the job's own
+plan reported once planning finished (see the `warnings` surface under Plan
+above), omitted when empty. The field is an output of the job's scan, not
+part of its identity: it never participates in deduplication.
 
 ## Settings
 
