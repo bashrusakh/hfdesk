@@ -39,6 +39,15 @@ jobs:
       - name: Test (race detector)
         run: go test ./... -race
 
+      # The benchmarks in pkg/hfdownloader assert product contracts (the
+      # dataset selection and attribution model, the verification read-pass
+      # budget, the ownership acquisition path), but `go test` never runs
+      # benchmarks, so without this step a contract drift in them stays
+      # silent. One iteration per benchmark is enough to execute their
+      # assertions.
+      - name: Test contract benchmarks
+        run: go test ./pkg/hfdownloader -run '^$' -bench '.' -benchtime=1x
+
   # The Go jobs never touch the Docker surface. Exercise the real entrypoint
   # image so PUID/PGID, the non-root drop, the --user path, symlink refusal, and
   # argument validation cannot regress silently.
