@@ -137,8 +137,8 @@ paths. The notice is informational
 only: it changes no plan item, no selection and no download outcome. It is
 bounded: the paths and directories it names are capped and the rest are
 counted, so the sentence never grows with the inventory. The notice surfaces
-as `Plan.Notices`, in the `POST /api/plan` response, and on the download's
-warning channel.
+as `Plan.Notices`, in the `POST /api/plan` response, on the download's
+warning channel, and in the exported `ScanPlan` preview's warning events.
 
 With AppendFilterSubdir, matched files are organized into subdirectories:
 
