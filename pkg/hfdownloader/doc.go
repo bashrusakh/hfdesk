@@ -103,8 +103,27 @@ directory, a leading-dot extension such as ".safetensors" selects that
 extension, a filter containing "/" is a complete relative path, "./name" selects
 only the literal root-level basename, and any other filter matches a whole
 delimiter-bounded path component (a directory name or the basename). Recognized
-dataset group filters also select data by membership. A filtered request with
-no surviving direct or membership selection returns `ErrNoFilterMatch`:
+dataset group filters also select data by membership. Dataset split membership
+follows one precedence rule: a directory component that names a standard split
+(`train`, `test`, `validation`, `dev`, `eval`) outranks a split name in the
+file's basename, so `validation/train_000.parquet` is a validation member and a
+`train` filter does not select it; the basename token (for example the `train`
+in `train-part-00001.csv`) contributes a candidate only when no directory
+component names a standard split. A directory with a standard split name wins
+even when it is not a split in the repository's own sense: a `dev/`, `eval/` or
+`test/` directory may be only a repository section, yet it still claims its
+files for that split, so a file inside it is not selected by a filter for the
+split its name mentions — a deliberate compromise of the heuristic. A split
+name a path mentions without the file belonging to that split stays a
+recognized group label: a filter naming it remains a membership selector
+instead of falling back to literal path matching, so it never selects the
+mentioning file. Two shapes remain
+conflicting evidence with both labels present — two standard-split directories
+in one path (for example `train/test/items.parquet`) and two split tokens in
+one basename (for example `train_test.csv`) — and a filter for either label
+keeps the established ambiguous-selection refusal when the emitted set would
+depend on which label is chosen. A filtered request with no surviving direct
+or membership selection returns `ErrNoFilterMatch`:
 
 	job := hfdownloader.Job{
 		Repo:    "TheBloke/Llama-2-7B-GGUF",
