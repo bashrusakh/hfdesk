@@ -3,6 +3,8 @@
 
 package server
 
+import "github.com/bashrusakh/hfdesk/pkg/hfdownloader"
+
 // DownloadRequest is the request body for starting a download.
 type DownloadRequest struct {
 	Repo               string   `json:"repo"`
@@ -39,6 +41,16 @@ type DownloadRequest struct {
 	// destination is used as the job's flat/local directory. An explicit
 	// localDir takes priority; an unknown key is rejected with 400.
 	RouteKey string `json:"routeKey,omitempty"`
+	// ShardRanges narrows a filtered selection to specific shard indices of
+	// split files ("<prefix>-NNNNN-of-MMMMM.<ext>"): comma-separated
+	// inclusive 1-based spans such as "1-100,120-185", where a bare "N" is
+	// the single index N. It requires non-empty filters; a malformed
+	// expression, an empty span (10-5) or ranges without filters are
+	// rejected with 400 invalid_shard_ranges before any Hub contact. Within
+	// each shard family the shards are indexed 1..M in written-number order
+	// and only shards whose index falls in the spans are planned; files that
+	// are not shard-shaped are unaffected. See hfdownloader.Job.ShardRanges.
+	ShardRanges string `json:"shardRanges,omitempty"`
 }
 
 // PlanResponse is the response for a dry-run/plan request.
@@ -55,6 +67,17 @@ type PlanResponse struct {
 	// directories, and at most five excluded paths. A notice never changes
 	// files, totalSize, or totalFiles, and it is omitted when empty.
 	Notices []string `json:"notices,omitempty"`
+	// Warnings are typed, non-fatal diagnostics about requested selectors
+	// that had no effect (currently ineffective shard ranges): objects of
+	// {code, message, segments} where code is a stable string
+	// (shard_ranges_no_shards, shard_ranges_ineffective_segments today),
+	// message is a bounded sentence, and segments names the offending input
+	// segments when the warning is about specific ones. The surface is
+	// extensible: clients branch on code and treat unknown codes as
+	// informational. A warning never changes files, totalSize, totalFiles,
+	// or the download outcome, never replaces an error, and is omitted when
+	// empty.
+	Warnings []hfdownloader.PlanWarning `json:"warnings,omitempty"`
 }
 
 // PlanFile represents a file in the plan.
