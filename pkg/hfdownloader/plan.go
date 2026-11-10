@@ -885,10 +885,11 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 	return plan, nil
 }
 
-// splitMentionNoticePathCap bounds the number of excluded paths one notice
-// names; the notice states how many more were left unnamed instead of
-// listing every path. Bounded, non-fatal diagnostics follow the established
-// analysis-warnings pattern: a notice never changes the plan or its items.
+// splitMentionNoticePathCap bounds the number of excluded paths and of
+// directories one notice names; the notice states how many more of each
+// were left unnamed instead of listing them all. Bounded, non-fatal
+// diagnostics follow the established analysis-warnings pattern: a notice
+// never changes the plan or its items.
 const splitMentionNoticePathCap = 5
 
 // splitMentionNotices reports the files a split-labelled filter did not
@@ -896,17 +897,22 @@ const splitMentionNoticePathCap = 5
 // another split's directory. One notice is produced per distinct filter
 // whose label these files mention, and the notice is informational only:
 // the plan, its items and the download outcome are exactly what they would
-// be without it. Paths are listed sorted and bounded, so the same tree and
-// filters always produce the same notices. Files that are in the plan
-// (selected by another filter) and files the request itself excluded are
-// never reported.
+// be without it. Each logical file — one case-folded path, first occurrence
+// winning, matching the plan's own exact/case-fold dedup — is counted and
+// named once, under the spelling the planner keeps. Paths are listed sorted
+// and bounded, so the same tree and filters always produce the same
+// notices. Files that are in the plan (selected by another filter) and
+// files the request itself excluded are never reported.
 func splitMentionNotices(job Job, membership datasetselection.Result, fileNodes []hfNode, items []PlanItem) []string {
 	if !job.IsDataset || len(job.Filters) == 0 {
 		return nil
 	}
-	planned := make(map[string]struct{}, len(items))
+	// The planner treats an exact duplicate and a case-variant of a planned
+	// path as the same logical file; key plan membership by the fold so the
+	// notice's model cannot disagree with the plan's.
+	plannedFold := make(map[string]struct{}, len(items))
 	for _, item := range items {
-		planned[item.RelativePath] = struct{}{}
+		plannedFold[strings.ToLower(item.RelativePath)] = struct{}{}
 	}
 	var notices []string
 	seenLabel := make(map[string]struct{}, len(job.Filters))
@@ -920,6 +926,7 @@ func splitMentionNotices(job Job, membership datasetselection.Result, fileNodes 
 		}
 		seenLabel[label] = struct{}{}
 		var excluded []string
+		seenFold := make(map[string]struct{})
 		for _, e := range membership.Evidence {
 			if !containsString(e.MentionedNotMember, label) {
 				continue
@@ -928,7 +935,12 @@ func splitMentionNotices(job Job, membership datasetselection.Result, fileNodes 
 				continue
 			}
 			p := fileNodes[e.InputIndex].Path
-			if _, ok := planned[p]; ok {
+			fold := strings.ToLower(p)
+			if _, dup := seenFold[fold]; dup {
+				continue
+			}
+			seenFold[fold] = struct{}{}
+			if _, ok := plannedFold[fold]; ok {
 				continue
 			}
 			if isExcludedPath(p, job.Excludes) {
@@ -947,8 +959,8 @@ func splitMentionNotices(job Job, membership datasetselection.Result, fileNodes 
 
 // formatSplitMentionNotice renders one notice as a single readable sentence
 // carrying the number of excluded files, the split label, the directories
-// they live in, and the excluded paths — the paths bounded at
-// splitMentionNoticePathCap, with the number of unnamed paths stated.
+// they live in, and the excluded paths — both lists bounded at
+// splitMentionNoticePathCap, with the number of unnamed entries stated.
 func formatSplitMentionNotice(label string, excluded []string) string {
 	n := len(excluded)
 	noun, mentions, lives := "files", "mention", "live"
@@ -972,8 +984,14 @@ func formatSplitMentionNotice(label string, excluded []string) string {
 		paths = excluded[:splitMentionNoticePathCap]
 		more = fmt.Sprintf(", and %d more", n-splitMentionNoticePathCap)
 	}
-	return fmt.Sprintf("excluded %d %s that %s %s but %s in %s: %s%s",
-		n, noun, mentions, label, lives, joinWithAnd(dirs), strings.Join(paths, ", "), more)
+	shownDirs := joinWithAnd(dirs)
+	dirMore := ""
+	if len(dirs) > splitMentionNoticePathCap {
+		shownDirs = strings.Join(dirs[:splitMentionNoticePathCap], ", ")
+		dirMore = fmt.Sprintf(" (and %d more directories)", len(dirs)-splitMentionNoticePathCap)
+	}
+	return fmt.Sprintf("excluded %d %s that %s %s but %s in %s%s: %s%s",
+		n, noun, mentions, label, lives, shownDirs, dirMore, strings.Join(paths, ", "), more)
 }
 
 // joinWithAnd renders a small list as "a/", "a/ and b/", or

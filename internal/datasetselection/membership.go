@@ -38,11 +38,13 @@ type Evidence struct {
 	DefiniteLabels []string
 	// MentionedNotMember lists standard split names the path mentions — a
 	// directory component equal to the split or a delimiter-bounded basename
-	// token — that are NOT membership candidates for this file: the
-	// precedence rule decided its membership elsewhere. The planner keeps
-	// these names in its recognized group-label set so a filter naming one
-	// stays a membership selector instead of literal path matching, while
-	// the file's own alternatives never gain them back.
+	// token — that are NOT membership candidates for this file: the name is
+	// reported as mentioned without becoming a candidate, whether a split
+	// directory decided the membership elsewhere or two same-source
+	// candidates left it undecided. The planner keeps these names in its
+	// recognized group-label set so a filter naming one stays a membership
+	// selector instead of literal path matching, while the file's own
+	// alternatives never gain them back.
 	MentionedNotMember []string
 	PossibleRoles      []EvidenceRole
 	DefiniteRole       EvidenceRole
@@ -299,9 +301,11 @@ func pathGroups(p, base string) (groups, mentionedNotMember []string) {
 // hasSplitToken recognizes the conventional split marker anywhere in a
 // basename, provided it is delimiter-bounded on both sides. This retains
 // corpus_train_000.parquet and model.train.parquet without treating
-// pretrain_000.parquet as train. pathGroups consults it only when no directory
-// component names a standard split: a directory that names the split outranks
-// the basename token.
+// pretrain_000.parquet as train. pathGroups always collects these tokens;
+// a token becomes a membership candidate only when no directory component
+// names a standard split, and otherwise it feeds the
+// mentioned-but-not-a-member list: a directory that names the split
+// outranks the basename token.
 func hasSplitToken(base, split string) bool {
 	for start := 0; ; {
 		i := strings.Index(base[start:], split)

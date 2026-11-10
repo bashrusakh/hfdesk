@@ -6,6 +6,7 @@ package hfdownloader
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -232,5 +233,67 @@ func TestPlanRepoDatasetSplitMentionNoticeIsBoundedAndDeterministic(t *testing.T
 	}
 	if len(again.Notices) != 1 || again.Notices[0] != wantNotice {
 		t.Errorf("second run plan.Notices = %q, want %q", again.Notices, wantNotice)
+	}
+}
+
+// TestPlanRepoDatasetSplitMentionNoticeCountsLogicalFilesOnce pins the
+// planner's dedup model in the notice: an exact duplicate inventory entry
+// and a case-fold variant are one logical file, so the notice counts and
+// names it once, under the first-occurrence spelling the planner keeps.
+func TestPlanRepoDatasetSplitMentionNoticeCountsLogicalFilesOnce(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "train/part-00000.csv", Size: 10},
+		{Type: "file", Path: "test/train-part.csv", Size: 11},
+		{Type: "file", Path: "test/train-part.csv", Size: 11}, // exact duplicate entry
+		{Type: "file", Path: "TEST/train-part.csv", Size: 11}, // case-fold variant
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo(train): %v", err)
+	}
+	if plan == nil {
+		t.Fatal("PlanRepo(train) returned no plan")
+	}
+	assertPaths(t, planPaths(plan), []string{"train/part-00000.csv"})
+	wantNotice := "excluded 1 file that mentions train but lives in test/: test/train-part.csv"
+	if len(plan.Notices) != 1 {
+		t.Fatalf("plan.Notices = %q, want exactly one notice %q", plan.Notices, wantNotice)
+	}
+	if plan.Notices[0] != wantNotice {
+		t.Errorf("plan.Notices[0] = %q, want %q", plan.Notices[0], wantNotice)
+	}
+}
+
+// TestPlanRepoDatasetSplitMentionNoticeBoundsDirectories pins the other
+// half of the bounded claim: excluded files spread over more directories
+// than the cap produce a notice that names only the first
+// splitMentionNoticePathCap directories and states how many more there
+// are, beside the already-capped path list.
+func TestPlanRepoDatasetSplitMentionNoticeBoundsDirectories(t *testing.T) {
+	files := []hfNode{{Type: "file", Path: "train/part-00000.csv", Size: 10}}
+	for i := 0; i < 7; i++ {
+		files = append(files, hfNode{Type: "file", Path: fmt.Sprintf("eval/d%d/train-%d.csv", i+1, i), Size: 11})
+	}
+	srv := mockHFServerForPlan(t, files)
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo(train): %v", err)
+	}
+	if plan == nil {
+		t.Fatal("PlanRepo(train) returned no plan")
+	}
+	assertPaths(t, planPaths(plan), []string{"train/part-00000.csv"})
+	wantNotice := "excluded 7 files that mention train but live in " +
+		"eval/d1/, eval/d2/, eval/d3/, eval/d4/, eval/d5/ (and 2 more directories): " +
+		"eval/d1/train-0.csv, eval/d2/train-1.csv, eval/d3/train-2.csv, " +
+		"eval/d4/train-3.csv, eval/d5/train-4.csv, and 2 more"
+	if len(plan.Notices) != 1 {
+		t.Fatalf("plan.Notices = %q, want exactly one notice %q", plan.Notices, wantNotice)
+	}
+	if plan.Notices[0] != wantNotice {
+		t.Errorf("plan.Notices[0] = %q, want %q", plan.Notices[0], wantNotice)
 	}
 }
