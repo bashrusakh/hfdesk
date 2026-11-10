@@ -128,7 +128,10 @@ func (m *systemdManager) Install(ctx context.Context, opts InstallOptions) (Inst
 	// reach detector B's loaded read as not-found, slip past it and be
 	// caught only by the verification after the write — with a mutation
 	// and a rollback behind it instead of the refusal before any change.
-	if refusal := preWriteExecStartOverride(path, m.scope); refusal != nil {
+	// The noun of the refusal follows the file evidence at this point:
+	// the loaded read below has not run yet, and "installation" is the
+	// umbrella noun that claims no repeat the attempt cannot prove.
+	if refusal := preWriteExecStartOverride(path, m.scope, operationNoun(!existed)); refusal != nil {
 		return opts, refusal
 	}
 
@@ -364,6 +367,22 @@ func (p previousRegistration) registrationPresent() bool {
 	return p.existed || (p.loadedKnown && p.loaded.loaded)
 }
 
+// operationNoun names the operation an install attempt performs in the
+// refusal and report family that names it ("the update was refused ...",
+// "... before the update"): an attempt over no existing registration is a
+// first installation and reads "installation", and an attempt that replaces
+// an existing registration is an "update". It is the same first/repeat rule
+// enableFirstRegistration applies, so a first installation is never called
+// an update. "installation" is also the umbrella noun of the documentation
+// ("a repeat installation"), so the noun never claims a repeat the attempt
+// cannot prove.
+func operationNoun(firstInstallation bool) string {
+	if firstInstallation {
+		return "installation"
+	}
+	return "update"
+}
+
 // registrationEnablement is what the supervisor reports about the enablement of
 // the unit.
 type registrationEnablement struct {
@@ -542,7 +561,7 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 		return result, err
 	}
 	if !unitFileUnchanged(previous.content, previous.existed, current, currentExists) {
-		return result, unitChangedDuringUpdateRefusal(previous.path)
+		return result, unitChangedDuringOperationRefusal(previous.path, operationNoun(!previous.registrationPresent()))
 	}
 	if err := writeUnitFile(previous.path, unit); err != nil {
 		return result, err
@@ -604,7 +623,7 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 			return result, AppendActionErrorIfUnnamed(fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration could not be put back into service: %v)", err, restoreErr), statusReadHint)
 		}
 		result.createdDirsSafeToRemove = systemdCreatedDirsSafeToRemove(previous, created)
-		return result, AppendActionErrorIfUnnamed(fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration was restored and the previous instance was started again)", err), statusReadHint)
+		return result, AppendActionErrorIfUnnamed(fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration and its loaded settings were restored, and the previous instance was started again)", err), statusReadHint)
 	}
 	result.versionVerified = verified
 	return result, nil

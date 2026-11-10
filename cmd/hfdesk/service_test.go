@@ -1299,6 +1299,64 @@ func TestBuildInstallOptionsKeepsTheCacheLayoutTogether(t *testing.T) {
 	}
 }
 
+// TestRenderStatusNamesAMaskedRegistration pins the `State` label of the
+// status block on both sides: the two mask kinds are printed as the mask
+// terms, while the ordinary states keep the labels they always had.
+func TestRenderStatusNamesAMaskedRegistration(t *testing.T) {
+	cases := []struct {
+		name  string
+		state service.State
+		want  string
+	}{
+		{"a persistent mask", service.StateMasked, "masked"},
+		{"a runtime mask", service.StateMaskedRuntime, "masked-runtime"},
+		{"a stopped registration", service.StateStopped, "stopped"},
+		{"a running instance", service.StateRunning, "running"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			renderStatus(&buf, service.ScopeUser, service.Status{State: tc.state, Name: service.ServiceName})
+
+			got := ""
+			for _, line := range strings.Split(buf.String(), "\n") {
+				if strings.HasPrefix(line, "State:") {
+					got = strings.TrimSpace(strings.TrimPrefix(line, "State:"))
+				}
+			}
+			if got != tc.want {
+				t.Errorf("the State line = %q, want %q:\n%s", got, tc.want, buf.String())
+			}
+		})
+	}
+}
+
+// TestStatusExitCodeDescribesAMaskedRegistration pins the exit-code family
+// on both sides: a masked registration describes like a stopped one — the
+// status never refuses and exits with 0 — while the states outside the
+// usable family keep the failure code.
+func TestStatusExitCodeDescribesAMaskedRegistration(t *testing.T) {
+	cases := []struct {
+		name  string
+		state service.State
+		want  int
+	}{
+		{"a persistent mask", service.StateMasked, 0},
+		{"a runtime mask", service.StateMaskedRuntime, 0},
+		{"a stopped registration", service.StateStopped, 0},
+		{"a running instance", service.StateRunning, 0},
+		{"an absent registration", service.StateNotInstalled, serviceFailureExitCode},
+		{"a failed instance", service.StateFailed, serviceFailureExitCode},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusExitCode(tc.state); got != tc.want {
+				t.Errorf("statusExitCode(%q) = %d, want %d", tc.state, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRenderStatusReportsTheInstance(t *testing.T) {
 	status := service.Status{
 		State:      service.StateRunning,

@@ -362,8 +362,8 @@ Exit codes:
      flag, a relative path, an unusable --executable, an unparsable --listen
 
 "hfdesk service status" exits with 0 when the service is running, stopped,
-starting or stopping, and with 1 when it is not installed, broken, failed or
-in an unknown state, so a script can branch on it.
+masked, masked-runtime, starting or stopping, and with 1 when it is not
+installed, broken, failed or in an unknown state, so a script can branch on it.
 
 Run "hfdesk service <subcommand> --help" for the flags of a subcommand.
 `, service.DefaultListen)
@@ -1382,14 +1382,16 @@ func writeLifecycleState(ctx context.Context, mgr service.Manager, w io.Writer) 
 // serviceStatus prints the state of the registered service.
 //
 // The exit code tells a script whether the instance is in a usable state:
-// 0 for a running, stopped, starting or stopping instance, 1 for an
-// instance that is not installed, broken, failed or unknown.
+// 0 for a running, stopped, masked, masked-runtime, starting or stopping
+// instance, 1 for an instance that is not installed, broken, failed or
+// unknown.
 func serviceStatus(args []string, stdout, stderr io.Writer) int {
 	mgr, scope, err := newLifecycleManager("hfdesk service status", args, stdout,
 		"Report the scope, the state and the paths of the instance.\n\n"+
 			"The exit code tells a script whether the instance is in a usable state:\n"+
-			"0 for a running, stopped, starting or stopping instance, 1 for an\n"+
-			"instance that is not installed, broken, failed or in an unknown state.")
+			"0 for a running, stopped, masked, masked-runtime, starting or stopping\n"+
+			"instance, 1 for an instance that is not installed, broken, failed or in\n"+
+			"an unknown state.")
 	if err != nil {
 		return serviceCommandResult(stderr, err)
 	}
@@ -1409,7 +1411,7 @@ func serviceStatus(args []string, stdout, stderr io.Writer) int {
 // status command.
 func statusExitCode(state service.State) int {
 	switch state {
-	case service.StateRunning, service.StateStopped, service.StateStarting, service.StateStopping:
+	case service.StateRunning, service.StateStopped, service.StateMasked, service.StateMaskedRuntime, service.StateStarting, service.StateStopping:
 		return 0
 	default:
 		return serviceFailureExitCode
