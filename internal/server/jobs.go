@@ -61,6 +61,15 @@ type Job struct {
 	EndedAt            *time.Time        `json:"endedAt,omitempty"`
 	Files              []JobFileProgress `json:"files,omitempty"`
 
+	// StrictFiles marks Filters as an exact manual file selection: each entry
+	// is one complete repository-relative path and the job downloads exactly
+	// those files (see DownloadRequest.StrictFiles). The normalized selection
+	// and this flag are part of job identity, so an identical active strict
+	// request deduplicates while a different selection stays an independent
+	// job; both persist through the normal snapshot/state machinery so the UI
+	// can render the selection ("N files") from /api/jobs.
+	StrictFiles bool `json:"strictFiles,omitempty"`
+
 	// RouteKey is the download route key requested at creation (internal/audit
 	// only). The resolved destination lives in LocalDir; this field is never a
 	// path and must not be re-resolved at run time.
@@ -548,7 +557,9 @@ resolveRequest:
 	// between. LocalRepo and ExactMatch are part of the identity too: the
 	// former redirects where the files land (cache folder ID / subfolder),
 	// the latter selects which files match, so two requests differing in
-	// either are different downloads even when the rest matches.
+	// either are different downloads even when the rest matches — except
+	// that ExactMatch is a documented no-op for a strict file selection, so
+	// when both requests are strict it never splits their identity.
 	m.mu.Lock()
 	if m.stopping {
 		m.mu.Unlock()
@@ -563,7 +574,8 @@ resolveRequest:
 			pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) &&
 			existing.LocalRepo == req.LocalRepo &&
 			existing.BranchVariant == req.BranchVariant &&
-			existing.ExactMatch == req.ExactMatch &&
+			existing.StrictFiles == req.StrictFiles &&
+			((existing.StrictFiles && req.StrictFiles) || existing.ExactMatch == req.ExactMatch) &&
 			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
 			stringSlicesEqual(existing.Filters, req.Filters) &&
 			stringSlicesEqual(existing.Excludes, req.Excludes) {
@@ -587,6 +599,7 @@ resolveRequest:
 		BranchVariant: req.BranchVariant,
 		Flat:          flat,
 		ExactMatch:    req.ExactMatch,
+		StrictFiles:   req.StrictFiles,
 		RouteKey:      routeKey,
 		Status:        JobStatusQueued,
 		CreatedAt:     time.Now(),
@@ -661,7 +674,9 @@ resolveRequest:
 				pathIdentityKey(existing.OutputDir) == reqDestKey && existing.Flat == flat &&
 				pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) && existing.LocalRepo == req.LocalRepo &&
 				existing.BranchVariant == req.BranchVariant &&
-				existing.ExactMatch == req.ExactMatch && (existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
+				existing.StrictFiles == req.StrictFiles &&
+				((existing.StrictFiles && req.StrictFiles) || existing.ExactMatch == req.ExactMatch) &&
+				(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
 				stringSlicesEqual(existing.Filters, req.Filters) && stringSlicesEqual(existing.Excludes, req.Excludes) {
 				a.Close()
 				snapshot := m.cloneJobLocked(existing)
@@ -1733,6 +1748,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		Filters:            job.Filters,
 		Excludes:           job.Excludes,
 		ExactMatch:         job.ExactMatch,
+		StrictFiles:        job.StrictFiles,
 		AppendFilterSubdir: false,
 		LocalRepo:          job.LocalRepo,
 		BranchVariant:      job.BranchVariant,
