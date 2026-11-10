@@ -6,6 +6,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -424,4 +425,97 @@ func TestApplyJobProgressKeepsWarningEvents(t *testing.T) {
 			t.Errorf("last kept warning = %q, want %q", last, wantLast)
 		}
 	})
+
+	t.Run("repeated diagnostic keeps one entry", func(t *testing.T) {
+		job := &Job{}
+		applyJobProgress(job, warn("revision is not pinned"), now)
+		applyJobProgress(job, warn("revision is not pinned"), now) // re-emitted by a later attempt
+		if len(job.Warnings) != 1 || job.Warnings[0] != "revision is not pinned" {
+			t.Fatalf("job.Warnings = %q, want one entry for the repeated diagnostic", job.Warnings)
+		}
+		// A distinct diagnostic is kept beside it, first arrival first.
+		applyJobProgress(job, warn("failed to write manifest: disk full"), now)
+		if len(job.Warnings) != 2 ||
+			job.Warnings[0] != "revision is not pinned" ||
+			job.Warnings[1] != "failed to write manifest: disk full" {
+			t.Fatalf("job.Warnings = %q, want both diagnostics in first-arrival order", job.Warnings)
+		}
+		// A further repeat of the first diagnostic still adds nothing.
+		applyJobProgress(job, warn("revision is not pinned"), now)
+		if len(job.Warnings) != 2 {
+			t.Fatalf("job.Warnings = %q, want the repeat to add no entry", job.Warnings)
+		}
+	})
+
+	t.Run("repeats do not consume the cap", func(t *testing.T) {
+		job := &Job{}
+		// Every message below is emitted twice, as a re-run of the plan
+		// would emit it: the repeats must not fill the bounded list.
+		for i := 0; i < maxJobWarnings-1; i++ {
+			applyJobProgress(job, warn(fmt.Sprintf("warning %d", i)), now)
+			applyJobProgress(job, warn(fmt.Sprintf("warning %d", i)), now)
+		}
+		if len(job.Warnings) != maxJobWarnings-1 {
+			t.Fatalf("len(job.Warnings) = %d, want %d after doubled emissions", len(job.Warnings), maxJobWarnings-1)
+		}
+		// The cap still has room for the next distinct diagnostic even
+		// though every earlier message was already emitted twice.
+		applyJobProgress(job, warn("failed to write manifest: disk full"), now)
+		if len(job.Warnings) != maxJobWarnings {
+			t.Fatalf("len(job.Warnings) = %d, want the cap %d", len(job.Warnings), maxJobWarnings)
+		}
+		if job.Warnings[maxJobWarnings-1] != "failed to write manifest: disk full" {
+			t.Errorf("last entry = %q, want the distinct diagnostic to take the final slot", job.Warnings[maxJobWarnings-1])
+		}
+		// Full: a further distinct diagnostic is still dropped.
+		applyJobProgress(job, warn("failed to write ref: permission denied"), now)
+		if len(job.Warnings) != maxJobWarnings {
+			t.Errorf("len(job.Warnings) = %d, want the cap %d once full", len(job.Warnings), maxJobWarnings)
+		}
+	})
+}
+
+// TestResumeKeepsOneWarningEntryPerDiagnostic pins the warning lifecycle
+// across a resume-style restart: resetAndQueueRestartLocked leaves the
+// job's warnings alone, and when the downloader re-emits the identical
+// messages on the next attempt — the unpinned-revision and plan-notice
+// warnings come from the per-attempt plan — they stay one entry each, so a
+// later distinct diagnostic of the new attempt still fits the bound.
+func TestResumeKeepsOneWarningEntryPerDiagnostic(t *testing.T) {
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "state"))
+	m.fenced = true // no attempt is dispatched; this pins the reset and re-emission only.
+	const unpinned = "revision is not pinned to an immutable commit"
+	job := &Job{
+		ID:        "resume-warnings",
+		Repo:      "owner/repo",
+		Status:    JobStatusPaused,
+		CreatedAt: time.Now(),
+		Warnings:  []string{unpinned},
+	}
+	m.jobs[job.ID] = job
+
+	now := time.Now()
+	warn := func(msg string) hfdownloader.ProgressEvent {
+		return hfdownloader.ProgressEvent{Level: "warn", Event: "warning", Message: msg}
+	}
+
+	// Resume path (retry=false): the reset must neither clear the kept
+	// diagnostics nor duplicate them.
+	m.mu.Lock()
+	resetAndQueueRestartLocked(m, job, false)
+	m.mu.Unlock()
+	if len(job.Warnings) != 1 || job.Warnings[0] != unpinned {
+		t.Fatalf("job.Warnings after resume reset = %q, want the single kept diagnostic", job.Warnings)
+	}
+
+	// The next attempt re-emits the same warning: same fact, same entry.
+	applyJobProgress(job, warn(unpinned), now)
+	if len(job.Warnings) != 1 {
+		t.Fatalf("job.Warnings after re-emission = %q, want one entry for the repeated diagnostic", job.Warnings)
+	}
+	// A distinct diagnostic of the new attempt is kept beside it.
+	applyJobProgress(job, warn("failed to write manifest: disk full"), now)
+	if len(job.Warnings) != 2 || job.Warnings[1] != "failed to write manifest: disk full" {
+		t.Fatalf("job.Warnings = %q, want the re-emitted and the distinct diagnostic once each", job.Warnings)
+	}
 }

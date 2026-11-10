@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -47,7 +48,7 @@ type Job struct {
 	OutputDir          string            `json:"outputDir"`
 	HubDir             string            `json:"hubDir,omitempty"` // Exact frozen Hub; OutputDir remains the friendly/app root.
 	DestinationWarning string            `json:"destinationWarning,omitempty"`
-	Warnings           []string          `json:"warnings,omitempty"`      // The downloader's non-fatal diagnostics, arrival order, bounded at maxJobWarnings (distinct from the server-computed DestinationWarning).
+	Warnings           []string          `json:"warnings,omitempty"`      // The downloader's distinct non-fatal diagnostics, one entry each in first-arrival order, bounded at maxJobWarnings (distinct from the server-computed DestinationWarning).
 	LocalDir           string            `json:"localDir,omitempty"`      // Effective local-dir for this job (per-request or server-global)
 	LocalRepo          string            `json:"localRepo,omitempty"`     // Override destination folder name (used for upstream mmproj)
 	BranchVariant      bool              `json:"branchVariant,omitempty"` // Whole EXL branch selected by revision
@@ -1567,8 +1568,8 @@ func updateJobETA(job *Job, transferred int64, now time.Time) {
 	job.Progress.EtaSeconds = int64(float64(remaining)/predictor + 0.5)
 }
 
-// maxJobWarnings bounds a job's Warnings list: the downloader's warning
-// diagnostics are kept in arrival order up to this many entries, and once
+// maxJobWarnings bounds a job's Warnings list: one entry per distinct
+// diagnostic, kept in first-arrival order, up to this many entries; once
 // full the list stops growing — the bounded-diagnostic pattern of
 // pkg/smartdl's analysis_warnings.
 const maxJobWarnings = 20
@@ -1702,10 +1703,16 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 	case "warning":
 		// Keep the downloader's non-fatal diagnostics (unpinned revision,
 		// plan notices, unusable resume state, best-effort metadata
-		// writes) in the job state, bounded in arrival order. The snapshot
-		// broadcast right after this event carries the list to listeners
-		// and the API, so no new transport is needed.
-		if evt.Message != "" && len(job.Warnings) < maxJobWarnings {
+		// writes) in the job state — one entry per distinct diagnostic: a
+		// resume or retry re-runs the plan and the downloader re-emits the
+		// identical messages, and a repeat is the same fact, so it must
+		// not duplicate in the snapshot nor consume the bounded cap that
+		// would otherwise fill with duplicates and drop a later, distinct
+		// diagnostic. First arrival wins: an existing entry keeps its
+		// position. The snapshot broadcast right after this event carries
+		// the list to listeners and the API, so no new transport is
+		// needed.
+		if evt.Message != "" && len(job.Warnings) < maxJobWarnings && !slices.Contains(job.Warnings, evt.Message) {
 			job.Warnings = append(job.Warnings, evt.Message)
 		}
 	}
