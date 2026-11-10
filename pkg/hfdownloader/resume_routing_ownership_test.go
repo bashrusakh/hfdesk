@@ -666,3 +666,251 @@ func TestFormatRangelessResumeNotice(t *testing.T) {
 		t.Errorf("splitMentionNoticePathCap = %d, want 5 (the messages above name five paths)", splitMentionNoticePathCap)
 	}
 }
+
+// splitResumeWarningFor is the exact aggregated message for one affected
+// file at this fixture's paths.
+func splitResumeWarningFor(rel string) string {
+	return "resume state for 1 file cannot be used without HTTP range support; " +
+		"downloading the full file and attempting to discard the obsolete state after success: " + rel
+}
+
+// warningAndErrorOrder extracts the indices of the first warning and the
+// first error event from a callback stream. It returns them as -1 when
+// absent.
+func warningAndErrorOrder(events []ProgressEvent) (warningIdx, errIdx int) {
+	warningIdx, errIdx = -1, -1
+	for i, ev := range events {
+		if ev.Event == "warning" && warningIdx == -1 {
+			warningIdx = i
+		}
+		if ev.Event == "error" && errIdx == -1 {
+			errIdx = i
+		}
+	}
+	return warningIdx, errIdx
+}
+
+// TestDownload_NoRangeSupportWarningDeliveredOnItemFailure pins the
+// delivery guarantee on the error path: one affected item (seeded state,
+// no range support) plus one item whose transfer fails. Download must
+// return the failure, the aggregated warning must reach the progress
+// callback exactly once naming the affected file, and the warning must be
+// delivered before the failure is surfaced — the warning event precedes
+// the failure's error event in the callback stream, and the callback ran
+// inside Download, so the returned error follows it. The diagnostic is not
+// swallowed by the error path. Determinism: the failing item's handler
+// waits for the affected item's own transfer request, and that request can
+// only happen after its routing decision collected the path (same
+// goroutine, program order), so the failure can never race ahead of the
+// collection; a 500 is not fail-fast, so no sibling abort intervenes.
+func TestDownload_NoRangeSupportWarningDeliveredOnItemFailure(t *testing.T) {
+	const total = 4_096
+	full := rangedTestPayload(total)
+	sha := singleTestSHA(full)
+	affected, failing := "f00.bin", "f01.bin"
+	affectedTransferStarted := make(chan struct{}, 1)
+	node := func(rel string) string {
+		return fmt.Sprintf(`{"type":"file","path":%q,"size":%d,"sha256":%q}`, rel, len(full), sha)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_, _ = w.Write([]byte("[" + node(affected) + "," + node(failing) + "]"))
+		case strings.Contains(r.URL.Path, "/resolve/") || strings.Contains(r.URL.Path, "/raw/"):
+			if r.Header.Get("X-HFDesk-Addressing-Probe") == "1" {
+				http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+				return
+			}
+			if strings.Contains(r.URL.Path, failing) {
+				<-affectedTransferStarted
+				http.Error(w, "injected transfer failure", http.StatusInternalServerError)
+				return
+			}
+			select {
+			case affectedTransferStarted <- struct{}{}:
+			default:
+			}
+			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // released first if a guard fires, so srv.Close cannot hang
+
+	out := t.TempDir()
+	seedFlatResumeState(t, flatDst(t, out, affected), affected, total, full)
+
+	cfg := Settings{
+		OutputDir:          out,
+		Endpoint:           srv.URL,
+		Concurrency:        2,
+		MaxActiveDownloads: 2,
+		MultipartThreshold: "1MB",
+		Verify:             "size",
+		Retries:            0,
+		StallTimeout:       "0",
+	}
+	var (
+		mu     sync.Mutex
+		events []ProgressEvent
+	)
+	done := make(chan error, 1)
+	go func() {
+		done <- Download(ctx, Job{Repo: "o/r", Revision: "main"}, cfg, func(ev ProgressEvent) {
+			mu.Lock()
+			events = append(events, ev)
+			mu.Unlock()
+		})
+	}()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Download neither failed nor finished; the affected item's transfer request never arrived")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if err == nil {
+		t.Fatal("Download succeeded; the injected transfer failure must fail the job")
+	}
+	if !strings.Contains(err.Error(), failing) {
+		t.Errorf("error = %v, want the failing item %q named", err, failing)
+	}
+
+	var warnings []string
+	for _, ev := range events {
+		if ev.Event == "warning" {
+			warnings = append(warnings, ev.Message)
+		}
+	}
+	want := splitResumeWarningFor(affected)
+	if len(warnings) != 1 || warnings[0] != want {
+		t.Errorf("warnings = %q, want exactly [%q]", warnings, want)
+	}
+	warningIdx, errIdx := warningAndErrorOrder(events)
+	if errIdx == -1 {
+		t.Error("no error event surfaced the failure to the callback")
+	}
+	if warningIdx == -1 {
+		t.Error("no warning event delivered on the failure path")
+	} else if errIdx != -1 && warningIdx >= errIdx {
+		t.Errorf("warning (event %d) must be delivered before the failure's error event (event %d)", warningIdx, errIdx)
+	}
+}
+
+// TestDownload_NoRangeSupportWarningDeliveredOnCancel pins the delivery
+// guarantee on the cancellation path: the one affected item's path is
+// collected during routing, strictly before its transfer request starts
+// (same goroutine, program order), so the test server signals the arrival
+// of that request and then lets the transfer end only through
+// cancellation — no sleeps, no scheduling assumptions. After the job
+// context is cancelled, Download must still emit exactly one aggregated
+// warning naming the affected file, deliver it before the cancellation is
+// surfaced (the warning precedes the error event in the callback stream),
+// and end as cancelled.
+func TestDownload_NoRangeSupportWarningDeliveredOnCancel(t *testing.T) {
+	const total = 4_096
+	full := rangedTestPayload(total)
+	sha := singleTestSHA(full)
+	rel := "f00.bin"
+	transferStarted := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_, _ = w.Write([]byte(fmt.Sprintf(`[{"type":"file","path":%q,"size":%d,"sha256":%q}]`, rel, len(full), sha)))
+		case strings.Contains(r.URL.Path, "/resolve/") || strings.Contains(r.URL.Path, "/raw/"):
+			if r.Header.Get("X-HFDesk-Addressing-Probe") == "1" {
+				http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+				return
+			}
+			select {
+			case transferStarted <- struct{}{}:
+			default:
+			}
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := t.TempDir()
+	seedFlatResumeState(t, flatDst(t, out, rel), rel, total, full)
+
+	cfg := Settings{
+		OutputDir:          out,
+		Endpoint:           srv.URL,
+		Concurrency:        2,
+		MaxActiveDownloads: 2,
+		MultipartThreshold: "1MB",
+		Verify:             "size",
+		Retries:            0,
+		StallTimeout:       "0",
+	}
+	var (
+		mu     sync.Mutex
+		events []ProgressEvent
+	)
+	done := make(chan error, 1)
+	go func() {
+		done <- Download(ctx, Job{Repo: "o/r", Revision: "main"}, cfg, func(ev ProgressEvent) {
+			mu.Lock()
+			events = append(events, ev)
+			mu.Unlock()
+		})
+	}()
+
+	select {
+	case <-transferStarted:
+		// The affected path is collected; cancellation can now be exact.
+	case err := <-done:
+		t.Fatalf("Download finished (%v) before the affected item's transfer started", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the affected item's transfer request never arrived")
+	}
+	cancel()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Download did not return after cancellation")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want a context cancellation", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	var warnings []string
+	for _, ev := range events {
+		if ev.Event == "warning" {
+			warnings = append(warnings, ev.Message)
+		}
+	}
+	want := splitResumeWarningFor(rel)
+	if len(warnings) != 1 || warnings[0] != want {
+		t.Errorf("warnings = %q, want exactly [%q]", warnings, want)
+	}
+	warningIdx, errIdx := warningAndErrorOrder(events)
+	if errIdx == -1 {
+		t.Error("no error event surfaced the cancellation to the callback")
+	}
+	if warningIdx == -1 {
+		t.Error("no warning event delivered on the cancel path")
+	} else if errIdx != -1 && warningIdx >= errIdx {
+		t.Errorf("warning (event %d) must be delivered before the cancellation's error event (event %d)", warningIdx, errIdx)
+	}
+}
