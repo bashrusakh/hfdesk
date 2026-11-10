@@ -226,7 +226,8 @@ type Plan struct {
 	// outcome, and it never replaces an error.
 	Notices []string `json:"notices,omitempty"`
 	// Warnings are typed, non-fatal diagnostics about requested selectors
-	// that had no effect — today only ineffective shard ranges. A warning
+	// that had no effect — today ineffective shard ranges and filter
+	// patterns that selected nothing (filters_unmatched). A warning
 	// never changes the plan's items or the download outcome and never
 	// replaces an error. The slice is omitted when empty; the code set is
 	// extensible, so consumers branch on Code and treat unknown codes as
@@ -237,8 +238,9 @@ type Plan struct {
 // PlanWarning is one typed, non-fatal warning attached to a Plan. Code is a
 // stable string so clients can branch on it; Message is a bounded,
 // human-readable sentence; Segments carries the offending request input
-// slices (for example the ineffective shard-range segments) when the warning
-// is about specific segments, bounded by what the caller itself wrote.
+// slices (for example the ineffective shard-range segments or the filter
+// patterns that selected nothing) when the warning is about specific
+// segments, bounded by what the caller itself wrote.
 type PlanWarning struct {
 	Code     string   `json:"code"`
 	Message  string   `json:"message"`
@@ -255,6 +257,15 @@ const (
 	// shard-range segments select no existing shard index of any matched
 	// shard family.
 	PlanWarningShardRangesIneffectiveSegments = "shard_ranges_ineffective_segments"
+	// PlanWarningFiltersUnmatched reports that specific filter patterns
+	// selected no file while the request's other filters kept the
+	// selection alive; Segments carries the unmatched patterns exactly as
+	// requested. Matching counts only SELECTED files — a direct filter
+	// match or dataset-membership selection of the pattern's own label —
+	// so a retained companion never counts, and a request whose filters
+	// select nothing at all still fails ErrNoFilterMatch instead of
+	// producing this warning.
+	PlanWarningFiltersUnmatched = "filters_unmatched"
 )
 
 // safeCommitName reports whether commit is a single, non-escaping path
@@ -338,6 +349,18 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 	// dataset request.
 	var recognizedDatasetLabels []string
 	var membershipDataSelected []bool
+	// membershipSelectedLabel carries the concrete group label of each
+	// membership-selected data node (empty otherwise), so a recognized
+	// group-label filter is credited only by selected data of its own
+	// label — another label's selection never counts as its match.
+	var membershipSelectedLabel []string
+	// filterMatched is the per-pattern selection proof aligned with
+	// job.Filters: a pattern is credited only by a SELECTED file — a
+	// direct path match or its own membership label — never by a retained
+	// companion. It feeds the filters_unmatched warning, which is built
+	// only after the ErrNoFilterMatch checks below, so a total-zero
+	// selection keeps its error and never becomes a warning.
+	filterMatched := make([]bool, len(job.Filters))
 
 	mode := planAddressingMode{revision: job.Revision, commit: job.Revision}
 	custom := isCustomHubEndpoint(cfg.Endpoint)
@@ -576,10 +599,16 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 			// concrete world: an emitted data record is selected, while a
 			// retained companion (companion role) carries no selection proof —
 			// the per-node mirror of the datasetMembershipMatch predicate above.
+			// The concrete label rides along so a group-label filter is credited
+			// only by selected data carrying that very label.
 			membershipDataSelected = make([]bool, len(fileNodes))
+			membershipSelectedLabel = make([]string, len(fileNodes))
 			for i := range datasetEvaluation.Records {
-				membershipDataSelected[i] = datasetEvaluation.Records[i].Selected &&
-					world.DataLabels[i] != "" && !world.Companion[i]
+				if datasetEvaluation.Records[i].Selected &&
+					world.DataLabels[i] != "" && !world.Companion[i] {
+					membershipDataSelected[i] = true
+					membershipSelectedLabel[i] = world.DataLabels[i]
+				}
 			}
 			if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
 				return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
@@ -628,6 +657,18 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 				selectionFilters = append(selectionFilters, filter)
 			}
 		}
+	}
+	// labelFilters and filterNorms project that same membership-only rule
+	// onto job.Filters indices for the per-pattern credit below: a filter
+	// whose normalized text is a recognized dataset group label selects
+	// through membership evidence only, and recognizedDatasetLabels stays
+	// nil outside a filtered dataset request, so every filter is a direct
+	// selector for ordinary model requests.
+	labelFilters := make([]bool, len(job.Filters))
+	filterNorms := make([]string, len(job.Filters))
+	for i, filter := range job.Filters {
+		filterNorms[i] = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
+		labelFilters[i] = containsString(recognizedDatasetLabels, filterNorms[i])
 	}
 	for nodeIndex, n := range fileNodes {
 		if err := ctx.Err(); err != nil {
@@ -858,6 +899,28 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 			DestinationSubdir: destinationSubdir,
 		})
 		selectedItems = append(selectedItems, selected)
+		// Per-pattern selection credit: only a file that actually entered
+		// the plan as SELECTED can match a pattern. A direct selector is
+		// credited by its own path match; a membership-only group label is
+		// credited only by selected data carrying that exact label, so
+		// retained companions and other labels' selections never count.
+		if selected {
+			for i, filter := range job.Filters {
+				if filterMatched[i] {
+					continue
+				}
+				if labelFilters[i] {
+					if membershipDataSelected != nil && membershipDataSelected[nodeIndex] &&
+						strings.EqualFold(membershipSelectedLabel[nodeIndex], filterNorms[i]) {
+						filterMatched[i] = true
+					}
+					continue
+				}
+				if filterMatchesPath(rel, filter, job.ExactMatch) {
+					filterMatched[i] = true
+				}
+			}
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -898,6 +961,13 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 		}
 		plan.Items = narrowed
 		plan.Warnings = warnings
+	}
+	// The filters_unmatched warning is attached only after the
+	// ErrNoFilterMatch checks above have passed (a total-zero selection
+	// returned an error instead) and after the shard-range block, so the
+	// established shard warnings keep their positions in the array.
+	if unmatched := unmatchedFilters(job.Filters, filterMatched); len(unmatched) > 0 {
+		plan.Warnings = append(plan.Warnings, unmatchedFilterWarning(unmatched))
 	}
 	if forced == nil && custom && !job.BranchVariant && mode.pinned {
 		probeDeadline := time.Now().Add(addressingProbeBudget)
@@ -1123,11 +1193,11 @@ func joinWithAnd(values []string) string {
 	return strings.Join(values[:len(values)-1], ", ") + " and " + values[len(values)-1]
 }
 
-// shardWarningSegmentCap bounds how many segments one warning message
+// warningSegmentCap bounds how many segments one warning message
 // lists; the remaining count is stated instead, so the sentence never grows
 // with the caller's expression. The Segments field still carries every
 // segment, which is itself bounded by the request that wrote it.
-const shardWarningSegmentCap = 5
+const warningSegmentCap = 5
 
 // parseShardFile reports whether rel names a split artifact in the
 // established "<prefix>-NNNNN-of-MMMMM.<ext>" form and, when it does,
@@ -1268,7 +1338,7 @@ func narrowShardRanges(items []PlanItem, selected []bool, ranges []shardRange, e
 	if len(ineffective) > 0 {
 		warnings = append(warnings, PlanWarning{
 			Code:     PlanWarningShardRangesIneffectiveSegments,
-			Message:  fmt.Sprintf("shard range segments selected no shard (indices present: 1-%d): %s", largestFamily, joinShardSegments(ineffective)),
+			Message:  fmt.Sprintf("shard range segments selected no shard (indices present: 1-%d): %s", largestFamily, joinBoundedSegments(ineffective)),
 			Segments: ineffective,
 		})
 	}
@@ -1286,14 +1356,56 @@ func narrowShardRanges(items []PlanItem, selected []bool, ranges []shardRange, e
 	return narrowed, selectedKept, warnings
 }
 
-// joinShardSegments renders ineffective segments as a bounded list: at most
-// shardWarningSegmentCap are named, the rest are counted.
-func joinShardSegments(segments []string) string {
-	if len(segments) <= shardWarningSegmentCap {
+// joinBoundedSegments renders segments as a bounded list: at most
+// warningSegmentCap are named, the rest are counted. It is the single
+// bounded segment join shared by every PlanWarning message.
+func joinBoundedSegments(segments []string) string {
+	if len(segments) <= warningSegmentCap {
 		return strings.Join(segments, ", ")
 	}
 	return fmt.Sprintf("%s, and %d more",
-		strings.Join(segments[:shardWarningSegmentCap], ", "), len(segments)-shardWarningSegmentCap)
+		strings.Join(segments[:warningSegmentCap], ", "), len(segments)-warningSegmentCap)
+}
+
+// unmatchedFilters returns the requested filter patterns that credited no
+// selected file, in request order, with exact duplicates collapsed
+// (first occurrence wins) so one missing pattern is named once. The caller
+// runs it only after the ErrNoFilterMatch checks have passed, so a request
+// whose filters selected nothing reports the error, never this list.
+func unmatchedFilters(filters []string, filterMatched []bool) []string {
+	var unmatched []string
+	seen := make(map[string]struct{}, len(filters))
+	for i, filter := range filters {
+		if filterMatched[i] {
+			continue
+		}
+		if _, dup := seen[filter]; dup {
+			continue
+		}
+		seen[filter] = struct{}{}
+		unmatched = append(unmatched, filter)
+	}
+	return unmatched
+}
+
+// unmatchedFilterWarning renders the filters_unmatched warning for patterns
+// that selected nothing: one bounded sentence naming each pattern (quoted,
+// at most warningSegmentCap listed and the rest counted) with every
+// unmatched pattern carried verbatim in Segments.
+func unmatchedFilterWarning(filters []string) PlanWarning {
+	quoted := make([]string, len(filters))
+	for i, filter := range filters {
+		quoted[i] = strconv.Quote(filter)
+	}
+	message := fmt.Sprintf("filters %s matched nothing", joinBoundedSegments(quoted))
+	if len(filters) == 1 {
+		message = fmt.Sprintf("filter %s matched nothing", quoted[0])
+	}
+	return PlanWarning{
+		Code:     PlanWarningFiltersUnmatched,
+		Message:  message,
+		Segments: filters,
+	}
 }
 
 func isCustomHubEndpoint(endpoint string) bool {
