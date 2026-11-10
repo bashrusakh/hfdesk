@@ -92,6 +92,24 @@ jobs:
       - name: Test selected-cache path locality
         run: go test ./internal/server -run '^TestCacheSelectionRejectsNonLocalRepoBeforeJoining$' -count=1 -v
 
+      # Keep this Windows subset symlink- and privilege-free. It covers ownership,
+      # resume, publication, and closing the partial before cancel cleanup.
+      # The same-process classification pins and the many-item concurrency
+      # regression run here too: Windows locks through LockFileEx, whose
+      # semantics differ from Unix flock, so the classification and
+      # many-item contention behavior must be exercised on this backend.
+      # The two cross-process ownership tests were renamed with the removal of
+      # the legacy payload-side OS-lock protocol. The three dead names that
+      # matched no test map to their current coverage: the cross-process
+      # claimant classification now lives in
+      # TestDownload_UnresolvableContentionFailsInsteadOfSkipping (a
+      # non-owning concurrent claimant is never reported as a live owner),
+      # TestDownloadFlatModeSingleRouteTakesTheDestinationDomain was renamed
+      # TestDownloadFlatModeSingleRouteUsesExternalOwnership, and same-revision
+      # single-path resume is TestDownloadSingle_ResumesFromExistingPartial.
+      - name: Test downloader ownership, resume and publication
+        run: go test ./pkg/hfdownloader -count=1 -run '^(TestOwnershipScopeHeldByLiveProcessBlocksTakeover|TestOwnershipScopeReleasedByCrashedProcess|TestDownload_UnresolvableContentionFailsInsteadOfSkipping|TestRangedMultipart_OutOfOrderRangesProduceExactBytes|TestRangedResumeKeepsAPinnedMatchingIdentity|TestPublishBlobNoReplaceRefusesToOverwrite|TestFinalizeBlobNeverReplacesAnExistingBlob|TestDownloadSingle_ResumesFromExistingPartial|TestDownloadFlatModeRoutesExcludeEachOther|TestDownloadFlatModeSingleRouteWritersAreExcluded|TestDownloadFlatModeSingleRouteUsesExternalOwnership|TestDownloadFlatModeUnknownSizeHandoffUsesOneDomain|TestCleanupJobPartFilesFlatModeRespectsTheDestinationDomain|TestDownloadSingle_CancelDuringProofRemovesPartial|TestCacheManyItemConcurrentDownloadCompletes|TestSameProcessBootstrapContentionIsNotAForeignOwnerError|TestKeyedDomainWaiterTimeoutIsSameProcessContention)$' -v
+
 
       # The Windows desktop host is a second binary of HFDesk. Its defining
       # property is the PE subsystem of the produced file: the console host
@@ -202,4 +220,3 @@ jobs:
       # platform would otherwise stay unnoticed until a macOS installation.
       - name: Test command layer
         run: go test ./cmd/hfdesk -v
-

@@ -4,6 +4,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -343,7 +344,7 @@ func (s *Server) handleMirrorPush(w http.ResponseWriter, r *http.Request) {
 		var ok bool
 		release, ok = s.jobs.beginCacheMutation(destination)
 		if !ok {
-			writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+			writeError(w, http.StatusConflict, "Cache is busy", "An active download or another cache operation is using this cache; retry when it finishes")
 			return
 		}
 		defer release()
@@ -387,7 +388,7 @@ func (s *Server) handleMirrorPull(w http.ResponseWriter, r *http.Request) {
 		var ok bool
 		release, ok = s.jobs.beginCacheMutation(destination)
 		if !ok {
-			writeError(w, http.StatusConflict, "Selected GGUF is busy", "A selected local GGUF group is being deleted")
+			writeError(w, http.StatusConflict, "Cache is busy", "An active download or another cache operation is using this cache; retry when it finishes")
 			return
 		}
 		defer release()
@@ -470,7 +471,7 @@ func scanHubForMirror(hubDir string) ([]mirrorEntry, error) {
 		blobsDir := filepath.Join(hubDir, name, "blobs")
 		var totalSize int64
 		filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
-			if err == nil && !info.IsDir() {
+			if err == nil && !info.IsDir() && !isBlobStagingArtifactName(info.Name()) {
 				totalSize += info.Size()
 			}
 			return nil
@@ -576,21 +577,20 @@ func mirrorSyncHubs(srcCache, dstCache, repoFilter string, dryRun, verify, delet
 		}
 	}
 
-	// Calculate sizes
-	for _, e := range toCopy {
-		result.CopiedSize += e.Size
-		result.Repos = append(result.Repos, e.Repo)
-	}
-	for _, e := range toDelete {
-		result.DeletedSize += e.Size
-	}
-
-	result.Copied = len(toCopy)
-	result.Deleted = len(toDelete)
-	result.CopiedSizeHuman = humanSizeBytes(result.CopiedSize)
-	result.DeletedSizeHuman = humanSizeBytes(result.DeletedSize)
-
 	if dryRun {
+		// A dry run reports the planned work; a real run counts only the copies
+		// and removals that actually happened.
+		for _, e := range toCopy {
+			result.CopiedSize += e.Size
+			result.Repos = append(result.Repos, e.Repo)
+		}
+		for _, e := range toDelete {
+			result.DeletedSize += e.Size
+		}
+		result.Copied = len(toCopy)
+		result.Deleted = len(toDelete)
+		result.CopiedSizeHuman = humanSizeBytes(result.CopiedSize)
+		result.DeletedSizeHuman = humanSizeBytes(result.DeletedSize)
 		result.Message = fmt.Sprintf("Would copy %d repos (%s)", len(toCopy), result.CopiedSizeHuman)
 		if len(toDelete) > 0 {
 			result.Message += fmt.Sprintf(", delete %d repos (%s)", len(toDelete), result.DeletedSizeHuman)
@@ -598,45 +598,85 @@ func mirrorSyncHubs(srcCache, dstCache, repoFilter string, dryRun, verify, delet
 		return result, nil
 	}
 
+	result.CopiedSizeHuman = humanSizeBytes(result.CopiedSize)
+	result.DeletedSizeHuman = humanSizeBytes(result.DeletedSize)
+
 	if len(toCopy) == 0 && len(toDelete) == 0 {
 		result.Message = "Nothing to do - destination is in sync"
 		return result, nil
 	}
 
-	// Copy each repo
+	// Copy each repo. The counts reflect only entries whose copy (and
+	// verification, when requested) completed without error, so a refused or
+	// unverifiable copy stays visible in errors instead of being reported as
+	// copied.
 	for _, e := range toCopy {
+		clean := true
 		if err := copyRepoCache(e.Path, srcCache, dstCache); err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("copy %s: %v", e.Repo, err))
 			result.Success = false
+			clean = false
 		}
 
 		if verify {
 			if err := verifyRepoCache(e.Path, srcCache, dstCache); err != nil {
 				result.Errors = append(result.Errors, fmt.Sprintf("verify %s: %v", e.Repo, err))
 				result.Success = false
+				clean = false
 			}
 		}
+		if clean {
+			result.Copied++
+			result.CopiedSize += e.Size
+			result.Repos = append(result.Repos, e.Repo)
+		}
 	}
+	result.CopiedSizeHuman = humanSizeBytes(result.CopiedSize)
 
-	// Delete extra repos
+	// Delete extra repos under their cache-owned tree admission so no participant
+	// sharing the destination loses a live writer's payload (see removeMirrorExtraRepo
+	// for the re-verified-vanish rule). A vanished destination counts as deleted at
+	// its scan-time size, never as an error.
 	for _, e := range toDelete {
-		if err := mirrorNoSymlinkPath(dstCache, e.Path); err != nil {
+		if err := removeMirrorExtraRepo(dstCache, e); err != nil {
 			result.Errors = append(result.Errors, err.Error())
 			result.Success = false
 			continue
 		}
-		if err := os.RemoveAll(e.Path); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", e.Repo, err))
-			result.Success = false
-		}
+		result.Deleted++
+		result.DeletedSize += e.Size
 	}
+	result.DeletedSizeHuman = humanSizeBytes(result.DeletedSize)
 
-	result.Message = fmt.Sprintf("Copied %d repos (%s)", len(toCopy), result.CopiedSizeHuman)
+	result.Message = fmt.Sprintf("Copied %d repos (%s)", result.Copied, result.CopiedSizeHuman)
 	if len(toDelete) > 0 {
-		result.Message += fmt.Sprintf(", deleted %d repos (%s)", len(toDelete), result.DeletedSizeHuman)
+		result.Message += fmt.Sprintf(", deleted %d repos (%s)", result.Deleted, result.DeletedSizeHuman)
 	}
 
 	return result, nil
+}
+
+// removeMirrorExtraRepo removes one destination repository only while holding its
+// cache-owned tree admission. It never waits: a live writer's conflict is reported instead of deleting.
+// A repository that vanished between scan and delete satisfies the shared re-verified-vanish rule and
+// is removed as a tolerated no-op, matching os.RemoveAll, rather than reported as a delete failure.
+func removeMirrorExtraRepo(dstCache string, e mirrorEntry) error {
+	admission, err := hfdownloader.OpenCacheAdmission(context.Background(), dstCache)
+	if err != nil {
+		return fmt.Errorf("delete %s: %w", e.Repo, err)
+	}
+	release, err := admission.AdmitTreeRemoval(context.Background(), e.Path)
+	if err != nil {
+		return fmt.Errorf("delete %s: %w", e.Repo, err)
+	}
+	defer release()
+	if err := mirrorNoSymlinkPath(dstCache, e.Path); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(e.Path); err != nil {
+		return fmt.Errorf("delete %s: %w", e.Repo, err)
+	}
+	return nil
 }
 
 // copyRepoCache copies a repo from source to destination cache.
@@ -646,8 +686,17 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 		return err
 	}
 
-	// Create destination directory
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+	// Entry-level admission for this repository's destination files excludes live writers in
+	// every process sharing the destination; unrelated repositories stay independent.
+	admission, err := hfdownloader.OpenCacheAdmission(context.Background(), dstCache)
+	if err != nil {
+		return err
+	}
+
+	// Create the destination directory under the shared directory-creation
+	// admission: an existing directory needs no admission because nothing is
+	// mutated, and a missing one is created while its admission is held.
+	if err := admission.AdmitDirectories(context.Background(), []string{filepath.Dir(dstPath)}); err != nil {
 		return err
 	}
 
@@ -661,7 +710,16 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 			return err
 		}
 
-		dst := filepath.Join(dstPath, rel)
+		// SafeJoin prevents the walked relative path from escaping the repo.
+		// The symlinked-parent check below still applies: SafeJoin is lexical
+		// and does not see symlinks.
+		dst, err := hfdownloader.SafeJoin(dstPath, rel)
+		if err != nil {
+			return fmt.Errorf("path traversal: %q would escape the destination repository: %w", rel, err)
+		}
+		if !info.IsDir() && filepath.Dir(rel) == "blobs" && isBlobStagingArtifactName(info.Name()) {
+			return nil
+		}
 		// Existing destination directory links must never redirect writes
 		// outside the selected repository/Hub. Snapshot leaf links are replaced
 		// below, but their parents must be real directories.
@@ -673,7 +731,7 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 			if err := mirrorNoSymlinkPath(dstCache, dst); err != nil {
 				return err
 			}
-			return os.MkdirAll(dst, info.Mode())
+			return admission.AdmitDirectories(context.Background(), []string{dst})
 		}
 
 		// Check if it's a symlink
@@ -691,15 +749,31 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 			if !hfdownloader.PathInside(repoPath, resolved) {
 				return fmt.Errorf("refusing escaping symlink %s -> %s (resolves outside repo)", path, link)
 			}
+			// The unlink of the old leaf and the creation of its replacement
+			// run while this entry's admission is held, so neither can race a
+			// live writer or replacer of the same entry in any participant.
+			release, err := admission.AdmitEntryReplacement(context.Background(), dst)
+			if err != nil {
+				return err
+			}
 			os.Remove(dst)
-			return os.Symlink(link, dst)
+			// lgtm[go/path-injection]
+			err = os.Symlink(link, dst)
+			release()
+			return err
 		}
 
 		// Copy file
 		if err := mirrorNoSymlinkPath(dstCache, dst); err != nil {
 			return err
 		}
-		return copyFileForMirror(path, dst)
+		release, err := admission.AdmitFileWrite(context.Background(), dst)
+		if err != nil {
+			return err
+		}
+		copyErr := copyFileForMirror(path, dst)
+		release()
+		return copyErr
 	})
 }
 
@@ -729,16 +803,17 @@ func copyFileForMirror(src, dst string) error {
 	return out.Close()
 }
 
-// verifyRepoCache verifies that a copied repo matches the source.
+var mirrorVerifyCoversEntry = func(rel string) bool { return true }
+
+// verifyRepoCache checks copied repository files, excluding staging in blobs/.
+// Symlinks are compared by target and regular files by size.
 func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 	dstPath, err := mirrorRepoDestination(repoPath, srcCache, dstCache)
 	if err != nil {
 		return err
 	}
 
-	blobsDir := filepath.Join(repoPath, "blobs")
-
-	return filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
+	return filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -750,8 +825,40 @@ func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 		if err != nil {
 			return err
 		}
+		if filepath.Dir(rel) == "blobs" && isBlobStagingArtifactName(info.Name()) {
+			return nil
+		}
+		if !mirrorVerifyCoversEntry(rel) {
+			return nil
+		}
 
-		dstFile := filepath.Join(dstPath, rel)
+		dstFile, err := hfdownloader.SafeJoin(dstPath, rel)
+		if err != nil {
+			return fmt.Errorf("path traversal: %q would escape the destination repository: %w", rel, err)
+		}
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			// Confine parents, but leave the snapshot leaf as a symlink.
+			if err := mirrorNoSymlinkPath(srcCache, filepath.Dir(path)); err != nil {
+				return err
+			}
+			if err := mirrorNoSymlinkPath(dstCache, filepath.Dir(dstFile)); err != nil {
+				return err
+			}
+			want, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			got, err := os.Readlink(dstFile)
+			if err != nil {
+				return fmt.Errorf("missing link %s: %w", rel, err)
+			}
+			if got != want {
+				return fmt.Errorf("link mismatch for %s: src=%s dst=%s", rel, want, got)
+			}
+			return nil
+		}
+
 		if err := mirrorNoSymlinkPath(srcCache, path); err != nil {
 			return err
 		}
@@ -760,13 +867,11 @@ func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 		}
 		dstInfo, err := os.Stat(dstFile)
 		if err != nil {
-			return fmt.Errorf("missing blob %s: %w", rel, err)
+			return fmt.Errorf("missing file %s: %w", rel, err)
 		}
-
 		if dstInfo.Size() != info.Size() {
 			return fmt.Errorf("size mismatch for %s: src=%d dst=%d", rel, info.Size(), dstInfo.Size())
 		}
-
 		return nil
 	})
 }
@@ -841,7 +946,7 @@ func countBlobs(repoPath string) int {
 	blobsDir := filepath.Join(repoPath, "blobs")
 	count := 0
 	filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() {
+		if err == nil && !info.IsDir() && !isBlobStagingArtifactName(info.Name()) {
 			count++
 		}
 		return nil

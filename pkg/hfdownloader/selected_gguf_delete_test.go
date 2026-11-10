@@ -5,6 +5,7 @@ package hfdownloader
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,7 +25,7 @@ func selectedDeleteCacheRoot(t *testing.T) string {
 
 func selectedDeleteFixture(t *testing.T) (*RepoDir, string, string, string) {
 	t.Helper()
-	cache := NewHFCache(selectedDeleteCacheRoot(t), 0)
+	cache := NewHFCache(selectedDeleteCacheRoot(t))
 	repo, err := cache.Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -245,7 +246,7 @@ func TestDeleteSelectedGGUFRetainsBlobDependencyThroughFriendlyDirectoryAlias(t 
 }
 
 func TestDeleteSelectedGGUFRefusesRegularSnapshotDependencyThroughFriendlyDirectoryAlias(t *testing.T) {
-	repo, err := NewHFCache(selectedDeleteCacheRoot(t), 0).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,8 +410,10 @@ func TestDeleteSelectedGGUFRefusesCreateTempPublicationTarget(t *testing.T) {
 	}
 }
 
-func TestStoreDownloadedFileAllowsReservedCollisionButDeleteRefusesIt(t *testing.T) {
-	repo, err := NewHFCache(selectedDeleteCacheRoot(t), 0).Repo("owner/model", RepoTypeModel)
+// Refuse staging-shaped blob keys before placement: content under a reserved
+// shape would be invisible to cache and mirror surfaces.
+func TestStoreDownloadedFileRefusesReservedCollisionName(t *testing.T) {
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,17 +426,117 @@ func TestStoreDownloadedFileAllowsReservedCollisionButDeleteRefusesIt(t *testing
 		t.Fatal(err)
 	}
 	stored, err := repo.StoreDownloadedFile(temp, "model-Q4_K_M.gguf", "version-a", key, "", false)
+	if err == nil {
+		t.Fatalf("the store accepted a staging-shaped blob name: %+v", stored)
+	}
+	if !errors.Is(err, errReservedBlobName) {
+		t.Fatalf("store error = %v, want the reserved-name refusal", err)
+	}
+	if !strings.Contains(err.Error(), "staging") {
+		t.Errorf("store error %q does not explain that the name belongs to the staging namespace", err)
+	}
+	if _, serr := os.Stat(repo.BlobPath(key)); !os.IsNotExist(serr) {
+		t.Errorf("the refused store published the blob, stat err=%v", serr)
+	}
+	if _, serr := os.Stat(filepath.Join(repo.SnapshotsDir(), "version-a", "model-Q4_K_M.gguf")); !os.IsNotExist(serr) {
+		t.Errorf("the refused store created the snapshot entry, stat err=%v", serr)
+	}
+	if _, serr := os.Stat(temp); serr != nil {
+		t.Errorf("the refused store consumed the payload: %v", serr)
+	}
+}
+
+// Build the reserved-shaped blob/snapshot directly: public storage refuses it,
+// but deletion must also reject existing collisions before unlinking anything.
+func TestDeleteSelectedGGUFRefusesStagingShapedBlobTarget(t *testing.T) {
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
 	if err != nil {
-		t.Fatalf("reserved collision must remain creatable through the public storage API: %v", err)
+		t.Fatal(err)
+	}
+	if err := repo.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	key := "tmp-" + strings.Repeat("f", 64)
+	blob := repo.BlobPath(key)
+	if err := os.WriteFile(blob, []byte("published collision"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	snapshotDir := filepath.Join(repo.SnapshotsDir(), "version-a")
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := filepath.Join(snapshotDir, "model-Q4_K_M.gguf")
+	if err := os.Symlink(filepath.Join("..", "..", "blobs", key), snapshot); err != nil {
+		t.Fatal(err)
 	}
 	result := repo.DeleteSelectedGGUF([]SelectedGGUFEntry{{Path: "model-Q4_K_M.gguf", Versions: []string{"version-a"}}})
 	if result.Attempted || len(result.Errors) == 0 || len(result.Removed) != 0 {
 		t.Fatalf("reserved collision was not refused at preflight: %+v", result)
 	}
-	for _, name := range []string{stored.SnapshotPath, stored.FriendlyPath, stored.BlobPath} {
+	for _, name := range []string{snapshot, blob} {
 		if _, err := os.Lstat(name); err != nil {
 			t.Fatalf("collision refusal changed %s: %v", name, err)
 		}
+	}
+}
+
+func TestFinalizeBlobRefusesReservedCollisionName(t *testing.T) {
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	key := "tmp-" + strings.Repeat("f", 64)
+	if err := os.WriteFile(repo.IncompletePath(key), []byte("payload"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err = repo.FinalizeBlob(key)
+	if err == nil {
+		t.Fatal("FinalizeBlob accepted a staging-shaped blob name")
+	}
+	if !errors.Is(err, errReservedBlobName) {
+		t.Fatalf("FinalizeBlob error = %v, want the reserved-name refusal", err)
+	}
+	if _, serr := os.Stat(repo.BlobPath(key)); !os.IsNotExist(serr) {
+		t.Errorf("the refused finalize published the blob, stat err=%v", serr)
+	}
+}
+
+// Non-canonical, non-reserved blob names remain valid published content.
+func TestStoreDownloadedFileAcceptsUnusualNonReservedName(t *testing.T) {
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	key := "unusual-published-name.bin"
+	if IsStagingArtifactName(key) {
+		t.Fatalf("the fixture name %q is a staging artifact", key)
+	}
+	temp := filepath.Join(t.TempDir(), "download")
+	if err := os.WriteFile(temp, []byte("unusual content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := repo.StoreDownloadedFile(temp, "model-Q4_K_M.gguf", "version-a", key, "", false)
+	if err != nil {
+		t.Fatalf("an unusual but non-reserved blob name was refused: %v", err)
+	}
+	if stored.SHA256 != key {
+		t.Errorf("stored SHA256 = %q, want %q", stored.SHA256, key)
+	}
+	got, err := os.ReadFile(stored.BlobPath)
+	if err != nil || string(got) != "unusual content" {
+		t.Fatalf("published blob = %q (err=%v)", got, err)
+	}
+	if _, err := os.Lstat(stored.SnapshotPath); err != nil {
+		t.Errorf("the snapshot entry was not created: %v", err)
+	}
+	if _, err := os.Lstat(stored.FriendlyPath); err != nil {
+		t.Errorf("the friendly entry was not created: %v", err)
 	}
 }
 
@@ -472,7 +575,25 @@ func TestStagingBlobPathClassifierMatchesProducerNamespace(t *testing.T) {
 			t.Errorf("producer staging path %q was not classified", name)
 		}
 	}
-	for _, name := range []string{"model.part", "model.parts.json", "abc123.gguf", "opaque-key", "tmp-", "key.tmp-", ".tmp-tail", "key.tmp-"} {
+	// The persistent ownership lock, any legacy transition-lock file, and atomic record temp
+	// are staging artifacts, never deletable blobs.
+	for _, name := range []string{
+		strings.Repeat("c", 64) + ".incomplete.meta.tmp",
+		strings.Repeat("c", 64) + ".incomplete.lock",
+		strings.Repeat("c", 64) + ".incomplete.meta.lock",
+	} {
+		if got := repo.isIncompleteBlobPath(repo.BlobPath(name)); !got {
+			t.Errorf("staging lock path %q was not classified", name)
+		}
+	}
+	// Reserve all producer name shapes inside blobs/, including forms normally
+	// created for flat destinations; a blob using one is still a staging collision.
+	for _, name := range []string{"model.part", "model.parts.json", "abc.lock", "opaque-key.lock"} {
+		if got := repo.isIncompleteBlobPath(repo.BlobPath(name)); !got {
+			t.Errorf("producer staging path %q was not classified", name)
+		}
+	}
+	for _, name := range []string{"abc123.gguf", "opaque-key", "tmp-", "key.tmp-", ".tmp-tail", "key.tmp-"} {
 		if got := repo.isIncompleteBlobPath(repo.BlobPath(name)); got {
 			t.Errorf("ordinary/non-producer blob path %q was classified", name)
 		}
@@ -552,7 +673,7 @@ func TestDeleteSelectedGGUFRefusesMixedIncompleteCompositionBeforeAnyUnlink(t *t
 // true, independent copies otherwise) instead of symlinks.
 func selectedDeleteFallbackFixture(t *testing.T, hardlink bool) (*RepoDir, string, string, string, []byte) {
 	t.Helper()
-	repo, err := NewHFCache(selectedDeleteCacheRoot(t), 0).Repo("owner/model", RepoTypeModel)
+	repo, err := NewHFCache(selectedDeleteCacheRoot(t)).Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}

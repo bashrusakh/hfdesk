@@ -15,6 +15,16 @@ import (
 	"github.com/bashrusakh/hfdesk/internal/hubtree"
 )
 
+// endpointStatusError retains the direct endpoint status for the narrow
+// commit-addressing compatibility classifier while preserving diagnostics.
+type endpointStatusError struct {
+	status int
+	err    error
+}
+
+func (e *endpointStatusError) Error() string { return e.err.Error() }
+func (e *endpointStatusError) Unwrap() error { return e.err }
+
 // DefaultEndpoint is the default HuggingFace Hub URL.
 // Can be overridden via Settings.Endpoint for mirrors or enterprise deployments.
 // Credits: Custom endpoint feature suggested by windtail (#38)
@@ -131,23 +141,27 @@ func headForETag(parentCtx context.Context, httpc *http.Client, token string, it
 // recursive, bounds malformed listings, and retries 429/5xx/network errors
 // with Retry-After/RateLimit-aware, context-cancellable waits. 401/403 (and
 // every other terminal status) fail immediately with the historical error
-// messages below.
+// messages below. Each page request runs under the per-fetch planning
+// metadata cap (dial + response headers + JSON body); its expiry surfaces as
+// an error matching hubtree.ErrPageFetchTimeout for the planning layer to
+// shape into the actionable timeout failure.
 func walkTree(ctx context.Context, httpc *http.Client, token, endpoint string, job Job, prefix string, fn func(hfNode) error) error {
 	w := &hubtree.Walker{
 		TreeURL: func(p string) string {
 			return treeURL(endpoint, job, p)
 		},
-		Token:     token,
-		UserAgent: "hfdesk/1",
-		Client:    httpc,
+		Token:            token,
+		UserAgent:        "hfdesk/1",
+		Client:           httpc,
+		PageFetchTimeout: metadataFetchTimeout,
 		StatusErr: func(resp *http.Response) error {
 			switch resp.StatusCode {
 			case http.StatusUnauthorized:
-				return fmt.Errorf("401 unauthorized: repo requires token or you do not have access (visit %s)", agreementURL(endpoint, job))
+				return &endpointStatusError{status: resp.StatusCode, err: fmt.Errorf("401 unauthorized: repo requires token or you do not have access (visit %s)", agreementURL(endpoint, job))}
 			case http.StatusForbidden:
-				return fmt.Errorf("403 forbidden: please accept the repository terms: %s", agreementURL(endpoint, job))
+				return &endpointStatusError{status: resp.StatusCode, err: fmt.Errorf("403 forbidden: please accept the repository terms: %s", agreementURL(endpoint, job))}
 			default:
-				return fmt.Errorf("tree API failed: %s", resp.Status)
+				return &endpointStatusError{status: resp.StatusCode, err: fmt.Errorf("tree API failed: %s", resp.Status)}
 			}
 		},
 	}
@@ -222,6 +236,18 @@ type RepoInfo struct {
 	LastModified string `json:"lastModified"` // ISO timestamp
 }
 
+// metadataFetchTimeout is the per-fetch TOTAL cap (dial + response headers +
+// JSON body) on one REQUIRED planning metadata fetch when the planning
+// context carries no earlier deadline: the repo-info lookup and every
+// tree-page request (via Walker.PageFetchTimeout) are one policy over the same
+// transport windows, so one honest value bounds both. Its smartdl mirrors —
+// treePageFetchTimeout and metadataFetchTimeout in pkg/smartdl/analyzer.go —
+// must change together with this value. It is generous relative to the 30s
+// dial / 60s header windows — two minutes still leaves ~30s for the body read
+// on the slowest endpoint satisfying them — so slow-but-working endpoints keep
+// working, and it is a package variable so tests can lower it deterministically.
+var metadataFetchTimeout = 2 * time.Minute
+
 // fetchRepoInfo fetches repository metadata including the commit SHA for a given revision.
 func fetchRepoInfo(ctx context.Context, httpc *http.Client, token, endpoint string, job Job) (*RepoInfo, error) {
 	ep := getEndpoint(endpoint)
@@ -241,7 +267,7 @@ func fetchRepoInfo(ctx context.Context, httpc *http.Client, token, endpoint stri
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("repo info API failed: %s", resp.Status)
+		return nil, &endpointStatusError{status: resp.StatusCode, err: fmt.Errorf("repo info API failed: %s", resp.Status)}
 	}
 
 	var info RepoInfo
@@ -249,4 +275,39 @@ func fetchRepoInfo(ctx context.Context, httpc *http.Client, token, endpoint stri
 		return nil, err
 	}
 	return &info, nil
+}
+
+// probeAddressing performs a bounded GET probe without following redirects.
+// It classifies only a direct repository-endpoint 404 as missing addressing;
+// auth, transport, redirect and other status outcomes remain inconclusive.
+func probeAddressing(ctx context.Context, httpc *http.Client, token, rawURL string, size int64, followRedirects bool) (status int, usable bool, location string, err error) {
+	probeClient := *httpc
+	if !followRedirects {
+		probeClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return 0, false, "", err
+	}
+	addAuth(req, token)
+	req.Header.Set("Range", "bytes=0-0")
+	req.Header.Set("Accept-Encoding", "identity")
+	// This identifies a bounded, disposable preflight request to endpoints and
+	// diagnostics. Its response is never used as payload; transfer requests do
+	// not carry the marker.
+	req.Header.Set("X-HFDesk-Addressing-Probe", "1")
+	resp, err := probeClient.Do(req)
+	if err != nil {
+		return 0, false, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent {
+		// Read no payload bytes: the probe establishes endpoint/method support,
+		// not the transfer's content proof. Closing promptly bounds ignored ranges.
+		return resp.StatusCode, true, resp.Header.Get("Location"), nil
+	}
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && size == 0 {
+		return resp.StatusCode, true, resp.Header.Get("Location"), nil
+	}
+	return resp.StatusCode, false, resp.Header.Get("Location"), nil
 }

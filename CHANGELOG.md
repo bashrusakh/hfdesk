@@ -16,20 +16,222 @@
 - Add a read-only Community feature for repository Discussions and Pull Requests: `GET /api/community/{owner}/{repo}` lists both types with paging and type/status filters, while `?num=N` returns a thread with sanitized comments and human-readable event summaries. The Model Details view now has Overview and Community tabs; the read-only Community tab is lazy-loaded, lists Discussions and Pull Requests, opens a thread with comments and events, and supports model and dataset repositories. The proxy uses the configured endpoint, proxy, and HF token without exposing the token to the browser (#136).
 - Report gated Hugging Face repositories as a dedicated access state instead of a partial analysis: the API returns HTTP 403 with error code `gated_repo`, the repository type, an accept link for the configured endpoint, and boolean-only token state, and the Model Details view shows configured-token and repository-agreement guidance without exposing the token.
 - Model Details now opens README, lineage, and related-download repository links in-place, with Back/Forward history across models, datasets, and revisions (#135).
+- Opt-in synthetic HF-cache benchmark (`go test -run '^$' -bench BenchmarkRangedFinalization ./pkg/hfdownloader/`) uses public `Download` and records client-observed network-complete → `file_done` time plus payload reads/writes during that interval for known-LFS `Verify=size` and `Verify=sha256` with concurrency. `TestCacheDownloadMeasurementBoundary` (64 KiB) asserts this deterministically at the public `Download` boundary: `Verify=size` at 0×S post-network payload reads/writes and `Verify=sha256` at exactly 1×S reads/0×S writes. It checks snapshot/friendly reachability and counts verification and cache-copy fallback I/O; timings are environment-specific, not a latency budget or CI-sized fixture (#140).
 
 - The Windows desktop host can install, update and start the HFDesk service from its own interface. The tray menu gained **Install service…**, which confirms the machine-wide change, requires the console program in the folder of the desktop program — the program paired with this desktop program, with no other candidate when the name of the desktop program carries a version, so a missing pair is an error that names the console file it expected, while a local build without a version falls back to `hfdesk.exe` and then to exactly one `hfdesk*.exe` of a release — because nothing is downloaded or copied, and then asks Windows for administrator rights through the standard prompt: the elevated helper waits for the desktop app to stop its own server through the graceful shutdown and exit, so the two instances never serve the same address, and then installs and starts the service from that folder and reports the result. An installation that registered the service and then failed to start it, or failed to verify the start, removes the registration it wrote again when the machine had no registration before — the registration only, the data stays — and its report says that the desktop app can be started normally again; a registration that existed before the attempt, and a machine whose state before the attempt could not be read, are left in place and the report names `hfdesk service uninstall` from an elevated shell. A launch that finds a registration asks before anything serves: it offers Open HFDesk / Update service / Cancel for a running service and for a broken one whose instance still runs, Start service / Update service / Cancel for a failed one and for a broken one without a running instance, and — only for a positively confirmed stopped service — Work in desktop mode as its default answer next to Start service / Update service / Cancel. Work in desktop mode continues the launch exactly like a launch without a registration: it starts the server of this app, never starts the service and never changes the registration, so the stopped service stays stopped. Every other answer ends the launch, which then starts no server of its own and publishes no state, where Open opens the registered address, Start starts the registered service, Update re-registers the service from the folder of the new desktop program while keeping its settings and its running state (a running service keeps running on the new version, a stopped one stays stopped), and Cancel changes nothing. A launch that cannot read the registration starts no server and publishes no state either, because an installed service may be running. The choice dialog is a Windows task dialog from the embedded application manifest, which declares the common controls version 6; a local build without that resource falls back to message boxes that map Yes, No and Cancel onto the actions in their text. The service keeps its own data under `%ProgramData%\HFDesk`, and the settings, jobs and models of the desktop app are not migrated into it.
 - Windows recovery defaults apply to new registrations and to existing registrations whose action list is successfully read as empty: three restarts, a one-day reset and non-crash recovery enabled, while the recovery command and reboot message are preserved. A nonempty custom action list and its non-crash flag remain unchanged, including intentional `NoAction`, which can leave a failed service without an automatic restart; this exception does not change the defaults for new or proven-empty registrations. Read errors cause no blind policy write, and failed default writes report whether restoration was verified.
 
 ### Changed
 
+- Mirror and rebuild mutations now join the destination ownership admission end
+  to end (#151): the mirror's snapshot symlink-leaf replacement takes entry
+  admission and its directory creation takes admitted directory creation, and
+  the sync/rebuild path creates, replaces and removes snapshot/friendly
+  entries, prunes empty directories and writes the rebuild script through the
+  same shared admission funnels the download path uses. A second HFDesk
+  instance (or another machine sharing the control filesystem) holding an
+  entry's or tree's scope now excludes these mutations — refused with the
+  actionable ownership error after the established bounded wait on the link and
+  script funnels, immediately on the non-waiting admission surface the mirror
+  uses for file writes and tree removals — instead of racing a live writer.
+  Coordination stays file-based per path: independent files and repositories
+  remain parallel, and no publication guarantee is added, since these
+  operations still perform no domain-exclusive placement.
+
+- Replace payload-adjacent destination lock files with one external ownership
+  realm for every download route (#140). `Settings.OwnershipDir` selects the
+  realm; empty uses the captured per-user HFDesk config directory. Clients that
+  share storage across profiles must configure the same accessible, nonoverlapping
+  realm. An item takes its scope after the skip decision and before resume/HEAD/
+  claim, and holds it through transfer, publication/store and cancel cleanup.
+  Cache snapshots and friendly entries acquire scopes for their actual paths
+  while the blob item key remains held. No new `.lock` payload sibling is
+  created; flat items named `foo.incomplete.lock` are ordinary independent
+  destinations. `CheckBlob` and cleanup use the same external realm/key
+  protocol. External locks are hashed beneath `<OwnershipDir>/v1/`, persistent
+  and never unlinked. A busy exclusive scope is waited for (bounded,
+  context-aware, effective five minutes), never taken over or reported as a
+  successful skip; unresolved reader contention also fails closed. Waiters
+  return and reacquire transfer slots. Mixed-version writers remain unsupported:
+  `LockFenced` alone is not current proof. New v4 records carry `OwnershipFence`
+  for the current realm/key; absent, unknown or mismatched live proofs are
+  preserved/refused unless independent self/death evidence permits reclaim.
+- The exported `(*hfdownloader.RepoDir).CleanupIncomplete` helper has been
+  removed (#140): it deleted a staging payload and its record without the
+  destination ownership domain or a record check, so it could remove another
+  live writer's partial. No in-tree code called it, and cleanup now runs only
+  through the two domain-fenced entry points.
+- Multipart downloads write ranged workers directly into one preallocated
+  staging file at their assigned offsets and resume from durable per-range
+  metadata, so finalization is an atomic rename plus link work, never a
+  full-file assembly copy (#140). A record is trusted only when it matches the
+  resolved commit, repository, path and expected size, is pinned on both sides,
+  tiles the file with normalized completion, and its payload exists at the
+  expected size before any create/truncate; a record whose payload was deleted
+  or resized is discarded rather than published as zeros. The ranged record is
+  version 4 and is the only resumable version; a record with a matching current
+  fence (or one whose owner is provably dead or is this process, including a
+  branch-only version-3 record that described imported bytes) is discarded,
+  never migrated, and the file is re-downloaded from zero while already-published
+  content stays untouched, while a record without a matching current fence whose
+  owner cannot be proven dead is refused as unproven and preserved. Every pre-#140
+  `.part-NN`/`.parts.json` family is likewise discarded, never migrated. Existing version-4 state keeps the
+  multipart route for a ranged-capable item even below the configured threshold,
+  so a threshold change does not ignore valid state; an item without usable
+  state keeps the configured routing. Without range support the downloader
+  warns, downloads the full file through the single path, and removes the
+  obsolete versioned pair only after the final file is durable (claim-checked).
+  A staging record is installed as a complete document; hard-link support is not
+  required because an atomic rename is the fallback.
+- The transfer is pinned to the commit the planner resolved (#140): the tree
+  walk and every per-file URL are built from that commit. When the endpoint
+  resolves no commit, the requested revision is used and an unpinned identity
+  with a known digest is content-proved once before publication, on both
+  routes, so a moved branch cannot publish unproven bytes.
+- The single-request path inherits staged bytes only under a proven identity
+  (#140): its versioned sidecar records repository, resolved commit, path,
+  expected size and whether that commit was pinned, and separately whether the
+  producing run observed clean response framing. An exactly-sized partial is
+  published without a request only when the identity matches and clean framing
+  is recorded; otherwise the final byte is reserved and re-requested. A
+  permanent 401/403/404 keeps the sidecar with a non-empty partial, and an
+  oversized partial is discarded rather than clamped. The sidecar is removed
+  only when the partial it describes is actually gone; a stat failure other
+  than not-exist leaves it in place so the bytes keep their resume identity.
+- `Settings.Verify` now controls LFS verification too (#140): `none` performs
+  no post-download content hash; `size` (the default) checks exact expected
+  size and complete validated transfer coverage on both paths and performs no
+  full-file SHA-256 reread on the normal path; `sha256` verifies with at most
+  one full-file read, always before publication when a known digest exists;
+  `etag` proves a known digest with that same single pre-publication pass while
+  non-LFS ETag-only files keep the historical no-post-check behavior. A known
+  digest is never hashed only after publication. A durable `ProofPending` flag
+  forces a re-proof on resume in every mode except `none`, so a crash mid-proof
+  or a later mode change cannot publish unproven ranges.
+- The mirror file copy, the mirror's `deleteExtra` removal and the HF branch of
+  selected-GGUF deletion now take cache-owned admission — entry admission per
+  copied destination file, tree admission per removed repository or per the
+  selected repository and its friendly view — instead of remaining writers
+  outside the destination ownership domain, while the downloader's publication
+  invariant still does not depend on their behavior: none of them publishes
+  through the no-replace primitive. The mirror copy itself checks nothing
+  beyond `io.Copy`'s error contract (its explicit size comparison happens only
+  in the opt-in verify pass, at size granularity rather than hashes), the
+  mirror's symlink-leaf replacement and directory creation join that admission
+  too (entry admission and admitted directory creation respectively), and
+  selected deletion's local-root branch takes flat-realm entry
+  admission over exactly the member paths it unlinks, resolved through the same
+  `Settings.OwnershipDir` its writers use (default `DefaultOwnershipDir()`) —
+  as strong as the flat realm's writer coordination: the flat realm's identity
+  is an opaque ID persisted inside the shared `OwnershipDir`
+  (`<OwnershipDir>/realm-id`), so every participant resolving one
+  `OwnershipDir` reads the same realm ID, and its path-derived resource keys
+  and lock filenames converge across hosts only under the conditions the
+  downloader contract states: the `OwnershipDir` and the items under one
+  common shared mount, where any prefix movement cancels out, with identical
+  path spellings required on a split topology and the dev:ino alias keys
+  staying host-local on purpose — resolving the same `OwnershipDir` is
+  necessary, not a complete sufficient condition on its own (#140).
+  Device/inode-derived lock files from the former
+  host-local realm identity are harmless residue (never unlinked);
+  mixed-version writers deriving it remain unsupported.
+- Ordinary downloads keep commit pinning on Hugging Face and commit-capable
+  endpoints. A custom endpoint proven to serve files only by branch name may
+  select one coherent unpinned plan before reservation; it starts retries from
+  zero, inherits no partials, and makes no immutable commit/ref claim. Branch
+  variants remain strictly commit-pinned.
 - A Transformers repository whose `config.json` carries a nested `quantization_config` object is now reported with the same `quantized` projection as a repository that has a root `quantization_config.json`: `GET /api/analyze` fills the projection for it instead of leaving it empty, which is also how the quant method of an EXL branch is discovered (#100).
 - `hfdownloader.PlanRepo` and `hfdownloader.Download` now reject a path-shaped filter combined with `AppendFilterSubdir` (typed `ErrAppendFilterSubdirPathFilter`) before any network or plan work: only single-component group/token filters can name a destination subdirectory. Path filters remain valid with `AppendFilterSubdir` disabled.
 - README rendering and Hugging Face repository-link classification now have a single Go implementation: the bundled UI renders the server-sanitized `html` from `GET /api/readme` and no longer carries a client Markdown renderer or duplicate URL classifier (#135, #147).
 - Remote repository tree paths must now use their canonical spelling: a raw path whose `path.Clean` form differs (for example a `./` segment, duplicate slash, or trailing slash) fails planning with a non-canonical-path error instead of being normalized, so two spellings of one remote file cannot both be planned and race to write a single cache entry.
+- Every Hugging Face metadata fetch of planning and repository analysis is now time-bounded per request (a 2-minute total cap over dial, response headers, and body) instead of being bounded only by the caller's deadline or an unbounded body read: the repo-info lookup and tree pages of planning, and the analyze flow's tree pages, refs, config/metadata file content, safetensors header reads, and model-info lineage lookup. When a required read stalls — a repo-info or tree-page body, or a metadata body read or LFS/pointer resolve that the analysis reports as a named-file failure — the operation fails at the cap with an actionable timeout naming the budget and the remedy: a failure, never caller cancellation and never a silently partial result. Optional fetches — refs, the lineage lookup, safetensors header probes, the EXL config lookups, and plain non-LFS transport failures of config/metadata content — keep their existing degradation (a silent skip or an uncertainty warning) and are now bounded by the same cap; the post-success dataset namespace probe's failure, previously silent, now surfaces as an analysis warning (the analysis outcome is unchanged). A caller's own deadline still wins over the cap; for the production analysis — one shared 60-second caller deadline, with the EXL branch pass already under its own 15-second context — the caps are defense in depth, while for deadline-less or longer-deadline callers they are the new bound, and only for such callers could a stalled endpoint previously hang an analysis or planning run (#151).
+
+### Removed
+
+- The obsolete stale-timeout configuration was removed with the age-based
+  ownership lease (#140): `hfdownloader.Settings.StaleTimeout`,
+  `hfdownloader.HFCache.StaleTimeout`, `hfdownloader.DefaultStaleTimeout` and
+  the third `staleTimeout` argument of `NewHFCache`/`NewHFCacheResolved` no
+  longer exist. Ownership uses the external realm selected by
+  `Settings.OwnershipDir`; v4 record ownership uses `LockFenced` plus the exact
+  current `OwnershipFence` realm/key proof, never record age. There is no stale
+  timeout compatibility shim or replacement setting.
+- The diagnostic-only staging-record heartbeat was removed (#140). The record
+  is not rewritten on a timer; it is diagnostics/resume state, not a
+  freshness-based lease; only the held external scope and matching
+  `LockFenced`/`OwnershipFence` pair prove current ownership.
 
 - `hfdesk service install` over an existing registration on Windows and Linux now merges with that registration instead of overwriting it: every setting the command does not name again is kept, the program always comes from the request (the invoked binary or `--executable`), a running instance is restarted on the new program and is only reported as installed once the supervisor runs it, a stopped or failed one stays stopped, and a broken one follows the running fact: it stays stopped when no instance runs and keeps running when one does, and a failed installation restores the previous registration and running state and names what it restored instead of claiming success. On macOS, `install` now preserves the registration across an update as well: the same merge keeps every setting the command does not name again, the autostart key `RunAtLoad` keeps the value the existing property list carries (a property list that cannot be read records no setting: the installation repairs it from the request and writes the default instead), a stopped instance is never started by a repeat installation, and an instance that runs is restarted on the new program through the manager's existing stop/start lifecycle; a first installation — no property list and no job launchd holds — still registers the job with `RunAtLoad` and starts it. HFDesk owns the property list it writes: the settings carried in the registered program arguments, the working directory and the service account are the ones the merge preserves, `RunAtLoad` keeps its found value — a property list that is missing or cannot be read leaves no value to keep, so the default that starts the instance is written instead — and a key that property list does not carry (a hand-added scheduling key) or a hand edit of the policy keys it does carry (`KeepAlive`, `ProcessType`, `ExitTimeOut`) is rewritten to HFDesk's rendering by the next update. macOS keeps its existing verification depth: the update reports the registration launchd accepted, without the readiness and version probe of the other platforms.
 
 ### Fixed
+
+- Many concurrent cache-mode downloads in one process no longer collapse behind the shared node bootstrap locks (#151): resolving an already-published cache node is read-only validation that takes no exclusive gate (the parent's child-bootstrap gate belongs to the node-creation path only, and creation stays gated), a preparation resolves each path once instead of re-walking the same shared chain, and ownership retries back off exponentially with jitter instead of a fixed 20ms quantum, so a 100-file job at the product's default concurrency completes in line with the work instead of exhausting the five-minute ownership budget. Same-process download contention is classified by which surface holds the conflicting lock and reported as such — including contention on one of the item's own scope keys when a sibling item's download scope in this process holds it (flat destinations like `model` and `model.part` overlap on `model.part`): it never surfaces the external "another process" ownership error, which within download contention stays reserved for a proven foreign holder, and the keyed in-process waiter times out with the same classification. The item's own scope held by a non-download surface (the claim gate, tree removal, a plain writer scope) keeps its established claim semantics.
+- Deleting a repository with thousands of directories no longer fails with "too many open files" under common file-descriptor limits (#151): cache tree admission (server `DELETE /api/cache/...`, mirror `deleteExtra` and HF selected-GGUF deletion) holds two open lock files per directory (entry and children locks) for the whole tree until removal finishes, while flat tree admission (branch-variant completion-record invalidation under a flat `OutputDir`) holds three for each existing directory (path, entry and object keys), and each such admission now raises the process soft file-descriptor limit toward the hard limit for exactly its own window (restored on release) instead of exhausting the common 1024-fd default after roughly 500 cache-mode directories. The whole-tree exclusion guarantee is unchanged — the entire tree is still exclusively admitted before any removal, and a live writer anywhere in the tree still refuses the admission. A tree beyond the raiseable hard limit or the OS per-process file cap fails with an actionable error naming the observed limits and the remedy (`ulimit -n` / `LimitNOFILE=`, raising the hard limit first when needed), never a raw per-process descriptor-exhaustion (EMFILE) error — system-wide ENFILE keeps its raw identity — and nothing is removed.
+- Flat-mode ownership keys no longer embed the absolute path spelling of the item (#151): the path-derived keys (`item-path` and `directory-path`) now derive from the persisted realm ID and the item's path relative to the realm root, so when the shared `OwnershipDir` and the coordinated items sit under one common shared mount, any common-prefix movement of that topology cancels out — two hosts mounting the same tree at different prefixes (for example `/mnt/nas/...` and `/vol/nas/...`) derive identical resource keys and lock filenames and genuinely exclude each other. That convergence presumes one shared realm ID, which must be minted once by a single participant: the ID is minted on first use under an exclusive bootstrap gate, and on a filesystem whose advisory locks are not effective across clients — the same limitation that already bounds the cross-host locks themselves — two hosts can each mint their own ID and will then never exclude each other, silently, because their lock filenames differ; no safety is claimed for the mechanism on such filesystems. A split topology (`OwnershipDir` and the items rooted under different mounts) requires identical rel-token input on every host — the same structure below the lowest common ancestor and the same descending component spellings — so independently mounted split topologies that preserve that structure still converge (the documented residual), and a target on another volume (Windows cross-drive) keeps its absolute-spelling derivation, so same-host behavior is unchanged in every shape. The dev:ino alias keys (`item-entry`, `directory-entry`, `directory-object`, tree-validation identity) stay host-local on purpose, so a foreign host's staged `OwnershipFence` never reads as current proof there: the record's consequence is the claim's two branches, not a blanket re-download — an unproven record (a foreign host, or a same-host live or mixed-version owner that cannot be reclaimed) is preserved and refused with `ErrStagingOwnershipUnproven` and is re-downloaded only after the operator removes the named staging pair and retries, while a reclaimable record (the owner proven dead or this process, including one fenced under the former keys) is taken over with its fence re-bound to the current proof and its committed ranges inherited (resume, not re-download), discarding and restarting from zero only on a version, range, size or identity mismatch. Flat lock files derived from the former absolute spelling become harmless residue (never unlinked), alongside the former device/inode-derived ones; mixed-version writers remain unsupported. The flat-identity claims in this changelog and the docs are corrected to state exactly these conditions.
+- A download job no longer reports success while a requested file is missing
+  because its external ownership scope is busy (#140): `completed` now means the
+  file is present and reachable at its snapshot/friendly path. The item waits
+  for an exclusive scope holder (bounded, effective five minutes) and re-checks
+  the published content-addressed blob, downloads the file itself when the
+  scope becomes free without publishing, or fails with an actionable scope-held
+  or unresolved-contention error. A path-derived destination always
+  re-downloads after the wait. A waiting item no longer occupies a
+  `MaxActiveDownloads` slot, so other files of the job proceed even with a low
+  limit. A link-creation failure now
+  fails the item in both transfer and skip paths with
+  `ErrCacheLinkUnreachable`, and the end-of-job link reconciliation reports a
+  job error, so a job cannot finish successful with a missing path; a disabled
+  friendly view is not an error.
+- The ranged publication now asserts two independent gates: a complete range
+  layout (every range `Done` and the committed total equal to the expected
+  size, in both the live and persisted layout) and the exact payload length
+  after the handle is flushed. A failure renames nothing and leaves the staged
+  bytes for a resume. A content-addressed blob is placed with a no-replace
+  primitive: atomic hard-link on filesystems that support it,
+  domain-exclusive check-then-rename otherwise. `FinalizeBlob` now uses that
+  same primitive and domain instead of renaming over a published blob, and a
+  writer that loses the race discards its own staging pair.
+- A staging record whose owner cannot be proven alive or dead is no longer
+  reported as "another live writer" (#140). Such a record (unfenced, unreadable
+  or unparseable current-format state) is preserved and refused with
+  `ErrStagingOwnershipUnproven`; the operator removes the staging pair and
+  retries, and never removes the persistent domain lock or a pair whose owner
+  is a proven live owner. `CheckBlob` now distinguishes `BlobDownloading` for a
+  proven live owner, `BlobStale` for a provably dead one, and
+  `BlobOwnershipUnknown` plus an `ErrBlobOwnershipUnknown` error for an unknown
+  state; the incomplete payload is preserved and an unknown state is never a
+  successful skip.
+- Cache surfaces and the mirror now separate published content from staging
+  artifacts with one exhaustive name-shape classification (#140): the
+  single-request `tmp-<name>` family, the ranged `.incomplete`/`.meta` pair and
+  temp, persistent `.lock`, obsolete pre-#140 `.part-NN`/`.parts.json`,
+  flat-mode partials and the cache store's `.tmp-<random>` copy temp are never
+  counted, listed as cached content, copied, verified or deleted, even when a
+  published name carries such a shape. Unusual non-canonical published names
+  remain content. A blob key whose name belongs to the staging namespace is
+  refused by `StoreDownloadedFile` and `FinalizeBlob` before placement.
+- Cleanup now participates in the destination ownership protocol (#140):
+  staging artifacts are removed only while the destination's domain is held, so
+  cancelling a job no longer deletes another live job's partial, and each
+  obsolete pre-#140 `<dst>.part-<digits>` file is unlinked only under that exact
+  path's entry admission in the destination realm — a residue file whose
+  admission a live holder refuses survives, and the refusal does not fail the
+  download or cleanup. The entry points collapse to one owner-checked
+  removal and one record-checked removal. A route removes only the artifacts it
+  creates: the multipart HEAD failure no longer removes a single-route
+  `.part`/sidecar.
+- An explicit cancel during the single-path known-digest proof now closes the
+  partial's writable handle before cleanup, so Windows does not retain the
+  cancelled `.part` and its sidecar; pause/internal aborts still preserve
+  resumable state. Unknown-size LFS items that fall back from multipart to the
+  single path are stored through the cache store, creating the blob and its
+  snapshot/friendly entries.
+- A shared staging mutation now requires the supported lifetime OS lock:
+  unsupported, denied or failed acquisition returns an operation error before
+  claim/payload mutation and preserves partial data; there is no lease-only
+  fallback. Unfenced records are retained unless same-host owner death is
+  proven, and cancellation while waiting to publish is observed before the
+  rename.
 
 - A macOS update no longer boots out a start that launchd has already scheduled: a loaded job whose state names a start before any process of it exists (`waiting`, `spawn scheduled`) is read as not running by the update, so the stopped-instance branch would have unloaded the pending start and left the instance down. The state is now read before anything is written and the update refuses instead — quoting the state it read and the stop that clears it — so the pending start survives, while every other state updates exactly as before.
 - A reinstalled macOS registration no longer drops the settings it carries when the property list spells them `--flag=value`: the merge read a flag only in its paired-words form, so a hand-edited or foreign property list carrying `--listen=127.0.0.1:9090` had that value silently replaced by the default of the request. The equals form now decides on the same terms as the paired words — the effective occurrence of the flag wins, the last one, which is the value `service run` really runs with, whichever form it uses, and everything after the first `=` is the value — so a reinstall preserves `--flag=value` arguments like any other registered setting, and a repeated flag keeps its effective last value instead of the first, non-effective one.
@@ -55,6 +257,7 @@
 - `GET /api/analyze` now supports an explicit `type=model|dataset` selector, so a repository that exists as both namespaces resolves without repeating the type-selection prompt (#135). `type` takes precedence over the legacy `dataset` parameter, and `type=model` combined with `dataset=true` is rejected as a conflict. The legacy `dataset` parameter keeps its pre-#135 behavior: only `dataset=true` forces the dataset namespace, while `dataset=false` still auto-detects.
 - The Model Details `HF Hub ↗` action now uses the endpoint reported by `GET /api/health` when settings have not loaded or the settings fetch failed, and stays hidden rather than guessing `huggingface.co`; health now reports the normalized effective `endpoint` (#135).
 - Filtered plan/download scans no longer succeed when no non-excluded path directly matches and no recognized dataset membership selects data: `POST /api/plan` now returns `400` with error code `no_filter_match` instead of a metadata-only plan, while empty repositories without filters still plan successfully.
+- Cache mutations now exclude live writers in every process sharing the cache, not just jobs of this server (#140): `DELETE /api/cache/{owner}/{repo}` and selected-GGUF deletion — HF and local locations alike — return `409` without unlinking anything while a live download uses the repository, its friendly view, or the selected member file (the local branch through the flat `Settings.OwnershipDir` realm it shares with flat writers), mirror `deleteExtra` removal reports the refusal in `errors[]` with `success: false` instead of deleting, and mirror in-place overwrite of a destination file refuses instead of truncating it. The exclusion lives in the cache itself (`H/.hfdesk-control`, `R/.hfdesk-control`), so a plain mirror target gains a hidden `.hfdesk-control` control directory. A local selected-delete likewise creates the flat ownership realm directory (`<DefaultOwnershipDir()>/v1/`) when it is absent, exactly as a flat download does. A whole-repository DELETE, a mirror `deleteExtra` removal, and the HF selected-GGUF delete treat a target that vanished between enumeration and removal as absent only after re-verifying the vanish while holding the missing target's creator-side admission, so a download starting in that window is excluded; an admission that can be neither established nor re-verified as vanished fails closed (`500`, or `errors[]` for mirror) instead of proceeding without exclusion. Mirror results count only what actually happened: `copied`/`copiedSize`/`repos` include only repositories whose copy (and verification, when requested) completed without error, `deleted`/`deletedSize` include only repositories actually removed, refused entries appear only in `errors`, and a re-verified vanished repository counts as removed at its scan-time size, like `os.RemoveAll`.
 
 - Reinstalling the service no longer resets the settings the command does not name again: an installation over an existing registration on Windows, Linux and macOS replaced the registration with the defaults of the scope, so a reinstall with a new `--executable` silently reset the bind address, the config/state/log paths, the cache root, the hub directory, the local output directory and the service account of the instance. These settings are now read from the registration and kept. On Windows the account identity is never changed either: an update over a registration whose account an administrator changed away from the supported `NT AUTHORITY\LocalService` identity refuses before anything is written or stopped and names the command that restores the supported identity, instead of writing the account back over the administrator's decision; a registration that runs as the supported identity keeps updating as before, and a differently spelled name of that same account (a localized name or a SID string) is stored in its canonical spelling.
 - Service updates now keep absent cache/hub settings on their config/environment fallback and readable Windows SCM settings, and interpret registered arguments with the same flag grammar as `service run`; unrelated Linux unit settings live in administrator drop-ins, which an update never touches. Linux compares loaded commands with typed D-Bus argv, not the lossy `systemctl show` display; rollback avoids a recovery restart until the stored unit and applicable loaded command/launch properties are verified.

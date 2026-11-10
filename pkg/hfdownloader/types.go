@@ -4,7 +4,7 @@
 package hfdownloader
 
 import (
-	"fmt"
+	"os"
 	"time"
 )
 
@@ -163,6 +163,11 @@ type Job struct {
 //	    Token:              os.Getenv("HF_TOKEN"),
 //	}
 type Settings struct {
+	// OwnershipDir selects the external ownership realm for flat OutputDir mode.
+	// Cache mode derives independent control roots from frozen HubDir and CacheDir;
+	// a non-empty OwnershipDir is rejected rather than selecting another namespace.
+	OwnershipDir string
+
 	// CacheDir is the HuggingFace cache root directory.
 	// Downloads use the official HF Hub cache structure:
 	//   <CacheDir>/hub/models--<owner>--<repo>/blobs/
@@ -176,12 +181,6 @@ type Settings struct {
 	// retains normal ENV resolution at cache construction, even with CacheDir.
 	HubDir string
 
-	// StaleTimeout is the duration after which an incomplete download
-	// with no writes is considered stale and can be taken over by
-	// another process. Accepts duration strings: "5m", "10m", "1h".
-	// If empty, defaults to "5m".
-	StaleTimeout string
-
 	// OutputDir is DEPRECATED. Use CacheDir instead.
 	// If set, falls back to legacy flat directory structure for compatibility.
 	// Will be removed in a future version.
@@ -193,9 +192,9 @@ type Settings struct {
 	// If <= 0, defaults to 8.
 	Concurrency int
 
-	// MaxActiveDownloads limits how many files download simultaneously.
-	// This controls overall parallelism across all files in a job.
-	// If <= 0, defaults to GOMAXPROCS (number of CPU cores).
+	// MaxActiveDownloads limits simultaneous transfers, not ownership waiters.
+	// A waiter returns its slot and reacquires it before transfer; failed
+	// acquisition leaves the slot returned. If <= 0, defaults to GOMAXPROCS.
 	MaxActiveDownloads int
 
 	// MultipartThreshold is the minimum file size to use multipart downloads.
@@ -204,14 +203,20 @@ type Settings struct {
 	// If empty, defaults to "256MiB".
 	MultipartThreshold string
 
-	// Verify specifies how to verify non-LFS files after download.
-	// LFS files are always verified by SHA-256 when the hash is available.
-	//
-	// Options:
-	//   - "none": No verification (fastest)
-	//   - "size": Verify file size matches expected (default, fast)
-	//   - "etag": Compare ETag header from server
-	//   - "sha256": Full SHA-256 hash verification (most secure, slower)
+	// Verify selects integrity checks for all files, including LFS:
+	//   - "none": no content hash; HTTP/range validation still applies.
+	//   - "size" (default): exact size and validated coverage, normally without
+	//     a full-file reread. Existing-file skip checks, inherited .part bytes,
+	//     unpinned identities, known digests with unknown size, and resumed
+	//     ProofPending records may still require hashing.
+	//   - "sha256": known digests are proved before publication with at most one
+	//     full-file read; eligible fresh sequential ranged transfers hash while
+	//     writing. With no known digest, HEAD-ETag checks remain post-publication.
+	//   - "etag": known digests use the same pre-publication proof; non-LFS
+	//     ETag-only files retain their historical no-post-check behavior.
+	// Known digests are never hashed only after publication. ProofPending
+	// preserves required proof across crashes/mode changes; "none" opts out.
+	// See doc.go for resume/framing rules and mode exceptions.
 	Verify string
 
 	// Retries is the maximum number of retry attempts per HTTP request.
@@ -297,11 +302,11 @@ type Settings struct {
 	// library callers can leave it nil and just set MaxSpeed.
 	SpeedLimiter *RateLimiter
 
-	// CleanupPartialsOnCancel, when non-nil, is called when the download
-	// context is cancelled. If it returns true, the downloader deletes any
-	// partial .part files (.part, .part-NN, .parts.json) before returning.
-	// When nil (default), partial files are preserved for resume (useful
-	// for pause/resume workflows).
+	// CleanupPartialsOnCancel, when non-nil, decides whether explicit cancel
+	// removes this run's partials. Pause/internal abort preserves resumable
+	// state; the persistent destination lock is never removed. A ranged cancel
+	// in the pre-placement window also retains its complete staging pair. When
+	// nil, partial files are preserved for resume.
 	CleanupPartialsOnCancel func() bool
 
 	// OnPartialFile, when non-nil, is called for every per-file
@@ -415,7 +420,6 @@ type ProgressFunc func(ProgressEvent)
 func DefaultSettings() Settings {
 	return Settings{
 		CacheDir:           "", // Empty = use DefaultCacheDir()
-		StaleTimeout:       "5m",
 		Concurrency:        8,
 		MaxActiveDownloads: 4,
 		MultipartThreshold: "256MiB",
@@ -430,20 +434,16 @@ func DefaultSettings() Settings {
 // BuildHFCache creates an HFCache from Settings.
 // This is the recommended way to get a cache instance.
 func (s Settings) BuildHFCache() (*HFCache, error) {
-	staleTimeout := DefaultStaleTimeout
-	if s.StaleTimeout != "" {
-		var err error
-		staleTimeout, err = time.ParseDuration(s.StaleTimeout)
-		if err != nil {
-			return nil, fmt.Errorf("invalid stale-timeout %q: %w", s.StaleTimeout, err)
-		}
+	if s.OwnershipDir != "" {
+		return nil, errCacheOwnershipDirNotSupported
 	}
-	if s.HubDir != "" {
-		root := s.CacheDir
-		if root == "" {
-			root = DefaultCacheDir()
-		}
-		return NewHFCacheResolved(root, s.HubDir, staleTimeout), nil
+	root := s.CacheDir
+	if root == "" {
+		root = DefaultCacheDir()
 	}
-	return NewHFCache(s.CacheDir, staleTimeout), nil
+	hub := s.HubDir
+	if hub == "" {
+		hub = os.Getenv("HF_HUB_CACHE")
+	}
+	return NewHFCacheResolved(root, hub), nil
 }

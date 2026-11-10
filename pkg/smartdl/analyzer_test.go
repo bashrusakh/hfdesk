@@ -139,6 +139,225 @@ func TestAnalyzeExplicitNamespace(t *testing.T) {
 	})
 }
 
+// TestAnalyzeDatasetProbeDegradation pins the surfacing of a failed
+// post-success dataset probe: the probe stays optional (the analysis succeeds
+// on the model files exactly as before), but its failure now carries a
+// degradation warning with the underlying cause instead of vanishing. A
+// definitive namespace miss and the successful probe (ErrBothExist, asserted
+// in TestAnalyzeExplicitNamespace) yield no warning, and caller cancellation
+// never becomes a warning cause, while a gated dataset twin degrades with the
+// non-secret gated text surfaced in the warning message.
+func TestAnalyzeDatasetProbeDegradation(t *testing.T) {
+	newProbeHub := func(t *testing.T, datasetTree http.HandlerFunc) (*httptest.Server, *atomic.Int64) {
+		t.Helper()
+		var datasetTrees atomic.Int64
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/api/datasets/owner/probe/tree/main":
+				datasetTrees.Add(1)
+				datasetTree(w, r)
+			case r.URL.Path == "/api/models/owner/probe/tree/main":
+				_, _ = io.WriteString(w, `[{"type":"file","path":"config.json","size":100},{"type":"file","path":"model.safetensors","size":100}]`)
+			case strings.HasSuffix(r.URL.Path, "/refs"):
+				_, _ = io.WriteString(w, `{"branches":[]}`)
+			case strings.HasSuffix(r.URL.Path, "/auth-check"):
+				// Fail-open auth-check fixture, as in TestAnalyzeExplicitNamespace.
+				http.NotFound(w, r)
+			case strings.Contains(r.URL.Path, "/raw/"):
+				_, _ = io.WriteString(w, `{"model_type":"llama"}`)
+			default:
+				t.Errorf("unexpected request: %s", r.URL)
+				http.NotFound(w, r)
+			}
+		}))
+		t.Cleanup(srv.Close)
+		return srv, &datasetTrees
+	}
+
+	wantSingleProbeWarning := func(t *testing.T, info *RepoInfo, wantCause string) AnalysisWarning {
+		t.Helper()
+		if len(info.AnalysisWarnings) != 1 {
+			t.Fatalf("analysis warnings = %+v, want exactly one both-namespace degradation warning", info.AnalysisWarnings)
+		}
+		warning := info.AnalysisWarnings[0]
+		if warning.Code != "both_namespace_detection_degraded" || !warning.Retryable {
+			t.Fatalf("analysis warning = %+v, want the retryable both-namespace degradation code", warning)
+		}
+		if len(warning.Causes) != 1 || warning.Causes[0] != wantCause {
+			t.Fatalf("warning causes = %v, want [%s]", warning.Causes, wantCause)
+		}
+		if !strings.Contains(warning.Message, "ErrBothExist") || !strings.Contains(warning.Message, "degraded") {
+			t.Fatalf("warning message = %q, want it to name the degraded ErrBothExist detection", warning.Message)
+		}
+		return warning
+	}
+
+	// The three synchronous outcomes — a genuinely failed probe, a definitive
+	// namespace miss, and a gated dataset twin — differ only in the probe
+	// server's behaviour and the expected warning cause and message; each row
+	// keeps its former t.Run label so a failure still names the case.
+	const gatedMessage = "Access to this resource is gated."
+	for _, tc := range []struct {
+		name            string
+		probe           http.HandlerFunc
+		infoWant        string
+		filesWant       string
+		treesWant       string
+		wantCause       string   // empty: assert that no warning is emitted
+		warningContains []string // substrings the single warning must carry
+		warningWant     string   // failure text for a missing substring
+	}{
+		{
+			name: "failed probe succeeds with the underlying cause",
+			probe: func(w http.ResponseWriter, r *http.Request) {
+				// A completed fetch whose body is not a tree listing: the
+				// existence answer is genuinely unknown — neither present nor
+				// an authoritative namespace miss.
+				_, _ = io.WriteString(w, `<html>broken gateway</html>`)
+			},
+			infoWant:        "a failed dataset probe must not fail the analysis",
+			filesWant:       "want the model result preserved",
+			treesWant:       "the probe must actually run for this degradation to discriminate",
+			wantCause:       "probe_unavailable",
+			warningContains: []string{"decode response"},
+			warningWant:     "want the underlying probe error surfaced",
+		},
+		{
+			name:      "definitive namespace miss carries no warning",
+			probe:     http.NotFound,
+			infoWant:  "want model analysis",
+			filesWant: "want the model result",
+			treesWant: "auto-detection must still probe the dataset namespace",
+		},
+		{
+			name: "gated dataset twin degrades without failing the analysis",
+			probe: func(w http.ResponseWriter, r *http.Request) {
+				// The dataset twin exists but requires an accepted agreement:
+				// 401/403 with the explicit GatedRepo marker is neither an
+				// authoritative namespace miss nor a completed listing, so the
+				// probe degrades detection instead of answering it.
+				w.Header().Set("X-Error-Code", "GatedRepo")
+				w.Header().Set("X-Error-Message", gatedMessage)
+				w.WriteHeader(http.StatusForbidden)
+			},
+			infoWant:        "a gated dataset twin must not fail the model analysis",
+			filesWant:       "want the model result preserved",
+			treesWant:       "the gated probe must actually run for this degradation to discriminate",
+			wantCause:       "probe_unavailable",
+			warningContains: []string{"gated", gatedMessage},
+			warningWant:     "want the non-secret gated text surfaced",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hub, datasetTrees := newProbeHub(t, tc.probe)
+
+			info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).
+				Analyze(context.Background(), "owner/probe", false)
+			if err != nil || info == nil {
+				t.Fatalf("info = %v, error = %v; %s", info, err, tc.infoWant)
+			}
+			if info.IsDataset || len(info.Files) != 2 {
+				t.Fatalf("analysis = is_dataset %v files %+v; %s", info.IsDataset, info.Files, tc.filesWant)
+			}
+			if got := datasetTrees.Load(); got != 1 {
+				t.Fatalf("dataset tree requests = %d, want 1: %s", got, tc.treesWant)
+			}
+			if tc.wantCause == "" {
+				if len(info.AnalysisWarnings) != 0 {
+					t.Fatalf("analysis warnings = %+v, want none: a definitive namespace miss is a completed probe, not a degradation", info.AnalysisWarnings)
+				}
+				return
+			}
+			warning := wantSingleProbeWarning(t, info, tc.wantCause)
+			for _, want := range tc.warningContains {
+				if !strings.Contains(warning.Message, want) {
+					t.Fatalf("warning message = %q, %s", warning.Message, tc.warningWant)
+				}
+			}
+		})
+	}
+
+	t.Run("stalled probe succeeds with budget-expiry warning", func(t *testing.T) {
+		srv, stalledHits := newStalledBodyFixture(t, analyzeNormalEndpoints, func(path string) bool {
+			return strings.Contains(path, "/api/datasets/")
+		})
+
+		const testBudget = 500 * time.Millisecond
+		oldBudget := treePageFetchTimeout
+		treePageFetchTimeout = testBudget
+		defer func() { treePageFetchTimeout = oldBudget }()
+
+		info, err := awaitBudgetedAnalysis(t, testBudget, metadataBudgetSlack, metadataBudgetWatchdogSlack, "",
+			func(ctx context.Context) (*RepoInfo, error) {
+				return NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).
+					Analyze(ctx, "owner/model", false)
+			})
+
+		if err != nil || info == nil {
+			t.Fatalf("info = %v, error = %v; a stalled dataset probe must not fail the analysis", info, err)
+		}
+		if got := stalledHits.Load(); got != 1 {
+			t.Errorf("stalled dataset tree requests = %d, want exactly 1 (an expired page budget is terminal, with no retry)", got)
+		}
+		if info.IsDataset || len(info.Files) != 2 {
+			t.Fatalf("analysis = is_dataset %v files %+v; want the model result preserved", info.IsDataset, info.Files)
+		}
+		warning := wantSingleProbeWarning(t, info, "probe_timeout")
+		if !strings.Contains(warning.Message, "timed out after 500ms") {
+			t.Errorf("warning message = %q, want the budget expiry text as-is", warning.Message)
+		}
+		if strings.Contains(warning.Message, "cancel") {
+			t.Errorf("warning message = %q; a budget expiry must not masquerade as caller cancellation", warning.Message)
+		}
+	})
+
+	t.Run("caller cancellation is not reported as a warning", func(t *testing.T) {
+		srv, stalledHits := newStalledBodyFixture(t, analyzeNormalEndpoints, func(path string) bool {
+			return strings.Contains(path, "/api/datasets/")
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		type result struct {
+			info *RepoInfo
+			err  error
+		}
+		done := make(chan result, 1)
+		go func() {
+			info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).
+				Analyze(ctx, "owner/model", false)
+			done <- result{info, err}
+		}()
+
+		// Cancel only once the probe request is actually in flight, so the
+		// cancellation lands inside the dataset probe itself.
+		deadline := time.Now().Add(5 * time.Second)
+		for stalledHits.Load() == 0 {
+			if time.Now().After(deadline) {
+				cancel()
+				t.Fatal("dataset probe never reached the stalled endpoint")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		cancel()
+
+		select {
+		case res := <-done:
+			// The established cancellation outcome stays untouched: the
+			// model analysis completes exactly as it did before this
+			// warning surface existed; only the warning must not appear.
+			if res.err != nil || res.info == nil {
+				t.Fatalf("info = %v, error = %v; cancellation handling must stay exactly as before this warning surface", res.info, res.err)
+			}
+			if len(res.info.AnalysisWarnings) != 0 {
+				t.Fatalf("analysis warnings = %+v, want none: caller cancellation must never become a degradation warning", res.info.AnalysisWarnings)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("analysis did not finish after caller cancellation")
+		}
+	})
+}
+
 func TestHumanSize(t *testing.T) {
 	tests := []struct {
 		bytes    int64

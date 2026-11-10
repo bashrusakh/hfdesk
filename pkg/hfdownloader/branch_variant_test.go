@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -151,6 +152,17 @@ func fakeBranchVariantHub(t *testing.T, revisions map[string]branchHubRevision, 
 			body, ok := entry.files[parts[1]]
 			if !ok {
 				http.NotFound(w, r)
+				return
+			}
+			if r.Header.Get("X-HFDesk-Addressing-Probe") == "1" {
+				if len(body) == 0 {
+					w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+					return
+				}
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(body)))
+				w.Header().Set("Content-Length", "1")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write([]byte(body[:1]))
 				return
 			}
 			for _, serve := range bodyServers {
@@ -779,24 +791,15 @@ func TestLocalBranchVariantRequiresResolvedCommitBeforeWriting(t *testing.T) {
 			cfg := Settings{OutputDir: root, Endpoint: hub.URL, Verify: "size"}
 			job := Job{Repo: branchFixtureRepo, Revision: revision, BranchVariant: true}
 
-			// The fixture produces exactly the condition under test: a
-			// healthy plan whose commit is the unresolved revision name.
-			plan, err := PlanRepo(context.Background(), job, cfg)
-			if err != nil {
-				t.Fatalf("PlanRepo: %v", err)
-			}
-			if plan.CommitResolved || plan.Commit != revision {
-				t.Fatalf("plan commit = %q resolved=%v, want the unresolved revision name %q", plan.Commit, plan.CommitResolved, revision)
-			}
-			if len(plan.Items) == 0 {
-				t.Fatal("plan has no items, the fixture cannot prove a download would have written a payload")
+			if _, err := PlanRepo(context.Background(), job, cfg); err == nil {
+				t.Fatal("branch-variant plan without a resolved commit succeeded")
 			}
 
 			var (
 				mu     sync.Mutex
 				events []ProgressEvent
 			)
-			err = Download(context.Background(), job, cfg, func(ev ProgressEvent) {
+			err := Download(context.Background(), job, cfg, func(ev ProgressEvent) {
 				mu.Lock()
 				events = append(events, ev)
 				mu.Unlock()
@@ -1175,7 +1178,7 @@ func TestBranchVariantManifestDirKeysByRevisionAndCommit(t *testing.T) {
 		commit   = "1234567890123456789012345678901234567890"
 		revision = "exl/4_25"
 	)
-	cache := NewHFCacheResolved(t.TempDir(), "", 0)
+	cache := NewHFCacheResolved(t.TempDir(), "")
 	repoDir, err := cache.Repo(branchFixtureRepo, RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -1230,7 +1233,7 @@ func TestBranchVariantStagingNameSeparatesCollidingHashlessPaths(t *testing.T) {
 	if names[0] == names[1] {
 		t.Fatalf("collapsing paths share staging name %q", names[0])
 	}
-	prefix := "tmp-" + commit + "-"
+	prefix := "tmp-path-"
 	for i, name := range names {
 		if !strings.HasPrefix(name, prefix) {
 			t.Errorf("staging name %q lacks commit-scoped prefix %q", name, prefix)
@@ -1393,12 +1396,10 @@ func TestLocalBranchVariantRefusesNonDirectoryRecordSlot(t *testing.T) {
 	}
 }
 
-// TestOrdinaryDownloadUsesBranchNameWhileBranchVariantUsesCommit pins the
-// commit-pinning scope: only a branch variant reads the tree and the file
-// bytes at the resolved commit. An ordinary download keeps addressing the
-// caller's branch name, so a mirror that resolves the revision to a SHA but
-// serves the file bytes only by branch name keeps working.
-func TestOrdinaryDownloadUsesBranchNameWhileBranchVariantUsesCommit(t *testing.T) {
+// TestOrdinaryAndBranchVariantDownloadsUseResolvedCommit pins the default:
+// ordinary and branch-variant requests both use resolved commit content when
+// the custom endpoint supports commit addressing.
+func TestOrdinaryAndBranchVariantDownloadsUseResolvedCommit(t *testing.T) {
 	const (
 		mainCommit     = "1111111111111111111111111111111111111111"
 		branchRevision = "4.00bpw"
@@ -1439,8 +1440,8 @@ func TestOrdinaryDownloadUsesBranchNameWhileBranchVariantUsesCommit(t *testing.T
 	if len(ordinaryPlan.Items) != 1 {
 		t.Fatalf("ordinary plan items = %+v, want one file", ordinaryPlan.Items)
 	}
-	if want := hub.URL + "/" + branchFixtureRepo + "/raw/main/config.json"; ordinaryPlan.Items[0].URL != want {
-		t.Errorf("ordinary URL = %q, want the branch URL %q", ordinaryPlan.Items[0].URL, want)
+	if want := hub.URL + "/" + branchFixtureRepo + "/raw/" + mainCommit + "/config.json"; ordinaryPlan.Items[0].URL != want {
+		t.Errorf("ordinary URL = %q, want the commit-pinned URL %q", ordinaryPlan.Items[0].URL, want)
 	}
 
 	branchPlan, err := PlanRepo(context.Background(), Job{Repo: branchFixtureRepo, Revision: branchRevision, BranchVariant: true}, cfg)
@@ -1462,8 +1463,8 @@ func TestOrdinaryDownloadUsesBranchNameWhileBranchVariantUsesCommit(t *testing.T
 	downloadBranchFixture(t, cfg, branchRevision)
 
 	ordinaryBody, err := os.ReadFile(filepath.Join(root, branchFixtureRepo, "config.json"))
-	if err != nil || string(ordinaryBody) != "main-branch-bytes" {
-		t.Errorf("ordinary payload = %q err=%v, want the branch-name bytes %q", ordinaryBody, err, "main-branch-bytes")
+	if err != nil || string(ordinaryBody) != "main-commit-bytes" {
+		t.Errorf("ordinary payload = %q err=%v, want the commit bytes %q", ordinaryBody, err, "main-commit-bytes")
 	}
 	branchBody, err := os.ReadFile(filepath.Join(branchLocalPayloadDir(root, branchRevision), "config.json"))
 	if err != nil || string(branchBody) != "branch-commit-bytes" {
@@ -2029,7 +2030,12 @@ func TestLocalBranchVariantRefusesSymlinkedAppOwnedComponent(t *testing.T) {
 			if err == nil {
 				t.Fatal("local branch variant accepted a symlinked app-owned component")
 			}
-			if !strings.Contains(err.Error(), "unsafe branch variant layout") {
+			if tc.name == "revision directory" {
+				want := "invalidate prior branch variant completion records: unsafe branch variant record directory " + link
+				if err.Error() != want {
+					t.Fatalf("local branch variant error = %v, want %q", err, want)
+				}
+			} else if !strings.Contains(err.Error(), "unsafe branch variant layout") {
 				t.Fatalf("local branch variant error = %v, want the unsafe-layout refusal", err)
 			}
 			mu.Lock()
@@ -2085,6 +2091,7 @@ func TestBranchVariantFetchesSharedBlobWhenSharedDownloadDoesNotDeliver(t *testi
 		commit   = "2222222222222222222222222222222222222222"
 		body     = "branch-a-weights"
 	)
+	var sharedDomain *blobDomain
 	cases := []struct {
 		name string
 		// prepare puts the shared blob into the state this case describes.
@@ -2115,12 +2122,12 @@ func TestBranchVariantFetchesSharedBlobWhenSharedDownloadDoesNotDeliver(t *testi
 			},
 		},
 		{
-			name:    "shared download disappears",
-			prepare: startSharedBlobDownload,
+			name: "shared download disappears",
+			prepare: func(t *testing.T, repoDir *RepoDir, sha string) {
+				sharedDomain = startSharedBlobDownload(t, repoDir, sha)
+			},
 			abandon: func(t *testing.T, repoDir *RepoDir, sha string) {
-				if err := repoDir.CleanupIncomplete(sha); err != nil {
-					t.Fatal(err)
-				}
+				sharedDomain.release()
 			},
 		},
 	}
@@ -2212,15 +2219,22 @@ func sharedBlobRevision(revision, commit, body string) map[string]branchHubRevis
 
 // startSharedBlobDownload simulates another process that is currently
 // fetching the blob: an .incomplete file with a live owner record.
-func startSharedBlobDownload(t *testing.T, repoDir *RepoDir, sha string) {
+func startSharedBlobDownload(t *testing.T, repoDir *RepoDir, sha string) *blobDomain {
 	t.Helper()
 	if err := repoDir.EnsureDirs(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(repoDir.IncompletePath(sha), []byte("partial"), 0o644); err != nil {
+	dst := filepath.Join(repoDir.BlobsDir(), "tmp-"+sha)
+	domain := acquireTestDomainFresh(t, dst)
+	staging := repoDir.IncompletePath(sha)
+	if err := os.WriteFile(staging, []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := repoDir.WriteIncompleteMeta(sha, 0); err != nil {
+	job := Job{Repo: branchFixtureRepo, Revision: "4.00bpw"}
+	item := PlanItem{RelativePath: "model.safetensors", SHA256: sha, Size: int64(len("branch-a-weights"))}
+	meta := newClaimMeta(item, job, "2222222222222222222222222222222222222222", true)
+	meta.LockFenced = true
+	if err := writeStagingMeta(repoDir.IncompleteMetaPath(sha), &meta); err != nil {
 		t.Fatal(err)
 	}
 	status, _, err := repoDir.CheckBlob(sha)
@@ -2230,6 +2244,7 @@ func startSharedBlobDownload(t *testing.T, repoDir *RepoDir, sha string) {
 	if status != BlobDownloading {
 		t.Fatalf("shared blob status = %v, want %v", status, BlobDownloading)
 	}
+	return domain
 }
 
 // TestBranchVariantWaitsForSharedBlobBeforeReportingSuccess discriminates
@@ -2259,7 +2274,7 @@ func TestBranchVariantWaitsForSharedBlobBeforeReportingSuccess(t *testing.T) {
 	}
 	sum := sha256.Sum256([]byte(body))
 	sha := hex.EncodeToString(sum[:])
-	startSharedBlobDownload(t, repoDir, sha)
+	sharedDomain := startSharedBlobDownload(t, repoDir, sha)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2301,9 +2316,7 @@ func TestBranchVariantWaitsForSharedBlobBeforeReportingSuccess(t *testing.T) {
 	if err := os.WriteFile(repoDir.BlobPath(sha), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := repoDir.CleanupIncomplete(sha); err != nil {
-		t.Fatal(err)
-	}
+	sharedDomain.release()
 
 	select {
 	case err := <-done:
@@ -2354,7 +2367,7 @@ func TestBranchVariantSharedBlobWaitFailsWhenCancelled(t *testing.T) {
 	}
 	sum := sha256.Sum256([]byte(body))
 	sha := hex.EncodeToString(sum[:])
-	startSharedBlobDownload(t, repoDir, sha)
+	sharedDomain := startSharedBlobDownload(t, repoDir, sha)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2376,12 +2389,13 @@ func TestBranchVariantSharedBlobWaitFailsWhenCancelled(t *testing.T) {
 		if err == nil {
 			t.Fatal("cancelled branch variant reported success")
 		}
-		if !strings.Contains(err.Error(), "wait for shared blob") {
-			t.Fatalf("cancelled branch variant error = %v, want the shared-blob wait error", err)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled branch variant error = %v, want context cancellation", err)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("cancelled branch variant did not stop promptly")
 	}
+	sharedDomain.release()
 
 	// A failed job publishes no completion record, so the variant is not
 	// reported as downloaded.
@@ -2404,25 +2418,25 @@ func TestOrdinaryDownloadKeepsLenientSkipBehavior(t *testing.T) {
 	cases := []struct {
 		name string
 		// prepare puts the shared blob into the state this case describes.
-		prepare func(t *testing.T, repoDir *RepoDir, sha string)
-		// wantReason is the skip reason the ordinary download reports.
+		prepare    func(t *testing.T, repoDir *RepoDir, sha string) *blobDomain
+		wantError  bool
 		wantReason string
 		// check asserts the state the case leaves behind.
 		check func(t *testing.T, repoDir *RepoDir)
 	}{
 		{
-			name:       "blob downloaded by another process",
+			name:       "waits for live owner and reuses published blob",
 			prepare:    startSharedBlobDownload,
-			wantReason: "downloading by another process",
+			wantReason: "blob exists",
 			check: func(t *testing.T, repoDir *RepoDir) {
-				if _, err := os.Stat(filepath.Join(repoDir.SnapshotsDir(), commit, "model.safetensors")); !os.IsNotExist(err) {
-					t.Fatalf("ordinary shared-blob skip created a snapshot entry (err=%v)", err)
+				if _, err := os.Stat(filepath.Join(repoDir.SnapshotsDir(), commit, "model.safetensors")); err != nil {
+					t.Fatalf("ordinary shared-blob completion omitted snapshot entry: %v", err)
 				}
 			},
 		},
 		{
 			name: "snapshot entry cannot be created",
-			prepare: func(t *testing.T, repoDir *RepoDir, sha string) {
+			prepare: func(t *testing.T, repoDir *RepoDir, sha string) *blobDomain {
 				if err := repoDir.EnsureDirs(); err != nil {
 					t.Fatal(err)
 				}
@@ -2435,8 +2449,9 @@ func TestOrdinaryDownloadKeepsLenientSkipBehavior(t *testing.T) {
 				if err := os.WriteFile(filepath.Join(repoDir.SnapshotsDir(), commit), []byte("blocked"), 0o644); err != nil {
 					t.Fatal(err)
 				}
+				return nil
 			},
-			wantReason: "blob exists",
+			wantError: true,
 		},
 	}
 	for _, tc := range cases {
@@ -2456,7 +2471,7 @@ func TestOrdinaryDownloadKeepsLenientSkipBehavior(t *testing.T) {
 			}
 			sum := sha256.Sum256([]byte(body))
 			sha := hex.EncodeToString(sum[:])
-			tc.prepare(t, repoDir, sha)
+			owner := tc.prepare(t, repoDir, sha)
 
 			var (
 				mu     sync.Mutex
@@ -2468,12 +2483,34 @@ func TestOrdinaryDownloadKeepsLenientSkipBehavior(t *testing.T) {
 			// budget.
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			if err := Download(ctx, Job{Repo: branchFixtureRepo, Revision: revision}, cfg, func(ev ProgressEvent) {
-				mu.Lock()
-				events = append(events, ev)
-				mu.Unlock()
-			}); err != nil {
-				t.Fatalf("ordinary download with a shared blob: %v", err)
+			done := make(chan error, 1)
+			go func() {
+				done <- Download(ctx, Job{Repo: branchFixtureRepo, Revision: revision}, cfg, func(ev ProgressEvent) {
+					mu.Lock()
+					events = append(events, ev)
+					mu.Unlock()
+				})
+			}()
+			if owner != nil {
+				select {
+				case err := <-done:
+					t.Fatalf("ordinary job finished while the live owner still held the domain: %v", err)
+				case <-time.After(250 * time.Millisecond):
+				}
+				if err := os.WriteFile(repoDir.BlobPath(sha), []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				owner.release()
+			}
+			downloadErr := <-done
+			if tc.wantError {
+				if downloadErr == nil {
+					t.Fatal("unreachable snapshot was reported successful")
+				}
+				return
+			}
+			if downloadErr != nil {
+				t.Fatalf("ordinary download after owner resolution: %v", downloadErr)
 			}
 
 			mu.Lock()
@@ -2505,20 +2542,43 @@ func TestOrdinaryDownloadKeepsLenientSkipBehavior(t *testing.T) {
 	}
 }
 
-// TestWaitForSharedBlobTimesOut pins the bounded-wait contract: a wait that
-// cannot finish ends as an error instead of an endless wait.
-func TestWaitForSharedBlobTimesOut(t *testing.T) {
-	cache := NewHFCacheResolved(t.TempDir(), "", 0)
+// TestDestinationDomainWaitTimesOut pins the bounded ownership wait: a writer
+// cannot complete or take over while another process holds the domain.
+func TestDestinationDomainWaitTimesOut(t *testing.T) {
+	cache := NewHFCacheResolved(t.TempDir(), "")
 	repoDir, err := cache.Repo(branchFixtureRepo, RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
 	}
 	const sha = "3333333333333333333333333333333333333333333333333333333333333333"
-	startSharedBlobDownload(t, repoDir, sha)
-
-	status, err := waitForSharedBlob(context.Background(), repoDir, sha, 50*time.Millisecond)
+	dst := filepath.Join(repoDir.BlobsDir(), "tmp-"+sha)
+	owner := startSharedBlobDownload(t, repoDir, sha)
+	defer owner.release()
+	status, _, err := repoDir.CheckBlob(sha)
+	if err != nil || status != BlobDownloading {
+		t.Fatalf("live destination status = %v err=%v, want downloading", status, err)
+	}
+	key, lockSrc := testDomainIdentity(dst)
+	// The cache-owned realm derivation used by the fixture above, so the
+	// second claimant contends on the scope that fixture holds.
+	hubDir := filepath.Dir(filepath.Dir(filepath.Dir(key)))
+	realm, rerr := NewHFCacheResolved(hubDir, hubDir).ownershipRealmForData()
+	if rerr != nil {
+		t.Fatalf("second claimant ownership realm: %v", rerr)
+	}
+	proofPath := lockSrc
+	paths := []string{lockSrc, key, lockSrc + ".incomplete", key + ".incomplete"}
+	if canonicalSHA256(filepath.Base(key)) {
+		proofPath = key
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err = acquireBlobDomainScoped(ctx, key, lockSrc, realm, paths, proofPath)
 	if err == nil {
-		t.Fatalf("wait for an unresolvable shared blob = %v, want an error", status)
+		t.Fatalf("destination wait = %v, want a context deadline", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("destination wait error = %v, want context deadline", err)
 	}
 	if status != BlobDownloading {
 		t.Fatalf("timed-out wait status = %v, want %v", status, BlobDownloading)
@@ -2623,7 +2683,7 @@ func TestBranchVariantFailsWhenSnapshotEntryCannotBeCreatedAfterSharedBlobComple
 	sha := hex.EncodeToString(sum[:])
 	// The blob is still being fetched by another process when the branch
 	// variant starts.
-	startSharedBlobDownload(t, repoDir, sha)
+	sharedDomain := startSharedBlobDownload(t, repoDir, sha)
 	// A regular file where the snapshot directory belongs makes the snapshot
 	// entry impossible to create.
 	if err := os.WriteFile(filepath.Join(repoDir.SnapshotsDir(), commit), []byte("blocked"), 0o644); err != nil {
@@ -2647,9 +2707,7 @@ func TestBranchVariantFailsWhenSnapshotEntryCannotBeCreatedAfterSharedBlobComple
 	if err := os.WriteFile(repoDir.BlobPath(sha), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := repoDir.CleanupIncomplete(sha); err != nil {
-		t.Fatal(err)
-	}
+	sharedDomain.release()
 
 	select {
 	case err := <-done:
@@ -2888,6 +2946,11 @@ func branchStagingFiles(blobsDir string) []string {
 		if !strings.HasPrefix(name, "tmp-") {
 			continue
 		}
+		// Legacy payload-side lock residue and the single-path identity sidecar
+		// are metadata for one stage, not additional staging payloads.
+		if strings.HasSuffix(name, ".lock") || strings.HasSuffix(name, ".part.meta") {
+			continue
+		}
 		names = append(names, strings.TrimSuffix(name, ".part"))
 	}
 	sort.Strings(names)
@@ -3028,6 +3091,17 @@ func TestBranchVariantConcurrentRevisionsAtOneCommitUseSeparateStagingFiles(t *t
 // the transfer fails. A negative interruptAfter serves the whole window.
 func branchRangeBodyServer(interruptAfter int) branchHubBodyServer {
 	return func(w http.ResponseWriter, r *http.Request, rel, body string) bool {
+		if r.Header.Get("X-HFDesk-Addressing-Probe") == "1" {
+			if len(body) == 0 {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return true
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(body)))
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte(body[:1]))
+			return true
+		}
 		if r.Method == http.MethodHead {
 			// A HEAD carries no body: the multipart path issues one to
 			// resolve the file size before it starts the parts.
@@ -3372,7 +3446,9 @@ func TestLocalBranchVariantRetryResumesItsOwnCommitPartial(t *testing.T) {
 	// partial of this commit is reused.
 	recorder := &branchRangeRecorder{}
 	retry := fakeBranchVariantHub(t, revisions, func(w http.ResponseWriter, r *http.Request, rel, gotBody string) bool {
-		recorder.record(r.Header.Get("Range"))
+		if r.Header.Get("X-HFDesk-Addressing-Probe") != "1" {
+			recorder.record(r.Header.Get("Range"))
+		}
 		return branchRangeBodyServer(-1)(w, r, rel, gotBody)
 	})
 	defer retry.Close()
@@ -3468,13 +3544,10 @@ func TestLocalBranchVariantPayloadHoldsOnlyTheVariantFiles(t *testing.T) {
 	}
 }
 
-// TestLocalBranchVariantMovedBranchDoesNotResumeAnotherCommitParts is the
-// multipart counterpart of the commit-mixing defect: a file above the
-// multipart threshold is assembled from .part-NN parts and a .parts.json
-// layout, and those artifacts are commit-scoped as well. The parts of an
-// interrupted transfer of one commit must not be resumed by a transfer of
-// another commit, or the assembled file holds two commits' bytes.
-func TestLocalBranchVariantMovedBranchDoesNotResumeAnotherCommitParts(t *testing.T) {
+// TestLocalBranchVariantMovedBranchDoesNotResumeAnotherCommitV4 verifies that
+// interrupted v4 state is scoped to the resolved commit; a moved branch starts
+// from its own state and publishes only the new commit's bytes.
+func TestLocalBranchVariantMovedBranchDoesNotResumeAnotherCommitV4(t *testing.T) {
 	const (
 		revision     = "4.00bpw"
 		firstCommit  = "2222222222222222222222222222222222222222"
@@ -3502,9 +3575,8 @@ func TestLocalBranchVariantMovedBranchDoesNotResumeAnotherCommitParts(t *testing
 		revision:    firstEntry,
 		firstCommit: firstEntry,
 	}
-	// The parts of the multipart transfer are interrupted after four bytes
-	// each, so the part files stay on disk exactly as an interrupted
-	// transfer leaves them.
+	// The ranged transfer is interrupted after four bytes of each assigned
+	// window, leaving a commit-pinned version-4 staging record.
 	hub := fakeBranchVariantHub(t, revisions, branchRangeBodyServer(4))
 	defer hub.Close()
 	root := t.TempDir()
@@ -3523,10 +3595,20 @@ func TestLocalBranchVariantMovedBranchDoesNotResumeAnotherCommitParts(t *testing
 	}
 	hub.Close()
 
-	// The interrupted multipart transfer left its part files behind.
-	partials := branchSpacePartials(t, root)
-	if len(partials) < 2 {
-		t.Fatalf("interrupted multipart transfer left %d partial artifacts, want the parts of both windows: %+v", len(partials), partials)
+	space, err := NewBranchVariantLocalSpace(root, branchFixtureRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging, err := space.stagingPath(revision, firstCommit, "model.safetensors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstMeta, err := readStagingMeta(staging + ".incomplete.meta")
+	if err != nil {
+		t.Fatalf("interrupted v4 record: %v", err)
+	}
+	if firstMeta.Version != stagingMetaVersion || firstMeta.Commit != firstCommit || !firstMeta.CommitPinned {
+		t.Fatalf("interrupted state identity = %+v, want pinned v4 commit %s", firstMeta, firstCommit)
 	}
 
 	// The branch moves to another commit whose file has the same length and
@@ -3548,6 +3630,17 @@ func TestLocalBranchVariantMovedBranchDoesNotResumeAnotherCommitParts(t *testing
 	}
 	if string(body) != secondBytes {
 		t.Fatalf("payload = %q, want the moved branch's bytes %q", body, secondBytes)
+	}
+	secondStaging, err := space.stagingPath(revision, secondCommit, "model.safetensors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(secondStaging + ".incomplete"); !os.IsNotExist(err) {
+		t.Errorf("completed moved-commit staging payload remains (err=%v)", err)
+	}
+	retainedFirst, err := readStagingMeta(staging + ".incomplete.meta")
+	if err != nil || retainedFirst.Commit != firstCommit {
+		t.Errorf("old commit state changed after branch move: meta=%+v err=%v", retainedFirst, err)
 	}
 }
 

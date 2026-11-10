@@ -1078,6 +1078,70 @@ func TestWalk_RetriesRateLimit(t *testing.T) {
 	}
 }
 
+// TestWalk_RetryWaitNotChargedToPageFetchTimeout pins the separation
+// between the per-page-request deadline and hubtree's own retry-wait bounds:
+// a server-requested wait longer than PageFetchTimeout must still be honored
+// to completion (waits sleep on the caller's context), so enabling the
+// per-request cap never truncates an established RateLimit/Retry-After wait.
+func TestWalk_RetryWaitNotChargedToPageFetchTimeout(t *testing.T) {
+	var reqs atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if reqs.Add(1) == 1 {
+			w.Header().Set("RateLimit", `"api";r=0;t=1`)
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]Node{fileNode("f.bin", 7)})
+	}))
+	defer srv.Close()
+
+	w := testWalker(srv, nil)
+	w.PageFetchTimeout = 400 * time.Millisecond
+
+	start := time.Now()
+	got := walkFiles(t, w)
+	elapsed := time.Since(start)
+	if len(got) != 1 || got[0] != "f.bin" {
+		t.Fatalf("files = %q, want the retried page", got)
+	}
+	if elapsed < 900*time.Millisecond {
+		t.Errorf("walk finished after %v: the server-requested 1s wait was cut short by the per-request cap", elapsed)
+	}
+}
+
+// TestWalk_PageFetchTimeoutNotChargedAcrossPages pins that the deadline is per
+// request attempt, not per walk: PageFetchTimeout (450ms) is smaller than the
+// total walk time (two 300ms pages) yet larger than one page's latency, so a
+// correct per-attempt deadline lets both pages finish while a single walk-wide
+// deadline would expire during page 2.
+func TestWalk_PageFetchTimeoutNotChargedAcrossPages(t *testing.T) {
+	const pageLatency = 300 * time.Millisecond
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Serve every page slowly: one page fits the budget, two together do not.
+		time.Sleep(pageLatency)
+		if r.URL.Query().Get("cursor") == "2" {
+			_ = json.NewEncoder(w).Encode([]Node{fileNode("p2.bin", 3)})
+			return
+		}
+		w.Header().Set("Link", `<?cursor=2>; rel=next`)
+		_ = json.NewEncoder(w).Encode([]Node{fileNode("p1.bin", 1)})
+	}))
+	defer srv.Close()
+
+	w := testWalker(srv, nil)
+	w.PageFetchTimeout = 450 * time.Millisecond
+
+	start := time.Now()
+	got := walkFiles(t, w)
+	elapsed := time.Since(start)
+
+	assertFiles(t, got, "p1.bin", "p2.bin")
+	if elapsed < 2*pageLatency {
+		t.Errorf("walk finished after %v; the two %v pages were not both served", elapsed, pageLatency)
+	}
+}
+
 // TestRetryWaitParsesServerHints pins the wait computation without sleeping:
 // Retry-After in seconds and HTTP-date form, the Hub RateLimit header, the
 // larger-wins rule, throttling-only parsing, and the cap.

@@ -58,7 +58,7 @@ func crossVolumeHardlink(oldname, newname string) error {
 
 func linkTestRepo(t *testing.T) *RepoDir {
 	t.Helper()
-	cache := NewHFCache(filepath.Join(t.TempDir(), "cache"), 0)
+	cache := NewHFCache(filepath.Join(t.TempDir(), "cache"))
 	repo, err := cache.Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)
@@ -270,7 +270,7 @@ func TestLocalFlatModeUnaffectedByLinkFallbackSimulated(t *testing.T) {
 // blobs and a completed download manifest, but no snapshot entries at all.
 func blobsOnlyCacheFixture(t *testing.T, content []byte) (*HFCache, *RepoDir, string) {
 	t.Helper()
-	cache := NewHFCache(filepath.Join(t.TempDir(), "cache"), 0)
+	cache := NewHFCache(filepath.Join(t.TempDir(), "cache"))
 	repo, err := cache.Repo("owner/model", RepoTypeModel)
 	if err != nil {
 		t.Fatal(err)

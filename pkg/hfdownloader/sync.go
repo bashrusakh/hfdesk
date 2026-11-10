@@ -32,13 +32,27 @@ type SyncResult struct {
 // Sync regenerates the friendly view (models/, datasets/) from the hub cache.
 // It scans all repos in hub/, reads their refs to find current commits,
 // repairs snapshot entries that are missing (see repairSnapshotEntries), and
-// creates friendly-view entries pointing at snapshot files.
+// creates friendly-view entries pointing at snapshot files. Every entry it
+// creates, replaces or removes and every directory it prunes does so under the
+// shared cache-mutation admission, so a second HFDesk instance holding an
+// entry's scope excludes this one.
 func (c *HFCache) Sync(opts SyncOptions) (*SyncResult, error) {
 	result := &SyncResult{}
 
 	hubDir := c.HubDir()
 	if _, err := os.Stat(hubDir); errors.Is(err, os.ErrNotExist) {
 		return result, nil // Nothing to sync
+	}
+
+	// Both realms the sync path mutates through: snapshot entries live in the
+	// hub-owned control tree, friendly entries and cleanup in the cache-root one.
+	hubRealm, err := c.ownershipRealmForDataContext(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("resolve hub ownership realm: %w", err)
+	}
+	friendlyRealm, err := c.ownershipRealmForFriendlyContext(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("resolve friendly ownership realm: %w", err)
 	}
 
 	// Scan hub/ for repo directories
@@ -67,7 +81,7 @@ func (c *HFCache) Sync(opts SyncOptions) (*SyncResult, error) {
 		}
 
 		// Sync this repo's friendly view
-		created, updated, repoErrs := c.syncRepoFriendlyView(repoDir, opts)
+		created, updated, repoErrs := c.syncRepoFriendlyView(repoDir, opts, hubRealm, friendlyRealm)
 		for _, e := range repoErrs {
 			result.Errors = append(result.Errors, fmt.Errorf("sync %s: %w", entry.Name(), e))
 		}
@@ -78,7 +92,7 @@ func (c *HFCache) Sync(opts SyncOptions) (*SyncResult, error) {
 
 	// Clean orphaned symlinks if requested
 	if opts.Clean {
-		removed, err := c.cleanOrphanedSymlinks(opts)
+		removed, err := c.cleanOrphanedSymlinks(opts, friendlyRealm)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("clean orphans: %w", err))
 		}
@@ -115,10 +129,12 @@ func parseRepoDirName(dirName string) (RepoType, string, string, bool) {
 
 // syncRepoFriendlyView syncs a single repo's friendly view.
 // It first repairs snapshot entries that are missing (see repairSnapshotEntries),
-// then mirrors the snapshot into the friendly view.
+// then mirrors the snapshot into the friendly view. Entry creation and repair run
+// through the scoped link funnels (hubRealm for snapshot entries, friendlyRealm
+// for friendly entries), so they cannot mutate an entry another participant owns.
 // Returns (created, updated, errors); per-entry failures are reported without
 // aborting the remaining entries.
-func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int, int, []error) {
+func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions, hubRealm, friendlyRealm *ownershipRealm) (int, int, []error) {
 	created := 0
 	updated := 0
 	var errs []error
@@ -166,7 +182,7 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 
 	// Recreate snapshot entries a blobs-only or partially repaired cache is
 	// missing before mirroring them into the friendly view.
-	repaired, repairErrs := repoDir.repairSnapshotEntries(commit)
+	repaired, repairErrs := repoDir.repairSnapshotEntries(commit, hubRealm)
 	created += repaired
 	errs = append(errs, repairErrs...)
 
@@ -219,9 +235,8 @@ func (c *HFCache) syncRepoFriendlyView(repoDir *RepoDir, opts SyncOptions) (int,
 			return nil
 		}
 
-		// Create or update entry
 		_, statErr := os.Lstat(friendlyPath)
-		if err := repoDir.createFriendlySymlinkCtx(context.Background(), commit, relPath, ""); err != nil {
+		if err := createFriendlyEntryScoped(context.Background(), repoDir, commit, relPath, "", friendlyRealm); err != nil {
 			errs = append(errs, fmt.Errorf("create friendly entry for %s: %w", relPath, err))
 			return nil
 		}
@@ -269,9 +284,10 @@ func readRepoManifest(repoDir *RepoDir) (*DownloadManifest, error) {
 // deleted entry. Entries whose blob is absent, whose recorded path would
 // escape the snapshot directory, or whose manifest shape is unusable are
 // skipped or reported; existing snapshot entries (of any link kind) are left
-// untouched.
+// untouched. Each recreated entry is placed under its ownership scope in
+// hubRealm, so a live writer of that entry excludes the repair.
 // Returns (created, errors).
-func (r *RepoDir) repairSnapshotEntries(commit string) (int, []error) {
+func (r *RepoDir) repairSnapshotEntries(commit string, hubRealm *ownershipRealm) (int, []error) {
 	created := 0
 	var errs []error
 
@@ -315,7 +331,7 @@ func (r *RepoDir) repairSnapshotEntries(commit string) (int, []error) {
 		if !snapshotEntryNeedsRepair(linkPath) {
 			continue
 		}
-		if err := r.createSnapshotSymlink(context.Background(), commit, rel, hash); err != nil {
+		if err := createSnapshotEntryScoped(context.Background(), r, commit, rel, hash, hubRealm); err != nil {
 			errs = append(errs, fmt.Errorf("repair snapshot entry %s: %w", rel, err))
 			continue
 		}
@@ -341,19 +357,20 @@ func snapshotEntryNeedsRepair(linkPath string) bool {
 	return false
 }
 
-// cleanOrphanedSymlinks removes symlinks in friendly view that point to non-existent files.
-func (c *HFCache) cleanOrphanedSymlinks(opts SyncOptions) (int, error) {
+// cleanOrphanedSymlinks removes symlinks in friendly view that point to non-existent files,
+// each removal under its entry's ownership scope in friendlyRealm.
+func (c *HFCache) cleanOrphanedSymlinks(opts SyncOptions, friendlyRealm *ownershipRealm) (int, error) {
 	removed := 0
 
 	// Clean models/
-	modelsRemoved, err := cleanOrphansInDir(c.ModelsDir())
+	modelsRemoved, err := cleanOrphansInDir(c.ModelsDir(), friendlyRealm)
 	if err != nil {
 		return removed, fmt.Errorf("clean models: %w", err)
 	}
 	removed += modelsRemoved
 
 	// Clean datasets/
-	datasetsRemoved, err := cleanOrphansInDir(c.DatasetsDir())
+	datasetsRemoved, err := cleanOrphansInDir(c.DatasetsDir(), friendlyRealm)
 	if err != nil {
 		return removed, fmt.Errorf("clean datasets: %w", err)
 	}
@@ -362,8 +379,10 @@ func (c *HFCache) cleanOrphanedSymlinks(opts SyncOptions) (int, error) {
 	return removed, nil
 }
 
-// cleanOrphansInDir removes broken symlinks in a directory tree.
-func cleanOrphansInDir(dir string) (int, error) {
+// cleanOrphansInDir removes broken symlinks in a directory tree. A removal
+// whose entry scope is held elsewhere is skipped like any other failed unlink;
+// the orphan stays for a later pass instead of being forced out.
+func cleanOrphansInDir(dir string, friendlyRealm *ownershipRealm) (int, error) {
 	removed := 0
 
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
@@ -393,8 +412,7 @@ func cleanOrphansInDir(dir string) (int, error) {
 		}
 
 		if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
-			// Broken symlink, remove it
-			if err := os.Remove(path); err != nil {
+			if err := removeCacheEntryScoped(context.Background(), friendlyRealm, path); err != nil {
 				return nil // Skip errors
 			}
 			removed++
@@ -408,20 +426,32 @@ func cleanOrphansInDir(dir string) (int, error) {
 	}
 
 	// Clean up empty directories
-	cleanEmptyDirs(dir)
+	cleanEmptyDirs(dir, friendlyRealm)
 
 	return removed, nil
 }
 
-// cleanEmptyDirs removes empty directories from bottom up.
-func cleanEmptyDirs(dir string) {
+// cleanEmptyDirs removes empty directories bottom up. Each removal first takes
+// tree admission for the directory in friendlyRealm: a non-empty directory
+// needs no admission because its unlink would fail anyway, and a tree held by
+// another participant is left alone like a failed os.Remove.
+func cleanEmptyDirs(dir string, friendlyRealm *ownershipRealm) {
 	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || !info.IsDir() {
 			return nil
 		}
-
-		// Try to remove (will fail if not empty)
-		os.Remove(path)
+		if entries, readErr := os.ReadDir(path); readErr != nil || len(entries) > 0 {
+			return nil
+		}
+		if friendlyRealm == nil {
+			return nil
+		}
+		lease, leaseErr := friendlyRealm.acquireTreeRemoval(context.Background(), path, 0)
+		if leaseErr != nil {
+			return nil // Skip: another participant owns this tree
+		}
+		_ = os.Remove(path)
+		lease.Release()
 		return nil
 	})
 }

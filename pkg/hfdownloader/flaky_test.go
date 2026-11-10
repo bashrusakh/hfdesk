@@ -107,7 +107,7 @@ func TestDownloadMultipart_ResumesAfterFlakyConnection(t *testing.T) {
 	}
 	cfg := Settings{Concurrency: nParts, Retries: 5}
 
-	err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, func(ProgressEvent) {})
+	_, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), func(ProgressEvent) {})
 	if err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}
@@ -161,12 +161,15 @@ func TestDownloadMultipart_ResumesAfterFlakyConnection(t *testing.T) {
 	}
 }
 
-// slowRangeServer serves Range requests at a bounded byte rate so the test
-// can cancel context mid-stream deterministically. It streams bytes in small
-// chunks with a short sleep between chunks.
-func slowRangeServer(t *testing.T, full []byte) *httptest.Server {
+// slowRangeServer streams small chunks slowly enough to cancel mid-transfer
+// and counts bytes accepted by successful server writes.
+func slowRangeServer(t *testing.T, full []byte) (*httptest.Server, *int64) {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var (
+		mu        sync.Mutex
+		delivered int64
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
 			w.Header().Set("Accept-Ranges", "bytes")
@@ -198,27 +201,21 @@ func slowRangeServer(t *testing.T, full []byte) *httptest.Server {
 			if _, err := w.Write(content[i:j]); err != nil {
 				return
 			}
+			mu.Lock()
+			delivered += int64(j - i)
+			mu.Unlock()
 			if flusher != nil {
 				flusher.Flush()
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
 	}))
+	return srv, &delivered
 }
 
-// TestDownloadMultipart_CancelMidStreamDoesNotClaim100 is a regression test
-// for the UI bug: when a user paused mid-download, downloadMultipart used to
-// emit a "file_progress downloaded==total" event via its tail path even
-// though the parts were incomplete, then ran assembly over the partial set
-// and destroyed the part files. On a subsequent resume the UI had already
-// snapped to 100%, assembly had corrupted/removed the partial bytes, and
-// the real resume appeared to start over from zero.
-//
-// This test cancels the context mid-download and asserts:
-//   - downloadMultipart returns a context error (not nil success)
-//   - no file_progress event ever reports downloaded == total
-//   - at least one part-XX file survives on disk after return, proving the
-//     partial bytes were not destroyed by an erroneous assembly pass
+// Cancellation must return an error without a terminal 100% event or publication.
+// Staging and metadata survive, with a nonzero partial checkpoint no larger
+// than the server's successful writes; preallocated length is not progress.
 func TestDownloadMultipart_CancelMidStreamDoesNotClaim100(t *testing.T) {
 	tmpDir := t.TempDir()
 	const totalSize = 200_000
@@ -233,8 +230,7 @@ func TestDownloadMultipart_CancelMidStreamDoesNotClaim100(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := slowRangeServer(t, full)
-	defer srv.Close()
+	srv, delivered := slowRangeServer(t, full)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -296,10 +292,15 @@ func TestDownloadMultipart_CancelMidStreamDoesNotClaim100(t *testing.T) {
 		BackoffMax:     "100ms",
 	}
 
-	err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, emit)
+	_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), emit)
 	if err == nil {
 		t.Fatal("downloadMultipart succeeded despite cancellation — expected a context error")
 	}
+
+	// Close the server first so its handler goroutines (the delivered-byte
+	// counters) are joined before the counter is read.
+	srv.Close()
+	cancel()
 
 	mu.Lock()
 	got100 := saw100
@@ -311,24 +312,32 @@ func TestDownloadMultipart_CancelMidStreamDoesNotClaim100(t *testing.T) {
 			lastSeen, totalSize)
 	}
 
-	// At least one part file should survive on disk — assembly must not
-	// have run and deleted them.
-	survived := 0
-	for i := 0; i < nParts; i++ {
-		p := fmt.Sprintf("%s.part-%02d", dst, i)
-		if fi, err := os.Stat(p); err == nil && fi.Size() > 0 {
-			survived++
-		}
+	// Preserve staging and its partial committed-range metadata after cancellation.
+	staging := dst + ".incomplete"
+	fi, err := os.Stat(staging)
+	if err != nil {
+		t.Fatalf("staging file did not survive cancel: %v", err)
 	}
-	if survived == 0 {
-		// It is valid for zero part files to exist if the cancel landed
-		// before any body bytes were written, but we selected the cancel
-		// point after the first progress event, so at least one part
-		// should have committed bytes.
-		t.Errorf("no part-NN files survived after cancel; assembly may have run and deleted them")
+	// Preallocated length is not evidence of transferred or committed bytes.
+	if fi.Size() != totalSize {
+		t.Errorf("staging file not preallocated: size=%d want %d", fi.Size(), totalSize)
+	}
+	meta, merr := readStagingMeta(staging + ".meta")
+	if merr != nil {
+		t.Fatalf("staging meta missing after cancel: %v", merr)
+	}
+	committed := committedTotal(meta.Ranges)
+	if committed == 0 {
+		t.Error("no committed bytes after cancel; the cancel landed after the first progress event, so some range must have committed data")
+	}
+	if committed >= totalSize {
+		t.Errorf("committed=%d equals the total; the checkpoint must never claim uncommitted bytes", committed)
+	}
+	// The committed checkpoint cannot exceed the server's successful writes.
+	if committed > *delivered {
+		t.Errorf("committed checkpoint %d exceeds the %d bytes the server delivered; metadata claims bytes not written", committed, *delivered)
 	}
 
-	// The assembled final file must NOT exist.
 	if _, err := os.Stat(dst); err == nil {
 		t.Error("final dst file exists after cancellation; should have been left alone")
 	}
@@ -400,7 +409,7 @@ func TestDownloadMultipart_ProgressMonotonic(t *testing.T) {
 	}
 	cfg := Settings{Concurrency: nParts, Retries: 5}
 
-	err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, emit)
+	_, err := downloadMultipart(ctx, srv.Client(), "", Job{Repo: "o/r"}, cfg, it, dst, withTestDomain(t, dst, multipartOpts{}), emit)
 	if err != nil {
 		t.Fatalf("downloadMultipart: %v", err)
 	}

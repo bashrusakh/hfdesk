@@ -4,8 +4,10 @@
 package hfdownloader
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -266,16 +268,7 @@ func TestCleanupJobPartFiles_LegacyDst(t *testing.T) {
 	}
 }
 
-// TestCleanupJobPartFiles_LegacyRespectsUserNamedFiles covers the
-// "user file literally named .part" defensive concern: the helper
-// only touches files matching one of the dsts in the input list.
-// A user file `weights.part` that does not correspond to any tracked
-// dst is left alone, even when no other files are present.
-//
-// The previous scan-based implementation could have deleted a
-// "weights.part" file with a coincidental name; the per-dst list
-// makes the cleanup strictly scoped to the job's own in-flight
-// files and the standalone case is structurally impossible.
+// An empty tracked-destination set must leave user-named .part files alone.
 func TestCleanupJobPartFiles_LegacyRespectsUserNamedFiles(t *testing.T) {
 	tmpDir := t.TempDir()
 	repoDir := filepath.Join(tmpDir, "owner", "user-named")
@@ -339,6 +332,120 @@ func TestCleanupJobPartFiles_LegacyRejectsOutOfRootDst(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Errorf("out-of-root path %s should survive cleanup: %v", path, err)
 		}
+	}
+}
+
+// A tracked tmp-<sha> destination cleans its adjacent and blob-keyed ranged
+// staging, without touching other keys or non-canonical names.
+func TestCleanupJobPartFiles_HFCacheBlobStaging(t *testing.T) {
+	cacheDir := t.TempDir()
+	blobsDir := filepath.Join(cacheDir, "hub", "models--owner--repo", "blobs")
+	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sha := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	otherSha := "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+	cache := NewHFCache(cacheDir)
+	realm, err := cache.ownershipRealmForData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err := realm.fenceProof(filepath.Join(blobsDir, sha))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tracked := map[string]string{
+		"tmp-" + sha:                      "completed temp window residue",
+		"tmp-" + sha + ".part":            "single-path partial",
+		sha + ".incomplete":               "blob-keyed staging payload",
+		sha + ".incomplete.meta":          "blob-keyed staging metadata",
+		"tmp-" + sha + ".incomplete":      "dst-adjacent staging payload",
+		"tmp-" + sha + ".incomplete.meta": "dst-adjacent staging metadata",
+	}
+	survive := map[string]string{
+		otherSha + ".incomplete":         "another blob's staging",
+		otherSha + ".incomplete.meta":    "another blob's staging metadata",
+		"other-file.incomplete":          "unrelated incomplete file",
+		"tmp-" + strings.Repeat("x", 64): "non-canonical tmp- name (no blob staging derived)",
+	}
+	for name, body := range tracked {
+		if strings.HasSuffix(name, ".meta") {
+			record, err := json.Marshal(IncompleteMeta{LockFenced: true, OwnershipFence: fence})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body = string(record)
+		}
+		if err := os.WriteFile(filepath.Join(blobsDir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, body := range survive {
+		if err := os.WriteFile(filepath.Join(blobsDir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A matching current realm/key proof permits cleanup.
+
+	if err := CleanupJobPartFiles(Settings{CacheDir: cacheDir}, []string{filepath.Join(blobsDir, "tmp-"+sha)}); err != nil {
+		t.Fatalf("CleanupJobPartFiles: %v", err)
+	}
+	for name := range tracked {
+		if _, err := os.Stat(filepath.Join(blobsDir, name)); !os.IsNotExist(err) {
+			t.Errorf("tracked artifact %q survived cleanup (stat err=%v)", name, err)
+		}
+	}
+	for name := range survive {
+		if _, err := os.Stat(filepath.Join(blobsDir, name)); err != nil {
+			t.Errorf("unrelated file %q was removed by cleanup: %v", name, err)
+		}
+	}
+}
+
+func TestCleanupJobPartFiles_LegacyRangedStaging(t *testing.T) {
+	tmpDir := t.TempDir()
+	repoDir := filepath.Join(tmpDir, "owner", "repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"model.bin.incomplete":      "A/model.bin staging payload",
+		"model.bin.incomplete.meta": "A/model.bin staging metadata",
+		"weights.bin.incomplete":    "B/weights.bin staging (concurrent job)",
+	}
+	realm, err := newOwnershipRealm(DefaultOwnershipDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err := realm.fenceProof(filepath.Join(repoDir, "model.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range files {
+		if strings.HasSuffix(name, ".meta") {
+			record, err := json.Marshal(IncompleteMeta{LockFenced: true, OwnershipFence: fence})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body = string(record)
+		}
+		if err := os.WriteFile(filepath.Join(repoDir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A matching current realm/key proof permits cleanup.
+	if err := CleanupJobPartFiles(Settings{OutputDir: tmpDir}, []string{filepath.Join(repoDir, "model.bin")}); err != nil {
+		t.Fatalf("CleanupJobPartFiles: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "model.bin.incomplete")); !os.IsNotExist(err) {
+		t.Error("model.bin.incomplete should be removed")
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "model.bin.incomplete.meta")); !os.IsNotExist(err) {
+		t.Error("model.bin.incomplete.meta should be removed")
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "weights.bin.incomplete")); err != nil {
+		t.Errorf("concurrent job's staging was removed: %v", err)
 	}
 }
 

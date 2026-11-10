@@ -389,11 +389,17 @@ array of bounded, non-fatal diagnostics:
 }
 ```
 
-`code` identifies the warning. The only code currently emitted is
-`exl_branch_discovery_incomplete`. `causes` contains stable reason codes, not
-upstream response bodies or URLs: `header_unavailable`,
-`header_uninterpretable`, `probe_timeout`, `probe_limit`, and
-`weight_role_unrecognized`. `retryable` indicates that repeating the same
+`code` identifies the warning. The codes currently emitted are
+`exl_branch_discovery_incomplete` and `both_namespace_detection_degraded`,
+the latter when the optional dataset-namespace probe after a successful model
+listing failed, so both-namespaces (`needsSelection`) detection is unverified
+for this analysis — the analysis outcome is unchanged, only the warning is
+added. `causes` contains stable reason codes, not upstream response bodies or
+URLs: `header_unavailable`, `header_uninterpretable`, `probe_timeout`,
+`probe_limit`, `weight_role_unrecognized`, and `probe_unavailable`.
+`both_namespace_detection_degraded` carries the underlying failure text in
+`message` (an expired tree-page budget keeps its actionable timeout text).
+`retryable` indicates that repeating the same
 analyze request may complete the optional discovery. A retry repeats the same
 repository, namespace, and revision request; it does not change the selection
 or start a download.
@@ -913,6 +919,22 @@ POST   /api/jobs/{id}/dismiss
 
 `dismiss` removes terminal jobs from the UI/state. Running or queued jobs must be cancelled first.
 
+A job that reports `completed` means the requested files are present in the
+cache (or at the flat output root) AND reachable at their snapshot/friendly
+paths. A file that another live writer owns is not present, so it is never
+counted as a completed skip: the item waits for that destination (bounded, up
+to five minutes) and then downloads the file or fails with an actionable error.
+Such a job reports `failed`, never `completed` with a missing file. A failed
+link creation fails the affected item the same way, in the transfer path and in
+both skip paths, so a job never reports `completed` with an unreachable path
+either. A disabled friendly view is not an error. Skipped same-SHA items are
+reconciled after all files finish and receive their own snapshot/friendly
+entries. A waiting item does not occupy one of the job's active-download slots,
+so other files proceed even with a low limit. Progress reports distinguish
+transfer, finalizing, completion, skipped, error, and cancellation states, and
+`file_finalizing` is emitted before the pre-publication proof. The detailed
+ownership and resume contract is in `pkg/hfdownloader/doc.go`.
+
 Cache-mode jobs include `hubDir`, the frozen exact Hub storage directory.
 `outputDir` keeps its existing meaning: the app/friendly root in cache mode,
 or the local output root in flat mode. Jobs and history record both roots;
@@ -971,11 +993,104 @@ entry in the status-to-code mapping, so `error_detail.code` is the generic
 
 Download reliability settings:
 
+- `verify` — the post-download verification mode, applied to LFS files as well: `none` performs no post-download content hash (HTTP and ranged-response validation still apply during the transfer); `size` (the default) checks the exact expected size and complete validated transfer coverage on both the multipart and single-request paths and performs no full-file SHA-256 reread on the normal transfer path (the pre-download skip check, an inherited single-path `.part` proof, an unpinned-identity proof, and a known digest with no known expected size may still hash); `sha256` verifies the full file against the known digest with at most one full-file read, always before the destination/blob is published when a known digest exists, so a mismatch never publishes corrupt bytes and the staging data is discarded (a retry re-downloads from scratch); when `sha256` has no known digest, the HEAD-ETag fallback remains a post-publication check; `etag` proves a known SHA-256 digest with that same single pre-publication pass, while non-LFS ETag-only files keep the historical no-post-check behavior. A known digest is never hashed only after publication. Resume state from an older or unsupported format is not migrated: only a valid version-4 ranged record, or a single-request `.part` with a matching pinned identity sidecar, is resumed (an exactly-sized partial is published without a request only when clean response framing is also recorded); the file is otherwise re-downloaded from zero while already-published content is untouched, while an unfenced older/unsupported record that cannot be proven dead is refused as unproven and preserved. The detailed proof and resume rules are in `pkg/hfdownloader/doc.go`.
 - `retries` — the non-progress retry budget per file/part request. A non-truncating attempt that advances the on-disk resume offset strictly beyond the highest offset reached refunds this budget and resets the backoff. For a single-file transfer, a response that ignores Range with `200 OK` restarts the partial and does not refund the budget, even if that attempt writes beyond the previous high-water mark; the new high-water mark is still recorded, so a later bodyless failure earns no refund. Multipart transfers still require `206 Partial Content` and do not accept `200` as a part. Progress refunds can increase the number of retries, but a separate lifetime retry-count ceiling limits retries after individual attempts return. That ceiling does not bound the duration or bytes of a single request that continues delivering data.
 - `stallTimeout` — a duration string (`"60s"`, `"2m"`). A body read that delivers no bytes for this long is aborted and retried from the current on-disk offset instead of hanging the job. An explicit `"0"` or `"0s"` disables the watchdog; empty preserves the current value. Invalid durations are rejected with `400` and are not persisted.
-- Retry backoff defaults to 400ms initially and 10s maximum. Library callers may override these values; the Settings API does not expose them. When a `429`/`503` response carries a `Retry-After` header or the Hub `RateLimit` header, the downloader waits the larger of that server-requested time and its local backoff, capped at 5 minutes. Retries include `429` and all `5xx`; other `4xx` responses are terminal for that file, while `401`, `403`, and `404` fail the whole job. Optional verification `HEAD` metadata failures are ignored; the actual file request remains authoritative. Cache storage normally moves a completed temporary file into place by rename. If that rename fails, the fallback copies to a staging file in the destination directory and renames the completed stage into place; this prevents a partial fallback copy from appearing at the final blob path, but does not provide crash durability or rollback guarantees.
+- The obsolete record-age `StaleTimeout` library setting is removed (`Settings.StaleTimeout`, `HFCache.StaleTimeout` and `DefaultStaleTimeout` no longer exist, and the cache constructors no longer take it): ownership is fenced by the destination ownership domain and a record's age never authorizes a takeover, so there is no replacement setting.
+- Retry backoff defaults to 400ms initially and 10s maximum. Library callers may override these values; the Settings API does not expose them. When a `429`/`503` response carries a `Retry-After` header or the Hub `RateLimit` header, the downloader waits the larger of that server-requested time and its local backoff, capped at 5 minutes. Retries include `429` and all `5xx`; other `4xx` responses are terminal for that file, while `401`, `403`, and `404` fail the whole job with an actionable message (accept the repository terms / use a token with access, or file not found). Optional verification `HEAD` metadata failures are ignored; the actual file request remains authoritative.
+- A completed cache blob is placed with a no-replace primitive, so an existing `blobs/<known-sha>` is not replaced by a domain participant; on a filesystem without hard links the placement is a check-then-rename performed while the blob key's ownership domain is held exclusively. If placement fails (for example a cross-device move), the cache store copies the payload to a staging file in the destination directory under the same domain and renames it into place; that final rename is not a no-replace primitive, and the fallback provides no crash durability or rollback guarantees. A writer that loses the race discards its own staging pair and reports the item complete. Every writer of one blob key, including both transfer routes and the exported `FinalizeBlob`, shares that one domain. The detailed publication tiers are in `pkg/hfdownloader/doc.go`.
 
-A permanent `401`, `403`, or `404` response for a file fails the whole job immediately with an actionable message (accept the repository terms / use a token with access, or file not found). `429` and every `5xx` are retryable. Other `4xx` statuses fail only the affected file and are not retried. Multipart transfers still require `206 Partial Content`; a `200` response to a part-range request is not accepted as a part.
+Multipart transfers write ranged workers directly into one staging file and
+resume from durable per-range metadata, including when the connection count
+changes between runs, so finalization is an atomic rename plus link work, never
+a full-file assembly copy. Never assemble or publish after cancellation or a
+known part error. Resume state is trusted only when it matches the
+resolved commit, repository, path and expected size, is pinned on both sides,
+and tiles the file with normalized completion; a record whose payload is missing
+or resized is discarded rather than published as zeros, and a staging file's
+on-disk length is not completion evidence because staging files are preallocated.
+The transfer is built from that resolved commit (tree walk and per-file URLs);
+when the endpoint resolves no commit, an unpinned identity with a known digest is
+content-proved once before publication. The ranged record is version 4 and is
+the only resumable version. A fenced other-version record (or one whose owner is
+provably dead or is this process) is discarded, never migrated, and the file is
+re-downloaded from zero while already-published content is untouched; an
+unfenced other-version record whose owner cannot be proven dead is refused as
+unproven and preserved. Every pre-#140 `.part-NN`/`.parts.json` family is
+likewise discarded and never migrated. Existing version-4 state keeps the
+multipart route even below the
+configured threshold; without range support the downloader warns, downloads the
+full file through the single path, and removes the obsolete state only after the
+final file is durable. The single-request `.part` is a sequential prefix
+identified by a versioned sidecar; its bytes are inherited only under a matching,
+pinned identity, and an exactly-sized partial is published without a request
+only when clean framing at the exact expected byte count is recorded. Otherwise
+the final byte is re-requested, and a body error during that revalidation leaves
+it uncommitted for a later retry; unknown expected size means no resume. The
+sidecar survives an interrupted run and is removed with its partial. Every 206
+must match the exact requested `Content-Range`, expected total and body length,
+writes are bounded to the requested range, and the file must have exactly the
+expected size before the rename. The multipart route never imports a
+single-route `.part`; a `.part` without a matching identity record is never
+inherited. A durable proof-pending flag forces a re-proof on resume in every
+mode except `none`. If
+an LFS item remains unknown-size after HEAD, Download uses the single-path temp
+and the normal cache-store path, so the blob and its snapshot/friendly entries
+are created from the completed file.
+
+Cache mode derives its ownership roots from the frozen storage associations:
+Hub items use `H/.hfdesk-control/v1`, derived only from `HubDir` H, and
+friendly-view items use `R/.hfdesk-control/v1`, derived from cache root R. They
+are independent when H and R are independent; a cache link operation admits its
+actual snapshot and friendly paths under the corresponding roots. Clients
+sharing H converge without a per-user ownership setting — that statement is
+cache-scoped: cache keys derive from the control tree persisted under H, not
+from the destination path spelling. `OwnershipDir` is a
+library `hfdownloader.Settings` option for flat `OutputDir` mode only, where
+cross-host convergence is governed by the realm-relative conditions stated
+under selected deletion below and is not implied by resolving the same
+directory alone; cache-mode
+use of a non-empty value is rejected rather than selecting another control
+namespace. It is not an HTTP setting. Cache node IDs and profiles persist in a
+typed control tree whose `metadata/` branches are separate from user components
+in `children/`. The legacy cache constructors that accept `OwnershipDir` return
+a cache whose ownership operations report the same configuration error. Current
+writers create no payload-side lock siblings. In
+particular a flat model named `foo.incomplete.lock` is an ordinary destination,
+independent of `foo`.
+
+An exclusive scope holder is waited for (bounded, context-aware, effective five
+minutes), never taken over; unresolved reader contention also fails closed. A
+waiting item returns its `MaxActiveDownloads` slot and reacquires it before
+transfer. A writer that cannot acquire the applicable H/R cache scope or flat
+realm fails before writing a payload and preserves existing partial data. Cache
+operations that require cache-owned admission — whole-repository delete, mirror
+removal and overwrite, selected HF deletion — likewise fail closed with `500`
+(or `errors[]` for mirror) when the control tree cannot be established on the
+filesystem, rather than mutating without exclusion.
+Mixed-version writers from a branch-only build that still relied on obsolete
+payload-side lock files are unsupported. New v4 records carry `LockFenced` and
+an `OwnershipFence` bound to the current cache-root/key or flat realm/key;
+`LockFenced` alone is not proof. A legacy, unknown or mismatched proof is
+preserved/refused unless self-identity or same-host owner death independently
+permits reclaim. Only a published content-addressed blob is completion proof by
+existence; an arbitrary destination follows the authoritative skip decision.
+Cleanup of staging artifacts, including obsolete pre-#140 parts, runs under the
+applicable item scope and removes only route-owned artifacts. A route removes
+only the artifacts it creates.
+
+An unproven staging record (including a legacy `LockFenced`-only record, an
+unknown/mismatched realm proof, or unreadable/unparseable current-format state)
+is preserved, never taken over, and refused with
+`ErrStagingOwnershipUnproven`; the operator removes the staging pair and retries,
+after establishing that no client still uses it. Never remove persistent cache
+metadata locks under an H/R `.hfdesk-control/v1` tree or flat-mode locks under
+`<OwnershipDir>/v1/` while a participant may hold them.
+`CheckBlob` reports
+`BlobDownloading`, `BlobStale`, or `BlobOwnershipUnknown` plus an
+`ErrBlobOwnershipUnknown` error; the incomplete payload is preserved and an
+unknown state is never a successful skip. The exact domain keys, staging names
+and publication tiers are in `pkg/hfdownloader/doc.go`.
 
 Token handling:
 
@@ -1072,6 +1187,24 @@ DELETE /api/cache-selection
 POST   /api/cache/rebuild
 DELETE /api/cache/{owner}/{repo}?type=model
 ```
+
+Every cache surface separates published content from the downloader's staging
+artifacts with one exhaustive, name-based classification. Staging names include
+the single-request `tmp-<name>` family (with `.part`, `.part.meta` and
+`.lock`), the ranged `<name>.incomplete`/`.meta` pair and its temp, the
+persistent `<name>.lock`, the obsolete pre-#140 `<name>.part-NN` and
+`<name>.parts.json` family, the flat-mode partials, and the cache store's
+`<name>.tmp-<random>` copy temp. A published blob is a canonical 64-hex SHA-256
+name; any other name in `blobs/` is an unusual published name and is treated as
+content. A `blobs/` name that carries a staging shape is treated as a staging
+artifact by every surface, including deletion, even if it was published
+content, so it is never counted, listed as cached content, copied, verified or
+deleted. The exclusion is scoped to `blobs/`: a file outside that namespace
+(for example a snapshot entry named `tokenizer.model.meta`) is content and is
+both copied and verified by the mirror. A blob key that names a staging shape is
+refused before placement by the public storage paths (`StoreDownloadedFile`,
+`FinalizeBlob`), so a successful store always has a reachable result. The
+canonical list and boundary rules are in `pkg/hfdownloader/doc.go`.
 
 `GET /api/cache-selection` returns a read-only, fresh view of GGUF groups for
 the requested repository and explicit repository type. `type` is required and
@@ -1196,9 +1329,59 @@ all confirmed members intact. Unrelated staging files do not by themselves
 prevent deleting a completed selection; ordinary opaque keys and `.part` /
 `.parts.json` names outside these producer-shaped namespaces remain eligible.
 The server does not cancel jobs. HF mutation excludes writers to the
-selected repository reference namespace and associated friendly view. Local
-selected-delete admission uses complete frozen plan destinations when
-available. A matching run activity with a known and complete plan is
+selected repository reference namespace and associated friendly view. For an
+HF location this now also holds across processes: before the first unlink the
+delete takes cache-owned admission over the repository tree and its friendly
+view and holds it through the operation, so a live download in another process
+sharing the cache refuses the request with the same `409`. The local-root
+location kind gets the same protection through the flat ownership realm: entry
+admission over the exact member paths is taken before any identity pin or
+unlink and held through the deletion, so a flat-mode writer in another process
+holding any member refuses with the same `409`. As for flat writers generally,
+the flat realm's identity is an opaque ID persisted inside the shared
+`Settings.OwnershipDir` (defaulting to the per-user `DefaultOwnershipDir()`;
+`<OwnershipDir>/realm-id`) and created atomically under an exclusive
+bootstrap gate on first use, so every participant resolving one `OwnershipDir`
+reads the same realm ID. That first creation belongs to a single participant:
+the bootstrap gate is an advisory lock of the same class as the cross-host
+locks described below, so on a filesystem whose advisory locks are not
+effective across clients — the same limitation that already bounds those
+locks — two hosts can each mint their own ID on first use and will then never
+exclude each other, silently, because their lock filenames differ; no safety is
+claimed for this mechanism on such filesystems. Path-derived flat keys derive
+from that realm ID and the item's path relative to the realm root, so
+participants whose
+`OwnershipDir` and items sit under one common shared mount exclude each other
+across hosts regardless of where that shared root is mounted; resolving the
+same `OwnershipDir` is necessary for that exclusion but is not on its own a
+complete sufficient condition. The true boundary: a split topology (the
+`OwnershipDir` and the items rooted under different mounts) requires
+identical rel-token input on every host — the same structure below the lowest
+common ancestor and the same descending component spellings — so
+independently mounted split topologies that preserve that structure still
+converge (the documented residual), and a
+target on another volume keeps its absolute-spelling derivation, so same-host
+behavior is unaffected in every shape; separately, the dev:ino alias keys
+(`item-entry` and the other entry/object keys) and tree-validation identity
+stay host-local on purpose for same-host bind-mount aliasing, so a foreign
+host's staged `OwnershipFence` never reads as current proof there. The
+record's fate follows the claim's two branches, not a blanket re-download: an
+UNPROVEN record (a foreign host — the host mismatch defeats death evidence —
+or a same-host live or mixed-version owner that cannot be reclaimed) is
+preserved and refused with `ErrStagingOwnershipUnproven`; nothing is
+re-downloaded automatically, its bytes are never silently reused, and the
+operator removes the named staging pair and retries. A RECLAIMABLE record
+(the owner proven dead or this process, including one fenced under the former
+flat keys) is taken over with its fence re-bound to the current proof and its
+committed ranges inherited — resumed, not re-downloaded — and only a version,
+range, size or identity mismatch discards it and restarts from zero. That
+shared directory is the flat realm's coordination boundary, not
+a new restriction. Lock files derived from
+the former host-local (device/inode) realm identity, or from the former
+absolute-path-spelling flat keys, are harmless residue and
+are never unlinked; mixed-version writers deriving either identity remain
+unsupported. Local selected-delete admission uses complete frozen plan
+destinations when available. A matching run activity with a known and complete plan is
 authoritative: if none of its frozen destinations overlaps the selected entry
 (including revalidated raw alias spellings), that activity cannot write the
 entry and is skipped; any overlapping or unresolved destination remains
@@ -1243,7 +1426,11 @@ HFDesk support policy. Regular-file deletion remains supported on the released
 platforms above. The Darwin hard-link pin fallback described above is a separate
 platform-specific behavior.
 The older `DELETE /api/cache/{owner}/{repo}` remains the separate
-whole-repository operation.
+whole-repository operation. It returns `409` without removing anything while an
+active download or another cache operation is using that repository or its
+friendly view, in this process or in another process sharing the cache; when
+cache ownership cannot be established on the filesystem it fails closed with
+`500` instead of removing anything.
 
 `locationId` is optional. When supplied, it must match a currently discovered
 location for this repo/type; unknown or stale IDs return `400` rather than
@@ -1393,7 +1580,40 @@ POST   /api/mirror/pull
 Mirror operations compare and synchronize selected local H with the explicit
 target root's `hub` child, regardless of local ENV. Mapping, verification, and
 `deleteExtra` remain bounded to those Hub roots. Mirror diff retains `localPath`
-as R and adds local `effectiveHubDir` and `hubDirSource`.
+as R and adds local `effectiveHubDir` and `hubDirSource`. A plain mirror
+destination gains a hidden `.hfdesk-control` control directory that holds the
+cache-owned admission state below. A local `DELETE /api/cache-selection`
+similarly creates the flat ownership realm directory
+(`<DefaultOwnershipDir()>/v1/`) when it does not exist yet, exactly as a flat
+download does.
+
+The mirror's scan, copy and verification use the same staging-artifact
+classification as the cache surfaces, scoped to the `blobs/` namespace: a
+staging artifact is never copied, counted or verified, so an unfinished
+download or legacy residue is never published as ready content. Copy and
+verification cover the same set, so a legitimate file outside `blobs/` (a
+snapshot entry named `tokenizer.model.meta`, for example) is copied and
+verified. A published blob is verified by size, a snapshot entry by its link
+target, and an unusual published blob name is copied and verified like any
+other content. Each mirror file copy takes cache-owned entry admission for its
+destination file and each `deleteExtra` removal takes cache-owned tree
+admission over the destination repository, so a live writer in any process
+sharing that cache is refused first: an in-place overwrite reports the refusal
+in `errors[]` with `success: false` and leaves the destination file intact, and
+a refused removal does the same instead of deleting. The copy itself remains a
+non-atomic truncate-and-write checked only by `io.Copy`'s error contract: its
+copied byte count is discarded, an explicit size comparison happens only in the
+opt-in `verify` pass, and that verification compares size rather than content
+hashes. It does not use the downloader's no-replace publication tiers. The
+mirror's symlink-leaf replacement takes entry admission and its directory
+creation takes the shared admitted directory-creation class (a directory
+that already exists needs no admission because nothing is mutated). A
+destination repository that vanishes between scan and
+deletion counts as deleted (at its scan-time size), like `os.RemoveAll`, not as
+an error; `deleted`/`deletedSize` count only repositories actually removed, and
+`copied`/`copiedSize`/`repos` count only repositories whose copy (and
+verification, when requested) completed without error. The canonical
+classification is in `pkg/hfdownloader/doc.go`.
 
 ## History and Disk
 
