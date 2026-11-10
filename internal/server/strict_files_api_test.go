@@ -218,3 +218,52 @@ func TestStrictSelectionContract(t *testing.T) {
 	waitJobStatus(t, s.jobs, first.ID, JobStatusCompleted, 15*time.Second)
 	waitJobStatus(t, s.jobs, third.ID, JobStatusCompleted, 15*time.Second)
 }
+
+// TestStrictSelectionRealDownloadMissFailsJob executes the documented
+// real-download leg of the strict contract (docs/API.md: "A real download
+// fails its job with the same error instead"): a well-formed selection that
+// holds an absent path passes the admission-time shape checks and is admitted
+// as a job, then the job fails with the same named error the plan endpoint
+// reports as 400 no_file_match — never silently downloading the present
+// sibling subset.
+func TestStrictSelectionRealDownloadMissFailsJob(t *testing.T) {
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_, _ = w.Write([]byte(`{"sha":"deadbeef"}`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			// a.bin exists; missing.bin does not, so the plan must refuse
+			// the whole selection instead of downloading the subset.
+			_, _ = w.Write([]byte(`[{"type":"file","path":"config.json","size":10},{"type":"file","path":"a.bin","size":4}]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
+
+	s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir(), LocalDir: t.TempDir(), Endpoint: hub.URL, MaxActive: 1, Proxy: &hfdownloader.ProxyConfig{NoEnvProxy: true}})
+	mux := http.NewServeMux()
+	s.registerAPIRoutes(mux)
+
+	// The selection is well-shaped, so admission succeeds and the miss only
+	// surfaces when the job plans against the revision's tree.
+	code, admitted, body := postStrict(mux, "/api/download", DownloadRequest{
+		Repo: "owner/model", StrictFiles: true, Filters: []string{"a.bin", "missing.bin"},
+	})
+	if code != http.StatusAccepted || admitted.ID == "" {
+		t.Fatalf("status=%d body=%s, want 202 admitting the job", code, body)
+	}
+
+	job := waitJobStatus(t, s.jobs, admitted.ID, JobStatusFailed, 15*time.Second)
+	if job.Status != JobStatusFailed {
+		t.Fatalf("job status=%s err=%q; want failed", job.Status, job.Error)
+	}
+	// Mirrors the plan endpoint's no_file_match naming: the ErrNoFileMatch
+	// sentinel text plus the absent path.
+	if !strings.Contains(job.Error, hfdownloader.ErrNoFileMatch.Error()) {
+		t.Fatalf("job error=%q; want it to contain %q", job.Error, hfdownloader.ErrNoFileMatch.Error())
+	}
+	if !strings.Contains(job.Error, "missing.bin") {
+		t.Fatalf("job error=%q; want it to name the absent path", job.Error)
+	}
+}
