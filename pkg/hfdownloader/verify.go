@@ -98,13 +98,7 @@ func shouldSkipLocalCtx(ctx context.Context, it PlanItem, dst string) (bool, str
 	}
 
 	if it.LFS && it.SHA256 != "" {
-		if err := verifySHA256Ctx(ctx, dst, it.SHA256); err == nil {
-			return true, "sha256 match", nil
-		} else if verr := ctx.Err(); verr != nil {
-			// Cancelled mid-verify: surface the cancellation, do not skip.
-			return false, "", verr
-		}
-		return false, "", nil
+		return skipLocalByHashCtx(ctx, it, dst)
 	}
 
 	if it.Size > 0 && fi.Size() == it.Size {
