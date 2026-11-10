@@ -110,6 +110,17 @@ const (
 	// fact is therefore carried by Status.Running and not by this state,
 	// which stays the diagnosis of the registration.
 	StateBroken State = "broken"
+	// StateMasked means the registration is masked persistently — the
+	// symbolic link to /dev/null at the registration file — so the
+	// supervisor cannot start it until an administrator unmasks it. Like
+	// StateBroken it is the diagnosis of the registration; a process that
+	// still runs is carried by Status.Running.
+	StateMasked State = "masked"
+	// StateMaskedRuntime means the registration is masked at runtime
+	// ("systemctl mask --runtime"): the mask lives with the supervisor and
+	// leaves no file at the registration path. The two terms are the ones
+	// the masked-unit refusal names its unmask command for.
+	StateMaskedRuntime State = "masked-runtime"
 	// StateUnknown means the supervisor did not report a usable state.
 	StateUnknown State = "unknown"
 )

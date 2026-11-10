@@ -882,9 +882,35 @@ func (m *systemdManager) Status(ctx context.Context) (Status, error) {
 		UnitPath: path,
 	}
 
+	// A masked registration is named by its mask and not by the state the
+	// supervisor reports for it: "stopped" hides the mask that explains
+	// why the instance cannot start. The rule and the two terms are the
+	// ones the masked-unit refusal uses — the supervisor reports the kind
+	// ("masked" / "masked-runtime"), and the link to /dev/null at the unit
+	// path identifies a persistent mask even when the "is-enabled" read
+	// degrades to an empty answer. An unreachable supervisor keeps its
+	// documented carve-out instead: the status reports unknown with the
+	// read error then, and the mask names only the states the status
+	// describes. status describes and never refuses, so the mask replaces
+	// only the state: the running fact is still read below and no error is
+	// raised for the mask itself.
+	enablement := m.registrationEnablement(ctx)
+	masked := enablement.masked || unitPathPersistentMask(path)
+	maskedState := StateMasked
+	if enablement.maskedRuntime {
+		maskedState = StateMaskedRuntime
+	}
+
 	content, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
+			// A runtime mask lives with the supervisor and leaves no
+			// file at the unit path: the absent file alone must not
+			// read as "not installed" while the mask is reported.
+			if masked {
+				status.State = maskedState
+				return status, nil
+			}
 			status.State = StateNotInstalled
 			status.Detail = fmt.Sprintf("the unit file does not exist: %s", path)
 			return status, nil
@@ -933,6 +959,9 @@ func (m *systemdManager) Status(ctx context.Context) (Status, error) {
 		return status, showErr
 	}
 	status.State = show.State
+	if masked {
+		status.State = maskedState
+	}
 	switch status.State {
 	case StateNotInstalled:
 		status.Detail = "the supervisor does not know the unit, reload the supervisor to pick the unit file up"

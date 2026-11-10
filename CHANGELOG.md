@@ -23,6 +23,7 @@
 
 ### Changed
 
+- `hfdesk service status` names a masked registration by its mask kind. A persistent mask reports `State: masked` instead of `stopped` and keeps the exit code `0`; a runtime mask reports `State: masked-runtime` instead of `not-installed`, and its exit code changes from `1` to `0`, so a script that branched on the old code sees the new one.
 - Mirror and rebuild mutations now join the destination ownership admission end
   to end (#151): the mirror's snapshot symlink-leaf replacement takes entry
   admission and its directory creation takes admitted directory creation, and
