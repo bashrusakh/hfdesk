@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 )
 
@@ -36,7 +35,14 @@ func BenchmarkPlanRepoDatasetSelectionInventory(b *testing.B) {
 				}
 				if mode == "all-train-with-matching-gguf" {
 					files = append(files, hfNode{Type: "file", Path: "train/model.gguf", Size: 10})
-					want = append(want, "train/model.gguf")
+					// Rule B (plan.go, dataset-group decision block): a
+					// recognized dataset group remains the governing selection
+					// when its files coexist with GGUFs that merely match the
+					// same filter; GGUF mode is the fallback only when no
+					// group is recognized. The colliding GGUF here is a
+					// companion that only matches the filter, so the expected
+					// selection is the group members only and train/model.gguf
+					// stays out of want.
 				}
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					switch {
@@ -136,6 +142,16 @@ func BenchmarkPlanRepoDatasetDecisionShapes(b *testing.B) {
 			b.Run(fmt.Sprintf("files-%d/%s", count, shape), func(b *testing.B) {
 				files := make([]hfNode, 0, count)
 				want := make([]string, 0, count)
+				// Rule A (dataset_feasibility.go: concreteDatasetFilterMatches
+				// and the attribution loop): a recognized dataset-group label
+				// attributes only the files that belong to that group, so the
+				// expected Subdir is per item and is built in lockstep with
+				// want: a group member is attributed its recognized label, a
+				// README companion matches no direct term and keeps "", and a
+				// path-mask collision (the label occurring only inside a file
+				// name) is attributed by the filter that actually applies to
+				// it, not by the group.
+				wantSubdirs := make([]string, 0, count)
 				filters := []string{"train"}
 				for i := 0; i < count; i++ {
 					switch shape {
@@ -145,10 +161,12 @@ func BenchmarkPlanRepoDatasetDecisionShapes(b *testing.B) {
 							name := fmt.Sprintf("partition/train_dataset-%05d.csv", pair)
 							files = append(files, hfNode{Type: "file", Path: name, Size: 10})
 							want = append(want, name)
+							wantSubdirs = append(wantSubdirs, "train")
 						} else {
 							name := fmt.Sprintf("partition/README-part-%05d.md", pair)
 							files = append(files, hfNode{Type: "file", Path: name, Size: 10})
 							want = append(want, name)
+							wantSubdirs = append(wantSubdirs, "")
 						}
 					case "path-mask-collisions":
 						filters = []string{"train", ".csv"}
@@ -158,6 +176,17 @@ func BenchmarkPlanRepoDatasetDecisionShapes(b *testing.B) {
 						}
 						files = append(files, hfNode{Type: "file", Path: name, Size: 10})
 						want = append(want, name)
+						// A member of the group train is attributed "train"
+						// (the recognized label, the longer applicable term).
+						// In test/train-part-%05d.csv the label occurs only
+						// inside the file name, so the file is not a group
+						// member: the label does not apply to it and the
+						// extension filter ".csv" attributes it instead.
+						if i%2 == 1 {
+							wantSubdirs = append(wantSubdirs, ".csv")
+						} else {
+							wantSubdirs = append(wantSubdirs, "train")
+						}
 					case "case-fold-classes":
 						filters = []string{"train", ".csv"}
 						pair := i / 2
@@ -166,6 +195,7 @@ func BenchmarkPlanRepoDatasetDecisionShapes(b *testing.B) {
 							name = fmt.Sprintf("TRAIN/PART-%05d.CSV", pair)
 						} else {
 							want = append(want, name)
+							wantSubdirs = append(wantSubdirs, "train")
 						}
 						files = append(files, hfNode{Type: "file", Path: name, Size: 10})
 					}
@@ -191,12 +221,12 @@ func BenchmarkPlanRepoDatasetDecisionShapes(b *testing.B) {
 					b.Fatalf("PlanRepo selected %d; want %d", len(plan.Items), len(want))
 				}
 				for i, item := range plan.Items {
-					wantSubdir := "train"
-					if shape == "nested-seeded-companions" && strings.Contains(item.RelativePath, "README-") {
-						wantSubdir = ""
-					}
-					if item.RelativePath != want[i] || item.Subdir != wantSubdir {
-						b.Fatalf("item[%d]=%q Subdir=%q; want %q Subdir=%q", i, item.RelativePath, item.Subdir, want[i], wantSubdir)
+					// Rule A pins both values exactly per item: the path must
+					// equal the expected selection and the Subdir must equal
+					// the term the product's attribution loop computes for
+					// that item.
+					if item.RelativePath != want[i] || item.Subdir != wantSubdirs[i] {
+						b.Fatalf("item[%d]=%q Subdir=%q; want %q Subdir=%q", i, item.RelativePath, item.Subdir, want[i], wantSubdirs[i])
 					}
 				}
 				b.ReportAllocs()
