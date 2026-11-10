@@ -176,12 +176,30 @@ func BenchmarkPlanRepoDatasetDecisionShapes(b *testing.B) {
 						}
 						files = append(files, hfNode{Type: "file", Path: name, Size: 10})
 						want = append(want, name)
-						// A member of the group train is attributed "train"
-						// (the recognized label, the longer applicable term).
-						// In test/train-part-%05d.csv the label occurs only
-						// inside the file name, so the file is not a group
-						// member: the label does not apply to it and the
-						// extension filter ".csv" attributes it instead.
+						// Two pins: a group member is attributed "train"
+						// (the recognized label, the longer applicable
+						// term), and the colliding file is attributed by
+						// the filter that actually applies to it. The
+						// colliding test/train-part-%05d.csv is ambiguous,
+						// not a plain non-member: hasSplitToken
+						// (internal/datasetselection/membership.go) finds
+						// a delimiter-bounded "train" token in its
+						// basename next to the directory label "test",
+						// and that package's conflicting-evidence branch
+						// (len(groups) > 1, sort.Strings) records the
+						// candidates PossibleLabels [test, train]. The
+						// model resolves the conflict to "test"; with
+						// that resolved label, concreteDatasetFilterMatches
+						// and the attribution loop
+						// (pkg/hfdownloader/dataset_feasibility.go) find
+						// the recognized label "train" inapplicable and
+						// ".csv" the only applicable term, so
+						// Subdir = ".csv". The precedence between
+						// conflicting candidate labels is not documented
+						// anywhere: resolution follows the sorted
+						// candidate order, so this case pins the model's
+						// current deterministic outcome; a follow-up is
+						// expected to document that precedence.
 						if i%2 == 1 {
 							wantSubdirs = append(wantSubdirs, ".csv")
 						} else {

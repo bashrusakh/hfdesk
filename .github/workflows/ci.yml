@@ -40,12 +40,18 @@ jobs:
         run: go test ./... -race
 
       # The benchmarks in pkg/hfdownloader assert product contracts (the
-      # dataset selection and attribution model, the verification read-pass
-      # budget, the ownership acquisition path), but `go test` never runs
-      # benchmarks, so without this step a contract drift in them stays
-      # silent. One iteration per benchmark is enough to execute their
-      # assertions.
+      # dataset selection and attribution model, the ownership acquisition
+      # path, and each benchmark fixture's own preconditions), but `go test`
+      # never runs benchmarks, so without this step a contract drift in them
+      # stays silent. One iteration per benchmark is enough to execute their
+      # assertions. The verification read-pass budget is asserted by a test
+      # (TestCacheDownloadMeasurementBoundary, run by the Test step), not by
+      # these benchmarks: BenchmarkRangedFinalization only reports the
+      # read-pass metrics.
       - name: Test contract benchmarks
+        env:
+          # Bound the payload: the step checks contracts, not performance, and the 1 GiB default would dominate the runner's wall clock and disk.
+          BENCHSIZE: "67108864"
         run: go test ./pkg/hfdownloader -run '^$' -bench '.' -benchtime=1x
 
   # The Go jobs never touch the Docker surface. Exercise the real entrypoint
