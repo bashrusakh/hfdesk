@@ -2589,6 +2589,23 @@ async function loadRepositoryDetails(entry) {
       await api('POST', '/download', body);
       showToast(`Download started: ${repo}`, 'success');
       navigateTo('jobs');
+      // Non-blocking start-flow plaque: the download is already queued, so
+      // this second plan only reports typed selector warnings for the
+      // request just started. The answer comes from a fresh server-side
+      // plan of the identical request taken right after Start — it is
+      // known only once that plan returns, and only filters_unmatched is
+      // surfaced here; any plan failure is ignored, and the job's own card
+      // reports its plan warnings when the job's plan completes.
+      if (filters.length > 0) {
+        try {
+          const plan = await api('POST', '/plan', { ...body, dryRun: true });
+          const unmatched = (Array.isArray(plan?.warnings) ? plan.warnings : [])
+            .filter(w => w?.code === 'filters_unmatched' && w.message);
+          if (unmatched.length) showToast(unmatched.map(w => w.message).join(' '), 'warning');
+        } catch (_) {
+          // The plaque is informational: never block or fail the start.
+        }
+      }
     } catch (e) {
       showToast(`Failed: ${e.message}`, 'error');
     }
@@ -2955,6 +2972,7 @@ async function loadRepositoryDetails(entry) {
           <span data-role="files"></span>
         </div>
         <div class="job-file-line" data-role="active-file" style="display:none"></div>
+        <div class="job-warning" data-role="warning" style="display:none; margin-top: 8px; font-size: 13px; color: var(--color-warning);"></div>
         <div class="job-error" data-role="error" style="display: none"></div>
     `;
     // Static fields (set once, never changed by progress events).
@@ -3104,6 +3122,19 @@ async function loadRepositoryDetails(entry) {
       fileEl.style.display = 'none';
       fileEl.textContent = '';
       fileEl.title = '';
+    }
+
+    // Plan warnings (e.g. filters_unmatched): a small warning line carrying
+    // what this job's own plan reported, hidden when it reported none.
+    const warningEl = el.querySelector('[data-role="warning"]');
+    const planWarnings = Array.isArray(job.warnings) ? job.warnings : [];
+    const warningText = planWarnings.map(w => w?.message).filter(Boolean).join(' ');
+    if (warningText) {
+      if (warningEl.textContent !== warningText) warningEl.textContent = warningText;
+      if (warningEl.style.display === 'none') warningEl.style.display = '';
+    } else if (warningEl.style.display !== 'none') {
+      warningEl.style.display = 'none';
+      warningEl.textContent = '';
     }
 
     // Error.
