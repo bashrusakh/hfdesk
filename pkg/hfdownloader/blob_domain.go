@@ -150,6 +150,10 @@ type blobDomainFence struct {
 	proof string
 }
 
+// acquireDefaultScopedBlobDomain builds the scope path set from the same
+// production builder the downloader uses (appendPartialOwnershipPaths), so
+// the helper cannot drift from production and drops no route-owned artifact —
+// notably the single-route identity sidecar dst.part.meta — from coverage.
 func acquireDefaultScopedBlobDomain(ctx context.Context, key, dst string) (*blobDomain, error) {
 	ownerDir, err := resolveOwnershipDir("")
 	if err != nil {
@@ -160,15 +164,14 @@ func acquireDefaultScopedBlobDomain(ctx context.Context, key, dst string) (*blob
 		return nil, err
 	}
 	proofPath := key
-	paths := []string{key, dst}
+	paths := appendUniqueOwnershipPaths([]string{key, dst}, appendPartialOwnershipPaths(nil, dst)...)
 	if strings.HasPrefix(key, flatDomainKeyPrefix) {
 		proofPath = strings.TrimPrefix(key, flatDomainKeyPrefix)
-		paths = appendUniqueOwnershipPaths(paths, proofPath, proofPath+".part", proofPath+".incomplete", proofPath+".incomplete.meta")
+		paths = appendPartialOwnershipPaths(paths, proofPath)
 	} else if strings.HasPrefix(filepath.Base(key), "path-") {
 		proofPath = dst
-		paths = appendUniqueOwnershipPaths(paths, dst+".part", dst+".incomplete", dst+".incomplete.meta")
 	} else {
-		paths = appendUniqueOwnershipPaths(paths, dst+".part", dst+".incomplete", dst+".incomplete.meta", key+".incomplete", key+".incomplete.meta")
+		paths = appendUniqueOwnershipPaths(paths, key+".incomplete", key+".incomplete.meta")
 	}
 	return acquireBlobDomainScoped(ctx, key, dst, realm, paths, proofPath)
 }
