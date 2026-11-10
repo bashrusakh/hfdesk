@@ -418,3 +418,251 @@ func TestDownloadSingle_IgnoredRangeRestartClearsInheritedProof(t *testing.T) {
 		t.Errorf("requests = %v, want the initial resume range %q", gotRanges, want)
 	}
 }
+
+// nonRangeHub serves one non-LFS file per path in rels with the same payload
+// bytes. Planning sets AcceptRanges=false for non-LFS items, so every file
+// of the plan is a no-range item.
+func nonRangeHub(t *testing.T, full []byte, rels []string) *httptest.Server {
+	t.Helper()
+	sha := singleTestSHA(full)
+	nodes := make([]string, 0, len(rels))
+	for _, rel := range rels {
+		nodes = append(nodes, fmt.Sprintf(`{"type":"file","path":%q,"size":%d,"sha256":%q}`, rel, len(full), sha))
+	}
+	tree := "[" + strings.Join(nodes, ",") + "]"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_, _ = w.Write([]byte(`{"sha":"commit123"}`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_, _ = w.Write([]byte(tree))
+		case strings.Contains(r.URL.Path, "/resolve/") || strings.Contains(r.URL.Path, "/raw/"):
+			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// flatDst returns the flat-mode destination for rel under out for o/r.
+func flatDst(t *testing.T, out, rel string) string {
+	t.Helper()
+	base, err := DestinationBase(out, "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(base, rel)
+}
+
+// seedFlatResumeState writes a pinned current-format versioned pair at
+// dst+".incomplete" whose identity matches this test's plan (repo o/r,
+// commit123, path rel, size total, the payload's digest).
+func seedFlatResumeState(t *testing.T, dst, rel string, total int64, full []byte) {
+	t.Helper()
+	staging := dst + ".incomplete"
+	seedRangedState(t, staging, "o/r", rel, total,
+		[]RangeProgress{{Start: 0, End: total/2 - 1, Committed: total / 2}, {Start: total / 2, End: total - 1}}, full)
+	meta, err := readStagingMeta(staging + ".meta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Commit = "commit123"
+	meta.SHA256 = singleTestSHA(full)
+	if err := writeStagingMeta(staging+".meta", meta); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// collectWarnings runs Download with cfg and returns every warning event's
+// message, in emission order.
+func collectWarnings(t *testing.T, cfg Settings, msgs *[]string, mu *sync.Mutex) {
+	t.Helper()
+	if err := Download(context.Background(), Job{Repo: "o/r", Revision: "main"}, cfg, func(ev ProgressEvent) {
+		if ev.Event == "warning" {
+			mu.Lock()
+			*msgs = append(*msgs, ev.Message)
+			mu.Unlock()
+		}
+	}); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+}
+
+// TestDownload_NoRangeSupportWarnsOnceForAllAffectedFiles pins the
+// aggregation: three files that each carry usable resume state while the
+// plan has no range support produce exactly ONE warning event, whose text
+// names the count (3) and the affected paths sorted, and every file still
+// completes at its final path — the transfer is unchanged.
+func TestDownload_NoRangeSupportWarnsOnceForAllAffectedFiles(t *testing.T) {
+	const total = 4_096
+	full := rangedTestPayload(total)
+	rels := []string{"f00.bin", "f01.bin", "f02.bin"}
+	srv := nonRangeHub(t, full, rels)
+	out := t.TempDir()
+	for _, rel := range rels {
+		seedFlatResumeState(t, flatDst(t, out, rel), rel, total, full)
+	}
+
+	cfg := Settings{
+		OutputDir:          out,
+		Endpoint:           srv.URL,
+		Concurrency:        2,
+		MaxActiveDownloads: 2,
+		MultipartThreshold: "1MB",
+		Verify:             "size",
+		Retries:            0,
+		StallTimeout:       "0",
+	}
+	var (
+		mu       sync.Mutex
+		warnings []string
+	)
+	collectWarnings(t, cfg, &warnings, &mu)
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := "resume state for 3 files cannot be used without HTTP range support; " +
+		"downloading the full files and attempting to discard the obsolete state after success: " +
+		"f00.bin, f01.bin, f02.bin"
+	if len(warnings) != 1 {
+		t.Fatalf("warning events = %d (%q), want exactly one aggregated warning", len(warnings), warnings)
+	}
+	if warnings[0] != want {
+		t.Errorf("warning = %q, want %q", warnings[0], want)
+	}
+	for _, rel := range rels {
+		assertExactFile(t, flatDst(t, out, rel), full)
+	}
+}
+
+// TestDownload_NoRangeSupportWarningBoundsAffectedPaths pins the bound: more
+// affected files than the plan notice's path cap still yield one warning
+// that names the count, the first sorted paths only, and how many more were
+// left unnamed — the unnamed paths stay out of the text.
+func TestDownload_NoRangeSupportWarningBoundsAffectedPaths(t *testing.T) {
+	const total = 4_096
+	full := rangedTestPayload(total)
+	rels := []string{"f00.bin", "f01.bin", "f02.bin", "f03.bin", "f04.bin", "f05.bin", "f06.bin", "f07.bin"}
+	srv := nonRangeHub(t, full, rels)
+	out := t.TempDir()
+	for _, rel := range rels {
+		seedFlatResumeState(t, flatDst(t, out, rel), rel, total, full)
+	}
+
+	cfg := Settings{
+		OutputDir:          out,
+		Endpoint:           srv.URL,
+		Concurrency:        2,
+		MaxActiveDownloads: 2,
+		MultipartThreshold: "1MB",
+		Verify:             "size",
+		Retries:            0,
+		StallTimeout:       "0",
+	}
+	var (
+		mu       sync.Mutex
+		warnings []string
+	)
+	collectWarnings(t, cfg, &warnings, &mu)
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := "resume state for 8 files cannot be used without HTTP range support; " +
+		"downloading the full files and attempting to discard the obsolete state after success: " +
+		"f00.bin, f01.bin, f02.bin, f03.bin, f04.bin, and 3 more"
+	if len(warnings) != 1 {
+		t.Fatalf("warning events = %d (%q), want exactly one aggregated warning", len(warnings), warnings)
+	}
+	if warnings[0] != want {
+		t.Errorf("warning = %q, want %q", warnings[0], want)
+	}
+	for _, rel := range []string{"f05.bin", "f06.bin", "f07.bin"} {
+		if strings.Contains(warnings[0], rel) {
+			t.Errorf("warning names the unnamed path %q: %q", rel, warnings[0])
+		}
+	}
+	for _, rel := range rels {
+		assertExactFile(t, flatDst(t, out, rel), full)
+	}
+}
+
+// TestDownload_NoResumeStateEmitsNoWarning pins the negative half: a
+// download whose items carry no resume state emits no warning event at all,
+// and the files still complete.
+func TestDownload_NoResumeStateEmitsNoWarning(t *testing.T) {
+	const total = 4_096
+	full := rangedTestPayload(total)
+	rels := []string{"f00.bin", "f01.bin"}
+	srv := nonRangeHub(t, full, rels)
+	out := t.TempDir()
+
+	cfg := Settings{
+		OutputDir:          out,
+		Endpoint:           srv.URL,
+		Concurrency:        2,
+		MaxActiveDownloads: 2,
+		MultipartThreshold: "1MB",
+		Verify:             "size",
+		Retries:            0,
+		StallTimeout:       "0",
+	}
+	var (
+		mu       sync.Mutex
+		warnings []string
+	)
+	collectWarnings(t, cfg, &warnings, &mu)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(warnings) != 0 {
+		t.Fatalf("warning events = %q, want none without resume state", warnings)
+	}
+	for _, rel := range rels {
+		assertExactFile(t, flatDst(t, out, rel), full)
+	}
+}
+
+// TestFormatRangelessResumeNotice pins the sentence itself: singular and
+// plural counts, sorted bounded paths with the unnamed remainder stated,
+// and the path cap shared with the plan notice — so a wording change cannot
+// slip through and the message never grows with the number of files.
+func TestFormatRangelessResumeNotice(t *testing.T) {
+	cases := []struct {
+		name  string
+		paths []string
+		want  string
+	}{
+		{
+			name:  "one file",
+			paths: []string{"only.bin"},
+			want: "resume state for 1 file cannot be used without HTTP range support; " +
+				"downloading the full file and attempting to discard the obsolete state after success: only.bin",
+		},
+		{
+			name:  "three files",
+			paths: []string{"a.bin", "b.bin", "c.bin"},
+			want: "resume state for 3 files cannot be used without HTTP range support; " +
+				"downloading the full files and attempting to discard the obsolete state after success: a.bin, b.bin, c.bin",
+		},
+		{
+			name:  "over the cap",
+			paths: []string{"p0.bin", "p1.bin", "p2.bin", "p3.bin", "p4.bin", "p5.bin", "p6.bin", "p7.bin"},
+			want: "resume state for 8 files cannot be used without HTTP range support; " +
+				"downloading the full files and attempting to discard the obsolete state after success: " +
+				"p0.bin, p1.bin, p2.bin, p3.bin, p4.bin, and 3 more",
+		},
+	}
+	for _, tc := range cases {
+		if got := formatRangelessResumeNotice(tc.paths); got != tc.want {
+			t.Errorf("%s: formatRangelessResumeNotice = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	if splitMentionNoticePathCap != 5 {
+		t.Errorf("splitMentionNoticePathCap = %d, want 5 (the messages above name five paths)", splitMentionNoticePathCap)
+	}
+}

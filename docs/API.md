@@ -955,9 +955,11 @@ messages again, and a repeat adds no entry and consumes none of the bound. A
 warning reports a fact about the download without failing it and without
 changing the selection — for example a revision that is not pinned to an
 immutable commit, a plan notice such as a split-precedence exclusion, resume
-state that cannot be used without HTTP range support, or a best-effort
-metadata write (a ref, friendly directory, rebuild script or manifest) that
-failed. The list is bounded: it keeps at most 20 distinct warnings, and once
+state that cannot be used without HTTP range support (reported once per
+download, naming the count and a bounded list of the affected files, not once
+per file), or a best-effort metadata write (a ref, friendly directory,
+rebuild script or manifest) that failed. The list is bounded: it keeps at
+most 20 distinct warnings, and once
 full a further distinct diagnostic is not added. It is distinct from
 `destinationWarning`, which the server computes once when the job is created.
 
