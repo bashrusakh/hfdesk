@@ -662,6 +662,55 @@ func TestSystemdRollbackReportsWhyTheRestoredStateIsUnknown(t *testing.T) {
 			t.Errorf("the unit file of the failed first installation still exists: %v", statErr)
 		}
 	})
+
+	t.Run("the first-installation rollback names the installation", func(t *testing.T) {
+		_ = systemdRollbackScriptedSupervisor(t)
+		m := &systemdManager{scope: ScopeUser}
+		path, err := m.unitPath()
+		assertNoError(t, err, "unitPath() = %v, want nil", err)
+		// The failed first installation captured no loaded state at all,
+		// so the report says what it could not capture — and it names the
+		// operation it restores for: a first installation is never called
+		// an update.
+		previous := previousRegistration{path: path, existed: false, loadedKnown: false}
+
+		_, err = m.reportUnitRollback(context.Background(), previous, nil, failure)
+		if !errors.Is(err, failure) {
+			t.Errorf("reportUnitRollback() = %v, want the original failure preserved", err)
+		}
+		assertNames(t, err.Error(), "reportUnitRollback()", []string{
+			"could not be restored and proven",
+			"the prior loaded state was not captured before the installation",
+		})
+		if strings.Contains(err.Error(), "before the update") {
+			t.Errorf("reportUnitRollback() = %q, must not call a first installation an update", err)
+		}
+	})
+
+	t.Run("the update rollback names the update", func(t *testing.T) {
+		_ = systemdRollbackScriptedSupervisor(t)
+		m := &systemdManager{scope: ScopeUser}
+		path, err := m.unitPath()
+		assertNoError(t, err, "unitPath() = %v, want nil", err)
+		opts := previousOptions(t)
+		content, err := renderCanonicalUnit(canonicalFacts(t, opts))
+		assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
+		// The replaced registration existed and its loaded state was not
+		// captured: the report keeps the update noun of that operation.
+		previous := previousRegistration{path: path, content: []byte(content), existed: true, loadedKnown: false}
+
+		_, err = m.reportUnitRollback(context.Background(), previous, nil, failure)
+		if !errors.Is(err, failure) {
+			t.Errorf("reportUnitRollback() = %v, want the original failure preserved", err)
+		}
+		assertNames(t, err.Error(), "reportUnitRollback()", []string{
+			"could not be restored and proven",
+			"the previous loaded configuration was not captured before the update",
+		})
+		if strings.Contains(err.Error(), "before the installation") {
+			t.Errorf("reportUnitRollback() = %q, must not call an update a first installation", err)
+		}
+	})
 }
 
 // mustRenderCanonical renders the canonical unit of the options or fails
