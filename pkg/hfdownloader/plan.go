@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -224,7 +225,37 @@ type Plan struct {
 	// split. A notice never changes the plan, its items, or the download
 	// outcome, and it never replaces an error.
 	Notices []string `json:"notices,omitempty"`
+	// Warnings are typed, non-fatal diagnostics about requested selectors
+	// that had no effect — today only ineffective shard ranges. A warning
+	// never changes the plan's items or the download outcome and never
+	// replaces an error. The slice is omitted when empty; the code set is
+	// extensible, so consumers branch on Code and treat unknown codes as
+	// informational.
+	Warnings []PlanWarning `json:"warnings,omitempty"`
 }
+
+// PlanWarning is one typed, non-fatal warning attached to a Plan. Code is a
+// stable string so clients can branch on it; Message is a bounded,
+// human-readable sentence; Segments carries the offending request input
+// slices (for example the ineffective shard-range segments) when the warning
+// is about specific segments, bounded by what the caller itself wrote.
+type PlanWarning struct {
+	Code     string   `json:"code"`
+	Message  string   `json:"message"`
+	Segments []string `json:"segments,omitempty"`
+}
+
+// Warning codes carried by PlanWarning.
+const (
+	// PlanWarningShardRangesNoShards reports that a shard-range request was
+	// made against a matched set containing no shard files at all, so the
+	// ranges narrowed nothing. Every requested segment is ineffective.
+	PlanWarningShardRangesNoShards = "shard_ranges_no_shards"
+	// PlanWarningShardRangesIneffectiveSegments reports that specific
+	// shard-range segments select no existing shard index of any matched
+	// shard family.
+	PlanWarningShardRangesIneffectiveSegments = "shard_ranges_ineffective_segments"
+)
 
 // safeCommitName reports whether commit is a single, non-escaping path
 // component. A real Hub commit is a hex SHA, but callers may also see fixture
@@ -295,6 +326,18 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 	// succeed on their own.
 	directFilterMatch := false
 	datasetMembershipMatch := false
+	// selectedItems carries the per-item selection proof alongside items: an
+	// item is selected only by a direct non-excluded filter match or by
+	// dataset-membership selection of its data role. Retained
+	// companions/metadata carry no proof, so shard ranges never narrow them
+	// and the ranges' zero-narrowed check can never be satisfied by a
+	// retained file that matched nothing.
+	var selectedItems []bool
+	// recognizedDatasetLabels and membershipDataSelected project the
+	// dataset-group proofs per file node; both stay nil outside a filtered
+	// dataset request.
+	var recognizedDatasetLabels []string
+	var membershipDataSelected []bool
 
 	mode := planAddressingMode{revision: job.Revision, commit: job.Revision}
 	custom := isCustomHubEndpoint(cfg.Endpoint)
@@ -454,6 +497,7 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		recognizedDatasetLabels = context.RecognizedLabels
 		// A recognized group label is a membership selector, so a literal path
 		// match on that label cannot satisfy the no-match guard for an otherwise
 		// empty selection. Explicit path forms have different normalized values
@@ -528,6 +572,15 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 					}
 				}
 			}
+			// Project the membership-selection proof per node from the final
+			// concrete world: an emitted data record is selected, while a
+			// retained companion (companion role) carries no selection proof —
+			// the per-node mirror of the datasetMembershipMatch predicate above.
+			membershipDataSelected = make([]bool, len(fileNodes))
+			for i := range datasetEvaluation.Records {
+				membershipDataSelected[i] = datasetEvaluation.Records[i].Selected &&
+					world.DataLabels[i] != "" && !world.Companion[i]
+			}
 			if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
 				return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
 			}
@@ -559,6 +612,20 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 				if can.Possible && cannot.Possible {
 					return nil, fmt.Errorf("dataset filter selection has ambiguous emitted set for %q: %w", n.Path, ErrAmbiguousSelection)
 				}
+			}
+		}
+	}
+	// selectionFilters holds the filters that can directly select an item: a
+	// recognized dataset group label is a membership selector, never a
+	// literal path match (mirroring datasetDirectPathMatch), so it is
+	// removed from the per-item direct proof in that mode only.
+	selectionFilters := job.Filters
+	if datasetGroupRequest {
+		selectionFilters = make([]string, 0, len(job.Filters))
+		for _, filter := range job.Filters {
+			normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
+			if !containsString(recognizedDatasetLabels, normalized) {
+				selectionFilters = append(selectionFilters, filter)
 			}
 		}
 	}
@@ -686,6 +753,23 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 				}
 			}
 		}
+		// Selection proof for this item: dataset-membership selection of its
+		// data role, or a direct non-excluded filter match. It rides with the
+		// item so shard ranges narrow only selected files, and the
+		// zero-narrowed check can never be satisfied by retained
+		// companions/metadata that matched nothing.
+		selected := datasetGroupRequest && membershipDataSelected != nil && membershipDataSelected[nodeIndex]
+		if !selected && len(job.Filters) > 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			for _, filter := range selectionFilters {
+				if filterMatchesPath(rel, filter, job.ExactMatch) {
+					selected = true
+					break
+				}
+			}
+		}
 		// Ordinary non-LFS model files keep their repo-relative destination.
 		// matchedFilter is used by AppendFilterSubdir to alter that destination;
 		// only dataset membership attribution and the established GGUF/LFS
@@ -773,6 +857,7 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 			Subdir:            matchedFilter, // empty when no filter matched
 			DestinationSubdir: destinationSubdir,
 		})
+		selectedItems = append(selectedItems, selected)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -786,6 +871,34 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 	}
 	plan := &Plan{Items: items, Commit: commitSHA, CommitPinned: commitPinned, CommitResolved: commitResolved}
 	plan.Notices = splitMentionNotices(job, datasetMembership, fileNodes, items)
+	// Shard ranges narrow the already-matched set, after notices (which
+	// describe the split-precedence rule, not this selector) and before the
+	// custom-endpoint probe walk, so only files that will actually download
+	// are probed. PlanRepo, ScanPlan and Download all reach this point
+	// through scanRepo, which keeps plan/dry-run/download parity in one
+	// owner. Notices above deliberately run on the unnarrowed set so a
+	// ranged-out shard is never misreported as split-rule-excluded.
+	if job.ShardRanges != "" {
+		ranges, err := parseShardRanges(job.ShardRanges)
+		if err != nil {
+			return nil, err
+		}
+		selectedBefore := 0
+		for _, isSelected := range selectedItems {
+			if isSelected {
+				selectedBefore++
+			}
+		}
+		narrowed, selectedKept, warnings := narrowShardRanges(plan.Items, selectedItems, ranges, job.ShardRanges)
+		// The zero-narrowed oracle is selection survival, never len(plan.Items):
+		// retained companions that matched nothing stay planned but can never
+		// satisfy a filtered request the ranges emptied of every selected file.
+		if selectedBefore > 0 && selectedKept == 0 {
+			return nil, fmt.Errorf("%w: shard ranges %q excluded every matched file", ErrNoFilterMatch, job.ShardRanges)
+		}
+		plan.Items = narrowed
+		plan.Warnings = warnings
+	}
 	if forced == nil && custom && !job.BranchVariant && mode.pinned {
 		probeDeadline := time.Now().Add(addressingProbeBudget)
 		useHFCache := cfg.CacheDir != "" || cfg.OutputDir == ""
@@ -1008,6 +1121,179 @@ func joinWithAnd(values []string) string {
 		return values[0]
 	}
 	return strings.Join(values[:len(values)-1], ", ") + " and " + values[len(values)-1]
+}
+
+// shardWarningSegmentCap bounds how many segments one warning message
+// lists; the remaining count is stated instead, so the sentence never grows
+// with the caller's expression. The Segments field still carries every
+// segment, which is itself bounded by the request that wrote it.
+const shardWarningSegmentCap = 5
+
+// parseShardFile reports whether rel names a split artifact in the
+// established "<prefix>-NNNNN-of-MMMMM.<ext>" form and, when it does,
+// returns the shard number written in the name and the family key: the
+// repository-relative path with the "-NNNNN-of-MMMMM" token removed, so the
+// shards of one family share one key across the matched set. The number
+// only orders members within their family; a name whose digits cannot fit
+// an int, whose token has no '-' before it, or whose total is zero is not
+// recognized — range narrowing must never drop a file on a malformed name.
+func parseShardFile(rel string) (number int, family string, ok bool) {
+	base := path.Base(rel)
+	sep := strings.LastIndex(base, "-of-")
+	if sep < 0 {
+		return 0, "", false
+	}
+	numEnd := sep
+	numStart := sep - 1
+	for numStart >= 0 && base[numStart] >= '0' && base[numStart] <= '9' {
+		numStart--
+	}
+	numStart++
+	if numStart == numEnd || numStart == 0 || base[numStart-1] != '-' {
+		return 0, "", false
+	}
+	totalStart := sep + 4
+	totalEnd := totalStart
+	for totalEnd < len(base) && base[totalEnd] >= '0' && base[totalEnd] <= '9' {
+		totalEnd++
+	}
+	if totalEnd == totalStart ||
+		(totalEnd < len(base) && base[totalEnd] != '.') ||
+		strings.Trim(base[totalStart:totalEnd], "0") == "" {
+		return 0, "", false
+	}
+	number, err := strconv.Atoi(base[numStart:numEnd])
+	if err != nil {
+		return 0, "", false
+	}
+	dir := path.Dir(rel)
+	if dir == "." {
+		dir = ""
+	}
+	family = dir + "/" + base[:numStart-1] + base[totalEnd:]
+	return number, family, true
+}
+
+// narrowShardRanges keeps only SELECTED shard files whose per-family index
+// falls inside the requested ranges. The selection proof is carried per
+// item: a file that never matched the filter — even a shard-shaped retained
+// companion — keeps its existing retention behavior untouched by ranges, and
+// non-shard-shaped files are never narrowed. Within each family of selected
+// files, members are ordered by the shard number written in their names and
+// indexed 1..M in that order, so 1-based ranges stay correct for both the
+// 1-based safetensors spelling and the 0-based dataset spelling; ranges
+// therefore address POSITIONS in written-number order, not the written
+// numbers themselves (for a family whose written numbers contain gaps the
+// two differ, for complete families they coincide). Ineffective ranges
+// surface as typed warnings instead of failing: a matched set without a
+// single selected shard file warns once naming every segment, and each
+// segment selecting no existing index is named. selectedKept reports how
+// many selected items survived, so the caller fails ErrNoFilterMatch when
+// ranges empty a non-empty selection even though retained companions remain
+// planned.
+func narrowShardRanges(items []PlanItem, selected []bool, ranges []shardRange, expr string) ([]PlanItem, int, []PlanWarning) {
+	isSelected := func(i int) bool { return i < len(selected) && selected[i] }
+	selectedTotal := 0
+	for _, flag := range selected {
+		if flag {
+			selectedTotal++
+		}
+	}
+	type shardMember struct {
+		item   int
+		number int
+	}
+	// Only selected items form families: retained shard-shaped files are not
+	// part of the ranged universe at all.
+	families := make(map[string][]shardMember)
+	for i, item := range items {
+		if !isSelected(i) {
+			continue
+		}
+		number, family, ok := parseShardFile(item.RelativePath)
+		if !ok {
+			continue
+		}
+		families[family] = append(families[family], shardMember{item: i, number: number})
+	}
+	if len(families) == 0 {
+		segments := make([]string, 0, len(ranges))
+		for _, r := range ranges {
+			segments = append(segments, r.text)
+		}
+		return items, selectedTotal, []PlanWarning{{
+			Code:     PlanWarningShardRangesNoShards,
+			Message:  fmt.Sprintf("shard ranges %q matched no shard file, so nothing was narrowed", expr),
+			Segments: segments,
+		}}
+	}
+	keep := make([]bool, len(items))
+	for i := range keep {
+		keep[i] = true
+	}
+	// The largest selected family supplies every reachable index (1..M), so a
+	// segment reaches an existing index exactly when it starts within that span.
+	largestFamily := 0
+	for _, members := range families {
+		sort.Slice(members, func(a, b int) bool {
+			if members[a].number != members[b].number {
+				return members[a].number < members[b].number
+			}
+			return items[members[a].item].RelativePath < items[members[b].item].RelativePath
+		})
+		if len(members) > largestFamily {
+			largestFamily = len(members)
+		}
+		for index, member := range members {
+			shardIndex := index + 1
+			selectedRange := false
+			for _, r := range ranges {
+				if shardIndex >= r.start && shardIndex <= r.end {
+					selectedRange = true
+					break
+				}
+			}
+			if !selectedRange {
+				keep[member.item] = false
+			}
+		}
+	}
+	var ineffective []string
+	for _, r := range ranges {
+		if r.start > largestFamily {
+			ineffective = append(ineffective, r.text)
+		}
+	}
+	var warnings []PlanWarning
+	if len(ineffective) > 0 {
+		warnings = append(warnings, PlanWarning{
+			Code:     PlanWarningShardRangesIneffectiveSegments,
+			Message:  fmt.Sprintf("shard range segments selected no shard (indices present: 1-%d): %s", largestFamily, joinShardSegments(ineffective)),
+			Segments: ineffective,
+		})
+	}
+	narrowed := make([]PlanItem, 0, len(items))
+	selectedKept := 0
+	for i, item := range items {
+		if !keep[i] {
+			continue
+		}
+		narrowed = append(narrowed, item)
+		if isSelected(i) {
+			selectedKept++
+		}
+	}
+	return narrowed, selectedKept, warnings
+}
+
+// joinShardSegments renders ineffective segments as a bounded list: at most
+// shardWarningSegmentCap are named, the rest are counted.
+func joinShardSegments(segments []string) string {
+	if len(segments) <= shardWarningSegmentCap {
+		return strings.Join(segments, ", ")
+	}
+	return fmt.Sprintf("%s, and %d more",
+		strings.Join(segments[:shardWarningSegmentCap], ", "), len(segments)-shardWarningSegmentCap)
 }
 
 func isCustomHubEndpoint(endpoint string) bool {

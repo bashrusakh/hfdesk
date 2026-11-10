@@ -138,6 +138,27 @@ type Job struct {
 	// model) but wanting the files saved alongside a different model's files.
 	// When empty, Repo is used for the destination path (default behaviour).
 	LocalRepo string
+
+	// ShardRanges narrows a filtered selection to specific shards of split
+	// files. The value is a comma-separated list of 1-based inclusive spans
+	// such as "1-100,120-185" (a bare "N" selects the single index N); it is
+	// only meaningful together with a non-empty Filters selection. Within
+	// each matched shard family — files named in the established split form
+	// "<prefix>-NNNNN-of-MMMMM.<ext>" — shards are ordered by their written
+	// shard number and indexed 1..M in that order, and only shards whose
+	// index falls inside the spans are planned. Ranges therefore address
+	// POSITIONS in written-number order, not the written numbers themselves:
+	// for a family whose written shard numbers contain gaps the positions and
+	// the numbers differ (for complete families they coincide). Files that
+	// are not shard-shaped (configs, index files, unsharded weights) are
+	// never affected, and ranges only narrow: a filter naming an absent path
+	// keeps its established ErrNoFilterMatch behavior. A malformed expression
+	// or ranges without filters fail validation with ErrInvalidShardRanges
+	// before any network work; ranges that empty the selection fail with
+	// ErrNoFilterMatch even when retained companion files that matched
+	// nothing remain planned, and ineffective ranges surface as
+	// Plan.Warnings instead of failing.
+	ShardRanges string
 }
 
 // Settings configures download behavior.

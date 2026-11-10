@@ -44,6 +44,13 @@ var (
 	// via errors.Is.
 	ErrAppendFilterSubdirPathFilter = errors.New("AppendFilterSubdir cannot be combined with a path-shaped filter")
 
+	// ErrInvalidShardRanges is returned when a shard-range expression is
+	// malformed (an empty expression or segment, a non-numeric token, a zero
+	// or negative index, or a reversed span such as "10-5") or when ranges
+	// are requested without a non-empty filter selection to narrow. Callers
+	// must reject it before any Hub contact; distinguishable via errors.Is.
+	ErrInvalidShardRanges = errors.New("invalid shard range expression")
+
 	// ErrBlobOwnershipUnknown means CheckBlob could not establish whether a live
 	// owner exists. Callers must return the error, not skip; the partial is kept.
 	ErrBlobOwnershipUnknown = errors.New("the owner of the incomplete download could not be determined")
