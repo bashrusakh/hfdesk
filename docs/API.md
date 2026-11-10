@@ -756,8 +756,20 @@ response item exposes only `path`, `size`, and `lfs`; `path` is
 repository-relative. The response does not include filter-attribution or
 destination-prefix fields.
 
+Successful responses to a filtered dataset request may also carry
+`notices`, an array of informational strings that is omitted when empty. A
+notice reports files the plan deliberately did not select: when a filter
+names a standard split and the tree contains files that mention that split
+without belonging to it, one notice names how many were excluded, the split
+label, the directories they live in, and at most five of the excluded paths
+(stating how many more were left unnamed). Notices are deterministic and
+non-fatal: they never change `files`, `totalSize`, `totalFiles`, or the
+download outcome, and they never replace an error. The bundled client
+renders them in the plan preview.
+
 The public Go planning contract is broader. `hfdownloader.PlanRepo` returns a
-`*Plan` whose `Items` are `PlanItem`s; the same `Plan` value is passed to
+`*Plan` whose `Items` are `PlanItem`s and whose `Notices` carry the same
+informational strings; the same `Plan` value is passed to
 `Settings.OnPlanComplete`. A `PlanItem` also exposes `DestinationSubdir`
 (`destinationSubdir`) and `Subdir` (`subdir`). `DestinationSubdir` is the
 candidate relative prefix selected by the matched filter; it is populated

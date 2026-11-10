@@ -102,7 +102,11 @@ func compileDatasetDecisionContextWithContext(ctx context.Context, nodes []hfNod
 		c.CoreLabels = append(c.CoreLabels, label)
 	}
 
-	// Labels are drawn solely from actual alternatives in this inventory.
+	// Labels are drawn from actual alternatives in this inventory, plus the
+	// split names files mention without belonging to them: a mentioned split
+	// must stay a recognized group label so a filter naming it remains a
+	// membership selector instead of literal path matching, but it never
+	// becomes any file's alternative.
 	labelSet := make(map[string]struct{})
 	evidence := make(map[int]datasetselection.Evidence, len(membership.Evidence))
 	for _, e := range membership.Evidence {
@@ -117,6 +121,12 @@ func compileDatasetDecisionContextWithContext(ctx context.Context, nodes []hfNod
 			labelSet[strings.ToLower(label)] = struct{}{}
 		}
 		for _, label := range e.DefiniteLabels {
+			if ctx.Err() != nil {
+				return c
+			}
+			labelSet[strings.ToLower(label)] = struct{}{}
+		}
+		for _, label := range e.MentionedNotMember {
 			if ctx.Err() != nil {
 				return c
 			}

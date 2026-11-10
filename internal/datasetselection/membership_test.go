@@ -19,11 +19,14 @@ func TestRecognize(t *testing.T) {
 		{Path: "other/data.parquet"},
 	}
 	r := Recognize(files)
-	assertIndexes(t, r.Groups["train"], 0)
+	assertIndexes(t, r.Groups["train"], 0, 7)
 	assertIndexes(t, r.Groups["test"], 1)
 	assertIndexes(t, r.Groups["customdata"], 2)
 	assertIndexes(t, r.Groups["default"], 9)
-	assertIndexes(t, r.Unresolved, 3, 4, 7)
+	// Index 7 (train/test.parquet) is a definite train member, not conflicting
+	// evidence: the directory component names the split and the "test" token in
+	// the basename does not outrank it, so only "train" remains.
+	assertIndexes(t, r.Unresolved, 3, 4)
 	for _, indices := range r.Groups {
 		for _, i := range indices {
 			if i == 5 || i == 6 || i == 8 {
@@ -31,6 +34,73 @@ func TestRecognize(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestRecognizeSplitDirectoryOutranksBasenameToken(t *testing.T) {
+	files := []File{
+		// The directory names validation; the "train" token in the basename
+		// does not outrank it, so this is a definite validation member.
+		{Path: "validation/train-part.parquet"},
+		// No directory component names a standard split, so the basename token
+		// still contributes the candidate: a definite train member.
+		{Path: "data/train-part.parquet"},
+		// Two standard-split directories remain conflicting evidence with both
+		// labels present; the precedence rule does not resolve that residual.
+		{Path: "train/test/items.parquet"},
+		// Two split tokens in one basename are the other surviving conflicting
+		// shape: the directory names no split, so both basename tokens are
+		// still collected as candidates.
+		{Path: "train_test.csv"},
+		// data/<custom>/ is not a standard split, so no directory component
+		// names one and the basename token still decides membership exactly
+		// as before the change: a definite train member.
+		{Path: "data/custom/train-0.csv"},
+	}
+	r := Recognize(files)
+	assertIndexes(t, r.Groups["validation"], 0)
+	assertIndexes(t, r.Groups["train"], 1, 4)
+	assertIndexes(t, r.Unresolved, 2, 3)
+	assertEvidence(t, r.Evidence[0], 0, EvidenceConventional, []string{"validation"}, []string{"validation"}, []EvidenceRole{EvidenceRoleData}, EvidenceRoleData)
+	assertEvidence(t, r.Evidence[1], 1, EvidenceConventional, []string{"train"}, []string{"train"}, []EvidenceRole{EvidenceRoleData}, EvidenceRoleData)
+	assertEvidence(t, r.Evidence[2], 2, EvidenceConflicting, []string{"test", "train"}, nil, []EvidenceRole{EvidenceRoleData}, "")
+	// Two split tokens in one basename are the second surviving conflicting
+	// shape: both candidates still come from the basename itself, which the
+	// precedence rule never suppresses.
+	assertEvidence(t, r.Evidence[3], 3, EvidenceConflicting, []string{"test", "train"}, nil, []EvidenceRole{EvidenceRoleData}, "")
+	assertEvidence(t, r.Evidence[4], 4, EvidenceConventional, []string{"train"}, []string{"train"}, []EvidenceRole{EvidenceRoleData}, EvidenceRoleData)
+	// The custom data/ directory is not a split, so the file belongs to the
+	// token's split and mentions no split it does not belong to.
+	assertMentionedNotMember(t, r.Evidence[4], nil)
+}
+
+func TestRecognizeReportsMentionedSplitNamesThatAreNotMembers(t *testing.T) {
+	files := []File{
+		// Mixed shape: a definite validation member whose "train" basename
+		// token is reported as known-but-not-a-member instead of a candidate.
+		{Path: "validation/train-part.parquet"},
+		// The directory pair still conflicts, and the suppressed "eval"
+		// basename token is reported the same way.
+		{Path: "train/test/eval-part.parquet"},
+		// Membership decided by the token itself: nothing is mentioned
+		// without being a member.
+		{Path: "zzz/train-part.parquet"},
+		// Both basename tokens are candidates, so neither is suppressed.
+		{Path: "train_test.csv"},
+		// Both directory components are candidates; the basename mentions
+		// no split at all.
+		{Path: "train/test/items.parquet"},
+	}
+	r := Recognize(files)
+	assertIndexes(t, r.Groups["validation"], 0)
+	assertIndexes(t, r.Groups["train"], 2)
+	assertIndexes(t, r.Unresolved, 1, 3, 4)
+	assertEvidence(t, r.Evidence[0], 0, EvidenceConventional, []string{"validation"}, []string{"validation"}, []EvidenceRole{EvidenceRoleData}, EvidenceRoleData)
+	assertMentionedNotMember(t, r.Evidence[0], []string{"train"})
+	assertEvidence(t, r.Evidence[1], 1, EvidenceConflicting, []string{"test", "train"}, nil, []EvidenceRole{EvidenceRoleData}, "")
+	assertMentionedNotMember(t, r.Evidence[1], []string{"eval"})
+	assertMentionedNotMember(t, r.Evidence[2], nil)
+	assertMentionedNotMember(t, r.Evidence[3], nil)
+	assertMentionedNotMember(t, r.Evidence[4], nil)
 }
 
 func TestRecognizeRetainsInputIndexAndCaseInsensitiveRoles(t *testing.T) {
@@ -244,6 +314,13 @@ func assertEvidence(t *testing.T, got Evidence, index int, reason EvidenceReason
 	t.Helper()
 	if got.InputIndex != index || got.Reason != reason || !sameStrings(got.PossibleLabels, possible) || !sameStrings(got.DefiniteLabels, definite) || !sameRoles(got.PossibleRoles, roles) || got.DefiniteRole != definiteRole {
 		t.Fatalf("evidence[%d] = %+v, want reason=%q possible=%v definite=%v", index, got, reason, possible, definite)
+	}
+}
+
+func assertMentionedNotMember(t *testing.T, got Evidence, want []string) {
+	t.Helper()
+	if !sameStrings(got.MentionedNotMember, want) {
+		t.Fatalf("evidence[%d] MentionedNotMember = %v, want %v", got.InputIndex, got.MentionedNotMember, want)
 	}
 }
 

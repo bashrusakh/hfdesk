@@ -24,6 +24,39 @@
 ### Changed
 
 - `hfdesk service status` names a masked registration by its mask kind. A persistent mask reports `State: masked` instead of `stopped` and keeps the exit code `0`; a runtime mask reports `State: masked-runtime` instead of `not-installed`, and its exit code changes from `1` to `0`, so a script that branched on the old code sees the new one.
+
+- Dataset split membership now has one documented precedence rule: a file
+  whose path places it inside a split directory belongs to that directory's
+  split, so a filter for a split its basename merely mentions never selects
+  it, whatever else the repository contains.
+
+- The rule changed what a group filter does with such a mention. A group
+  filter over a tree whose only mention of the split was inside another
+  split's directory used to fail the whole plan with the ambiguous-selection
+  error: when the tree also has a member of the filtered split, the request
+  now succeeds and the plan selects the group's own members; when it has
+  none, it fails closed with the same `no_filter_match` error a filter with
+  no matches already returns (`ErrNoFilterMatch`) instead of downloading the
+  mentioning file. The attribution of such a file follows the filter that
+  actually applies to it and no longer depends on the alphabetical order of
+  the candidate labels, so the same path shape behaves the same regardless of
+  the sibling directory's name — `test/train-part.csv` and
+  `validation/train-part.csv` now agree. The exclusion is now visible: the
+  plan and `POST /api/plan` carry a new `notices` field naming the number of
+  excluded files, the split label, the directories and up to five of the
+  excluded paths (stating how many more were left unnamed), and a download
+  job reports the same sentence as a warning — informational only, never an
+  error and never a change to the selection.
+
+- Two residual shapes remain conflicting evidence with both labels present
+  and keep the ambiguous-selection refusal, exactly as before: two
+  standard-split directories in one path (`train/test/items.parquet`) and two
+  split tokens in one basename (`train_test.csv`). A directory named for a
+  standard split wins even when it is a repository section rather than a
+  split in the repository's own sense: a file inside a `dev/`, `eval/` or
+  `test/` directory that is only a section is not selected by a filter for
+  the split its name mentions — a deliberate compromise of the heuristic.
+
 - Mirror and rebuild mutations now join the destination ownership admission end
   to end (#151): the mirror's snapshot symlink-leaf replacement takes entry
   admission and its directory creation takes admitted directory creation, and

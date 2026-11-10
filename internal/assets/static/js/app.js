@@ -2775,10 +2775,18 @@ async function loadRepositoryDetails(entry) {
         </div>
       `).join('') || '<p>No files found</p>';
 
+      // Plan notices are bounded, server-owned, non-secret strings (for
+      // example split-mention files the split-precedence rule excluded);
+      // escape each one before injecting it, like every other string here.
+      const noticesHtml = (Array.isArray(data.notices) ? data.notices : [])
+        .map(n => `<div class="analysis-warning-message">${escapeHtml(n)}</div>`)
+        .join('');
+
       setModalContent(`
         <p style="margin-bottom: 16px; color: var(--color-text-secondary);">
           ${data.totalFiles} files, ${formatBytes(data.totalSize)} total
         </p>
+        ${noticesHtml ? `<div class="analysis-warning" role="status" style="margin-bottom: 16px;">${noticesHtml}</div>` : ''}
         <div class="analysis-files" style="max-height: 400px;">
           ${filesHtml}
         </div>
