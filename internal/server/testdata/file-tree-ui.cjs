@@ -28,6 +28,13 @@ const overlapNode = { textContent: '' };
 let panelHTML = '';
 let panelBoxes = null;
 
+// Counters the render-contract scenarios observe: rowsRewrites counts full
+// rows-container rewrites (a targeted collapse must not cause one), and
+// focusedToggle records the caret the production toggle last focused — a
+// rows rebuild drops focus unless the handler hands it back.
+let rowsRewrites = 0;
+let focusedToggle = null;
+
 function decodeAttr(value) {
   return value.replace(/&quot;/g, '"').replace(/&#39;/g, "'")
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
@@ -58,6 +65,51 @@ function parseCheckBoxes(html) {
   return boxes;
 }
 
+// Locates a rendered data-children container (test paths are plain, so the
+// raw attribute value matches) and spans it to its depth-matched </div>, so
+// the production collapse handler can empty exactly that subtree in the panel
+// markup, like a real DOM write.
+function childrenStub(rawPath) {
+  const idx = panelHTML.indexOf('data-children="' + rawPath + '"');
+  if (idx === -1) return null;
+  const openEnd = panelHTML.indexOf('>', idx);
+  if (openEnd === -1) return null;
+  let depth = 1;
+  let pos = openEnd + 1;
+  let closeIdx = -1;
+  while (pos < panelHTML.length) {
+    const open = panelHTML.indexOf('<div', pos);
+    const close = panelHTML.indexOf('</div>', pos);
+    if (close === -1) break;
+    if (open !== -1 && open < close) { depth++; pos = open + 4; continue; }
+    depth--;
+    if (depth === 0) { closeIdx = close; break; }
+    pos = close + 6;
+  }
+  if (closeIdx === -1) return null;
+  return {
+    get innerHTML() { return panelHTML.slice(openEnd + 1, closeIdx); },
+    set innerHTML(value) {
+      panelHTML = panelHTML.slice(0, openEnd + 1) + String(value) + panelHTML.slice(closeIdx);
+      panelBoxes = null;
+    }
+  };
+}
+
+// The caret the production expand handler looks up after a rebuild: focus()
+// records which caret holds keyboard focus so the scenarios can assert it.
+function caretStub(rawPath) {
+  const idx = panelHTML.indexOf('data-toggle="' + rawPath + '"');
+  if (idx === -1) return null;
+  const path = decodeAttr(rawPath);
+  return {
+    dataset: { toggle: path },
+    textContent: '',
+    setAttribute() {},
+    focus() { focusedToggle = path; }
+  };
+}
+
 const filesPanelNode = {
   dataset: {},
   handlers: {},
@@ -65,10 +117,12 @@ const filesPanelNode = {
   setAttribute() {},
   removeAttribute() {},
   get innerHTML() { return panelHTML; },
-  set innerHTML(value) { panelHTML = String(value); panelBoxes = null; },
+  set innerHTML(value) { panelHTML = String(value); panelBoxes = null; focusedToggle = null; },
   querySelector(selector) {
     if (selector === '#fileTreeSummary') return summaryNode;
     if (selector === '#fileTreeOverlap') return overlapNode;
+    if (selector.startsWith('[data-children="')) return childrenStub(selector.slice(16, -2));
+    if (selector.startsWith('[data-toggle="')) return caretStub(selector.slice(14, -2));
     return null;
   },
   querySelectorAll(selector) {
@@ -85,9 +139,13 @@ const filesPanelNode = {
 
 // The rows container lives inside the rendered panel: writing it rewrites the
 // panel's row markup, exactly like innerHTML in the real DOM, so a re-render
-// (Clear, filter keystroke) reparses the visible checkboxes.
+// (Clear, filter keystroke) reparses the visible checkboxes. A rewrite also
+// destroys the rendered carets, so keyboard focus on one is lost — matching
+// the real DOM — until the production handler restores it.
 const rowsNode = {
   set innerHTML(value) {
+    rowsRewrites++;
+    focusedToggle = null;
     const marker = panelHTML.indexOf('id="fileTreeRows"');
     const openEnd = marker === -1 ? -1 : panelHTML.indexOf('>', marker);
     const footer = openEnd === -1 ? -1 : panelHTML.indexOf('<div class="file-tree-footer">', openEnd);
@@ -272,6 +330,50 @@ source = source.replace(marker, hook + '\n' + marker);
 vm.runInNewContext(source, context);
 const ui = window.test;
 window.messages = [];
+
+// The cap and the auto-collapse threshold are read from the loaded app.js so
+// this harness can never drift from the shipped constants; the fallbacks keep
+// it runnable against a pre-fix app.js that defines neither (used to capture
+// the unbounded-baseline failure evidence).
+const capSource = /const FILE_TREE_RENDER_CAP = (\d+)/.exec(source);
+const ROW_CAP = capSource ? Number(capSource[1]) : 300;
+const collapseSource = /const FILE_TREE_AUTO_COLLAPSE_FILES = (\d+)/.exec(source);
+const AUTO_COLLAPSE = collapseSource ? Number(collapseSource[1]) : 1000;
+
+const countMatches = (html, re) => (html.match(re) || []).length;
+// Row identities: a tree row (dir or file) vs the one "show more" row.
+const rowPattern = /file-tree-row file-tree-(?:dir|file)/g;
+const morePattern = /class="quant-row file-tree-more"/g;
+function lte(actual, limit, message) {
+  assertions++;
+  assert.ok(actual <= limit, `${message} (got ${actual}, limit ${limit})`);
+}
+
+// Directory-shaped fixture: dirCount directories of filesPerDir files each,
+// plus optional root-level files.
+function makeDirTree(dirCount, filesPerDir, rootFiles = 0) {
+  const files = [];
+  for (let d = 0; d < dirCount; d++) {
+    const dir = `dir${String(d).padStart(4, '0')}`;
+    for (let f = 0; f < filesPerDir; f++) files.push(file(`${dir}/f${String(f).padStart(4, '0')}.bin`, 64));
+  }
+  for (let r = 0; r < rootFiles; r++) files.push(file(`root${String(r).padStart(4, '0')}.bin`, 64));
+  return files;
+}
+
+// Simulates activating a rendered caret: the browser focuses the caret the
+// user activated before the click reaches the panel handler.
+function caretClick(path) {
+  const caret = {
+    dataset: { toggle: path },
+    textContent: '',
+    setAttribute() {},
+    closest(selector) { return selector === '[data-toggle]' ? caret : null; }
+  };
+  focusedToggle = path;
+  firePanel('click', caret);
+  return caret;
+}
 
 const ROOT = 'tree-case';
 let sequence = 0;
@@ -576,28 +678,193 @@ scenario('Clear, filter re-render and live reconcile keep rendered boxes on the 
 
 scenario('a large file tree renders with one index and one sort per node', () => {
   resetWorld();
-  const count = (html, re) => (html.match(re) || []).length;
   const time = fn => {
     const t0 = process.hrtime.bigint();
     const out = fn();
     return { out, ms: Number(process.hrtime.bigint() - t0) / 1e6 };
   };
   const sample = (label, dirCount, filesPerDir) => {
-    const files = [];
-    for (let d = 0; d < dirCount; d++) {
-      const dir = `dir${String(d).padStart(4, '0')}`;
-      for (let f = 0; f < filesPerDir; f++) files.push(file(`${dir}/f${String(f).padStart(4, '0')}.bin`, 64));
+    const analysis = setAnalysis(makeDirTree(dirCount, filesPerDir));
+    ui.renderFilesTab(analysis);
+    eq(ui.fileTreeState.nodes.size, dirCount * filesPerDir + dirCount + 1,
+      `${label}: one indexed node per file, directory and root`);
+
+    // Auto-collapsed initial view: root rows only, bounded by the cap — the
+    // old expectation (one rendered row per file) was exactly the defect.
+    const initial = time(() => { ui.fileTreeState.query = ''; return ui.renderFileTreeRows(); });
+    eq(countMatches(initial.out, /data-file="/g), 0,
+      `${label}: the initial view lists no file rows`);
+    eq(countMatches(initial.out, rowPattern), Math.min(dirCount, ROW_CAP),
+      `${label}: the initial view renders exactly min(root rows, cap) rows`);
+    if (dirCount > ROW_CAP) {
+      eq(countMatches(initial.out, morePattern), 1,
+        `${label}: a truncated root level carries exactly one show-more row`);
+      match(initial.out, new RegExp(`… ${dirCount - ROW_CAP} more not shown`),
+        `${label}: the show-more row states the hidden count`);
     }
-    setAnalysis(files);
-    const full = time(() => { ui.fileTreeState.query = ''; return ui.renderFileTreeRows(); });
-    eq(count(full.out, /data-file="/g), dirCount * filesPerDir, `${label}: the full render lists every file`);
+
+    // Expanding one directory emits its children, still within the cap.
+    const beforeExpand = rowsRewrites;
+    caretClick('dir0000');
+    eq(rowsRewrites, beforeExpand + 1, `${label}: expanding rebuilds the bounded view`);
+    const expandedHtml = filesPanelNode.innerHTML;
+    eq(countMatches(expandedHtml, /data-file="/g), filesPerDir,
+      `${label}: expanding a directory lists exactly its children`);
+    const wouldBe = dirCount + filesPerDir;
+    eq(countMatches(expandedHtml, rowPattern), Math.min(wouldBe, ROW_CAP),
+      `${label}: the expanded view stays within the cap`);
+    if (wouldBe > ROW_CAP) {
+      match(expandedHtml, new RegExp(`… ${wouldBe - ROW_CAP} more not shown`),
+        `${label}: the expanded view's hidden count is exact`);
+    }
+
+    // Collapsing is a targeted update: the descendant rows go away without a
+    // rows-container rewrite, and the view stays bounded.
+    const beforeCollapse = rowsRewrites;
+    caretClick('dir0000');
+    eq(rowsRewrites, beforeCollapse, `${label}: collapsing does not rewrite the rows container`);
+    const collapsedHtml = filesPanelNode.innerHTML;
+    eq(countMatches(collapsedHtml, /data-file="/g), 0,
+      `${label}: collapsing removes every descendant row`);
+    lte(countMatches(collapsedHtml, rowPattern) + countMatches(collapsedHtml, morePattern),
+      ROW_CAP + 1, `${label}: the collapsed view stays bounded`);
+
+    // A filter keystroke renders matches up to the cap with an honest total.
     const keystroke = time(() => { ui.fileTreeState.query = 'f0001'; return ui.renderFileTreeRows(); });
-    eq(count(keystroke.out, /data-file="/g), dirCount, `${label}: a filter keystroke renders one match per directory`);
+    const matchWouldBe = dirCount * 2; // one directory row plus one file row per directory
+    if (matchWouldBe <= ROW_CAP) {
+      eq(countMatches(keystroke.out, /data-file="/g), dirCount,
+        `${label}: a filter keystroke renders one match per directory`);
+      eq(countMatches(keystroke.out, morePattern), 0,
+        `${label}: an uncapped search needs no show-more row`);
+    } else {
+      eq(countMatches(keystroke.out, rowPattern), ROW_CAP,
+        `${label}: a capped search stops at the cap`);
+      match(keystroke.out, new RegExp(`Showing ${ROW_CAP} of ${matchWouldBe} matches`),
+        `${label}: the search states its total match count honestly`);
+    }
     ui.fileTreeState.query = '';
-    console.log(`TIME ${label}: full render ${full.ms.toFixed(1)} ms, keystroke ${keystroke.ms.toFixed(1)} ms`);
+    console.log(`TIME ${label}: initial ${initial.ms.toFixed(1)} ms, keystroke ${keystroke.ms.toFixed(1)} ms`);
   };
   sample('3000 files / 40 dirs', 40, 75);
   sample('8000 files / 800 dirs', 800, 10);
+});
+
+scenario('the auto-collapse threshold is documented and honored', () => {
+  resetWorld();
+  eq(AUTO_COLLAPSE, 1000, 'the documented auto-collapse threshold is 1000 files');
+
+  // At the threshold the fully expanded look is preserved exactly.
+  const atLimit = setAnalysis(makeDirTree(100, 10));
+  eq(atLimit.files.length, AUTO_COLLAPSE, 'the fixture sits exactly at the threshold');
+  eq(ui.fileTreeState.collapsed.size, 0, 'a revision at the threshold keeps every directory expanded');
+  ui.renderFilesTab(atLimit);
+  match(filesPanelNode.innerHTML, /data-children="dir0000">/, 'the root directory renders expanded');
+
+  // One file above the threshold: root rows and root files only.
+  const above = setAnalysis(makeDirTree(100, 10, 1));
+  eq(above.files.length, AUTO_COLLAPSE + 1, 'the fixture sits one file above the threshold');
+  eq(ui.fileTreeState.collapsed.size, 100, 'a revision above the threshold collapses every directory');
+  ui.renderFilesTab(above);
+  const html = filesPanelNode.innerHTML;
+  eq(countMatches(html, /data-file="/g), 1, 'collapsed directories contribute no descendant rows');
+  match(html, /data-file="root0000\.bin"/, 'the root file stays visible');
+  match(html, /data-children="dir0000" hidden/, 'the directory children container starts collapsed');
+  eq(countMatches(html, rowPattern), 101, 'the initial view is root rows plus the root file');
+  assertChecksMatchModel('auto-collapsed initial view');
+
+  // Expansion state survives a same-identity refresh, as before.
+  caretClick('dir0000');
+  eq(ui.fileTreeState.collapsed.size, 99, 'expanding removes the directory from the collapsed set');
+  ui.renderFilesTab(above);
+  eq(countMatches(filesPanelNode.innerHTML, /data-file="dir0000\//g), 10,
+    'the expansion survives a refresh of the same revision');
+});
+
+scenario('initial render of 5k–70k-file trees emits only root-level rows', () => {
+  resetWorld();
+  const rootRowsOnly = (label, dirCount, filesPerDir, rootFiles, totalFiles) => {
+    setAnalysis(makeDirTree(dirCount, filesPerDir, rootFiles));
+    eq(ui.fileTreeState.files.length, totalFiles, `${label}: the fixture lists the full file count`);
+    const html = ui.renderFileTreeRows();
+    eq(countMatches(html, /data-file="/g), 0, `${label}: the initial render emits no file rows`);
+    const rows = countMatches(html, rowPattern);
+    lte(rows, ROW_CAP, `${label}: the initial render is bounded by the cap`);
+    eq(countMatches(html, /file-tree-row file-tree-\w+" data-path="[^"]*" style="padding-left:8px"/g), rows,
+      `${label}: every emitted row is root-level`);
+    const rootRows = dirCount + rootFiles;
+    if (rootRows > ROW_CAP) {
+      eq(countMatches(html, morePattern), 1, `${label}: truncation adds exactly one show-more row`);
+      match(html, new RegExp(`… ${rootRows - ROW_CAP} more not shown`),
+        `${label}: the hidden count is exact`);
+    }
+  };
+  rootRowsOnly('5k files', 500, 10, 1, 5001);
+  rootRowsOnly('c4-scale files', 800, 86, 421, 69221);
+});
+
+scenario('expanding a huge directory stays within the row cap', () => {
+  resetWorld();
+  const analysis = setAnalysis(makeDirTree(1, 5000));
+  ui.renderFilesTab(analysis);
+  eq(countMatches(filesPanelNode.innerHTML, rowPattern), 1, 'the auto-collapsed view is one directory row');
+  eq(countMatches(filesPanelNode.innerHTML, /data-file="/g), 0, 'no child rows exist before expansion');
+
+  // Selection is model-based: the collapsed directory selects all 5000
+  // members while none of them is rendered.
+  clickBox('dir', 'dir0000');
+  eq(ui.fileTreeState.selected.size, 5000, 'a collapsed directory still selects its whole subtree');
+  match(summaryNode.textContent, /^5000 selected/, 'the footer totals the fully collapsed selection');
+  assertChecksMatchModel('selection while collapsed');
+
+  // Expansion creates the rows now, capped, with the honest remainder, and
+  // hands keyboard focus back to the caret that was activated.
+  const before = rowsRewrites;
+  caretClick('dir0000');
+  eq(rowsRewrites, before + 1, 'expanding rebuilds the bounded view');
+  eq(focusedToggle, 'dir0000', 'the caret keeps keyboard focus across the rebuild');
+  const expandedHtml = filesPanelNode.innerHTML;
+  const rows = countMatches(expandedHtml, rowPattern);
+  eq(rows, ROW_CAP, 'the expanded view renders exactly the cap');
+  eq(countMatches(expandedHtml, morePattern), 1, 'the overflow adds exactly one show-more row');
+  lte(rows + 1, ROW_CAP + 1, 'the expanded view never exceeds cap+1 rows');
+  eq(countMatches(expandedHtml, /data-file="/g), ROW_CAP - 1, 'one cap row is the directory itself');
+  match(expandedHtml, new RegExp(`… ${5000 - (ROW_CAP - 1)} more not shown`),
+    'the show-more row states the exact hidden count');
+  assertChecksMatchModel('after expanding a fully selected directory');
+
+  // Collapse: targeted row removal, bounded result, model untouched.
+  const beforeCollapse = rowsRewrites;
+  caretClick('dir0000');
+  eq(rowsRewrites, beforeCollapse, 'collapsing does not rewrite the rows container');
+  eq(focusedToggle, 'dir0000', 'the caret keeps keyboard focus through the targeted collapse');
+  eq(countMatches(filesPanelNode.innerHTML, /data-file="/g), 0, 'collapsing removes every descendant row');
+  lte(countMatches(filesPanelNode.innerHTML, rowPattern) + countMatches(filesPanelNode.innerHTML, morePattern),
+    ROW_CAP + 1, 'the collapsed view stays bounded');
+  eq(ui.fileTreeState.selected.size, 5000, 'collapsing never touches the selection model');
+});
+
+scenario('a search matching thousands is capped and reports its total', () => {
+  resetWorld();
+  const analysis = setAnalysis(makeDirTree(500, 10));
+  ui.renderFilesTab(analysis);
+  typeFilter('.bin');
+  const html = filesPanelNode.innerHTML;
+  const rows = countMatches(html, rowPattern);
+  eq(rows, ROW_CAP, 'the capped search renders exactly the cap');
+  eq(countMatches(html, morePattern), 1, 'the capped search adds exactly one show-more row');
+  lte(rows + 1, ROW_CAP + 1, 'the search view never exceeds cap+1 rows');
+  const totalMatches = 500 + 5000; // every directory row and file row matches '.bin'
+  match(html, new RegExp(`Showing ${ROW_CAP} of ${totalMatches} matches — narrow the filter`),
+    'the search states its total honestly and suggests narrowing');
+  doesNotMatch(html, /No files match the filter/, 'a capped result is not an empty result');
+  assertChecksMatchModel('while the search is capped');
+
+  // Clearing the filter returns to the collapsed root view, still bounded.
+  typeFilter('');
+  eq(countMatches(filesPanelNode.innerHTML, /data-file="/g), 0, 'clearing the filter restores the collapsed view');
+  lte(countMatches(filesPanelNode.innerHTML, rowPattern) + countMatches(filesPanelNode.innerHTML, morePattern),
+    ROW_CAP + 1, 'the restored view stays bounded');
 });
 
 scenario('Download selected posts the exact strict selection', async () => {

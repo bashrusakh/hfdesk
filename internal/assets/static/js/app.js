@@ -2361,6 +2361,13 @@ async function loadRepositoryDetails(entry) {
   };
   let fileTreeBoundPanel = null;
 
+  // One view renders at most FILE_TREE_RENDER_CAP rows plus one "show more"
+  // row stating the hidden count; above FILE_TREE_AUTO_COLLAPSE_FILES files
+  // a revision opens with every directory collapsed (root rows and root
+  // files visible), smaller revisions keep today's fully expanded look.
+  const FILE_TREE_RENDER_CAP = 300;
+  const FILE_TREE_AUTO_COLLAPSE_FILES = 1000;
+
   function fileTreeIdentity(data) {
     return `${data.is_dataset ? 'dataset' : 'model'}:${data.repo}@${data.branch || 'main'}`;
   }
@@ -2421,7 +2428,8 @@ async function loadRepositoryDetails(entry) {
   function resetFileTree(data) {
     const files = Array.isArray(data.files) ? data.files : [];
     const identity = fileTreeIdentity(data);
-    if (fileTreeState.identity !== identity) {
+    const identityChanged = fileTreeState.identity !== identity;
+    if (identityChanged) {
       fileTreeState.identity = identity;
       fileTreeState.selected = new Set();
       fileTreeState.collapsed = new Set();
@@ -2439,6 +2447,12 @@ async function loadRepositoryDetails(entry) {
     fileTreeState.sizes = sizes;
     fileTreeState.tree = buildFileTree(files);
     fileTreeState.nodes = indexFileTree(fileTreeState.tree);
+    if (identityChanged && files.length > FILE_TREE_AUTO_COLLAPSE_FILES) {
+      fileTreeState.collapsed = new Set();
+      fileTreeState.nodes.forEach(node => {
+        if (node.dir && node.path) fileTreeState.collapsed.add(node.path);
+      });
+    }
   }
 
   function fileTreeFindNode(path) {
@@ -2568,28 +2582,56 @@ async function loadRepositoryDetails(entry) {
     return st.cached ? selectableStatusChip('done') : '';
   }
 
+  // Lazy and bounded: only expanded directories emit descendant rows, and the
+  // walk stops emitting at FILE_TREE_RENDER_CAP, counting the remainder into
+  // one honest "show more" row at the truncation point.
   function renderFileTreeRows() {
     if (!fileTreeState.files.length) return '';
     const states = fileTreeFileStates();
     const query = fileTreeState.query.trim().toLowerCase();
+    const PLACEHOLDER = '<!--file-tree-more-->';
+    const expanded = node => !!query || !fileTreeState.collapsed.has(node.path);
+    // Prices a node without markup: its row plus, when expanded, its matches.
+    const countRows = node => {
+      let n = 1;
+      if (node.dir && expanded(node)) {
+        fileTreeSortedChildren(node).forEach(child => {
+          if (fileTreeMatches(child, query)) n += countRows(child);
+        });
+      }
+      return n;
+    };
+    const budget = { left: FILE_TREE_RENDER_CAP, shown: 0, hidden: 0, moreIndent: -1 };
     const renderNode = (node, depth) => {
       let html = '';
       fileTreeSortedChildren(node).forEach(child => {
         if (!fileTreeMatches(child, query)) return;
         const indent = 8 + depth * 18;
+        if (budget.left <= 0) {
+          // Past the cap rows are counted, never emitted; the row text is
+          // filled in after the walk, once the hidden total is known.
+          budget.hidden += countRows(child);
+          if (budget.moreIndent === -1) {
+            budget.moreIndent = indent;
+            html += PLACEHOLDER;
+          }
+          return;
+        }
+        budget.left--;
+        budget.shown++;
         if (child.dir) {
           const dirState = fileTreeDirState(child.path);
           // A filter forces matches visible regardless of collapse; the stored
           // expansion is restored when the query is cleared.
-          const expanded = query ? true : !fileTreeState.collapsed.has(child.path);
+          const open = expanded(child);
           const label = `${child.name}/`;
           html += `<div class="quant-row file-tree-row file-tree-dir" data-path="${escapeHtmlAttribute(child.path)}" style="padding-left:${indent}px">
               <input type="checkbox" class="file-tree-check" data-dir="${escapeHtmlAttribute(child.path)}"${dirState === 'on' ? ' checked' : ''} aria-label="${escapeHtmlAttribute('Select all files under ' + child.path + '/')}">
-              <button type="button" class="file-tree-caret" data-toggle="${escapeHtmlAttribute(child.path)}" aria-expanded="${expanded ? 'true' : 'false'}" aria-label="${escapeHtmlAttribute((expanded ? 'Collapse ' : 'Expand ') + label)}">${expanded ? '▾' : '▸'}</button>
+              <button type="button" class="file-tree-caret" data-toggle="${escapeHtmlAttribute(child.path)}" aria-expanded="${open ? 'true' : 'false'}" aria-label="${escapeHtmlAttribute((open ? 'Collapse ' : 'Expand ') + label)}">${open ? '▾' : '▸'}</button>
               <span class="file-tree-name file-tree-name-dir">${escapeHtml(label)}</span>
               <span class="file-tree-meta">${child.fileCount} file${child.fileCount === 1 ? '' : 's'}</span>
               <span class="quant-size">${formatBytes(child.size)}</span>
-            </div><div class="file-tree-children" data-children="${escapeHtmlAttribute(child.path)}"${expanded ? '' : ' hidden'}>${renderNode(child, depth + 1)}</div>`;
+            </div><div class="file-tree-children" data-children="${escapeHtmlAttribute(child.path)}"${open ? '' : ' hidden'}>${open ? renderNode(child, depth + 1) : ''}</div>`;
         } else {
           const st = states.get(child.path) || { cached: false, active: '' };
           html += `<div class="quant-row file-tree-row file-tree-file" data-path="${escapeHtmlAttribute(child.path)}" style="padding-left:${indent}px">
@@ -2603,7 +2645,15 @@ async function loadRepositoryDetails(entry) {
       });
       return html;
     };
-    return renderNode(fileTreeState.tree, 0)
+    let out = renderNode(fileTreeState.tree, 0);
+    if (budget.moreIndent !== -1) {
+      const text = query
+        ? `Showing ${budget.shown} of ${budget.shown + budget.hidden} matches — narrow the filter to see more`
+        : `… ${budget.hidden} more not shown — use the filter to narrow the view`;
+      out = out.replace(PLACEHOLDER,
+        `<div class="quant-row file-tree-more" style="padding-left:${budget.moreIndent}px"><span class="file-tree-meta">${text}</span></div>`);
+    }
+    return out
       || '<div class="file-tree-empty">No files match the filter.</div>';
   }
 
@@ -2680,17 +2730,23 @@ async function loadRepositoryDetails(entry) {
       const toggle = target?.closest?.('[data-toggle]');
       if (toggle) {
         const path = toggle.dataset.toggle;
-        const collapsing = !fileTreeState.collapsed.has(path);
-        if (collapsing) fileTreeState.collapsed.add(path);
-        else fileTreeState.collapsed.delete(path);
-        // Toggle just this subtree: a full row re-render would drop the focus
-        // from the caret the keyboard user just activated.
-        const children = panel.querySelector(`[data-children="${CSS.escape(path)}"]`);
-        if (children) children.hidden = collapsing;
         const dirName = `${path.slice(path.lastIndexOf('/') + 1)}/`;
-        toggle.textContent = collapsing ? '▸' : '▾';
-        toggle.setAttribute('aria-expanded', collapsing ? 'false' : 'true');
-        toggle.setAttribute('aria-label', `${collapsing ? 'Expand' : 'Collapse'} ${dirName}`);
+        if (!fileTreeState.collapsed.has(path)) {
+          fileTreeState.collapsed.add(path);
+          // Targeted update: no full re-render, so the caret keeps its focus.
+          const children = panel.querySelector(`[data-children="${CSS.escape(path)}"]`);
+          if (children) children.innerHTML = '';
+          toggle.textContent = '▸';
+          toggle.setAttribute('aria-expanded', 'false');
+          toggle.setAttribute('aria-label', `Expand ${dirName}`);
+        } else {
+          fileTreeState.collapsed.delete(path);
+          // Descendants were never rendered: rebuild the bounded view, then
+          // hand focus back to the caret for the keyboard user.
+          refreshFileTreeRows();
+          const caret = panel.querySelector(`[data-toggle="${CSS.escape(path)}"]`);
+          if (typeof caret?.focus === 'function') caret.focus();
+        }
         return;
       }
       if (target?.id === 'fileTreeClear') {
