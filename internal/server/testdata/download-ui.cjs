@@ -48,7 +48,8 @@ let source = fs.readFileSync('../assets/static/js/app.js', 'utf8');
 source = source.replace('  // Start\n', `
   window.test = {
     state, getConfiguredRouteOptions, routeKeyForAnalysis, renderRouteSelect,
-    routeSelectValue, renderSelectableItems, renderNonSelectableFiles, startDownload,
+    routeSelectValue, renderSelectableItems, renderFilesTab,
+    resetFileTree, fileTreeToggleFile, startDownload,
     saveSettings, resetSettings,
     setAnalysis(value) { currentAnalysis = value; }
   };
@@ -75,7 +76,7 @@ function select(id, analysis) {
 
 async function run(entry, type, { dataset = false, manual = '', low = false, choice } = {}) {
   const repo = 'fixture/case' + (++sequence);
-  const analysis = { repo, type, branch: 'custom', is_dataset: dataset };
+  const analysis = { repo, type, branch: 'custom', is_dataset: dataset, files: [{ path: 'model.bin', size: 123 }] };
   const id = entry === 'quant' ? 'quantRouteSelect' : entry === 'modal' ? 'dlModalRoute' : 'nonSelectableRoute';
   let key = select(id, analysis);
   if (choice !== undefined) {
@@ -94,7 +95,14 @@ async function run(entry, type, { dataset = false, manual = '', low = false, cho
   messages.length = 0;
   lowDestination = low;
   if (entry === 'quant') await window.downloadQuant(repo, 'weights', dataset, 'Weights', 'fixture/parent', repo);
-  if (entry === 'file') await window.downloadSingleFile(repo, 'model.bin', dataset);
+  if (entry === 'file') {
+    // The Files tree start surface checks files through selection state, then
+    // posts the strict request with the same Save to pick and disk guard the
+    // other entries exercise.
+    ui.resetFileTree(analysis);
+    ui.fileTreeToggleFile('model.bin');
+    await window.downloadSelectedFiles();
+  }
   if (entry === 'all') await window.startWizardDownload(repo, dataset);
   if (entry === 'modal') await window.confirmDirectDownload(repo, dataset, 'custom');
   if (entry === 'form') {
@@ -121,6 +129,7 @@ async function run(entry, type, { dataset = false, manual = '', low = false, cho
     assert.equal(download.data.outputDir, appPath, 'CreateJob retains the app/friendly root');
     assert.equal(download.data.hubDir || download.data.outputDir, preview.data.path, 'Physical job destination must match disk preview');
     if (entry === 'quant') assert.equal(download.body.localRepo, 'fixture/parent');
+    if (entry === 'file') assert.equal(download.body.strictFiles, true, 'the tree start surface posts a strict selection');
   }
 }
 
@@ -139,39 +148,66 @@ async function run(entry, type, { dataset = false, manual = '', low = false, cho
   }
   await run('quant', 'gguf', { choice: '' });
   if (fixture.routes?.audio) await run('quant', 'gguf', { choice: 'audio' });
-  // File-list downloads select a repository-relative path exactly: a root-level
+  // The Files tree selects repository-relative paths exactly: a root-level
   // entry is encoded as "./name" so a same-named nested alias is not selected,
-  // while a nested entry keeps its canonical relative path. The displayed name
-  // and toast stay unencoded.
-  ui.setAnalysis({ repo: 'fixture/filelist', type: 'audio', branch: 'main' });
-  const rootFileList = ui.renderNonSelectableFiles({ repo: 'fixture/filelist', files: [{ path: 'model.bin' }] });
-  assert(rootFileList.includes('>model.bin<'), 'root file-list display name must stay unencoded');
+  // while a nested entry keeps its canonical relative path. The request is a
+  // strict selection and the displayed names stay unencoded.
+  const filesPanel = {
+    innerHTML: '',
+    dataset: {},
+    addEventListener() {},
+    setAttribute() {},
+    removeAttribute() {},
+    querySelector: () => null,
+    querySelectorAll: () => []
+  };
+  nodes.set('#modelsFilesPanel', filesPanel);
+  const rootAnalysis = { repo: 'fixture/filelist', type: 'audio', branch: 'main', files: [{ path: 'model.bin', size: 123 }] };
+  ui.setAnalysis(rootAnalysis);
+  ui.renderFilesTab(rootAnalysis);
+  assert(filesPanel.innerHTML.includes('>model.bin<'), 'root file-list display name must stay unencoded');
+  ui.fileTreeToggleFile('model.bin');
   calls.length = 0;
   messages.length = 0;
-  await window.downloadSingleFile('fixture/filelist', 'model.bin', false);
+  await window.downloadSelectedFiles();
   let fileDownload = calls.find(c => c.path === '/api/download');
   assert(fileDownload, 'root file-list request missing');
   assert.deepEqual(fileDownload.body.filters, ['./model.bin']);
-  assert(fileDownload.body.exactMatch);
+  assert.equal(fileDownload.body.strictFiles, true, 'root file list posts a strict selection');
+  assert(!('exactMatch' in fileDownload.body), 'a strict request does not send exactMatch');
   assert(!fileDownload.body.filters.includes('model.bin'), 'root file list must not send the legacy basename selector');
-  assert(messages.some(m => m.message === 'Queued: model.bin'), 'root file-list toast must stay unencoded');
+  assert(messages.some(m => m.message === 'Queued: 1 file'), 'root file-list toast reports the strict selection');
   calls.length = 0;
   messages.length = 0;
-  await window.downloadSingleFile('fixture/filelist', 'nested/model.bin', false);
+  const nestedAnalysis = { repo: 'fixture/filelist', type: 'audio', branch: 'main', files: [{ path: 'nested/model.bin', size: 42 }] };
+  ui.setAnalysis(nestedAnalysis);
+  ui.resetFileTree(nestedAnalysis);
+  ui.fileTreeToggleFile('nested/model.bin');
+  await window.downloadSelectedFiles();
   fileDownload = calls.find(c => c.path === '/api/download');
   assert(fileDownload, 'nested file-list request missing');
   assert.deepEqual(fileDownload.body.filters, ['nested/model.bin']);
-  assert(fileDownload.body.exactMatch);
-  assert(messages.some(m => m.message === 'Queued: nested/model.bin'), 'nested file-list toast must keep the relative path');
+  assert.equal(fileDownload.body.strictFiles, true, 'nested file list posts a strict selection');
+  assert(messages.some(m => m.message === 'Queued: 1 file'), 'nested file-list toast keeps the selection count');
   // Dataset renderers must not offer inert controls, even with routes configured.
   ui.setAnalysis({ repo: 'fixture/data', type: 'gguf', is_dataset: true });
   assert(!ui.renderSelectableItems([{label: 'Data', id: 'data'}], 'items').includes('quantRouteSelect'));
-  assert(!ui.renderNonSelectableFiles({ repo: 'fixture/data', is_dataset: true, files: [{path: 'data.bin'}] }).includes('nonSelectableRoute'));
+  const datasetAnalysis = { repo: 'fixture/data', type: 'gguf', is_dataset: true, files: [{ path: 'data.bin', size: 7 }] };
+  ui.setAnalysis(datasetAnalysis);
+  ui.renderFilesTab(datasetAnalysis);
+  assert(!filesPanel.innerHTML.includes('nonSelectableRoute'), 'a dataset tree must not offer a destination picker');
   // No configured destinations leave both analysis surfaces without a picker.
   if (!Object.keys(fixture.routes || {}).length) {
-    ui.setAnalysis({ repo: 'fixture/model', type: 'gguf' });
+    const noRouteAnalysis = { repo: 'fixture/model', type: 'gguf', files: [{ path: 'model.bin', size: 7 }] };
+    ui.setAnalysis(noRouteAnalysis);
     assert(!ui.renderSelectableItems([{label: 'Model', id: 'model'}], 'items').includes('quantRouteSelect'));
-    assert(!ui.renderNonSelectableFiles({ repo: 'fixture/model', files: [{path: 'model.bin'}] }).includes('nonSelectableRoute'));
+    ui.renderFilesTab(noRouteAnalysis);
+    assert(!filesPanel.innerHTML.includes('nonSelectableRoute'), 'no configured destinations leave the tree without a picker');
+  } else {
+    const routedAnalysis = { repo: 'fixture/model', type: 'gguf', files: [{ path: 'model.bin', size: 7 }] };
+    ui.setAnalysis(routedAnalysis);
+    ui.renderFilesTab(routedAnalysis);
+    assert(filesPanel.innerHTML.includes('nonSelectableRoute'), 'configured destinations keep the tree Save to picker');
   }
   // A changed configuration must not reinterpret a previously selected index.
   const oldRoutes = ui.state.settings.downloadRoutes;

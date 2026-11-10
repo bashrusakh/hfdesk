@@ -442,10 +442,10 @@ let retryFocusPending = false;
 
 // Detail tabs and Community are local UI state only. Do not mirror them into
 // the URL/history: a page refresh intentionally returns to the empty state.
-const DETAIL_TAB_ORDER = ['overview', 'community'];
+const DETAIL_TAB_ORDER = ['overview', 'community', 'files'];
 const COMMUNITY_TYPE_VALUES = ['all', 'discussion', 'pull_request'];
 let detailActiveTab = 'overview';
-const detailScrollPositions = { overview: 0, list: 0, thread: 0 };
+const detailScrollPositions = { overview: 0, files: 0, list: 0, thread: 0 };
 
 // Community state is scoped to one repository + dataset flag. Re-analyzing the
 // same repo keeps it; a different repo (or dataset type) resets it.
@@ -575,6 +575,7 @@ function detailViewKey() {
   if (detailActiveTab === 'community') {
     return communityState.view === 'thread' ? 'thread' : 'list';
   }
+  if (detailActiveTab === 'files') return 'files';
   return 'overview';
 }
 
@@ -598,6 +599,7 @@ function renderDetailTabs(visible) {
 
   const overviewTab = $('#modelsTabOverview');
   const communityTab = $('#modelsTabCommunity');
+  const filesTab = $('#modelsTabFiles');
   const setTabState = (tab, name) => {
     if (!tab) return;
     const selected = detailActiveTab === name;
@@ -607,6 +609,7 @@ function renderDetailTabs(visible) {
   };
   setTabState(overviewTab, 'overview');
   setTabState(communityTab, 'community');
+  setTabState(filesTab, 'files');
 
   const setPanelState = (panel, tabId, active) => {
     if (!panel) return;
@@ -623,10 +626,11 @@ function renderDetailTabs(visible) {
   };
   setPanelState($('#modelsOverviewPanel'), 'modelsTabOverview', detailActiveTab === 'overview');
   setPanelState($('#modelsCommunityPanel'), 'modelsTabCommunity', detailActiveTab === 'community');
+  setPanelState($('#modelsFilesPanel'), 'modelsTabFiles', detailActiveTab === 'files');
 }
 
 function activateDetailTab(name) {
-  const next = name === 'community' ? 'community' : 'overview';
+  const next = ['community', 'files'].includes(name) ? name : 'overview';
   if (detailActiveTab === next) {
     if (next === 'community') ensureCommunityList();
     return;
@@ -646,15 +650,18 @@ function initDetailTabs() {
 
   const overviewTab = $('#modelsTabOverview');
   const communityTab = $('#modelsTabCommunity');
+  const filesTab = $('#modelsTabFiles');
   overviewTab?.addEventListener('click', () => activateDetailTab('overview'));
   communityTab?.addEventListener('click', () => activateDetailTab('community'));
+  filesTab?.addEventListener('click', () => activateDetailTab('files'));
 
   tablist.addEventListener('keydown', (event) => {
     if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
     const focused = event.target.closest('[role="tab"]');
     if (!focused) return;
 
-    let index = DETAIL_TAB_ORDER.indexOf(focused.id === 'modelsTabCommunity' ? 'community' : 'overview');
+    const tabNameById = { modelsTabCommunity: 'community', modelsTabFiles: 'files' };
+    let index = DETAIL_TAB_ORDER.indexOf(tabNameById[focused.id] || 'overview');
     if (index < 0) return;
     event.preventDefault();
 
@@ -665,7 +672,8 @@ function initDetailTabs() {
 
     const next = DETAIL_TAB_ORDER[index];
     activateDetailTab(next);
-    $(next === 'community' ? '#modelsTabCommunity' : '#modelsTabOverview')?.focus();
+    const tabId = next.charAt(0).toUpperCase() + next.slice(1);
+    $(`#modelsTab${tabId}`)?.focus();
   });
 
   renderDetailTabs(false);
@@ -675,6 +683,9 @@ function prepareDetailForAnalysis(repo, isDataset = false) {
   saveDetailScrollPosition();
   detailActiveTab = 'overview';
   detailScrollPositions.overview = 0;
+  // A transition away from an analysis invalidates its cache-presence
+  // snapshot: the tree's done markers may only come from the current lookup.
+  analysisCachedFiles = null;
 
   const nextRepo = normalizeCommunityRepo(repo);
   if (!communityState.repo) {
@@ -1552,8 +1563,12 @@ async function loadRepositoryDetails(entry) {
     reconcileAnalysisAfterLoad();
     if (focusAfterRetry) {
       const tabs = $('#modelsDetailTabs');
-      if (tabs && !tabs.hidden) $('#modelsTabOverview')?.focus();
-      else resultDiv.focus();
+      if (tabs && !tabs.hidden) {
+        const activeTabId = '#modelsTab' + detailActiveTab.charAt(0).toUpperCase() + detailActiveTab.slice(1);
+        $(activeTabId)?.focus();
+      } else {
+        resultDiv.focus();
+      }
     }
   } catch (e) {
     if (requestId !== analyzeRequestId) return;
@@ -1865,8 +1880,14 @@ async function loadRepositoryDetails(entry) {
   // Make analyzeRepo available globally for legacy/direct entry points.
   window.analyzeRepo = analyzeRepo;
 
+  // Cache presence for the open analysis's file list, normalized the way
+  // syncLocalAnalysisStatus normalizes cache entries. The Files tree reads it
+  // for per-file done markers: null means "not known" (a failed or skipped
+  // lookup), so no row may claim done. Cleared on every analysis transition.
+  let analysisCachedFiles = null;
+
   async function syncLocalAnalysisStatus(data) {
-    if (!data?.repo || !data.selectable_items?.length) return;
+    if (!data?.repo || (!data.selectable_items?.length && !data.files?.length)) return;
     const isDataset = !!data.is_dataset;
     try {
       const map = getDlStatus(data.repo, isDataset);
@@ -1877,10 +1898,14 @@ async function loadRepositoryDetails(entry) {
       // the repository. The server searches the default destination and every
       // configured route; the stored status is per revision.
       const isBranchItem = item => item?.branch_variant === true && !!item?.revision;
-      const ordinaryItems = data.selectable_items.filter(item => !isBranchItem(item));
-      const branchItems = data.selectable_items.filter(isBranchItem);
+      const selectableItems = data.selectable_items || [];
+      const ordinaryItems = selectableItems.filter(item => !isBranchItem(item));
+      const branchItems = selectableItems.filter(isBranchItem);
+      // The repository file list also feeds the Files tree's done markers, so
+      // a file-only analysis (no selectable items) still needs the lookup.
+      const wantsRepoFiles = Array.isArray(data.files) && data.files.length > 0;
 
-      if (ordinaryItems.length) {
+      if (ordinaryItems.length || wantsRepoFiles) {
         // /api/cache/<repo> without a type prefers the model namespace. A repo
         // that exists as both model and dataset must be looked up in the
         // namespace the open analysis actually represents.
@@ -1888,6 +1913,7 @@ async function loadRepositoryDetails(entry) {
         const resp = await fetch(`/api/cache/${data.repo}?type=${repoType}`);
 
         if (resp.status === 404) {
+          analysisCachedFiles = new Set();
           ordinaryItems.forEach(item => {
             const key = selectableStatusKey(item);
             if (!key || map[key] !== 'done') return;
@@ -1899,6 +1925,7 @@ async function loadRepositoryDetails(entry) {
 
           const cached = await resp.json();
           const cachedFiles = new Set((cached.files || []).map(f => normalizeRepoPath(f.name)));
+          analysisCachedFiles = cachedFiles;
 
           ordinaryItems.forEach(item => {
             const key = selectableStatusKey(item);
@@ -1948,10 +1975,12 @@ async function loadRepositoryDetails(entry) {
       // presence is nevertheless the only authority for artifact and branch
       // 'done', so a transient lookup/parse failure must not leave a stale
       // downloaded artifact hiding its Download button. Legacy non-artifact
-      // token statuses keep their last-known-good value.
+      // token statuses keep their last-known-good value. The Files tree follows
+      // the same rule: an unknown lookup clears its done snapshot entirely.
+      analysisCachedFiles = null;
       const map = getDlStatus(data.repo, isDataset);
       let changed = false;
-      data.selectable_items.forEach(item => {
+      (data.selectable_items || []).forEach(item => {
         const key = selectableStatusKey(item);
         if ((!String(key).startsWith('artifact:') && !String(key).startsWith('branchVariant:')) || map[key] !== 'done') return;
         delete map[key];
@@ -1965,35 +1994,23 @@ async function loadRepositoryDetails(entry) {
     return String(path || '').replace(/\\/g, '/').toLowerCase();
   }
 
-  const ANALYSIS_WARNING_CAUSE_LABELS = {
-    header_unavailable: 'Safetensors header unavailable',
-    header_uninterpretable: 'Safetensors header could not be interpreted',
-    probe_timeout: 'Header probe timed out',
-    probe_limit: 'Header probe limit reached',
-    weight_role_unrecognized: 'Unrecognized model-weight file role'
-  };
-
   // Labels are scoped per warning code: both_namespace_detection_degraded
-  // reuses the probe_* codes for the dataset-namespace existence probe, where
-  // no safetensors header probe runs, so it must not inherit the EXL
-  // header-probe wording above. probe_unavailable never occurs in the EXL
-  // warning, so its human label lives only here rather than a raw-code
-  // fallback.
+  // uses the probe_* codes for the dataset-namespace existence probe, where
+  // no safetensors header probe runs. probe_unavailable gets its human label
+  // here rather than falling back to the raw code.
   const BOTH_NAMESPACE_WARNING_CAUSE_LABELS = {
     probe_timeout: 'Dataset-namespace probe timed out',
     probe_unavailable: 'Dataset-namespace probe unavailable'
   };
 
-  // Render only the bounded EXL branch-discovery and namespace-detection
-  // warnings. Messages and causes are server-owned, non-secret strings;
-  // escape both before injecting them.
+  // Render only the bounded namespace-detection warnings. Messages and causes
+  // are server-owned, non-secret strings; escape both before injecting them.
   function renderAnalysisWarnings(data, { showRetry = true } = {}) {
     const warnings = (Array.isArray(data?.analysis_warnings) ? data.analysis_warnings : [])
-      .filter(w => w?.code === 'exl_branch_discovery_incomplete' || w?.code === 'both_namespace_detection_degraded');
+      .filter(w => w?.code === 'both_namespace_detection_degraded');
     if (!warnings.length) return '';
 
     const labelsByCode = {
-      exl_branch_discovery_incomplete: ANALYSIS_WARNING_CAUSE_LABELS,
       both_namespace_detection_degraded: BOTH_NAMESPACE_WARNING_CAUSE_LABELS
     };
     const causes = [];
@@ -2001,7 +2018,7 @@ async function loadRepositoryDetails(entry) {
       // Dedup stays first-wins; the label is chosen by the warning code that
       // first produced the cause, so each chip text stays context-accurate.
       if (cause && !causes.some(entry => entry.cause === cause)) {
-        const labels = labelsByCode[w.code] || ANALYSIS_WARNING_CAUSE_LABELS;
+        const labels = labelsByCode[w.code] || {};
         causes.push({ cause, label: labels[cause] || cause });
       }
     }));
@@ -2071,19 +2088,6 @@ async function loadRepositoryDetails(entry) {
 
     // The response's dataset flag is authoritative for the Community scope.
     ensureCommunityScope(data.repo, !!data.is_dataset);
-
-    const filesHtml = data.files?.slice(0, 20).map(f => `
-      <div class="analysis-file">
-        <span class="analysis-file-name">${escapeHtml(f.path || f.name)}</span>
-        <span class="analysis-file-size">${f.size_human || formatBytes(f.size)}</span>
-      </div>
-    `).join('') || '';
-
-    const moreFiles = (data.files?.length || 0) > 20
-      ? `<div class="analysis-file" style="justify-content: center; color: var(--color-text-muted);">
-           ... and ${data.files.length - 20} more files
-         </div>`
-      : '';
 
     // Build type-specific info
     let typeInfoHtml = '';
@@ -2292,11 +2296,6 @@ async function loadRepositoryDetails(entry) {
       ? `<button class="btn-link" onclick="showRevisionPickerFromAnalysis()">change</button>`
       : '';
 
-    // For non-GGUF/non-selectable models: show a simple file list with download buttons
-    const nonSelectableFilesHtml = !hasSelectableItems && data.files?.length
-      ? renderNonSelectableFiles(data)
-      : '';
-
     resultDiv.innerHTML = `
       <div class="analysis-card">
         <div class="analysis-header">
@@ -2312,7 +2311,6 @@ async function loadRepositoryDetails(entry) {
           ${typeInfoHtml}
           ${selectableItemsHtml}
           ${relatedDownloadsHtml}
-          ${nonSelectableFilesHtml}
           ${readmeHtml}
         </div>
         <div class="analysis-actions-wrapper">
@@ -2328,15 +2326,448 @@ async function loadRepositoryDetails(entry) {
       </div>
     `;
 
-    detailActiveTab = 'overview';
+    // Recognized formats open on Overview; an unrecognized/generic analysis
+    // has no smart selection, so its file tree is the download path and the
+    // default tab. The Files tab itself is always visible.
+    detailActiveTab = hasSelectableItems ? 'overview' : 'files';
     detailScrollPositions.overview = 0;
+    detailScrollPositions.files = 0;
     const scroller = $('#analyzeResult');
     if (scroller) scroller.scrollTop = 0;
     renderDetailTabs(true);
+    renderFilesTab(data);
     updateScrollArrows();
     loadReadmePreview(data);
     bindAnalysisWarningRetry(data);
   }
+
+  // =========================================
+  // Files tab: exact-selection file tree
+  // =========================================
+
+  // The tree is built client-side from the analysis payload's flat file list —
+  // no extra endpoint. Selection, expansion and the filter query live here as
+  // UI state: they survive live status re-renders and reset only when the
+  // analysis identity (namespace + repo + revision) changes.
+  const fileTreeState = {
+    identity: '',
+    files: [],
+    sizes: new Map(),
+    tree: null,
+    selected: new Set(),
+    collapsed: new Set(),
+    query: ''
+  };
+  let fileTreeBoundPanel = null;
+
+  function fileTreeIdentity(data) {
+    return `${data.is_dataset ? 'dataset' : 'model'}:${data.repo}@${data.branch || 'main'}`;
+  }
+
+  // buildFileTree turns the flat path/size list into nested nodes and rolls up
+  // size, member paths and file count per directory once, so tri-state checks,
+  // selection toggles and footer totals never re-walk the list.
+  function buildFileTree(files) {
+    const root = { path: '', dir: true, children: new Map(), size: 0, members: [], fileCount: 0 };
+    files.forEach(f => {
+      const path = f.path || f.name || '';
+      if (!path) return;
+      const parts = path.split('/');
+      let cur = root;
+      parts.forEach((part, i) => {
+        const isFile = i === parts.length - 1;
+        const nodePath = cur.path ? `${cur.path}/${part}` : part;
+        if (!cur.children.has(part)) {
+          cur.children.set(part, { name: part, path: nodePath, dir: !isFile, children: new Map(), size: 0, members: [], fileCount: 0 });
+        }
+        const node = cur.children.get(part);
+        if (isFile) {
+          node.size = Number(f.size) || 0;
+          node.isLfs = f.is_lfs === true;
+        }
+        cur = node;
+      });
+    });
+    (function roll(node) {
+      if (!node.dir) {
+        node.members = [node.path];
+        node.fileCount = 1;
+        return node.size;
+      }
+      node.children.forEach(child => {
+        node.size += roll(child);
+        node.members = node.members.concat(child.members);
+        node.fileCount += child.fileCount;
+      });
+      return node.size;
+    })(root);
+    return root;
+  }
+
+  function resetFileTree(data) {
+    const files = Array.isArray(data.files) ? data.files : [];
+    const identity = fileTreeIdentity(data);
+    if (fileTreeState.identity !== identity) {
+      fileTreeState.identity = identity;
+      fileTreeState.selected = new Set();
+      fileTreeState.collapsed = new Set();
+      fileTreeState.query = '';
+    }
+    const sizes = new Map();
+    files.forEach(f => {
+      const path = f.path || f.name || '';
+      if (path) sizes.set(path, Number(f.size) || 0);
+    });
+    // Keep only paths the current revision still lists, so a refresh that
+    // dropped a file can never send a stale spelling to the strict request.
+    fileTreeState.selected.forEach(path => { if (!sizes.has(path)) fileTreeState.selected.delete(path); });
+    fileTreeState.files = files;
+    fileTreeState.sizes = sizes;
+    fileTreeState.tree = buildFileTree(files);
+  }
+
+  function fileTreeFindNode(node, path) {
+    if (node.path === path) return node;
+    let found = null;
+    node.children.forEach(child => { found = found || fileTreeFindNode(child, path); });
+    return found;
+  }
+
+  function fileTreeDirState(path) {
+    const node = fileTreeState.tree && fileTreeFindNode(fileTreeState.tree, path);
+    if (!node || !node.dir) return 'off';
+    let on = 0;
+    node.members.forEach(m => { if (fileTreeState.selected.has(m)) on++; });
+    return on === 0 ? 'off' : on === node.members.length ? 'on' : 'mixed';
+  }
+
+  // Checking a directory selects every file under it recursively; an
+  // all-checked directory click clears the whole subtree. The decision comes
+  // from selection state, never from the DOM property the browser already
+  // toggled, so a partially checked click always completes the selection.
+  function fileTreeToggleDir(path) {
+    const node = fileTreeState.tree && fileTreeFindNode(fileTreeState.tree, path);
+    if (!node || !node.dir) return;
+    const turnOn = fileTreeDirState(path) !== 'on';
+    node.members.forEach(m => { if (turnOn) fileTreeState.selected.add(m); else fileTreeState.selected.delete(m); });
+  }
+
+  function fileTreeToggleFile(path) {
+    if (fileTreeState.selected.has(path)) fileTreeState.selected.delete(path);
+    else fileTreeState.selected.add(path);
+  }
+
+  function fileTreeSelectedPaths() {
+    return Array.from(fileTreeState.selected).sort();
+  }
+
+  // Per-file status for the tree. cached comes only from cache presence
+  // (analysisCachedFiles — the same authority the selectable rows use); active
+  // comes from queued/running jobs matched to the open analysis: a strict job
+  // projects its resolved selection, a path-shaped filter projects through
+  // artifactJobPaths' normalization, and a token filter projects only when it
+  // names a selectable artifact item that enumerates its files. Arbitrary
+  // token filters (Advanced Options) cannot be mapped onto files and are
+  // deliberately not projected per file.
+  function fileTreeFileStates() {
+    const states = new Map();
+    if (!fileTreeState.files.length) return states;
+    const cached = analysisCachedFiles;
+    fileTreeState.files.forEach(f => {
+      const path = f.path || f.name || '';
+      if (!path) return;
+      states.set(path, { cached: !!(cached && cached.has(normalizeRepoPath(path))), active: '' });
+    });
+    const byPath = new Map();
+    states.forEach((st, path) => {
+      const key = normalizeArtifactPath(path);
+      const group = byPath.get(key);
+      if (group) group.push(st);
+      else byPath.set(key, [st]);
+    });
+    const mark = (normPath, status) => {
+      (byPath.get(normPath) || []).forEach(st => {
+        if (st.active === 'running') return;
+        if (status === 'running' || !st.active) st.active = status;
+      });
+    };
+    const analysis = currentAnalysis;
+    if (!analysis?.repo) return states;
+    const items = analysis.selectable_items || [];
+    Array.from(state.jobs.values()).forEach(job => {
+      if (job.status !== 'running' && job.status !== 'queued') return;
+      if (!jobMatchesAnalysis(job, analysis)) return;
+      const filters = Array.isArray(job.filters) ? job.filters : [];
+      if (job.strictFiles) {
+        artifactJobPaths(filters).forEach(p => mark(p, job.status));
+        return;
+      }
+      filters.forEach(filter => {
+        const raw = String(filter || '');
+        if (!raw) return;
+        if (raw.startsWith('./') || raw.includes('/') || raw.includes('\\')) {
+          mark(normalizeArtifactPath(raw), job.status);
+          return;
+        }
+        const item = items.find(it => Array.isArray(it.files) && it.files.length
+          && ['quantization', 'vision_encoder'].includes(it.category)
+          && (it.filter_value || it.id) === raw);
+        if (item) item.files.map(normalizeArtifactPath).forEach(p => mark(p, job.status));
+      });
+    });
+    return states;
+  }
+
+  function fileTreeSelectionTotals(states) {
+    let bytes = 0;
+    let cachedCount = 0;
+    let activeCount = 0;
+    fileTreeState.selected.forEach(path => {
+      const size = fileTreeState.sizes.get(path);
+      if (size === undefined) return;
+      bytes += size;
+      const st = states.get(path);
+      if (st?.cached) cachedCount++;
+      if (st?.active) activeCount++;
+    });
+    return { n: fileTreeState.selected.size, bytes, cachedCount, activeCount };
+  }
+
+  function fileTreeSortedChildren(node) {
+    return Array.from(node.children.values()).sort((a, b) =>
+      (a.dir === b.dir) ? a.name.localeCompare(b.name) : (a.dir ? -1 : 1));
+  }
+
+  function fileTreeMatches(node, query) {
+    if (!query) return true;
+    if (!node.dir) return node.path.toLowerCase().includes(query);
+    return fileTreeSortedChildren(node).some(child => fileTreeMatches(child, query));
+  }
+
+  function fileTreeChipHtml(st) {
+    if (st.active) return selectableStatusChip(st.active);
+    return st.cached ? selectableStatusChip('done') : '';
+  }
+
+  function renderFileTreeRows() {
+    if (!fileTreeState.files.length) return '';
+    const states = fileTreeFileStates();
+    const query = fileTreeState.query.trim().toLowerCase();
+    const renderNode = (node, depth) => {
+      let html = '';
+      fileTreeSortedChildren(node).forEach(child => {
+        if (!fileTreeMatches(child, query)) return;
+        const indent = 8 + depth * 18;
+        if (child.dir) {
+          const dirState = fileTreeDirState(child.path);
+          // A filter forces matches visible regardless of collapse; the stored
+          // expansion is restored when the query is cleared.
+          const expanded = query ? true : !fileTreeState.collapsed.has(child.path);
+          const label = `${child.name}/`;
+          html += `<div class="quant-row file-tree-row file-tree-dir" data-path="${escapeHtmlAttribute(child.path)}" style="padding-left:${indent}px">
+              <input type="checkbox" class="file-tree-check" data-dir="${escapeHtmlAttribute(child.path)}"${dirState === 'on' ? ' checked' : ''} aria-label="${escapeHtmlAttribute('Select all files under ' + child.path + '/')}">
+              <button type="button" class="file-tree-caret" data-toggle="${escapeHtmlAttribute(child.path)}" aria-expanded="${expanded ? 'true' : 'false'}" aria-label="${escapeHtmlAttribute((expanded ? 'Collapse ' : 'Expand ') + label)}">${expanded ? '▾' : '▸'}</button>
+              <span class="file-tree-name file-tree-name-dir">${escapeHtml(label)}</span>
+              <span class="file-tree-meta">${child.fileCount} file${child.fileCount === 1 ? '' : 's'}</span>
+              <span class="quant-size">${formatBytes(child.size)}</span>
+            </div><div class="file-tree-children" data-children="${escapeHtmlAttribute(child.path)}"${expanded ? '' : ' hidden'}>${renderNode(child, depth + 1)}</div>`;
+        } else {
+          const st = states.get(child.path) || { cached: false, active: '' };
+          html += `<div class="quant-row file-tree-row file-tree-file" data-path="${escapeHtmlAttribute(child.path)}" style="padding-left:${indent}px">
+              <input type="checkbox" class="file-tree-check" data-file="${escapeHtmlAttribute(child.path)}"${fileTreeState.selected.has(child.path) ? ' checked' : ''} aria-label="${escapeHtmlAttribute('Select ' + child.path)}">
+              <span class="file-tree-name">${escapeHtml(child.name)}</span>
+              ${child.isLfs ? '<span class="file-tree-lfs" title="Stored with Large File Storage">LFS</span>' : ''}
+              <span class="file-tree-status" data-status="${escapeHtmlAttribute(child.path)}">${fileTreeChipHtml(st)}</span>
+              <span class="quant-size">${formatBytes(child.size)}</span>
+            </div>`;
+        }
+      });
+      return html;
+    };
+    return renderNode(fileTreeState.tree, 0)
+      || '<div class="file-tree-empty">No files match the filter.</div>';
+  }
+
+  // A partially checked directory must read as indeterminate, which is a DOM
+  // property with no HTML attribute: re-sync every directory box after each
+  // selection change and after every row re-render.
+  function syncFileTreeChecks() {
+    const panel = $('#modelsFilesPanel');
+    if (!panel) return;
+    const boxes = panel.querySelectorAll('input.file-tree-check[data-dir]');
+    for (const box of boxes) {
+      const state = fileTreeDirState(box.dataset.dir);
+      box.checked = state === 'on';
+      box.indeterminate = state === 'mixed';
+    }
+  }
+
+  function updateFileTreeFooter() {
+    const panel = $('#modelsFilesPanel');
+    if (!panel) return;
+    const summary = panel.querySelector('#fileTreeSummary');
+    const overlap = panel.querySelector('#fileTreeOverlap');
+    if (!summary || !overlap) return;
+    const totals = fileTreeSelectionTotals(fileTreeFileStates());
+    const summaryText = `${totals.n} selected · ${formatBytes(totals.bytes)}`;
+    const overlapText = `${totals.cachedCount} already downloaded · ${totals.activeCount} in progress`;
+    if (summary.textContent !== summaryText) summary.textContent = summaryText;
+    if (overlap.textContent !== overlapText) overlap.textContent = overlapText;
+  }
+
+  function applyFileTreeStates() {
+    const panel = $('#modelsFilesPanel');
+    if (!panel) return;
+    const states = fileTreeFileStates();
+    const slots = panel.querySelectorAll('.file-tree-status[data-status]');
+    for (const slot of slots) {
+      const st = states.get(slot.dataset.status);
+      const html = st ? fileTreeChipHtml(st) : '';
+      if (slot.innerHTML !== html) slot.innerHTML = html;
+    }
+    updateFileTreeFooter();
+  }
+
+  // The coalesced live reconcile calls this instead of re-rendering the tree,
+  // so chips and footer totals follow jobs/cache without disturbing focus,
+  // checked state or expansion.
+  function updateFileTreeStatuses() {
+    if (!currentAnalysis || fileTreeIdentity(currentAnalysis) !== fileTreeState.identity) return;
+    applyFileTreeStates();
+  }
+
+  function refreshFileTreeRows() {
+    const rows = $('#fileTreeRows');
+    if (!rows) return;
+    rows.innerHTML = renderFileTreeRows();
+    syncFileTreeChecks();
+    applyFileTreeStates();
+  }
+
+  function bindFileTreePanel(panel) {
+    if (fileTreeBoundPanel === panel) return;
+    fileTreeBoundPanel = panel;
+    panel.addEventListener('click', (event) => {
+      const target = event.target;
+      const toggle = target?.closest?.('[data-toggle]');
+      if (toggle) {
+        const path = toggle.dataset.toggle;
+        const collapsing = !fileTreeState.collapsed.has(path);
+        if (collapsing) fileTreeState.collapsed.add(path);
+        else fileTreeState.collapsed.delete(path);
+        // Toggle just this subtree: a full row re-render would drop the focus
+        // from the caret the keyboard user just activated.
+        const children = panel.querySelector(`[data-children="${CSS.escape(path)}"]`);
+        if (children) children.hidden = collapsing;
+        const dirName = `${path.slice(path.lastIndexOf('/') + 1)}/`;
+        toggle.textContent = collapsing ? '▸' : '▾';
+        toggle.setAttribute('aria-expanded', collapsing ? 'false' : 'true');
+        toggle.setAttribute('aria-label', `${collapsing ? 'Expand' : 'Collapse'} ${dirName}`);
+        return;
+      }
+      if (target?.id === 'fileTreeClear') {
+        fileTreeState.selected.clear();
+        refreshFileTreeRows();
+        return;
+      }
+      if (target?.id === 'fileTreeDownload') window.downloadSelectedFiles();
+    });
+    panel.addEventListener('change', (event) => {
+      const box = event.target;
+      if (!box || box.type !== 'checkbox' || !box.classList?.contains('file-tree-check')) return;
+      if (box.dataset.dir !== undefined) fileTreeToggleDir(box.dataset.dir);
+      else if (box.dataset.file !== undefined) fileTreeToggleFile(box.dataset.file);
+      else return;
+      syncFileTreeChecks();
+      updateFileTreeFooter();
+    });
+    panel.addEventListener('input', (event) => {
+      if (event.target?.id !== 'fileTreeSearch') return;
+      // Only the rows container is rewritten, so the filter input keeps focus
+      // and caret position while typing.
+      fileTreeState.query = String(event.target.value || '');
+      refreshFileTreeRows();
+    });
+  }
+
+  function renderFilesTab(data) {
+    resetFileTree(data);
+    const panel = $('#modelsFilesPanel');
+    if (!panel) return;
+    if (!fileTreeState.files.length) {
+      panel.innerHTML = `
+        <div class="analysis-section">
+          <div class="file-tree-empty">No file list is available for this revision.</div>
+        </div>`;
+      return;
+    }
+    // The "Save to" choice is offered only when type folders are configured;
+    // datasets are never routed. This is the same select the Download All
+    // wizard reads for a non-selectable analysis.
+    const routeGroup = (!data.is_dataset && getConfiguredRouteOptions().length)
+      ? `<label class="file-tree-route" title="Choose a configured type folder, or keep the server default.">Save to ${renderRouteSelect('nonSelectableRoute', { className: 'search-select', ariaLabel: 'Destination type folder' })}</label>`
+      : '';
+    panel.innerHTML = `
+      <div class="analysis-section">
+        <div class="file-tree-toolbar">
+          <input type="search" class="file-tree-search" id="fileTreeSearch" placeholder="Filter files…" value="${escapeHtmlAttribute(fileTreeState.query)}" aria-label="Filter files" autocomplete="off" spellcheck="false">
+          ${routeGroup}
+        </div>
+        <div class="file-tree" id="fileTreeRows" role="group" aria-label="Repository file tree">${renderFileTreeRows()}</div>
+        <div class="file-tree-footer">
+          <div class="file-tree-footer-info">
+            <div class="file-tree-summary" id="fileTreeSummary">0 selected · 0 B</div>
+            <div class="file-tree-overlap" id="fileTreeOverlap">0 already downloaded · 0 in progress</div>
+            <div class="file-tree-guarantee">Only checked files — nothing else is added</div>
+          </div>
+          <div class="file-tree-actions">
+            <button type="button" class="btn btn-ghost" id="fileTreeClear">Clear</button>
+            <button type="button" class="btn btn-primary" id="fileTreeDownload">Download selected</button>
+          </div>
+        </div>
+      </div>`;
+    syncFileTreeChecks();
+    applyFileTreeStates();
+    bindFileTreePanel(panel);
+  }
+
+  // Start an exact-selection download: the request carries the checked file
+  // paths only — directories expand client-side to their member files, and
+  // root-level names go through the established "./name" selector — plus
+  // strictFiles. An identical active request answers with the existing job's
+  // message, which is toasted without writing any queued status for the
+  // reused job.
+  window.downloadSelectedFiles = async function() {
+    const analysis = currentAnalysis;
+    if (!analysis?.repo) return;
+    const paths = fileTreeSelectedPaths();
+    if (!paths.length) {
+      showToast('No files are checked', 'error');
+      return;
+    }
+    const body = {
+      repo: analysis.repo,
+      revision: analysis.branch || 'main',
+      dataset: !!analysis.is_dataset,
+      filters: artifactRequestPaths(paths),
+      strictFiles: true
+    };
+    const routeKey = analysis.is_dataset ? '' : routeSelectValue('nonSelectableRoute');
+    if (routeKey) body.routeKey = routeKey;
+    try {
+      if (!await checkDownloadDiskSpace(body)) return;
+      const data = await api('POST', '/download', body);
+      if (data.message) {
+        showToast(data.message, 'info');
+        return;
+      }
+      state.jobs.set(data.id, data);
+      applyFileTreeStates();
+      showToast(`Queued: ${paths.length} file${paths.length === 1 ? '' : 's'}`, 'success');
+    } catch (e) {
+      showToast(`Failed: ${e.message}`, 'error');
+    }
+  };
 
   let _scrollArrowUp = null;
   let _scrollArrowDown = null;
@@ -2862,6 +3293,15 @@ async function loadRepositoryDetails(entry) {
 
   function getJobQuantLabel(job) {
     const filters = Array.isArray(job.filters) ? job.filters : [];
+    // A strict selection is an exact file list, not filter chips: label it by
+    // count and carry the selected paths as the chip's expanded tooltip list.
+    if (job.strictFiles) {
+      return {
+        quant: filters.length ? `${filters.length} files` : '',
+        mmproj: '',
+        quantTitle: filters.join('\n')
+      };
+    }
     const quant = filters.find(f => !/mmproj/i.test(f)) || '';
     const mmproj = filters.find(f => /mmproj/i.test(f)) || '';
     return {
@@ -3039,6 +3479,8 @@ async function loadRepositoryDetails(entry) {
     const quantEl = el.querySelector('[data-role="quant"]');
     if (jobLabels.quant) {
       if (quantEl.textContent !== jobLabels.quant) quantEl.textContent = jobLabels.quant;
+      const quantTitle = jobLabels.quantTitle || '';
+      if (quantEl.title !== quantTitle) quantEl.title = quantTitle;
       if (quantEl.style.display === 'none') quantEl.style.display = '';
     } else if (quantEl.style.display !== 'none') {
       quantEl.style.display = 'none';
@@ -5595,6 +6037,7 @@ async function loadRepositoryDetails(entry) {
     try {
       refreshDlStatusFromJobs(analysis.repo, analysis.selectable_items, !!analysis.is_dataset);
       updateSelectableRowStatuses(analysis.selectable_items);
+      updateFileTreeStatuses();
       if (syncCache) {
         await syncLocalAnalysisStatus(analysis);
         if (currentAnalysis !== analysis) return;
@@ -5602,6 +6045,7 @@ async function loadRepositoryDetails(entry) {
         // that arrived during the fetch is not overwritten by stale cache.
         refreshDlStatusFromJobs(analysis.repo, analysis.selectable_items, !!analysis.is_dataset);
         updateSelectableRowStatuses(analysis.selectable_items);
+        updateFileTreeStatuses();
       }
     } finally {
       liveStatusReconcileRunning = false;
@@ -5846,84 +6290,6 @@ async function loadRepositoryDetails(entry) {
       }
 
       showToast(`Queued: ${label || repo}`, 'success');
-    } catch (e) {
-      showToast(`Failed: ${e.message}`, 'error');
-    }
-  };
-
-  /**
-   * For non-GGUF/non-selectable models: renders a plain file list with per-file download.
-   */
-  function renderNonSelectableFiles(data) {
-    if (!data.files?.length) return '';
-    const repo = data.repo;
-    // Offer a labeled destination choice when type folders are configured.
-    // Non-selectable types (e.g. audio) have no selectable_items, so this file
-    // list and the "Download All" wizard are the paths that reach the server;
-    // both read this one select. Keys never appear in the markup. Datasets are
-    // never routed, so no control is offered for a dataset analysis.
-    const routeGroup = !currentAnalysis?.is_dataset && getConfiguredRouteOptions().length ? `
-        <div class="quant-category">
-          <div class="quant-category-title">Save to</div>
-          <div class="quant-route-control">
-            ${renderRouteSelect('nonSelectableRoute', { className: 'search-select', style: 'display:block; width:100%; max-width:320px; margin:4px 0 0 12px', ariaLabel: 'Destination type folder' })}
-            <p class="form-hint" style="margin-top:4px">Choose a configured type folder, or keep the server default.</p>
-          </div>
-        </div>` : '';
-    // Exclude non-model files from the list (keep only content files)
-    const files = data.files.filter(f => {
-      const n = (f.path || f.name || '').toLowerCase();
-      return !n.endsWith('.md') && !n.endsWith('.gitattributes') && !n.endsWith('.txt') || data.files.length <= 5;
-    });
-    if (!files.length) return '';
-
-    const rows = files.slice(0, 50).map(f => {
-      const name = f.path || f.name || '';
-      const size = f.size_human || (f.size ? formatBytes(f.size) : '');
-      return `
-        <div class="quant-row">
-          <button class="quant-dl-btn" title="Download file"
-            onclick="downloadSingleFile('${escapeHtml(repo)}', '${escapeHtml(name)}', ${data.is_dataset})">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="14" height="14">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-              <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-            </svg>
-          </button>
-          <span class="quant-label" style="font-family:var(--font-mono);font-size:12px">${escapeHtml(name)}</span>
-          ${size ? `<span class="quant-size">${escapeHtml(size)}</span>` : ''}
-        </div>`;
-    }).join('');
-
-    const more = data.files.length > 50 ? `<div class="quant-row" style="color:var(--color-text-muted);font-size:12px;padding:6px 12px">… and ${data.files.length - 50} more files</div>` : '';
-
-    return `
-      <div class="analysis-section">
-        ${routeGroup}
-        <div class="quant-category">
-          <div class="quant-category-title">Files (${data.files.length})</div>
-          ${rows}${more}
-        </div>
-      </div>`;
-  }
-
-  // Download a single specific file by its exact repository-relative path.
-  window.downloadSingleFile = async function(repo, filename, isDataset) {
-    try {
-      // Destination chosen in the file list's "Save to" select, when present.
-      const routeKey = isDataset ? '' : routeSelectValue('nonSelectableRoute');
-      // The file list identifies files by their repository-relative path. Send
-      // root-level entries through the exact "./name" selector so a same-named
-      // nested alias is not selected by legacy basename matching; nested paths
-      // remain canonical. Display and toast keep the unencoded filename.
-      const filters = artifactRequestPaths([filename]);
-      const body = {
-        repo, revision: currentAnalysis?.branch || 'main',
-        dataset: isDataset, filters, exactMatch: true
-      };
-      if (routeKey) body.routeKey = routeKey;
-      if (!await checkDownloadDiskSpace(body)) return;
-      await api('POST', '/download', body);
-      showToast(`Queued: ${filename}`, 'success');
     } catch (e) {
       showToast(`Failed: ${e.message}`, 'error');
     }
