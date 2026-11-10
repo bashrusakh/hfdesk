@@ -724,8 +724,18 @@ func TestDownload_NoRangeSupportWarningDeliveredOnItemFailure(t *testing.T) {
 				return
 			}
 			if strings.Contains(r.URL.Path, failing) {
-				<-affectedTransferStarted
-				http.Error(w, "injected transfer failure", http.StatusInternalServerError)
+				select {
+				case <-affectedTransferStarted:
+					// The affected item's transfer request stays the only
+					// success release: it arrives strictly after its
+					// routing decision collected the path, so the failure
+					// still cannot race ahead of the collection.
+					http.Error(w, "injected transfer failure", http.StatusInternalServerError)
+				case <-r.Context().Done():
+					// Client gone (guard-failure teardown cancelling the
+					// download): return instead of blocking srv.Close on
+					// a stuck handler.
+				}
 				return
 			}
 			select {
