@@ -185,15 +185,19 @@ func TestSameProcessBootstrapContentionIsNotAForeignOwnerError(t *testing.T) {
 	if err := repo.EnsureDirs(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cache.ownershipRealmForData(); err != nil {
+	realm, err := cache.ownershipRealmForData()
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Hold the shared child-bootstrap gate of the blobs node — the gate every
 	// item's staging leaf node must pass on first creation — the way a
-	// same-process sibling creating nodes would.
-	bootstrapPath := filepath.Join(cache.HubDir(), ".hfdesk-control", "v1", "root",
-		"children", "models--owner--model", "children", "blobs", "metadata", "child-bootstrap.lock")
+	// same-process sibling creating nodes would. The path must be the
+	// realm's canonical spelling: production registers held locks under the
+	// EvalSymlinks-resolved node root, so a hand-built spelling would miss
+	// the process-local registry and misclassify the contention.
+	bootstrapPath := filepath.Join(realm.nodeRoot, "children", "models--owner--model",
+		"children", "blobs", "metadata", "child-bootstrap.lock")
 	gate, err := ownershipLockOpen(bootstrapPath, ownershipExclusive)
 	if err != nil {
 		t.Fatal(err)
