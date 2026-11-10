@@ -986,9 +986,13 @@ func formatSplitMentionNotice(label string, excluded []string) string {
 	}
 	shownDirs := joinWithAnd(dirs)
 	dirMore := ""
-	if len(dirs) > splitMentionNoticePathCap {
+	if extraDirs := len(dirs) - splitMentionNoticePathCap; extraDirs > 0 {
 		shownDirs = strings.Join(dirs[:splitMentionNoticePathCap], ", ")
-		dirMore = fmt.Sprintf(" (and %d more directories)", len(dirs)-splitMentionNoticePathCap)
+		dirNoun := "directories"
+		if extraDirs == 1 {
+			dirNoun = "directory"
+		}
+		dirMore = fmt.Sprintf(" (and %d more %s)", extraDirs, dirNoun)
 	}
 	return fmt.Sprintf("excluded %d %s that %s %s but %s in %s%s: %s%s",
 		n, noun, mentions, label, lives, shownDirs, dirMore, strings.Join(paths, ", "), more)

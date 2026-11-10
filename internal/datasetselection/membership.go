@@ -303,9 +303,10 @@ func pathGroups(p, base string) (groups, mentionedNotMember []string) {
 // corpus_train_000.parquet and model.train.parquet without treating
 // pretrain_000.parquet as train. pathGroups always collects these tokens;
 // a token becomes a membership candidate only when no directory component
-// names a standard split, and otherwise it feeds the
-// mentioned-but-not-a-member list: a directory that names the split
-// outranks the basename token.
+// names a standard split. Otherwise it feeds the
+// mentioned-but-not-a-member list only when it names a split the file does
+// not belong to: a token naming the file's own split feeds neither list,
+// and a directory that names the split outranks the basename token.
 func hasSplitToken(base, split string) bool {
 	for start := 0; ; {
 		i := strings.Index(base[start:], split)
