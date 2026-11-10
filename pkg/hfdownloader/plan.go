@@ -1648,8 +1648,10 @@ func refuseReservedLocalOwner(repo string) error {
 	return nil
 }
 
-// ScanPlan scans a repository and emits plan_item events via the progress callback.
-// This is useful for dry-run/preview functionality.
+// ScanPlan scans a repository and emits plan_item events via the progress
+// callback, preceded by warning events for the plan's notices (the same
+// warning channel Download uses). This is useful for dry-run/preview
+// functionality.
 func ScanPlan(ctx context.Context, job Job, cfg Settings, progress ProgressFunc) error {
 	plan, err := PlanRepo(ctx, job, cfg)
 	if err != nil {
@@ -1660,6 +1662,15 @@ func ScanPlan(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		if !plan.CommitPinned {
 			progress(ProgressEvent{Time: time.Now().UTC(), Level: "warn", Event: "warning", Repo: job.Repo, Revision: job.Revision,
 				Message: "revision is not pinned to an immutable commit; the plan is revision-addressed"})
+		}
+		// Plan notices are informational diagnostics (bounded at their
+		// source, currently the split-mention exclusions of the
+		// split-precedence rule). They ride the warning channel exactly as
+		// Download emits them, before the plan_item list: they describe
+		// files that are not in the plan, so they read naturally first.
+		for _, notice := range plan.Notices {
+			progress(ProgressEvent{Time: time.Now().UTC(), Level: "warn", Event: "warning", Repo: job.Repo, Revision: job.Revision,
+				Message: notice})
 		}
 		for _, item := range plan.Items {
 			progress(ProgressEvent{
