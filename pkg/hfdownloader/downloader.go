@@ -111,13 +111,13 @@ func removeMultipartResumeFiles(dst string, domain *blobDomain) error {
 		return err
 	}
 	for _, p := range files {
-		// lgtm[go/path-injection]
 		release, aerr := domain.realm.acquireWriter(context.Background(), []string{p}, 0)
 		if aerr != nil {
 			downloadLog.Warn("keep obsolete multipart residue file owned by another writer",
 				"path", p, "error", aerr)
 			continue
 		}
+		// lgtm[go/path-injection]
 		if rerr := os.Remove(p); rerr != nil && !os.IsNotExist(rerr) {
 			release.Release()
 			return rerr

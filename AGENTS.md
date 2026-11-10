@@ -250,8 +250,8 @@ or job ownership behavior. This section is the agent-level summary; when it and
   placement. Cleanup runs only under the destination domain, through the
   collapsed entry points `removeStagingArtifactsLocked` and
   `removeStagingArtifactsIfUnowned`. The obsolete pre-#140 `<dst>.part-<digits>`
-  family is additionally covered per file: each unlink takes that exact path's
-  entry admission in the held destination domain's realm, a file whose
+  family is in no destination scope path set, so each unlink is covered only by
+  that exact path's own entry admission in the destination realm: a file whose
   admission a live holder refuses survives without failing the operation, and
   with no held domain the family is left alone. A route removes only the
   artifacts it creates (B1): for example, a multipart HEAD failure leaves a
