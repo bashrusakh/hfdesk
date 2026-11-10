@@ -604,7 +604,7 @@ func (m *systemdManager) register(ctx context.Context, opts InstallOptions, acco
 			return result, AppendActionErrorIfUnnamed(fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration could not be put back into service: %v)", err, restoreErr), statusReadHint)
 		}
 		result.createdDirsSafeToRemove = systemdCreatedDirsSafeToRemove(previous, created)
-		return result, AppendActionErrorIfUnnamed(fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration was restored and the previous instance was started again)", err), statusReadHint)
+		return result, AppendActionErrorIfUnnamed(fmt.Errorf("service: the installation did not put the new executable into service: %w (the previous registration and its loaded settings were restored, and the previous instance was started again)", err), statusReadHint)
 	}
 	result.versionVerified = verified
 	return result, nil

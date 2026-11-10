@@ -1849,7 +1849,7 @@ func TestSystemdUpdateThatKeepsTheMainPIDFailsVerification(t *testing.T) {
 	}
 	assertNames(t, err.Error(), "Install()", []string{
 		"kept the previous MainPID",
-		"the previous registration was restored",
+		"the previous registration and its loaded settings were restored",
 		"the previous instance was started again",
 	})
 
