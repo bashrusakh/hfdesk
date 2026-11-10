@@ -87,6 +87,78 @@ func ownershipHeldExclusivelyHere(path string) bool {
 	return ownershipHeldLocks.exclusive[clean] > 0
 }
 
+// downloadDomainHeldKeys records which exclusive ownership request keys are
+// held by download-domain item scopes in this process — the scope acquired in
+// acquireBlobDomainScopedWithin — so classification can tell a sibling item's
+// download scope apart from any other same-process surface that holds one of
+// the item's own keys. It is process-local diagnostic state that never
+// participates in exclusion, with the same discipline as ownershipHeldLocks:
+// an entry is added before the OS lock attempt and dropped only after the
+// handle releases the OS lock, so it may over-claim a hold (softening a
+// classification) but can never miss one and mislabel a download-domain holder
+// as foreign. Only acquisitions carrying the download-scope context marker
+// register here; plain writer scopes, admission surfaces and the claim gate
+// never do, which preserves the established same-item carve-out.
+var downloadDomainHeldKeys = struct {
+	sync.Mutex
+	keys map[string]int
+}{keys: map[string]int{}}
+
+func registerDownloadDomainHeldKey(key string) {
+	downloadDomainHeldKeys.Lock()
+	downloadDomainHeldKeys.keys[key]++
+	downloadDomainHeldKeys.Unlock()
+}
+
+func unregisterDownloadDomainHeldKey(key string) {
+	downloadDomainHeldKeys.Lock()
+	if downloadDomainHeldKeys.keys[key] <= 1 {
+		delete(downloadDomainHeldKeys.keys, key)
+	} else {
+		downloadDomainHeldKeys.keys[key]--
+	}
+	downloadDomainHeldKeys.Unlock()
+}
+
+// ownershipHeldByDownloadDomain reports whether a download-domain item scope
+// of this process is a proven exclusive holder of key.
+func ownershipHeldByDownloadDomain(key string) bool {
+	downloadDomainHeldKeys.Lock()
+	defer downloadDomainHeldKeys.Unlock()
+	return downloadDomainHeldKeys.keys[key] > 0
+}
+
+// downloadDomainScopeKey marks the context of one download item's destination
+// scope acquisition so exclusive request keys taken under it register in
+// downloadDomainHeldKeys. Mirrors downloadSlotWaitNoticeKey's context tagging.
+type downloadDomainScopeKey struct{}
+
+func withDownloadDomainScopeMarker(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, downloadDomainScopeKey{}, true)
+}
+
+func markedDownloadDomainScope(ctx context.Context) bool {
+	marked, _ := ctx.Value(downloadDomainScopeKey{}).(bool)
+	return marked
+}
+
+// downloadDomainKeyedLock releases the OS handle first, then drops the
+// process-local download-domain key registration, so a live hold is never
+// missing from the registry and the registration never outlives the released
+// lock beyond the release itself.
+type downloadDomainKeyedLock struct {
+	handle ownershipLockHandle
+	key    string
+}
+
+func (l *downloadDomainKeyedLock) release() {
+	l.handle.release()
+	unregisterDownloadDomainHeldKey(l.key)
+}
+
 type ownershipRegisteredLock struct {
 	handle ownershipLockHandle
 	path   string
@@ -438,6 +510,7 @@ func (r *ownershipRealm) tryAcquire(ctx context.Context, requests []ownershipLoc
 		handles: make(map[string]ownershipLockHandle, len(normalized)),
 		modes:   make(map[string]ownershipLockMode, len(normalized)),
 	}
+	markedScope := markedDownloadDomainScope(ctx)
 	for _, request := range normalized {
 		if err := ctx.Err(); err != nil {
 			lease.Release()
@@ -447,13 +520,25 @@ func (r *ownershipRealm) tryAcquire(ctx context.Context, requests []ownershipLoc
 		if lockPath == "" {
 			lockPath = r.lockPath(request.key)
 		}
+		registered := markedScope && request.mode == ownershipExclusive
+		if registered {
+			// Register before the OS attempt so a live download-domain hold is
+			// never missing from the registry (ownershipHeldLocks discipline).
+			registerDownloadDomainHeldKey(request.key)
+		}
 		handle, err := ownershipLockOpen(lockPath, request.mode)
 		if err != nil {
+			if registered {
+				unregisterDownloadDomainHeldKey(request.key)
+			}
 			lease.Release()
 			if errors.Is(err, errOwnershipBusy) {
 				return nil, &ownershipConflictError{key: request.key, path: lockPath, err: err}
 			}
 			return nil, err
+		}
+		if registered {
+			handle = &downloadDomainKeyedLock{handle: handle, key: request.key}
 		}
 		lease.handles[request.key] = handle
 		lease.order = append(lease.order, request.key)

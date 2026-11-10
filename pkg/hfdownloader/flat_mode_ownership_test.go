@@ -264,6 +264,103 @@ func TestDownloadFlatModeSingleRouteUsesExternalOwnership(t *testing.T) {
 	assertExternalRealmLockFiles(t, cfg.OwnershipDir)
 }
 
+// The scope path sets of the flat destinations `model` and `model.part`
+// overlap on `model.part`: it is `model`'s single-route partial and the other
+// item's destination, so the items share an ownership key while their domain
+// keys differ and the keyed waiter does not serialize them. A refused
+// acquisition against a sibling item's download scope in this process must be
+// classified as same-process contention — never the external/live-owner class
+// — while the same refusal against a real foreign holder stays external.
+func TestOverlappingFlatScopeContentionClassifiesByHolderSurface(t *testing.T) {
+	if !ownershipOSLockAvailable {
+		t.Skip("this platform has no OS ownership lock primitive")
+	}
+	shortBlobOwnershipWait(t, 300*time.Millisecond)
+
+	const total = 4_096
+	full := rangedTestPayload(total)
+
+	t.Run("holder is this process's download scope", func(t *testing.T) {
+		out := t.TempDir()
+		srv, getRanges := recordingHub(t, full, "model.part", true)
+		defer srv.Close()
+		cfg := flatModeSettings(out, srv.URL, "0")
+		base, err := DestinationBase(out, "o/r")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(base, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Hold item `model`'s scope exactly as Download acquires it: production
+		// path construction plus the download-domain scope acquisition. Its
+		// scope covers `model.part` — the destination the download below plans.
+		dstHolder := filepath.Join(base, "model")
+		key, domainDst, proofPath, paths, err := downloadOwnershipPaths(false, nil, dstHolder, dstHolder, PlanItem{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		realm, err := newOwnershipRealm(cfg.OwnershipDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		holder, err := acquireBlobDomainScoped(t.Context(), key, domainDst, realm, paths, proofPath)
+		if err != nil {
+			t.Fatalf("hold the overlapping item's scope: %v", err)
+		}
+		defer holder.release()
+
+		res := runFlatModeDownload(t.Context(), cfg)
+		if res.err == nil {
+			t.Fatalf("Download succeeded although a sibling item's download scope holds its destination (skips=%v, done=%v)",
+				res.skips, res.done)
+		}
+		assertNotForeignOwnershipClass(t, res.err)
+		if !errors.Is(res.err, errStagingOwnershipSameProcess) {
+			t.Fatalf("Download error = %v, want errStagingOwnershipSameProcess for an in-process download-scope holder", res.err)
+		}
+		if got := getRanges(); len(got) != 0 {
+			t.Errorf("the excluded item issued %d payload GETs (%v), want 0: it never owned the key", len(got), got)
+		}
+	})
+
+	t.Run("holder is another process", func(t *testing.T) {
+		out := t.TempDir()
+		srv, _ := recordingHub(t, full, "model.part", true)
+		defer srv.Close()
+		cfg := flatModeSettings(out, srv.URL, "0")
+		base, err := DestinationBase(out, "o/r")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(base, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		dst := filepath.Join(base, "model.part")
+		child := startBlobOwnershipChild(t, blobOwnershipChildConfig{
+			DomainDst:    dst,
+			OwnershipDir: cfg.OwnershipDir,
+			PartialPath:  dst + ".incomplete",
+			Payload:      "the live partial of the other process",
+			ReadyPath:    filepath.Join(out, "child-ready"),
+			GoPath:       filepath.Join(out, "child-go"),
+		})
+		waitForFile(t, filepath.Join(out, "child-ready"), 60*time.Second)
+		defer releaseBlobOwnershipChild(t, child, filepath.Join(out, "child-go"))
+
+		res := runFlatModeDownload(t.Context(), cfg)
+		if res.err == nil {
+			t.Fatalf("Download succeeded although a foreign process holds the destination (skips=%v, done=%v)",
+				res.skips, res.done)
+		}
+		if !errors.Is(res.err, errStagingOwnershipBusy) {
+			t.Fatalf("Download error = %v, want errStagingOwnershipBusy while the scope is held by another process", res.err)
+		}
+	})
+}
+
 func assertExternalRealmLockFiles(t *testing.T, ownershipDir string) {
 	t.Helper()
 	realm, err := newOwnershipRealm(ownershipDir)

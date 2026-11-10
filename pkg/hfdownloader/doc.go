@@ -309,17 +309,21 @@ read-only validation and takes no lock; the parent's exclusive child-bootstrap
 gate belongs to the node-creation path only, and node creation remains gated
 behind it. Retried acquisitions back off exponentially with jitter so
 contended waiters decorrelate instead of re-contending in fixed-quantum
-waves. A refused acquisition is classified before it surfaces: a shared
-ownership key outside the item's own scope keys that this process is proven
-to hold exclusively fails as
-same-process contention (and the keyed in-process waiter times out the same
-way), so download contention within one process never surfaces the
-external/live-owner class — same-key in-process download writers are
-serialized by the keyed waiter before any OS lock is touched. Other same-item
-surfaces, such as tree-removal admission or the claim gate holding the item's
-scope, keep the established claim semantics: their contention may report the
-external/live-owner class, and a shared key this process does not hold also
-remains external.
+waves. A refused acquisition is classified before it surfaces by which
+surface holds the conflicting lock: a lock held by a download-domain item
+scope of this process fails as same-process contention — including when the
+conflicting key is one of the item's own scope keys but a sibling item's
+download scope in this process holds it (flat destinations `model` and
+`model.part` overlap on the `model.part` key), and when the key is outside
+the item's own scope keys and this process holds it exclusively (the node
+child-bootstrap gate, for example) — and the keyed in-process waiter times
+out the same way, so download contention within one process never surfaces
+the external/live-owner class; same-key in-process download writers are
+serialized by the keyed waiter before any OS lock is touched. The item's own
+scope held by a non-download surface keeps the established claim semantics:
+tree-removal admission, the claim gate or a plain writer scope holding it
+report the external/live-owner class, and a holder this process does not hold
+also remains external.
 
 If a cache-owned or flat-mode lock cannot be acquired (unsupported, denied, or
 filesystem error), the operation fails before mutating claims or payloads and

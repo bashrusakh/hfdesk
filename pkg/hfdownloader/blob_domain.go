@@ -64,10 +64,17 @@ func blobOwnershipScopeError(sha, rel string, cause error) error {
 }
 
 // classifyOwnershipConflict maps a refused probe's conflict to its holder
-// class; doc.go carries the contract.
+// class; doc.go carries the contract. The discriminator is which surface in
+// this process holds the conflicting lock: a download-domain item scope —
+// including a sibling item's scope whose path set overlaps this item's own —
+// is same-process contention, while the item's own scope held by a
+// non-download surface keeps the established external claim semantics.
 func classifyOwnershipConflict(conflict *ownershipConflictError, ownScope map[string]bool) error {
 	if conflict == nil {
 		return errStagingOwnershipUncertain
+	}
+	if ownershipHeldByDownloadDomain(conflict.key) {
+		return errStagingOwnershipSameProcess
 	}
 	if ownScope[conflict.key] {
 		return errStagingOwnershipBusy
@@ -181,6 +188,10 @@ func acquireBlobDomainScopedWithin(ctx context.Context, key, dst string, realm *
 	if realm == nil {
 		return nil, fmt.Errorf("external ownership realm is unavailable")
 	}
+	// Mark this acquisition as a download-domain scope: exclusive keys taken
+	// under it register as download-domain holds, so a refused sibling
+	// acquisition classifies by the holding surface (doc.go).
+	ctx = withDownloadDomainScopeMarker(ctx)
 	return acquireBlobDomainUsing(ctx, key, dst, slotWait, func(beginWait func()) (blobDomainFence, error) {
 		scope, err := realm.acquireWriterWithWait(ctx, paths, lockWait, beginWait)
 		if err != nil {
