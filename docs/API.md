@@ -747,7 +747,8 @@ Request:
   "filters": ["q4_k_m"],
   "excludes": [],
   "exactMatch": false,
-  "branchVariant": false
+  "branchVariant": false,
+  "shardRanges": "1-100,120-185"
 }
 ```
 
@@ -796,6 +797,51 @@ or recognized dataset-group membership selects data, the request fails with
 `400` and error code `no_filter_match`; retained companion/metadata files alone
 never make a filtered request succeed.
 
+`shardRanges` (optional, string) narrows a filtered selection to specific
+shards of split files. Syntax: comma-separated inclusive spans of 1-based
+shard indices, each `N` or `N-M` (`1-100,120-185`, where `N` alone is the
+single index `N`); whitespace around a segment is trimmed and segment order
+does not matter. The field requires a non-empty `filters` selection. Within
+the matched file set, files named in the established split form
+`<prefix>-NNNNN-of-MMMMM.<ext>` are grouped per family (the path with the
+shard token removed), ordered by the shard number written in their names and
+indexed `1..M` in that order — so 1-based safetensors shards and 0-based
+dataset shards both line up with the requested indices — and only shards
+whose index falls inside the spans are planned. Ranges therefore address
+positions in written-number order, not the written numbers themselves: for a
+family whose written shard numbers contain gaps the positions and the
+numbers differ (for complete families they coincide). Files that are not
+shard-shaped (configs, index files, unsharded weights) are never affected,
+and ranges only narrow: a filter that names an absent path keeps its
+established `no_filter_match` behavior, and a filter whose files all fall
+outside the ranges fails the same way when no matched file remains —
+retained companion files that matched nothing never keep such a request
+alive.
+
+A malformed expression — an empty expression or segment, a non-numeric
+token, a zero or negative index, a reversed span such as `10-5`, or ranges
+without filters — is rejected with HTTP 400 and error code
+`invalid_shard_ranges` before any Hub contact, identically on `POST
+/api/plan` and `POST /api/download` (including `dryRun: true`), so a dry run
+never accepts a request the real download rejects.
+
+Ranges never fail silently. A successful plan response can carry `warnings`,
+an array of typed objects `{"code": ..., "message": ..., "segments": [...]}`
+omitted when empty. `message` is a bounded sentence and `segments` names the
+offending input segments; two codes exist today:
+
+- `shard_ranges_no_shards` — the matched set contains no shard files at
+  all, so the ranges narrowed nothing; `segments` lists every requested
+  segment.
+- `shard_ranges_ineffective_segments` — specific spans select no existing
+  shard index (for example `9-10` against a four-shard family); `segments`
+  lists exactly those spans.
+
+Warnings are deterministic and non-fatal: they never change `files`,
+`totalSize`, `totalFiles`, or the download outcome, and they never replace
+an error. The surface is extensible — later warnings join the same array —
+so clients branch on `code` and treat unknown codes as informational.
+
 ## Download
 
 ```http
@@ -808,6 +854,14 @@ Notes:
 
 - `repo` is required and must be `owner/name`.
 - `revision` defaults to `main`.
+- `shardRanges` participates in job identity like `filters`: requests that
+  are identical except for their shard ranges start independent jobs, and an
+  identical request (same repo, revision, destination, filters and ranges)
+  reuses the running one. The job snapshot returned by `POST /api/download`,
+  `GET /api/jobs` and `jobs_state.json` exposes the field as `shardRanges`,
+  and the bundled Downloads view labels it on the job's chip. Planning,
+  `dryRun: true` and the real download apply ranges identically; the syntax,
+  validation error code and warning codes are documented under Plan above.
 - `branchVariant` (optional) selects one whole EXL2/EXL3 branch named by
   `revision`. It is model-only and must be unfiltered: `filters` and `excludes`
   must be empty, and `appendFilterSubdir`, `localRepo`, and `dataset: true` are
