@@ -2354,6 +2354,7 @@ async function loadRepositoryDetails(entry) {
     files: [],
     sizes: new Map(),
     tree: null,
+    nodes: new Map(),
     selected: new Set(),
     collapsed: new Set(),
     query: ''
@@ -2404,6 +2405,19 @@ async function loadRepositoryDetails(entry) {
     return root;
   }
 
+  // indexFileTree runs once per tree build: a path → node map turns every
+  // per-row subtree lookup into a map read, and warming each node's child
+  // order here means no render or filter pass ever re-sorts a directory.
+  function indexFileTree(root) {
+    const nodes = new Map();
+    (function index(node) {
+      nodes.set(node.path, node);
+      fileTreeSortedChildren(node);
+      node.children.forEach(index);
+    })(root);
+    return nodes;
+  }
+
   function resetFileTree(data) {
     const files = Array.isArray(data.files) ? data.files : [];
     const identity = fileTreeIdentity(data);
@@ -2424,17 +2438,15 @@ async function loadRepositoryDetails(entry) {
     fileTreeState.files = files;
     fileTreeState.sizes = sizes;
     fileTreeState.tree = buildFileTree(files);
+    fileTreeState.nodes = indexFileTree(fileTreeState.tree);
   }
 
-  function fileTreeFindNode(node, path) {
-    if (node.path === path) return node;
-    let found = null;
-    node.children.forEach(child => { found = found || fileTreeFindNode(child, path); });
-    return found;
+  function fileTreeFindNode(path) {
+    return fileTreeState.nodes.get(path) || null;
   }
 
   function fileTreeDirState(path) {
-    const node = fileTreeState.tree && fileTreeFindNode(fileTreeState.tree, path);
+    const node = fileTreeState.tree && fileTreeFindNode(path);
     if (!node || !node.dir) return 'off';
     let on = 0;
     node.members.forEach(m => { if (fileTreeState.selected.has(m)) on++; });
@@ -2446,7 +2458,7 @@ async function loadRepositoryDetails(entry) {
   // from selection state, never from the DOM property the browser already
   // toggled, so a partially checked click always completes the selection.
   function fileTreeToggleDir(path) {
-    const node = fileTreeState.tree && fileTreeFindNode(fileTreeState.tree, path);
+    const node = fileTreeState.tree && fileTreeFindNode(path);
     if (!node || !node.dir) return;
     const turnOn = fileTreeDirState(path) !== 'on';
     node.members.forEach(m => { if (turnOn) fileTreeState.selected.add(m); else fileTreeState.selected.delete(m); });
@@ -2533,9 +2545,16 @@ async function loadRepositoryDetails(entry) {
     return { n: fileTreeState.selected.size, bytes, cachedCount, activeCount };
   }
 
+  // Children keep one cached sort per node — warmed by indexFileTree at tree
+  // build — so a render or filter pass never re-sorts a directory it already
+  // ordered; the lazy branch keeps the function total for any node built
+  // outside the indexed tree.
   function fileTreeSortedChildren(node) {
-    return Array.from(node.children.values()).sort((a, b) =>
-      (a.dir === b.dir) ? a.name.localeCompare(b.name) : (a.dir ? -1 : 1));
+    if (!node.sorted) {
+      node.sorted = Array.from(node.children.values()).sort((a, b) =>
+        (a.dir === b.dir) ? a.name.localeCompare(b.name) : (a.dir ? -1 : 1));
+    }
+    return node.sorted;
   }
 
   function fileTreeMatches(node, query) {
@@ -2589,16 +2608,25 @@ async function loadRepositoryDetails(entry) {
   }
 
   // A partially checked directory must read as indeterminate, which is a DOM
-  // property with no HTML attribute: re-sync every directory box after each
-  // selection change and after every row re-render.
+  // property with no HTML attribute: re-sync every box after each selection
+  // change and after every row re-render. File boxes must sync too: a
+  // directory toggle changes the model without re-rendering rows, and a
+  // member box left showing the old state would invert the user's next click
+  // relative to what the panel displays (and downloadSelectedFiles sends the
+  // model, so the request must always match the rendered checkboxes).
   function syncFileTreeChecks() {
     const panel = $('#modelsFilesPanel');
     if (!panel) return;
-    const boxes = panel.querySelectorAll('input.file-tree-check[data-dir]');
+    const boxes = panel.querySelectorAll('input.file-tree-check');
     for (const box of boxes) {
-      const state = fileTreeDirState(box.dataset.dir);
-      box.checked = state === 'on';
-      box.indeterminate = state === 'mixed';
+      if (box.dataset.dir !== undefined) {
+        const state = fileTreeDirState(box.dataset.dir);
+        box.checked = state === 'on';
+        box.indeterminate = state === 'mixed';
+      } else if (box.dataset.file !== undefined) {
+        box.checked = fileTreeState.selected.has(box.dataset.file);
+        box.indeterminate = false;
+      }
     }
   }
 

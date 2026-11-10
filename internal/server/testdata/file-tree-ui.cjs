@@ -19,18 +19,83 @@ function doesNotMatch(value, re, message) { assertions++; assert.doesNotMatch(St
 
 const summaryNode = { textContent: '' };
 const overlapNode = { textContent: '' };
+
+// The panel stub parses the rendered markup into real checkbox elements, so
+// the shipped syncFileTreeChecks mutates observable box state and the tests
+// can assert checked/indeterminate against the selection model instead of
+// only re-reading the model. The parse is cached until innerHTML or the rows
+// subtree changes.
+let panelHTML = '';
+let panelBoxes = null;
+
+function decodeAttr(value) {
+  return value.replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+function parseCheckBoxes(html) {
+  const boxes = [];
+  const re = /<input type="checkbox" class="file-tree-check" (data-dir|data-file)="([^"]*)"(\schecked)?\saria-label="[^"]*">/g;
+  let m;
+  while ((m = re.exec(html))) {
+    const path = decodeAttr(m[2]);
+    boxes.push({
+      type: 'checkbox',
+      classList: { contains: name => name === 'file-tree-check' },
+      checked: !!m[3],
+      indeterminate: false,
+      dataset: m[1] === 'data-dir' ? { dir: path } : { file: path },
+      setAttribute() {},
+      removeAttribute() {}
+    });
+  }
+  // Parse-drift guard: every rendered file-tree checkbox must materialize,
+  // otherwise the DOM assertions below would silently observe nothing.
+  const rendered = (html.match(/class="file-tree-check"/g) || []).length;
+  if (rendered !== boxes.length) {
+    throw new Error(`harness parsed ${boxes.length} of ${rendered} rendered checkboxes`);
+  }
+  return boxes;
+}
+
 const filesPanelNode = {
-  innerHTML: '',
   dataset: {},
-  addEventListener() {},
+  handlers: {},
+  addEventListener(type, fn) { (this.handlers[type] ||= []).push(fn); },
   setAttribute() {},
   removeAttribute() {},
+  get innerHTML() { return panelHTML; },
+  set innerHTML(value) { panelHTML = String(value); panelBoxes = null; },
   querySelector(selector) {
     if (selector === '#fileTreeSummary') return summaryNode;
     if (selector === '#fileTreeOverlap') return overlapNode;
     return null;
   },
-  querySelectorAll() { return []; }
+  querySelectorAll(selector) {
+    if (!panelBoxes) panelBoxes = parseCheckBoxes(panelHTML);
+    if (selector === 'input.file-tree-check') return panelBoxes;
+    if (selector === 'input.file-tree-check[data-dir]') {
+      return panelBoxes.filter(box => box.dataset.dir !== undefined);
+    }
+    // Status chips stay asserted through the model and the markup string;
+    // only checkbox state needs live element observability.
+    return [];
+  }
+};
+
+// The rows container lives inside the rendered panel: writing it rewrites the
+// panel's row markup, exactly like innerHTML in the real DOM, so a re-render
+// (Clear, filter keystroke) reparses the visible checkboxes.
+const rowsNode = {
+  set innerHTML(value) {
+    const marker = panelHTML.indexOf('id="fileTreeRows"');
+    const openEnd = marker === -1 ? -1 : panelHTML.indexOf('>', marker);
+    const footer = openEnd === -1 ? -1 : panelHTML.indexOf('<div class="file-tree-footer">', openEnd);
+    if (footer === -1) throw new Error('harness: rows container is not inside the rendered panel');
+    panelHTML = panelHTML.slice(0, openEnd + 1) + String(value) + panelHTML.slice(footer);
+    panelBoxes = null;
+  },
+  get innerHTML() { return panelHTML; }
 };
 const overviewPanelNode = {
   innerHTML: '',
@@ -80,7 +145,13 @@ const document = {
       get innerHTML() { return html || text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
     };
   },
-  querySelector(selector) { return domNodes.get(selector) || null; },
+  querySelector(selector) {
+    // The rows container exists only while the panel markup carries it.
+    if (selector === '#fileTreeRows') {
+      return panelHTML.includes('id="fileTreeRows"') ? rowsNode : null;
+    }
+    return domNodes.get(selector) || null;
+  },
   querySelectorAll() { return []; },
   getElementById() { return null; }
 };
@@ -250,6 +321,57 @@ function statusesOf() {
   return map;
 }
 
+function domBox(kind, path) {
+  const boxes = filesPanelNode.querySelectorAll('input.file-tree-check');
+  const box = boxes.find(b => (kind === 'dir' ? b.dataset.dir : b.dataset.file) === path);
+  if (!box) throw new Error(`no rendered ${kind} checkbox for ${path}`);
+  return box;
+}
+
+// Dispatches an event to the panel listeners the production code registered
+// through bindFileTreePanel.
+function firePanel(type, target) {
+  (filesPanelNode.handlers[type] || []).forEach(fn => fn({ type, target }));
+}
+
+// Simulates a user click on a checkbox: the browser flips the box's own
+// visual state before the change event reaches the panel handler, and the
+// handler then reconciles model and DOM exactly as in the shipped app.
+function clickBox(kind, path) {
+  const box = domBox(kind, path);
+  box.indeterminate = false;
+  box.checked = !box.checked;
+  firePanel('change', box);
+  return box;
+}
+
+function clickClear() { firePanel('click', { id: 'fileTreeClear' }); }
+function typeFilter(value) { firePanel('input', { id: 'fileTreeSearch', value }); }
+
+// Every rendered checkbox must equal what the selection model says, in both
+// directions: file boxes mirror selected-set membership, directory boxes carry
+// the tri-state (checked for complete, indeterminate for mixed).
+function assertChecksMatchModel(label) {
+  const boxes = filesPanelNode.querySelectorAll('input.file-tree-check');
+  assertions++;
+  assert.ok(boxes.length > 0, `${label}: expected rendered checkboxes`);
+  for (const box of boxes) {
+    if (box.dataset.dir !== undefined) {
+      const state = ui.fileTreeDirState(box.dataset.dir);
+      eq(box.checked, state === 'on',
+        `${label}: dir box ${box.dataset.dir} checked=${box.checked} vs model ${state}`);
+      eq(box.indeterminate, state === 'mixed',
+        `${label}: dir box ${box.dataset.dir} indeterminate=${box.indeterminate} vs model ${state}`);
+    } else {
+      const want = ui.fileTreeState.selected.has(box.dataset.file);
+      eq(box.checked, want,
+        `${label}: file box ${box.dataset.file} checked=${box.checked} vs model selected=${want}`);
+      eq(box.indeterminate, false,
+        `${label}: file box ${box.dataset.file} must never be indeterminate`);
+    }
+  }
+}
+
 const scenarios = [];
 function scenario(name, fn) { scenarios.push({ name, fn }); }
 
@@ -318,6 +440,164 @@ scenario('directory tri-state collapses to its exact member files', () => {
   ui.fileTreeToggleDir('unet');
   eq(ui.fileTreeDirState('unet'), 'off', 'clicking a fully checked directory clears it');
   deepEq(ui.fileTreeSelectedPaths(), [], 'clearing the directory empties the selection');
+});
+
+scenario('rendered checkboxes follow the model through a directory toggle (A/A2)', () => {
+  resetWorld();
+  const files = [
+    file('unet/a.bin', 1024),
+    file('unet/b.bin', 1024),
+    file('config.json', 24)
+  ];
+  const analysis = setAnalysis(files);
+  ui.renderFilesTab(analysis);
+
+  // (A) A directory toggle changes the model without re-rendering rows, so
+  // every member file box must be synced to checked, the dir box to complete,
+  // and the footer to the selection count — all three agreeing.
+  const dirBox = clickBox('dir', 'unet');
+  eq(domBox('file', 'unet/a.bin').checked, true, 'member file box unet/a.bin shows checked after the dir toggle');
+  eq(domBox('file', 'unet/b.bin').checked, true, 'member file box unet/b.bin shows checked after the dir toggle');
+  eq(domBox('file', 'config.json').checked, false, 'an unrelated file box stays unchecked');
+  eq(dirBox.checked, true, 'the directory box reads complete');
+  eq(dirBox.indeterminate, false, 'the complete directory box is not indeterminate');
+  deepEq(ui.fileTreeSelectedPaths(), ['unet/a.bin', 'unet/b.bin'], 'the model holds exactly the two member files');
+  eq(summaryNode.textContent, '2 selected · 2 KB', 'the footer counts the two selected files');
+  assertChecksMatchModel('after directory toggle on');
+
+  // (A2) Clicking a member file that displays checked must uncheck it and
+  // remove it from the model — no inversion between display and request.
+  const aBox = clickBox('file', 'unet/a.bin');
+  eq(aBox.checked, false, 'the clicked member box shows unchecked');
+  eq(domBox('file', 'unet/b.bin').checked, true, 'the sibling member box stays checked');
+  eq(dirBox.checked, false, 'the now-mixed directory box is not complete');
+  eq(dirBox.indeterminate, true, 'the mixed directory box reads indeterminate');
+  deepEq(ui.fileTreeSelectedPaths(), ['unet/b.bin'], 'the model contains exactly unet/b.bin');
+  eq(summaryNode.textContent, '1 selected · 1 KB', 'the footer counts one selected file');
+  assertChecksMatchModel('after member file toggle off');
+});
+
+scenario('directory mixed/complete/off transitions leave every file box on the model', () => {
+  resetWorld();
+  const files = [
+    file('unet/a.bin', 1024),
+    file('unet/sub/b.bin', 2048),
+    file('other/c.bin', 4096)
+  ];
+  const analysis = setAnalysis(files);
+  ui.renderFilesTab(analysis);
+
+  // off → mixed through a file click: boxes and model agree.
+  clickBox('file', 'unet/a.bin');
+  deepEq(ui.fileTreeSelectedPaths(), ['unet/a.bin'], 'one member file is selected');
+  assertChecksMatchModel('after file toggle into mixed');
+
+  // mixed → complete through a directory click: every member box flips on.
+  const unetBox = clickBox('dir', 'unet');
+  eq(unetBox.checked, true, 'the mixed directory click completes the dir box');
+  eq(unetBox.indeterminate, false, 'the completed directory box is not indeterminate');
+  eq(domBox('file', 'unet/a.bin').checked, true, 'member a stays checked');
+  eq(domBox('file', 'unet/sub/b.bin').checked, true, 'the previously unchecked member box flips to checked');
+  deepEq(ui.fileTreeSelectedPaths(), ['unet/a.bin', 'unet/sub/b.bin'], 'the model holds every member file');
+  assertChecksMatchModel('after mixed to complete');
+
+  // complete → off through a directory click: every member box flips off.
+  clickBox('dir', 'unet');
+  eq(unetBox.checked, false, 'the complete directory click clears the dir box');
+  eq(unetBox.indeterminate, false, 'the cleared directory box is not indeterminate');
+  eq(domBox('file', 'unet/a.bin').checked, false, 'member a flips to unchecked');
+  eq(domBox('file', 'unet/sub/b.bin').checked, false, 'member b flips to unchecked');
+  deepEq(ui.fileTreeSelectedPaths(), [], 'the model is empty');
+  assertChecksMatchModel('after complete to off');
+
+  // A sibling directory toggles independently.
+  const otherBox = clickBox('dir', 'other');
+  eq(otherBox.checked, true, 'the sibling directory box checks');
+  eq(domBox('file', 'other/c.bin').checked, true, 'its member box checks with it');
+  assertChecksMatchModel('after sibling directory on');
+  clickBox('dir', 'other');
+  eq(otherBox.checked, false, 'the sibling directory box clears');
+  assertChecksMatchModel('after sibling directory off');
+});
+
+scenario('Clear, filter re-render and live reconcile keep rendered boxes on the model', async () => {
+  resetWorld();
+  const files = [
+    file('unet/a.bin', 1024),
+    file('unet/b.bin', 1024),
+    file('scripts/train.py', 2048)
+  ];
+  const analysis = setAnalysis(files);
+  await ui.syncLocalAnalysisStatus(analysis);
+  ui.renderFilesTab(analysis);
+  clickBox('dir', 'unet');
+  assertChecksMatchModel('initial directory selection');
+
+  // A filter keystroke re-renders the rows: visible boxes follow the model,
+  // filtered-out rows disappear from the DOM.
+  typeFilter('train');
+  eq(domBox('file', 'scripts/train.py').checked, false, 'the visible non-selected file box reads unchecked');
+  let absent = false;
+  try { domBox('file', 'unet/a.bin'); } catch (_) { absent = true; }
+  eq(absent, true, 'the filtered-out file row is not rendered');
+  deepEq(ui.fileTreeSelectedPaths(), ['unet/a.bin', 'unet/b.bin'], 'filtering never changes the model');
+  eq(summaryNode.textContent, '2 selected · 2 KB', 'the footer keeps the selection while filtered');
+  assertChecksMatchModel('while filtered');
+
+  // Clearing the filter restores every row with its model state.
+  typeFilter('');
+  eq(domBox('file', 'unet/a.bin').checked, true, 'the restored member box reads checked');
+  eq(domBox('file', 'scripts/train.py').checked, false, 'the restored non-selected box reads unchecked');
+  assertChecksMatchModel('after filter cleared');
+
+  // Clear empties the model and every rendered box together.
+  clickClear();
+  eq(domBox('file', 'unet/a.bin').checked, false, 'Clear unchecks the member box');
+  eq(domBox('dir', 'unet').checked, false, 'Clear unchecks the directory box');
+  eq(domBox('dir', 'unet').indeterminate, false, 'Clear leaves no indeterminate directory');
+  deepEq(ui.fileTreeSelectedPaths(), [], 'Clear empties the model');
+  eq(summaryNode.textContent, '0 selected · 0 B', 'Clear empties the footer');
+  assertChecksMatchModel('after Clear');
+
+  // The coalesced live reconcile re-renders statuses without touching rows:
+  // boxes must still match the model afterwards.
+  clickBox('dir', 'unet');
+  ui.handleWSMessage({
+    type: 'job_update',
+    data: {
+      id: 'strict-live', repo: analysis.repo, isDataset: false, status: 'running',
+      strictFiles: true, filters: ['unet/a.bin'], excludes: []
+    }
+  });
+  await ui.flushLiveReconcile();
+  deepEq(ui.fileTreeSelectedPaths(), ['unet/a.bin', 'unet/b.bin'], 'the live update keeps the selection');
+  assertChecksMatchModel('after live reconcile');
+});
+
+scenario('a large file tree renders with one index and one sort per node', () => {
+  resetWorld();
+  const count = (html, re) => (html.match(re) || []).length;
+  const time = fn => {
+    const t0 = process.hrtime.bigint();
+    const out = fn();
+    return { out, ms: Number(process.hrtime.bigint() - t0) / 1e6 };
+  };
+  const sample = (label, dirCount, filesPerDir) => {
+    const files = [];
+    for (let d = 0; d < dirCount; d++) {
+      const dir = `dir${String(d).padStart(4, '0')}`;
+      for (let f = 0; f < filesPerDir; f++) files.push(file(`${dir}/f${String(f).padStart(4, '0')}.bin`, 64));
+    }
+    setAnalysis(files);
+    const full = time(() => { ui.fileTreeState.query = ''; return ui.renderFileTreeRows(); });
+    eq(count(full.out, /data-file="/g), dirCount * filesPerDir, `${label}: the full render lists every file`);
+    const keystroke = time(() => { ui.fileTreeState.query = 'f0001'; return ui.renderFileTreeRows(); });
+    eq(count(keystroke.out, /data-file="/g), dirCount, `${label}: a filter keystroke renders one match per directory`);
+    ui.fileTreeState.query = '';
+    console.log(`TIME ${label}: full render ${full.ms.toFixed(1)} ms, keystroke ${keystroke.ms.toFixed(1)} ms`);
+  };
+  sample('3000 files / 40 dirs', 40, 75);
+  sample('8000 files / 800 dirs', 800, 10);
 });
 
 scenario('Download selected posts the exact strict selection', async () => {
