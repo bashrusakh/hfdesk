@@ -163,11 +163,11 @@ func TestShardRangeValidationFailsClosedBeforeHubContact(t *testing.T) {
 	}
 }
 
-// TestShardRangePlanDryRunParityAndWarnings: POST /api/plan and dry-run
+// TestShardRangePlanDryRunParityAndNotices: POST /api/plan and dry-run
 // POST /api/download apply ranges identically, an ineffective segment
-// surfaces as the typed warning on both surfaces, and a range selection that
+// surfaces as a plan notice naming it on both surfaces, and a range selection that
 // narrows to zero files takes the established no_filter_match 400 path.
-func TestShardRangePlanDryRunParityAndWarnings(t *testing.T) {
+func TestShardRangePlanDryRunParityAndNotices(t *testing.T) {
 	hub := shardRangeHub(shardRangeContent())
 	defer hub.Close()
 	_, mux := newShardRangeServer(t, hub, Config{})
@@ -190,8 +190,8 @@ func TestShardRangePlanDryRunParityAndWarnings(t *testing.T) {
 		if got := strings.Join(planPathsOf(plan), ","); got != strings.Join(want, ",") {
 			t.Errorf("%s paths = %v, want %v", path, planPathsOf(plan), want)
 		}
-		if len(plan.Warnings) != 0 {
-			t.Errorf("%s warnings = %+v, want none for effective ranges", path, plan.Warnings)
+		if len(plan.Notices) != 0 {
+			t.Errorf("%s notices = %+v, want none for effective ranges", path, plan.Notices)
 		}
 	}
 
@@ -201,9 +201,9 @@ func TestShardRangePlanDryRunParityAndWarnings(t *testing.T) {
 		req := warned
 		req.DryRun = path == "/api/download"
 		_, resp, _ := postPlanResponse(t, mux, path, req)
-		if len(resp.Warnings) != 1 || resp.Warnings[0].Code != hfdownloader.PlanWarningShardRangesIneffectiveSegments ||
-			strings.Join(resp.Warnings[0].Segments, ",") != "9-10" {
-			t.Errorf("%s warnings = %+v, want one shard_ranges_ineffective_segments [9-10]", path, resp.Warnings)
+		wantNotice := "shard range segments selected no shard (indices present: 1-3): 9-10"
+		if len(resp.Notices) != 1 || resp.Notices[0] != wantNotice {
+			t.Errorf("%s notices = %+v, want one notice %q", path, resp.Notices, wantNotice)
 		}
 	}
 
@@ -223,6 +223,43 @@ func TestShardRangePlanDryRunParityAndWarnings(t *testing.T) {
 	}
 	if errResp.ErrorDetail == nil || errResp.ErrorDetail.Code != "no_filter_match" {
 		t.Fatalf("error_detail=%+v, want code no_filter_match; body=%s", errResp.ErrorDetail, raw)
+	}
+}
+
+// TestShardRangeNoticeReachesJobWarnings proves the ONE carriage path: a
+// shard-range notice rides Plan.Notices -> downloader warning event ->
+// the job's bounded warnings list, with no second transport. The job
+// completes and its snapshot reports exactly the notice sentence, naming
+// the ineffective span.
+func TestShardRangeNoticeReachesJobWarnings(t *testing.T) {
+	hub := shardRangeHub(shardRangeContent())
+	defer hub.Close()
+	root := t.TempDir()
+	s, mux := newShardRangeServer(t, hub, Config{LocalDir: root, MaxActive: 1})
+
+	body, err := json.Marshal(DownloadRequest{
+		Repo: "owner/model", Revision: "main",
+		Filters: []string{".safetensors"}, ExactMatch: true, ShardRanges: "1,9-10",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/download", bytes.NewReader(body)))
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status=%d, want 202 admitted job; body=%s", w.Code, w.Body.String())
+	}
+	var admitted Job
+	if err := json.Unmarshal(w.Body.Bytes(), &admitted); err != nil {
+		t.Fatal(err)
+	}
+	finished := waitJobStatus(t, s.jobs, admitted.ID, JobStatusCompleted, 10*time.Second)
+	if finished.Status != JobStatusCompleted {
+		t.Fatalf("job status=%s err=%q; want completed", finished.Status, finished.Error)
+	}
+	want := "shard range segments selected no shard (indices present: 1-3): 9-10"
+	if len(finished.Warnings) != 1 || finished.Warnings[0] != want {
+		t.Errorf("job warnings = %q, want exactly [%q]", finished.Warnings, want)
 	}
 }
 

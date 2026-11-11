@@ -220,53 +220,15 @@ type Plan struct {
 	// per-commit snapshots cannot be confused with another revision.
 	CommitResolved bool `json:"commitResolved,omitempty"`
 	// Notices are bounded, informational messages about files the plan
-	// deliberately did not select — currently the split-mention files the
-	// split-precedence rule dropped for a filter naming their mentioned
-	// split. A notice never changes the plan, its items, or the download
-	// outcome, and it never replaces an error.
+	// deliberately did not select or selectors that had no effect — the
+	// split-mention files the split-precedence rule dropped for a filter
+	// naming their mentioned split, ineffective shard ranges (named below
+	// at ShardRanges), and filter patterns that selected nothing while the
+	// request's other filters kept the selection alive (named after the
+	// shard block below). A notice never changes the plan, its items,
+	// or the download outcome, and it never replaces an error.
 	Notices []string `json:"notices,omitempty"`
-	// Warnings are typed, non-fatal diagnostics about requested selectors
-	// that had no effect — today ineffective shard ranges and filter
-	// patterns that selected nothing (filters_unmatched). A warning
-	// never changes the plan's items or the download outcome and never
-	// replaces an error. The slice is omitted when empty; the code set is
-	// extensible, so consumers branch on Code and treat unknown codes as
-	// informational.
-	Warnings []PlanWarning `json:"warnings,omitempty"`
 }
-
-// PlanWarning is one typed, non-fatal warning attached to a Plan. Code is a
-// stable string so clients can branch on it; Message is a bounded,
-// human-readable sentence; Segments carries the offending request input
-// slices (for example the ineffective shard-range segments or the filter
-// patterns that selected nothing) when the warning is about specific
-// segments, bounded by what the caller itself wrote.
-type PlanWarning struct {
-	Code     string   `json:"code"`
-	Message  string   `json:"message"`
-	Segments []string `json:"segments,omitempty"`
-}
-
-// Warning codes carried by PlanWarning.
-const (
-	// PlanWarningShardRangesNoShards reports that a shard-range request was
-	// made against a matched set containing no shard files at all, so the
-	// ranges narrowed nothing. Every requested segment is ineffective.
-	PlanWarningShardRangesNoShards = "shard_ranges_no_shards"
-	// PlanWarningShardRangesIneffectiveSegments reports that specific
-	// shard-range segments select no existing shard index of any matched
-	// shard family.
-	PlanWarningShardRangesIneffectiveSegments = "shard_ranges_ineffective_segments"
-	// PlanWarningFiltersUnmatched reports that specific filter patterns
-	// selected no file while the request's other filters kept the
-	// selection alive; Segments carries the unmatched patterns exactly as
-	// requested. Matching counts only SELECTED files — a direct filter
-	// match or dataset-membership selection of the pattern's own label —
-	// so a retained companion never counts, and a request whose filters
-	// select nothing at all still fails ErrNoFilterMatch instead of
-	// producing this warning.
-	PlanWarningFiltersUnmatched = "filters_unmatched"
-)
 
 // safeCommitName reports whether commit is a single, non-escaping path
 // component. A real Hub commit is a hex SHA, but callers may also see fixture
@@ -357,9 +319,9 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 	// filterMatched is the per-pattern selection proof aligned with
 	// job.Filters: a pattern is credited only by a SELECTED file — a
 	// direct path match or its own membership label — never by a retained
-	// companion. It feeds the filters_unmatched warning, which is built
+	// companion. It feeds the filters_unmatched notice, which is built
 	// only after the ErrNoFilterMatch checks below, so a total-zero
-	// selection keeps its error and never becomes a warning.
+	// selection keeps its error and never becomes a notice.
 	filterMatched := make([]bool, len(job.Filters))
 
 	mode := planAddressingMode{revision: job.Revision, commit: job.Revision}
@@ -477,6 +439,20 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// Strict manual selection resolves against the walked tree once, before
+	// any filter, GGUF, or dataset evaluation: every selected path must exist
+	// (ErrNoFilterMatch-style guard, exact and all-or-nothing) and the
+	// resulting set is the sole inclusion source below. A successful
+	// resolution is itself the direct-match proof for the final guard, so
+	// retained companions can never satisfy (or spoil) it.
+	var strictSet map[string]struct{}
+	if job.StrictFiles {
+		strictSet, err = resolveStrictSelection(fileNodes, job.Filters)
+		if err != nil {
+			return nil, err
+		}
+		directFilterMatch = true
+	}
 	baseNames := make([]string, 0, len(fileNodes))
 	datasetFiles := make([]datasetselection.File, len(fileNodes))
 	for _, n := range fileNodes {
@@ -485,7 +461,7 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 		}
 		baseNames = append(baseNames, strings.ToLower(n.Path))
 		datasetFiles[len(baseNames)-1] = datasetselection.File{Path: n.Path}
-		if len(job.Filters) > 0 && !isExcludedPath(n.Path, job.Excludes) {
+		if len(job.Filters) > 0 && !job.StrictFiles && !isExcludedPath(n.Path, job.Excludes) {
 			for _, filter := range job.Filters {
 				if filterMatchesPath(n.Path, filter, job.ExactMatch) {
 					directFilterMatch = true
@@ -503,13 +479,13 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 			datasetDataRoles[evidence.InputIndex] = true
 		}
 	}
-	ggufMode := isGGUFFilterDownloadWithExcludes(baseNames, job.Filters, job.Excludes, job.ExactMatch)
+	ggufMode := !job.StrictFiles && isGGUFFilterDownloadWithExcludes(baseNames, job.Filters, job.Excludes, job.ExactMatch)
 	var datasetEvaluation datasetDecisionEvaluation
 	// A recognized dataset group remains the governing selection when its files
 	// coexist with GGUFs that happen to match the same filter. GGUF mode is the
 	// fallback only when no dataset group is recognized (e.g. a dataset repo
 	// containing a GGUF-only quant selection).
-	datasetGroupRequest := job.IsDataset && len(job.Filters) > 0
+	datasetGroupRequest := !job.StrictFiles && job.IsDataset && len(job.Filters) > 0
 	var recognizedDatasetGroup bool
 	if datasetGroupRequest {
 		membership := datasetMembership
@@ -743,7 +719,19 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 			!GGUFPathSelected(rel, job.Filters, job.Excludes, job.ExactMatch) {
 			continue
 		}
-		if datasetGroupRequest {
+		if job.StrictFiles {
+			// Strict manual selection: include only explicitly selected
+			// repository-relative paths. No substring matching, no basename
+			// aliasing, no companion/metadata retention, no GGUF inference,
+			// and no dataset-membership widening; attribution stays empty so
+			// destinations remain repository-relative. Membership is
+			// exact-spelling (resolveStrictSelection proved the selected path
+			// IS a tree path), so the plan item keeps the selection's spelling
+			// and a case-variant tree file is never substituted for it.
+			if _, ok := strictSet[rel]; !ok {
+				continue
+			}
+		} else if datasetGroupRequest {
 			// Inclusion and attribution come from one concrete dataset world.
 		} else if ggufMode {
 			// GGUF-only selection is matched-only: keep selected GGUF/mmproj and
@@ -933,14 +921,20 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 		return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
 	}
 	plan := &Plan{Items: items, Commit: commitSHA, CommitPinned: commitPinned, CommitResolved: commitResolved}
-	plan.Notices = splitMentionNotices(job, datasetMembership, fileNodes, items)
+	// splitCovered names the distinct filter labels the split-mention
+	// notices below already report (their pinned behavior wins); the
+	// filters_unmatched notice skips exactly those patterns so no pattern
+	// is reported twice.
+	splitNotices, splitCovered := splitMentionNotices(job, datasetMembership, fileNodes, items)
+	plan.Notices = splitNotices
 	// Shard ranges narrow the already-matched set, after notices (which
 	// describe the split-precedence rule, not this selector) and before the
 	// custom-endpoint probe walk, so only files that will actually download
 	// are probed. PlanRepo, ScanPlan and Download all reach this point
 	// through scanRepo, which keeps plan/dry-run/download parity in one
-	// owner. Notices above deliberately run on the unnarrowed set so a
-	// ranged-out shard is never misreported as split-rule-excluded.
+	// owner. Split-mention notices above deliberately run on the unnarrowed
+	// set so a ranged-out shard is never misreported as split-rule-excluded;
+	// this selector's own diagnostics append to Plan.Notices afterwards.
 	if job.ShardRanges != "" {
 		ranges, err := parseShardRanges(job.ShardRanges)
 		if err != nil {
@@ -952,7 +946,7 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 				selectedBefore++
 			}
 		}
-		narrowed, selectedKept, warnings := narrowShardRanges(plan.Items, selectedItems, ranges, job.ShardRanges)
+		narrowed, selectedKept, shardNotices := narrowShardRanges(plan.Items, selectedItems, ranges, job.ShardRanges)
 		// The zero-narrowed oracle is selection survival, never len(plan.Items):
 		// retained companions that matched nothing stay planned but can never
 		// satisfy a filtered request the ranges emptied of every selected file.
@@ -960,14 +954,20 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 			return nil, fmt.Errorf("%w: shard ranges %q excluded every matched file", ErrNoFilterMatch, job.ShardRanges)
 		}
 		plan.Items = narrowed
-		plan.Warnings = warnings
+		// Shard diagnostics join the established notices surface in
+		// first-arrival order: the split-mention notices above describe the
+		// unnarrowed set, the shard notices below describe this selector, and
+		// both ride Plan.Notices -> warning events -> Job.Warnings unchanged.
+		plan.Notices = append(plan.Notices, shardNotices...)
 	}
-	// The filters_unmatched warning is attached only after the
+	// The filters_unmatched notice joins Plan.Notices only after the
 	// ErrNoFilterMatch checks above have passed (a total-zero selection
 	// returned an error instead) and after the shard-range block, so the
-	// established shard warnings keep their positions in the array.
-	if unmatched := unmatchedFilters(job.Filters, filterMatched); len(unmatched) > 0 {
-		plan.Warnings = append(plan.Warnings, unmatchedFilterWarning(unmatched))
+	// established split-mention and shard notices keep their positions. A
+	// pattern whose miss a split-notice already reports is skipped there
+	// (their pinned coverage wins), so no pattern is reported twice.
+	if unmatched := unmatchedFilters(job.Filters, filterMatched, splitCovered); len(unmatched) > 0 {
+		plan.Notices = append(plan.Notices, unmatchedFilterNotice(unmatched))
 	}
 	if forced == nil && custom && !job.BranchVariant && mode.pinned {
 		probeDeadline := time.Now().Add(addressingProbeBudget)
@@ -1085,10 +1085,14 @@ const splitMentionNoticePathCap = 5
 // named once, under the spelling the planner keeps. Paths are listed sorted
 // and bounded, so the same tree and filters always produce the same
 // notices. Files that are in the plan (selected by another filter) and
-// files the request itself excluded are never reported.
-func splitMentionNotices(job Job, membership datasetselection.Result, fileNodes []hfNode, items []PlanItem) []string {
+// files the request itself excluded are never reported. The returned
+// covered set names the distinct labels these notices actually report
+// (lowercased/trimmed, first occurrence winning), so the caller's
+// filters_unmatched notice can skip exactly those patterns and no miss is
+// ever reported twice; it is nil when nothing was reported.
+func splitMentionNotices(job Job, membership datasetselection.Result, fileNodes []hfNode, items []PlanItem) ([]string, map[string]struct{}) {
 	if !job.IsDataset || len(job.Filters) == 0 {
-		return nil
+		return nil, nil
 	}
 	// The planner treats an exact duplicate and a case-variant of a planned
 	// path as the same logical file; key plan membership by the fold so the
@@ -1098,6 +1102,7 @@ func splitMentionNotices(job Job, membership datasetselection.Result, fileNodes 
 		plannedFold[strings.ToLower(item.RelativePath)] = struct{}{}
 	}
 	var notices []string
+	var covered map[string]struct{}
 	seenLabel := make(map[string]struct{}, len(job.Filters))
 	for _, filter := range job.Filters {
 		label := strings.ToLower(strings.TrimSpace(filter))
@@ -1136,8 +1141,12 @@ func splitMentionNotices(job Job, membership datasetselection.Result, fileNodes 
 		}
 		sort.Strings(excluded)
 		notices = append(notices, formatSplitMentionNotice(label, excluded))
+		if covered == nil {
+			covered = make(map[string]struct{})
+		}
+		covered[label] = struct{}{}
 	}
-	return notices
+	return notices, covered
 }
 
 // formatSplitMentionNotice renders one notice as a single readable sentence
@@ -1193,10 +1202,9 @@ func joinWithAnd(values []string) string {
 	return strings.Join(values[:len(values)-1], ", ") + " and " + values[len(values)-1]
 }
 
-// warningSegmentCap bounds how many segments one warning message
-// lists; the remaining count is stated instead, so the sentence never grows
-// with the caller's expression. The Segments field still carries every
-// segment, which is itself bounded by the request that wrote it.
+// warningSegmentCap bounds how many patterns or spans one unmatched-filter
+// or shard notice lists; the remaining count is stated instead, so the
+// sentence never grows with the caller's expression.
 const warningSegmentCap = 5
 
 // parseShardFile reports whether rel names a split artifact in the
@@ -1255,13 +1263,15 @@ func parseShardFile(rel string) (number int, family string, ok bool) {
 // therefore address POSITIONS in written-number order, not the written
 // numbers themselves (for a family whose written numbers contain gaps the
 // two differ, for complete families they coincide). Ineffective ranges
-// surface as typed warnings instead of failing: a matched set without a
-// single selected shard file warns once naming every segment, and each
-// segment selecting no existing index is named. selectedKept reports how
-// many selected items survived, so the caller fails ErrNoFilterMatch when
+// surface as plan notices instead of failing: a matched set without a
+// single selected shard file appends one notice naming the whole
+// expression, and one notice names the spans selecting no existing index
+// (bounded by warningSegmentCap, the rest counted). selectedKept
+// reports how many selected items survived, so the caller fails
+// ErrNoFilterMatch when
 // ranges empty a non-empty selection even though retained companions remain
 // planned.
-func narrowShardRanges(items []PlanItem, selected []bool, ranges []shardRange, expr string) ([]PlanItem, int, []PlanWarning) {
+func narrowShardRanges(items []PlanItem, selected []bool, ranges []shardRange, expr string) ([]PlanItem, int, []string) {
 	isSelected := func(i int) bool { return i < len(selected) && selected[i] }
 	selectedTotal := 0
 	for _, flag := range selected {
@@ -1287,15 +1297,8 @@ func narrowShardRanges(items []PlanItem, selected []bool, ranges []shardRange, e
 		families[family] = append(families[family], shardMember{item: i, number: number})
 	}
 	if len(families) == 0 {
-		segments := make([]string, 0, len(ranges))
-		for _, r := range ranges {
-			segments = append(segments, r.text)
-		}
-		return items, selectedTotal, []PlanWarning{{
-			Code:     PlanWarningShardRangesNoShards,
-			Message:  fmt.Sprintf("shard ranges %q matched no shard file, so nothing was narrowed", expr),
-			Segments: segments,
-		}}
+		return items, selectedTotal, []string{fmt.Sprintf(
+			"shard ranges %q matched no shard file, so nothing was narrowed", expr)}
 	}
 	keep := make([]bool, len(items))
 	for i := range keep {
@@ -1334,13 +1337,11 @@ func narrowShardRanges(items []PlanItem, selected []bool, ranges []shardRange, e
 			ineffective = append(ineffective, r.text)
 		}
 	}
-	var warnings []PlanWarning
+	var shardNotices []string
 	if len(ineffective) > 0 {
-		warnings = append(warnings, PlanWarning{
-			Code:     PlanWarningShardRangesIneffectiveSegments,
-			Message:  fmt.Sprintf("shard range segments selected no shard (indices present: 1-%d): %s", largestFamily, joinBoundedSegments(ineffective)),
-			Segments: ineffective,
-		})
+		shardNotices = append(shardNotices, fmt.Sprintf(
+			"shard range segments selected no shard (indices present: 1-%d): %s",
+			largestFamily, joinBoundedSegments(ineffective)))
 	}
 	narrowed := make([]PlanItem, 0, len(items))
 	selectedKept := 0
@@ -1353,12 +1354,12 @@ func narrowShardRanges(items []PlanItem, selected []bool, ranges []shardRange, e
 			selectedKept++
 		}
 	}
-	return narrowed, selectedKept, warnings
+	return narrowed, selectedKept, shardNotices
 }
 
 // joinBoundedSegments renders segments as a bounded list: at most
 // warningSegmentCap are named, the rest are counted. It is the single
-// bounded segment join shared by every PlanWarning message.
+// bounded segment join shared by every plan-notice message.
 func joinBoundedSegments(segments []string) string {
 	if len(segments) <= warningSegmentCap {
 		return strings.Join(segments, ", ")
@@ -1369,14 +1370,20 @@ func joinBoundedSegments(segments []string) string {
 
 // unmatchedFilters returns the requested filter patterns that credited no
 // selected file, in request order, with exact duplicates collapsed
-// (first occurrence wins) so one missing pattern is named once. The caller
-// runs it only after the ErrNoFilterMatch checks have passed, so a request
-// whose filters selected nothing reports the error, never this list.
-func unmatchedFilters(filters []string, filterMatched []bool) []string {
+// (first occurrence wins) so one missing pattern is named once. A pattern
+// whose lowercased/trimmed label a split-mention notice already reports is
+// skipped — that pinned coverage wins, so one miss is never reported
+// twice. The caller runs it only after the ErrNoFilterMatch checks have
+// passed, so a request whose filters selected nothing reports the error,
+// never this list.
+func unmatchedFilters(filters []string, filterMatched []bool, splitCovered map[string]struct{}) []string {
 	var unmatched []string
 	seen := make(map[string]struct{}, len(filters))
 	for i, filter := range filters {
 		if filterMatched[i] {
+			continue
+		}
+		if _, covered := splitCovered[strings.ToLower(strings.TrimSpace(filter))]; covered {
 			continue
 		}
 		if _, dup := seen[filter]; dup {
@@ -1388,24 +1395,20 @@ func unmatchedFilters(filters []string, filterMatched []bool) []string {
 	return unmatched
 }
 
-// unmatchedFilterWarning renders the filters_unmatched warning for patterns
+// unmatchedFilterNotice renders the filters_unmatched notice for patterns
 // that selected nothing: one bounded sentence naming each pattern (quoted,
-// at most warningSegmentCap listed and the rest counted) with every
-// unmatched pattern carried verbatim in Segments.
-func unmatchedFilterWarning(filters []string) PlanWarning {
+// at most warningSegmentCap listed and the rest counted), in the same
+// shape as the split-mention and shard notices so every plan diagnostic
+// rides Plan.Notices -> warning events -> Job.Warnings unchanged.
+func unmatchedFilterNotice(filters []string) string {
 	quoted := make([]string, len(filters))
 	for i, filter := range filters {
 		quoted[i] = strconv.Quote(filter)
 	}
-	message := fmt.Sprintf("filters %s matched nothing", joinBoundedSegments(quoted))
 	if len(filters) == 1 {
-		message = fmt.Sprintf("filter %s matched nothing", quoted[0])
+		return fmt.Sprintf("filter %s matched nothing", quoted[0])
 	}
-	return PlanWarning{
-		Code:     PlanWarningFiltersUnmatched,
-		Message:  message,
-		Segments: filters,
-	}
+	return fmt.Sprintf("filters %s matched nothing", joinBoundedSegments(quoted))
 }
 
 func isCustomHubEndpoint(endpoint string) bool {
@@ -1743,6 +1746,85 @@ func isDatasetServiceMetadata(relativePath string) bool {
 	return strings.EqualFold(path.Base(strings.ReplaceAll(relativePath, "\\", "/")), "dataset_info.json")
 }
 
+// ValidateFileSelection normalizes and validates a strict file selection
+// (the Filters of a StrictFiles job) and returns the canonical selection.
+// Entries are normalized by converting "\" separators to "/" and stripping a
+// leading "./" root alias (the established request spelling for root-level
+// files); every normalized entry must then be a canonical repository-relative
+// path — the same accepted domain as the repo tree itself — so empty,
+// absolute, trailing-slash, ".", "..", and non-canonical spellings are
+// rejected with ErrInvalidFileSelection naming the entry. Deduplication
+// compares exact spellings: a repeated normalized path collapses to one
+// entry, while two entries that differ only in case are rejected with
+// ErrInvalidFileSelection naming both — on case-insensitive filesystems they
+// are one file, so silently keeping the first would break exactness. The
+// result is never empty: an empty input is an invalid selection, not
+// "download everything".
+//
+// Entries are otherwise used verbatim: no whitespace trimming, no
+// case-insensitive matching, and no basename or substring interpretation.
+func ValidateFileSelection(paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("%w: selection is empty", ErrInvalidFileSelection)
+	}
+	normalized := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	folded := make(map[string]string, len(paths))
+	for _, p := range paths {
+		cleaned := strings.ReplaceAll(p, `\`, "/")
+		cleaned = strings.TrimPrefix(cleaned, "./")
+		if unsafeRepoPath(cleaned) {
+			return nil, fmt.Errorf("%w: %q is not a canonical repository-relative file path", ErrInvalidFileSelection, p)
+		}
+		if _, dup := seen[cleaned]; dup {
+			continue
+		}
+		fold := strings.ToLower(cleaned)
+		if first, clash := folded[fold]; clash {
+			return nil, fmt.Errorf("%w: %q and %q differ only in case and are one file on case-insensitive filesystems; keep one spelling", ErrInvalidFileSelection, first, cleaned)
+		}
+		seen[cleaned] = struct{}{}
+		folded[fold] = cleaned
+		normalized = append(normalized, cleaned)
+	}
+	return normalized, nil
+}
+
+// resolveStrictSelection maps a strict file selection onto the walked tree
+// and returns the exact-spelling path set that drives plan inclusion.
+// Matching is exact equality over complete repository-relative paths
+// (case-sensitive, after ValidateFileSelection's separator/alias
+// normalization): a selected spelling either IS a tree path — then the plan
+// item is that very spelling — or it is a miss, so a case-variant tree file
+// is never substituted for the selection. No substring widening and no
+// basename aliasing: a single-segment entry selects only the root-level file
+// of that name. Selection is all-or-nothing: any selected path absent from
+// the tree fails the plan with ErrNoFileMatch naming the missing paths
+// instead of downloading a subset.
+func resolveStrictSelection(nodes []hfNode, selection []string) (map[string]struct{}, error) {
+	normalized, err := ValidateFileSelection(selection)
+	if err != nil {
+		return nil, err
+	}
+	inTree := make(map[string]struct{}, len(nodes))
+	for _, n := range nodes {
+		inTree[n.Path] = struct{}{}
+	}
+	selected := make(map[string]struct{}, len(normalized))
+	var missing []string
+	for _, p := range normalized {
+		if _, ok := inTree[p]; !ok {
+			missing = append(missing, p)
+			continue
+		}
+		selected[p] = struct{}{}
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("%w: %s", ErrNoFileMatch, strings.Join(missing, ", "))
+	}
+	return selected, nil
+}
+
 // filterMatches reports whether filter fLower matches the file name nameLower
 // (both already lowercased). In substring mode (the default) it uses a plain
 // substring check. In exact mode it matches only when fLower equals a whole
@@ -2046,8 +2128,10 @@ func refuseReservedLocalOwner(repo string) error {
 	return nil
 }
 
-// ScanPlan scans a repository and emits plan_item events via the progress callback.
-// This is useful for dry-run/preview functionality.
+// ScanPlan scans a repository and emits plan_item events via the progress
+// callback, preceded by warning events for the plan's notices (the same
+// warning channel Download uses). This is useful for dry-run/preview
+// functionality.
 func ScanPlan(ctx context.Context, job Job, cfg Settings, progress ProgressFunc) error {
 	plan, err := PlanRepo(ctx, job, cfg)
 	if err != nil {
@@ -2058,6 +2142,15 @@ func ScanPlan(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		if !plan.CommitPinned {
 			progress(ProgressEvent{Time: time.Now().UTC(), Level: "warn", Event: "warning", Repo: job.Repo, Revision: job.Revision,
 				Message: "revision is not pinned to an immutable commit; the plan is revision-addressed"})
+		}
+		// Plan notices are informational diagnostics (bounded at their
+		// source, currently the split-mention exclusions of the
+		// split-precedence rule). They ride the warning channel exactly as
+		// Download emits them, before the plan_item list: they describe
+		// files that are not in the plan, so they read naturally first.
+		for _, notice := range plan.Notices {
+			progress(ProgressEvent{Time: time.Now().UTC(), Level: "warn", Event: "warning", Repo: job.Repo, Revision: job.Revision,
+				Message: notice})
 		}
 		for _, item := range plan.Items {
 			progress(ProgressEvent{

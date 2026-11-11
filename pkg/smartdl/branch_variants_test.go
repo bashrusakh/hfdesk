@@ -5,15 +5,13 @@ package smartdl
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"strconv"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -276,91 +274,379 @@ func TestEXLBranchVariantsRemainAvailableAfterSpecializedMetadataClassification(
 	}
 }
 
-// TestEXLBranchVariantsPreserveMainWeights pins the preserved behavior of a
-// main revision that carries model weights: it gets no EXL branch option, and
-// the analyzer makes no optional branch request for it.
-//
-// The weight file's name is the data that differs: a model-weight file is
-// recognized by its content, not by a name that happens to look like one.
-func TestEXLBranchVariantsPreserveMainWeights(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		file   string
-		header string
-	}{
-		{
-			name:   "standard weight file name",
-			file:   "model.safetensors",
-			header: `{"layers.0.mlp.q_weight":{"dtype":"U8","shape":[16],"data_offsets":[0,16]}}`,
-		},
-		{
-			name:   "arbitrary weight file name",
-			file:   "opaque-export-part.safetensors",
-			header: `{"layers.0.attn.q_weight":{"dtype":"U8","shape":[16],"data_offsets":[0,16]},"layers.0.attn.q_scale":{"dtype":"F16","shape":[1],"data_offsets":[16,18]}}`,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			const repo = "owner/exl3-model"
-			modelHeader := makeSafetensorsHeader(t, tc.header, 500)
-			var branchRequests, headerRequests atomic.Int64
-			hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				switch {
-				case strings.Contains(r.URL.Path, "/tree/"):
-					if strings.HasSuffix(r.URL.Path, "/tree/main") {
-						fmt.Fprintf(w, `[{"type":"file","path":"config.json","size":10},{"type":"file","path":%q,"size":500},{"type":"file","path":"quantization_config.json","size":20}]`, tc.file)
-						return
-					}
-					branchRequests.Add(1)
-					http.NotFound(w, r)
-				case strings.HasSuffix(r.URL.Path, "/refs"):
-					io.WriteString(w, `{"branches":[{"name":"main"},{"name":"4.00bpw"}],"tags":[]}`)
-				case strings.HasSuffix(r.URL.Path, "/auth-check"):
-					http.NotFound(w, r)
-				case strings.HasSuffix(r.URL.Path, "/raw/main/"+tc.file):
-					headerRequests.Add(1)
-					serveSafetensorsHeaderRange(w, r, modelHeader, 500)
-				case strings.HasSuffix(r.URL.Path, "/raw/main/config.json"):
-					io.WriteString(w, `{"model_type":"llama"}`)
-				case strings.HasSuffix(r.URL.Path, "/raw/main/quantization_config.json"):
-					io.WriteString(w, `{"quant_method":"exl3","bits":4,"head_bits":6}`)
-				case strings.Contains(r.URL.Path, "/raw/4.00bpw/"):
-					branchRequests.Add(1)
-					http.NotFound(w, r)
-				default:
-					t.Errorf("unexpected request: %s", r.URL)
-					http.NotFound(w, r)
-				}
-			}))
-			defer hub.Close()
+// TestEXLBranchVariantsOfferedWhenMainCarriesWeights pins the availability
+// rule next to the preserved main analysis: a main revision that carries
+// model weights keeps its type, quantization projection, and metadata, and
+// the bitrate-shaped branch ref is still offered. Visibility no longer
+// depends on guessing the main tree's file content, so no safetensors header
+// probe runs against the weight file at all. Precedence is pinned beside it:
+// because the main tree carries recognized payload by name (root
+// model.safetensors), the offered row carries no Recommended badge and no
+// branch-variant recommendation appears — this safetensors-only Transformers
+// analysis produced no file recommendation at base (rows were hidden there),
+// so it must not gain one from the now-visible branch row.
+func TestEXLBranchVariantsOfferedWhenMainCarriesWeights(t *testing.T) {
+	const repo = "owner/exl3-model"
+	var headerRequests atomic.Int64
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/tree/"):
+			if strings.HasSuffix(r.URL.Path, "/tree/main") {
+				io.WriteString(w, `[{"type":"file","path":"config.json","size":10},{"type":"file","path":"model.safetensors","size":500},{"type":"file","path":"quantization_config.json","size":20}]`)
+				return
+			}
+			io.WriteString(w, `[{"type":"file","path":"model.safetensors","size":400}]`)
+		case strings.HasSuffix(r.URL.Path, "/refs"):
+			io.WriteString(w, `{"branches":[{"name":"main"},{"name":"4.00bpw"}],"tags":[]}`)
+		case strings.HasSuffix(r.URL.Path, "/auth-check"):
+			http.NotFound(w, r)
+		case strings.HasSuffix(r.URL.Path, "/raw/main/model.safetensors"),
+			strings.HasSuffix(r.URL.Path, "/resolve/main/model.safetensors"):
+			headerRequests.Add(1)
+			io.WriteString(w, "weight content must never be probed for branch visibility")
+		case strings.HasSuffix(r.URL.Path, "/raw/main/config.json"):
+			io.WriteString(w, `{"model_type":"llama"}`)
+		case strings.HasSuffix(r.URL.Path, "/raw/main/quantization_config.json"):
+			io.WriteString(w, `{"quant_method":"exl3","bits":4,"head_bits":6}`)
+		case strings.Contains(r.URL.Path, "/raw/4.00bpw/"):
+			http.NotFound(w, r)
+		default:
+			t.Errorf("unexpected request: %s", r.URL)
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
 
-			info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).AnalyzeModelWithRevision(context.Background(), repo, "main")
-			if err != nil {
-				t.Fatalf("analyze main with weights: %v", err)
-			}
-			if info.Type != TypeTransformers || info.Quantized == nil || info.Quantized.Method != "exl3" {
-				t.Fatalf("main analysis changed: type=%s quantized=%+v", info.Type, info.Quantized)
-			}
-			if len(info.AnalysisWarnings) != 0 {
-				t.Fatalf("confirmed model-weight header produced an analysis warning: %+v", info.AnalysisWarnings)
-			}
-			for _, item := range info.SelectableItems {
-				if item.Revision != "" {
-					t.Fatalf("main-with-weights repo gained branch item: %+v", item)
-				}
-			}
-			if headerRequests.Load() != 2 || branchRequests.Load() != 0 {
-				t.Fatalf("header/branch requests = %d/%d, want 2/0", headerRequests.Load(), branchRequests.Load())
-			}
-		})
+	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).AnalyzeModelWithRevision(context.Background(), repo, "main")
+	if err != nil {
+		t.Fatalf("analyze main with weights: %v", err)
+	}
+	if info.Type != TypeTransformers || info.Quantized == nil || info.Quantized.Method != "exl3" {
+		t.Fatalf("main analysis changed: type=%s quantized=%+v", info.Type, info.Quantized)
+	}
+	if len(info.AnalysisWarnings) != 0 {
+		t.Fatalf("analysis with weights produced a warning: %+v", info.AnalysisWarnings)
+	}
+	items := exlBranchSelectableItems(info)
+	if len(items) != 1 {
+		t.Fatalf("branch options = %+v, want the shaped ref offered despite main weights", items)
+	}
+	item := items[0]
+	if item.Revision != "4.00bpw" || !item.BranchVariant || item.Method != "exl3" {
+		t.Fatalf("branch item = %+v, want the offered EXL3 branch", item)
+	}
+	if item.Recommended {
+		t.Fatalf("branch item = %+v, want no Recommended badge while the format analysis owns main-tree weights", item)
+	}
+	if info.RecommendedDownload != nil {
+		t.Fatalf("recommended download = %+v, want nil: no file recommendation existed at base and the branch row must not create one", info.RecommendedDownload)
+	}
+	if headerRequests.Load() != 0 {
+		t.Fatalf("main weight header requests = %d, want none: availability must not probe file content", headerRequests.Load())
 	}
 }
 
-func TestEXLBranchVariantsIgnoreRenamedCalibrationSafetensors(t *testing.T) {
+// TestRecommendationPrecedenceAcrossBranchAvailability pins requirement 2
+// against requirement 3: the branch Recommended badge follows
+// mainTreeCarriesPayload — names/layout decide, file names never prove
+// calibration — so offering EXL-shaped branch rows never changes the
+// recommendation a known format already produced from main-tree payload,
+// while a classic EXL branch repository (config-only main, payloads on
+// branches) keeps the branch-variant recommendation established by PR #152 —
+// base parity with git show d7ba4fd:pkg/smartdl/branch_variants_test.go,
+// whose classic-EXL cases asserted an unfiltered branch revision.
+func TestRecommendationPrecedenceAcrossBranchAvailability(t *testing.T) {
+	serve := func(t *testing.T, mainTree string, raw map[string]string) *httptest.Server {
+		t.Helper()
+		hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/tree/main"):
+				io.WriteString(w, mainTree)
+			case strings.Contains(r.URL.Path, "/tree/"):
+				io.WriteString(w, `[]`)
+			case strings.HasSuffix(r.URL.Path, "/refs"):
+				io.WriteString(w, `{"branches":[{"name":"main"},{"name":"4.00bpw"}],"tags":[]}`)
+			case strings.HasSuffix(r.URL.Path, "/auth-check"):
+				http.NotFound(w, r)
+			case strings.Contains(r.URL.Path, "/raw/main/"):
+				rel := r.URL.Path[strings.LastIndex(r.URL.Path, "/raw/main/")+len("/raw/main/"):]
+				if body, ok := raw[rel]; ok {
+					io.WriteString(w, body)
+					return
+				}
+				http.NotFound(w, r)
+			default:
+				// Optional branch metadata and size lookups degrade silently.
+				http.NotFound(w, r)
+			}
+		}))
+		t.Cleanup(hub.Close)
+		return hub
+	}
+
+	t.Run("known format with weights on main keeps its file recommendation", func(t *testing.T) {
+		hub := serve(t,
+			`[{"type":"file","path":"config.json","size":10},{"type":"file","path":"model.safetensors","size":400},{"type":"file","path":"pytorch_model.bin","size":300}]`,
+			map[string]string{"config.json": `{"model_type":"llama"}`})
+		info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).
+			AnalyzeModelWithRevision(context.Background(), "owner/example-EXL3-model", "main")
+		if err != nil {
+			t.Fatalf("analyze weights-on-main: %v", err)
+		}
+		if info.Type != TypeTransformers || info.Transformers == nil {
+			t.Fatalf("main analysis = type %s, want a concrete Transformers file selection", info.Type)
+		}
+		items := exlBranchSelectableItems(info)
+		if len(items) != 1 {
+			t.Fatalf("branch rows = %+v, want the shaped ref offered alongside the format selection", items)
+		}
+		if item := items[0]; item.Revision != "4.00bpw" || !item.BranchVariant {
+			t.Fatalf("branch row = %+v, want the offered, downloadable branch variant", item)
+		} else if item.Recommended {
+			t.Fatalf("branch row = %+v, want no Recommended badge while the format owns a main-tree selection", item)
+		}
+		rd := info.RecommendedDownload
+		if rd == nil || rd.BranchVariant || rd.Revision != "" {
+			t.Fatalf("recommended download = %+v, want the format's file selection, not a branch variant", rd)
+		}
+		if want := []string{"safetensors"}; !reflect.DeepEqual(rd.Filters, want) {
+			t.Fatalf("recommended filters = %v, want the format selection %v", rd.Filters, want)
+		}
+	})
+
+	t.Run("GGUF weights on main keep the artifact recommendation", func(t *testing.T) {
+		hub := serve(t,
+			`[{"type":"file","path":"config.json","size":10},{"type":"file","path":"model-Q4_K_M.gguf","size":4000000000}]`,
+			map[string]string{"config.json": `{"model_type":"llama"}`})
+		info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).
+			AnalyzeModelWithRevision(context.Background(), "owner/example-EXL3-model", "main")
+		if err != nil {
+			t.Fatalf("analyze GGUF weights-on-main: %v", err)
+		}
+		if info.Type != TypeGGUF || info.GGUF == nil {
+			t.Fatalf("main analysis = type %s, want a concrete GGUF file selection", info.Type)
+		}
+		items := exlBranchSelectableItems(info)
+		if len(items) != 1 {
+			t.Fatalf("branch rows = %+v, want the shaped ref offered alongside the GGUF selection", items)
+		}
+		if item := items[0]; item.Revision != "4.00bpw" || !item.BranchVariant || item.Recommended {
+			t.Fatalf("branch row = %+v, want an offered, unrecommended branch variant", item)
+		}
+		rd := info.RecommendedDownload
+		if rd == nil || rd.BranchVariant || rd.Revision != "" || !rd.ExactMatch {
+			t.Fatalf("recommended download = %+v, want the GGUF artifact request, not a branch variant", rd)
+		}
+		if want := []string{"./model-Q4_K_M.gguf"}; !reflect.DeepEqual(rd.Filters, want) {
+			t.Fatalf("recommended filters = %v, want the GGUF artifact %v", rd.Filters, want)
+		}
+	})
+
+	t.Run("classic EXL branch repository keeps the branch recommendation", func(t *testing.T) {
+		hub := serve(t, `[{"type":"file","path":"config.json","size":10}]`,
+			map[string]string{"config.json": `{"model_type":"llama"}`})
+		info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).
+			AnalyzeModelWithRevision(context.Background(), "owner/example-EXL3-model", "main")
+		if err != nil {
+			t.Fatalf("analyze config-only main: %v", err)
+		}
+		items := exlBranchSelectableItems(info)
+		if len(items) != 1 || !items[0].Recommended {
+			t.Fatalf("branch rows = %+v, want the sole row recommended without a competing file selection", items)
+		}
+		rd := info.RecommendedDownload
+		if rd == nil || rd.Revision != "4.00bpw" || !rd.BranchVariant || len(rd.Filters) != 0 || rd.ExactMatch {
+			t.Fatalf("recommended download = %+v; want unfiltered branch revision %q (base parity)", rd, "4.00bpw")
+		}
+	})
+
+	analyze := func(t *testing.T, hub *httptest.Server) *RepoInfo {
+		t.Helper()
+		info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).
+			AnalyzeModelWithRevision(context.Background(), "owner/example-EXL3-model", "main")
+		if err != nil {
+			t.Fatalf("analyze fixture main: %v", err)
+		}
+		return info
+	}
+	// offeredAndUnbadged asserts the availability half of the rule: the shaped
+	// ref is listed and downloadable, and payload on main withholds the badge.
+	offeredAndUnbadged := func(t *testing.T, info *RepoInfo) {
+		t.Helper()
+		items := exlBranchSelectableItems(info)
+		if len(items) != 1 {
+			t.Fatalf("branch rows = %+v, want the shaped ref offered", items)
+		}
+		if item := items[0]; item.Revision != "4.00bpw" || !item.BranchVariant || item.Recommended {
+			t.Fatalf("branch row = %+v, want an offered, unrecommended branch variant while main carries payload", item)
+		}
+	}
+
+	t.Run("specialized multimodal with root payload keeps nil recommendation", func(t *testing.T) {
+		// F1a: reclassification hides info.Transformers, but the root payload
+		// still decides precedence by name — base hid the rows behind this
+		// payload (mainWeightEvidencePresent) and the reclassified type yields
+		// no selectable items, so base recommendation was nil.
+		hub := serve(t,
+			`[{"type":"file","path":"config.json","size":10},{"type":"file","path":"model.safetensors","size":400}]`,
+			map[string]string{"config.json": `{"vision_config":{"model_type":"siglip","image_size":224},"text_config":{"model_type":"llama","max_position_embeddings":4096}}`})
+		info := analyze(t, hub)
+		if info.Type != TypeMultimodal {
+			t.Fatalf("main analysis = type %s (metadata %+v, warnings %+v), want specialized reclassification over root payload", info.Type, info.Metadata, info.AnalysisWarnings)
+		}
+		offeredAndUnbadged(t, info)
+		if info.RecommendedDownload != nil {
+			t.Fatalf("recommended download = %+v, want nil (base parity: payload hid the rows, the type yields no items)", info.RecommendedDownload)
+		}
+	})
+
+	t.Run("LoRA with adapter payload keeps nil recommendation", func(t *testing.T) {
+		hub := serve(t,
+			`[{"type":"file","path":"adapter_config.json","size":300},{"type":"file","path":"adapter_model.safetensors","size":1200}]`,
+			map[string]string{"adapter_config.json": `{"r":16,"lora_alpha":32,"target_modules":["q_proj"]}`})
+		info := analyze(t, hub)
+		if info.Type != TypeLoRA {
+			t.Fatalf("main analysis = type %s, want LoRA classification", info.Type)
+		}
+		offeredAndUnbadged(t, info)
+		if info.RecommendedDownload != nil {
+			t.Fatalf("recommended download = %+v, want nil (base parity: payload hid the rows, LoRA yields no selectable items)", info.RecommendedDownload)
+		}
+	})
+
+	t.Run("payload-less diffusers main recommends the branch", func(t *testing.T) {
+		// Base parity: no weight-shaped file anywhere → mainWeightEvidenceAbsent
+		// → base showed the rows and badged one, and the unfiltered branch won
+		// the recommendation.
+		hub := serve(t,
+			`[{"type":"file","path":"model_index.json","size":500},{"type":"file","path":"README.md","size":100}]`,
+			map[string]string{"model_index.json": `{"_class_name":"StableDiffusionPipeline","unet":{"_class_name":"UNet2DConditionModel"},"vae":{"_class_name":"AutoencoderKL"}}`})
+		info := analyze(t, hub)
+		if info.Type != TypeDiffusers {
+			t.Fatalf("main analysis = type %s, want Diffusers classification", info.Type)
+		}
+		items := exlBranchSelectableItems(info)
+		if len(items) != 1 || items[0].Revision != "4.00bpw" || !items[0].BranchVariant || !items[0].Recommended {
+			t.Fatalf("branch rows = %+v, want the badged branch: payload-less main means the branch is the actual selection (base parity)", items)
+		}
+		rd := info.RecommendedDownload
+		if rd == nil || rd.Revision != "4.00bpw" || !rd.BranchVariant || len(rd.Filters) != 0 {
+			t.Fatalf("recommended download = %+v, want unfiltered branch revision %q (base parity)", rd, "4.00bpw")
+		}
+	})
+
+	t.Run("subdirectory payload keeps the diffusers component recommendation", func(t *testing.T) {
+		// Seam closure: payload recognition spans the whole main tree like
+		// base's classifyMainWeights scan — unet/diffusion_pytorch_model.safetensors
+		// counts, so no badge and the component selection stands (base hid the
+		// rows and preserved it), while the branch row stays offered.
+		hub := serve(t,
+			`[{"type":"file","path":"model_index.json","size":500},{"type":"file","path":"README.md","size":100},{"type":"file","path":"unet/diffusion_pytorch_model.safetensors","size":400}]`,
+			map[string]string{"model_index.json": `{"_class_name":"StableDiffusionPipeline","unet":["diffusers","UNet2DConditionModel"],"vae":["diffusers","AutoencoderKL"]}`})
+		info := analyze(t, hub)
+		if info.Type != TypeDiffusers {
+			t.Fatalf("main analysis = type %s, want Diffusers classification", info.Type)
+		}
+		offeredAndUnbadged(t, info)
+		rd := info.RecommendedDownload
+		if rd == nil || rd.BranchVariant || rd.Revision != "" {
+			t.Fatalf("recommended download = %+v, want the diffusers component selection, not a branch variant", rd)
+		}
+		filters := append([]string(nil), rd.Filters...)
+		sort.Strings(filters)
+		if want := []string{"unet", "vae"}; !reflect.DeepEqual(filters, want) {
+			t.Fatalf("recommended filters = %v, want the required diffusers components %v (base hid the rows via its whole-tree payload scan)", filters, want)
+		}
+	})
+
+	t.Run("marker-bearing model.pt keeps base's hidden-rows outcome", func(t *testing.T) {
+		// (f) Base's name table: ext .pt is weight-ish and "model" is a
+		// weight-role marker → Present → base hid the rows; format/nil
+		// recommendation stands. A bespoke extension list without .pt would
+		// wrongly Absent-badge the branch here.
+		hub := serve(t,
+			`[{"type":"file","path":"config.json","size":10},{"type":"file","path":"model.pt","size":400}]`,
+			map[string]string{"config.json": `{"model_type":"llama"}`})
+		info := analyze(t, hub)
+		offeredAndUnbadged(t, info)
+		if info.RecommendedDownload != nil {
+			t.Fatalf("recommended download = %+v, want nil (base hid the rows on name evidence; this Generic tree yields no items)", info.RecommendedDownload)
+		}
+	})
+
+	t.Run("clean data-only main still recommends the branch", func(t *testing.T) {
+		// (g) Base's name table: neither .md nor .json is weight-shaped →
+		// Absent → base showed the rows and badged one (base parity with the
+		// classic unfiltered-branch expectation).
+		hub := serve(t,
+			`[{"type":"file","path":"README.md","size":100},{"type":"file","path":"measurement.json","size":60916}]`,
+			nil)
+		info := analyze(t, hub)
+		items := exlBranchSelectableItems(info)
+		if len(items) != 1 || items[0].Revision != "4.00bpw" || !items[0].BranchVariant || !items[0].Recommended {
+			t.Fatalf("branch rows = %+v, want the badged branch on a clean Absent main (base parity)", items)
+		}
+		rd := info.RecommendedDownload
+		if rd == nil || rd.Revision != "4.00bpw" || !rd.BranchVariant || len(rd.Filters) != 0 || rd.ExactMatch {
+			t.Fatalf("recommended download = %+v, want unfiltered branch revision %q (base parity)", rd, "4.00bpw")
+		}
+	})
+
+	t.Run("unrecognized weight-ish name hides the badge like base's Unknown", func(t *testing.T) {
+		// (h) Base's name table: .bin that is neither tokenizer/vocab nor
+		// marker-bearing (training_args.bin — base's own comment example) is
+		// Unknown, which also hid rows at base; the candidate never warns
+		// (requirement 3) and this Transformers tree has no selectable items
+		// (analyzeWeightFiles skips training artifacts), so the name-based
+		// output is nil.
+		hub := serve(t,
+			`[{"type":"file","path":"config.json","size":10},{"type":"file","path":"training_args.bin","size":900}]`,
+			map[string]string{"config.json": `{"model_type":"llama"}`})
+		info := analyze(t, hub)
+		if info.Type != TypeTransformers {
+			t.Fatalf("main analysis = type %s, want Transformers (config + root .bin)", info.Type)
+		}
+		if len(info.AnalysisWarnings) != 0 {
+			t.Fatalf("Unknown-class name produced an analysis warning: %+v (candidate availability never warns)", info.AnalysisWarnings)
+		}
+		offeredAndUnbadged(t, info)
+		if info.RecommendedDownload != nil {
+			t.Fatalf("recommended download = %+v, want nil (base hid the rows for Unknown too; no selectable items exist)", info.RecommendedDownload)
+		}
+	})
+
+	t.Run("renamed weight-looking file counts as payload by name", func(t *testing.T) {
+		// Names decide in both directions: a renamed weight-shaped file is
+		// payload wherever it sits in the main tree, exactly like
+		// model.safetensors, so no badge and the name-based output (nil for
+		// this config-less Generic tree) stands.
+		hub := serve(t,
+			`[{"type":"file","path":"README.md","size":100},{"type":"file","path":"renamed-trace.safetensors","size":1024}]`,
+			nil)
+		info := analyze(t, hub)
+		offeredAndUnbadged(t, info)
+		if info.RecommendedDownload != nil {
+			t.Fatalf("recommended download = %+v, want the name-based output (nil for this config-less Generic tree)", info.RecommendedDownload)
+		}
+	})
+}
+
+// TestEXLBranchVariantsIgnoreMainCalibrationFiles pins that calibration
+// artifacts on main neither gate the branch row nor invite a header probe:
+// the branch is listed from its ref shape, size enrichment still runs, and
+// the analyzer never reads the main tree's safetensors content. Recommendation
+// follows the names-decide rule (user decision, provenance: interactive page
+// «Калибровочный шов: имена против пробы заголовка», answer «Имена решают
+// (рекомендация)»): a root calibration-batch-001.safetensors looks like
+// payload by name, so the row gets no Recommended badge and the
+// recommendation stays the analysis's name-based output (nil for this
+// config-less Generic tree) — file names never prove calibration, and the
+// branch remains manually selectable through the always-offered row.
+func TestEXLBranchVariantsIgnoreMainCalibrationFiles(t *testing.T) {
 	const (
 		repo     = "turboderp/Qwen3.8-27B-exl3"
 		revision = "4.00bpw"
 	)
-	calibrationHeader := makeSafetensorsHeader(t, `{"input_ids":{"dtype":"I64","shape":[250,2048],"data_offsets":[0,4096000]}}`, 4096088)
 	var headerRequests, branchTreeRequests atomic.Int64
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -368,10 +654,10 @@ func TestEXLBranchVariantsIgnoreRenamedCalibrationSafetensors(t *testing.T) {
 			branch := strings.SplitN(r.URL.Path, "/tree/", 2)[1]
 			switch branch {
 			case "main":
-				io.WriteString(w, `[{"type":"file","path":".gitattributes","size":1519},{"type":"file","path":"README.md","size":3481},{"type":"file","path":"cal_trace.json","size":3410836},{"type":"file","path":"cal_trace.md","size":2274406},{"type":"file","path":"calibration-batch-001.safetensors","size":4096088,"lfs":{"size":4096088,"oid":"a034bee4c7920b4ac2e62b9d881a9b118488c414a81cf89aa64bd9274c47d685"}},{"type":"file","path":"kld_table.json","size":190470},{"type":"file","path":"measurement.json","size":60916},{"type":"file","path":"noise_attrib.json","size":257094},{"type":"file","path":"qbench_prompts_gen.json","size":344109},{"type":"file","path":"qbench_prompts_gen.md","size":228736},{"type":"file","path":"recipe_1.40bpw.yaml","size":21487},{"type":"file","path":"recipe_1.60bpw.yaml","size":21487},{"type":"file","path":"recipe_1.80bpw.yaml","size":21487},{"type":"file","path":"recipe_2.00bpw.yaml","size":21490},{"type":"file","path":"recipe_2.20bpw.yaml","size":21484},{"type":"file","path":"recipe_3.00bpw.yaml","size":21487},{"type":"file","path":"recipe_4.00bpw.yaml","size":21487},{"type":"file","path":"recipe_5.00bpw.yaml","size":21486},{"type":"file","path":"recipe_6.00bpw.yaml","size":21486},{"type":"file","path":"rfn_2.00bpw.json","size":85427}]`)
+				io.WriteString(w, `[{"type":"file","path":".gitattributes","size":1519},{"type":"file","path":"README.md","size":3481},{"type":"file","path":"cal_trace.json","size":3410836},{"type":"file","path":"calibration-batch-001.safetensors","size":4096088,"lfs":{"size":4096088,"oid":"a034bee4c7920b4ac2e62b9d881a9b118488c414a81cf89aa64bd9274c47d685"}},{"type":"file","path":"recipe_4.00bpw.yaml","size":21487}]`)
 			case revision, "4_25":
 				branchTreeRequests.Add(1)
-				io.WriteString(w, `[{"type":"file","path":"config.json","size":4621},{"type":"file","path":"model-00001-of-00002.safetensors","size":8471336006},{"type":"file","path":"model-00002-of-00002.safetensors","size":8389473789},{"type":"file","path":"model.safetensors.index.json","size":238664},{"type":"file","path":"quantization_config.json","size":629045}]`)
+				io.WriteString(w, `[{"type":"file","path":"config.json","size":4621},{"type":"file","path":"model-00001-of-00002.safetensors","size":8471336006},{"type":"file","path":"model-00002-of-00002.safetensors","size":8389473789}]`)
 			default:
 				t.Errorf("unexpected tree revision %q", branch)
 				http.NotFound(w, r)
@@ -380,9 +666,10 @@ func TestEXLBranchVariantsIgnoreRenamedCalibrationSafetensors(t *testing.T) {
 			io.WriteString(w, `{"branches":[{"name":"main"},{"name":"4.00bpw"}],"tags":[]}`)
 		case strings.HasSuffix(r.URL.Path, "/auth-check"):
 			http.NotFound(w, r)
-		case strings.HasSuffix(r.URL.Path, "/resolve/main/calibration-batch-001.safetensors"):
+		case strings.HasSuffix(r.URL.Path, "/resolve/main/calibration-batch-001.safetensors"),
+			strings.HasSuffix(r.URL.Path, "/raw/main/calibration-batch-001.safetensors"):
 			headerRequests.Add(1)
-			serveSafetensorsHeaderRange(w, r, calibrationHeader, 4096088)
+			http.NotFound(w, r)
 		case strings.HasSuffix(r.URL.Path, "/raw/4.00bpw/quantization_config.json"):
 			io.WriteString(w, `{"quant_method":"exl3","bits_per_weight":4}`)
 		default:
@@ -396,247 +683,85 @@ func TestEXLBranchVariantsIgnoreRenamedCalibrationSafetensors(t *testing.T) {
 		t.Fatalf("analyze calibration-only main: %v", err)
 	}
 	if len(info.SelectableItems) != 1 || info.SelectableItems[0].Revision != revision || info.SelectableItems[0].Method != "exl3" {
-		t.Fatalf("calibration-only main hid EXL branch: %+v", info.SelectableItems)
+		t.Fatalf("calibration main tree hid EXL branch: %+v", info.SelectableItems)
+	}
+	if info.SelectableItems[0].Recommended {
+		t.Fatalf("branch row = %+v, want no Recommended badge: names decide, a root calibration-shaped safetensors counts as payload", info.SelectableItems[0])
 	}
 	if len(info.AnalysisWarnings) != 0 {
-		t.Fatalf("confirmed calibration header produced an analysis warning: %+v", info.AnalysisWarnings)
+		t.Fatalf("calibration main tree produced an analysis warning: %+v", info.AnalysisWarnings)
 	}
-	if info.RecommendedDownload == nil || info.RecommendedDownload.Revision != revision || len(info.RecommendedDownload.Filters) != 0 {
-		t.Fatalf("recommended EXL selection = %+v, want unfiltered revision %q", info.RecommendedDownload, revision)
+	if info.RecommendedDownload != nil {
+		t.Fatalf("recommended download = %+v, want the name-based output (nil for this config-less Generic tree), never the branch", info.RecommendedDownload)
 	}
-	if headerRequests.Load() != 2 {
-		t.Fatalf("header range requests = %d, want prefix and bounded header only", headerRequests.Load())
+	if headerRequests.Load() != 0 {
+		t.Fatalf("calibration header requests = %d, want none: availability must not probe file content", headerRequests.Load())
 	}
 	if branchTreeRequests.Load() == 0 {
-		t.Fatal("calibration-only main did not inspect the real branch for size enrichment")
+		t.Fatal("branch row did not inspect the real branch for size enrichment")
 	}
 }
 
-func TestIsCalibrationOnlySafetensorsHeader(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		header   string
-		wantRole bool
-		wantErr  bool
-	}{
-		{
-			name:     "legacy input_ids only",
-			header:   `{"input_ids":{"dtype":"I64","shape":[250,2048],"data_offsets":[0,4096000]}}`,
-			wantRole: true,
-		},
-		{
-			name:     "current trace input_ids and row lengths",
-			header:   `{"input_ids":{"dtype":"I64","shape":[250,2048],"data_offsets":[0,4096000]},"lengths":{"dtype":"I64","shape":[250],"data_offsets":[4096000,4098000]}}`,
-			wantRole: true,
-		},
-		{
-			name:     "length rows mismatch",
-			header:   `{"input_ids":{"dtype":"I64","shape":[250,2048],"data_offsets":[0,4096000]},"lengths":{"dtype":"I64","shape":[249],"data_offsets":[4096000,4097992]}}`,
-			wantRole: false,
-		},
-		{
-			name:     "arbitrary integer tensor is not calibration",
-			header:   `{"opaque_tensor":{"dtype":"I64","shape":[250,2048],"data_offsets":[0,4096000]}}`,
-			wantRole: false,
-		},
-		{
-			name:     "mixed input and model parameter is a weight file",
-			header:   `{"input_ids":{"dtype":"I64","shape":[250,2048],"data_offsets":[0,4096000]},"q_weight":{"dtype":"U8","shape":[16],"data_offsets":[4096000,4096016]}}`,
-			wantRole: false,
-		},
-		{
-			name:    "malformed header is inconclusive",
-			header:  `{"input_ids":`,
-			wantErr: true,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := isCalibrationOnlySafetensorsHeader([]byte(tc.header))
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("error = %v, wantErr=%v", err, tc.wantErr)
-			}
-			if err == nil && got != tc.wantRole {
-				t.Fatalf("calibration role = %v, want %v", got, tc.wantRole)
-			}
-		})
-	}
-}
-
-func TestEXLBranchEligibilityConservativelyHandlesUnsupportedSafetensorsRange(t *testing.T) {
-	const repo = "owner/exl3-model"
-	var rangeRequests atomic.Int64
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/tree/"):
-			if strings.HasSuffix(r.URL.Path, "/tree/main") {
-				io.WriteString(w, `[{"type":"file","path":"opaque.safetensors","size":1000}]`)
-				return
-			}
-			http.NotFound(w, r)
-		case strings.HasSuffix(r.URL.Path, "/refs"):
-			io.WriteString(w, `{"branches":[{"name":"main"},{"name":"4.00bpw"}],"tags":[]}`)
-		case strings.HasSuffix(r.URL.Path, "/auth-check"):
-			http.NotFound(w, r)
-		case strings.HasSuffix(r.URL.Path, "/raw/main/opaque.safetensors"):
-			rangeRequests.Add(1)
-			io.WriteString(w, "range unsupported") // 200 must not be read as a full model file.
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer hub.Close()
-
-	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).AnalyzeModelWithRevision(context.Background(), repo, "main")
-	if err != nil {
-		t.Fatalf("unsupported optional header probe failed main analysis: %v", err)
-	}
-	for _, item := range info.SelectableItems {
-		if item.Revision != "" {
-			t.Fatalf("unknown file role exposed branch option without positive calibration evidence: %+v", item)
-		}
-	}
-	encoded, err := json.Marshal(info)
-	if err != nil {
-		t.Fatalf("marshal partial analysis: %v", err)
-	}
-	var response struct {
-		AnalysisWarnings []struct {
-			Code      string   `json:"code"`
-			Message   string   `json:"message"`
-			Causes    []string `json:"causes"`
-			Retryable bool     `json:"retryable"`
-		} `json:"analysis_warnings"`
-	}
-	if err := json.Unmarshal(encoded, &response); err != nil {
-		t.Fatalf("decode analysis warning: %v", err)
-	}
-	if len(response.AnalysisWarnings) != 1 {
-		t.Fatalf("analysis warnings = %+v, want one incomplete-branch diagnostic; analysis=%s", response.AnalysisWarnings, encoded)
-	}
-	warning := response.AnalysisWarnings[0]
-	if warning.Code != "exl_branch_discovery_incomplete" || warning.Message == "" || !warning.Retryable || !reflect.DeepEqual(warning.Causes, []string{"header_unavailable"}) {
-		t.Fatalf("analysis warning = %+v, want safe retryable header-unavailable diagnostic", warning)
-	}
-	if strings.Contains(string(encoded), "range unsupported") {
-		t.Fatalf("analysis warning leaked upstream response body: %s", encoded)
-	}
-	if rangeRequests.Load() != 1 {
-		t.Fatalf("unsupported range requests = %d, want one bounded attempt", rangeRequests.Load())
-	}
-}
-
-// TestEXLBranchEligibilityDiscoveryOutcomes pins the outcomes of the optional
-// safetensors header probe: an unknown main file role never exposes a branch
-// row on its own, a known weight suppresses the uncertainty, and every
-// incomplete discovery is reported as one retryable diagnostic.
-func TestEXLBranchEligibilityDiscoveryOutcomes(t *testing.T) {
-	weightHeader := makeSafetensorsHeader(t, `{"layers.0.q_weight":{"dtype":"U8","shape":[8],"data_offsets":[0,8]}}`, 1024)
-	calibrationHeader := makeSafetensorsHeader(t, `{"input_ids":{"dtype":"I64","shape":[1,1],"data_offsets":[0,8]}}`, 1024)
-	malformedHeader := makeSafetensorsHeader(t, `{"input_ids":`, 1024)
-	probeLimitFiles := make([]exlHeaderFixtureFile, 0, maxEXLSafeTensorHeaderProbes+1)
-	for i := 0; i < maxEXLSafeTensorHeaderProbes+1; i++ {
-		probeLimitFiles = append(probeLimitFiles, exlHeaderFixtureFile{
-			path:   fmt.Sprintf("calibration-%02d.safetensors", i),
-			mode:   "header",
-			header: calibrationHeader,
-			size:   1024,
+// TestEXLBranchVisibilityNeverDependsOnMainFileContent pins the availability
+// rule across every main-tree shape that used to gate branch eligibility
+// through safetensors header probes: whatever those headers would say (model
+// weight, calibration-only, malformed, unavailable, hanging, over the probe
+// budget, a Range-ignoring body, or no safetensors at all), the shaped branch
+// ref is offered, no header request is made, and no analysis warning is
+// emitted — an unknown file role is a normal state, not a blocker.
+func TestEXLBranchVisibilityNeverDependsOnMainFileContent(t *testing.T) {
+	overBudgetFiles := make([]exlHeaderFixtureFile, 0, 17)
+	for i := 0; i < 17; i++ {
+		overBudgetFiles = append(overBudgetFiles, exlHeaderFixtureFile{
+			path: fmt.Sprintf("calibration-%02d.safetensors", i),
+			size: 1024,
 		})
 	}
 	for _, tc := range []struct {
-		name string
-		// files are the main tree files the analyzer inspects.
+		name  string
 		files []exlHeaderFixtureFile
-		// wantCauses are the diagnostic causes of the incomplete discovery. An
-		// empty list means the discovery was complete and reported no warning.
-		wantCauses []string
-		// wantRequests is the number of header HTTP requests the probe may
-		// make.
-		wantRequests int64
 	}{
-		{
-			name: "unknown role does not override later calibration evidence",
-			files: []exlHeaderFixtureFile{
-				{path: "unavailable.safetensors", mode: "unavailable", size: 1024},
-				{path: "malformed.safetensors", mode: "header", header: malformedHeader, size: 1024},
-				{path: "calibration.safetensors", mode: "header", header: calibrationHeader, size: 1024},
-			},
-			wantCauses:   []string{"header_unavailable", "header_uninterpretable"},
-			wantRequests: 5,
-		},
-		{
-			name: "known safetensors weight wins over an earlier unknown",
-			files: []exlHeaderFixtureFile{
-				{path: "unavailable.safetensors", mode: "unavailable", size: 1024},
-				{path: "model.safetensors", mode: "header", header: weightHeader, size: 1024},
-			},
-			wantRequests: 3,
-		},
-		{
-			name: "another known weight suppresses the unknown header warning",
-			files: []exlHeaderFixtureFile{
-				{path: "unavailable.safetensors", mode: "unavailable", size: 1024},
-				{path: "model.gguf", size: 1024},
-			},
-			wantRequests: 0,
-		},
-		{
-			name: "malformed header reports incomplete discovery",
-			files: []exlHeaderFixtureFile{
-				{path: "malformed.safetensors", mode: "header", header: malformedHeader, size: 1024},
-			},
-			wantCauses:   []string{"header_uninterpretable"},
-			wantRequests: 2,
-		},
-		{
-			name:         "probe limit reports incomplete discovery",
-			files:        probeLimitFiles,
-			wantCauses:   []string{"probe_limit"},
-			wantRequests: 2 * int64(maxEXLSafeTensorHeaderProbes),
-		},
-		{
-			name: "probe timeout reports incomplete discovery",
-			files: []exlHeaderFixtureFile{
-				{path: "slow.safetensors", mode: "timeout", size: 1024},
-			},
-			wantCauses:   []string{"probe_timeout"},
-			wantRequests: 1,
-		},
+		{name: "model weight header", files: []exlHeaderFixtureFile{{path: "model.safetensors", size: 1024}}},
+		{name: "calibration-only header", files: []exlHeaderFixtureFile{{path: "renamed-trace.safetensors", size: 1024}}},
+		{name: "malformed header", files: []exlHeaderFixtureFile{{path: "malformed.safetensors", size: 1024}}},
+		{name: "unavailable header endpoint", files: []exlHeaderFixtureFile{{path: "unavailable.safetensors", mode: "unavailable", size: 1024}}},
+		{name: "hanging header endpoint", files: []exlHeaderFixtureFile{{path: "slow.safetensors", mode: "timeout", size: 1024}}},
+		{name: "file count over the old probe budget", files: overBudgetFiles},
+		{name: "Range-ignoring 200 body", files: []exlHeaderFixtureFile{{path: "opaque-export.safetensors", mode: "range", size: 1024}}},
+		{name: "no safetensors at all", files: []exlHeaderFixtureFile{{path: "README.md", size: 10}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			info, headerRequests := analyzeEXLHeaderFixture(t, tc.files)
-			if got := exlBranchRevisionCount(info); got != 0 {
-				t.Fatalf("unknown main file role exposed %d branch rows, want 0", got)
-			}
-			if len(tc.wantCauses) == 0 {
-				if len(info.AnalysisWarnings) != 0 {
-					t.Fatalf("analysis warnings = %+v, want none", info.AnalysisWarnings)
-				}
-			} else {
-				if len(info.AnalysisWarnings) != 1 {
-					t.Fatalf("analysis warnings = %+v, want one incomplete-branch diagnostic", info.AnalysisWarnings)
-				}
-				warning := info.AnalysisWarnings[0]
-				if warning.Code != exlBranchDiscoveryWarningCode || !warning.Retryable {
-					t.Fatalf("analysis warning = %+v, want the retryable incomplete-branch diagnostic", warning)
-				}
-				if !reflect.DeepEqual(warning.Causes, tc.wantCauses) {
-					t.Fatalf("analysis warning causes = %v, want %v", warning.Causes, tc.wantCauses)
+			branchRows := make([]string, 0, 1)
+			for _, item := range info.SelectableItems {
+				if item.Revision != "" {
+					branchRows = append(branchRows, item.Revision)
 				}
 			}
-			if headerRequests != tc.wantRequests {
-				t.Fatalf("header HTTP requests = %d, want %d", headerRequests, tc.wantRequests)
+			if !reflect.DeepEqual(branchRows, []string{"4.00bpw"}) {
+				t.Fatalf("branch rows = %v, want the shaped ref offered for any main content", branchRows)
+			}
+			if headerRequests != 0 {
+				t.Fatalf("header HTTP requests = %d, want none: availability must not probe file content", headerRequests)
+			}
+			if len(info.AnalysisWarnings) != 0 {
+				t.Fatalf("analysis warnings = %+v, want none: nothing is hidden, so nothing is incomplete", info.AnalysisWarnings)
 			}
 		})
 	}
 }
 
 type exlHeaderFixtureFile struct {
-	path   string
-	mode   string
-	header []byte
-	size   int64
+	path string
+	mode string
+	size int64
 }
 
+// analyzeEXLHeaderFixture exercises the production analyzer path with a fake
+// Hub whose main tree varies only in the file content that used to gate
+// branch visibility. The weight endpoints answer per mode and are counted:
+// availability must never reach them, so the answers only document the old
+// trigger shapes.
 func analyzeEXLHeaderFixture(t *testing.T, files []exlHeaderFixtureFile) (*RepoInfo, int64) {
 	t.Helper()
 	const repo = "owner/exl3-model"
@@ -661,19 +786,22 @@ func analyzeEXLHeaderFixture(t *testing.T, files []exlHeaderFixtureFile) (*RepoI
 			http.NotFound(w, r)
 		case strings.HasPrefix(r.URL.Path, "/"+repo+"/raw/main/"):
 			path := strings.TrimPrefix(r.URL.Path, "/"+repo+"/raw/main/")
-			file, ok := byPath[path]
-			if !ok {
+			if _, ok := byPath[path]; !ok {
 				http.NotFound(w, r)
 				return
 			}
 			headerRequests.Add(1)
-			switch file.mode {
+			switch byPath[path].mode {
 			case "unavailable":
 				http.Error(w, "UPSTREAM_BODY_MUST_NOT_LEAK", http.StatusServiceUnavailable)
 			case "timeout":
 				<-r.Context().Done()
+			case "range":
+				w.Header().Set("Content-Length", "16")
+				w.WriteHeader(http.StatusOK) // This endpoint ignores Range and serves a complete body.
+				_, _ = w.Write([]byte("range unsupported"))
 			default:
-				serveSafetensorsHeaderRange(w, r, file.header, file.size)
+				io.WriteString(w, "unused header content")
 			}
 		default:
 			http.NotFound(w, r)
@@ -686,283 +814,6 @@ func analyzeEXLHeaderFixture(t *testing.T, files []exlHeaderFixtureFile) (*RepoI
 		t.Fatalf("analyze fixture main: %v", err)
 	}
 	return info, headerRequests.Load()
-}
-
-func exlBranchRevisionCount(info *RepoInfo) int {
-	count := 0
-	for _, item := range info.SelectableItems {
-		if item.Revision != "" {
-			count++
-		}
-	}
-	return count
-}
-
-func TestEXLBranchEligibilityReadsBoundedHeaderFromRangeIgnoring200(t *testing.T) {
-	const repo = "owner/exl3-model"
-	headerFile := makeSafetensorsHeader(t, `{"input_ids":{"dtype":"I64","shape":[1,1],"data_offsets":[0,8]},"lengths":{"dtype":"I64","shape":[1],"data_offsets":[8,16]}}`, 512)
-	// The tail is synthetic fixture storage, not model or calibration data.
-	fileBody := append(append([]byte(nil), headerFile...), make([]byte, 16)...)
-	var bodyBytesRead, fullResponses, responseLength, contentHeaderLength atomic.Int64
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/tree/"):
-			if strings.HasSuffix(r.URL.Path, "/tree/main") {
-				fmt.Fprintf(w, `[{"type":"file","path":"renamed-trace.safetensors","size":%d}]`, len(fileBody))
-				return
-			}
-			io.WriteString(w, `[{"type":"file","path":"model.safetensors","size":500}]`)
-		case strings.HasSuffix(r.URL.Path, "/refs"):
-			io.WriteString(w, `{"branches":[{"name":"main"},{"name":"4.00bpw"}],"tags":[]}`)
-		case strings.HasSuffix(r.URL.Path, "/auth-check"):
-			http.NotFound(w, r)
-		case strings.HasSuffix(r.URL.Path, "/raw/main/renamed-trace.safetensors"):
-			fullResponses.Add(1)
-			w.Header().Set("Content-Length", strconv.Itoa(len(fileBody)))
-			w.WriteHeader(http.StatusOK) // This endpoint ignores Range and serves the complete file.
-			_, _ = w.Write(fileBody)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer hub.Close()
-
-	client := hub.Client()
-	client.Transport = &safetensorsBodyCountingTransport{
-		base:          client.Transport,
-		path:          "/raw/main/renamed-trace.safetensors",
-		count:         &bodyBytesRead,
-		contentLength: &responseLength,
-		headerLength:  &contentHeaderLength,
-	}
-	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: client}).AnalyzeModelWithRevision(context.Background(), repo, "main")
-	if err != nil {
-		t.Fatalf("analyze Range-ignoring main: %v", err)
-	}
-	if len(info.SelectableItems) != 1 || info.SelectableItems[0].Revision != "4.00bpw" {
-		t.Fatalf("complete 200 calibration response hid EXL branch: %+v", info.SelectableItems)
-	}
-	if len(info.AnalysisWarnings) != 0 {
-		t.Fatalf("bounded complete 200 calibration header produced a warning: %+v", info.AnalysisWarnings)
-	}
-	wantRead := int64(8 + len(headerFile)) // first prefix, then the skipped prefix plus JSON header.
-	if bodyBytesRead.Load() != wantRead || fullResponses.Load() != 2 {
-		t.Fatalf("HTTP 200 reads/requests/content-length/header = %d/%d/%d/%d (tree=%d body=%d), want header-only %d bytes across two requests", bodyBytesRead.Load(), fullResponses.Load(), responseLength.Load(), contentHeaderLength.Load(), len(fileBody), len(fileBody), wantRead)
-	}
-}
-
-func TestEXLBranchEligibilityCancelsRangeIgnoring200BeforeBodyDrain(t *testing.T) {
-	for _, protocol := range []struct {
-		name string
-		h2   bool
-	}{{name: "http1"}, {name: "http2", h2: true}} {
-		t.Run(protocol.name, func(t *testing.T) {
-			const repo = "owner/exl3-model"
-			headerFile := makeSafetensorsHeader(t, `{"input_ids":{"dtype":"I64","shape":[1,1],"data_offsets":[0,8]},"lengths":{"dtype":"I64","shape":[1],"data_offsets":[8,16]}}`, 512)
-			tail := []byte("synthetic")
-			fileSize := int64(len(headerFile) + len(tail))
-			payloadGate := make(chan struct{})
-			canceled := make(chan struct{}, 2)
-			protocolMajors := make(chan int, 2)
-			var payloadWrites atomic.Int64
-			hub := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				switch {
-				case strings.Contains(r.URL.Path, "/tree/"):
-					if strings.HasSuffix(r.URL.Path, "/tree/main") {
-						fmt.Fprintf(w, `[{"type":"file","path":"calibration-stream.safetensors","size":%d,"lfs":{"size":%d,"oid":"0000000000000000000000000000000000000000000000000000000000000000"}}]`, fileSize, fileSize)
-						return
-					}
-					io.WriteString(w, `[{"type":"file","path":"model.safetensors","size":500}]`)
-				case strings.HasSuffix(r.URL.Path, "/refs"):
-					io.WriteString(w, `{"branches":[{"name":"main"},{"name":"4.00bpw"}],"tags":[]}`)
-				case strings.HasSuffix(r.URL.Path, "/auth-check"):
-					http.NotFound(w, r)
-				case strings.HasSuffix(r.URL.Path, "/resolve/main/calibration-stream.safetensors"):
-					protocolMajors <- r.ProtoMajor
-					w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
-					w.WriteHeader(http.StatusOK)
-					_, _ = w.Write(headerFile)
-					w.(http.Flusher).Flush()
-					select {
-					case <-r.Context().Done():
-						canceled <- struct{}{}
-					case <-payloadGate:
-						payloadWrites.Add(1)
-						_, _ = w.Write(tail)
-					}
-				default:
-					http.NotFound(w, r)
-				}
-			}))
-			hub.EnableHTTP2 = protocol.h2
-			if protocol.h2 {
-				hub.StartTLS()
-			} else {
-				hub.Start()
-			}
-			defer hub.Close()
-
-			client := hub.Client()
-			if protocol.h2 {
-				transport, ok := client.Transport.(*http.Transport)
-				if !ok {
-					t.Fatalf("HTTP/2 test transport has type %T", client.Transport)
-				}
-				transport.ForceAttemptHTTP2 = true
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-			defer cancel()
-			result := make(chan error, 1)
-			go func() {
-				info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: client}).AnalyzeModelWithRevision(ctx, repo, "main")
-				if err == nil && (len(info.SelectableItems) != 1 || info.SelectableItems[0].Revision != "4.00bpw") {
-					err = fmt.Errorf("Range-ignoring 200 hid EXL branch: %+v", info.SelectableItems)
-				}
-				if err == nil && len(info.AnalysisWarnings) != 0 {
-					err = fmt.Errorf("bounded Range-ignoring 200 produced warnings: %+v", info.AnalysisWarnings)
-				}
-				result <- err
-			}()
-			select {
-			case err := <-result:
-				if err != nil {
-					t.Fatalf("analyze streaming 200 calibration header: %v", err)
-				}
-			case <-time.After(2 * time.Second):
-				close(payloadGate)
-				select {
-				case <-result:
-				case <-time.After(2 * time.Second):
-				}
-				t.Fatal("analysis drained or blocked on the unread 200 tensor body")
-			}
-			for i := 0; i < 2; i++ {
-				select {
-				case <-canceled:
-				case <-time.After(time.Second):
-					t.Fatal("Range response body was not canceled after bounded header read")
-				}
-			}
-			for i := 0; i < 2; i++ {
-				select {
-				case got := <-protocolMajors:
-					want := 1
-					if protocol.h2 {
-						want = 2
-					}
-					if got != want {
-						t.Fatalf("Range response protocol = HTTP/%d, want HTTP/%d", got, want)
-					}
-				case <-time.After(time.Second):
-					t.Fatal("expected Range response protocol was not observed")
-				}
-			}
-			if payloadWrites.Load() != 0 {
-				t.Fatalf("server wrote %d synthetic payload chunks after header classification", payloadWrites.Load())
-			}
-		})
-	}
-}
-
-func TestEXLBranchEligibilityBoundsSafetensorsHeaderRead(t *testing.T) {
-	const repo = "owner/exl3-model"
-	const headerSize = maxSafeTensorHeaderSize + 1
-	totalSize := int64(8 + headerSize + 1)
-	prefix := make([]byte, 8)
-	binary.LittleEndian.PutUint64(prefix, uint64(headerSize))
-	var rangeRequests atomic.Int64
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/tree/"):
-			if strings.HasSuffix(r.URL.Path, "/tree/main") {
-				fmt.Fprintf(w, `[{"type":"file","path":"oversized-header.safetensors","size":%d}]`, totalSize)
-				return
-			}
-			http.NotFound(w, r)
-		case strings.HasSuffix(r.URL.Path, "/refs"):
-			io.WriteString(w, `{"branches":[{"name":"main"},{"name":"4.00bpw"}],"tags":[]}`)
-		case strings.HasSuffix(r.URL.Path, "/auth-check"):
-			http.NotFound(w, r)
-		case strings.HasSuffix(r.URL.Path, "/raw/main/oversized-header.safetensors"):
-			rangeRequests.Add(1)
-			if r.Header.Get("Range") != "bytes=0-7" {
-				t.Errorf("oversized-header probe Range = %q, want bytes=0-7", r.Header.Get("Range"))
-			}
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-7/%d", totalSize))
-			w.Header().Set("Content-Length", "8")
-			w.WriteHeader(http.StatusPartialContent)
-			_, _ = w.Write(prefix)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer hub.Close()
-
-	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).AnalyzeModelWithRevision(context.Background(), repo, "main")
-	if err != nil {
-		t.Fatalf("oversized optional header failed main analysis: %v", err)
-	}
-	for _, item := range info.SelectableItems {
-		if item.Revision != "" {
-			t.Fatalf("oversized unknown header exposed branch option: %+v", item)
-		}
-	}
-	if len(info.AnalysisWarnings) != 1 || !reflect.DeepEqual(info.AnalysisWarnings[0].Causes, []string{"header_unavailable"}) {
-		t.Fatalf("analysis warnings = %+v, want bounded-header diagnostic", info.AnalysisWarnings)
-	}
-	if rangeRequests.Load() != 1 {
-		t.Fatalf("oversized header range requests = %d, want only the 8-byte prefix", rangeRequests.Load())
-	}
-}
-
-func TestEXLBranchEligibilityRangeProbePropagatesCancellation(t *testing.T) {
-	const repo = "owner/exl3-model"
-	started := make(chan struct{})
-	var startOnce atomic.Bool
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/tree/"):
-			if strings.HasSuffix(r.URL.Path, "/tree/main") {
-				io.WriteString(w, `[{"type":"file","path":"opaque.safetensors","size":1000}]`)
-				return
-			}
-			http.NotFound(w, r)
-		case strings.HasSuffix(r.URL.Path, "/refs"):
-			io.WriteString(w, `{"branches":[{"name":"main"},{"name":"4.00bpw"}],"tags":[]}`)
-		case strings.HasSuffix(r.URL.Path, "/auth-check"):
-			http.NotFound(w, r)
-		case strings.HasSuffix(r.URL.Path, "/raw/main/opaque.safetensors"):
-			if startOnce.CompareAndSwap(false, true) {
-				close(started)
-			}
-			<-r.Context().Done()
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer hub.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	result := make(chan error, 1)
-	go func() {
-		_, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).AnalyzeModelWithRevision(ctx, repo, "main")
-		result <- err
-	}()
-	select {
-	case <-started:
-		cancel()
-	case <-time.After(2 * time.Second):
-		t.Fatal("safetensors header probe did not start")
-	}
-	select {
-	case err := <-result:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("analysis error = %v, want context.Canceled", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("analysis did not stop after safetensors header probe cancellation")
-	}
 }
 
 func TestAnalyzeEXLBranchNestedQuantizationConfigWithoutRepoNameHint(t *testing.T) {
@@ -1037,38 +888,57 @@ func TestAnalyzeEXLBranchNestedQuantizationConfigWithoutRepoNameHint(t *testing.
 	}
 }
 
-func TestEXLBranchMethodPriorityAndFallback(t *testing.T) {
+// TestEXLBranchConfigEnrichmentOverridesDisplay pins that branch-config
+// reads only adjust display fields and never decide whether a row exists:
+// an explicit EXL branch method wins over the main/repository display, a
+// failed lookup keeps the caller's display, an unknown method string keeps
+// it too, and a recognized non-EXL branch method clears the name-based EXL
+// guess instead of claiming a flavor the config denies.
+func TestEXLBranchConfigEnrichmentOverridesDisplay(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/raw/branch/quantization_config.json") {
-			io.WriteString(w, `{"quant_method":"exl2"}`)
-			return
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/raw/exl-branch/quantization_config.json"):
+			io.WriteString(w, `{"quant_method":"exl2","bits_per_weight":4.5,"head_bits":8}`)
+		case strings.HasSuffix(r.URL.Path, "/raw/non-exl-branch/quantization_config.json"):
+			io.WriteString(w, `{"quant_method":"gptq","bits":4}`)
+		case strings.HasSuffix(r.URL.Path, "/raw/unknown-branch/quantization_config.json"):
+			io.WriteString(w, `{"quant_method":"mystery_quant","bits":4}`)
+		default:
+			http.NotFound(w, r)
 		}
-		http.NotFound(w, r)
 	}))
 	defer server.Close()
 	a := NewAnalyzer(AnalyzerOptions{Endpoint: server.URL, HTTPClient: server.Client()})
-	candidate := exlBranchCandidate{revision: "branch", bpw: 4.25, headBits: 6}
+	base := exlBranchDisplay{method: "exl3", bpw: 4.25, headBits: 6}
 
-	// Branch config outranks both main-config and repo-name evidence.
-	got := a.lookupEXLBranch(context.Background(), "owner/exl3-model", candidate, "exl3", "exl3", true)
-	if !got.include || got.item.Method != "exl2" {
-		t.Fatalf("branch-config method = %+v, want exl2 variant", got)
+	got := a.lookupEXLBranch(context.Background(), "owner/exl3-model", exlBranchCandidate{revision: "exl-branch"}, base)
+	if got.method != "exl2" || got.bpw != 4.5 || got.headBits != 8 {
+		t.Fatalf("branch-config display = %+v, want exl2 with the config's widths", got)
 	}
 
-	// An unavailable additional lookup must retain the method evidence the
-	// caller already has; head_bits alone, without config or repo evidence,
-	// must not classify EXL.
-	got = a.lookupEXLBranch(context.Background(), "owner/exl3-model", exlBranchCandidate{revision: "missing", bpw: 4.25, headBits: 6}, "exl3", "exl2", true)
-	if !got.include || got.item.Method != "exl2" {
-		t.Fatalf("failed branch-config lookup did not retain main-config priority: %+v", got)
+	got = a.lookupEXLBranch(context.Background(), "owner/exl3-model", exlBranchCandidate{revision: "missing"}, base)
+	if got != base {
+		t.Fatalf("failed lookup display = %+v, want the unchanged base %+v", got, base)
 	}
-	got = a.lookupEXLBranch(context.Background(), "owner/metadata-model", exlBranchCandidate{revision: "missing", bpw: 4.25, headBits: 6}, "", "", false)
-	if got.include {
-		t.Fatalf("head_bits/repo without EXL hint classified a variant: %+v", got)
+
+	got = a.lookupEXLBranch(context.Background(), "owner/exl3-model", exlBranchCandidate{revision: "unknown-branch"}, base)
+	if got.method != "exl3" {
+		t.Fatalf("unknown branch method display = %+v, want the base method kept", got)
+	}
+
+	got = a.lookupEXLBranch(context.Background(), "owner/exl3-model", exlBranchCandidate{revision: "non-exl-branch"}, base)
+	if got.method != "" || got.bpw != 4.25 || got.headBits != 6 {
+		t.Fatalf("known non-EXL branch config display = %+v, want no EXL method claim and the name widths", got)
 	}
 }
 
-func TestAnalyzeEXLBranchDoesNotOverrideKnownNonEXLMainMethod(t *testing.T) {
+// TestAnalyzeEXLBranchListedDespiteKnownNonEXLMainMethod pins the new
+// availability rule for the known-non-EXL case: the shaped branch is offered
+// even though the main configuration declares gptq, while the known non-EXL
+// method still outranks the repository-name guess for display (no method
+// claim), the main quantization metadata is preserved, and the offered row
+// keeps a downloadable branch-variant request shape.
+func TestAnalyzeEXLBranchListedDespiteKnownNonEXLMainMethod(t *testing.T) {
 	const repo = "owner/exl3-model"
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -1100,10 +970,16 @@ func TestAnalyzeEXLBranchDoesNotOverrideKnownNonEXLMainMethod(t *testing.T) {
 	if !ok || mainConfig["quant_method"] != "gptq" {
 		t.Fatalf("main quantization metadata = %+v, want explicit gptq", info.Metadata["quantization_config.json"])
 	}
-	for _, item := range info.SelectableItems {
-		if item.BranchVariant {
-			t.Fatalf("repo-name fallback overrode known non-EXL main method: %+v", item)
-		}
+	items := exlBranchSelectableItems(info)
+	if len(items) != 1 {
+		t.Fatalf("branch items = %+v, want the shaped ref offered despite the known non-EXL main method", items)
+	}
+	item := items[0]
+	if item.Revision != "4.00bpw" || !item.BranchVariant || item.Method != "" {
+		t.Fatalf("branch item = %+v, want no EXL method claim over known non-EXL evidence", item)
+	}
+	if info.RecommendedDownload == nil || !info.RecommendedDownload.BranchVariant || !BranchVariantRevisionShape(info.RecommendedDownload.Revision) {
+		t.Fatalf("recommended download = %+v, want a downloadable branch-variant request", info.RecommendedDownload)
 	}
 }
 
@@ -1193,7 +1069,11 @@ func TestAnalyzeEXLBranchUsesMainConfigBeforeRepoNameFallback(t *testing.T) {
 	}
 }
 
-func TestEXLBranchMainMethodSeedsAllCandidatesWhenOptionalLookupTimesOut(t *testing.T) {
+// TestEXLBranchMainMethodSurvivesOptionalLookupTimeout pins requirement 3:
+// when the shared optional-lookup budget expires before any branch config is
+// read, every candidate row still exists, carrying the display method the
+// main configuration established, and the timeout itself is not a warning.
+func TestEXLBranchMainMethodSurvivesOptionalLookupTimeout(t *testing.T) {
 	oldWait := exlBranchLookupWait
 	exlBranchLookupWait = 150 * time.Millisecond
 	defer func() { exlBranchLookupWait = oldWait }()
@@ -1216,92 +1096,31 @@ func TestEXLBranchMainMethodSeedsAllCandidatesWhenOptionalLookupTimesOut(t *test
 		Refs:      refs,
 		Quantized: &QuantizedInfo{Method: "exl2"},
 	}
-	items, warning, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).exlBranchVariantItems(context.Background(), info)
+	items, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).exlBranchVariantItems(context.Background(), info)
 	if err != nil {
 		t.Fatalf("branch discovery with a slow optional lookup: %v", err)
 	}
-	if warning != nil {
-		t.Fatalf("optional lookup timeout produced a warning: %+v", warning)
-	}
 	if len(items) != len(refs) {
-		t.Fatalf("main EXL2 method seeded %d of %d branch candidates after optional timeout: %+v", len(items), len(refs), items)
+		t.Fatalf("main EXL2 method established %d of %d branch rows after optional timeout: %+v", len(items), len(refs), items)
 	}
 	for _, item := range items {
 		if item.Method != "exl2" || !item.BranchVariant {
-			t.Fatalf("seeded branch item = %+v; want EXL2 branch", item)
+			t.Fatalf("display-degraded branch item = %+v; want the EXL2 branch row kept", item)
 		}
 	}
 }
 
-func TestEXLBranchNonWeightArtifactsDoNotProveMainWeights(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		files []FileInfo
-	}{
-		{name: "training args bin", files: []FileInfo{{Path: "training_args.bin"}}},
-		{name: "optimizer pt", files: []FileInfo{{Path: "optimizer.pt"}}},
-		{name: "optimizer and training", files: []FileInfo{{Path: "training_args.bin"}, {Path: "optimizer.pt"}}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			info := &RepoInfo{
-				Repo:      "owner/model",
-				Refs:      []RepoRef{{Name: "4.00bpw", Type: "branch"}},
-				Quantized: &QuantizedInfo{Method: "exl2"},
-				Files:     tc.files,
-			}
-			items, warning, err := NewAnalyzer(AnalyzerOptions{}).exlBranchVariantItems(context.Background(), info)
-			if err != nil {
-				t.Fatalf("branch discovery with non-weight artifacts: %v", err)
-			}
-			if len(items) != 0 {
-				t.Fatalf("non-weight artifacts exposed branch items: %+v", items)
-			}
-			if warning == nil || warning.Code != exlBranchDiscoveryWarningCode || !warning.Retryable {
-				t.Fatalf("non-weight artifacts warning=%+v; want the unknown-role warning path", warning)
-			}
-			if !reflect.DeepEqual(warning.Causes, []string{weightRoleUnrecognizedCause}) {
-				t.Fatalf("non-weight artifact causes=%v; want %q", warning.Causes, weightRoleUnrecognizedCause)
-			}
-		})
-	}
-
-	for _, name := range []string{"pytorch_model.bin", "model.gguf", "tf_model.h5", "saved_model.pb", "consolidated.00.pth"} {
-		t.Run("real weight "+name, func(t *testing.T) {
-			info := &RepoInfo{
-				Repo:      "owner/model",
-				Refs:      []RepoRef{{Name: "4.00bpw", Type: "branch"}},
-				Quantized: &QuantizedInfo{Method: "exl2"},
-				Files:     []FileInfo{{Path: name}},
-			}
-			items, warning, err := NewAnalyzer(AnalyzerOptions{}).exlBranchVariantItems(context.Background(), info)
-			if err != nil {
-				t.Fatalf("branch discovery with real weight %q: %v", name, err)
-			}
-			if warning != nil {
-				t.Fatalf("real weight %q produced warning: %+v", name, warning)
-			}
-			if len(items) != 0 {
-				t.Fatalf("real weight %q exposed branch items: %+v", name, items)
-			}
-		})
-	}
-
-	t.Run("tokenizer bin is known non-weight", func(t *testing.T) {
-		info := &RepoInfo{
-			Repo:      "owner/model",
-			Refs:      []RepoRef{{Name: "4.00bpw", Type: "branch"}},
-			Quantized: &QuantizedInfo{Method: "exl2"},
-			Files:     []FileInfo{{Path: "tokenizer.bin"}},
-		}
-		items, warning, err := NewAnalyzer(AnalyzerOptions{}).exlBranchVariantItems(context.Background(), info)
-		if err != nil || warning != nil || len(items) != 1 {
-			t.Fatalf("tokenizer.bin result items=%+v warning=%+v err=%v; want branch discovery without an unknown-role warning", items, warning, err)
-		}
-	})
-}
-
-func TestEXLBranchTimeoutDoesNotEmitUnvisitedRepoFallbackSeeds(t *testing.T) {
+// TestEXLBranchLookupTimeoutNeverTruncatesVisibility pins requirement 3: the
+// budgeted per-branch lookup can leave queued candidates unvisited when the
+// optional-lookup budget expires, but every shaped ref keeps its row — the
+// budget can only degrade display enrichment, never truncate the offered
+// list — and queued candidates still never start before the shared deadline.
+func TestEXLBranchLookupTimeoutNeverTruncatesVisibility(t *testing.T) {
 	const repo = "owner/model-exl3"
+	oldWait := exlBranchLookupWait
+	exlBranchLookupWait = 150 * time.Millisecond
+	defer func() { exlBranchLookupWait = oldWait }()
+
 	started := make(chan string, exlBranchLookupWorkers)
 	canceled := make(chan string, exlBranchLookupWorkers)
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1333,7 +1152,7 @@ func TestEXLBranchTimeoutDoesNotEmitUnvisitedRepoFallbackSeeds(t *testing.T) {
 	result := make(chan []SelectableItem, 1)
 	resultErr := make(chan error, 1)
 	go func() {
-		items, _, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).exlBranchVariantItems(context.Background(), info)
+		items, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).exlBranchVariantItems(context.Background(), info)
 		result <- items
 		resultErr <- err
 	}()
@@ -1364,8 +1183,13 @@ func TestEXLBranchTimeoutDoesNotEmitUnvisitedRepoFallbackSeeds(t *testing.T) {
 	if err := <-resultErr; err != nil {
 		t.Fatalf("optional metadata timeout failed branch discovery: %v", err)
 	}
-	if len(items) != 0 {
-		t.Fatalf("known GPTQ main retained %d preseeded EXL repo-name variants after unvisited lookups: %+v", len(items), items)
+	if len(items) != len(refs) {
+		t.Fatalf("lookup timeout truncated the branch list: %d of %d shaped refs kept: %+v", len(items), len(refs), items)
+	}
+	for i, ref := range refs {
+		if items[i].Revision != ref.Name || !items[i].BranchVariant {
+			t.Fatalf("branch row %d = %+v, want the unvisited shaped ref %q still offered", i, items[i], ref.Name)
+		}
 	}
 	for i := exlBranchLookupWorkers; i < len(refs); i++ {
 		if seen[refs[i].Name] {
@@ -1549,19 +1373,26 @@ func TestEXLNMBranchRejectsNonBitrateNames(t *testing.T) {
 	}
 }
 
-func TestEXLNMBranchRejectGenericRepo(t *testing.T) {
-	// This exercises the production analyzer path, not a parser zero value:
-	// without branch config, main config, or an EXL repository name there is no
-	// method evidence, so a bitrate-shaped N_M ref must not be listed.
+// TestEXLNMBranchListedWithoutMethodEvidence pins that an unknown method is
+// a normal state, not a blocker: with no branch config, no main config, and
+// no EXL repository or branch-name hint, the bitrate-shaped ref is still
+// offered with no method claim, and its recommended request keeps the
+// downloadable branch-variant shape.
+func TestEXLNMBranchListedWithoutMethodEvidence(t *testing.T) {
 	info := analyzeEXLNMBranchFixture(t, exlNMBranchFixture{
 		repo:     "owner/generic-model",
 		branches: []string{"main", "4_25"},
 	})
-	if items := exlBranchSelectableItems(info); len(items) != 0 {
-		t.Fatalf("generic repository exposed N_M branch rows without EXL evidence: %+v", items)
+	items := exlBranchSelectableItems(info)
+	if len(items) != 1 {
+		t.Fatalf("branch items = %+v, want the shaped ref offered without method evidence", items)
 	}
-	if info.RecommendedDownload != nil && info.RecommendedDownload.BranchVariant {
-		t.Fatalf("generic repository recommended a branch variant: %+v", info.RecommendedDownload)
+	item := items[0]
+	if item.Revision != "4_25" || !item.BranchVariant || item.Method != "" || item.BitsPerWeight != 4.25 || !item.Recommended {
+		t.Fatalf("branch item = %+v, want an EXL-shape row with no method claim", item)
+	}
+	if info.RecommendedDownload == nil || !info.RecommendedDownload.BranchVariant || !BranchVariantRevisionShape(info.RecommendedDownload.Revision) {
+		t.Fatalf("recommended download = %+v, want a downloadable branch-variant request", info.RecommendedDownload)
 	}
 }
 
@@ -1607,7 +1438,11 @@ func TestEXLNMBranchUnknownMethodFallsBackToNameEvidence(t *testing.T) {
 	}
 }
 
-func TestEXLNMBranchEveryRecognizedNonEXLMethodExcludesRows(t *testing.T) {
+// TestEXLNMBranchConfigReadsNeverGateVisibility pins that a recognized
+// non-EXL quant_method read from a branch or main config never removes the
+// shaped ref from the list; it only keeps the display from claiming an EXL
+// flavor the config denies (the repository-name guess stays suppressed).
+func TestEXLNMBranchConfigReadsNeverGateVisibility(t *testing.T) {
 	methods := []string{"gptq", "awq", "bitsandbytes", "bnb", "hqq", "eetq", "GPTQ", "BnB", "HQQ"}
 	for _, method := range methods {
 		t.Run("branch-config-"+method, func(t *testing.T) {
@@ -1616,8 +1451,9 @@ func TestEXLNMBranchEveryRecognizedNonEXLMethodExcludesRows(t *testing.T) {
 				branches:      []string{"main", "4_25"},
 				branchConfigs: map[string]string{"4_25": fmt.Sprintf(`{"quant_method":%q,"bits":4}`, method)},
 			})
-			if items := exlBranchSelectableItems(info); len(items) != 0 {
-				t.Fatalf("recognized non-EXL branch method %q exposed rows: %+v", method, items)
+			items := exlBranchSelectableItems(info)
+			if len(items) != 1 || items[0].Revision != "4_25" || !items[0].BranchVariant || items[0].Method != "" {
+				t.Fatalf("recognized non-EXL branch config %q = %+v, want the row listed without an EXL method claim", method, items)
 			}
 		})
 		t.Run("main-config-"+method, func(t *testing.T) {
@@ -1633,8 +1469,9 @@ func TestEXLNMBranchEveryRecognizedNonEXLMethodExcludesRows(t *testing.T) {
 					"quantization_config.json": fmt.Sprintf(`{"quant_method":%q,"bits":4}`, method),
 				},
 			})
-			if items := exlBranchSelectableItems(info); len(items) != 0 {
-				t.Fatalf("recognized non-EXL main method %q was overridden by the repository name: %+v", method, items)
+			items := exlBranchSelectableItems(info)
+			if len(items) != 1 || items[0].Revision != "4_25" || !items[0].BranchVariant || items[0].Method != "" {
+				t.Fatalf("recognized non-EXL main config %q = %+v, want the row listed without an EXL method claim", method, items)
 			}
 		})
 	}
@@ -1652,72 +1489,6 @@ func TestRecognizedNonEXLMethodUsesQuantizedMethodTable(t *testing.T) {
 			t.Fatalf("unknown method %q was treated as recognized non-EXL evidence", unknown)
 		}
 	}
-}
-
-func makeSafetensorsHeader(t *testing.T, headerJSON string, totalSize int64) []byte {
-	t.Helper()
-	header := []byte(headerJSON)
-	for len(header)%8 != 0 {
-		header = append(header, ' ')
-	}
-	if int64(8+len(header)) > totalSize {
-		t.Fatalf("fixture header length %d exceeds declared file size %d", len(header), totalSize)
-	}
-	fileHeader := make([]byte, 8+len(header))
-	binary.LittleEndian.PutUint64(fileHeader[:8], uint64(len(header)))
-	copy(fileHeader[8:], header)
-	return fileHeader
-}
-
-func serveSafetensorsHeaderRange(w http.ResponseWriter, r *http.Request, fileHeader []byte, totalSize int64) {
-	rawRange := strings.TrimPrefix(r.Header.Get("Range"), "bytes=")
-	parts := strings.Split(rawRange, "-")
-	if len(parts) != 2 {
-		http.Error(w, "invalid range", http.StatusRequestedRangeNotSatisfiable)
-		return
-	}
-	start, startErr := strconv.ParseInt(parts[0], 10, 64)
-	end, endErr := strconv.ParseInt(parts[1], 10, 64)
-	if startErr != nil || endErr != nil || start < 0 || end < start || end >= int64(len(fileHeader)) {
-		http.Error(w, "invalid range", http.StatusRequestedRangeNotSatisfiable)
-		return
-	}
-	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize))
-	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
-	w.WriteHeader(http.StatusPartialContent)
-	_, _ = w.Write(fileHeader[start : end+1])
-}
-
-type safetensorsBodyCountingTransport struct {
-	base          http.RoundTripper
-	path          string
-	count         *atomic.Int64
-	contentLength *atomic.Int64
-	headerLength  *atomic.Int64
-}
-
-func (t *safetensorsBodyCountingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := t.base.RoundTrip(req)
-	if err == nil && resp != nil && strings.HasSuffix(req.URL.Path, t.path) {
-		t.contentLength.Store(resp.ContentLength)
-		if length, parseErr := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64); parseErr == nil {
-			t.headerLength.Store(length)
-		}
-		resp.Body = &safetensorsBodyCounter{ReadCloser: resp.Body, count: t.count}
-	}
-	return resp, err
-}
-
-type safetensorsBodyCounter struct {
-	io.ReadCloser
-	count *atomic.Int64
-}
-
-func (r *safetensorsBodyCounter) Read(p []byte) (int, error) {
-	n, err := r.ReadCloser.Read(p)
-	r.count.Add(int64(n))
-	return n, err
 }
 
 func TestEXLBranchVariantsIgnoreDatasets(t *testing.T) {
@@ -1818,16 +1589,11 @@ func TestEXLBranchVariantSizingLimitAndFailureAreNonfatal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("optional branch lookups failed main analysis: %v", err)
 	}
-	if got, want := len(info.SelectableItems), maxEXLBranchSizeLookups+2; got != want {
+	// Every shaped ref is listed — including the one whose own config
+	// declares a recognized non-EXL method, which only suppresses the display
+	// method claim instead of hiding the row.
+	if got, want := len(info.SelectableItems), maxEXLBranchSizeLookups+3; got != want {
 		t.Fatalf("branch item count = %d, want all %d recognized refs", got, want)
-	}
-	for _, item := range info.SelectableItems {
-		if item.Revision == "non-exl-5.00bpw" {
-			t.Fatal("explicit non-EXL branch config was listed as an EXL variant")
-		}
-	}
-	if nonEXLConfigRequests.Load() != 1 {
-		t.Fatalf("valid non-EXL branch config requests = %d, want exactly one lookup", nonEXLConfigRequests.Load())
 	}
 	if got := treeRequests.Load(); got != maxEXLBranchSizeLookups {
 		t.Fatalf("branch tree sizing requests = %d, want exactly %d", got, maxEXLBranchSizeLookups)
@@ -1835,9 +1601,19 @@ func TestEXLBranchVariantSizingLimitAndFailureAreNonfatal(t *testing.T) {
 	if peak.Load() > exlBranchLookupWorkers {
 		t.Fatalf("concurrent branch tree requests peaked at %d, limit %d", peak.Load(), exlBranchLookupWorkers)
 	}
+	if nonEXLConfigRequests.Load() != 1 {
+		t.Fatalf("valid non-EXL branch config requests = %d, want exactly one lookup", nonEXLConfigRequests.Load())
+	}
 	items := make(map[string]SelectableItem, len(info.SelectableItems))
 	for _, item := range info.SelectableItems {
 		items[item.Revision] = item
+	}
+	nonEXL, ok := items["non-exl-5.00bpw"]
+	if !ok {
+		t.Fatal("shaped branch hidden by its non-EXL config read")
+	}
+	if nonEXL.Method != "" {
+		t.Fatalf("non-EXL branch config method claim = %q, want no EXL flavor over known non-EXL evidence", nonEXL.Method)
 	}
 	if _, ok := items["variant-00-1.00bpw"]; !ok {
 		t.Fatal("failed optional sizing lookup removed a valid branch item")
@@ -1848,16 +1624,18 @@ func TestEXLBranchVariantSizingLimitAndFailureAreNonfatal(t *testing.T) {
 	if items["variant-00-1.00bpw"].SizeHuman != "" {
 		t.Fatalf("failed optional sizing lookup synthesized size %q", items["variant-00-1.00bpw"].SizeHuman)
 	}
-	if items["variant-15-16.00bpw"].Size != 100 {
-		t.Fatalf("invalid branch consumed a sizing slot; last in-budget valid branch = %+v", items["variant-15-16.00bpw"])
+	// The size budget covers the first maxEXLBranchSizeLookups rows in sort
+	// order: non-exl-5.00bpw plus variant-00 through variant-14.
+	if items["variant-14-15.00bpw"].Size != 100 {
+		t.Fatalf("last in-budget branch size = %+v, want 100", items["variant-14-15.00bpw"])
 	}
-	for i := maxEXLBranchSizeLookups; i < maxEXLBranchSizeLookups+2; i++ {
-		revision := fmt.Sprintf("variant-%02d-%d.00bpw", i, i+1)
-		if _, ok := items[revision]; !ok {
+	for _, revision := range []string{"variant-15-16.00bpw", "variant-16-17.00bpw", "variant-17-18.00bpw"} {
+		item, ok := items[revision]
+		if !ok {
 			t.Fatalf("size cap removed unsized branch %q", revision)
 		}
-		if items[revision].SizeHuman != "" {
-			t.Fatalf("unsized branch %q unexpectedly has size %q", revision, items[revision].SizeHuman)
+		if item.SizeHuman != "" {
+			t.Fatalf("unsized branch %q unexpectedly has size %q", revision, item.SizeHuman)
 		}
 	}
 }

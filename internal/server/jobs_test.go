@@ -301,6 +301,40 @@ func TestJobManager_ListJobs(t *testing.T) {
 	}
 }
 
+// TestCloneJobWarningsDeepCopy pins the snapshot copy of Warnings: every
+// broadcast, API response and persisted state goes through cloneJobLocked,
+// and a copy that shared the backing array would alias the live job's
+// slice — a race between the download goroutine appending and a listener
+// reading. Mutations on one side must stay on that side, in both
+// directions.
+func TestCloneJobWarningsDeepCopy(t *testing.T) {
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "state"))
+	job := &Job{ID: "clone-warnings", Warnings: []string{"first", "second"}}
+
+	m.mu.Lock()
+	clone := m.cloneJobLocked(job)
+	m.mu.Unlock()
+
+	// Mutate the clone: the original must not see it (a shared backing
+	// array would show "changed-in-clone" below).
+	clone.Warnings[0] = "changed-in-clone"
+	clone.Warnings = append(clone.Warnings, "appended-in-clone")
+	if job.Warnings[0] != "first" || job.Warnings[1] != "second" || len(job.Warnings) != 2 {
+		t.Fatalf("original aliases the clone's mutations: %v", job.Warnings)
+	}
+
+	m.mu.Lock()
+	fresh := m.cloneJobLocked(job)
+	m.mu.Unlock()
+
+	// Mutate the original: an existing snapshot must not see it.
+	job.Warnings[1] = "changed-in-original"
+	job.Warnings = append(job.Warnings, "appended-in-original")
+	if fresh.Warnings[0] != "first" || fresh.Warnings[1] != "second" || len(fresh.Warnings) != 2 {
+		t.Fatalf("clone aliases the original's mutations: %v", fresh.Warnings)
+	}
+}
+
 func TestJobManager_CancelJob(t *testing.T) {
 	// Stand-in hub endpoint that hangs every request until the job's context
 	// is cancelled. Hitting the real huggingface.co here made the test flaky:

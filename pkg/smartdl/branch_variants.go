@@ -18,34 +18,20 @@ import (
 )
 
 const (
-	maxEXLBranchSizeLookups       = 16
-	maxEXLSafeTensorHeaderProbes  = 16
-	exlBranchLookupWorkers        = 3
-	exlBranchLookupTimeout        = 15 * time.Second
-	exlBranchDiscoveryWarningCode = "exl_branch_discovery_incomplete"
+	maxEXLBranchSizeLookups = 16
+	exlBranchLookupWorkers  = 3
+	exlBranchLookupTimeout  = 15 * time.Second
 )
 
 // exlBranchLookupWait is the shared optional-metadata budget for one branch
 // discovery pass. It is a variable so a focused test can shorten the wait.
 var exlBranchLookupWait = exlBranchLookupTimeout
 
-const weightRoleUnrecognizedCause = "weight_role_unrecognized"
-
-const exlBranchDiscoveryWarningMessage = "EXL branch discovery could not be completed because one or more main file roles could not be safely established. Retry analysis to try again."
-
 // An N_M branch name encodes a bitrate as <whole>_<fraction> (4_25 is 4.25 BPW).
 // Bounding both parts keeps date-like or arbitrary refs out of the variant list.
 const (
 	maxEXLNMBranchWholeBits = 64
 	maxEXLNMBranchFraction  = 99
-)
-
-type mainWeightEvidence uint8
-
-const (
-	mainWeightEvidenceAbsent mainWeightEvidence = iota
-	mainWeightEvidencePresent
-	mainWeightEvidenceUnknown
 )
 
 var (
@@ -63,19 +49,26 @@ type exlBranchCandidate struct {
 	headBits float64
 }
 
-type exlBranchResult struct {
-	item    SelectableItem
-	include bool
-	exclude bool
+// exlBranchDisplay is the display-only enrichment state for one branch row.
+// Every field is optional presentation data; none of it ever decides which
+// rows exist.
+type exlBranchDisplay struct {
+	method   string
+	bpw      float64
+	headBits float64
 }
 
 // exlBranchVariantItems discovers named EXL2/EXL3 bitrate branches for a
-// model repo whose main tree has no recognized model weights. Ref
-// names provide the complete option list; optional branch config/tree lookups
-// enrich method, precision, and size without making those lookups fatal.
-func (a *Analyzer) exlBranchVariantItems(ctx context.Context, info *RepoInfo) ([]SelectableItem, *AnalysisWarning, error) {
+// model repo. Ref names provide the complete option list: every branch whose
+// name has the recognized EXL variant shape is offered, whatever the main
+// tree's files, configs, or headers contain or fail to say. Optional branch
+// config and tree lookups enrich method, precision, and size; their outcome
+// or timeout only degrades display and can never add, remove, or truncate a
+// row. Row presence never depends on main content; the Recommended badge does
+// — see mainTreeCarriesPayload.
+func (a *Analyzer) exlBranchVariantItems(ctx context.Context, info *RepoInfo) ([]SelectableItem, error) {
 	if info == nil || info.IsDataset {
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	repoMethod := exlMethodFromRepo(info.Repo)
@@ -102,22 +95,7 @@ func (a *Analyzer) exlBranchVariantItems(ctx context.Context, info *RepoInfo) ([
 		}
 	}
 	if len(candidates) == 0 {
-		return nil, nil, nil
-	}
-	weightEvidence, causes, err := a.classifyMainWeights(ctx, info.Repo, info.Files)
-	if err != nil {
-		return nil, nil, err
-	}
-	switch weightEvidence {
-	case mainWeightEvidencePresent:
-		return nil, nil, nil
-	case mainWeightEvidenceUnknown:
-		return nil, &AnalysisWarning{
-			Code:      exlBranchDiscoveryWarningCode,
-			Message:   exlBranchDiscoveryWarningMessage,
-			Causes:    causes,
-			Retryable: true,
-		}, nil
+		return nil, nil
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		left, right := strings.ToLower(candidates[i].revision), strings.ToLower(candidates[j].revision)
@@ -127,37 +105,30 @@ func (a *Analyzer) exlBranchVariantItems(ctx context.Context, info *RepoInfo) ([
 		return left < right
 	})
 
-	// Seed every candidate whose method is already established from the
-	// repository/main metadata. Optional lookups may enrich or disqualify an
-	// item. A seeded candidate keeps its seeded row (with a zero size) when
-	// the sizing budget is exhausted or an optional lookup fails, so those
-	// failures never truncate the seeded part of the visible branch set. A
-	// candidate whose method can only be established from its own branch
-	// metadata has no seed: it is exposed only when the bounded lookup
-	// visited it and the branch metadata established the method, so a
-	// candidate the lookup never visited is dropped and the visible branch
-	// set is truncated by the budget. A non-empty main method wins even
-	// when it is EXL evidence (mainMethodKnown is only true for a recognized
-	// non-EXL negative); the repository name is only a fallback when the main
-	// method is empty and not a known non-EXL negative.
-	itemsByCandidate := make([]SelectableItem, len(candidates))
-	includeCandidate := make([]bool, len(candidates))
-	seedMethod := mainMethod
-	if seedMethod == "" && !mainMethodKnown {
-		seedMethod = repoMethod
-	}
-	if seedMethod != "" {
-		for i, candidate := range candidates {
-			itemsByCandidate[i] = newEXLBranchItem(candidate, seedMethod, candidate.bpw, candidate.headBits)
-			includeCandidate[i] = true
+	// Base display enrichment: a non-empty EXL main method wins; otherwise
+	// the name heuristics apply — repository name first, then the branch name
+	// itself — unless the main configuration declares a recognized non-EXL
+	// method, whose known-negative evidence outranks any name guess. None of
+	// this decides visibility: every candidate already has its row.
+	displays := make([]exlBranchDisplay, len(candidates))
+	for i, candidate := range candidates {
+		method := mainMethod
+		if method == "" && !mainMethodKnown {
+			method = repoMethod
+			if method == "" {
+				method = exlMethodFromName(candidate.revision)
+			}
 		}
+		displays[i] = exlBranchDisplay{method: method, bpw: candidate.bpw, headBits: candidate.headBits}
 	}
 
+	// Bounded, best-effort branch-config enrichment. A slow or failing lookup
+	// leaves the base display in place; the shared budget never decides which
+	// rows are exposed.
 	workers := exlBranchLookupWorkers
 	if workers > len(candidates) {
 		workers = len(candidates)
 	}
-	results := make([]exlBranchResult, len(candidates))
 	jobs := make(chan int)
 	lookupCtx, cancel := context.WithTimeout(ctx, exlBranchLookupWait)
 	defer cancel()
@@ -171,7 +142,7 @@ func (a *Analyzer) exlBranchVariantItems(ctx context.Context, info *RepoInfo) ([
 				if lookupCtx.Err() != nil {
 					continue
 				}
-				results[index] = a.lookupEXLBranch(lookupCtx, info.Repo, candidates[index], repoMethod, mainMethod, mainMethodKnown)
+				displays[index] = a.lookupEXLBranch(lookupCtx, info.Repo, candidates[index], displays[index])
 			}
 		}()
 	}
@@ -186,21 +157,24 @@ sendJobs:
 	}
 	close(jobs)
 	wg.Wait()
-	for i, result := range results {
-		if result.exclude {
-			includeCandidate[i] = false
-		} else if result.include {
-			itemsByCandidate[i] = result.item
-			includeCandidate[i] = true
-		}
+
+	// External cancellation is not an optional enrichment failure: propagate
+	// it before the size pass starts any further request.
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
-	// Size only candidates whose EXL method is established. The count limit
+	items := make([]SelectableItem, len(candidates))
+	for i := range candidates {
+		items[i] = newEXLBranchItem(candidates[i], displays[i].method, displays[i].bpw, displays[i].headBits)
+	}
+
+	// Size only the first candidates under the count limit. The limit
 	// controls enrichment, never which variant rows are exposed.
 	sizeIndexes := make([]int, 0, maxEXLBranchSizeLookups)
-	for i, include := range includeCandidate {
-		if !include || len(sizeIndexes) == maxEXLBranchSizeLookups || lookupCtx.Err() != nil {
-			continue
+	for i := range items {
+		if len(sizeIndexes) == maxEXLBranchSizeLookups || lookupCtx.Err() != nil {
+			break
 		}
 		sizeIndexes = append(sizeIndexes, i)
 	}
@@ -222,7 +196,7 @@ sendJobs:
 					if err != nil {
 						continue
 					}
-					itemsByCandidate[index].Size, itemsByCandidate[index].SizeHuman = exlBranchTreeSize(files)
+					items[index].Size, items[index].SizeHuman = exlBranchTreeSize(files)
 				}
 			}()
 		}
@@ -244,66 +218,57 @@ sendJobs:
 	// owned by this optional enrichment pass, however, leaves the main analysis
 	// and all completed branch options usable.
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	items := make([]SelectableItem, 0, len(candidates))
-	for i := range candidates {
-		if includeCandidate[i] {
-			items = append(items, itemsByCandidate[i])
-		}
+	// Recommendation precedence (never availability): the Recommended badge —
+	// and with it the branch-variant recommended_download — is assigned only
+	// where the name-layer classification is Absent; Present and Unknown both
+	// withhold it (rule stated precisely at classifyMainTreeWeightNames). No
+	// badge means the type analysis's own output stands (a format's file
+	// recommendation, or no recommendation for a type that yields no items —
+	// the state base produced when Present or Unknown hid the rows). Only the
+	// classic EXL branch layout, configs and docs on main with payloads on
+	// bitrate branches, sits in the Absent case: there one branch row carries
+	// the badge and names the recommended download. Every candidate still
+	// gets its row either way.
+	if !mainTreeCarriesPayload(info) {
+		markRecommendedEXLBranch(items)
 	}
-	markRecommendedEXLBranch(items)
-	return items, nil, nil
+	return items, nil
 }
 
-func (a *Analyzer) lookupEXLBranch(ctx context.Context, repo string, candidate exlBranchCandidate, repoMethod, mainMethod string, mainMethodKnown bool) exlBranchResult {
-	result := exlBranchResult{}
+// lookupEXLBranch best-effort enriches one branch row's display fields from
+// the branch's own quantization config. It never adds or removes a row: a
+// failed, timed-out, or unknown lookup leaves the caller's display as-is. A
+// branch config outranks repository/main evidence in both directions — an
+// explicit EXL method wins, and a recognized non-EXL method clears the
+// name-based guess instead of claiming an EXL flavor the config denies.
+func (a *Analyzer) lookupEXLBranch(ctx context.Context, repo string, candidate exlBranchCandidate, display exlBranchDisplay) exlBranchDisplay {
 	if ctx.Err() != nil {
-		return result
+		return display
 	}
 
 	branchQuantized, _ := a.fetchEXLBranchQuantized(ctx, repo, candidate.revision)
-
-	method := ""
-	if branchQuantized != nil && strings.TrimSpace(branchQuantized.Method) != "" {
-		method = normalizeEXLMethod(branchQuantized.Method)
-		if method == "" && recognizedNonEXLMethod(branchQuantized.Method) {
-			// A recognized non-EXL quantization config is stronger than a
-			// repo-name heuristic and means this ref is not an EXL bitrate
-			// variant. An unknown method string is not known-negative
-			// evidence, so the main/name fallback below still applies.
-			result.exclude = true
-			return result
+	if branchQuantized == nil {
+		return display
+	}
+	if strings.TrimSpace(branchQuantized.Method) != "" {
+		if method := normalizeEXLMethod(branchQuantized.Method); method != "" {
+			display.method = method
+		} else if recognizedNonEXLMethod(branchQuantized.Method) {
+			display.method = ""
 		}
+		// An unknown method string is not known-negative evidence, so the
+		// main/repository/branch-name display above still applies.
 	}
-	if method == "" {
-		method = mainMethod
+	if validEXLWidth(branchQuantized.BitsPerWeight) {
+		display.bpw = branchQuantized.BitsPerWeight
 	}
-	if method == "" && mainMethodKnown {
-		result.exclude = true
-		return result
+	if validEXLWidth(branchQuantized.HeadBits) {
+		display.headBits = branchQuantized.HeadBits
 	}
-	if method == "" {
-		method = repoMethod
-	}
-	if method == "" {
-		return result
-	}
-
-	bpw := candidate.bpw
-	if branchQuantized != nil && validEXLWidth(branchQuantized.BitsPerWeight) {
-		bpw = branchQuantized.BitsPerWeight
-	}
-	headBits := candidate.headBits
-	if branchQuantized != nil && validEXLWidth(branchQuantized.HeadBits) {
-		headBits = branchQuantized.HeadBits
-	}
-
-	item := newEXLBranchItem(candidate, method, bpw, headBits)
-	result.item = item
-	result.include = true
-	return result
+	return display
 }
 
 func exlBranchTreeSize(files []FileInfo) (int64, string) {
@@ -448,106 +413,133 @@ func safeEXLRevision(revision string) bool {
 	return true
 }
 
-// classifyMainWeights preserves the existing positive weight evidence while
-// separating an incomplete safetensors probe from a known weight. Non-safetensors
-// weight formats and successfully read safetensors headers that are not the
-// recognized calibration-only form retain their existing weight classification.
-// Probe and classifier failures are uncertainty, not evidence that weights exist.
-func (a *Analyzer) classifyMainWeights(ctx context.Context, repo string, files []FileInfo) (mainWeightEvidence, []string, error) {
-	unknownCauses := make(map[string]struct{})
-	// A recognized weight file elsewhere in the tree is sufficient to preserve
-	// ordinary main behavior, regardless of the ordering of safetensors files.
-	// Non-safetensors names are evidence only when they name a model-weight
-	// role; a training artifact such as training_args.bin or optimizer.pt is
-	// not proof that the main revision carries model weights.
-	for _, file := range files {
-		if err := ctx.Err(); err != nil {
-			return mainWeightEvidenceAbsent, nil, err
-		}
-		name := strings.ToLower(filepath.Base(file.Path))
-		switch filepath.Ext(name) {
-		case ".gguf", ".gguf-split", ".onnx", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".bin":
-			if filepath.Ext(name) == ".bin" && (strings.Contains(name, "tokenizer") || strings.Contains(name, "vocab")) {
-				// A tokenizer byte file is known non-weight evidence, not an
-				// unknown model role.
-				continue
-			}
-			if isRecognizedNonSafetensorsWeightName(name) {
-				return mainWeightEvidencePresent, nil, nil
-			}
-			unknownCauses[weightRoleUnrecognizedCause] = struct{}{}
-		}
-	}
-
-	probeCtx, cancel := context.WithTimeout(ctx, exlBranchLookupTimeout)
-	defer cancel()
-	safetensorsProbes := 0
-	for _, file := range files {
-		if err := ctx.Err(); err != nil {
-			return mainWeightEvidenceAbsent, nil, err
-		}
-		name := strings.ToLower(filepath.Base(file.Path))
-		if filepath.Ext(name) != ".safetensors" {
-			continue
-		}
-		if safetensorsProbes == maxEXLSafeTensorHeaderProbes {
-			unknownCauses["probe_limit"] = struct{}{}
-			break
-		}
-		if probeErr := probeCtx.Err(); probeErr != nil {
-			if err := ctx.Err(); err != nil {
-				return mainWeightEvidenceAbsent, nil, err
-			}
-			unknownCauses["probe_timeout"] = struct{}{}
-			break
-		}
-		safetensorsProbes++
-		header, err := a.fetchSafetensorsHeader(probeCtx, repo, "main", file)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return mainWeightEvidenceAbsent, nil, ctxErr
-			}
-			if errors.Is(err, context.DeadlineExceeded) {
-				unknownCauses["probe_timeout"] = struct{}{}
-				if probeCtx.Err() != nil {
-					break
-				}
-			} else {
-				unknownCauses["header_unavailable"] = struct{}{}
-			}
-			continue
-		}
-		calibrationOnly, err := isCalibrationOnlySafetensorsHeader(header)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return mainWeightEvidenceAbsent, nil, ctxErr
-			}
-			unknownCauses["header_uninterpretable"] = struct{}{}
-			continue
-		}
-		if !calibrationOnly {
-			return mainWeightEvidencePresent, nil, nil
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return mainWeightEvidenceAbsent, nil, err
-	}
-	if len(unknownCauses) == 0 {
-		return mainWeightEvidenceAbsent, nil, nil
-	}
-	causes := make([]string, 0, len(unknownCauses))
-	for cause := range unknownCauses {
-		causes = append(causes, cause)
-	}
-	sort.Strings(causes)
-	return mainWeightEvidenceUnknown, causes, nil
+func exlMethodFromRepo(repo string) string {
+	return exlMethodFromName(filepath.Base(repo))
 }
 
-// isRecognizedNonSafetensorsWeightName reports whether a non-safetensors file
-// name identifies a model-weight role. It deliberately rejects training,
-// optimizer, scheduler, trainer-state, and tokenizer artifacts so those files
-// remain unknown role evidence rather than confirmed model weights.
-func isRecognizedNonSafetensorsWeightName(name string) bool {
+// exlMethodFromName reads an EXL flavor hint out of a repository base name or
+// a branch name. It is a display heuristic only and never gates visibility.
+func exlMethodFromName(name string) string {
+	lower := strings.ToLower(name)
+	if strings.Contains(lower, "exl3") {
+		return "exl3"
+	}
+	if strings.Contains(lower, "exl2") {
+		return "exl2"
+	}
+	return ""
+}
+
+func normalizeEXLMethod(method string) string {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "exl2":
+		return "exl2"
+	case "exl3":
+		return "exl3"
+	default:
+		return ""
+	}
+}
+
+func validEXLWidth(value float64) bool {
+	return value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+// exlBranchDescription renders the row's display text. The method is
+// best-effort enrichment and may be unknown, in which case the description
+// carries only the bitrate (and head bits when known).
+func exlBranchDescription(method string, bpw, headBits float64) string {
+	parts := make([]string, 0, 3)
+	if method != "" {
+		parts = append(parts, strings.ToUpper(method))
+	}
+	parts = append(parts, strconv.FormatFloat(bpw, 'f', -1, 64)+" BPW")
+	if validEXLWidth(headBits) {
+		parts = append(parts, "head "+strconv.FormatFloat(headBits, 'f', -1, 64)+" bits")
+	}
+	return strings.Join(parts, " · ")
+}
+
+// mainTreeCarriesPayload reports whether base's NAME-layer weight-role
+// classification of the whole main tree would have been anything other than
+// Absent — i.e. whether base would have hidden the branch rows on name
+// evidence alone (Present or Unknown both hid them; only clean Absent showed
+// rows and the badge). Names only: no content probes, no header reads, and
+// never a calibration judgment — file names never prove calibration, so a
+// calibration-looking or renamed .safetensors counts as payload exactly like
+// model.safetensors (user decision «Имена решают (рекомендация)»: any
+// .safetensors name is Present; calibration is undetectable by name and is
+// never judged).
+//
+// It decides recommendation precedence, never availability: branch rows are
+// offered whatever it returns. Non-Absent → no branch row is badged and the
+// type analysis's own output stands: a known format's file recommendation
+// where the type has one, no recommendation where it yields no items —
+// exactly what base produced when payload hid the branch rows. Absent → the
+// branch set is the repository's actual selection: one row is badged and
+// names recommended_download, the classic EXL branch layout PR #152
+// established.
+func mainTreeCarriesPayload(info *RepoInfo) bool {
+	if info == nil {
+		return false
+	}
+	return classifyMainTreeWeightNames(info.Files) != weightNameAbsent
+}
+
+// Base's three-way name-layer outcome (git show d7ba4fd:pkg/smartdl/
+// branch_variants.go, classifyMainWeights/mainWeightEvidence): Absent showed
+// the rows and the badge; Present and Unknown both hid the rows.
+const (
+	weightNameAbsent  = iota // no weight-shaped name at all
+	weightNameUnknown        // weight-ish extension without a weight-role marker
+	weightNamePresent        // recognized weight name, or any .safetensors by name
+)
+
+// classifyMainTreeWeightNames reproduces the name layer of base's
+// classifyMainWeights over the whole tree, probes removed, derived
+// mechanically from git show d7ba4fd:pkg/smartdl/branch_variants.go:
+//   - .safetensors → Present (user names-decide override; replaces base's
+//     probe layer, which calibration content and probe failures used to
+//     resolve — names decide instead, and calibration is never judged);
+//   - {.gguf, .gguf-split, .onnx, .pt, .pth, .ckpt, .h5, .pb, .bin} —
+//     base's weight-ish extension list; a .bin named tokenizer*/vocab* is
+//     known non-weight evidence and contributes nothing; otherwise
+//     isWeightRoleName decides Present, and a non-match is Unknown (base
+//     hid rows there too);
+//   - any other extension contributes nothing.
+//
+// Outcome: Present if any file is Present (short-circuit, like base), else
+// Unknown if any weight-ish name was unrecognized, else Absent.
+func classifyMainTreeWeightNames(files []FileInfo) int {
+	unknown := false
+	for _, file := range files {
+		name := strings.ToLower(filepath.Base(file.Path))
+		ext := filepath.Ext(name)
+		if ext == ".safetensors" {
+			return weightNamePresent
+		}
+		switch ext {
+		case ".gguf", ".gguf-split", ".onnx", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".bin":
+			if ext == ".bin" && (strings.Contains(name, "tokenizer") || strings.Contains(name, "vocab")) {
+				continue // base: known non-weight evidence, not an unknown role
+			}
+			if isWeightRoleName(name) {
+				return weightNamePresent
+			}
+			unknown = true
+		}
+	}
+	if unknown {
+		return weightNameUnknown
+	}
+	return weightNameAbsent
+}
+
+// isWeightRoleName is base isRecognizedNonSafetensorsWeightName
+// (git show d7ba4fd:pkg/smartdl/branch_variants.go) verbatim: the denylist
+// keeps training/optimizer/scheduler/trainer-state/tokenizer/vocab artifacts
+// as unknown-role evidence; weight roles come only from the marker lists.
+func isWeightRoleName(name string) bool {
 	lower := strings.ToLower(filepath.Base(name))
 	for _, marker := range []string{"training", "optimizer", "scheduler", "trainer_state", "tokenizer", "vocab"} {
 		if strings.Contains(lower, marker) {
@@ -573,40 +565,9 @@ func isRecognizedNonSafetensorsWeightName(name string) bool {
 	return false
 }
 
-func exlMethodFromRepo(repo string) string {
-	name := strings.ToLower(filepath.Base(repo))
-	if strings.Contains(name, "exl3") {
-		return "exl3"
-	}
-	if strings.Contains(name, "exl2") {
-		return "exl2"
-	}
-	return ""
-}
-
-func normalizeEXLMethod(method string) string {
-	switch strings.ToLower(strings.TrimSpace(method)) {
-	case "exl2":
-		return "exl2"
-	case "exl3":
-		return "exl3"
-	default:
-		return ""
-	}
-}
-
-func validEXLWidth(value float64) bool {
-	return value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
-}
-
-func exlBranchDescription(method string, bpw, headBits float64) string {
-	parts := []string{strings.ToUpper(method), strconv.FormatFloat(bpw, 'f', -1, 64) + " BPW"}
-	if validEXLWidth(headBits) {
-		parts = append(parts, "head "+strconv.FormatFloat(headBits, 'f', -1, 64)+" bits")
-	}
-	return strings.Join(parts, " · ")
-}
-
+// markRecommendedEXLBranch marks the branch row closest to 4 BPW. Callers
+// gate it on mainTreeCarriesPayload: a main tree that carries recognized
+// payload never has a branch row displaced as the recommendation.
 func markRecommendedEXLBranch(items []SelectableItem) {
 	if len(items) == 0 {
 		return

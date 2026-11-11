@@ -137,8 +137,27 @@ paths. The notice is informational
 only: it changes no plan item, no selection and no download outcome. It is
 bounded: the paths and directories it names are capped and the rest are
 counted, so the sentence never grows with the inventory. The notice surfaces
-as `Plan.Notices`, in the `POST /api/plan` response, and on the download's
-warning channel.
+as `Plan.Notices`, in the `POST /api/plan` response, on the download's
+warning channel, and in the exported `ScanPlan` preview's warning events.
+
+With StrictFiles, Filters is instead a strict manual file selection: each
+filter is one complete repository-relative file path, matched by exact
+spelling (case-sensitive) against the walked tree — no substring widening, no
+basename aliasing (a single-segment entry names the root-level file only), no
+companion/metadata retention, no GGUF inference, and no dataset-membership
+selection; ExactMatch has no effect. ValidateFileSelection normalizes each
+entry (backslashes to "/", a leading "./" alias stripped; repeated
+normalized spellings collapse to one entry) and, together with validate,
+rejects an empty selection, a non-canonical path, two entries differing only
+in case (they are one file on case-insensitive filesystems), and the
+combinations with Excludes, AppendFilterSubdir or a branch variant — all as
+ErrInvalidFileSelection naming the offending entry or field — before any
+network work. The selection is all-or-nothing: every path must exist at the
+resolved revision spelled exactly that way or the plan fails with
+ErrNoFileMatch naming the missing paths. Directory entries are not expanded
+— a trailing-slash entry is non-canonical — so callers express a directory
+as its member file paths. Storage, verification, resume and revision
+isolation are unchanged; StrictFiles narrows plan composition only.
 
 With AppendFilterSubdir, matched files are organized into subdirectories:
 
@@ -178,10 +197,12 @@ inside the spans are planned. Non-shard-shaped files are unaffected and
 ranges only narrow: a selection the ranges empty fails with
 `ErrNoFilterMatch` even when retained companion files that matched nothing
 remain planned, while ineffective ranges — a matched set with no shard
-file at all, or a span selecting no existing index — become typed
-`Plan.Warnings` entries ({code, message, segments}) that never change the
-plan, its items or the download outcome, and surface in the `POST /api/plan`
-response. Shard ranges change plan selection only: resume identity,
+file at all, or a span selecting no existing index — become plan notices
+naming the whole expression or the ineffective spans; they never change the
+plan, its items or the download outcome, and surface in `Plan.Notices`, in
+the `POST /api/plan` response, on the download's warning channel, and in
+the exported `ScanPlan` preview's warning events — the same channels as the
+split-mention notice above. Shard ranges change plan selection only: resume identity,
 verification, ownership and publication semantics are unaffected.
 
 # Ownership: one destination domain
@@ -654,10 +675,14 @@ with no state keeps the configured routing. A pre-#140 `.part-NN`/`.parts.json`
 family is NOT resume state and does not force the multipart route; it is
 discarded when the multipart route owns the staging (or left for the existing
 success/cleanup path), and the file is re-downloaded from zero. If the server or
-plan does not support ranges, the downloader emits an explicit warning,
-downloads the full file through the single path, and removes the obsolete
-versioned pair only after the final file is durable (claim-checked); the
-pre-#140 family is removed by the single-path success cleanup. If an LFS item
+plan does not support ranges, the downloader emits an explicit warning once for
+the download — after every item goroutine has finished, naming the count of
+affected files and a bounded, sorted list of their paths (at most the plan
+notice's path cap, with the remainder counted), so a repo-wide condition is one
+warning rather than one per file — downloads the full file through the single
+path, and removes the obsolete versioned pair only after the final file is
+durable (claim-checked); the pre-#140 family is removed by the single-path
+success cleanup. If an LFS item
 remains unknown-size after HEAD, Download uses the single-path temp and the
 normal cache-store path, so the blob and its snapshot/friendly entries are
 created from the completed temp file.

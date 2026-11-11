@@ -42,6 +42,28 @@ func validate(job Job, cfg Settings) error {
 	if !IsValidModelName(job.Repo) {
 		return fmt.Errorf("invalid repo id %q (expected owner/name)", job.Repo)
 	}
+	if job.StrictFiles {
+		// Strict manual selection narrows only plan composition; reject the
+		// combinations whose semantics contradict "exactly these paths",
+		// before any network or plan work. Checks and their order mirror the
+		// request boundary (admitStrictSelection in internal/server) so both
+		// layers name the same offending entry or field with
+		// ErrInvalidFileSelection. The block runs before the generic
+		// branch-variant and AppendFilterSubdir rules so a strict request
+		// always surfaces its own named error, matching the HTTP layer.
+		if _, err := ValidateFileSelection(job.Filters); err != nil {
+			return err
+		}
+		if len(job.Excludes) != 0 {
+			return fmt.Errorf("%w: strict file selection cannot be combined with excludes", ErrInvalidFileSelection)
+		}
+		if job.BranchVariant {
+			return fmt.Errorf("%w: strict file selection cannot be combined with a branch variant", ErrInvalidFileSelection)
+		}
+		if job.AppendFilterSubdir {
+			return fmt.Errorf("%w: strict file selection cannot be combined with appendFilterSubdir", ErrInvalidFileSelection)
+		}
+	}
 	if job.BranchVariant {
 		// The branch-variant shape is enforced at the server's request
 		// boundary too; repeating the incompatible-field check here keeps

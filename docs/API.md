@@ -314,16 +314,18 @@ Important response fields:
 }
 ```
 
-`recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract. GGUF recommendations use exact artifact selectors from `selectable_items[].files` rather than the legacy quant token, and set `exactMatch: true`: root-level paths are prefixed with `./`, while nested paths keep their complete repository-relative spelling. Dataset recommendations also set `exactMatch: true`, but use the group's `filter_value` as the selector. Other model recommendations keep their existing filter values and leave `exactMatch` unset. Exactly one non-MTP GGUF quantization artifact is recommended: the first `Q4_K_M`/`UD_Q4_K_M` in the analyzer's deterministic order, or otherwise the first non-MTP quality>=4 artifact under 10 GiB. A preferred local `mmproj` companion remains separately recommended and is bundled into the same request.
+`recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract. GGUF recommendations use exact artifact selectors from `selectable_items[].files` rather than the legacy quant token, and set `exactMatch: true`: root-level paths are prefixed with `./`, while nested paths keep their complete repository-relative spelling. Dataset recommendations also set `exactMatch: true`, but use the group's `filter_value` as the selector. Other model recommendations keep their existing filter values and leave `exactMatch` unset. Exactly one non-MTP GGUF quantization artifact is recommended: the first `Q4_K_M`/`UD_Q4_K_M` in the analyzer's deterministic order, or otherwise the first non-MTP quality>=4 artifact under 10 GiB. A preferred local `mmproj` companion remains separately recommended and is bundled into the same request. Branch rows never displace this: even when EXL2/EXL3 branch refs are listed as selectable items (see below), `recommended_download` names a branch only when the main tree carries no recognized model payload by name/layout; branch rows are always available and downloadable, and file names never prove calibration.
 
 `recommended_download` targets exactly one repository (`repo`, the analyzed repository). A recommended item whose `upstream_repo` is set is an mmproj companion discovered in an upstream base-model repository; its `files` paths are relative to that upstream repository, so they are omitted from `recommended_filters` and `recommended_download`. Download such a companion through its individual `selectable_items[]` entry, which retains `upstream_repo` and the exact upstream `files`. Recommended items from the analyzed repository are still included. If every recommended item is upstream, `recommended_download` is omitted.
 
 ### EXL2/EXL3 branch variants
 
-For a model repository whose main tree has no recognized model weights and whose
-refs contain EXL2/EXL3 bitrate branches (for example `4.00bpw`,
-`SC_6.00bpw_H6_V6`, `4_25`, or `exl/4_25`), `GET /api/analyze` exposes each
-branch as a selectable item:
+For a model repository whose refs contain EXL2/EXL3 bitrate branches (for
+example `4.00bpw`, `SC_6.00bpw_H6_V6`, `4_25`, or `exl/4_25`), `GET /api/analyze`
+exposes each branch as a selectable item. Visibility depends only on the real
+branch refs and the branch-name shape: the analyzer never reads main-tree file
+content to decide which branches to offer, so weights, calibration artifacts,
+or an unreadable header on main neither hide a branch nor fail the analysis:
 
 ```json
 {
@@ -341,16 +343,32 @@ branch as a selectable item:
 
 `revision` is the branch to download, `branch_variant` distinguishes it from an
 ordinary revision-backed selection, and `bits_per_weight`/`head_bits` describe
-the branch metadata when it is available. One branch is marked `recommended`.
-The per-branch metadata lookups are bounded. A branch whose quant method
-follows from the repository name or the main configuration is always listed; a
-branch whose method can only be established from its own branch metadata is
-listed only when the lookup reached it, so a slow Hub can return fewer branches
-than the repository has refs. The discovery warning below covers the
-uncertainty of the main tree's file roles, not this truncation.
+the branch metadata when it is available. One branch is marked `recommended`
+only when the main tree carries no recognized model payload (by name/layout) —
+the classic EXL branch layout, where main carries configs and docs while the
+quantized payloads live on the bitrate branches. When the main tree carries
+payload — base's name-layer weight-role recognition over the whole main
+tree (names only; a safetensors-named file counts as payload by the
+user-decided names-decide rule) — no branch row is
+marked and the analysis's own output stands: a known format's file-based
+`recommended_download` where it has one, no recommendation where its type
+yields none. File names never prove calibration, so a calibration-looking or
+renamed weight-shaped file counts as payload exactly like `model.safetensors`.
+The branch rows themselves stay offered and downloadable either way, because
+availability never depends on main-tree content. `method` and the widths are
+best-effort display enrichment, never a visibility
+condition: they come from the branch's own quantization config when it is
+readable, otherwise from the main configuration, the repository name, or the
+branch name. `method` is omitted when no EXL2/EXL3 evidence exists, and a known
+non-EXL `quant_method` keeps it empty instead of guessing a flavor. The
+per-branch metadata and size lookups are bounded; when they fail or time out,
+only this display enrichment degrades — every recognized branch stays listed
+and downloadable.
 
-`recommended_download` then names that branch and asks for the whole branch
-without file filters:
+When a branch row carries `recommended` (main tree without recognized
+payload, see above), `recommended_download` then names that branch and asks
+for the whole
+branch without file filters:
 
 ```json
 {
@@ -382,25 +400,23 @@ array of bounded, non-fatal diagnostics:
 
 ```json
 {
-  "code": "exl_branch_discovery_incomplete",
-  "message": "EXL branch discovery could not be completed because one or more main file roles could not be safely established. Retry analysis to try again.",
-  "causes": ["header_unavailable", "header_uninterpretable"],
+  "code": "both_namespace_detection_degraded",
+  "message": "Both-namespaces (ErrBothExist) detection was degraded: the dataset-namespace existence probe failed, so this repository was not checked for also existing as a dataset (cause: Get \"https://huggingface.co/api/models/owner/name\": dial tcp: lookup huggingface.co: no such host). Retry analysis to try again.",
+  "causes": ["probe_unavailable"],
   "retryable": true
 }
 ```
 
-`code` identifies the warning. The codes currently emitted are
-`exl_branch_discovery_incomplete` and `both_namespace_detection_degraded`,
-the latter when the optional dataset-namespace probe after a successful model
-listing failed, so both-namespaces (`needsSelection`) detection is unverified
-for this analysis — the analysis outcome is unchanged, only the warning is
-added. `causes` contains stable reason codes, not upstream response bodies or
-URLs: `header_unavailable`, `header_uninterpretable`, `probe_timeout`,
-`probe_limit`, `weight_role_unrecognized`, and `probe_unavailable`.
-`both_namespace_detection_degraded` carries the underlying failure text in
-`message` (an expired tree-page budget keeps its actionable timeout text).
+`code` identifies the warning. The only code currently emitted is
+`both_namespace_detection_degraded`, when the optional dataset-namespace
+probe after a successful model listing failed, so both-namespaces
+(`needsSelection`) detection is unverified for this analysis — the analysis
+outcome is unchanged, only the warning is added. `causes` contains stable
+reason codes, not upstream response bodies or URLs: `probe_timeout` and
+`probe_unavailable`. The message carries the underlying failure text (an
+expired tree-page budget keeps its actionable timeout text).
 `retryable` indicates that repeating the same
-analyze request may complete the optional discovery. A retry repeats the same
+analyze request may complete the optional work. A retry repeats the same
 repository, namespace, and revision request; it does not change the selection
 or start a download.
 
@@ -757,16 +773,24 @@ response item exposes only `path`, `size`, and `lfs`; `path` is
 repository-relative. The response does not include filter-attribution or
 destination-prefix fields.
 
-Successful responses to a filtered dataset request may also carry
+Successful responses to a filtered request may also carry
 `notices`, an array of informational strings that is omitted when empty. A
 notice reports files the plan deliberately did not select: when a filter
 names a standard split and the tree contains files that mention that split
 without belonging to it, one notice names how many were excluded, the split
 label, the directories they live in, and at most five of the excluded paths
-(stating how many more were left unnamed). Notices are deterministic and
+(stating how many more were left unnamed). An ineffective shard-range
+selection adds its own notices to the same array (documented under
+`shardRanges` below). A filter pattern that selected nothing while the
+request's other filters kept the selection alive adds a
+`filters_unmatched` notice naming the unmatched patterns (documented
+below) — except that a pattern whose miss a split-mention notice already
+reports is skipped there, so no pattern is ever reported twice. Notices
+are deterministic and
 non-fatal: they never change `files`, `totalSize`, `totalFiles`, or the
 download outcome, and they never replace an error. The bundled client
-renders them in the plan preview.
+renders them in the plan preview, and a download job reports the same
+sentences in its `warnings` list (documented under Job below).
 
 The public Go planning contract is broader. `hfdownloader.PlanRepo` returns a
 `*Plan` whose `Items` are `PlanItem`s and whose `Notices` carry the same
@@ -825,38 +849,93 @@ without filters — is rejected with HTTP 400 and error code
 /api/plan` and `POST /api/download` (including `dryRun: true`), so a dry run
 never accepts a request the real download rejects.
 
-Ranges never fail silently. A successful plan response can carry `warnings`,
-an array of typed objects `{"code": ..., "message": ..., "segments": [...]}`
-omitted when empty. `message` is a bounded sentence and `segments` names the
-offending input segments; three codes exist today:
+Ranges never fail silently: their diagnostics ride the established `notices`
+array defined above (a download job then reports the same sentences in its
+`warnings` list), never a separate channel. Two notices exist today:
 
-- `shard_ranges_no_shards` — the matched set contains no shard files at
-  all, so the ranges narrowed nothing; `segments` lists every requested
-  segment.
-- `shard_ranges_ineffective_segments` — specific spans select no existing
-  shard index (for example `9-10` against a four-shard family); `segments`
-  lists exactly those spans.
-- `filters_unmatched` — the request's other filters selected files, but the
-  patterns listed in `segments` selected none; `message` names them (for
-  example `filter "q4" matched nothing`). Matching counts only selected
-  files — a direct filter match or dataset-membership selection of the
-  pattern's own label — so retained companion files never count, excludes
-  apply before the credit, and a request whose filters select nothing at
-  all still fails with `no_filter_match` instead of warning.
+- the matched set contains no shard files at all, so the ranges narrowed
+  nothing — the notice names the whole expression, for example
+  `shard ranges "1-5" matched no shard file, so nothing was narrowed`.
+- specific spans select no existing shard index (for example `9-10`
+  against a four-shard family) — the notice names exactly those spans, for
+  example `shard range segments selected no shard (indices present: 1-4):
+  9-10`. At most five spans are named; the rest are counted.
 
-Warnings are deterministic and non-fatal: they never change `files`,
+Notices are deterministic and non-fatal: they never change `files`,
 `totalSize`, `totalFiles`, or the download outcome, and they never replace
-an error. The surface is extensible — later warnings join the same array —
-so clients branch on `code` and treat unknown codes as informational.
+an error.
 
-The same array is produced by `POST /api/plan`, by `dryRun: true` on
-`POST /api/download`, and by the plan of a real download: the job snapshot
-returned by `POST /api/download`, `GET /api/jobs`, and `GET /api/jobs/{id}`
-carries the warnings its own plan reported as `warnings` (persisted in
-`jobs_state.json`), so a client can see what a running or finished job's
-plan said. The bundled Downloads view renders them as a small warning line
-on the job card, and the bundled start flow surfaces `filters_unmatched` as
-a non-blocking warning toast right after the download is queued.
+A request whose filters select nothing at all keeps failing with
+`no_filter_match`; but when the request's other filters still select files
+and a pattern selected none, the plan carries a `filters_unmatched` notice
+naming exactly the unmatched patterns — one sentence such as
+`filter "q4" matched nothing`, or `filters "q4", "fp16" matched nothing`
+when several are unmatched (at most five are named; the rest are counted).
+Matching counts only **selected** files — a direct filter match (any
+shape: substring, `.ext`, `./name`, `dir/`, a full path) or a
+dataset-membership selection of the pattern's own label — so retained
+companions never count, excludes apply before the credit, and a
+membership selection can leave every direct pattern unselected and named.
+The notice never repeats a pattern whose miss the split-mention notices
+above already report: that pinned coverage wins for the pattern, and this
+producer extends to everything else (direct patterns, shaped selectors,
+and dataset labels the split family does not cover), so no pattern is
+ever reported twice. Like every notice it rides `notices` → a download
+job's `warnings` list, and the bundled start flow shows it as a
+non-blocking warning toast right after the download is queued.
+
+### Strict file selection
+
+`strictFiles: true` reinterprets `filters` as a strict manual file selection
+(the file-tree picker contract): each filter is one complete
+repository-relative **file** path, and the plan contains exactly those files
+and nothing else. Directories are expressed as their member file paths; a
+trailing-slash directory entry is rejected as non-canonical.
+
+- Matching is exact-spelling (case-sensitive) over the complete path: a
+  selected spelling either is the tree file spelled exactly that way or it is
+  a miss — a case-variant file is never substituted for the selection.
+  `exactMatch` has no effect. There is no substring widening, no basename
+  aliasing (a single-segment entry names the root-level file only, never a
+  same-named file in a subdirectory), no companion/metadata retention, no GGUF
+  inference, and no dataset-membership selection.
+- Entries are normalized before storage and identity comparison: `\`
+  separators become `/`, a leading `./` root alias is stripped (the
+  established `./name` request spelling), and repeated spellings collapse to
+  one entry (`./a.bin` and `a.bin` are the same entry). Entries are otherwise
+  used verbatim — no whitespace trimming and no case folding.
+- The selection is all-or-nothing, and request-shape problems fail with `400`
+  before any Hub contact on both endpoints:
+  - empty `filters` → `400` `invalid_file_selection`
+  - an `owner/name:file` colon shorthand combined with `strictFiles` → `400`
+    `invalid_file_selection`, with a hint that the shorthand is not
+    supported in strict mode — send the file paths in `filters`; the colon
+    in `repo` is rejected this way whether or not `filters` is set
+  - a non-canonical entry (empty, absolute, trailing `/`, `.`, `..`, or a
+    spelling that does not clean to itself such as `a/../b`) → `400`
+    `invalid_file_selection`, naming the entry
+  - two entries that differ only in case (for example `a.bin` and `A.bin`) →
+    `400` `invalid_file_selection`, naming both entries: on case-insensitive
+    filesystems they are one file, so neither may be silently dropped
+  - `excludes` set → `400` `invalid_file_selection` (`excludes` are substring
+    patterns and contradict exactness)
+  - `appendFilterSubdir: true` → `400` `invalid_file_selection` (selection
+    paths are not destination directory names)
+  - `branchVariant: true` → `400` `invalid_file_selection` (a branch variant
+    requires an unfiltered request; a strict selection is a filter list)
+- A well-formed path that does not exist at the revision spelled exactly that
+  way fails `POST /api/plan` (and a `dryRun: true` download) with `400`
+  `no_file_match`, naming the missing paths. A real download fails its job
+  with the same error instead, matching how a no-match filter behaves on a
+  real download.
+- The normalized selection is part of job identity: an identical active strict
+  request returns the existing job like any duplicate, a different selection is
+  an independent job, and two strict requests differing only in `exactMatch`
+  are one job — the flag is a no-op here, so it never splits strict identity.
+  The job snapshot exposes the selection as `filters` plus `strictFiles` via
+  `GET /api/jobs` and `jobs_state.json`.
+- Storage mode, verification, resume, and revision pinning are unchanged;
+  `strictFiles` narrows plan composition only.
 
 ## Download
 
@@ -877,7 +956,8 @@ Notes:
   `GET /api/jobs` and `jobs_state.json` exposes the field as `shardRanges`,
   and the bundled Downloads view labels it on the job's chip. Planning,
   `dryRun: true` and the real download apply ranges identically; the syntax,
-  validation error code and warning codes are documented under Plan above.
+  validation error code and the notices a doomed range selection produces are
+  documented under Plan above.
 - `branchVariant` (optional) selects one whole EXL2/EXL3 branch named by
   `revision`. It is model-only and must be unfiltered: `filters` and `excludes`
   must be empty, and `appendFilterSubdir`, `localRepo`, and `dataset: true` are
@@ -986,7 +1066,13 @@ Notes:
   the key. This keeps a dataset request that previously succeeded (for example
   a client that always sends a `routeKey`) from newly failing with `400`.
 - Duplicate active downloads return the existing job; two requests for the same
-  repo routed to different destinations are distinct jobs.
+  repo routed to different destinations are distinct jobs. The same rule covers
+  a strict manual selection: with `strictFiles: true` the normalized selection
+  (see Strict file selection in the Plan section) is part of the identity, so
+  an identical active strict request returns `200` with
+  `"message": "Download already in progress"` while a different selection is an
+  independent job; two strict requests differing only in `exactMatch` are the
+  same request, since that flag has no effect in strict mode.
 
 ## Jobs
 
@@ -1017,7 +1103,29 @@ transfer, finalizing, completion, skipped, error, and cancellation states, and
 `file_finalizing` is emitted before the pre-publication proof. The detailed
 ownership and resume contract is in `pkg/hfdownloader/doc.go`.
 
+Job responses include `warnings`, an array of strings omitted when empty: the
+downloader's non-fatal diagnostics for the job, one entry per distinct
+message, in first-arrival order. A repeated diagnostic appears once — a
+resumed or retried attempt re-runs the plan and the downloader emits the same
+messages again, and a repeat adds no entry and consumes none of the bound. A
+warning reports a fact about the download without failing it and without
+changing the selection — for example a revision that is not pinned to an
+immutable commit, a plan notice such as a split-precedence exclusion, an
+ineffective shard range, or a filter pattern that matched nothing
+(`filter "q4" matched nothing`), resume
+state that cannot be used without HTTP range support (reported once per
+download, naming the count and a bounded list of the affected files, not once
+per file), or a best-effort metadata write (a ref, friendly directory,
+rebuild script or manifest) that failed. The list is bounded: it keeps at
+most 20 distinct warnings, and once
+full a further distinct diagnostic is not added. It is distinct from
+`destinationWarning`, which the server computes once when the job is created.
+
 Cache-mode jobs include `hubDir`, the frozen exact Hub storage directory.
+A strict manual selection is exposed on the snapshot the same way as every
+other job field: `filters` holds the normalized selected paths and
+`strictFiles` is `true`, so a client can render an exact "N files" label and
+match the per-file progress entries (`files`) against the selection.
 `outputDir` keeps its existing meaning: the app/friendly root in cache mode,
 or the local output root in flat mode. Jobs and history record both roots;
 changing Settings or restarting with different ENV does not relocate new-format

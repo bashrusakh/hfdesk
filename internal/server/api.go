@@ -84,7 +84,7 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.Contains(req.Repo, ":") && len(req.Filters) == 0 {
+	if strings.Contains(req.Repo, ":") && len(req.Filters) == 0 && !req.StrictFiles {
 		parts := strings.SplitN(req.Repo, ":", 2)
 		req.Repo = parts[0]
 		if parts[1] != "" {
@@ -99,6 +99,9 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 
 	if !hfdownloader.IsValidModelName(req.Repo) {
 		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
+		return
+	}
+	if admitStrictSelection(w, &req) {
 		return
 	}
 	if err := validateBranchVariantRequest(req); err != nil {
@@ -168,7 +171,7 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		return
 	}
 
-	if strings.Contains(req.Repo, ":") && len(req.Filters) == 0 {
+	if strings.Contains(req.Repo, ":") && len(req.Filters) == 0 && !req.StrictFiles {
 		parts := strings.SplitN(req.Repo, ":", 2)
 		req.Repo = parts[0]
 		if parts[1] != "" {
@@ -184,6 +187,9 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 	revision := req.Revision
 	if revision == "" {
 		revision = "main"
+	}
+	if admitStrictSelection(w, &req) {
+		return
 	}
 	if err := validateBranchVariantRequest(req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid branch variant request", err.Error())
@@ -202,6 +208,7 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		Filters:            req.Filters,
 		Excludes:           req.Excludes,
 		ExactMatch:         req.ExactMatch,
+		StrictFiles:        req.StrictFiles,
 		AppendFilterSubdir: req.AppendFilterSubdir,
 		BranchVariant:      req.BranchVariant,
 		ShardRanges:        req.ShardRanges,
@@ -261,6 +268,16 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 				"Invalid shard ranges", err.Error())
 			return
 		}
+		if errors.Is(err, hfdownloader.ErrInvalidFileSelection) {
+			writeAPIError(w, http.StatusBadRequest, "invalid_file_selection",
+				"Invalid file selection", err.Error())
+			return
+		}
+		if errors.Is(err, hfdownloader.ErrNoFileMatch) {
+			writeAPIError(w, http.StatusBadRequest, "no_file_match",
+				"Selected files do not exist in the repository", err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Failed to scan repository", err.Error())
 		return
 	}
@@ -281,10 +298,59 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		TotalSize:  totalSize,
 		TotalFiles: len(files),
 		Notices:    plan.Notices,
-		Warnings:   plan.Warnings,
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// admitStrictSelection validates the strict file-selection request shape at
+// the HTTP boundary, before any Hub contact, for both the download and plan
+// endpoints. It canonicalizes the selection in place (normalization +
+// exact-spelling dedup; entries differing only in case are rejected, so one
+// spelling reaches job identity, the job snapshot, and the plan) and rejects
+// the combinations that contradict exactness: an owner/name:file colon
+// shorthand in repo (with or without filters), an empty selection,
+// non-canonical paths, case-colliding entries, excludes, a branch variant,
+// and appendFilterSubdir — every one surfaced as 400 invalid_file_selection
+// with ErrInvalidFileSelection, checked in the same order as hfdownloader's
+// validate so both layers name the same offending entry or field. It runs
+// before validateBranchVariantRequest so a strict + branchVariant request
+// gets the same named error at this layer and the library layer. A
+// non-strict request is untouched. Returns true when it wrote the 400
+// response.
+func admitStrictSelection(w http.ResponseWriter, req *DownloadRequest) bool {
+	if !req.StrictFiles {
+		return false
+	}
+	var err error
+	switch {
+	case strings.Contains(req.Repo, ":"):
+		// The owner/name:file shorthand expands into filters for non-strict
+		// requests only, so a strict request whose repo kept the colon came
+		// from that shorthand — a client-side shape error whether or not
+		// filters were also sent, rejected before any Hub contact instead of
+		// failing later on the Hub's repo lookup.
+		err = fmt.Errorf("%w: the owner/name:file shorthand is not supported with strictFiles — send file paths in filters", hfdownloader.ErrInvalidFileSelection)
+	default:
+		var normalized []string
+		if normalized, err = hfdownloader.ValidateFileSelection(req.Filters); err == nil {
+			req.Filters = normalized
+			switch {
+			case len(req.Excludes) != 0:
+				err = fmt.Errorf("%w: strict file selection cannot be combined with excludes", hfdownloader.ErrInvalidFileSelection)
+			case req.BranchVariant:
+				err = fmt.Errorf("%w: strict file selection cannot be combined with a branch variant", hfdownloader.ErrInvalidFileSelection)
+			case req.AppendFilterSubdir:
+				err = fmt.Errorf("%w: strict file selection cannot be combined with appendFilterSubdir", hfdownloader.ErrInvalidFileSelection)
+			}
+		}
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_file_selection",
+			"Invalid file selection", err.Error())
+		return true
+	}
+	return false
 }
 
 // handleListJobs returns all jobs.

@@ -8,11 +8,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
 // filterUnmatchedRequest is the shared fixture request: one matched
@@ -24,12 +23,27 @@ func filterUnmatchedRequest() DownloadRequest {
 	}
 }
 
-// TestFilterUnmatchedPlanDryRunWarnings: POST /api/plan and dry-run
-// POST /api/download carry the typed filters_unmatched warning naming only
-// the unmatched pattern through the established Plan.Warnings plumbing, a
-// fully matched filter set stays warning-free, and a total-zero selection
-// keeps the no_filter_match 400 instead of ever becoming a warning.
-func TestFilterUnmatchedPlanDryRunWarnings(t *testing.T) {
+// filterNotices extracts the filters_unmatched sentences from a plan's
+// notices (the `filter "…" matched nothing` / `filters "… matched nothing`
+// shapes; split-mention notices start with "excluded" and shard notices
+// with "shard").
+func filterNotices(notices []string) []string {
+	var found []string
+	for _, n := range notices {
+		if strings.HasPrefix(n, `filter "`) || strings.HasPrefix(n, `filters "`) {
+			found = append(found, n)
+		}
+	}
+	return found
+}
+
+// TestFilterUnmatchedPlanDryRunNotices: POST /api/plan and dry-run
+// POST /api/download carry the filters_unmatched notice naming only the
+// unmatched pattern through the established Plan.Notices plumbing, a fully
+// matched filter set stays free of such notices, and a total-zero
+// selection keeps the no_filter_match 400 instead of ever becoming a
+// notice.
+func TestFilterUnmatchedPlanDryRunNotices(t *testing.T) {
 	hub := shardRangeHub(shardRangeContent())
 	defer hub.Close()
 	_, mux := newShardRangeServer(t, hub, Config{})
@@ -42,13 +56,12 @@ func TestFilterUnmatchedPlanDryRunWarnings(t *testing.T) {
 		if code != http.StatusOK {
 			t.Fatalf("%s status=%d, want 200; body=%s", path, code, raw)
 		}
-		if len(resp.Warnings) != 1 ||
-			resp.Warnings[0].Code != hfdownloader.PlanWarningFiltersUnmatched ||
-			strings.Join(resp.Warnings[0].Segments, ",") != "q4" {
-			t.Fatalf("%s warnings = %+v, want one filters_unmatched [q4]", path, resp.Warnings)
+		found := filterNotices(resp.Notices)
+		if len(found) != 1 {
+			t.Fatalf("%s notices = %q, want exactly one filters_unmatched notice", path, resp.Notices)
 		}
-		if resp.Warnings[0].Message != `filter "q4" matched nothing` {
-			t.Errorf("%s message = %q, want %q", path, resp.Warnings[0].Message, `filter "q4" matched nothing`)
+		if found[0] != `filter "q4" matched nothing` {
+			t.Errorf("%s notice = %q, want %q", path, found[0], `filter "q4" matched nothing`)
 		}
 	}
 
@@ -63,8 +76,8 @@ func TestFilterUnmatchedPlanDryRunWarnings(t *testing.T) {
 		if code != http.StatusOK {
 			t.Fatalf("%s status=%d, want 200; body=%s", path, code, raw)
 		}
-		if len(resp.Warnings) != 0 {
-			t.Errorf("%s warnings = %+v, want none for a fully matched filter set", path, resp.Warnings)
+		if len(resp.Notices) != 0 {
+			t.Errorf("%s notices = %q, want none for a fully matched filter set", path, resp.Notices)
 		}
 	}
 
@@ -86,23 +99,28 @@ func TestFilterUnmatchedPlanDryRunWarnings(t *testing.T) {
 		if errResp.ErrorDetail == nil || errResp.ErrorDetail.Code != "no_filter_match" {
 			t.Errorf("%s error_detail=%+v, want code no_filter_match; body=%s", path, errResp.ErrorDetail, raw)
 		}
-		if strings.Contains(raw, "warnings") {
-			t.Errorf("%s total-zero response carries warnings: %s", path, raw)
+		if strings.Contains(raw, "notices") {
+			t.Errorf("%s total-zero response carries notices: %s", path, raw)
 		}
 	}
 }
 
-// TestFilterUnmatchedWarningOnJobSnapshot: a real download whose plan
-// reports filters_unmatched exposes the warning on the job snapshot served
-// by GET /api/jobs (and in the jobs_state.json JSON shape), the warning is
-// an output rather than identity — a fresh identical request starts an
-// independent job with no warnings carried over — and the job still
-// completes: the warning is non-blocking.
-func TestFilterUnmatchedWarningOnJobSnapshot(t *testing.T) {
+// TestFilterUnmatchedNoticeOnJobSnapshot: a real download whose plan
+// reports filters_unmatched exposes the SAME sentence on the job snapshot
+// served by GET /api/jobs (and in the jobs_state.json JSON shape) through
+// main's notices -> warning events -> Job.Warnings carriage — the exact
+// message the plan notices carried — the warning is an output rather than
+// identity (a fresh identical request starts an independent job with no
+// warnings carried over), and the job still completes: the notice is
+// non-blocking. This is the end-to-end both-surfaces proof: the plan
+// response above and this job snapshot carry the identical sentence.
+func TestFilterUnmatchedNoticeOnJobSnapshot(t *testing.T) {
 	hub := shardRangeHub(shardRangeContent())
 	defer hub.Close()
 	root := t.TempDir()
 	s, mux := newShardRangeServer(t, hub, Config{LocalDir: root, MaxActive: 1})
+
+	const want = `filter "q4" matched nothing`
 
 	body, err := json.Marshal(filterUnmatchedRequest())
 	if err != nil {
@@ -124,10 +142,12 @@ func TestFilterUnmatchedWarningOnJobSnapshot(t *testing.T) {
 	if finished.Status != JobStatusCompleted {
 		t.Fatalf("job status=%s err=%q; want completed (warnings must not block)", finished.Status, finished.Error)
 	}
-	if len(finished.Warnings) != 1 ||
-		finished.Warnings[0].Code != hfdownloader.PlanWarningFiltersUnmatched ||
-		strings.Join(finished.Warnings[0].Segments, ",") != "q4" {
-		t.Fatalf("job snapshot warnings = %+v, want one filters_unmatched [q4]", finished.Warnings)
+	if !slices.Contains(finished.Warnings, want) {
+		t.Fatalf("job snapshot warnings = %q, want the exact plan notice %q", finished.Warnings, want)
+	}
+	if n := len(filterNotices(finished.Warnings)); n != 1 {
+		t.Errorf("job snapshot carries %d filters_unmatched notices %q, want exactly one (no double-reporting)",
+			n, finished.Warnings)
 	}
 
 	// /api/jobs serves the same field to clients.
@@ -148,8 +168,8 @@ func TestFilterUnmatchedWarningOnJobSnapshot(t *testing.T) {
 			continue
 		}
 		seen = true
-		if len(job.Warnings) != 1 || job.Warnings[0].Code != hfdownloader.PlanWarningFiltersUnmatched {
-			t.Errorf("/api/jobs warnings = %+v, want one filters_unmatched", job.Warnings)
+		if !slices.Contains(job.Warnings, want) {
+			t.Errorf("/api/jobs warnings = %q, want the exact plan notice %q", job.Warnings, want)
 		}
 	}
 	if !seen {
@@ -162,7 +182,7 @@ func TestFilterUnmatchedWarningOnJobSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(encoded), `"warnings"`) ||
-		!strings.Contains(string(encoded), `filters_unmatched`) {
+		!strings.Contains(string(encoded), `filter \"q4\" matched nothing`) {
 		t.Errorf("persisted job JSON lacks the warnings surface: %s", encoded)
 	}
 

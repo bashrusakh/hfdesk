@@ -3,8 +3,6 @@
 
 package server
 
-import "github.com/bashrusakh/hfdesk/pkg/hfdownloader"
-
 // DownloadRequest is the request body for starting a download.
 type DownloadRequest struct {
 	Repo               string   `json:"repo"`
@@ -24,6 +22,31 @@ type DownloadRequest struct {
 	// changing legacy unqualified basename/token matching. Exact segment
 	// boundaries preserve quantization tokens such as "Q6_K".
 	ExactMatch bool `json:"exactMatch,omitempty"`
+	// StrictFiles reinterprets filters as a strict manual file selection: each
+	// filter is one complete repository-relative file path, matched by exact
+	// spelling (case-sensitive), and nothing else is planned — no substring
+	// widening, no basename aliasing, no companion/metadata retention, no
+	// GGUF inference, no dataset-membership selection. exactMatch has no
+	// effect in this mode and does not participate in job identity for a
+	// strict request. A leading "./" is stripped from any entry and "\"
+	// separators are normalized away, then repeated spellings are dropped
+	// before the selection is stored on the job; two entries that differ
+	// only in case are rejected instead of deduplicated (they are one file
+	// on case-insensitive filesystems). The selection is all-or-nothing and
+	// validated before any Hub contact: an owner/name:file colon shorthand in
+	// repo is rejected with the same code and a hint, whether or not filters
+	// is set; filters must be non-empty (400
+	// invalid_file_selection when empty), every path must be canonical and
+	// spelled free of case collisions (400 invalid_file_selection, naming
+	// the offending or colliding entries), every path must exist at the
+	// revision spelled exactly that way (400 no_file_match from plan/dry-run;
+	// a real download fails its job the same way filtered downloads do), and
+	// excludes, branchVariant, and appendFilterSubdir are rejected (400
+	// invalid_file_selection for all three). The normalized selection and
+	// this flag participate in job deduplication, appear on the job snapshot
+	// (filters + strictFiles) via /api/jobs and jobs_state.json, and plan
+	// with POST /api/plan returning exactly the selected files.
+	StrictFiles bool `json:"strictFiles,omitempty"`
 	// LocalDir overrides the download destination for this specific request,
 	// writing real files (flat mode) instead of the HF cache layout.
 	// When empty, the server-global LocalDir (if set) or HF cache is used.
@@ -60,27 +83,19 @@ type PlanResponse struct {
 	Files      []PlanFile `json:"files"`
 	TotalSize  int64      `json:"totalSize"`
 	TotalFiles int        `json:"totalFiles"`
-	// Notices are informational messages about files the plan deliberately
-	// did not select (currently split-mention files the split-precedence
-	// rule dropped for a filter naming their mentioned split). Each notice
-	// is one bounded sentence naming the count, the split label, the
-	// directories, and at most five excluded paths. A notice never changes
-	// files, totalSize, or totalFiles, and it is omitted when empty.
+	// Notices are informational, bounded sentences: split-mention files the
+	// split-precedence rule dropped for a filter naming their mentioned
+	// split (naming the count, the split label, the directories and at most
+	// five excluded paths), ineffective shard ranges (naming the whole
+	// expression or up to five ineffective spans — see shardRanges), and
+	// filter patterns that selected nothing while the request's other
+	// filters kept the selection alive (naming up to five unmatched
+	// patterns, for example `filter "q4" matched nothing`; a pattern whose
+	// miss a split-mention notice already reports is never repeated here).
+	// A notice never changes files, totalSize, or totalFiles, and it is
+	// omitted when empty. A real download reports the same sentences in its
+	// job snapshot `warnings` once its plan completes.
 	Notices []string `json:"notices,omitempty"`
-	// Warnings are typed, non-fatal diagnostics about requested selectors
-	// that had no effect (currently ineffective shard ranges and filter
-	// patterns that selected nothing): objects of
-	// {code, message, segments} where code is a stable string
-	// (shard_ranges_no_shards, shard_ranges_ineffective_segments,
-	// filters_unmatched today), message is a bounded sentence, and segments
-	// names the offending input segments when the warning is about specific
-	// ones. The surface is extensible: clients branch on code and treat
-	// unknown codes as informational. A warning never changes files,
-	// totalSize, totalFiles, or the download outcome, never replaces an
-	// error, and is omitted when empty. A real download reports the same
-	// warnings on its job snapshot (`warnings`) once its own plan
-	// completes.
-	Warnings []hfdownloader.PlanWarning `json:"warnings,omitempty"`
 }
 
 // PlanFile represents a file in the plan.

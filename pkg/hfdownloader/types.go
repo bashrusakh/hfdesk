@@ -116,6 +116,29 @@ type Job struct {
 	// Excludes are always matched as substrings, regardless of this setting.
 	ExactMatch bool
 
+	// StrictFiles reinterprets Filters as a strict manual file selection: each
+	// filter is one complete repository-relative file path, matched against
+	// the walked tree by exact spelling (case-sensitive). Nothing else may
+	// select: no substring widening, no basename aliasing (a single-segment
+	// entry names the root-level file only), no companion or metadata
+	// retention, no GGUF inference, and no dataset-membership selection.
+	// ExactMatch has no effect in this mode and never splits job identity
+	// for a strict request. A leading "./" is stripped from any entry and
+	// "\" separators are normalized away, matching the established
+	// "./name" request spelling; after that, repeated spellings collapse to
+	// one entry and two entries differing only in case are rejected (they
+	// are one file on case-insensitive filesystems).
+	//
+	// The selection is all-or-nothing: Filters must be non-empty, every
+	// selected path must exist at the resolved revision spelled exactly that
+	// way (otherwise ErrNoFileMatch names the missing paths), and the
+	// canonical-path rule of ValidateFileSelection applies to every entry.
+	// StrictFiles cannot be combined with Excludes, AppendFilterSubdir, or a
+	// branch variant (ErrInvalidFileSelection from validate, before any
+	// network work). Storage, verification, resume, and revision isolation
+	// are unchanged: this flag only narrows plan composition.
+	StrictFiles bool
+
 	// AppendFilterSubdir puts each filter's matched files in a subdirectory
 	// named after the filter. Useful for organizing multiple quantizations.
 	//
@@ -157,7 +180,7 @@ type Job struct {
 	// before any network work; ranges that empty the selection fail with
 	// ErrNoFilterMatch even when retained companion files that matched
 	// nothing remain planned, and ineffective ranges surface as
-	// Plan.Warnings instead of failing.
+	// Plan.Notices instead of failing.
 	ShardRanges string
 }
 

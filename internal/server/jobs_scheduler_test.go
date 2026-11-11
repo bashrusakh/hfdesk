@@ -4,7 +4,10 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -335,5 +338,184 @@ func TestUpdateJobETA(t *testing.T) {
 	updateJobSpeed(job, job.Progress.TotalBytes, start.Add(60*time.Second))
 	if job.Progress.EtaSeconds != 0 {
 		t.Fatalf("ETA after completion should be 0, got %d", job.Progress.EtaSeconds)
+	}
+}
+
+// TestApplyJobProgressKeepsWarningEvents pins the job's warning list: a
+// warning event is kept in the job state and rides the Job JSON the API
+// serves (handleGetJob, handleListJobs and BroadcastJob marshal the *Job
+// itself), a job that receives no warnings carries none (the field is
+// omitted), an empty message is not stored, a non-warning event never
+// becomes one, and the list is bounded — once maxJobWarnings entries are
+// kept it stops growing while keeping the first ones.
+func TestApplyJobProgressKeepsWarningEvents(t *testing.T) {
+	now := time.Now()
+	warn := func(msg string) hfdownloader.ProgressEvent {
+		return hfdownloader.ProgressEvent{Level: "warn", Event: "warning", Message: msg}
+	}
+
+	t.Run("kept in state and in the API response shape", func(t *testing.T) {
+		job := &Job{ID: "warn-job"}
+		applyJobProgress(job, hfdownloader.ProgressEvent{Event: "plan_item", Path: "a.gguf", Total: 10}, now)
+		applyJobProgress(job, warn("revision is not pinned to an immutable commit"), now)
+
+		const want = "revision is not pinned to an immutable commit"
+		if len(job.Warnings) != 1 || job.Warnings[0] != want {
+			t.Fatalf("job.Warnings = %q, want [%q]", job.Warnings, want)
+		}
+		// The warning case folds nothing else into the job.
+		if job.Progress.TotalFiles != 1 || job.Progress.TotalBytes != 10 || len(job.Files) != 1 {
+			t.Errorf("warning disturbed progress: totalFiles=%d totalBytes=%d fileList=%d",
+				job.Progress.TotalFiles, job.Progress.TotalBytes, len(job.Files))
+		}
+
+		data, err := json.Marshal(job)
+		if err != nil {
+			t.Fatalf("marshal job: %v", err)
+		}
+		var decoded struct {
+			Warnings []string `json:"warnings"`
+		}
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("unmarshal job JSON: %v", err)
+		}
+		if len(decoded.Warnings) != 1 || decoded.Warnings[0] != want {
+			t.Errorf("response warnings = %q, want [%q]", decoded.Warnings, want)
+		}
+	})
+
+	t.Run("job without warnings carries none", func(t *testing.T) {
+		job := &Job{ID: "quiet-job"}
+		applyJobProgress(job, hfdownloader.ProgressEvent{Event: "plan_item", Path: "a.gguf", Total: 10}, now)
+		// A non-warning event carrying a message must not become a warning.
+		applyJobProgress(job, hfdownloader.ProgressEvent{Level: "error", Event: "error", Message: "boom"}, now)
+		if len(job.Warnings) != 0 {
+			t.Fatalf("job.Warnings = %q, want none", job.Warnings)
+		}
+		data, err := json.Marshal(job)
+		if err != nil {
+			t.Fatalf("marshal job: %v", err)
+		}
+		if strings.Contains(string(data), `"warnings"`) {
+			t.Errorf("job JSON must omit the warnings field when empty, got %s", data)
+		}
+	})
+
+	t.Run("empty message is not stored", func(t *testing.T) {
+		job := &Job{}
+		applyJobProgress(job, warn(""), now)
+		if len(job.Warnings) != 0 {
+			t.Fatalf("job.Warnings = %q, want none for an empty message", job.Warnings)
+		}
+	})
+
+	t.Run("list is bounded and keeps the first entries", func(t *testing.T) {
+		job := &Job{}
+		for i := 0; i < maxJobWarnings+5; i++ {
+			applyJobProgress(job, warn(fmt.Sprintf("warning %d", i)), now)
+		}
+		if len(job.Warnings) != maxJobWarnings {
+			t.Fatalf("len(job.Warnings) = %d, want the cap %d", len(job.Warnings), maxJobWarnings)
+		}
+		if job.Warnings[0] != "warning 0" {
+			t.Errorf("first kept warning = %q, want %q (the cap keeps the first entries)",
+				job.Warnings[0], "warning 0")
+		}
+		if last, wantLast := job.Warnings[maxJobWarnings-1], fmt.Sprintf("warning %d", maxJobWarnings-1); last != wantLast {
+			t.Errorf("last kept warning = %q, want %q", last, wantLast)
+		}
+	})
+
+	t.Run("repeated diagnostic keeps one entry", func(t *testing.T) {
+		job := &Job{}
+		applyJobProgress(job, warn("revision is not pinned"), now)
+		applyJobProgress(job, warn("revision is not pinned"), now) // re-emitted by a later attempt
+		if len(job.Warnings) != 1 || job.Warnings[0] != "revision is not pinned" {
+			t.Fatalf("job.Warnings = %q, want one entry for the repeated diagnostic", job.Warnings)
+		}
+		// A distinct diagnostic is kept beside it, first arrival first.
+		applyJobProgress(job, warn("failed to write manifest: disk full"), now)
+		if len(job.Warnings) != 2 ||
+			job.Warnings[0] != "revision is not pinned" ||
+			job.Warnings[1] != "failed to write manifest: disk full" {
+			t.Fatalf("job.Warnings = %q, want both diagnostics in first-arrival order", job.Warnings)
+		}
+		// A further repeat of the first diagnostic still adds nothing.
+		applyJobProgress(job, warn("revision is not pinned"), now)
+		if len(job.Warnings) != 2 {
+			t.Fatalf("job.Warnings = %q, want the repeat to add no entry", job.Warnings)
+		}
+	})
+
+	t.Run("repeats do not consume the cap", func(t *testing.T) {
+		job := &Job{}
+		// Every message below is emitted twice, as a re-run of the plan
+		// would emit it: the repeats must not fill the bounded list.
+		for i := 0; i < maxJobWarnings-1; i++ {
+			applyJobProgress(job, warn(fmt.Sprintf("warning %d", i)), now)
+			applyJobProgress(job, warn(fmt.Sprintf("warning %d", i)), now)
+		}
+		if len(job.Warnings) != maxJobWarnings-1 {
+			t.Fatalf("len(job.Warnings) = %d, want %d after doubled emissions", len(job.Warnings), maxJobWarnings-1)
+		}
+		// The cap still has room for the next distinct diagnostic even
+		// though every earlier message was already emitted twice.
+		applyJobProgress(job, warn("failed to write manifest: disk full"), now)
+		if len(job.Warnings) != maxJobWarnings {
+			t.Fatalf("len(job.Warnings) = %d, want the cap %d", len(job.Warnings), maxJobWarnings)
+		}
+		if job.Warnings[maxJobWarnings-1] != "failed to write manifest: disk full" {
+			t.Errorf("last entry = %q, want the distinct diagnostic to take the final slot", job.Warnings[maxJobWarnings-1])
+		}
+		// Full: a further distinct diagnostic is still dropped.
+		applyJobProgress(job, warn("failed to write ref: permission denied"), now)
+		if len(job.Warnings) != maxJobWarnings {
+			t.Errorf("len(job.Warnings) = %d, want the cap %d once full", len(job.Warnings), maxJobWarnings)
+		}
+	})
+}
+
+// TestResumeKeepsOneWarningEntryPerDiagnostic pins the warning lifecycle
+// across a resume-style restart: resetAndQueueRestartLocked leaves the
+// job's warnings alone, and when the downloader re-emits the identical
+// messages on the next attempt — the unpinned-revision and plan-notice
+// warnings come from the per-attempt plan — they stay one entry each, so a
+// later distinct diagnostic of the new attempt still fits the bound.
+func TestResumeKeepsOneWarningEntryPerDiagnostic(t *testing.T) {
+	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "state"))
+	m.fenced = true // no attempt is dispatched; this pins the reset and re-emission only.
+	const unpinned = "revision is not pinned to an immutable commit"
+	job := &Job{
+		ID:        "resume-warnings",
+		Repo:      "owner/repo",
+		Status:    JobStatusPaused,
+		CreatedAt: time.Now(),
+		Warnings:  []string{unpinned},
+	}
+	m.jobs[job.ID] = job
+
+	now := time.Now()
+	warn := func(msg string) hfdownloader.ProgressEvent {
+		return hfdownloader.ProgressEvent{Level: "warn", Event: "warning", Message: msg}
+	}
+
+	// Resume path (retry=false): the reset must neither clear the kept
+	// diagnostics nor duplicate them.
+	m.mu.Lock()
+	resetAndQueueRestartLocked(m, job, false)
+	m.mu.Unlock()
+	if len(job.Warnings) != 1 || job.Warnings[0] != unpinned {
+		t.Fatalf("job.Warnings after resume reset = %q, want the single kept diagnostic", job.Warnings)
+	}
+
+	// The next attempt re-emits the same warning: same fact, same entry.
+	applyJobProgress(job, warn(unpinned), now)
+	if len(job.Warnings) != 1 {
+		t.Fatalf("job.Warnings after re-emission = %q, want one entry for the repeated diagnostic", job.Warnings)
+	}
+	// A distinct diagnostic of the new attempt is kept beside it.
+	applyJobProgress(job, warn("failed to write manifest: disk full"), now)
+	if len(job.Warnings) != 2 || job.Warnings[1] != "failed to write manifest: disk full" {
+		t.Fatalf("job.Warnings = %q, want the re-emitted and the distinct diagnostic once each", job.Warnings)
 	}
 }
