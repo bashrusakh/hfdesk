@@ -73,6 +73,13 @@ type PlanResponse struct {
 	Files      []PlanFile `json:"files"`
 	TotalSize  int64      `json:"totalSize"`
 	TotalFiles int        `json:"totalFiles"`
+	// Notices are informational messages about files the plan deliberately
+	// did not select (currently split-mention files the split-precedence
+	// rule dropped for a filter naming their mentioned split). Each notice
+	// is one bounded sentence naming the count, the split label, the
+	// directories, and at most five excluded paths. A notice never changes
+	// files, totalSize, or totalFiles, and it is omitted when empty.
+	Notices []string `json:"notices,omitempty"`
 }
 
 // PlanFile represents a file in the plan.

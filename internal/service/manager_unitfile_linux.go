@@ -897,18 +897,19 @@ func userScopeDataSystemdDirs() []string {
 // directory that already carries an ExecStart= directive, on a first
 // installation and on an update alike: after the write systemd composes
 // the drop-in over the canonical unit, so the command of the registration
-// would come from the drop-in and not from the install flags. The scan
-// covers the whole drop-in search path of the scope and names every file
-// that carries the directive — each of them takes part in the merge that
-// would own the command. The one action is the established removal of the
-// override from those files, the reload that makes the supervisor read the
-// files again and the retry; a file that cannot be read proves nothing and
-// is left to the loaded-command verification after the write. A directory
-// that cannot be read — permission-denied on an existing one included —
-// refuses with the access as its cause instead of passing for an empty
-// one, so the promise to refuse before it writes anything holds in that
-// state as well.
-func preWriteExecStartOverride(unitPath string, scope Scope) error {
+// would come from the drop-in and not from the install flags. The noun of
+// the refusal names the operation the attempt performs (operationNoun).
+// The scan covers the whole drop-in search path of the scope and names
+// every file that carries the directive — each of them takes part in the
+// merge that would own the command. The one action is the established
+// removal of the override from those files, the reload that makes the
+// supervisor read the files again and the retry; a file that cannot be read
+// proves nothing and is left to the loaded-command verification after the
+// write. A directory that cannot be read — permission-denied on an existing
+// one included — refuses with the access as its cause instead of passing
+// for an empty one, so the promise to refuse before it writes anything
+// holds in that state as well.
+func preWriteExecStartOverride(unitPath string, scope Scope, noun string) error {
 	holders := make([]string, 0, 1)
 	seenDirs := make(map[string]bool, len(systemdDropInSearchDirs(unitPath, scope)))
 	for _, dir := range systemdDropInSearchDirs(unitPath, scope) {
@@ -926,8 +927,8 @@ func preWriteExecStartOverride(unitPath string, scope Scope) error {
 			// cannot prove its absence, and the verification after the
 			// write would only reach it with a mutation and a rollback
 			// behind it.
-			return fmt.Errorf("service: the update was refused and the registration was not changed: the drop-in directory %q cannot be read: %v. Restore this user's read access to the directory — HFDesk never changes it — and run %q again",
-				dir, err, "hfdesk service install")
+			return fmt.Errorf("service: the %s was refused and the registration was not changed: the drop-in directory %q cannot be read: %v. Restore this user's read access to the directory — HFDesk never changes it — and run %q again",
+				noun, dir, err, "hfdesk service install")
 		}
 		for _, entry := range entries {
 			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".conf") {
@@ -947,15 +948,15 @@ func preWriteExecStartOverride(unitPath string, scope Scope) error {
 	case 0:
 		return nil
 	case 1:
-		return fmt.Errorf("service: the update was refused and the registration was not changed: the drop-in %q carries an %s override, which would own the command of the registration HFDesk writes. Remove the %q override from %q, reload the unit files with %q, and run %q again",
-			holders[0], "ExecStart=", "ExecStart=", holders[0], scopeSupervisorHint(scope)+" daemon-reload", "hfdesk service install")
+		return fmt.Errorf("service: the %s was refused and the registration was not changed: the drop-in %q carries an %s override, which would own the command of the registration HFDesk writes. Remove the %q override from %q, reload the unit files with %q, and run %q again",
+			noun, holders[0], "ExecStart=", "ExecStart=", holders[0], scopeSupervisorHint(scope)+" daemon-reload", "hfdesk service install")
 	default:
 		quoted := make([]string, len(holders))
 		for i, path := range holders {
 			quoted[i] = fmt.Sprintf("%q", path)
 		}
-		return fmt.Errorf("service: the update was refused and the registration was not changed: the drop-ins %s carry an %s override, one of which owns the command of the registration HFDesk writes. Remove the %q override from each of them, reload the unit files with %q, and run %q again",
-			strings.Join(quoted, ", "), "ExecStart=", "ExecStart=", scopeSupervisorHint(scope)+" daemon-reload", "hfdesk service install")
+		return fmt.Errorf("service: the %s was refused and the registration was not changed: the drop-ins %s carry an %s override, one of which owns the command of the registration HFDesk writes. Remove the %q override from each of them, reload the unit files with %q, and run %q again",
+			noun, strings.Join(quoted, ", "), "ExecStart=", "ExecStart=", scopeSupervisorHint(scope)+" daemon-reload", "hfdesk service install")
 	}
 }
 
@@ -1070,13 +1071,14 @@ func (u canonicalUnit) registrationOptions() InstallOptions {
 	return opts
 }
 
-// unitChangedDuringUpdateRefusal states the result, the cause and the one
-// next action of the guard that protects the atomic write: the file moved
-// out from under the snapshot this update read, so the write is refused
-// instead of overwriting a change the update never saw.
-func unitChangedDuringUpdateRefusal(unitPath string) error {
-	return fmt.Errorf("service: the update was refused and the registration was not changed: the unit file %q changed while the update was running. Run %q again",
-		unitPath, "hfdesk service install")
+// unitChangedDuringOperationRefusal states the result, the cause and the
+// one next action of the guard that protects the atomic write: the file
+// moved out from under the snapshot this attempt read, so the write is
+// refused instead of overwriting a change the attempt never saw. The noun
+// names the operation the attempt performs (operationNoun).
+func unitChangedDuringOperationRefusal(unitPath string, noun string) error {
+	return fmt.Errorf("service: the %s was refused and the registration was not changed: the unit file %q changed while the %s was running. Run %q again",
+		noun, unitPath, noun, "hfdesk service install")
 }
 
 // systemdExecStartSlot returns the index of the program token of a command

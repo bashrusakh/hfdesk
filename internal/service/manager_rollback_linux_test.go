@@ -122,7 +122,7 @@ func TestSystemdRollbackUsesTypedArgvForSpacesQuotesEmptyArgsAndEnvironment(t *t
 	t.Setenv("HFDESK_TEST_SYSTEMCTL_RESTART_MARKER", filepath.Join(t.TempDir(), "restart"))
 
 	_, err := fixture.manager.Install(context.Background(), DefaultInstallOptions(ScopeUser, fixture.updated.Executable))
-	if err == nil || !strings.Contains(err.Error(), "the previous registration was restored") {
+	if err == nil || !strings.Contains(err.Error(), "the previous registration and its loaded settings were restored") {
 		t.Fatalf("Install() = %v, want the failed restart and verified typed rollback", err)
 	}
 	content, readErr := os.ReadFile(fixture.unitPath)
@@ -175,8 +175,8 @@ func TestSystemdFailedRestartRestoresThePreviousRegistration(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want the failure of the restart")
 	}
-	if !strings.Contains(err.Error(), "the previous registration was restored") {
-		t.Errorf("Install() = %q, want an error that reports the restored registration", err)
+	if !strings.Contains(err.Error(), "the previous registration and its loaded settings were restored") {
+		t.Errorf("Install() = %q, want an error that reports the restored registration and its loaded settings", err)
 	}
 	// The restart of the restore is verified, so the sentence that names
 	// the started instance is allowed here.
@@ -243,7 +243,7 @@ func TestSystemdRollbackReloadFailureDoesNotRestartOrClaimRecovery(t *testing.T)
 		t.Fatal("Install() = nil, want the environment mismatch and unconfirmed rollback")
 	}
 	assertNames(t, err.Error(), "Install()", []string{"did not preserve the loaded environment", "reload the restored unit"})
-	assertNamesWithout(t, err.Error(), "Install()", nil, []string{"captured loaded command/launch settings were restored", "previous instance was started again"})
+	assertNamesWithout(t, err.Error(), "Install()", nil, []string{"captured loaded command/launch settings were restored", "and its loaded settings were restored", "previous instance was started again"})
 
 	disk, readErr := os.ReadFile(unitPath)
 	if readErr != nil || string(disk) != previousUnit {
@@ -319,7 +319,7 @@ func TestSystemdActiveUnitThatDoesNotServeIsAFailedUpdate(t *testing.T) {
 	assertNames(t, err.Error(), "Install()", []string{
 		"does not answer on",
 		previous.Listen,
-		"the previous registration was restored",
+		"the previous registration and its loaded settings were restored",
 		"the previous instance was started again",
 	})
 
@@ -437,6 +437,9 @@ func TestSystemdRestoreThatIsNotConfirmedIsNotReportedAsStartedAgain(t *testing.
 	})
 	if strings.Contains(err.Error(), "the previous instance was started again") {
 		t.Errorf("Install() = %q, want no claim that the previous instance was started again", err)
+	}
+	if strings.Contains(err.Error(), "and its loaded settings were restored") {
+		t.Errorf("Install() = %q, want no claim that the loaded settings were restored", err)
 	}
 
 	content, readErr := os.ReadFile(unitPath)
@@ -657,6 +660,55 @@ func TestSystemdRollbackReportsWhyTheRestoredStateIsUnknown(t *testing.T) {
 		}
 		if _, statErr := os.Stat(path); !errors.Is(statErr, fs.ErrNotExist) {
 			t.Errorf("the unit file of the failed first installation still exists: %v", statErr)
+		}
+	})
+
+	t.Run("the first-installation rollback names the installation", func(t *testing.T) {
+		_ = systemdRollbackScriptedSupervisor(t)
+		m := &systemdManager{scope: ScopeUser}
+		path, err := m.unitPath()
+		assertNoError(t, err, "unitPath() = %v, want nil", err)
+		// The failed first installation captured no loaded state at all,
+		// so the report says what it could not capture — and it names the
+		// operation it restores for: a first installation is never called
+		// an update.
+		previous := previousRegistration{path: path, existed: false, loadedKnown: false}
+
+		_, err = m.reportUnitRollback(context.Background(), previous, nil, failure)
+		if !errors.Is(err, failure) {
+			t.Errorf("reportUnitRollback() = %v, want the original failure preserved", err)
+		}
+		assertNames(t, err.Error(), "reportUnitRollback()", []string{
+			"could not be restored and proven",
+			"the prior loaded state was not captured before the installation",
+		})
+		if strings.Contains(err.Error(), "before the update") {
+			t.Errorf("reportUnitRollback() = %q, must not call a first installation an update", err)
+		}
+	})
+
+	t.Run("the update rollback names the update", func(t *testing.T) {
+		_ = systemdRollbackScriptedSupervisor(t)
+		m := &systemdManager{scope: ScopeUser}
+		path, err := m.unitPath()
+		assertNoError(t, err, "unitPath() = %v, want nil", err)
+		opts := previousOptions(t)
+		content, err := renderCanonicalUnit(canonicalFacts(t, opts))
+		assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
+		// The replaced registration existed and its loaded state was not
+		// captured: the report keeps the update noun of that operation.
+		previous := previousRegistration{path: path, content: []byte(content), existed: true, loadedKnown: false}
+
+		_, err = m.reportUnitRollback(context.Background(), previous, nil, failure)
+		if !errors.Is(err, failure) {
+			t.Errorf("reportUnitRollback() = %v, want the original failure preserved", err)
+		}
+		assertNames(t, err.Error(), "reportUnitRollback()", []string{
+			"could not be restored and proven",
+			"the previous loaded configuration was not captured before the update",
+		})
+		if strings.Contains(err.Error(), "before the installation") {
+			t.Errorf("reportUnitRollback() = %q, must not call an update a first installation", err)
 		}
 	})
 }

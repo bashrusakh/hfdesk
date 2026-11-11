@@ -27,6 +27,40 @@
 
 ### Changed
 
+- `hfdesk service status` names a masked registration by its mask kind. A persistent mask reports `State: masked` instead of `stopped` and keeps the exit code `0`; a runtime mask reports `State: masked-runtime` instead of `not-installed`, and its exit code changes from `1` to `0`, so a script that branched on the old code sees the new one.
+
+- Dataset split membership now has one documented precedence rule: a file
+  whose path places it inside a split directory belongs to that directory's
+  split, so a filter for a split its basename merely mentions never selects
+  it, whatever else the repository contains.
+
+- The rule changed what a group filter does with such a mention. A group
+  filter over a tree whose only mention of the split was inside another
+  split's directory used to fail the whole plan with the ambiguous-selection
+  error: when the tree also has a member of the filtered split, the request
+  now succeeds and the plan selects the group's own members; when it has
+  none, it fails closed with the same `no_filter_match` error a filter with
+  no matches already returns (`ErrNoFilterMatch`) instead of downloading the
+  mentioning file. The attribution of such a file follows the filter that
+  actually applies to it and no longer depends on the alphabetical order of
+  the candidate labels, so the same path shape behaves the same regardless of
+  the sibling directory's name — `test/train-part.csv` and
+  `validation/train-part.csv` now agree. The exclusion is now visible: the
+  plan and `POST /api/plan` carry a new `notices` field naming the number of
+  excluded files, the split label, the directories and up to five of the
+  excluded paths (stating how many more were left unnamed), and a download
+  job reports the same sentence as a warning — informational only, never an
+  error and never a change to the selection.
+
+- Two residual shapes remain conflicting evidence with both labels present
+  and keep the ambiguous-selection refusal, exactly as before: two
+  standard-split directories in one path (`train/test/items.parquet`) and two
+  split tokens in one basename (`train_test.csv`). A directory named for a
+  standard split wins even when it is a repository section rather than a
+  split in the repository's own sense: a file inside a `dev/`, `eval/` or
+  `test/` directory that is only a section is not selected by a filter for
+  the split its name mentions — a deliberate compromise of the heuristic.
+
 - Mirror and rebuild mutations now join the destination ownership admission end
   to end (#151): the mirror's snapshot symlink-leaf replacement takes entry
   admission and its directory creation takes admitted directory creation, and
@@ -279,6 +313,8 @@
 - A stalled admitted settings write can no longer hang the graceful service handover forever either: `CompleteHandover` drained admitted settings writes with an unbounded wait, so a write stuck on the storage blocked the handover, the desktop quit and every later launch behind the singleton the same way. The drain now shares the bounded handover-join budget with the jobs close under one deadline, which keeps the whole join inside the window the elevated helper waits in: on timeout the handover completes with an error, the desktop reports the failed shutdown and never signals success, so no service is installed or started for persistence that did not complete, and the quit finishes. The normal path still reports both persistence outcomes, settings and jobs, exactly as before.
 - A service mutation can now hold a desktop singleton object that another Windows identity owns: an elevated helper or `hfdesk service` command running as a different administrator account was refused with an access denial although the object's descriptor grants the administrators read control — and any open handle is all a hold needs, because a hold never waits on the object. The hold now falls back to opening the existing object with that read control; only an object this identity cannot open at all still refuses before the mutation, with the step that ends it. The descriptor is unchanged (the administrators keep read control only), and a desktop launch that cannot access the object still reports the other Windows identity that owns it.
 - A service mutation that starts or restarts the Windows service now refuses before its first service step while a desktop instance serves its address: `hfdesk service install`, `start` and `restart`, and the elevated helper's install/update/start actions, held the per-session desktop singleton only against a *new* desktop launch and never checked whether an already-running desktop owned the address — a registered-but-stopped service could therefore be started beside a desktop instance that serves the very same address. The refusal covers every outcome that starts or restarts the service: `start`, `restart`, a first `install`, and an `install` or a helper update over a running instance (which the installation restarts), while an `install` or update over an existing registration that is positively confirmed stopped only rewrites the registration, starts nothing and proceeds beside that desktop — a registration state that is not positively stopped fails closed. Each mutation now decides with two facts taken around its hold: the desktop's published state (only a started server publishes one, the shutdown removes it) and whether another process of the session held the singleton then (the kernel object dies with its holders, so a state file that outlived a crashed desktop never refuses). Both facts are required: a gate launch that publishes no state and a fresh hold over a stale state file proceed exactly as before, the tray handover flow is unchanged because its authorization already proves the desktop exited, and the refusal — before its first service step — names the one step that ends it: quit HFDesk from the notification-area icon and repeat the command.
+- A running download's non-fatal diagnostics are no longer dropped before the user can see them: the job state now keeps the downloader's warning events — an unpinned revision, the split-precedence plan notice, resume state that cannot be used without HTTP range support, and best-effort metadata writes that failed (a ref, friendly directory, rebuild script or manifest) — in a bounded `warnings` list holding each distinct diagnostic once (a message re-emitted by a resumed or retried attempt appears once; at most 20 entries in first-arrival order, omitted when empty), `GET /api/jobs` and `GET /api/jobs/{id}` carry it, and the jobs page renders it above the job's file line in the existing warning style. Previously every warning event was silently discarded when folded into the job state.
+- A repo-wide "resume state cannot be used without HTTP range support" condition is now reported once per download instead of once per affected file: the single warning names the count of affected files and a sorted, bounded list of their paths (at most five, the rest counted), so a stale-state condition across many files no longer fills the job's bounded warning list with near-identical per-file messages and no longer pushes other diagnostics, such as a failed manifest write, out of that list. The per-file behavior is unchanged: each affected file is still downloaded in full through the single path, and its obsolete versioned pair is still removed only after the file is durable.
 
 ## [1.3.0-beta.1] - 2026-10-15
 

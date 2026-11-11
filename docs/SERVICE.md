@@ -431,9 +431,9 @@ Every command of the service family ends with one of three exit codes:
 | `2` | The command line could not be understood: an unknown or a missing subcommand, an unknown flag, mutually exclusive scope selectors, a relative path, an unusable `--executable` or an unparsable `--listen`. |
 
 `status` uses the same codes with a narrower meaning: it exits with `0` when the
-state of the service is `running`, `stopped`, `starting` or `stopping`, and with
-`1` when the state is `not-installed`, `broken`, `failed` or `unknown`, so a
-script can branch on it.
+state of the service is `running`, `stopped`, `masked`, `masked-runtime`,
+`starting` or `stopping`, and with `1` when the state is `not-installed`,
+`broken`, `failed` or `unknown`, so a script can branch on it.
 
 The code follows the **state**, not the running fact: a registration that is
 `broken` exits with `1` even when the instance it started still runs, because the
@@ -457,6 +457,7 @@ with the same three codes.
 | `running` | The service is running. |
 | `failed` | The service failed. |
 | `broken` | Registered, but its executable is gone. The instance the supervisor started can still be running; the `Detail` says so. |
+| `masked` / `masked-runtime` | The registration is masked and cannot start until an administrator unmasks it: `masked` is the persistent mask (a link to `/dev/null` at the registration file), `masked-runtime` a mask placed with `systemctl mask --runtime`. HFDesk never removes a mask; the refusal of `install` names the unmask command of the observed kind. |
 | `unknown` | The supervisor did not report a usable state. |
 
 A registration points at an **absolute executable path**. If the binary is

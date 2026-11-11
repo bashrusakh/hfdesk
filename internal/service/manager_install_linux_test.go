@@ -1550,13 +1550,14 @@ func TestSystemdFirstInstallRefusesADropInThatOwnsTheCommand(t *testing.T) {
 		t.Fatal("Install() = nil, want the refusal of the drop-in that owns the command")
 	}
 	assertNamesWithout(t, err.Error(), "Install()", []string{
-		"the update was refused and the registration was not changed",
+		"the installation was refused and the registration was not changed",
 		dropIn,
 		`Remove the "ExecStart=" override from "` + dropIn + `"`,
 		"reload the unit files with \"systemctl --user daemon-reload\"",
 		`run "hfdesk service install" again`,
 	}, []string{
 		" or ",
+		"the update was refused",
 	})
 
 	// The refusal happened before any mutation: no unit file, no
@@ -1702,6 +1703,7 @@ func TestSystemdPreWriteScanRefusesTheDropInOverrideOnAnUpdate(t *testing.T) {
 		`run "hfdesk service install" again`,
 	}, []string{
 		" or ",
+		"the installation was refused",
 	})
 	// Before any change: the unit file kept its bytes, no directory of
 	// the instance exists, and the supervisor saw the mask read and
@@ -1849,7 +1851,7 @@ func TestSystemdUpdateThatKeepsTheMainPIDFailsVerification(t *testing.T) {
 	}
 	assertNames(t, err.Error(), "Install()", []string{
 		"kept the previous MainPID",
-		"the previous registration was restored",
+		"the previous registration and its loaded settings were restored",
 		"the previous instance was started again",
 	})
 

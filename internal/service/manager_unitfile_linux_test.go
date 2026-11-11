@@ -2080,7 +2080,7 @@ func TestSystemdReadCanonicalUnitRejectsNonCanonicalShapes(t *testing.T) {
 func TestPreWriteExecStartOverrideClassifiesTheDirectory(t *testing.T) {
 	t.Run("a missing directory proves nothing and refuses nothing", func(t *testing.T) {
 		unitPath := filepath.Join(t.TempDir(), unitName)
-		if err := preWriteExecStartOverride(unitPath, ScopeUser); err != nil {
+		if err := preWriteExecStartOverride(unitPath, ScopeUser, operationNoun(false)); err != nil {
 			t.Errorf("preWriteExecStartOverride() = %v, want nil for a missing drop-in directory", err)
 		}
 	})
@@ -2099,7 +2099,7 @@ func TestPreWriteExecStartOverrideClassifiesTheDirectory(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
 
-		err := preWriteExecStartOverride(unitPath, ScopeUser)
+		err := preWriteExecStartOverride(unitPath, ScopeUser, operationNoun(false))
 		if err == nil {
 			t.Fatal("preWriteExecStartOverride() = nil, want the refusal of the unreadable drop-in directory")
 		}
@@ -2303,7 +2303,7 @@ func TestPreWriteScanRefusesACarrierInTheUnitPathOverride(t *testing.T) {
 		t.Fatalf("write the carrier: %v", err)
 	}
 
-	err := preWriteExecStartOverride(unitPath, ScopeUser)
+	err := preWriteExecStartOverride(unitPath, ScopeUser, operationNoun(false))
 	if err == nil {
 		t.Fatal("preWriteExecStartOverride() = nil, want the refusal of the env entry's carrier")
 	}
@@ -2341,7 +2341,7 @@ func TestPreWriteScanRefusesACarrierInAGeneratorTree(t *testing.T) {
 		return []string{ownDir, generatorDropIn}
 	}
 
-	err := preWriteExecStartOverride(unitPath, ScopeUser)
+	err := preWriteExecStartOverride(unitPath, ScopeUser, operationNoun(false))
 	if err == nil {
 		t.Fatal("preWriteExecStartOverride() = nil, want the refusal of the generator tree's carrier")
 	}
@@ -2376,7 +2376,7 @@ func TestPreWriteScanCoversTheDropInSearchPath(t *testing.T) {
 		if err := os.WriteFile(otherFile, []byte("[Service]\nExecStart  =  /bin/false --other-dir\n"), 0o644); err != nil {
 			t.Fatalf("write the drop-in: %v", err)
 		}
-		err := preWriteExecStartOverride(unitPath, ScopeUser)
+		err := preWriteExecStartOverride(unitPath, ScopeUser, operationNoun(false))
 		if err == nil {
 			t.Fatal("preWriteExecStartOverride() = nil, want the refusal of the other directory's override")
 		}
@@ -2398,7 +2398,7 @@ func TestPreWriteScanCoversTheDropInSearchPath(t *testing.T) {
 		if err := os.WriteFile(ownFile, []byte("[Service]\nExecStart=/bin/true\n"), 0o644); err != nil {
 			t.Fatalf("write the own drop-in: %v", err)
 		}
-		err := preWriteExecStartOverride(unitPath, ScopeUser)
+		err := preWriteExecStartOverride(unitPath, ScopeUser, operationNoun(false))
 		if err == nil {
 			t.Fatal("preWriteExecStartOverride() = nil, want the refusal that names both files")
 		}

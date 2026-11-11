@@ -360,6 +360,70 @@ func TestSystemdStatusKeepsTheRunningFactOfABrokenRegistration(t *testing.T) {
 	}
 }
 
+// TestSystemdStatusNamesAMaskedRegistration pins the masked labels of the
+// status on both sides: a masked registration is named by its mask kind —
+// "masked" for the persistent mask (the link to /dev/null at the unit path)
+// and "masked-runtime" for a mask placed at runtime, which leaves no file
+// there — instead of being described as "stopped" or "not-installed", while
+// an ordinary registration keeps the label it always had. The status
+// describes and never refuses, so the mask raises no error.
+//
+// Every row discriminates: the want names exactly one label, so a mask row
+// that reported "stopped" or "not-installed", or an ordinary row that
+// reported a mask term, fails on the comparison.
+func TestSystemdStatusNamesAMaskedRegistration(t *testing.T) {
+	cases := []struct {
+		name string
+		// enabledState is the state of the unit the supervisor reports.
+		enabledState string
+		// maskFile replaces the unit file with the link to /dev/null of a
+		// persistent mask, and absentFile leaves no file at the unit path
+		// the way a runtime mask does.
+		maskFile   bool
+		absentFile bool
+		want       State
+	}{
+		{"a persistent mask", "masked", true, false, StateMasked},
+		{"a runtime mask", "masked-runtime", false, true, StateMaskedRuntime},
+		{"a stopped registration", "disabled", false, false, StateStopped},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			systemdRecordingSupervisor(t)
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			m := &systemdManager{scope: ScopeUser}
+			path, err := m.unitPath()
+			assertNoError(t, err, "unitPath() = %v, want nil", err)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatalf("create the unit directory: %v", err)
+			}
+			switch {
+			case tc.maskFile:
+				if err := os.Symlink(os.DevNull, path); err != nil {
+					t.Fatalf("mask the unit: %v", err)
+				}
+			case !tc.absentFile:
+				executable := systemdTestExecutable(t)
+				unit := "[Service]\nExecStart=" + systemdQuoteAlways(executable) + "\n"
+				if err := os.WriteFile(path, []byte(unit), 0o644); err != nil {
+					t.Fatalf("write the unit file: %v", err)
+				}
+				// A non-empty executable makes the fake supervisor report
+				// the unit as loaded.
+				t.Setenv("HFDESK_TEST_SYSTEMCTL_EXECUTABLE", executable)
+			}
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_ENABLED_STATE", tc.enabledState)
+			t.Setenv("HFDESK_TEST_SYSTEMCTL_ACTIVE", "inactive")
+
+			status, statusErr := m.Status(context.Background())
+			assertNoError(t, statusErr, "Status() = %v, want the description and no error for a masked registration", statusErr)
+			if status.State != tc.want {
+				t.Errorf("the state = %q, want %q (detail %q)", status.State, tc.want, status.Detail)
+			}
+		})
+	}
+}
+
 // systemdStatus registers a unit with the given arguments in a temporary
 // configuration directory and returns the status of the instance.
 //

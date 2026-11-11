@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -217,6 +218,12 @@ type Plan struct {
 	// variants require a resolved commit so their content-addressed blobs and
 	// per-commit snapshots cannot be confused with another revision.
 	CommitResolved bool `json:"commitResolved,omitempty"`
+	// Notices are bounded, informational messages about files the plan
+	// deliberately did not select — currently the split-mention files the
+	// split-precedence rule dropped for a filter naming their mentioned
+	// split. A notice never changes the plan, its items, or the download
+	// outcome, and it never replaces an error.
+	Notices []string `json:"notices,omitempty"`
 }
 
 // safeCommitName reports whether commit is a single, non-escaping path
@@ -804,6 +811,7 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 		return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
 	}
 	plan := &Plan{Items: items, Commit: commitSHA, CommitPinned: commitPinned, CommitResolved: commitResolved}
+	plan.Notices = splitMentionNotices(job, datasetMembership, fileNodes, items)
 	if forced == nil && custom && !job.BranchVariant && mode.pinned {
 		probeDeadline := time.Now().Add(addressingProbeBudget)
 		useHFCache := cfg.CacheDir != "" || cfg.OutputDir == ""
@@ -901,6 +909,131 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 		}
 	}
 	return plan, nil
+}
+
+// splitMentionNoticePathCap bounds the number of excluded paths and of
+// directories one notice names; the notice states how many more of each
+// were left unnamed instead of listing them all. Bounded, non-fatal
+// diagnostics follow the established analysis-warnings pattern: a notice
+// never changes the plan or its items.
+const splitMentionNoticePathCap = 5
+
+// splitMentionNotices reports the files a split-labelled filter did not
+// select because the split-membership precedence rule placed them in
+// another split's directory. One notice is produced per distinct filter
+// whose label these files mention, and the notice is informational only:
+// the plan, its items and the download outcome are exactly what they would
+// be without it. Each logical file — one case-folded path, first occurrence
+// winning, matching the plan's own exact/case-fold dedup — is counted and
+// named once, under the spelling the planner keeps. Paths are listed sorted
+// and bounded, so the same tree and filters always produce the same
+// notices. Files that are in the plan (selected by another filter) and
+// files the request itself excluded are never reported.
+func splitMentionNotices(job Job, membership datasetselection.Result, fileNodes []hfNode, items []PlanItem) []string {
+	if !job.IsDataset || len(job.Filters) == 0 {
+		return nil
+	}
+	// The planner treats an exact duplicate and a case-variant of a planned
+	// path as the same logical file; key plan membership by the fold so the
+	// notice's model cannot disagree with the plan's.
+	plannedFold := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		plannedFold[strings.ToLower(item.RelativePath)] = struct{}{}
+	}
+	var notices []string
+	seenLabel := make(map[string]struct{}, len(job.Filters))
+	for _, filter := range job.Filters {
+		label := strings.ToLower(strings.TrimSpace(filter))
+		if label == "" {
+			continue
+		}
+		if _, dup := seenLabel[label]; dup {
+			continue
+		}
+		seenLabel[label] = struct{}{}
+		var excluded []string
+		seenFold := make(map[string]struct{})
+		for _, e := range membership.Evidence {
+			if !containsString(e.MentionedNotMember, label) {
+				continue
+			}
+			if e.InputIndex < 0 || e.InputIndex >= len(fileNodes) {
+				continue
+			}
+			p := fileNodes[e.InputIndex].Path
+			fold := strings.ToLower(p)
+			if _, dup := seenFold[fold]; dup {
+				continue
+			}
+			seenFold[fold] = struct{}{}
+			if _, ok := plannedFold[fold]; ok {
+				continue
+			}
+			if isExcludedPath(p, job.Excludes) {
+				continue
+			}
+			excluded = append(excluded, p)
+		}
+		if len(excluded) == 0 {
+			continue
+		}
+		sort.Strings(excluded)
+		notices = append(notices, formatSplitMentionNotice(label, excluded))
+	}
+	return notices
+}
+
+// formatSplitMentionNotice renders one notice as a single readable sentence
+// carrying the number of excluded files, the split label, the directories
+// they live in, and the excluded paths — both lists bounded at
+// splitMentionNoticePathCap, with the number of unnamed entries stated.
+func formatSplitMentionNotice(label string, excluded []string) string {
+	n := len(excluded)
+	noun, mentions, lives := "files", "mention", "live"
+	if n == 1 {
+		noun, mentions, lives = "file", "mentions", "lives"
+	}
+	dirs := make([]string, 0, n)
+	seenDir := make(map[string]struct{}, n)
+	for _, p := range excluded {
+		dir := path.Dir(p) + "/"
+		if _, dup := seenDir[dir]; dup {
+			continue
+		}
+		seenDir[dir] = struct{}{}
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+	paths := excluded
+	more := ""
+	if n > splitMentionNoticePathCap {
+		paths = excluded[:splitMentionNoticePathCap]
+		more = fmt.Sprintf(", and %d more", n-splitMentionNoticePathCap)
+	}
+	shownDirs := joinWithAnd(dirs)
+	dirMore := ""
+	if extraDirs := len(dirs) - splitMentionNoticePathCap; extraDirs > 0 {
+		shownDirs = strings.Join(dirs[:splitMentionNoticePathCap], ", ")
+		dirNoun := "directories"
+		if extraDirs == 1 {
+			dirNoun = "directory"
+		}
+		dirMore = fmt.Sprintf(" (and %d more %s)", extraDirs, dirNoun)
+	}
+	return fmt.Sprintf("excluded %d %s that %s %s but %s in %s%s: %s%s",
+		n, noun, mentions, label, lives, shownDirs, dirMore, strings.Join(paths, ", "), more)
+}
+
+// joinWithAnd renders a small list as "a/", "a/ and b/", or
+// "a/, b/ and c/".
+func joinWithAnd(values []string) string {
+	switch len(values) {
+	case 0:
+		return ""
+	case 1:
+		return values[0]
+	}
+	return strings.Join(values[:len(values)-1], ", ") + " and " + values[len(values)-1]
 }
 
 func isCustomHubEndpoint(endpoint string) bool {
@@ -1620,8 +1753,10 @@ func refuseReservedLocalOwner(repo string) error {
 	return nil
 }
 
-// ScanPlan scans a repository and emits plan_item events via the progress callback.
-// This is useful for dry-run/preview functionality.
+// ScanPlan scans a repository and emits plan_item events via the progress
+// callback, preceded by warning events for the plan's notices (the same
+// warning channel Download uses). This is useful for dry-run/preview
+// functionality.
 func ScanPlan(ctx context.Context, job Job, cfg Settings, progress ProgressFunc) error {
 	plan, err := PlanRepo(ctx, job, cfg)
 	if err != nil {
@@ -1632,6 +1767,15 @@ func ScanPlan(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 		if !plan.CommitPinned {
 			progress(ProgressEvent{Time: time.Now().UTC(), Level: "warn", Event: "warning", Repo: job.Repo, Revision: job.Revision,
 				Message: "revision is not pinned to an immutable commit; the plan is revision-addressed"})
+		}
+		// Plan notices are informational diagnostics (bounded at their
+		// source, currently the split-mention exclusions of the
+		// split-precedence rule). They ride the warning channel exactly as
+		// Download emits them, before the plan_item list: they describe
+		// files that are not in the plan, so they read naturally first.
+		for _, notice := range plan.Notices {
+			progress(ProgressEvent{Time: time.Now().UTC(), Level: "warn", Event: "warning", Repo: job.Repo, Revision: job.Revision,
+				Message: notice})
 		}
 		for _, item := range plan.Items {
 			progress(ProgressEvent{

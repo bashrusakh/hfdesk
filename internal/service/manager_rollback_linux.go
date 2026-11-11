@@ -170,7 +170,7 @@ func (m *systemdManager) rollbackUnit(ctx context.Context, previous previousRegi
 	}
 	if previous.existed {
 		if !previous.loadedKnown {
-			return errors.New("the previous loaded configuration was not captured before the update")
+			return fmt.Errorf("the previous loaded configuration was not captured before the %s", operationNoun(!previous.registrationPresent()))
 		}
 		if previous.loaded.loaded && !sameSystemdLoadedConfig(loaded, previous.loaded) {
 			return errors.New("the supervisor did not load the previous command and captured launch settings")
@@ -185,7 +185,7 @@ func (m *systemdManager) rollbackUnit(ctx context.Context, previous previousRegi
 		}
 	} else {
 		if !previous.loadedKnown {
-			return errors.New("the prior loaded state was not captured before the update")
+			return fmt.Errorf("the prior loaded state was not captured before the %s", operationNoun(!previous.registrationPresent()))
 		}
 		if previous.loaded.loaded {
 			if !loaded.loaded || !sameSystemdLoadedConfig(loaded, previous.loaded) {

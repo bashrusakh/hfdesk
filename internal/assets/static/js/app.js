@@ -3278,10 +3278,18 @@ async function loadRepositoryDetails(entry) {
         </div>
       `).join('') || '<p>No files found</p>';
 
+      // Plan notices are bounded, server-owned, non-secret strings (for
+      // example split-mention files the split-precedence rule excluded);
+      // escape each one before injecting it, like every other string here.
+      const noticesHtml = (Array.isArray(data.notices) ? data.notices : [])
+        .map(n => `<div class="analysis-warning-message">${escapeHtml(n)}</div>`)
+        .join('');
+
       setModalContent(`
         <p style="margin-bottom: 16px; color: var(--color-text-secondary);">
           ${data.totalFiles} files, ${formatBytes(data.totalSize)} total
         </p>
+        ${noticesHtml ? `<div class="analysis-warning" role="status" style="margin-bottom: 16px;">${noticesHtml}</div>` : ''}
         <div class="analysis-files" style="max-height: 400px;">
           ${filesHtml}
         </div>
@@ -3442,6 +3450,7 @@ async function loadRepositoryDetails(entry) {
           <span data-role="bytes"></span>
           <span data-role="files"></span>
         </div>
+        <div class="job-warnings" data-role="warnings" style="display:none"></div>
         <div class="job-file-line" data-role="active-file" style="display:none"></div>
         <div class="job-error" data-role="error" style="display: none"></div>
     `;
@@ -3572,6 +3581,26 @@ async function loadRepositoryDetails(entry) {
     const metaVisible = revVisible || !!jobLabels.quant || !!jobLabels.mmproj;
     const metaLine = el.querySelector('.job-meta-line');
     metaLine.style.display = metaVisible ? '' : 'none';
+
+    // Warnings: the downloader's non-fatal diagnostics kept in the job's
+    // state (bounded server-side). Bounded block above the file line,
+    // reusing the analysis-warning visual language; every message is
+    // escaped like every other string here, and the block is rewritten
+    // only when the list changed so hover/click DOM stays stable between
+    // progress ticks. No warnings renders nothing.
+    const warnings = Array.isArray(job.warnings) ? job.warnings : [];
+    const warnEl = el.querySelector('[data-role="warnings"]');
+    const warnKey = JSON.stringify(warnings);
+    if ((warnEl.dataset.key || '') !== warnKey) {
+      warnEl.dataset.key = warnKey;
+      if (warnings.length) {
+        warnEl.innerHTML = `<div class="analysis-warning" role="status" style="margin-top: 10px;">${warnings.map(w => `<div class="analysis-warning-message">${escapeHtml(String(w))}</div>`).join('')}</div>`;
+        warnEl.style.display = '';
+      } else {
+        warnEl.innerHTML = '';
+        warnEl.style.display = 'none';
+      }
+    }
 
     const currentFile = activeJobFile(job);
     const fileEl = el.querySelector('[data-role="active-file"]');

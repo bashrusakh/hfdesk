@@ -1326,38 +1326,58 @@ func TestPlanRepoDatasetUnknownRootMetadataSkippedAndExplicitSelectionWorks(t *t
 }
 
 func TestPlanRepoDatasetGroupLabelPathCollisionIsMembershipOnly(t *testing.T) {
+	// The still-ambiguous fixture is the two-standard-split-directories shape:
+	// train/test/items.parquet carries both split labels, so a "train" group
+	// filter still refuses rather than guessing. The former test/train.csv
+	// fixture is no longer ambiguous — under the split-directory precedence
+	// rule its directory outranks the basename token, making it a definite
+	// test member — so the collision moved to a path whose directories name
+	// two splits, which still literally contains the "train" component that
+	// must not act as a literal selection.
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
-		{Type: "file", Path: "test/train.csv", Size: 10},
+		{Type: "file", Path: "train/test/items.parquet", Size: 10},
 	}
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
 	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
 	if plan != nil || !errors.Is(err, ErrAmbiguousSelection) {
-		t.Fatalf("PlanRepo = (%v, %v), want nil plan and fail-closed ErrAmbiguousSelection; test/train.csv is a conflicting membership, not a literal train selection", planPaths(plan), err)
+		t.Fatalf("PlanRepo = (%v, %v), want nil plan and fail-closed ErrAmbiguousSelection; train/test/items.parquet is a conflicting membership, not a literal train selection", planPaths(plan), err)
 	}
 
 	// The conflicting file is still selectable through an explicit path form.
-	plan, err = PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"test/train.csv"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	plan, err = PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train/test/items.parquet"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("explicit conflicting path PlanRepo: %v", err)
 	}
-	assertPaths(t, planPaths(plan), []string{"test/train.csv"})
+	assertPaths(t, planPaths(plan), []string{"train/test/items.parquet"})
 }
 
 func TestPlanRepoDatasetGroupCollisionCanBeResolvedByIndependentFilter(t *testing.T) {
+	// The collision needs a fixture that still refuses on its own: under the
+	// split-directory precedence rule test/train.csv is a definite test
+	// member, so the group filter alone would plan without any help from
+	// ".csv". The two-standard-split-directories shape keeps both labels, so
+	// the "train" group filter alone refuses and the independent extension
+	// filter is what turns the collision into a selection.
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
-		{Type: "file", Path: "test/train.csv", Size: 20},
+		{Type: "file", Path: "train/test/data.csv", Size: 20},
 	}
 	srv := mockHFServerForPlan(t, files)
 	defer srv.Close()
 
-	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train", ".csv"}, ExactMatch: true, AppendFilterSubdir: true}, Settings{Endpoint: srv.URL})
+	// Without the independent filter the group collision still refuses.
+	plan, err := PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train"}, ExactMatch: true}, Settings{Endpoint: srv.URL})
+	if plan != nil || !errors.Is(err, ErrAmbiguousSelection) {
+		t.Fatalf("PlanRepo(train) = (%v, %v), want nil plan and ErrAmbiguousSelection for the two-directory collision", plan, err)
+	}
+
+	plan, err = PlanRepo(context.Background(), Job{Repo: "owner/data", IsDataset: true, Filters: []string{"train", ".csv"}, ExactMatch: true, AppendFilterSubdir: true}, Settings{Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("independent extension filter should resolve group/path collision: %v", err)
 	}
-	if got, want := planPaths(plan), []string{"train.csv", "test/train.csv"}; !reflect.DeepEqual(got, want) {
+	if got, want := planPaths(plan), []string{"train.csv", "train/test/data.csv"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("paths=%v, want %v", got, want)
 	}
 	for _, item := range plan.Items {
@@ -1372,9 +1392,15 @@ func TestPlanRepoDatasetGroupCollisionCanBeResolvedByIndependentFilter(t *testin
 }
 
 func TestPlanRepoDatasetGroupCollisionWithRootCompanionRefuses(t *testing.T) {
+	// The collision keeps its full scenario — group member, colliding member
+	// and root companion — on the shape that is still ambiguous under the
+	// split-directory precedence rule: two standard-split directories in one
+	// path. The former test/train.csv colliding file is now a definite test
+	// member (its directory outranks the basename token), so it no longer
+	// creates the ambiguity this refusal test is about.
 	files := []hfNode{
 		{Type: "file", Path: "train.csv", Size: 10},
-		{Type: "file", Path: "test/train.csv", Size: 20},
+		{Type: "file", Path: "train/test/items.parquet", Size: 20},
 		{Type: "file", Path: "README.md", Size: 5},
 	}
 	srv := mockHFServerForPlan(t, files)

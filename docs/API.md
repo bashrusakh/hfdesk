@@ -772,8 +772,20 @@ response item exposes only `path`, `size`, and `lfs`; `path` is
 repository-relative. The response does not include filter-attribution or
 destination-prefix fields.
 
+Successful responses to a filtered dataset request may also carry
+`notices`, an array of informational strings that is omitted when empty. A
+notice reports files the plan deliberately did not select: when a filter
+names a standard split and the tree contains files that mention that split
+without belonging to it, one notice names how many were excluded, the split
+label, the directories they live in, and at most five of the excluded paths
+(stating how many more were left unnamed). Notices are deterministic and
+non-fatal: they never change `files`, `totalSize`, `totalFiles`, or the
+download outcome, and they never replace an error. The bundled client
+renders them in the plan preview.
+
 The public Go planning contract is broader. `hfdownloader.PlanRepo` returns a
-`*Plan` whose `Items` are `PlanItem`s; the same `Plan` value is passed to
+`*Plan` whose `Items` are `PlanItem`s and whose `Notices` carry the same
+informational strings; the same `Plan` value is passed to
 `Settings.OnPlanComplete`. A `PlanItem` also exposes `DestinationSubdir`
 (`destinationSubdir`) and `Subdir` (`subdir`). `DestinationSubdir` is the
 candidate relative prefix selected by the matched filter; it is populated
@@ -1009,6 +1021,22 @@ so other files proceed even with a low limit. Progress reports distinguish
 transfer, finalizing, completion, skipped, error, and cancellation states, and
 `file_finalizing` is emitted before the pre-publication proof. The detailed
 ownership and resume contract is in `pkg/hfdownloader/doc.go`.
+
+Job responses include `warnings`, an array of strings omitted when empty: the
+downloader's non-fatal diagnostics for the job, one entry per distinct
+message, in first-arrival order. A repeated diagnostic appears once — a
+resumed or retried attempt re-runs the plan and the downloader emits the same
+messages again, and a repeat adds no entry and consumes none of the bound. A
+warning reports a fact about the download without failing it and without
+changing the selection — for example a revision that is not pinned to an
+immutable commit, a plan notice such as a split-precedence exclusion, resume
+state that cannot be used without HTTP range support (reported once per
+download, naming the count and a bounded list of the affected files, not once
+per file), or a best-effort metadata write (a ref, friendly directory,
+rebuild script or manifest) that failed. The list is bounded: it keeps at
+most 20 distinct warnings, and once
+full a further distinct diagnostic is not added. It is distinct from
+`destinationWarning`, which the server computes once when the job is created.
 
 Cache-mode jobs include `hubDir`, the frozen exact Hub storage directory.
 A strict manual selection is exposed on the snapshot the same way as every
