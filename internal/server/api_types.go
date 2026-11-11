@@ -3,8 +3,6 @@
 
 package server
 
-import "github.com/bashrusakh/hfdesk/pkg/hfdownloader"
-
 // DownloadRequest is the request body for starting a download.
 type DownloadRequest struct {
 	Repo               string   `json:"repo"`
@@ -85,24 +83,14 @@ type PlanResponse struct {
 	Files      []PlanFile `json:"files"`
 	TotalSize  int64      `json:"totalSize"`
 	TotalFiles int        `json:"totalFiles"`
-	// Notices are informational messages about files the plan deliberately
-	// did not select (currently split-mention files the split-precedence
-	// rule dropped for a filter naming their mentioned split). Each notice
-	// is one bounded sentence naming the count, the split label, the
-	// directories, and at most five excluded paths. A notice never changes
-	// files, totalSize, or totalFiles, and it is omitted when empty.
+	// Notices are informational, bounded sentences: split-mention files the
+	// split-precedence rule dropped for a filter naming their mentioned
+	// split (naming the count, the split label, the directories and at most
+	// five excluded paths), and ineffective shard ranges (naming the whole
+	// expression or up to five ineffective spans — see shardRanges). A
+	// notice never changes files, totalSize, or totalFiles, and it is
+	// omitted when empty.
 	Notices []string `json:"notices,omitempty"`
-	// Warnings are typed, non-fatal diagnostics about requested selectors
-	// that had no effect (currently ineffective shard ranges): objects of
-	// {code, message, segments} where code is a stable string
-	// (shard_ranges_no_shards, shard_ranges_ineffective_segments today),
-	// message is a bounded sentence, and segments names the offending input
-	// segments when the warning is about specific ones. The surface is
-	// extensible: clients branch on code and treat unknown codes as
-	// informational. A warning never changes files, totalSize, totalFiles,
-	// or the download outcome, never replaces an error, and is omitted when
-	// empty.
-	Warnings []hfdownloader.PlanWarning `json:"warnings,omitempty"`
 }
 
 // PlanFile represents a file in the plan.

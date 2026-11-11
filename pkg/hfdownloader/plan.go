@@ -220,42 +220,13 @@ type Plan struct {
 	// per-commit snapshots cannot be confused with another revision.
 	CommitResolved bool `json:"commitResolved,omitempty"`
 	// Notices are bounded, informational messages about files the plan
-	// deliberately did not select — currently the split-mention files the
-	// split-precedence rule dropped for a filter naming their mentioned
-	// split. A notice never changes the plan, its items, or the download
-	// outcome, and it never replaces an error.
+	// deliberately did not select or selectors that had no effect — the
+	// split-mention files the split-precedence rule dropped for a filter
+	// naming their mentioned split, and ineffective shard ranges (named
+	// below at ShardRanges). A notice never changes the plan, its items,
+	// or the download outcome, and it never replaces an error.
 	Notices []string `json:"notices,omitempty"`
-	// Warnings are typed, non-fatal diagnostics about requested selectors
-	// that had no effect — today only ineffective shard ranges. A warning
-	// never changes the plan's items or the download outcome and never
-	// replaces an error. The slice is omitted when empty; the code set is
-	// extensible, so consumers branch on Code and treat unknown codes as
-	// informational.
-	Warnings []PlanWarning `json:"warnings,omitempty"`
 }
-
-// PlanWarning is one typed, non-fatal warning attached to a Plan. Code is a
-// stable string so clients can branch on it; Message is a bounded,
-// human-readable sentence; Segments carries the offending request input
-// slices (for example the ineffective shard-range segments) when the warning
-// is about specific segments, bounded by what the caller itself wrote.
-type PlanWarning struct {
-	Code     string   `json:"code"`
-	Message  string   `json:"message"`
-	Segments []string `json:"segments,omitempty"`
-}
-
-// Warning codes carried by PlanWarning.
-const (
-	// PlanWarningShardRangesNoShards reports that a shard-range request was
-	// made against a matched set containing no shard files at all, so the
-	// ranges narrowed nothing. Every requested segment is ineffective.
-	PlanWarningShardRangesNoShards = "shard_ranges_no_shards"
-	// PlanWarningShardRangesIneffectiveSegments reports that specific
-	// shard-range segments select no existing shard index of any matched
-	// shard family.
-	PlanWarningShardRangesIneffectiveSegments = "shard_ranges_ineffective_segments"
-)
 
 // safeCommitName reports whether commit is a single, non-escaping path
 // component. A real Hub commit is a hex SHA, but callers may also see fixture
@@ -902,8 +873,9 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 	// custom-endpoint probe walk, so only files that will actually download
 	// are probed. PlanRepo, ScanPlan and Download all reach this point
 	// through scanRepo, which keeps plan/dry-run/download parity in one
-	// owner. Notices above deliberately run on the unnarrowed set so a
-	// ranged-out shard is never misreported as split-rule-excluded.
+	// owner. Split-mention notices above deliberately run on the unnarrowed
+	// set so a ranged-out shard is never misreported as split-rule-excluded;
+	// this selector's own diagnostics append to Plan.Notices afterwards.
 	if job.ShardRanges != "" {
 		ranges, err := parseShardRanges(job.ShardRanges)
 		if err != nil {
@@ -915,7 +887,7 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 				selectedBefore++
 			}
 		}
-		narrowed, selectedKept, warnings := narrowShardRanges(plan.Items, selectedItems, ranges, job.ShardRanges)
+		narrowed, selectedKept, shardNotices := narrowShardRanges(plan.Items, selectedItems, ranges, job.ShardRanges)
 		// The zero-narrowed oracle is selection survival, never len(plan.Items):
 		// retained companions that matched nothing stay planned but can never
 		// satisfy a filtered request the ranges emptied of every selected file.
@@ -923,7 +895,11 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 			return nil, fmt.Errorf("%w: shard ranges %q excluded every matched file", ErrNoFilterMatch, job.ShardRanges)
 		}
 		plan.Items = narrowed
-		plan.Warnings = warnings
+		// Shard diagnostics join the established notices surface in
+		// first-arrival order: the split-mention notices above describe the
+		// unnarrowed set, the shard notices below describe this selector, and
+		// both ride Plan.Notices -> warning events -> Job.Warnings unchanged.
+		plan.Notices = append(plan.Notices, shardNotices...)
 	}
 	if forced == nil && custom && !job.BranchVariant && mode.pinned {
 		probeDeadline := time.Now().Add(addressingProbeBudget)
@@ -1149,10 +1125,10 @@ func joinWithAnd(values []string) string {
 	return strings.Join(values[:len(values)-1], ", ") + " and " + values[len(values)-1]
 }
 
-// shardWarningSegmentCap bounds how many segments one warning message
+// shardWarningSegmentCap bounds how many ineffective spans one notice
 // lists; the remaining count is stated instead, so the sentence never grows
-// with the caller's expression. The Segments field still carries every
-// segment, which is itself bounded by the request that wrote it.
+// with the caller's expression. The no-shards notice names the whole
+// expression instead, which is itself bounded by the request that wrote it.
 const shardWarningSegmentCap = 5
 
 // parseShardFile reports whether rel names a split artifact in the
@@ -1211,13 +1187,15 @@ func parseShardFile(rel string) (number int, family string, ok bool) {
 // therefore address POSITIONS in written-number order, not the written
 // numbers themselves (for a family whose written numbers contain gaps the
 // two differ, for complete families they coincide). Ineffective ranges
-// surface as typed warnings instead of failing: a matched set without a
-// single selected shard file warns once naming every segment, and each
-// segment selecting no existing index is named. selectedKept reports how
-// many selected items survived, so the caller fails ErrNoFilterMatch when
+// surface as plan notices instead of failing: a matched set without a
+// single selected shard file appends one notice naming the whole
+// expression, and one notice names the spans selecting no existing index
+// (bounded by shardWarningSegmentCap, the rest counted). selectedKept
+// reports how many selected items survived, so the caller fails
+// ErrNoFilterMatch when
 // ranges empty a non-empty selection even though retained companions remain
 // planned.
-func narrowShardRanges(items []PlanItem, selected []bool, ranges []shardRange, expr string) ([]PlanItem, int, []PlanWarning) {
+func narrowShardRanges(items []PlanItem, selected []bool, ranges []shardRange, expr string) ([]PlanItem, int, []string) {
 	isSelected := func(i int) bool { return i < len(selected) && selected[i] }
 	selectedTotal := 0
 	for _, flag := range selected {
@@ -1243,15 +1221,8 @@ func narrowShardRanges(items []PlanItem, selected []bool, ranges []shardRange, e
 		families[family] = append(families[family], shardMember{item: i, number: number})
 	}
 	if len(families) == 0 {
-		segments := make([]string, 0, len(ranges))
-		for _, r := range ranges {
-			segments = append(segments, r.text)
-		}
-		return items, selectedTotal, []PlanWarning{{
-			Code:     PlanWarningShardRangesNoShards,
-			Message:  fmt.Sprintf("shard ranges %q matched no shard file, so nothing was narrowed", expr),
-			Segments: segments,
-		}}
+		return items, selectedTotal, []string{fmt.Sprintf(
+			"shard ranges %q matched no shard file, so nothing was narrowed", expr)}
 	}
 	keep := make([]bool, len(items))
 	for i := range keep {
@@ -1290,13 +1261,11 @@ func narrowShardRanges(items []PlanItem, selected []bool, ranges []shardRange, e
 			ineffective = append(ineffective, r.text)
 		}
 	}
-	var warnings []PlanWarning
+	var shardNotices []string
 	if len(ineffective) > 0 {
-		warnings = append(warnings, PlanWarning{
-			Code:     PlanWarningShardRangesIneffectiveSegments,
-			Message:  fmt.Sprintf("shard range segments selected no shard (indices present: 1-%d): %s", largestFamily, joinShardSegments(ineffective)),
-			Segments: ineffective,
-		})
+		shardNotices = append(shardNotices, fmt.Sprintf(
+			"shard range segments selected no shard (indices present: 1-%d): %s",
+			largestFamily, joinShardSegments(ineffective)))
 	}
 	narrowed := make([]PlanItem, 0, len(items))
 	selectedKept := 0
@@ -1309,7 +1278,7 @@ func narrowShardRanges(items []PlanItem, selected []bool, ranges []shardRange, e
 			selectedKept++
 		}
 	}
-	return narrowed, selectedKept, warnings
+	return narrowed, selectedKept, shardNotices
 }
 
 // joinShardSegments renders ineffective segments as a bounded list: at most

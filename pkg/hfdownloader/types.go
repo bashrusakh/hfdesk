@@ -180,7 +180,7 @@ type Job struct {
 	// before any network work; ranges that empty the selection fail with
 	// ErrNoFilterMatch even when retained companion files that matched
 	// nothing remain planned, and ineffective ranges surface as
-	// Plan.Warnings instead of failing.
+	// Plan.Notices instead of failing.
 	ShardRanges string
 }
 

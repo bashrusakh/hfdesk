@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -117,21 +116,17 @@ func TestPlanRepo_ShardRangeRejectionMakesNoHubContact(t *testing.T) {
 }
 
 // TestPlanRepo_ShardRangeSelection is the plan-semantics suite: narrowing a
-// mixed set (1-based shards, 0-based companions, non-sharded files), typed
-// warnings for ineffective/no-shard requests, the zero-match error, and the
+// mixed set (1-based shards, 0-based companions, non-sharded files), notices
+// for ineffective/no-shard requests, the zero-match error, and the
 // preserved no-ranges behavior — all against the same fixture family.
 func TestPlanRepo_ShardRangeSelection(t *testing.T) {
-	type wantWarning struct {
-		code     string
-		segments []string
-	}
 	cases := []struct {
-		name     string
-		files    []hfNode
-		job      Job
-		want     []string
-		wantErr  error
-		wantWarn []wantWarning
+		name        string
+		files       []hfNode
+		job         Job
+		want        []string
+		wantErr     error
+		wantNotices []string
 	}{
 		{
 			name:  "narrowed mixed set keeps companions",
@@ -149,7 +144,7 @@ func TestPlanRepo_ShardRangeSelection(t *testing.T) {
 			},
 		},
 		{
-			name:  "ineffective segment warns and is named",
+			name:  "ineffective segment is named in a notice",
 			files: shardMixedTree(),
 			job: Job{Repo: "owner/repo", Revision: "main", Filters: []string{".safetensors"},
 				ExactMatch: true, ShardRanges: "1,9-10"},
@@ -159,15 +154,15 @@ func TestPlanRepo_ShardRangeSelection(t *testing.T) {
 				"data-00002-of-00003.parquet",
 				"model.safetensors.index.json", "config.json",
 			},
-			wantWarn: []wantWarning{{PlanWarningShardRangesIneffectiveSegments, []string{"9-10"}}},
+			wantNotices: []string{"shard range segments selected no shard (indices present: 1-4): 9-10"},
 		},
 		{
-			name:  "no shard files warn once",
+			name:  "no shard files notice names the expression",
 			files: []hfNode{{Type: "file", Path: "config.json", Size: 5}, {Type: "file", Path: "README.md", Size: 9}},
 			job: Job{Repo: "owner/repo", Revision: "main", Filters: []string{"config.json"},
 				ShardRanges: "1-5"},
-			want:     []string{"config.json", "README.md"},
-			wantWarn: []wantWarning{{PlanWarningShardRangesNoShards, []string{"1-5"}}},
+			want:        []string{"config.json", "README.md"},
+			wantNotices: []string{`shard ranges "1-5" matched no shard file, so nothing was narrowed`},
 		},
 		{
 			name: "narrowed to zero fails with no filter match",
@@ -241,14 +236,14 @@ func TestPlanRepo_ShardRangeSelection(t *testing.T) {
 		},
 		{
 			// Same gap family: positions only reach 1..3, so "4-5" selects no
-			// position and surfaces as the ineffective-segments warning while
+			// position and surfaces as the ineffective-segments notice while
 			// the selected unsharded sibling keeps the plan alive.
-			name:  "gap family out-of-position segment warns",
+			name:  "gap family out-of-position segment notices",
 			files: shardGapTree(),
 			job: Job{Repo: "owner/repo", Revision: "main", Filters: []string{".safetensors"},
 				ExactMatch: true, ShardRanges: "4-5"},
-			want:     []string{"other.safetensors", "config.json"},
-			wantWarn: []wantWarning{{PlanWarningShardRangesIneffectiveSegments, []string{"4-5"}}},
+			want:        []string{"other.safetensors", "config.json"},
+			wantNotices: []string{"shard range segments selected no shard (indices present: 1-3): 4-5"},
 		},
 		{
 			name:  "without ranges the base plan is unchanged",
@@ -281,21 +276,12 @@ func TestPlanRepo_ShardRangeSelection(t *testing.T) {
 			if got := shardPlanPaths(plan); !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("plan paths = %v, want %v", got, tc.want)
 			}
-			if plan.Notices != nil {
-				t.Errorf("model-repo plan carries notices: %v", plan.Notices)
-			}
-			if len(plan.Warnings) != len(tc.wantWarn) {
-				t.Fatalf("warnings = %+v, want %+v", plan.Warnings, tc.wantWarn)
-			}
-			for i, want := range tc.wantWarn {
-				w := plan.Warnings[i]
-				if w.Code != want.code || !reflect.DeepEqual(w.Segments, want.segments) {
-					t.Errorf("warning %d = %+v, want code=%s segments=%v", i, w, want.code, want.segments)
-				}
-				// Every warning must name its ineffective input in the message.
-				if len(want.segments) > 0 && !strings.Contains(w.Message, want.segments[0]) {
-					t.Errorf("warning message %q does not name %q", w.Message, want.segments[0])
-				}
+			// The folded surface: shard diagnostics are ordinary notices, and
+			// the model-repo fixture has no split-mention notices, so the
+			// notices must equal the expected sentences exactly — each one
+			// naming its expression or its ineffective segments.
+			if !reflect.DeepEqual(plan.Notices, tc.wantNotices) {
+				t.Errorf("notices = %q, want %q", plan.Notices, tc.wantNotices)
 			}
 		})
 	}
@@ -327,6 +313,76 @@ func TestPlanRepo_ShardRangeDatasetMembershipZeroFails(t *testing.T) {
 	if plan != nil {
 		t.Fatalf("plan returned despite ranges emptying the membership selection: %v", shardPlanPaths(plan))
 	}
+}
+
+// TestPlanRepo_StrictSelectionComposesWithShardRanges is the composition
+// case: strictFiles and shardRanges on ONE request. The exact selection is
+// narrowed by the ranges to exactly the in-range selected shards (a
+// selected non-shard companion survives), and both zero oracles hold in
+// their corners: a selected path absent from the tree still fails with
+// ErrNoFileMatch before narrowing, and ranges that empty a shard-only
+// selection fail with ErrNoFilterMatch. A selected non-shard file the
+// ranges cannot touch keeps such a request alive, because the oracle is
+// selection survival — the explicit selection, not the shard count.
+func TestPlanRepo_StrictSelectionComposesWithShardRanges(t *testing.T) {
+	srv := mockHFServerForPlan(t, shardMixedTree())
+	defer srv.Close()
+	shards := []string{
+		"model-00001-of-00004.safetensors", "model-00002-of-00004.safetensors",
+		"model-00003-of-00004.safetensors", "model-00004-of-00004.safetensors",
+	}
+	planFor := func(filters []string, ranges string) (*Plan, error) {
+		return PlanRepo(context.Background(), Job{
+			Repo: "owner/repo", Revision: "main", StrictFiles: true,
+			Filters: filters, ShardRanges: ranges,
+		}, Settings{Endpoint: srv.URL})
+	}
+
+	t.Run("ranges narrow the exact selection to the in-range shards", func(t *testing.T) {
+		plan, err := planFor(append(append([]string{}, shards...), "config.json"), "2-3")
+		if err != nil {
+			t.Fatalf("PlanRepo: %v", err)
+		}
+		want := []string{
+			"model-00002-of-00004.safetensors", "model-00003-of-00004.safetensors",
+			"config.json",
+		}
+		if got := shardPlanPaths(plan); !reflect.DeepEqual(got, want) {
+			t.Errorf("plan paths = %v, want exactly the in-range selected shards + the selected companion %v", got, want)
+		}
+		if plan.Notices != nil {
+			t.Errorf("effective ranges on a strict selection carry notices: %q", plan.Notices)
+		}
+	})
+
+	t.Run("strict zero-oracle: a missing selected path fails before narrowing", func(t *testing.T) {
+		plan, err := planFor(append(append([]string{}, shards...),
+			"model-00009-of-00004.safetensors"), "2-3")
+		if plan != nil || !errors.Is(err, ErrNoFileMatch) {
+			t.Fatalf("PlanRepo = (%v, %v), want nil plan with ErrNoFileMatch", plan, err)
+		}
+	})
+
+	t.Run("ranges zero-oracle: ranges emptying a shard-only selection fail", func(t *testing.T) {
+		plan, err := planFor(shards, "5-9")
+		if plan != nil || !errors.Is(err, ErrNoFilterMatch) {
+			t.Fatalf("PlanRepo = (%v, %v), want nil plan with ErrNoFilterMatch", plan, err)
+		}
+	})
+
+	t.Run("a selected non-shard companion survives an emptied shard subset", func(t *testing.T) {
+		plan, err := planFor(append(append([]string{}, shards...), "config.json"), "5-9")
+		if err != nil {
+			t.Fatalf("PlanRepo: %v", err)
+		}
+		if got := shardPlanPaths(plan); !reflect.DeepEqual(got, []string{"config.json"}) {
+			t.Errorf("plan paths = %v, want the selected companion alone", got)
+		}
+		want := "shard range segments selected no shard (indices present: 1-4): 5-9"
+		if !reflect.DeepEqual(plan.Notices, []string{want}) {
+			t.Errorf("notices = %q, want [%q]", plan.Notices, want)
+		}
+	})
 }
 
 // TestParseShardFile pins the recognizer behind narrowing: the family key

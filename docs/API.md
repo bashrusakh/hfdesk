@@ -773,16 +773,19 @@ response item exposes only `path`, `size`, and `lfs`; `path` is
 repository-relative. The response does not include filter-attribution or
 destination-prefix fields.
 
-Successful responses to a filtered dataset request may also carry
+Successful responses to a filtered request may also carry
 `notices`, an array of informational strings that is omitted when empty. A
 notice reports files the plan deliberately did not select: when a filter
 names a standard split and the tree contains files that mention that split
 without belonging to it, one notice names how many were excluded, the split
 label, the directories they live in, and at most five of the excluded paths
-(stating how many more were left unnamed). Notices are deterministic and
+(stating how many more were left unnamed). An ineffective shard-range
+selection adds its own notices to the same array (documented under
+`shardRanges` below). Notices are deterministic and
 non-fatal: they never change `files`, `totalSize`, `totalFiles`, or the
 download outcome, and they never replace an error. The bundled client
-renders them in the plan preview.
+renders them in the plan preview, and a download job reports the same
+sentences in its `warnings` list (documented under Job below).
 
 The public Go planning contract is broader. `hfdownloader.PlanRepo` returns a
 `*Plan` whose `Items` are `PlanItem`s and whose `Notices` carry the same
@@ -841,22 +844,21 @@ without filters — is rejected with HTTP 400 and error code
 /api/plan` and `POST /api/download` (including `dryRun: true`), so a dry run
 never accepts a request the real download rejects.
 
-Ranges never fail silently. A successful plan response can carry `warnings`,
-an array of typed objects `{"code": ..., "message": ..., "segments": [...]}`
-omitted when empty. `message` is a bounded sentence and `segments` names the
-offending input segments; two codes exist today:
+Ranges never fail silently: their diagnostics ride the established `notices`
+array defined above (a download job then reports the same sentences in its
+`warnings` list), never a separate channel. Two notices exist today:
 
-- `shard_ranges_no_shards` — the matched set contains no shard files at
-  all, so the ranges narrowed nothing; `segments` lists every requested
-  segment.
-- `shard_ranges_ineffective_segments` — specific spans select no existing
-  shard index (for example `9-10` against a four-shard family); `segments`
-  lists exactly those spans.
+- the matched set contains no shard files at all, so the ranges narrowed
+  nothing — the notice names the whole expression, for example
+  `shard ranges "1-5" matched no shard file, so nothing was narrowed`.
+- specific spans select no existing shard index (for example `9-10`
+  against a four-shard family) — the notice names exactly those spans, for
+  example `shard range segments selected no shard (indices present: 1-4):
+  9-10`. At most five spans are named; the rest are counted.
 
-Warnings are deterministic and non-fatal: they never change `files`,
+Notices are deterministic and non-fatal: they never change `files`,
 `totalSize`, `totalFiles`, or the download outcome, and they never replace
-an error. The surface is extensible — later warnings join the same array —
-so clients branch on `code` and treat unknown codes as informational.
+an error.
 
 ### Strict file selection
 
@@ -930,7 +932,8 @@ Notes:
   `GET /api/jobs` and `jobs_state.json` exposes the field as `shardRanges`,
   and the bundled Downloads view labels it on the job's chip. Planning,
   `dryRun: true` and the real download apply ranges identically; the syntax,
-  validation error code and warning codes are documented under Plan above.
+  validation error code and the notices a doomed range selection produces are
+  documented under Plan above.
 - `branchVariant` (optional) selects one whole EXL2/EXL3 branch named by
   `revision`. It is model-only and must be unfiltered: `filters` and `excludes`
   must be empty, and `appendFilterSubdir`, `localRepo`, and `dataset: true` are
@@ -1083,7 +1086,8 @@ resumed or retried attempt re-runs the plan and the downloader emits the same
 messages again, and a repeat adds no entry and consumes none of the bound. A
 warning reports a fact about the download without failing it and without
 changing the selection — for example a revision that is not pinned to an
-immutable commit, a plan notice such as a split-precedence exclusion, resume
+immutable commit, a plan notice such as a split-precedence exclusion or an
+ineffective shard range, resume
 state that cannot be used without HTTP range support (reported once per
 download, naming the count and a bounded list of the affected files, not once
 per file), or a best-effort metadata write (a ref, friendly directory,

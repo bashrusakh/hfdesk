@@ -298,7 +298,6 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		TotalSize:  totalSize,
 		TotalFiles: len(files),
 		Notices:    plan.Notices,
-		Warnings:   plan.Warnings,
 	}
 
 	writeJSON(w, http.StatusOK, resp)

@@ -197,10 +197,12 @@ inside the spans are planned. Non-shard-shaped files are unaffected and
 ranges only narrow: a selection the ranges empty fails with
 `ErrNoFilterMatch` even when retained companion files that matched nothing
 remain planned, while ineffective ranges — a matched set with no shard
-file at all, or a span selecting no existing index — become typed
-`Plan.Warnings` entries ({code, message, segments}) that never change the
-plan, its items or the download outcome, and surface in the `POST /api/plan`
-response. Shard ranges change plan selection only: resume identity,
+file at all, or a span selecting no existing index — become plan notices
+naming the whole expression or the ineffective spans; they never change the
+plan, its items or the download outcome, and surface in `Plan.Notices`, in
+the `POST /api/plan` response, on the download's warning channel, and in
+the exported `ScanPlan` preview's warning events — the same channels as the
+split-mention notice above. Shard ranges change plan selection only: resume identity,
 verification, ownership and publication semantics are unaffected.
 
 # Ownership: one destination domain
