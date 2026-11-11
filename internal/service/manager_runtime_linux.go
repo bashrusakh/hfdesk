@@ -17,7 +17,6 @@ import (
 	"math"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -88,36 +87,6 @@ func (m *systemdManager) restartVerifyWait() time.Duration {
 		return m.restartWait
 	}
 	return ShutdownBudget
-}
-
-// verifyRunningExecutable waits until the supervisor reports the expected
-// program, a stable MainPID exposes HFDesk service-run arguments, and that
-// process answers on its effective Listen address.
-//
-// systemctl show reports the configuration of the loaded unit, not the image of
-// the process that runs it, so a registration that points at the new executable
-// proves nothing while the old process still runs. The unit is of type simple,
-// so the supervisor reports it active as soon as the process was forked, and a
-// process that dies right after is active for a moment: the readiness probe
-// therefore has to answer as well. A probe that does not answer within the wait
-// fails the verification like a state that never becomes running, so the caller
-// rolls the installation back instead of reporting an update that left no
-// server behind.
-//
-// An empty executable skips only the path comparison. It does not waive the
-// requirement for a live HFDesk process. The wait is bounded by the shutdown
-// budget and the context of the installation.
-//
-// The registered command is compared program to program: the program is the
-// token at the slot of the command's shape, so a recognized "env" wrapper is
-// judged by the program it launches and never passes by its own wrapper path.
-// The supervisor's path= stays part of the comparison as the raw first word of
-// the command, which is the program of a plain command and the value a caller
-// that verifies a command by its first token (the restore of a wrapped
-// registration) passes. A command whose shape has no readable program slot
-// fails with the wrapper path named as the executable it is.
-func (m *systemdManager) verifyRunningExecutable(ctx context.Context, executable, listen, expectedVersion string) (bool, error) {
-	return m.verifyRunningExecutableWithListenSource(ctx, executable, listen, expectedVersion, false)
 }
 
 func (m *systemdManager) verifyRunningExecutableWithListenSource(ctx context.Context, executable, listen, expectedVersion string, dynamicListen bool) (bool, error) {
@@ -218,31 +187,6 @@ func (m *systemdManager) verifyRunningExecutableWithListenSource(ctx context.Con
 		case <-time.After(restartPollInterval):
 		}
 	}
-}
-
-// preflight rejects an installation the supervisor demonstrably cannot run:
-// a missing supervisor, an unusable bind address, a definite access denial, or
-// a format failure that the host's visible binary-format handlers cannot
-// resolve. Unknown executable formats are left to systemd rather than rejected
-// by this partial inspection.
-func (m *systemdManager) preflight(ctx context.Context, opts InstallOptions, account *user.User) error {
-	var (
-		accountName string
-		identity    *accessAccount
-	)
-	if m.scope == ScopeUser {
-		if current, err := user.Current(); err == nil {
-			accountName = current.Username
-		}
-		current := currentExecutableAccessIdentity()
-		identity = &current
-	} else if account != nil {
-		accountName = account.Username
-		if current, err := linuxExecutableAccessIdentity(account); err == nil {
-			identity = &current
-		}
-	}
-	return m.preflightWithContext(ctx, opts, accountName, identity, opts.Paths.StateDir)
 }
 
 func systemdWorkingDirectoryForPreflight(opts InstallOptions, existing bool, loaded systemdLoadedConfig, loadedKnown bool) string {
@@ -642,35 +586,6 @@ func binfmtMiscHandlers(directory string) binfmtMiscAvailability {
 		}
 	}
 	return binfmtMiscEmpty
-}
-
-func linuxExecutableAccessIdentity(account *user.User) (accessAccount, error) {
-	uid, err := strconv.Atoi(account.Uid)
-	if err != nil {
-		return accessAccount{}, err
-	}
-	gid, err := strconv.Atoi(account.Gid)
-	if err != nil {
-		return accessAccount{}, err
-	}
-	groupIDs, err := account.GroupIds()
-	if err != nil {
-		return accessAccount{}, err
-	}
-	identity := accessAccount{UID: uid, GID: gid, Groups: []int{gid}}
-	seen := map[int]struct{}{gid: {}}
-	for _, groupID := range groupIDs {
-		group, err := strconv.Atoi(groupID)
-		if err != nil {
-			return accessAccount{}, err
-		}
-		if _, ok := seen[group]; ok {
-			continue
-		}
-		seen[group] = struct{}{}
-		identity.Groups = append(identity.Groups, group)
-	}
-	return identity, nil
 }
 
 func currentExecutableAccessIdentity() accessAccount {

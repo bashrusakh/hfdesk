@@ -254,38 +254,6 @@ func (m *systemdManager) accountValidationOptions(ctx context.Context, requested
 // directory. The caller turns it into the guidance of the installation.
 var errNotWritable = errors.New("the service account cannot write into the directory")
 
-// checkServiceAccountAccess verifies that the account of a machine-wide
-// instance can write into the directories the user named explicitly.
-//
-// The scope defaults are not checked: the cache of a machine-wide instance
-// lives inside its own state directory, which the installation owns.
-//
-// A directory inside the state directory of the instance is not checked
-// either, as long as it does not exist yet: the installation creates the
-// state directory and grants it to the account, and the service creates the
-// directory itself below it. A directory that exists already inside the
-// state directory belongs to whoever owns it: the installation never walks
-// the tree of the state directory and never grants such a directory to the
-// account, so it is checked like every other named directory.
-//
-// The decision is made on the real location of the two paths, so a link
-// inside the state directory that points out of it is checked like any other
-// path.
-//
-// The ownership and the permissions of a named tree are never changed: the
-// installation refuses the installation and names the way to grant the
-// access.
-func (m *systemdManager) checkServiceAccountAccess(opts InstallOptions, account *user.User) error {
-	if m.scope != ScopeSystem || account == nil {
-		return nil
-	}
-	identity, err := linuxAccessAccount(account)
-	if err != nil {
-		return err
-	}
-	return m.checkServiceAccountAccessWithIdentity(opts, account.Username, &identity)
-}
-
 func (m *systemdManager) checkServiceAccountAccessWithIdentity(opts InstallOptions, accountName string, identity *accessAccount) error {
 	if m.scope != ScopeSystem {
 		return nil
@@ -340,26 +308,6 @@ func (m *systemdManager) checkServiceAccountAccessWithIdentity(opts InstallOptio
 	return nil
 }
 
-// checkDirWritableByAccount reports whether the account can write into the
-// given directory.
-//
-// The check is the effective one: the account has to create entries in the
-// directory and to reach it. A directory the account owns with the mode 0500
-// is not writable at all, because the owner has no write permission in it,
-// and a directory below a parent without the execute permission cannot be
-// reached at all.
-//
-// A directory that is missing is checked through its nearest existing
-// ancestor: the instance creates the directory it needs inside a directory
-// that has to be writable for it.
-func checkDirWritableByAccount(path string, account *user.User) error {
-	identity, err := linuxAccessAccount(account)
-	if err != nil {
-		return err
-	}
-	return checkDirWritableByIdentity(path, identity)
-}
-
 func checkDirWritableByIdentity(path string, identity accessAccount) error {
 	ok, err := accountCanUseDir(path, identity)
 	if err != nil {
@@ -369,59 +317,6 @@ func checkDirWritableByIdentity(path string, identity accessAccount) error {
 		return errNotWritable
 	}
 	return nil
-}
-
-// linuxAccessAccount returns the identity of the account an access check
-// runs for.
-//
-// The groups of the account are its primary group and the supplementary
-// groups the group database of the machine knows: a directory the account
-// reaches through a supplementary group is as usable as one it reaches
-// through its primary group.
-func linuxAccessAccount(account *user.User) (accessAccount, error) {
-	uid, err := strconv.Atoi(account.Uid)
-	if err != nil {
-		return accessAccount{}, fmt.Errorf("the user id %q of the account %q cannot be read: %w", account.Uid, account.Username, err)
-	}
-	gid, err := strconv.Atoi(account.Gid)
-	if err != nil {
-		return accessAccount{}, fmt.Errorf("the group id %q of the account %q cannot be read: %w", account.Gid, account.Username, err)
-	}
-	identity := accessAccount{UID: uid, GID: gid}
-	for _, id := range accountGroupIds(account) {
-		group, err := strconv.Atoi(id)
-		if err != nil {
-			continue
-		}
-		identity.Groups = append(identity.Groups, group)
-	}
-	return identity, nil
-}
-
-// accountGroupIds returns the ids of the groups the account belongs to.
-//
-// The primary group of the account is always one of them. The other groups
-// are read from the group database of the machine: the standard library
-// knows no membership of an account.
-func accountGroupIds(account *user.User) []string {
-	ids := []string{account.Gid}
-	content, err := os.ReadFile("/etc/group")
-	if err != nil {
-		return ids
-	}
-	for _, line := range strings.Split(string(content), "\n") {
-		fields := strings.Split(strings.TrimSpace(line), ":")
-		if len(fields) < 4 {
-			continue
-		}
-		for _, member := range strings.Split(fields[3], ",") {
-			if member == account.Username {
-				ids = append(ids, fields[2])
-				break
-			}
-		}
-	}
-	return ids
 }
 
 // instanceDir is one directory an installation owns.
@@ -493,21 +388,6 @@ func createdDirs(path string) []string {
 		missing[i], missing[j] = missing[j], missing[i]
 	}
 	return missing
-}
-
-// createdDirOrder returns the directories an installation creates, in the
-// order it creates them.
-//
-// The map holds the directories of every directory of the instance. The
-// directories of the instance are created in the order of instanceDirs (the
-// config directory, the state directory and the log directory) and from the
-// top down inside each of them, so the list is the order of the creation.
-//
-// A directory that several directories of the instance need is listed once:
-// the first directory of the instance that needed it is the one that created
-// it.
-func createdDirOrder(opts InstallOptions, created map[string][]string) []string {
-	return createdDirOrderForDirs(instanceDirs(opts), created)
 }
 
 func createdDirOrderForDirs(dirs []instanceDir, created map[string][]string) []string {
@@ -693,52 +573,6 @@ func removeCreatedDirs(dirs []string) {
 func machineDir(path string) bool {
 	clean := filepath.Clean(path)
 	return filepath.Dir(clean) == string(filepath.Separator)
-}
-
-// grantInstanceDirs grants the three directories the installation owns to
-// the account of the instance.
-//
-// A directory the installation created belongs to the account: the instance
-// writes its config file, its state and its logs there, and it runs as the
-// account. The ownership is granted with a single chown per directory: the
-// tree of a directory is never walked, and the model and the cache trees are
-// never touched.
-//
-// A directory that existed before the installation belongs to whoever owns
-// it, so it is not chowned. The account still has to be able to write there,
-// and the installation refuses to go on when it cannot.
-//
-// A directory of the machine is refused: the directory of the config file is
-// derived from the path of a file, so a config file in /etc would hand /etc
-// itself to the account of the instance.
-//
-// Every refusal happens before the first ownership is changed, so a refused
-// installation leaves every ownership as it was.
-//
-// The created map holds the directories the installation creates for every
-// directory of the instance. It is read before the directories are created,
-// so the installation knows which of them it owns.
-func (m *systemdManager) grantInstanceDirs(opts InstallOptions, account *user.User, created map[string][]string) error {
-	return m.grantInstanceDirsForDirs(opts, account, created, instanceDirs(opts))
-}
-
-func (m *systemdManager) grantInstanceDirsForDirs(opts InstallOptions, account *user.User, created map[string][]string, dirs []instanceDir) error {
-	if m.scope != ScopeSystem {
-		return nil
-	}
-	if account == nil {
-		return m.grantInstanceDirsForDirsWithIdentity(opts, systemdInstallIdentity{accountName: "the native service identity"}, created, dirs)
-	}
-	owner, err := linuxSystemdOwnershipIdentity(account, account.Gid)
-	if err != nil {
-		return err
-	}
-	access, accessErr := linuxAccessAccount(account)
-	identity := systemdInstallIdentity{accountName: account.Username, owner: &owner}
-	if accessErr == nil {
-		identity.access = &access
-	}
-	return m.grantInstanceDirsForDirsWithIdentity(opts, identity, created, dirs)
 }
 
 func (m *systemdManager) grantInstanceDirsForDirsWithIdentity(opts InstallOptions, identity systemdInstallIdentity, created map[string][]string, dirs []instanceDir) error {

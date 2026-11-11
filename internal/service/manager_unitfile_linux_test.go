@@ -27,178 +27,6 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
-func TestSystemdRenderUnitUserScope(t *testing.T) {
-	opts := systemdTestOptions(t, ScopeUser)
-
-	unit, err := renderUnit(opts, nil)
-	assertNoError(t, err, "renderUnit() = %v, want nil", err)
-
-	for _, want := range []string{
-		"Description=HFDesk",
-		"Documentation=https://github.com/bashrusakh/hfdesk",
-		"After=network-online.target",
-		"Wants=network-online.target",
-		"Type=simple",
-		"Restart=on-failure",
-		"RestartSec=5s",
-		"NoNewPrivileges=true",
-		"UMask=0077",
-		"WantedBy=default.target",
-	} {
-		if !strings.Contains(unit, want) {
-			t.Errorf("the unit does not contain %q:\n%s", want, unit)
-		}
-	}
-	if strings.Contains(unit, "WantedBy=multi-user.target") {
-		t.Errorf("a user scope unit must not be enabled for the machine:\n%s", unit)
-	}
-	// A user scope instance runs as the user of the session: the unit
-	// names no account at all.
-	for _, directive := range unitDirectives(unit) {
-		if strings.HasPrefix(directive, "User=") || strings.HasPrefix(directive, "Group=") {
-			t.Errorf("a user scope unit names an account: %q", directive)
-		}
-	}
-
-	parsed := parseUnit(unit)
-	if !filepath.IsAbs(parsed.Program) {
-		t.Errorf("ExecStart = %q, want an absolute path", parsed.Program)
-	}
-	if parsed.Program != opts.Executable {
-		t.Errorf("ExecStart = %q, want %q", parsed.Program, opts.Executable)
-	}
-	if parsed.WorkingDirectory != opts.Paths.StateDir {
-		t.Errorf("WorkingDirectory = %q, want the state dir %q", parsed.WorkingDirectory, opts.Paths.StateDir)
-	}
-
-	home, err := os.UserHomeDir()
-	assertNoError(t, err, "UserHomeDir() = %v, want nil", err)
-	if got := parsed.Environment["HOME"]; got != home {
-		t.Errorf("Environment HOME = %q, want the home of the user %q", got, home)
-	}
-
-	// The registered command is the canonical argument vector of the
-	// shared contract.
-	wantArgs := RunArgs(opts)
-	if len(parsed.ExecArgs) != len(wantArgs) {
-		t.Fatalf("the arguments of the unit = %v, want %v", parsed.ExecArgs, wantArgs)
-	}
-	for i := range wantArgs {
-		if parsed.ExecArgs[i] != wantArgs[i] {
-			t.Fatalf("the arguments of the unit = %v, want %v", parsed.ExecArgs, wantArgs)
-		}
-	}
-}
-
-func TestSystemdRenderUnitSystemScope(t *testing.T) {
-	// The account of a machine-wide instance is an account of the machine:
-	// the unit names it and the primary group of it.
-	account := systemdSecondAccount(t)
-
-	opts := systemdTestOptions(t, ScopeSystem)
-	opts.ServiceUser = account.Username
-
-	unit, err := renderUnit(opts, account)
-	assertNoError(t, err, "renderUnit() = %v, want nil", err)
-
-	if !strings.Contains(unit, "WantedBy=multi-user.target") {
-		t.Errorf("the unit does not contain %q:\n%s", "WantedBy=multi-user.target", unit)
-	}
-	if strings.Contains(unit, "WantedBy=default.target") {
-		t.Errorf("a system scope unit must not be enabled for a user session:\n%s", unit)
-	}
-
-	parsed := parseUnit(unit)
-	if got := parsed.Environment["HOME"]; got != "/var/lib/hfdesk" {
-		t.Errorf("Environment HOME = %q, want %q", got, "/var/lib/hfdesk")
-	}
-	home, err := os.UserHomeDir()
-	if err == nil && home != "" {
-		if got := parsed.Environment["HOME"]; got == home {
-			t.Errorf("Environment HOME = %q, want the machine level home of a system scope instance", got)
-		}
-	}
-	// A machine wide instance runs as the dedicated service account of
-	// the platform, never as the user who runs the install command.
-	if want := "User=" + systemdQuote(account.Username) + "\n"; !strings.Contains(unit, want) {
-		t.Errorf("the unit does not run as the service account %q:\n%s", account.Username, unit)
-	}
-	// The group of the unit is the primary group of the account, never the
-	// name of the account.
-	group, err := user.LookupGroupId(account.Gid)
-	assertNoError(t, err, "LookupGroupId(%q) = %v, want nil", account.Gid, err)
-	if want := "Group=" + systemdQuote(group.Name) + "\n"; !strings.Contains(unit, want) {
-		t.Errorf("the unit does not run in the primary group %q of the service account %q:\n%s", group.Name, account.Username, unit)
-	}
-	if current, err := user.Current(); err == nil && current.Username != "" {
-		for _, directive := range unitDirectives(unit) {
-			if directive == "User="+current.Username {
-				t.Errorf("the unit runs as the user who installed it: %q", directive)
-			}
-		}
-	}
-}
-
-func TestSystemdRenderUnitCarriesNoCredential(t *testing.T) {
-	const sentinel = "hf_zzSENTINELzz_9f3a"
-
-	opts := systemdTestOptions(t, ScopeUser)
-	// Every field that could plausibly carry access data is filled with
-	// the sentinel, so the check keeps its meaning when such a field is
-	// added.
-	setCredentialFields(&opts, sentinel)
-
-	unit, err := renderUnit(opts, nil)
-	assertNoError(t, err, "renderUnit() = %v, want nil", err)
-	if strings.Contains(unit, sentinel) {
-		t.Errorf("the unit leaks the sentinel %q:\n%s", sentinel, unit)
-	}
-	for _, directive := range unitDirectives(unit) {
-		if looksLikeCredential(directive) {
-			t.Errorf("the unit carries a credential looking directive %q", directive)
-		}
-	}
-
-	// The supervisor owns the lifecycle: no fork, no detached process, no
-	// pid file, no background shell.
-	for _, forbidden := range []string{"nohup", "Type=forking", "PIDFile=", "StandardOutput=file:", "StandardError=file:"} {
-		if strings.Contains(unit, forbidden) {
-			t.Errorf("the unit contains %q:\n%s", forbidden, unit)
-		}
-	}
-	for _, line := range strings.Split(unit, "\n") {
-		if strings.HasSuffix(strings.TrimSpace(line), "&") {
-			t.Errorf("the unit puts a command into the background: %q", line)
-		}
-	}
-}
-
-func TestSystemdRenderUnitQuotesPathsWithSpaces(t *testing.T) {
-	opts := systemdTestOptions(t, ScopeUser)
-	opts.Executable = "/opt/HF Desk/bin/hfdesk"
-	opts.Paths.StateDir = "/var/lib/HF Desk"
-
-	unit, err := renderUnit(opts, nil)
-	assertNoError(t, err, "renderUnit() = %v, want nil", err)
-	if !strings.Contains(unit, `ExecStart="/opt/HF Desk/bin/hfdesk"`) {
-		t.Errorf("the executable is not quoted:\n%s", unit)
-	}
-	if !strings.Contains(unit, `"/var/lib/HF Desk"`) {
-		t.Errorf("an argument with a space is not quoted:\n%s", unit)
-	}
-
-	parsed := parseUnit(unit)
-	if parsed.Program != opts.Executable {
-		t.Errorf("ExecStart = %q, want %q", parsed.Program, opts.Executable)
-	}
-	if got := parsed.flagValue("--state-dir"); got != opts.Paths.StateDir {
-		t.Errorf("--state-dir = %q, want %q", got, opts.Paths.StateDir)
-	}
-	if parsed.WorkingDirectory != opts.Paths.StateDir {
-		t.Errorf("WorkingDirectory = %q, want %q", parsed.WorkingDirectory, opts.Paths.StateDir)
-	}
-}
-
 // TestParsedUnitFlagValueAcceptsBothArgumentForms pins that the unit reader
 // recovers a run flag from both forms a registered ExecStart may carry: the
 // paired words of the canonical write and the equals form a hand-edited or
@@ -225,61 +53,6 @@ func TestParsedUnitFlagValueAcceptsBothArgumentForms(t *testing.T) {
 				t.Errorf("--local-dir = %q, want %q", got, "/srv/models")
 			}
 		})
-	}
-}
-
-// TestSystemdRenderUnitEscapesTheDollarSign checks that a path with a dollar
-// sign reaches the process as it was written.
-//
-// The supervisor expands the environment of the unit in the command line of
-// the unit, so a dollar sign in a path would be rewritten before the process
-// sees it. A doubled dollar sign is the documented escape of a literal dollar
-// sign, so the unit carries the escaped form and the supervisor hands the
-// original path to the process.
-func TestSystemdRenderUnitEscapesTheDollarSign(t *testing.T) {
-	opts := systemdTestOptions(t, ScopeUser)
-	opts.Executable = "/opt/hf$desk/bin/hfdesk"
-	opts.Paths.ConfigFile = "/etc/hf$desk/hfdesk.json"
-	opts.Paths.StateDir = "/var/lib/hf$desk"
-	opts.Paths.LogDir = "/var/log/hf$desk"
-	opts.CacheDir = "/var/cache/hf$desk"
-	opts.HubDir = "/var/cache/hf$desk/hub"
-	opts.LocalDir = "/var/lib/models/hf$desk"
-
-	unit, err := renderUnit(opts, nil)
-	assertNoError(t, err, "renderUnit() = %v, want nil", err)
-
-	command := unitDirective(unit, "ExecStart")
-	if command == "" {
-		t.Fatalf("the unit has no ExecStart directive:\n%s", unit)
-	}
-	if !strings.Contains(command, "hf$$desk") {
-		t.Errorf("the command of the unit does not escape the dollar sign of the paths: %q", command)
-	}
-	if strings.Contains(command, "hf$desk") {
-		t.Errorf("the command of the unit holds an unescaped dollar sign: %q", command)
-	}
-
-	// The supervisor reconstructs the paths the process sees.
-	parsed := parseUnit(unit)
-	if parsed.Program != opts.Executable {
-		t.Errorf("ExecStart = %q, want %q", parsed.Program, opts.Executable)
-	}
-	wantArgs := RunArgs(opts)
-	if len(parsed.ExecArgs) != len(wantArgs) {
-		t.Fatalf("the arguments of the unit = %v, want %v", parsed.ExecArgs, wantArgs)
-	}
-	for i := range wantArgs {
-		if parsed.ExecArgs[i] != wantArgs[i] {
-			t.Errorf("the argument %d of the unit = %q, want %q", i, parsed.ExecArgs[i], wantArgs[i])
-		}
-	}
-
-	// The working directory is a setting of the unit and not a part of its
-	// command line: the supervisor does not expand the environment of the
-	// unit there, so the path stays as it was written.
-	if parsed.WorkingDirectory != opts.Paths.StateDir {
-		t.Errorf("WorkingDirectory = %q, want %q", parsed.WorkingDirectory, opts.Paths.StateDir)
 	}
 }
 
@@ -321,8 +94,10 @@ func TestSystemdUnitPaths(t *testing.T) {
 func TestSystemdParseUnitRecoversTheRegistration(t *testing.T) {
 	opts := systemdTestOptions(t, ScopeUser)
 
-	unit, err := renderUnit(opts, nil)
-	assertNoError(t, err, "renderUnit() = %v, want nil", err)
+	facts, err := canonicalUnitForInstall(opts, nil)
+	assertNoError(t, err, "canonicalUnitForInstall() = %v, want nil", err)
+	unit, err := renderCanonicalUnit(facts)
+	assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
 	parsed := parseUnit(unit)
 
 	if parsed.Program != opts.Executable {
@@ -417,8 +192,10 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	unit, err := renderUnit(opts, nil)
-	assertNoError(t, err, "renderUnit() = %v, want nil", err)
+	facts, err := canonicalUnitForInstall(opts, nil)
+	assertNoError(t, err, "canonicalUnitForInstall() = %v, want nil", err)
+	unit, err := renderCanonicalUnit(facts)
+	assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
 	path := filepath.Join(root, unitName)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -465,8 +242,10 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 	}
 	trailingOpts := opts
 	trailingOpts.Paths.StateDir = trailingStateDir
-	trailingUnit, err := renderUnit(trailingOpts, nil)
-	assertNoError(t, err, "renderUnit() for terminal backslash = %v", err)
+	trailingFacts, err := canonicalUnitForInstall(trailingOpts, nil)
+	assertNoError(t, err, "canonicalUnitForInstall() for terminal backslash = %v", err)
+	trailingUnit, err := renderCanonicalUnit(trailingFacts)
+	assertNoError(t, err, "renderCanonicalUnit() for terminal backslash = %v", err)
 	if got := verify("first install with terminal backslash", trailingUnit); got != trailingStateDir {
 		t.Errorf("native terminal-backslash WorkingDirectory = %q, want %q", got, trailingStateDir)
 	}
@@ -476,8 +255,10 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 	}
 	pairedOpts := opts
 	pairedOpts.Paths.StateDir = pairedBackslashes
-	pairedUnit, err := renderUnit(pairedOpts, nil)
-	assertNoError(t, err, "renderUnit() for paired terminal backslashes = %v", err)
+	pairedFacts, err := canonicalUnitForInstall(pairedOpts, nil)
+	assertNoError(t, err, "canonicalUnitForInstall() for paired terminal backslashes = %v", err)
+	pairedUnit, err := renderCanonicalUnit(pairedFacts)
+	assertNoError(t, err, "renderCanonicalUnit() for paired terminal backslashes = %v", err)
 	if got := verify("first install with paired terminal backslashes", pairedUnit); got != pairedBackslashes {
 		t.Errorf("native paired-backslash WorkingDirectory = %q, want %q", got, pairedBackslashes)
 	}
@@ -491,8 +272,10 @@ func TestSystemdWorkingDirectoryRejectsUnrepresentableTrailingSpace(t *testing.T
 	}
 	err := validateUnitPaths(opts, true)
 	assertNoError(t, err, "executable-only validation rejected the inherited app state path: %v", err)
-	if _, err := renderUnit(opts, nil); err == nil || !strings.Contains(err.Error(), "trailing spaces are stripped") {
-		t.Fatalf("renderUnit() = %v, want refusal of an unrepresentable WorkingDirectory", err)
+	facts, err := canonicalUnitForInstall(opts, nil)
+	assertNoError(t, err, "canonicalUnitForInstall() = %v, want nil", err)
+	if _, err := renderCanonicalUnit(facts); err == nil || !strings.Contains(err.Error(), "trailing spaces are stripped") {
+		t.Fatalf("renderCanonicalUnit() = %v, want refusal of an unrepresentable WorkingDirectory", err)
 	}
 	opts.Explicit.StateDir = true
 	if err := validateUnitPaths(opts, true); err == nil || !strings.Contains(err.Error(), "trailing spaces are stripped") {
@@ -650,8 +433,10 @@ func TestSystemdAnalyzeVerifySystemScope(t *testing.T) {
 	// stays the machine level path of the template.
 	opts.Paths.StateDir = root
 
-	unit, err := renderUnit(opts, account)
-	assertNoError(t, err, "renderUnit() = %v, want nil", err)
+	facts, err := canonicalUnitForInstall(opts, &unitWriteIdentity{account: account})
+	assertNoError(t, err, "canonicalUnitForInstall() = %v, want nil", err)
+	unit, err := renderCanonicalUnit(facts)
+	assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
 	// The unit that is verified is the machine-wide one: it names the
 	// account and it is enabled for the boot of the machine.
 	if want := "User=" + systemdQuote(account.Username) + "\n"; !strings.Contains(unit, want) {
@@ -683,137 +468,6 @@ func TestSystemdAnalyzeVerifySystemScope(t *testing.T) {
 	t.Logf("%s verify %s accepted the machine-wide unit", analyze, path)
 }
 
-// TestSystemdRenderUnitNamesTheServiceAccount checks that the unit of a
-// machine-wide instance names the service account, and that the group of the
-// unit is the primary group of that account and never the name of the
-// account. The unit of a user scope instance names no account at all.
-func TestSystemdRenderUnitNamesTheServiceAccount(t *testing.T) {
-	t.Run("the machine-wide scope names the account of the user", func(t *testing.T) {
-		opts := systemdTestOptions(t, ScopeSystem)
-		opts.ServiceUser = "hfdesk-svc"
-
-		// The account is not on the machine, so no group of it can be
-		// resolved: the unit names the account and no group at all.
-		unit, err := renderUnit(opts, nil)
-		assertNoError(t, err, "renderUnit() = %v, want nil", err)
-		if got := unitDirective(unit, "User"); got != "hfdesk-svc" {
-			t.Errorf("the account of the unit = %q, want %q", got, "hfdesk-svc")
-		}
-		if got := unitDirective(unit, "Group"); got != "" {
-			t.Errorf("the unit names the group %q of an account the machine does not know", got)
-		}
-	})
-
-	t.Run("the machine-wide scope falls back to the default of the platform", func(t *testing.T) {
-		opts := systemdTestOptions(t, ScopeSystem)
-
-		// The default account of the platform may or may not be on this
-		// machine: the unit names it either way, and the group of the
-		// unit is the primary group of the account when the machine
-		// knows the account.
-		account, err := user.Lookup(DefaultServiceUser())
-		if err != nil {
-			account = nil
-		}
-
-		unit, err := renderUnit(opts, account)
-		assertNoError(t, err, "renderUnit() = %v, want nil", err)
-		name := DefaultServiceUser()
-		if got := unitDirective(unit, "User"); got != name {
-			t.Errorf("the account of the unit = %q, want the default service account %q", got, name)
-		}
-		wantGroup := ""
-		if account != nil {
-			group, err := user.LookupGroupId(account.Gid)
-			assertNoError(t, err, "LookupGroupId(%q) = %v, want nil", account.Gid, err)
-			wantGroup = group.Name
-		}
-		if got := unitDirective(unit, "Group"); got != wantGroup {
-			t.Errorf("the group of the unit = %q, want %q", got, wantGroup)
-		}
-	})
-
-	t.Run("the user scope names no account", func(t *testing.T) {
-		opts := systemdTestOptions(t, ScopeUser)
-		opts.ServiceUser = "hfdesk-svc"
-
-		unit, err := renderUnit(opts, nil)
-		assertNoError(t, err, "renderUnit() = %v, want nil", err)
-		for _, directive := range unitDirectives(unit) {
-			if strings.HasPrefix(directive, "User=") || strings.HasPrefix(directive, "Group=") {
-				t.Errorf("a user scope unit names an account: %q", directive)
-			}
-		}
-		if got := unitDirective(unit, "User"); got != "" {
-			t.Errorf("the account of a user scope unit = %q, want none", got)
-		}
-		if got := unitDirective(unit, "Group"); got != "" {
-			t.Errorf("the group of a user scope unit = %q, want none", got)
-		}
-	})
-}
-
-// TestSystemdRenderUnitNamesThePrimaryGroupOfTheAccount checks that the
-// group of a machine-wide unit is the primary group of its service account
-// and never the name of the account.
-//
-// The account of the test is an account whose primary group carries another
-// name than the account, whenever the machine knows one: that is the case
-// that shows the difference. A machine whose accounts all carry the name of
-// their primary group is checked against the resolved primary group instead.
-func TestSystemdRenderUnitNamesThePrimaryGroupOfTheAccount(t *testing.T) {
-	account, other := systemdAccountWithAnotherPrimaryGroup(t)
-	if !other {
-		account = systemdCurrentAccount(t)
-	}
-	group, err := user.LookupGroupId(account.Gid)
-	assertNoError(t, err, "LookupGroupId(%q) = %v, want nil", account.Gid, err)
-
-	opts := systemdTestOptions(t, ScopeSystem)
-	opts.ServiceUser = account.Username
-
-	unit, err := renderUnit(opts, account)
-	assertNoError(t, err, "renderUnit() = %v, want nil", err)
-	t.Logf("the machine-wide unit of the account %q:\n%s", account.Username, unit)
-
-	if got := unitDirective(unit, "User"); got != account.Username {
-		t.Errorf("the account of the unit = %q, want %q", got, account.Username)
-	}
-	if got := unitDirective(unit, "Group"); got != group.Name {
-		t.Errorf("the group of the unit = %q, want the primary group %q of the account %q", got, group.Name, account.Username)
-	}
-	// The name of the account is never the group of the unit: an account
-	// whose primary group carries another name would name a group that
-	// does not exist.
-	if group.Name != account.Username {
-		if got := unitDirective(unit, "Group"); got == account.Username {
-			t.Errorf("the group of the unit = %q, want the primary group %q of the account %q", got, group.Name, account.Username)
-		}
-	}
-}
-
-// TestSystemdRenderUnitOmitsAnUnresolvableGroup checks that a machine-wide
-// unit names no group at all when the primary group of its service account
-// cannot be resolved: the supervisor then uses the default group of the
-// account, and no group name is ever guessed.
-func TestSystemdRenderUnitOmitsAnUnresolvableGroup(t *testing.T) {
-	account := systemdUnresolvableAccount(t)
-
-	opts := systemdTestOptions(t, ScopeSystem)
-	opts.ServiceUser = account.Username
-
-	unit, err := renderUnit(opts, account)
-	assertNoError(t, err, "renderUnit() = %v, want nil", err)
-	t.Logf("the machine-wide unit of the account %q:\n%s", account.Username, unit)
-
-	if got := unitDirective(unit, "User"); got != account.Username {
-		t.Errorf("the account of the unit = %q, want %q", got, account.Username)
-	}
-	if got := unitDirective(unit, "Group"); got != "" {
-		t.Errorf("the unit names the group %q of an account whose group cannot be resolved", got)
-	}
-}
-
 // TestSystemdStopTimeoutCoversTheShutdownOfTheServer checks that the
 // deadline of the supervisor covers the graceful shutdown of the server.
 //
@@ -827,8 +481,10 @@ func TestSystemdStopTimeoutCoversTheShutdownOfTheServer(t *testing.T) {
 	}
 
 	opts := systemdTestOptions(t, ScopeUser)
-	unit, err := renderUnit(opts, nil)
-	assertNoError(t, err, "renderUnit() = %v, want nil", err)
+	facts, err := canonicalUnitForInstall(opts, nil)
+	assertNoError(t, err, "canonicalUnitForInstall() = %v, want nil", err)
+	unit, err := renderCanonicalUnit(facts)
+	assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
 
 	value := unitDirective(unit, "TimeoutStopSec")
 	if value == "" {

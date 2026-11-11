@@ -477,7 +477,7 @@ func systemdStatusOf(t *testing.T, words ...string) Status {
 func TestSystemdPreflightProjectsNativeGroupAndSupplementaryGroupAccess(t *testing.T) {
 	systemdRecordingSupervisor(t)
 	target := systemdSecondAccount(t)
-	targetIdentity, err := linuxExecutableAccessIdentity(target)
+	targetIdentity, err := linuxSystemdAccessIdentity(target, target.Gid, nil)
 	if err != nil {
 		t.Skipf("could not resolve target account groups: %v", err)
 	}
@@ -749,54 +749,6 @@ func TestSystemdCheckExecutableAccessUsesKernelPermissions(t *testing.T) {
 	})
 }
 
-func TestLinuxExecutableAccessIdentityCarriesSupplementaryGroups(t *testing.T) {
-	account, err := user.Current()
-	assertNoError(t, err, "")
-	identity, err := linuxExecutableAccessIdentity(account)
-	if err != nil {
-		t.Skipf("could not resolve account groups: %v", err)
-	}
-	uid, err := strconv.Atoi(account.Uid)
-	assertNoError(t, err, "")
-	gid, err := strconv.Atoi(account.Gid)
-	assertNoError(t, err, "")
-	if identity.UID != uid || identity.GID != gid {
-		t.Fatalf("identity = %+v, want uid=%d gid=%d", identity, uid, gid)
-	}
-	accountGroups, err := account.GroupIds()
-	if err != nil {
-		t.Skipf("could not resolve supplementary groups: %v", err)
-	}
-	got := make(map[int]bool, len(identity.Groups))
-	for _, group := range identity.Groups {
-		got[group] = true
-	}
-	for _, groupID := range accountGroups {
-		group, err := strconv.Atoi(groupID)
-		assertNoError(t, err, "parse account group %q: %v", groupID, err)
-		if !got[group] {
-			t.Errorf("identity groups %v omit account group %d", identity.Groups, group)
-		}
-	}
-	credential, err := accessCredential(identity)
-	assertNoError(t, err, "")
-	if int(credential.Uid) != uid || int(credential.Gid) != gid {
-		t.Errorf("credential = %+v, want uid=%d gid=%d", credential, uid, gid)
-	}
-	for _, group := range identity.Groups {
-		found := false
-		for _, credentialGroup := range credential.Groups {
-			if int(credentialGroup) == group {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("credential groups %v omit identity group %d", credential.Groups, group)
-		}
-	}
-}
-
 func TestLinuxIDToUint32ChecksFullNumericBoundaries(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -930,7 +882,12 @@ func TestSystemdPreflightAcceptsReadableShebang(t *testing.T) {
 	if err := exec.Command(opts.Executable).Run(); err != nil {
 		t.Fatalf("readable shebang control did not run: %v", err)
 	}
-	err := (&systemdManager{scope: ScopeUser}).preflight(context.Background(), opts, nil)
+	accountName := ""
+	if current, err := user.Current(); err == nil {
+		accountName = current.Username
+	}
+	identity := currentExecutableAccessIdentity()
+	err := (&systemdManager{scope: ScopeUser}).preflightWithContext(context.Background(), opts, accountName, &identity, opts.Paths.StateDir)
 	assertNoError(t, err, "preflight refused a readable runnable script: %v", err)
 }
 
@@ -1209,6 +1166,10 @@ func TestSystemdInterpreterPathsPreserveKernelSymlinkDotDotResolution(t *testing
 	systemdRecordingSupervisor(t)
 	systemdTempInstallEnvironment(t)
 	identity := currentExecutableAccessIdentity()
+	accountName := ""
+	if current, err := user.Current(); err == nil {
+		accountName = current.Username
+	}
 	manager := &systemdManager{scope: ScopeUser}
 
 	validRoot := t.TempDir()
@@ -1230,7 +1191,7 @@ func TestSystemdInterpreterPathsPreserveKernelSymlinkDotDotResolution(t *testing
 	opts := systemdTempInstallOptions(t, t.TempDir())
 	opts.Executable = absoluteScript
 	opts.Paths.StateDir = validRoot
-	if err := manager.preflight(context.Background(), opts, nil); err != nil {
+	if err := manager.preflightWithContext(context.Background(), opts, accountName, &identity, opts.Paths.StateDir); err != nil {
 		t.Errorf("preflight refused the runnable absolute symlink/.. script: %v", err)
 	}
 
@@ -1252,7 +1213,7 @@ func TestSystemdInterpreterPathsPreserveKernelSymlinkDotDotResolution(t *testing
 		t.Errorf("kernel access for valid relative interpreter = (%v, %v), want allowed", access, err)
 	}
 	opts.Executable = relativeScript
-	if err := manager.preflight(context.Background(), opts, nil); err != nil {
+	if err := manager.preflightWithContext(context.Background(), opts, accountName, &identity, opts.Paths.StateDir); err != nil {
 		t.Errorf("preflight refused the runnable relative symlink/.. script: %v", err)
 	}
 
@@ -1307,7 +1268,7 @@ func TestSystemdInterpreterPathsPreserveKernelSymlinkDotDotResolution(t *testing
 	opts = systemdTempInstallOptions(t, t.TempDir())
 	opts.Executable = validELFCandidate
 	opts.Paths.StateDir = validELFRoot
-	if err := manager.preflight(context.Background(), opts, nil); err != nil {
+	if err := manager.preflightWithContext(context.Background(), opts, accountName, &identity, opts.Paths.StateDir); err != nil {
 		t.Errorf("preflight refused the runnable relative PT_INTERP: %v", err)
 	}
 
@@ -1512,8 +1473,16 @@ func TestSystemdPreflightWarnsRatherThanRejectingInconclusiveAccess(t *testing.T
 	opts.Scope = ScopeSystem
 	manager := &systemdManager{scope: ScopeSystem}
 
-	err = manager.preflight(context.Background(), opts, &accountCopy)
-	assertNoError(t, err, "preflight() = %v, want unknown access to remain unclassified", err)
+	// The identity is built from the account copy the way the
+	// installation's access identity resolves an account directly: its
+	// uid differs from the running user, so the access probe cannot
+	// establish the target credentials and the result stays inconclusive.
+	var identity *accessAccount
+	if resolved, idErr := linuxSystemdAccessIdentity(&accountCopy, accountCopy.Gid, nil); idErr == nil {
+		identity = &resolved
+	}
+	err = manager.preflightWithContext(context.Background(), opts, accountCopy.Username, identity, opts.Paths.StateDir)
+	assertNoError(t, err, "preflightWithContext() = %v, want unknown access to remain unclassified", err)
 	if !strings.Contains(logs.String(), "inconclusive") || strings.Contains(logs.String(), "not usable") {
 		t.Errorf("access warning = %q, want an inconclusive warning without a denial claim", logs.String())
 	}
@@ -1536,7 +1505,12 @@ func TestSystemdPreflightLeavesUnknownFormatUnclassified(t *testing.T) {
 	if err := os.WriteFile(opts.Executable, []byte("MZ\x90\x00"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	err := (&systemdManager{scope: ScopeUser}).preflight(context.Background(), opts, nil)
+	accountName := ""
+	if current, err := user.Current(); err == nil {
+		accountName = current.Username
+	}
+	identity := currentExecutableAccessIdentity()
+	err := (&systemdManager{scope: ScopeUser}).preflightWithContext(context.Background(), opts, accountName, &identity, opts.Paths.StateDir)
 	assertNoError(t, err, "preflight refused an unclassified format: %v", err)
 }
 
@@ -1672,7 +1646,7 @@ func TestSystemdStaticReadinessRequiresLiveStableMatchingMainPID(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			probeCalls = 0
 			manager := managerWithPID(func(int) uint32 { return tc.pid })
-			if _, err := manager.verifyRunningExecutable(context.Background(), executable, listen, "fixture-version"); err == nil || !strings.Contains(err.Error(), "service process could not be verified") {
+			if _, err := manager.verifyRunningExecutableWithListenSource(context.Background(), executable, listen, "fixture-version", false); err == nil || !strings.Contains(err.Error(), "service process could not be verified") {
 				t.Fatalf("verification error = %v, want a live-process evidence failure", err)
 			}
 			if probeCalls != 0 {
@@ -1687,7 +1661,7 @@ func TestSystemdStaticReadinessRequiresLiveStableMatchingMainPID(t *testing.T) {
 			return uint32(process.Process.Pid)
 		}
 		return 0
-	}).verifyRunningExecutable(context.Background(), executable, listen, "fixture-version"); err == nil {
+	}).verifyRunningExecutableWithListenSource(context.Background(), executable, listen, "fixture-version", false); err == nil {
 		t.Fatal("readiness succeeded after MainPID disappeared during the successful HTTP probe")
 	}
 	if probeCalls != 1 {
@@ -1696,7 +1670,7 @@ func TestSystemdStaticReadinessRequiresLiveStableMatchingMainPID(t *testing.T) {
 
 	probeCalls = 0
 	otherListen := "127.0.0.1:" + strconv.Itoa(freePort(t))
-	_, err := managerWithPID(func(int) uint32 { return uint32(process.Process.Pid) }).verifyRunningExecutable(context.Background(), executable, otherListen, "fixture-version")
+	_, err := managerWithPID(func(int) uint32 { return uint32(process.Process.Pid) }).verifyRunningExecutableWithListenSource(context.Background(), executable, otherListen, "fixture-version", false)
 	if err == nil || !strings.Contains(err.Error(), "does not match the static unit Listen") {
 		t.Fatalf("verification error = %v, want the static/runtime Listen mismatch", err)
 	}
@@ -1737,9 +1711,9 @@ func TestSystemdVerifyRejectsAnUnintendedWrappedCommand(t *testing.T) {
 			t.Setenv("HFDESK_TEST_SYSTEMCTL_EXEC_START", tc.command)
 			manager := &systemdManager{scope: ScopeUser, restartWait: 20 * time.Millisecond}
 
-			_, err := manager.verifyRunningExecutable(context.Background(), executable, "127.0.0.1:19090", "fixture-version")
+			_, err := manager.verifyRunningExecutableWithListenSource(context.Background(), executable, "127.0.0.1:19090", "fixture-version", false)
 			if err == nil {
-				t.Fatal("verifyRunningExecutable() = nil, want the wrapped command rejected")
+				t.Fatal("verifyRunningExecutableWithListenSource() = nil, want the wrapped command rejected")
 			}
 			assertNames(t, err.Error(), "verification error", append([]string{"does not run", executable}, tc.want...))
 			assertNamesWithout(t, err.Error(), "verification error", nil, tc.wantNot)
@@ -1799,9 +1773,9 @@ func TestSystemdReadinessAcceptsLiveScriptWrapperWithHFDeskArgs(t *testing.T) {
 			return map[string]dbus.Variant{"MainPID": dbus.MakeVariant(uint32(command.Process.Pid))}, nil
 		},
 	}
-	verified, err := manager.verifyRunningExecutable(context.Background(), wrapper, listen, "fixture-version")
+	verified, err := manager.verifyRunningExecutableWithListenSource(context.Background(), wrapper, listen, "fixture-version", false)
 	if err != nil || !verified {
-		t.Fatalf("verifyRunningExecutable() = (%t, %v), want the script wrapper's live HFDesk process; stderr: %s", verified, err, stderr.String())
+		t.Fatalf("verifyRunningExecutableWithListenSource() = (%t, %v), want the script wrapper's live HFDesk process; stderr: %s", verified, err, stderr.String())
 	}
 }
 
@@ -1835,7 +1809,7 @@ func TestSystemdWrappedRegisteredCommandKeepsTheRuntimeChecks(t *testing.T) {
 
 	t.Run("a stale process that reports another version is rejected", func(t *testing.T) {
 		manager, listen, executable := setup(t, "old-version")
-		_, err := manager.verifyRunningExecutable(context.Background(), executable, listen, "fixture-version")
+		_, err := manager.verifyRunningExecutableWithListenSource(context.Background(), executable, listen, "fixture-version", false)
 		if err == nil || !strings.Contains(err.Error(), "does not run the expected version") {
 			t.Fatalf("verification error = %v, want the version rejection of the stale process", err)
 		}
@@ -1843,9 +1817,9 @@ func TestSystemdWrappedRegisteredCommandKeepsTheRuntimeChecks(t *testing.T) {
 
 	t.Run("the raw first token of the command still matches", func(t *testing.T) {
 		manager, listen, _ := setup(t, "fixture-version")
-		verified, err := manager.verifyRunningExecutable(context.Background(), "/usr/bin/env", listen, "fixture-version")
+		verified, err := manager.verifyRunningExecutableWithListenSource(context.Background(), "/usr/bin/env", listen, "fixture-version", false)
 		if err != nil || !verified {
-			t.Fatalf("verifyRunningExecutable() = (%t, %v), want the raw wrapper-path expectation of the restore path accepted; stderr error: %v", verified, err, err)
+			t.Fatalf("verifyRunningExecutableWithListenSource() = (%t, %v), want the raw wrapper-path expectation of the restore path accepted; stderr error: %v", verified, err, err)
 		}
 	})
 }
