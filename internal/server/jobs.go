@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -47,6 +48,7 @@ type Job struct {
 	OutputDir          string            `json:"outputDir"`
 	HubDir             string            `json:"hubDir,omitempty"` // Exact frozen Hub; OutputDir remains the friendly/app root.
 	DestinationWarning string            `json:"destinationWarning,omitempty"`
+	Warnings           []string          `json:"warnings,omitempty"`      // The downloader's distinct non-fatal diagnostics, one entry each in first-arrival order, bounded at maxJobWarnings (distinct from the server-computed DestinationWarning).
 	LocalDir           string            `json:"localDir,omitempty"`      // Effective local-dir for this job (per-request or server-global)
 	LocalRepo          string            `json:"localRepo,omitempty"`     // Override destination folder name (used for upstream mmproj)
 	ShardRanges        string            `json:"shardRanges,omitempty"`   // Shard-range selection narrowing the filters (see hfdownloader.Job.ShardRanges)
@@ -61,6 +63,15 @@ type Job struct {
 	StartedAt          *time.Time        `json:"startedAt,omitempty"`
 	EndedAt            *time.Time        `json:"endedAt,omitempty"`
 	Files              []JobFileProgress `json:"files,omitempty"`
+
+	// StrictFiles marks Filters as an exact manual file selection: each entry
+	// is one complete repository-relative path and the job downloads exactly
+	// those files (see DownloadRequest.StrictFiles). The normalized selection
+	// and this flag are part of job identity, so an identical active strict
+	// request deduplicates while a different selection stays an independent
+	// job; both persist through the normal snapshot/state machinery so the UI
+	// can render the selection ("N files") from /api/jobs.
+	StrictFiles bool `json:"strictFiles,omitempty"`
 
 	// RouteKey is the download route key requested at creation (internal/audit
 	// only). The resolved destination lives in LocalDir; this field is never a
@@ -454,6 +465,9 @@ func (m *JobManager) cloneJobLocked(j *Job) *Job {
 	if j.Files != nil {
 		clone.Files = append([]JobFileProgress(nil), j.Files...)
 	}
+	if j.Warnings != nil {
+		clone.Warnings = append([]string(nil), j.Warnings...)
+	}
 	if j.StartedAt != nil {
 		t := *j.StartedAt
 		clone.StartedAt = &t
@@ -553,7 +567,9 @@ resolveRequest:
 	// between. LocalRepo and ExactMatch are part of the identity too: the
 	// former redirects where the files land (cache folder ID / subfolder),
 	// the latter selects which files match, so two requests differing in
-	// either are different downloads even when the rest matches.
+	// either are different downloads even when the rest matches — except
+	// that ExactMatch is a documented no-op for a strict file selection, so
+	// when both requests are strict it never splits their identity.
 	m.mu.Lock()
 	if m.stopping {
 		m.mu.Unlock()
@@ -568,7 +584,8 @@ resolveRequest:
 			pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) &&
 			existing.LocalRepo == req.LocalRepo &&
 			existing.BranchVariant == req.BranchVariant &&
-			existing.ExactMatch == req.ExactMatch &&
+			existing.StrictFiles == req.StrictFiles &&
+			((existing.StrictFiles && req.StrictFiles) || existing.ExactMatch == req.ExactMatch) &&
 			existing.ShardRanges == req.ShardRanges &&
 			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
 			stringSlicesEqual(existing.Filters, req.Filters) &&
@@ -594,6 +611,7 @@ resolveRequest:
 		Flat:          flat,
 		ExactMatch:    req.ExactMatch,
 		ShardRanges:   req.ShardRanges,
+		StrictFiles:   req.StrictFiles,
 		RouteKey:      routeKey,
 		Status:        JobStatusQueued,
 		CreatedAt:     time.Now(),
@@ -668,7 +686,9 @@ resolveRequest:
 				pathIdentityKey(existing.OutputDir) == reqDestKey && existing.Flat == flat &&
 				pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) && existing.LocalRepo == req.LocalRepo &&
 				existing.BranchVariant == req.BranchVariant &&
-				existing.ExactMatch == req.ExactMatch && existing.ShardRanges == req.ShardRanges &&
+				existing.StrictFiles == req.StrictFiles &&
+				((existing.StrictFiles && req.StrictFiles) || existing.ExactMatch == req.ExactMatch) &&
+				existing.ShardRanges == req.ShardRanges &&
 				(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
 				stringSlicesEqual(existing.Filters, req.Filters) && stringSlicesEqual(existing.Excludes, req.Excludes) {
 				a.Close()
@@ -1571,6 +1591,12 @@ func updateJobETA(job *Job, transferred int64, now time.Time) {
 	job.Progress.EtaSeconds = int64(float64(remaining)/predictor + 0.5)
 }
 
+// maxJobWarnings bounds a job's Warnings list: one entry per distinct
+// diagnostic, kept in first-arrival order, up to this many entries; once
+// full the list stops growing — the bounded-diagnostic pattern of
+// pkg/smartdl's analysis_warnings.
+const maxJobWarnings = 20
+
 // applyJobProgress folds one downloader progress event into the job's
 // aggregate state. The caller must hold the manager lock. now feeds the
 // speed/ETA estimators and is passed in for deterministic testing.
@@ -1696,6 +1722,22 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 		job.Phase = "finalizing"
 		job.Progress.BytesPerSecond = 0
 		job.Progress.EtaSeconds = 0
+
+	case "warning":
+		// Keep the downloader's non-fatal diagnostics (unpinned revision,
+		// plan notices, unusable resume state, best-effort metadata
+		// writes) in the job state — one entry per distinct diagnostic: a
+		// resume or retry re-runs the plan and the downloader re-emits the
+		// identical messages, and a repeat is the same fact, so it must
+		// not duplicate in the snapshot nor consume the bounded cap that
+		// would otherwise fill with duplicates and drop a later, distinct
+		// diagnostic. First arrival wins: an existing entry keeps its
+		// position. The snapshot broadcast right after this event carries
+		// the list to listeners and the API, so no new transport is
+		// needed.
+		if evt.Message != "" && len(job.Warnings) < maxJobWarnings && !slices.Contains(job.Warnings, evt.Message) {
+			job.Warnings = append(job.Warnings, evt.Message)
+		}
 	}
 }
 
@@ -1741,6 +1783,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		Filters:            job.Filters,
 		Excludes:           job.Excludes,
 		ExactMatch:         job.ExactMatch,
+		StrictFiles:        job.StrictFiles,
 		AppendFilterSubdir: false,
 		LocalRepo:          job.LocalRepo,
 		BranchVariant:      job.BranchVariant,

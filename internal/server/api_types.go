@@ -24,6 +24,31 @@ type DownloadRequest struct {
 	// changing legacy unqualified basename/token matching. Exact segment
 	// boundaries preserve quantization tokens such as "Q6_K".
 	ExactMatch bool `json:"exactMatch,omitempty"`
+	// StrictFiles reinterprets filters as a strict manual file selection: each
+	// filter is one complete repository-relative file path, matched by exact
+	// spelling (case-sensitive), and nothing else is planned — no substring
+	// widening, no basename aliasing, no companion/metadata retention, no
+	// GGUF inference, no dataset-membership selection. exactMatch has no
+	// effect in this mode and does not participate in job identity for a
+	// strict request. A leading "./" is stripped from any entry and "\"
+	// separators are normalized away, then repeated spellings are dropped
+	// before the selection is stored on the job; two entries that differ
+	// only in case are rejected instead of deduplicated (they are one file
+	// on case-insensitive filesystems). The selection is all-or-nothing and
+	// validated before any Hub contact: an owner/name:file colon shorthand in
+	// repo is rejected with the same code and a hint, whether or not filters
+	// is set; filters must be non-empty (400
+	// invalid_file_selection when empty), every path must be canonical and
+	// spelled free of case collisions (400 invalid_file_selection, naming
+	// the offending or colliding entries), every path must exist at the
+	// revision spelled exactly that way (400 no_file_match from plan/dry-run;
+	// a real download fails its job the same way filtered downloads do), and
+	// excludes, branchVariant, and appendFilterSubdir are rejected (400
+	// invalid_file_selection for all three). The normalized selection and
+	// this flag participate in job deduplication, appear on the job snapshot
+	// (filters + strictFiles) via /api/jobs and jobs_state.json, and plan
+	// with POST /api/plan returning exactly the selected files.
+	StrictFiles bool `json:"strictFiles,omitempty"`
 	// LocalDir overrides the download destination for this specific request,
 	// writing real files (flat mode) instead of the HF cache layout.
 	// When empty, the server-global LocalDir (if set) or HF cache is used.

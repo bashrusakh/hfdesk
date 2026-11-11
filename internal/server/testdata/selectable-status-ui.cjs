@@ -908,23 +908,23 @@ scenario('analysis warning renders escaped message, causes, and retry', async ()
   eq(ui.renderAnalysisWarnings({ analysis_warnings: [{ code: 'other', message: 'ignore' }] }), '', 'unrelated warning code is not rendered');
   const html = ui.renderAnalysisWarnings({
     analysis_warnings: [{
-      code: 'exl_branch_discovery_incomplete',
-      message: 'Branch discovery incomplete <retry>',
-      causes: ['header_unavailable', 'probe_timeout'],
+      code: 'both_namespace_detection_degraded',
+      message: 'Dataset-namespace probe failed <retry>',
+      causes: ['probe_unavailable', 'probe_timeout'],
       retryable: true
     }]
   });
-  match(html, /Branch discovery incomplete &lt;retry&gt;/, 'warning message is escaped');
-  match(html, /Safetensors header unavailable/, 'header cause label is rendered');
-  match(html, /Header probe timed out/, 'probe cause label is rendered');
+  match(html, /Dataset-namespace probe failed &lt;retry&gt;/, 'warning message is escaped');
+  match(html, /Dataset-namespace probe unavailable/, 'probe-unavailable cause label is rendered');
+  match(html, /Dataset-namespace probe timed out/, 'probe-timeout cause label is rendered');
   match(html, /data-analysis-warning-retry/, 'retryable warning offers a retry button');
   doesNotMatch(html, /<retry>/, 'warning message is not injected as markup');
 
   const pickerHtml = ui.renderAnalysisWarnings({
     analysis_warnings: [{
-      code: 'exl_branch_discovery_incomplete',
-      message: 'Branch discovery incomplete',
-      causes: ['header_unavailable'],
+      code: 'both_namespace_detection_degraded',
+      message: 'Dataset-namespace probe failed',
+      causes: ['probe_unavailable'],
       retryable: true
     }]
   }, { showRetry: false });

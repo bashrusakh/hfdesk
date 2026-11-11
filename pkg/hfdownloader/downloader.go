@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -137,6 +138,30 @@ type skippedBlobLink struct {
 	relativePath string
 	filterSubdir string
 	sha256       string
+}
+
+// formatRangelessResumeNotice renders the one per-download warning for files
+// whose versioned resume state cannot be used because the server advertises
+// no HTTP range support. It follows the plan notice's convention
+// (formatSplitMentionNotice): the count of affected files and their paths,
+// both bounded — the paths at splitMentionNoticePathCap with the number of
+// unnamed entries stated — so the sentence never grows with the number of
+// files. The caller sorts the paths first: the item loop collects them
+// concurrently, so emission order alone is not deterministic.
+func formatRangelessResumeNotice(paths []string) string {
+	n := len(paths)
+	noun := "files"
+	if n == 1 {
+		noun = "file"
+	}
+	shown := paths
+	more := ""
+	if n > splitMentionNoticePathCap {
+		shown = paths[:splitMentionNoticePathCap]
+		more = fmt.Sprintf(", and %d more", n-splitMentionNoticePathCap)
+	}
+	return fmt.Sprintf("resume state for %d %s cannot be used without HTTP range support; downloading the full %s and attempting to discard the obsolete state after success: %s%s",
+		n, noun, noun, strings.Join(shown, ", "), more)
 }
 
 // Download scans and downloads repository files into the HF cache by default.
@@ -395,6 +420,14 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 
 	var manifestBuilder *ManifestBuilder
 	var manifestMu sync.Mutex
+	// rangelessResumePaths collects, under rangelessResumeMu, the files
+	// whose versioned resume state cannot be used because the item has no
+	// HTTP range support. The item goroutines append concurrently;
+	// Download emits one aggregated warning for the whole list after
+	// wg.Wait, so the repo-wide condition is one diagnostic, not one per
+	// file.
+	var rangelessResumeMu sync.Mutex
+	var rangelessResumePaths []string
 	if job.BranchVariant || (useHFCache && !cfg.NoManifest) {
 		manifestBuilder = NewManifestBuilder(job, cfg.Command)
 		if plan.CommitPinned {
@@ -665,9 +698,9 @@ LOOP:
 			obsoleteVersionedStaging := ""
 			if !it.AcceptRanges && resumeStaging != "" {
 				obsoleteVersionedStaging = resumeStaging
-				emit(ProgressEvent{Level: "warn", Event: "warning", Message: fmt.Sprintf(
-					"resume state for %s cannot be used without HTTP range support; downloading the full file and attempting to discard the obsolete state after success",
-					finalRel)})
+				rangelessResumeMu.Lock()
+				rangelessResumePaths = append(rangelessResumePaths, finalRel)
+				rangelessResumeMu.Unlock()
 			}
 
 			if cfg.OnPartialFile != nil {
@@ -926,6 +959,23 @@ LOOP:
 	}
 
 	wg.Wait()
+
+	// Aggregate the "resume state unusable without HTTP range support"
+	// condition into one warning for the whole download: the condition is
+	// repo-wide (no range support plus stale state), so one distinct
+	// message per file would flood the bounded job warning list and push
+	// later, genuinely distinct diagnostics out of it. Emission sits
+	// immediately after wg.Wait: every item goroutine has finished here on
+	// the normal path, on an item error, and after a LOOP cancellation,
+	// and nothing between the loop above and this point returns from
+	// Download. No affected file means no event.
+	rangelessResumeMu.Lock()
+	affectedResumePaths := append([]string(nil), rangelessResumePaths...)
+	rangelessResumeMu.Unlock()
+	if len(affectedResumePaths) > 0 {
+		sort.Strings(affectedResumePaths)
+		emit(ProgressEvent{Level: "warn", Event: "warning", Message: formatRangelessResumeNotice(affectedResumePaths)})
+	}
 
 	// Reconcile each skipped shared blob's own snapshot/friendly paths after all
 	// transfers finish. Success requires every skipped blob to still be complete
