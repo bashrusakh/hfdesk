@@ -27,6 +27,17 @@ import (
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
 
+// setBoundAddr records an effective bound address for the server without a
+// listener to ask: no address-family behavior is known for it, so BrowserURL
+// keeps its earlier derivation for that bind. It is the test-layer fixture
+// that stands in for the bound-address state the live listener path records.
+func (s *Server) setBoundAddr(addr net.Addr) {
+	s.boundAddrMu.Lock()
+	s.boundAddr = addr
+	s.boundIPv6Only, s.boundFamilyKnown = false, false
+	s.boundAddrMu.Unlock()
+}
+
 // capturedLog is a concurrency-safe buffer that collects what a logging
 // pipeline writes to its console sink.
 type capturedLog struct {

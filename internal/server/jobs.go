@@ -1026,51 +1026,6 @@ func resetAndQueueRestartLocked(m *JobManager, job *Job, retry bool) *Job {
 	return snapshot
 }
 
-// DeleteJob removes a job from the list.
-func (m *JobManager) DeleteJob(id string) bool {
-	m.mu.Lock()
-	if m.stopping {
-		m.mu.Unlock()
-		return false
-	}
-
-	job, ok := m.jobs[id]
-	if !ok {
-		m.mu.Unlock()
-		return false
-	}
-	m.opWG.Add(1)
-
-	if job.cancel != nil && (job.Status == JobStatusQueued || job.Status == JobStatusRunning) {
-		job.cancel()
-	}
-
-	delete(m.jobs, id)
-	m.signalWriteDecisionLocked()
-	m.mu.Unlock()
-	m.opWG.Done()
-	return true
-}
-
-// WaitAll blocks until every in-flight runJob goroutine has returned or
-// until timeout elapses. Returns true if all goroutines exited cleanly,
-// false on timeout. Primarily for tests and graceful shutdown — lets
-// callers observe actual goroutine exit rather than just Status==Cancelled,
-// which is set before the downloader's filesystem operations fully unwind.
-func (m *JobManager) WaitAll(timeout time.Duration) bool {
-	done := make(chan struct{})
-	go func() {
-		m.runWG.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return true
-	case <-time.After(timeout):
-		return false
-	}
-}
-
 // DismissJobResult distinguishes the three possible outcomes of a dismiss
 // attempt so the HTTP layer can map them to appropriate status codes.
 type DismissJobResult int
@@ -1085,20 +1040,14 @@ const (
 	DismissJobStillActive
 )
 
-// DismissJob removes a job from the manager if and only if it is in a
-// terminal state (completed, failed, cancelled, paused). Dismissal is the
-// user's way of hiding a finished job from the UI permanently, and the
+// DismissJobResult removes a job from the manager if and only if it is in a
+// terminal state (completed, failed, cancelled, paused), and reports the
+// reason a dismissal failed otherwise, for use by the HTTP handler. Dismissal
+// is the user's way of hiding a finished job from the UI permanently, and the
 // guarantee that matters for github issue #68 is that the job does not
 // come back on the next page refresh — so the underlying storage drops it.
 // Dismissing a queued or running job is rejected so a stray click can't
 // wipe a live download.
-func (m *JobManager) DismissJob(id string) bool {
-	res, _ := m.DismissJobResult(id)
-	return res == DismissJobOK
-}
-
-// DismissJobResult is the richer variant of DismissJob that returns the
-// reason a dismissal failed, for use by the HTTP handler.
 func (m *JobManager) DismissJobResult(id string) (DismissJobResult, *Job) {
 	m.mu.Lock()
 	if m.stopping {
@@ -1132,29 +1081,6 @@ func (m *JobManager) DismissJobResult(id string) (DismissJobResult, *Job) {
 	}
 
 	return DismissJobOK, snapshot
-}
-
-// Subscribe adds a listener for job updates.
-func (m *JobManager) Subscribe() chan *Job {
-	ch := make(chan *Job, 100)
-	m.listenerMu.Lock()
-	m.listeners = append(m.listeners, ch)
-	m.listenerMu.Unlock()
-	return ch
-}
-
-// Unsubscribe removes a listener.
-func (m *JobManager) Unsubscribe(ch chan *Job) {
-	m.listenerMu.Lock()
-	defer m.listenerMu.Unlock()
-
-	for i, listener := range m.listeners {
-		if listener == ch {
-			m.listeners = append(m.listeners[:i], m.listeners[i+1:]...)
-			close(ch)
-			return
-		}
-	}
 }
 
 // notifyListeners forwards an already-snapshotted job update to channel

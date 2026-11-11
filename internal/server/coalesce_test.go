@@ -27,6 +27,20 @@ func (r *recordingSink) snapshot() []*Job {
 	return append([]*Job(nil), r.jobs...)
 }
 
+// stop halts pending timers and rejects further schedule calls. Safe to call
+// multiple times. It is the test-layer cleanup for coalescers under test; the
+// production coalescer lives for the process lifetime and is never stopped.
+func (c *jobCoalescer) stop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stopped = true
+	for id, t := range c.timers {
+		t.Stop()
+		delete(c.timers, id)
+	}
+	c.pending = map[string]*Job{}
+}
+
 // TestJobCoalescer_FirstEventSentImmediately — an event for a job with no prior
 // activity must be forwarded without delay.
 func TestJobCoalescer_FirstEventSentImmediately(t *testing.T) {

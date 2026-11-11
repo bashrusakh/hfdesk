@@ -67,7 +67,7 @@ func TestSelectedDeleteReservationCloseDuringInventoryDrainsAttempt(t *testing.T
 	m.fenced = true // Keep scheduler execution outside this reservation test.
 	m.jobs[job.ID] = job
 	target := filepath.Join(jobDestinationBase(job), "other.gguf")
-	if jobMayWriteSelectedPath(job, target) {
+	if jobMayWriteSelectedPaths(job, []string{target}, inventoryWritableNamespace) {
 		t.Fatal("pre-shutdown nonmatching writer unexpectedly conflicts with reservation")
 	}
 	preCloseRelease, ok := m.reserveSelectedGGUF([]string{target})
@@ -180,7 +180,24 @@ func TestSelectedDeleteReservationRejectsCompletedManagedAliasMutationDuringInve
 }
 
 func testCacheWriteAttempt(m *JobManager) *cacheWriteAttempt {
-	return &cacheWriteAttempt{manager: m, start: m.captureWriteDecision(), evidence: map[string]selectedWriteEvidence{}, failed: map[string]bool{}, descriptors: map[string]writeDecisionJob{}, probes: map[string]writeIdentityProbe{}, targets: map[string]writeIdentityProbe{}, inventory: inventoryWritableNamespace}
+	m.mu.RLock()
+	start := m.captureWriteDecisionLocked()
+	m.mu.RUnlock()
+	return &cacheWriteAttempt{manager: m, start: start, evidence: map[string]selectedWriteEvidence{}, failed: map[string]bool{}, descriptors: map[string]writeDecisionJob{}, probes: map[string]writeIdentityProbe{}, targets: map[string]writeIdentityProbe{}, inventory: inventoryWritableNamespace}
+}
+
+// writeDecisionChangeChannel exposes the manager's decision-change signal to
+// the same-package tests that observe reservation/mutation wakeups.
+func (m *JobManager) writeDecisionChangeChannel() <-chan struct{} {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.writeDecisionChanged
+}
+
+// decisionJobKey derives the full semantic identity key of a job descriptor;
+// it is the test-layer twin of decisionDescriptorKey for *Job inputs.
+func decisionJobKey(j *Job) string {
+	return decisionDescriptorKey(decisionJob(j))
 }
 
 func TestWriteDecisionSnapshotCopiesOnlyDecisionState(t *testing.T) {
@@ -188,7 +205,9 @@ func TestWriteDecisionSnapshotCopiesOnlyDecisionState(t *testing.T) {
 	j := &Job{ID: "j", Repo: "o/r", Status: JobStatusQueued, Filters: []string{"one"}, Excludes: []string{"skip"}}
 	m.jobs[j.ID] = j
 	m.runActivities[1] = &jobWriteActivity{job: j, planKnown: true, planned: map[string]frozenMutationPath{"/tmp/a": {physical: "/tmp/a", key: "/tmp/a", raw: "/tmp/a"}}}
-	s := m.captureWriteDecision()
+	m.mu.RLock()
+	s := m.captureWriteDecisionLocked()
+	m.mu.RUnlock()
 	j.Filters[0] = "changed"
 	j.Status = JobStatusRunning
 	m.runActivities[1].planned["/tmp/b"] = frozenMutationPath{physical: "/tmp/b", key: "/tmp/b", raw: "/tmp/b"}
@@ -198,7 +217,9 @@ func TestWriteDecisionSnapshotCopiesOnlyDecisionState(t *testing.T) {
 	j.Filters = []string{"one"}
 	j.Status = JobStatusQueued
 	delete(m.runActivities[1].planned, "/tmp/b")
-	s = m.captureWriteDecision()
+	m.mu.RLock()
+	s = m.captureWriteDecisionLocked()
+	m.mu.RUnlock()
 	j.Progress.DownloadedBytes++
 	if !m.writeDecisionUnchanged(s) {
 		t.Fatal("progress-only changes invalidated decision")
@@ -248,7 +269,9 @@ func TestWriteDecisionSnapshotStableForAliasedPlannedPaths(t *testing.T) {
 		wantFirst = second.raw
 	}
 	for i := 0; i < attempts; i++ {
-		snapshot := m.captureWriteDecision()
+		m.mu.RLock()
+		snapshot := m.captureWriteDecisionLocked()
+		m.mu.RUnlock()
 		planned := snapshot.activities[0].planned
 		if len(planned) != 2 {
 			t.Fatalf("snapshot collapsed logical paths: got %d entries", len(planned))
@@ -261,7 +284,9 @@ func TestWriteDecisionSnapshotStableForAliasedPlannedPaths(t *testing.T) {
 
 func TestWriteDecisionEpochDetectsCompletedMutation(t *testing.T) {
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "state"))
-	s := m.captureWriteDecision()
+	m.mu.RLock()
+	s := m.captureWriteDecisionLocked()
+	m.mu.RUnlock()
 	end := m.beginObservedMutation([]string{"/tmp/managed"})
 	end()
 	if m.writeDecisionUnchanged(s) {
@@ -271,7 +296,9 @@ func TestWriteDecisionEpochDetectsCompletedMutation(t *testing.T) {
 
 func TestWriteDecisionReservationAndMutationSignal(t *testing.T) {
 	m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(t.TempDir(), "state"))
-	before := m.captureWriteDecision()
+	m.mu.RLock()
+	before := m.captureWriteDecisionLocked()
+	m.mu.RUnlock()
 	ch := m.writeDecisionChangeChannel()
 	end := m.beginObservedMutation([]string{t.TempDir()})
 	select {
@@ -323,7 +350,7 @@ func TestCacheWriteAttemptProbeFailsClosedOnIdentityError(t *testing.T) {
 	if err := os.MkdirAll(base, 0700); err != nil {
 		t.Fatal(err)
 	}
-	a.Collect(j)
+	a.collectDescriptor(decisionJob(j))
 	target := filepath.Join(base, "target")
 	a.MayWrite(j, []string{target})
 	if !a.Revalidate([]string{target}) {
@@ -355,7 +382,7 @@ func TestCacheWriteAttemptRevalidatesCapturedTargetsAndNamespaceAliases(t *testi
 	}
 	defer a.Close()
 	j := &Job{ID: "alias", Repo: "owner/repo", OutputDir: link, Status: JobStatusQueued}
-	a.Collect(j)
+	a.collectDescriptor(decisionJob(j))
 	target := filepath.Join(link, "owner", "repo", "weights.gguf")
 	a.MayWrite(j, []string{target})
 	if !a.Revalidate([]string{target}) {
@@ -389,14 +416,14 @@ func TestCacheWriteAttemptInventoriesOncePerLifetimeNotTarget(t *testing.T) {
 		}
 		return writableNamespaceInventory{base: identity}, true
 	}
-	a.Collect(j)
-	a.Collect(j)
+	a.collectDescriptor(decisionJob(j))
+	a.collectDescriptor(decisionJob(j))
 	newDescriptor := *j
 	newDescriptor.generation++
-	a.Collect(&newDescriptor)
+	a.collectDescriptor(decisionJob(&newDescriptor))
 	differentSelection := *j
 	differentSelection.Filters = []string{"other.gguf"}
-	a.Collect(&differentSelection)
+	a.collectDescriptor(decisionJob(&differentSelection))
 	if count != 6 {
 		t.Fatalf("inventories=%d, want each semantic descriptor × two namespaces", count)
 	}
@@ -420,7 +447,9 @@ func TestCacheWriteAttemptCollectsSnapshotJobsAndActivitiesOnce(t *testing.T) {
 	m.mu.Lock()
 	m.registerRunActivityLocked(j)
 	m.mu.Unlock()
-	s := m.captureWriteDecision()
+	m.mu.RLock()
+	s := m.captureWriteDecisionLocked()
+	m.mu.RUnlock()
 	count := 0
 	a := testCacheWriteAttempt(m)
 	a.inventory = func(base string) (writableNamespaceInventory, bool) {
@@ -469,7 +498,9 @@ func TestCollectSnapshotKeepsHistoricalActivityDistinctFromQueuedRetry(t *testin
 	if old.generation == 1 {
 		t.Fatal("reset did not retire the historical activity generation")
 	}
-	s := m.captureWriteDecision()
+	m.mu.RLock()
+	s := m.captureWriteDecisionLocked()
+	m.mu.RUnlock()
 	count := 0
 	a := testCacheWriteAttempt(m)
 	a.inventory = func(base string) (writableNamespaceInventory, bool) {
@@ -523,7 +554,9 @@ func TestQueuedRetryDoesNotReuseHistoricalCompletePlan(t *testing.T) {
 	resetAndQueueRestartLocked(m, job, true)
 	m.mu.Unlock()
 
-	s := m.captureWriteDecision()
+	m.mu.RLock()
+	s := m.captureWriteDecisionLocked()
+	m.mu.RUnlock()
 	if len(s.activities) != 1 || !s.activities[0].planComplete {
 		t.Fatalf("fixture lost the historical complete activity: %#v", s.activities)
 	}
@@ -616,15 +649,19 @@ func TestCacheWriteAttemptMutationScopesCoverWholeWriterNamespace(t *testing.T) 
 		}
 		return writableNamespaceInventory{base: identity}, true
 	}
-	a.Collect(j)
+	a.collectDescriptor(decisionJob(j))
 	end := m.beginObservedMutation([]string{filepath.Join(base, "other-subtree")})
-	a.start = m.captureWriteDecision()
+	m.mu.RLock()
+	a.start = m.captureWriteDecisionLocked()
+	m.mu.RUnlock()
 	if !a.HasActiveBroadMutation(nil) {
 		t.Fatal("sibling mutation inside writer namespace did not conflict")
 	}
 	end()
 	end = m.beginObservedMutation([]string{filepath.Join(root, "unrelated")})
-	a.start = m.captureWriteDecision()
+	m.mu.RLock()
+	a.start = m.captureWriteDecisionLocked()
+	m.mu.RUnlock()
 	if a.HasActiveBroadMutation(nil) {
 		t.Fatal("unrelated namespace mutation conflicted")
 	}
@@ -656,7 +693,7 @@ func TestBeginCacheMutationSymlinkDirectoryScopeConflictsWithSnapshotNamespace(t
 	if !ok {
 		t.Fatal("evidence attempt rejected")
 	}
-	a.Collect(job)
+	a.collectDescriptor(decisionJob(job))
 	if !m.writeDecisionUnchanged(a.start) {
 		t.Fatal("manager epoch changed during collection")
 	}
@@ -680,7 +717,7 @@ func TestBeginCacheMutationSymlinkDirectoryScopeConflictsWithSnapshotNamespace(t
 		t.Fatal("second evidence attempt rejected")
 	}
 	defer a.Close()
-	a.Collect(job)
+	a.collectDescriptor(decisionJob(job))
 	if a.HasActiveBroadMutation(nil) {
 		t.Fatal("unrelated directory scope blocked writer evidence")
 	}
@@ -727,7 +764,7 @@ func TestCacheWriteEvidenceRevalidatesRawMutationScopeAfterAliasRetarget(t *test
 		t.Fatal("evidence attempt rejected")
 	}
 	defer a.Close()
-	a.Collect(job)
+	a.collectDescriptor(decisionJob(job))
 	if !a.HasActiveBroadMutationFor(decisionJob(job), nil) {
 		t.Fatal("retargeted raw mutation scope did not block the writer's current namespace")
 	}
@@ -794,7 +831,7 @@ func TestObservedCleanupEntryScopeIsTypedAndNamespaceSensitive(t *testing.T) {
 		t.Fatal("attempt rejected")
 	}
 	defer a.Close()
-	a.Collect(job)
+	a.collectDescriptor(decisionJob(job))
 	if !m.writeDecisionUnchanged(a.start) {
 		t.Fatal("manager state changed during entry-scope collection")
 	}
@@ -848,7 +885,7 @@ func TestObservedCleanupEntryScopeIsTypedAndNamespaceSensitive(t *testing.T) {
 
 	unrelated := &Job{ID: "other", Repo: "owner/repo", LocalDir: filepath.Join(root, "other-writer"), Flat: true}
 	b := testCacheWriteAttempt(m)
-	b.Collect(unrelated)
+	b.collectDescriptor(decisionJob(unrelated))
 	if b.HasActiveBroadMutation(nil) {
 		t.Fatal("existing cleanup file falsely conflicted with an unrelated namespace")
 	}
@@ -879,7 +916,7 @@ func TestSelectedLocalDeleteKeepsFinalSymlinkEntryIdentity(t *testing.T) {
 	}
 	defer release()
 	a := testCacheWriteAttempt(m)
-	a.Collect(job)
+	a.collectDescriptor(decisionJob(job))
 	if a.HasActiveBroadMutation(nil) {
 		t.Fatal("entry-scoped symlink deletion followed its leaf target")
 	}
@@ -902,7 +939,9 @@ func TestSelectedReservationBeginAndEndAdvanceDecisionEpoch(t *testing.T) {
 				t.Fatal(err)
 			}
 			m := newJobManagerWithStatePath(Config{}, nil, filepath.Join(root, "state"))
-			before := m.captureWriteDecision()
+			m.mu.RLock()
+			before := m.captureWriteDecisionLocked()
+			m.mu.RUnlock()
 			release, ok := tc.reserve(m, target)
 			if !ok {
 				t.Fatal("reservation rejected")
@@ -910,7 +949,9 @@ func TestSelectedReservationBeginAndEndAdvanceDecisionEpoch(t *testing.T) {
 			if m.writeDecisionUnchanged(before) {
 				t.Fatal("reservation begin did not invalidate snapshot")
 			}
-			during := m.captureWriteDecision()
+			m.mu.RLock()
+			during := m.captureWriteDecisionLocked()
+			m.mu.RUnlock()
 			release()
 			if m.writeDecisionUnchanged(during) {
 				t.Fatal("reservation release did not invalidate snapshot")
@@ -927,7 +968,9 @@ func TestRunActivityKeepsRegisteredDescriptorAndFullSemanticKey(t *testing.T) {
 	m.mu.Unlock()
 	j.generation = 50
 	j.Filters[0] = "changed"
-	s := m.captureWriteDecision()
+	m.mu.RLock()
+	s := m.captureWriteDecisionLocked()
+	m.mu.RUnlock()
 	var activity writeDecisionActivity
 	for _, a := range s.activities {
 		if a.id == id {
@@ -969,7 +1012,9 @@ func TestCollectSnapshotIgnoresTerminalAndCompletePlanButFailsRelevantUnknownClo
 		count++
 		return writableNamespaceInventory{base: base}, true
 	}
-	s := m.captureWriteDecision()
+	m.mu.RLock()
+	s := m.captureWriteDecisionLocked()
+	m.mu.RUnlock()
 	a.CollectSnapshot(s)
 	if len(a.evidence) != 1 || count != 2 {
 		t.Fatalf("collected evidence=%d inventories=%d, want only relevant unknown activity", len(a.evidence), count)
@@ -983,7 +1028,7 @@ func TestCollectSnapshotIgnoresTerminalAndCompletePlanButFailsRelevantUnknownClo
 	outside := t.TempDir()
 	symlinkOrSkip(t, outside, filepath.Join(base, "escape"))
 	a = testCacheWriteAttempt(m)
-	a.Collect(relevant)
+	a.collectDescriptor(decisionJob(relevant))
 	if !a.MayWrite(relevant, []string{filepath.Join(base, "weights.gguf")}) {
 		t.Fatal("relevant outward alias did not fail closed")
 	}
@@ -998,10 +1043,10 @@ func TestSelectedWriterIgnoresInternalAliasCycleForUnreachableTarget(t *testing.
 	symlinkOrSkip(t, base, filepath.Join(base, "loop"))
 	job := &Job{ID: "cycle", Repo: "owner/repo", OutputDir: root, Flat: true, Filters: []string{"selected.gguf"}, ExactMatch: true}
 	target := filepath.Join(root, "repoB", "selected.gguf")
-	if jobMayWriteSelectedPath(job, target) {
+	if jobMayWriteSelectedPaths(job, []string{target}, inventoryWritableNamespace) {
 		t.Fatal("irrelevant internal alias cycle blocked an unreachable target")
 	}
-	if !jobMayWriteSelectedPath(job, filepath.Join(base, "selected.gguf")) {
+	if !jobMayWriteSelectedPaths(job, []string{filepath.Join(base, "selected.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("reachable selected target was not recognized through the inventoried namespace")
 	}
 	if err := os.MkdirAll(filepath.Join(root, "repoB"), 0700); err != nil {
@@ -1040,7 +1085,7 @@ func TestSelectedWriterIgnoresInternalAliasCycleForUnreachableTarget(t *testing.
 		t.Fatal(err)
 	}
 	symlinkOrSkip(t, t.TempDir(), filepath.Join(base, "outward"))
-	if !jobMayWriteSelectedPath(job, target) {
+	if !jobMayWriteSelectedPaths(job, []string{target}, inventoryWritableNamespace) {
 		t.Fatal("outward alias did not retain conservative possible-writer handling")
 	}
 }
@@ -1142,8 +1187,8 @@ func TestFailedInventoryIsMemoizedPerDescriptor(t *testing.T) {
 	job := &Job{ID: "unknown", Repo: "owner/repo", OutputDir: root}
 	calls := 0
 	a.inventory = func(string) (writableNamespaceInventory, bool) { calls++; return writableNamespaceInventory{}, false }
-	a.Collect(job)
-	a.Collect(job)
+	a.collectDescriptor(decisionJob(job))
+	a.collectDescriptor(decisionJob(job))
 	if calls != 1 || len(a.failed) != 1 {
 		t.Fatalf("failed inventory rescanned: calls=%d failed=%d", calls, len(a.failed))
 	}
@@ -1158,7 +1203,7 @@ func TestBroadMutationFailsClosedForFailedDescriptor(t *testing.T) {
 	a := testCacheWriteAttempt(m)
 	job := &Job{ID: "unknown", Repo: "owner/repo", OutputDir: root}
 	a.inventory = func(string) (writableNamespaceInventory, bool) { return writableNamespaceInventory{}, false }
-	a.Collect(job)
+	a.collectDescriptor(decisionJob(job))
 	descriptor := decisionJob(job)
 	if !a.failed[decisionDescriptorKey(descriptor)] {
 		t.Fatal("fixture did not produce a failed descriptor")
@@ -1189,7 +1234,10 @@ func TestBroadMutationFindsEvidenceForNormalizedStartingDescriptor(t *testing.T)
 	}
 	end := m.beginObservedMutation([]string{filepath.Join(base, "scratch")})
 	a := testCacheWriteAttempt(m)
-	a.CollectSnapshot(m.captureWriteDecision())
+	m.mu.RLock()
+	decisionNow := m.captureWriteDecisionLocked()
+	m.mu.RUnlock()
+	a.CollectSnapshot(decisionNow)
 
 	descriptor := decisionJob(job)
 	if _, ok := a.evidence[decisionDescriptorKey(descriptor)]; ok {

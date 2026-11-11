@@ -126,8 +126,24 @@ func TestJobManagerCompletionDuringQuiesceDoesNotDispatchQueue(t *testing.T) {
 	}))
 	defer server.Close()
 	m := newLifecycleTestManager(t, Config{CacheDir: t.TempDir(), Endpoint: server.URL, MaxActive: 1})
-	updates := m.Subscribe()
-	defer m.Unsubscribe(updates)
+	// Register directly on the live listener list the way the manager's
+	// notifyListeners consumes it; the deferred removal mirrors the old
+	// subscribe/unsubscribe wrapper pair the fixture used.
+	updates := make(chan *Job, 100)
+	m.listenerMu.Lock()
+	m.listeners = append(m.listeners, updates)
+	m.listenerMu.Unlock()
+	defer func() {
+		m.listenerMu.Lock()
+		defer m.listenerMu.Unlock()
+		for i, listener := range m.listeners {
+			if listener == updates {
+				m.listeners = append(m.listeners[:i], m.listeners[i+1:]...)
+				close(updates)
+				return
+			}
+		}
+	}()
 	first, _, err := m.CreateJob(DownloadRequest{Repo: "owner/active"})
 	assertNoError(t, err, "")
 	if _, _, err := m.CreateJob(DownloadRequest{Repo: "owner/queued"}); err != nil {
@@ -292,7 +308,7 @@ func TestJobManagerFinalSnapshotAndNoWritesAfterClose(t *testing.T) {
 	if len(loaded) != 1 || loaded[0].Status != JobStatusPaused {
 		t.Fatalf("final snapshot did not include unsaved mutation: %#v", loaded)
 	}
-	if m.CancelJob("paused") || m.PauseJob("paused") || m.ResumeJob("paused") || m.RetryJob("paused") || m.DeleteJob("paused") {
+	if m.CancelJob("paused") || m.PauseJob("paused") || m.ResumeJob("paused") || m.RetryJob("paused") {
 		t.Fatal("mutator succeeded after stopping")
 	}
 	if result, _ := m.DismissJobResult("paused"); result == DismissJobOK {

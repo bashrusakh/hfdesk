@@ -14,6 +14,26 @@ import (
 	"time"
 )
 
+// WaitAll blocks until every in-flight runJob goroutine has returned or
+// until timeout elapses. Returns true if all goroutines exited cleanly,
+// false on timeout. It is the test-layer synchronization fixture for
+// observing actual goroutine exit rather than just Status==Cancelled,
+// which is set before the downloader's filesystem operations fully unwind;
+// live shutdown quiesces and closes the manager instead.
+func (m *JobManager) WaitAll(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		m.runWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 func TestJobManager_CreateJob(t *testing.T) {
 	testCacheDir := t.TempDir()
 

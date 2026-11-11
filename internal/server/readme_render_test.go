@@ -88,7 +88,7 @@ func TestRenderReadmeHTML_UnsafeSchemesStripped(t *testing.T) {
 	}
 }
 
-func TestClassifyReadmeRepoURL(t *testing.T) {
+func TestClassifyReadmeRepoURLForEndpoint(t *testing.T) {
 	tests := []struct {
 		name        string
 		in          string
@@ -148,9 +148,13 @@ func TestClassifyReadmeRepoURL(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			repo, isDataset, revision, ok := classifyReadmeRepoURL(tt.in, tt.endpoint)
+			endpoint, parsed := parseReadmeEndpoint(tt.endpoint)
+			if !parsed {
+				t.Fatalf("fixture endpoint %q did not parse", tt.endpoint)
+			}
+			repo, isDataset, revision, ok := classifyReadmeRepoURLForEndpoint(tt.in, endpoint)
 			if ok != tt.wantOK || repo != tt.wantRepo || isDataset != tt.wantDataset || revision != tt.wantRev {
-				t.Fatalf("classifyReadmeRepoURL(%q, %q) = (%q, %v, %q, %v), want (%q, %v, %q, %v)",
+				t.Fatalf("classifyReadmeRepoURLForEndpoint(%q, %q) = (%q, %v, %q, %v), want (%q, %v, %q, %v)",
 					tt.in, tt.endpoint, repo, isDataset, revision, ok, tt.wantRepo, tt.wantDataset, tt.wantRev, tt.wantOK)
 			}
 		})

@@ -119,18 +119,6 @@ func (m *JobManager) captureWriteDecisionLocked() writeDecisionSnapshot {
 	return s
 }
 
-func (m *JobManager) captureWriteDecision() writeDecisionSnapshot {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.captureWriteDecisionLocked()
-}
-
-func (m *JobManager) writeDecisionChangeChannel() <-chan struct{} {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.writeDecisionChanged
-}
-
 func (m *JobManager) writeDecisionUnchanged(s writeDecisionSnapshot) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -237,10 +225,6 @@ func (a *cacheWriteAttempt) Close() {
 	}
 }
 
-func decisionJobKey(j *Job) string {
-	return decisionDescriptorKey(decisionJob(j))
-}
-
 func decisionDescriptorKey(d writeDecisionJob) string {
 	b, _ := json.Marshal(struct {
 		ID, Repo, Revision, Output, Hub, Local, LocalRepo string
@@ -319,15 +303,6 @@ func (a *cacheWriteAttempt) CollectSnapshot(s writeDecisionSnapshot) {
 		seen[key] = struct{}{}
 		a.collectDescriptor(activity.job)
 	}
-}
-
-// Collect builds each semantic job's writable namespace once, independent
-// of target count. It is safe to call only on the attempt-local job copies.
-func (a *cacheWriteAttempt) Collect(job *Job) {
-	if a == nil || job == nil {
-		return
-	}
-	a.collectDescriptor(decisionJob(job))
 }
 
 func (a *cacheWriteAttempt) collectDescriptor(descriptor writeDecisionJob) {

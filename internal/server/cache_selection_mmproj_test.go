@@ -436,17 +436,17 @@ func TestSelectedDeleteMMProjWriterAdmissionStaysConservative(t *testing.T) {
 	writeSelectionFile(t, repoDir, "model-Q4_K_M.gguf")
 	target := filepath.Join(repoDir, "mmproj-F32.gguf")
 	job := &Job{ID: "quant-writer", Repo: "owner/model", OutputDir: root, LocalDir: root, Filters: []string{"q4_k_m"}, Status: JobStatusQueued, starting: true}
-	if !jobMayWriteSelectedPath(job, target) {
+	if !jobMayWriteSelectedPaths(job, []string{target}, inventoryWritableNamespace) {
 		t.Fatal("unknown-plan quant-only writer was not kept conservative for a companion")
 	}
 	job.Filters = []string{"model-Q4_K_M.gguf"}
-	if !jobMayWriteSelectedPath(job, target) {
+	if !jobMayWriteSelectedPaths(job, []string{target}, inventoryWritableNamespace) {
 		t.Fatal("path-scoped writer was not kept conservative")
 	}
 	alias := filepath.Join(repoDir, "alias")
 	symlinkOrSkip(t, repoDir, alias)
 	job.Filters = []string{"q4_k_m"}
-	if !jobMayWriteSelectedPath(job, filepath.Join(alias, "mmproj-F32.gguf")) {
+	if !jobMayWriteSelectedPaths(job, []string{filepath.Join(alias, "mmproj-F32.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("aliased quant writer was not kept conservative")
 	}
 }

@@ -408,26 +408,18 @@ var readmeReservedModelRoutes = map[string]struct{}{
 	"terms":         {},
 }
 
-// classifyReadmeRepoURL recognizes canonical model/dataset repository views on
-// the configured Hugging Face endpoint. Only repository roots and revision
-// tree views are internal: blob/resolve/raw URLs address a file (or a
-// README-relative asset), so they keep their external/new-tab behavior. A tree
-// view is internal only when its revision is exactly one path segment after
-// "tree"; a raw multi-segment path such as /tree/refs/pr/1 would otherwise be
-// truncated into a wrong revision, so it stays external. An encoded slash
-// (%2F) inside that segment still decodes to a slash within one revision.
-// Reserved Hub pages (papers, docs, settings, ...) and links on any other host
-// are deliberately not internal. When the configured endpoint includes a path
-// prefix (for example https://mirror.example/hf), the prefix is stripped
-// boundary-safely before the repository path is parsed.
-func classifyReadmeRepoURL(rawURL, endpointBase string) (repo string, isDataset bool, revision string, ok bool) {
-	endpoint, ok := parseReadmeEndpoint(endpointBase)
-	if !ok {
-		return "", false, "", false
-	}
-	return classifyReadmeRepoURLForEndpoint(rawURL, endpoint)
-}
-
+// classifyReadmeRepoURLForEndpoint recognizes canonical model/dataset
+// repository views on the parsed Hugging Face endpoint. Only repository roots
+// and revision tree views are internal: blob/resolve/raw URLs address a file
+// (or an README-relative asset), so they keep their external/new-tab behavior.
+// A tree view is internal only when its revision is exactly one path segment
+// after "tree"; a raw multi-segment path such as /tree/refs/pr/1 would
+// otherwise be truncated into a wrong revision, so it stays external. An
+// encoded slash (%2F) inside that segment still decodes to a slash within one
+// revision. Reserved Hub pages (papers, docs, settings, ...) and links on any
+// other host are deliberately not internal. When the configured endpoint
+// includes a path prefix (for example https://mirror.example/hf), the prefix
+// is stripped boundary-safely before the repository path is parsed.
 func classifyReadmeRepoURLForEndpoint(rawURL string, endpoint readmeEndpointInfo) (repo string, isDataset bool, revision string, ok bool) {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {

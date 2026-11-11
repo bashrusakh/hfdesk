@@ -426,7 +426,9 @@ func TestRestartRecollectsAfterTransientRealRunIsRemoved(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("restart attempt did not reach its controlled off-lock inventory")
 	}
-	before := m.captureWriteDecision()
+	m.mu.RLock()
+	before := m.captureWriteDecisionLocked()
+	m.mu.RUnlock()
 	candidateProbe, err := captureWriteIdentityProbe(candidateBase, true)
 	if err != nil {
 		t.Fatalf("capture stable candidate namespace: %v", err)
@@ -475,7 +477,9 @@ func TestRestartRecollectsAfterTransientRealRunIsRemoved(t *testing.T) {
 			t.Fatalf("selected-delete target probe changed during unrelated run: path=%q before=%+v after=%+v err=%v", path, expected, current, probeErr)
 		}
 	}
-	after := m.captureWriteDecision()
+	m.mu.RLock()
+	after := m.captureWriteDecisionLocked()
+	m.mu.RUnlock()
 	before.epoch = after.epoch
 	if !reflect.DeepEqual(before, after) {
 		t.Fatalf("transient run did not return manager decision state to its initial shape except history:\nbefore=%#v\nafter=%#v", before, after)

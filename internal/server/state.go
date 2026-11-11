@@ -58,18 +58,14 @@ func saveJobsStateLocked(path string, jobs []*Job) error {
 	return replaceJobsStateFile(path, data, defaultStateFileOps{})
 }
 
-// LoadJobsState reads jobs_state.json. Returns empty slice (not error) if the
-// file does not exist yet.
-func LoadJobsState() ([]*Job, error) {
-	return loadJobsState(JobsStatePath())
-}
-
 func saveJobsState(path string, jobs []*Job) error {
 	stateMu.Lock()
 	defer stateMu.Unlock()
 	return saveJobsStateLocked(path, jobs)
 }
 
+// loadJobsState reads jobs_state.json. Returns empty slice (not error) if the
+// file does not exist yet.
 func loadJobsState(path string) ([]*Job, error) {
 	stateMu.Lock()
 	defer stateMu.Unlock()

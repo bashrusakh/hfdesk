@@ -1323,16 +1323,6 @@ func hasLocalWeightFile(dir string, excluded []string) bool {
 	return found
 }
 
-// cacheQuantLabel extracts the quantisation token from a GGUF filename
-// (e.g. "Q4_K_M" from "model-Q4_K_M.gguf") and returns it in a
-// canonical, dash-free uppercase form ("Q4_K_M", or "UD_Q4_K_M" for
-// un-distilled variants). Returns "" if no complete quant token is
-// present. The classifier is owned by pkg/smartdl so cache metadata,
-// selection, and download planning cannot diverge.
-func cacheQuantLabel(name string) string {
-	return smartdl.GGUFQuantType(name, name)
-}
-
 // isCacheMMProjFile reports whether a GGUF filename is an mmproj companion
 // (clip/projector for multimodal models). The artifact-role rule has a single
 // owner in pkg/smartdl, where the "vision_encoder" role and the known naming
