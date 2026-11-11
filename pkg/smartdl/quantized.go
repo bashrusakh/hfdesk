@@ -339,33 +339,6 @@ func estimateVRAM(hiddenSize, numLayers, bits int) int64 {
 	return vram
 }
 
-func IsGPTQ(info *QuantizedInfo) bool {
-	return info.Method == "gptq"
-}
-
-func IsAWQ(info *QuantizedInfo) bool {
-	return info.Method == "awq"
-}
-
-func IsEXL2(info *QuantizedInfo) bool {
-	return info.Method == "exl2"
-}
-
-// VRAMHuman returns VRAM estimate as human-readable string.
-func VRAMHuman(info *QuantizedInfo) string {
-	return humanSize(info.EstimatedVRAM)
-}
-
-// SupportsBackend checks if a specific backend is compatible.
-func SupportsBackend(info *QuantizedInfo, backend string) bool {
-	for _, b := range info.Backends {
-		if b == backend {
-			return true
-		}
-	}
-	return false
-}
-
 // QuantizedToSelectableItems converts quantized model info to SelectableItems.
 // For GPTQ/AWQ, there's typically only one version, so this shows informational items.
 func QuantizedToSelectableItems(info *QuantizedInfo, files []FileInfo) []SelectableItem {

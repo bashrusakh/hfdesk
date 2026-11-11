@@ -161,7 +161,7 @@ func TestGGUFUnderscoreDelimitedSplitArtifactsKeepQuantIdentity(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	defer srv.Close()
-	analyzed, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).Analyze(context.Background(), "owner/repo", false)
+	analyzed, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(context.Background(), "owner/repo", false, "main")
 	if err != nil {
 		t.Fatalf("public analyzer: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestGGUFArtifactIdentityIsIndependentOfQuantLabel(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	defer srv.Close()
-	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).Analyze(context.Background(), "owner/repo", false)
+	info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(context.Background(), "owner/repo", false, "main")
 	if err != nil {
 		t.Fatalf("public analyzer: %v", err)
 	}

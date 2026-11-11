@@ -129,7 +129,7 @@ func TestAnalyzeExplicitNamespace(t *testing.T) {
 		defer hub.Close()
 		analyzer := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL})
 
-		info, err := analyzer.Analyze(context.Background(), repo, false)
+		info, err := analyzer.AnalyzeWithRevision(context.Background(), repo, false, "main")
 		if info != nil || !errors.Is(err, ErrBothExist) {
 			t.Fatalf("info = %v, error = %v; want ErrBothExist", info, err)
 		}
@@ -252,7 +252,7 @@ func TestAnalyzeDatasetProbeDegradation(t *testing.T) {
 			hub, datasetTrees := newProbeHub(t, tc.probe)
 
 			info, err := NewAnalyzer(AnalyzerOptions{Endpoint: hub.URL, HTTPClient: hub.Client()}).
-				Analyze(context.Background(), "owner/probe", false)
+				AnalyzeWithRevision(context.Background(), "owner/probe", false, "main")
 			if err != nil || info == nil {
 				t.Fatalf("info = %v, error = %v; %s", info, err, tc.infoWant)
 			}
@@ -290,7 +290,7 @@ func TestAnalyzeDatasetProbeDegradation(t *testing.T) {
 		info, err := awaitBudgetedAnalysis(t, testBudget, metadataBudgetSlack, metadataBudgetWatchdogSlack, "",
 			func(ctx context.Context) (*RepoInfo, error) {
 				return NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).
-					Analyze(ctx, "owner/model", false)
+					AnalyzeWithRevision(ctx, "owner/model", false, "main")
 			})
 
 		if err != nil || info == nil {
@@ -325,7 +325,7 @@ func TestAnalyzeDatasetProbeDegradation(t *testing.T) {
 		done := make(chan result, 1)
 		go func() {
 			info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).
-				Analyze(ctx, "owner/model", false)
+				AnalyzeWithRevision(ctx, "owner/model", false, "main")
 			done <- result{info, err}
 		}()
 

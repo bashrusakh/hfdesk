@@ -96,7 +96,7 @@ func TestAnalyze_StructuralPaginationClassification(t *testing.T) {
 						}))
 						defer srv.Close()
 						a := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client(), Token: "fake-token"})
-						info, err := a.Analyze(context.Background(), "owner/repo", mode == "dataset")
+						info, err := a.AnalyzeWithRevision(context.Background(), "owner/repo", mode == "dataset", "main")
 						if mode == "optional" {
 							if err != nil || info == nil || info.IsDataset || info.FileCount != 1 || info.Files[0].Path != "opposite.txt" {
 								t.Errorf("optional probe: info = %v, error = %v; want successful model", info, err)
@@ -165,7 +165,7 @@ func TestAnalyze_NamespaceFallbackPreserved(t *testing.T) {
 				}}
 				defer transport.CloseIdleConnections()
 				a := NewAnalyzer(AnalyzerOptions{Endpoint: endpoint, HTTPClient: &http.Client{Transport: transport}})
-				info, err := a.Analyze(context.Background(), "owner/repo", false)
+				info, err := a.AnalyzeWithRevision(context.Background(), "owner/repo", false, "main")
 				switch {
 				case modelStatus == 403:
 					if info != nil || err == nil || !strings.Contains(err.Error(), "forbidden") {
@@ -210,7 +210,7 @@ func TestAnalyze_TransportPort401IsNotAuthorization(t *testing.T) {
 		HTTPClient: &http.Client{Transport: transport},
 	})
 
-	info, err := a.Analyze(context.Background(), "owner/repo", false)
+	info, err := a.AnalyzeWithRevision(context.Background(), "owner/repo", false, "main")
 	if info != nil || err == nil {
 		t.Fatalf("info = %v, error = %v; want transport failure", info, err)
 	}
@@ -237,7 +237,7 @@ func TestAnalyze_TransportDiagnosticsDoNotTriggerNamespaceFallback(t *testing.T)
 				return nil, errors.New(diagnostic)
 			})}
 			a := NewAnalyzer(AnalyzerOptions{Endpoint: "https://hub.test", HTTPClient: client})
-			info, err := a.Analyze(context.Background(), "owner/repo", false)
+			info, err := a.AnalyzeWithRevision(context.Background(), "owner/repo", false, "main")
 			if info != nil || err == nil {
 				t.Fatalf("info = %v, error = %v; want original transport failure", info, err)
 			}
@@ -332,7 +332,7 @@ func TestAnalyze_PaginationOriginBoundary(t *testing.T) {
 					}))
 					defer srv.Close()
 					a := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client(), Token: token})
-					info, err := a.Analyze(context.Background(), "owner/repo", dataset)
+					info, err := a.AnalyzeWithRevision(context.Background(), "owner/repo", dataset, "main")
 					wantReqs, wantOpposite := int64(2), int64(0)
 					if strings.HasPrefix(form, "foreign") {
 						wantReqs = 1
@@ -392,7 +392,7 @@ func TestAnalyze_CrossOriginDirectoryFailsWholeAnalysis(t *testing.T) {
 					}))
 					defer srv.Close()
 					a := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client(), Token: token})
-					info, err := a.Analyze(context.Background(), "owner/repo", dataset)
+					info, err := a.AnalyzeWithRevision(context.Background(), "owner/repo", dataset, "main")
 					if err == nil || err.Error() != "fetch file tree: hubtree: cross-origin next pagination target" || info != nil {
 						t.Errorf("info = %v, error = %v; want whole-analysis failure", info, err)
 					}
@@ -716,7 +716,7 @@ func TestAnalyze_TokenMetadataPagination(t *testing.T) {
 				}))
 				defer srv.Close()
 				a := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()})
-				info, err := a.Analyze(context.Background(), "owner/repo", dataset)
+				info, err := a.AnalyzeWithRevision(context.Background(), "owner/repo", dataset, "main")
 				if err != nil {
 					t.Fatalf("Analyze: %v", err)
 				}
@@ -815,7 +815,7 @@ func TestAnalyze_StalledTreePageFailsWithinPageFetchBudget(t *testing.T) {
 			"unbounded tree-page body read or a starved runner",
 			func(ctx context.Context) (*RepoInfo, error) {
 				return NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).
-					Analyze(ctx, "owner/repo", false)
+					AnalyzeWithRevision(ctx, "owner/repo", false, "main")
 			})
 
 		if info != nil || err == nil {
@@ -853,7 +853,7 @@ func TestAnalyze_StalledTreePageFailsWithinPageFetchBudget(t *testing.T) {
 		// failure, never re-shaped into a budget expiry.
 		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 		defer cancel()
-		info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).Analyze(ctx, "owner/repo", false)
+		info, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(ctx, "owner/repo", false, "main")
 		if info != nil || err == nil {
 			t.Fatalf("info=%v err=%v, want the caller-deadline failure", info, err)
 		}
