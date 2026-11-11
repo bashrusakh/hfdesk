@@ -2361,10 +2361,8 @@ async function loadRepositoryDetails(entry) {
   };
   let fileTreeBoundPanel = null;
 
-  // One view renders at most FILE_TREE_RENDER_CAP rows plus one "show more"
-  // row stating the hidden count; above FILE_TREE_AUTO_COLLAPSE_FILES files
-  // a revision opens with every directory collapsed (root rows and root
-  // files visible), smaller revisions keep today's fully expanded look.
+  // A view fitting FILE_TREE_RENDER_CAP rows renders exactly as it always did; larger views are capped plus one honest "show more" row.
+  // FILE_TREE_AUTO_COLLAPSE_FILES only picks the opening expansion state (every directory collapsed above it, expanded at or below).
   const FILE_TREE_RENDER_CAP = 300;
   const FILE_TREE_AUTO_COLLAPSE_FILES = 1000;
 
@@ -2730,23 +2728,13 @@ async function loadRepositoryDetails(entry) {
       const toggle = target?.closest?.('[data-toggle]');
       if (toggle) {
         const path = toggle.dataset.toggle;
-        const dirName = `${path.slice(path.lastIndexOf('/') + 1)}/`;
-        if (!fileTreeState.collapsed.has(path)) {
-          fileTreeState.collapsed.add(path);
-          // Targeted update: no full re-render, so the caret keeps its focus.
-          const children = panel.querySelector(`[data-children="${CSS.escape(path)}"]`);
-          if (children) children.innerHTML = '';
-          toggle.textContent = '▸';
-          toggle.setAttribute('aria-expanded', 'false');
-          toggle.setAttribute('aria-label', `Expand ${dirName}`);
-        } else {
-          fileTreeState.collapsed.delete(path);
-          // Descendants were never rendered: rebuild the bounded view, then
-          // hand focus back to the caret for the keyboard user.
-          refreshFileTreeRows();
-          const caret = panel.querySelector(`[data-toggle="${CSS.escape(path)}"]`);
-          if (typeof caret?.focus === 'function') caret.focus();
-        }
+        if (fileTreeState.collapsed.has(path)) fileTreeState.collapsed.delete(path);
+        else fileTreeState.collapsed.add(path);
+        // Both directions rebuild through the bounded renderer: expand creates the lazy
+        // rows, collapse re-allocates the budget so the one "show more" row stays exact.
+        refreshFileTreeRows();
+        const caret = panel.querySelector(`[data-toggle="${CSS.escape(path)}"]`);
+        if (typeof caret?.focus === 'function') caret.focus();
         return;
       }
       if (target?.id === 'fileTreeClear') {

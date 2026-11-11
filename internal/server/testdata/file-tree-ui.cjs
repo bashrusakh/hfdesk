@@ -361,8 +361,10 @@ function makeDirTree(dirCount, filesPerDir, rootFiles = 0) {
   return files;
 }
 
-// Simulates activating a rendered caret: the browser focuses the caret the
-// user activated before the click reaches the panel handler.
+// Simulates activating a rendered caret: the browser moves keyboard focus
+// to the caret the user activated, and the handler must keep it there — a
+// rows rebuild drops focus, so nothing is pre-seeded here and only a real
+// production focus() call can leave focusedToggle set afterwards.
 function caretClick(path) {
   const caret = {
     dataset: { toggle: path },
@@ -370,7 +372,6 @@ function caretClick(path) {
     setAttribute() {},
     closest(selector) { return selector === '[data-toggle]' ? caret : null; }
   };
-  focusedToggle = path;
   firePanel('click', caret);
   return caret;
 }
@@ -718,11 +719,12 @@ scenario('a large file tree renders with one index and one sort per node', () =>
         `${label}: the expanded view's hidden count is exact`);
     }
 
-    // Collapsing is a targeted update: the descendant rows go away without a
-    // rows-container rewrite, and the view stays bounded.
+    // Collapsing goes through the bounded renderer too: the budget is
+    // re-allocated and the view stays capped, with focus back on the caret.
     const beforeCollapse = rowsRewrites;
     caretClick('dir0000');
-    eq(rowsRewrites, beforeCollapse, `${label}: collapsing does not rewrite the rows container`);
+    eq(rowsRewrites, beforeCollapse + 1, `${label}: collapsing rebuilds the bounded view`);
+    eq(focusedToggle, 'dir0000', `${label}: the caret keeps keyboard focus across the collapse rebuild`);
     const collapsedHtml = filesPanelNode.innerHTML;
     eq(countMatches(collapsedHtml, /data-file="/g), 0,
       `${label}: collapsing removes every descendant row`);
@@ -750,11 +752,12 @@ scenario('a large file tree renders with one index and one sort per node', () =>
   sample('8000 files / 800 dirs', 800, 10);
 });
 
-scenario('the auto-collapse threshold is documented and honored', () => {
+scenario('the auto-collapse threshold picks the opening expansion state', () => {
   resetWorld();
   eq(AUTO_COLLAPSE, 1000, 'the documented auto-collapse threshold is 1000 files');
 
-  // At the threshold the fully expanded look is preserved exactly.
+  // The threshold picks only the opening expansion state (at it: every
+  // directory starts expanded); the row cap bounds rendered rows either way.
   const atLimit = setAnalysis(makeDirTree(100, 10));
   eq(atLimit.files.length, AUTO_COLLAPSE, 'the fixture sits exactly at the threshold');
   eq(ui.fileTreeState.collapsed.size, 0, 'a revision at the threshold keeps every directory expanded');
@@ -833,11 +836,12 @@ scenario('expanding a huge directory stays within the row cap', () => {
     'the show-more row states the exact hidden count');
   assertChecksMatchModel('after expanding a fully selected directory');
 
-  // Collapse: targeted row removal, bounded result, model untouched.
+  // Collapse: the bounded renderer re-allocates the budget, focus returns to
+  // the caret, and the model is untouched.
   const beforeCollapse = rowsRewrites;
   caretClick('dir0000');
-  eq(rowsRewrites, beforeCollapse, 'collapsing does not rewrite the rows container');
-  eq(focusedToggle, 'dir0000', 'the caret keeps keyboard focus through the targeted collapse');
+  eq(rowsRewrites, beforeCollapse + 1, 'collapsing rebuilds the bounded view');
+  eq(focusedToggle, 'dir0000', 'the caret keeps keyboard focus across the collapse rebuild');
   eq(countMatches(filesPanelNode.innerHTML, /data-file="/g), 0, 'collapsing removes every descendant row');
   lte(countMatches(filesPanelNode.innerHTML, rowPattern) + countMatches(filesPanelNode.innerHTML, morePattern),
     ROW_CAP + 1, 'the collapsed view stays bounded');
@@ -865,6 +869,69 @@ scenario('a search matching thousands is capped and reports its total', () => {
   eq(countMatches(filesPanelNode.innerHTML, /data-file="/g), 0, 'clearing the filter restores the collapsed view');
   lte(countMatches(filesPanelNode.innerHTML, rowPattern) + countMatches(filesPanelNode.innerHTML, morePattern),
     ROW_CAP + 1, 'the restored view stays bounded');
+});
+
+// F1 regression: the cap's "show more" row can be hosted inside a directory's
+// children (the budget first runs out there) and its hidden count spans later
+// siblings too. Collapsing that host must not delete the row or strand the
+// siblings: the bounded renderer re-allocates the budget instead.
+scenario('collapsing the truncation host keeps one honest show-more row (F1)', () => {
+  resetWorld();
+  // 750 files = 3 root dirs × 250 — below the auto-collapse threshold, so the
+  // tree opens fully expanded; 753 rows exceed the cap, which alone truncates.
+  // Emission order: dir0000 (251 rows), then dir0001's row and its first 48
+  // children hit the cap, so the show-more row is hosted inside dir0001 and
+  // its count covers dir0001's remainder plus all of dir0002.
+  const analysis = setAnalysis(makeDirTree(3, 250));
+  eq(analysis.files.length, 750, 'the fixture sits below the auto-collapse threshold');
+  eq(ui.fileTreeState.collapsed.size, 0, 'the fixture opens fully expanded');
+  ui.renderFilesTab(analysis);
+  const initial = filesPanelNode.innerHTML;
+  eq(countMatches(initial, rowPattern), ROW_CAP, 'the initial view is capped at the row cap');
+  eq(countMatches(initial, morePattern), 1, 'the initial view carries exactly one show-more row');
+  match(initial, new RegExp(`… ${3 * 251 - ROW_CAP} more not shown`),
+    'the initial hidden count spans dir0001’s remainder and all of dir0002');
+  eq(countMatches(initial, /data-file="dir0002\//g), 0, 'dir0002 starts hidden behind the cap');
+  match(childrenStub('dir0001').innerHTML, /file-tree-more/,
+    'the show-more row is hosted inside dir0001’s children');
+
+  // Collapsing dir0001 must re-allocate the budget: dir0002 becomes visible
+  // again, exactly one show-more row survives with the new exact count, and
+  // the activated caret keeps keyboard focus.
+  const before = rowsRewrites;
+  caretClick('dir0001');
+  const collapsed = filesPanelNode.innerHTML;
+  eq(countMatches(collapsed, morePattern), 1, 'collapsing the host keeps exactly one show-more row');
+  eq(rowsRewrites, before + 1, 'collapsing rebuilds the bounded view');
+  eq(countMatches(collapsed, /data-file="dir0002\//g), 47, 'dir0002 rows become visible again (budget re-allocated)');
+  match(collapsed, new RegExp(`… ${251 + 1 + 251 - ROW_CAP} more not shown`),
+    'the surviving show-more row states the exact remaining count');
+  eq(countMatches(collapsed, rowPattern), ROW_CAP, 'the collapsed view stays at the cap');
+  lte(countMatches(collapsed, rowPattern) + countMatches(collapsed, morePattern),
+    ROW_CAP + 1, 'the collapsed view never exceeds cap+1 rows');
+  eq(focusedToggle, 'dir0001', 'the caret keeps keyboard focus across the collapse rebuild');
+  assertChecksMatchModel('after collapsing the truncation host');
+
+  // Collapse back/expand interplay leaves the invariant intact.
+  caretClick('dir0001');
+  const reexpanded = filesPanelNode.innerHTML;
+  eq(countMatches(reexpanded, rowPattern), ROW_CAP, 're-expanding returns to the capped view');
+  eq(countMatches(reexpanded, morePattern), 1, 're-expanding keeps exactly one show-more row');
+  match(reexpanded, new RegExp(`… ${3 * 251 - ROW_CAP} more not shown`),
+    're-expanding restores the original hidden count');
+  eq(countMatches(reexpanded, /data-file="dir0002\//g), 0, 're-expanding hides dir0002 behind the cap again');
+  eq(focusedToggle, 'dir0001', 'the caret keeps keyboard focus across the expand rebuild');
+  assertChecksMatchModel('after re-expanding the truncation host');
+
+  caretClick('dir0001');
+  const recollapsed = filesPanelNode.innerHTML;
+  eq(countMatches(recollapsed, morePattern), 1, 'collapsing again keeps exactly one show-more row');
+  eq(countMatches(recollapsed, /data-file="dir0002\//g), 47, 'collapsing again re-allocates the budget to dir0002');
+  match(recollapsed, new RegExp(`… ${251 + 1 + 251 - ROW_CAP} more not shown`),
+    'the count is exact again after the second collapse');
+  eq(countMatches(recollapsed, rowPattern), ROW_CAP, 'the second collapse stays at the cap');
+  eq(focusedToggle, 'dir0001', 'focus survives the second collapse rebuild');
+  assertChecksMatchModel('after collapsing the truncation host again');
 });
 
 scenario('Download selected posts the exact strict selection', async () => {
