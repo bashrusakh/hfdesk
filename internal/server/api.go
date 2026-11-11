@@ -5,9 +5,11 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -1049,6 +1051,13 @@ type CachedRepoInfo struct {
 	HasMMProj      bool             `json:"hasMMProj,omitempty"`
 	MMProjFiles    []string         `json:"mmprojFiles,omitempty"`
 	Capabilities   []string         `json:"capabilities,omitempty"`
+	// WholeFolderDeletable reports, for Local sources only, whether the
+	// folder holds exactly one model's files and may be deleted as one
+	// whole-folder unit; ineligible folders carry WholeFolderDeleteReason.
+	// Other sources leave both fields unset (a pointer keeps an explicit
+	// false distinguishable from an absent field).
+	WholeFolderDeletable    *bool  `json:"wholeFolderDeletable,omitempty"`
+	WholeFolderDeleteReason string `json:"wholeFolderDeleteReason,omitempty"`
 }
 
 // CachedFileInfo represents a file in the cache.
@@ -1168,15 +1177,17 @@ func localCacheRoots(cacheDir, localDir string, localScanDirs []string, download
 	cacheRoot := filepath.Clean(cacheDir)
 	localSkipSpecial := localDir != "" && pathIdentityKey(localDir) == pathIdentityKey(cacheRoot)
 
-	add(filepath.Join(cacheDir, "models"), "Friendly view", false)
-	add(localDir, "Local", localSkipSpecial)
+	// The source labels are also the whole-folder delete request's routing
+	// keys, so their spelling is defined once here.
+	add(filepath.Join(cacheDir, "models"), cacheSourceFriendlyView, false)
+	add(localDir, cacheSourceLocal, localSkipSpecial)
 	for _, dir := range localScanDirs {
-		add(dir, "Local", false)
+		add(dir, cacheSourceLocal, false)
 	}
 	for _, dir := range routeDirs(downloadRoutes) {
-		add(dir, "Local", false)
+		add(dir, cacheSourceLocal, false)
 	}
-	add(cacheDir, "Local", true)
+	add(cacheDir, cacheSourceLocal, true)
 	return roots
 }
 
@@ -1457,10 +1468,27 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 		}
 		identities[bkey] = append(identities[bkey], &identity{fi, false})
 	}
+	// Whole-folder eligibility is computed for Local sources along the same
+	// walk and the same excluded-subroot view the listing already uses, so
+	// the flag and the delete-time classifier see the same file set. The
+	// collected folder-relative paths go to the folder-level classifier in
+	// one call: per-file reductions, the pipeline-key rule for Diffusers
+	// component directories, and fail-closed unclassifiable names.
+	classifyFolder := source == cacheSourceLocal
+	folderPaths := []string{}
+	folderRelErr := false
 
 	err := walkLocalCacheRepo(repoDir, excluded, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
+		}
+		if classifyFolder {
+			relPath, relErr := filepath.Rel(repoDir, path)
+			if relErr != nil {
+				folderRelErr = true
+			} else {
+				folderPaths = append(folderPaths, relPath)
+			}
 		}
 		fileInfo := info
 		identityPath := path
@@ -1535,7 +1563,7 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 	}
 	ggufMeta := collectCacheGGUFMetadata(repoDir, includeFiles, excluded)
 
-	return &CachedRepoInfo{
+	info := &CachedRepoInfo{
 		Repo:           owner + "/" + name,
 		Owner:          owner,
 		Name:           name,
@@ -1552,7 +1580,56 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 		HasMMProj:      ggufMeta.HasMMProj,
 		MMProjFiles:    ggufMeta.MMProjFiles,
 		Capabilities:   ggufMeta.Capabilities,
-	}, nil
+	}
+	if classifyFolder {
+		keys, unclassified := smartdl.SingleModelFolderKeys(folderPaths)
+		unclassified = unclassified || folderRelErr
+		// The nested-boundary factor is repo-scoped: only a configured root
+		// nested UNDER THIS folder makes it ineligible, mirroring what the
+		// DELETE endpoint's selectedDeleteExclusions computes for this repo —
+		// a configured root under a sibling folder never affects this flag.
+		nestedRepoRoot := false
+		repoKey, absErr := filepath.Abs(repoDir)
+		if absErr != nil {
+			nestedRepoRoot = true // fail closed
+		} else {
+			repoKey = pathIdentityKey(repoKey)
+			for _, sub := range excluded {
+				if withinLocalRoot(repoKey, sub) {
+					nestedRepoRoot = true
+					break
+				}
+			}
+		}
+		reason := singleModelFolderReason(len(keys), unclassified, nestedRepoRoot)
+		eligible := reason == ""
+		info.WholeFolderDeletable = &eligible
+		if !eligible {
+			info.WholeFolderDeleteReason = reason
+		}
+	}
+	return info, nil
+}
+
+// singleModelFolderReason returns why a local folder is not exactly one
+// model's folder, or "" when it is. It is deliberately fail-closed in the
+// established refusal direction: an unclassified weight name, a folder with
+// no recognized model weight files, a nested configured scan-root boundary,
+// or two or more distinct model keys all refuse — a shared pile is never a
+// whole-folder target, and per-group deletion remains the way to remove one
+// variant from it.
+func singleModelFolderReason(keyCount int, unclassified, nestedRoot bool) string {
+	switch {
+	case unclassified:
+		return "A weight file name in this folder could not be classified; whole-folder deletion is refused"
+	case nestedRoot:
+		return "A configured scan-root boundary is nested inside this model folder; whole-folder deletion is refused"
+	case keyCount == 0:
+		return "No recognizable model weight files were found in this folder"
+	case keyCount > 1:
+		return "This folder contains files of multiple models; use per-group deletion to remove one variant"
+	}
+	return ""
 }
 
 // scanLocalCachedRepos walks every local cache root (Friendly view,
@@ -2097,6 +2174,68 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		repoType = hfdownloader.RepoTypeDataset
 	}
 
+	// Optional whole-model-folder scope for local sources. An absent or empty
+	// body keeps the established Hub-repository behavior byte-for-byte: the
+	// request discriminator never changes how the legacy path executes.
+	var delReq cacheDeleteRequest
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&delReq); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+			return
+		}
+	}
+	if delReq.Source != "" || delReq.Path != "" {
+		if delReq.Source == "" || delReq.Path == "" {
+			writeError(w, http.StatusBadRequest, "Invalid deletion request", "source and path are required together")
+			return
+		}
+		if repoType != hfdownloader.RepoTypeModel {
+			writeError(w, http.StatusBadRequest, "Invalid deletion scope", "Whole-folder deletion is only available for models")
+			return
+		}
+		switch delReq.Source {
+		case cacheSourceLocal:
+			s.handleLocalModelFolderDelete(w, r, repo, parts, delReq)
+			return
+		case cacheSourceFriendlyView:
+			cfg := s.snapshotConfig()
+			cache := cfg.cache()
+			rd, err := cache.Repo(repo, hfdownloader.RepoTypeModel)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "Invalid repository ID", err.Error())
+				return
+			}
+			absCacheDir, err := filepath.Abs(cfg.cacheRoot())
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "Failed to resolve cache path", err.Error())
+				return
+			}
+			absFriendly, err := filepath.Abs(rd.FriendlyPath())
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "Failed to resolve path", err.Error())
+				return
+			}
+			clientPath, err := filepath.Abs(delReq.Path)
+			if err != nil || pathIdentityKey(clientPath) != pathIdentityKey(absFriendly) {
+				writeError(w, http.StatusBadRequest, "Invalid path", "Path does not match this model's friendly view folder")
+				return
+			}
+			if _, hubErr := os.Lstat(rd.Path()); hubErr != nil && os.IsNotExist(hubErr) {
+				// Friendly-only presence: the friendly tree is the model's
+				// complete cache and is removed by the friendly leg's own
+				// safety layers below.
+				s.handleFriendlyViewOnlyCacheDelete(w, r, repo, parts, absCacheDir, absFriendly)
+				return
+			}
+			// The repository resolves as an HF cache item (or its Hub state
+			// cannot be established): the established Hub+friendly pair flow
+			// below applies unchanged, exactly like the HF-cache button.
+		default:
+			writeError(w, http.StatusBadRequest, "Invalid deletion scope", `Expected source "Local" or "Friendly view"`)
+			return
+		}
+	}
+
 	cfg := s.snapshotConfig()
 	cacheDir := cfg.cacheRoot()
 	cache := cfg.cache()
@@ -2241,6 +2380,336 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"message": fmt.Sprintf("Deleted %s from cache", repo),
 	})
+}
+
+// Source labels for cache listings. They double as the whole-folder delete
+// request's routing keys, so their spelling is defined once here.
+const (
+	cacheSourceLocal        = "Local"
+	cacheSourceFriendlyView = "Friendly view"
+)
+
+// cacheDeleteRequest is the optional JSON body that scopes
+// DELETE /api/cache/{owner}/{repo} to a whole model folder of a local source.
+// Source names the listing surface the confirmation was shown on; Path is the
+// exact folder Details displayed. The server never trusts Path: it only
+// matches it against folders it derives from its own registered roots or from
+// its own cache-repo derivation, and otherwise refuses.
+type cacheDeleteRequest struct {
+	Source string `json:"source"`
+	Path   string `json:"path"`
+}
+
+// handleLocalModelFolderDelete deletes the whole model folder a local-source
+// listing showed. The folder is the model unit. Every safety layer of the
+// established deletion paths applies here: strict repo-ID validation (layers
+// 1-4), registered-roots-only resolution, owner/model symlink-component
+// rejection through the anchored open, configured-descendant fail-closed
+// refusal, the in-process destructive window, cross-process exclusive
+// flat-realm tree admission over the model folder through
+// writeCacheDeleteAdmission, repeated SameFile binding rechecks, and a final
+// removal confined to an os.Root anchored at the folder's owner directory.
+// Partial removal answers with the established whole-repository
+// 200-with-errors shape instead of hiding the failure.
+func (s *Server) handleLocalModelFolderDelete(w http.ResponseWriter, r *http.Request, repo string, parts []string, delReq cacheDeleteRequest) {
+	if !hfdownloader.IsValidModelName(repo) || !filepath.IsLocal(repo) {
+		writeError(w, http.StatusBadRequest, "Invalid repository ID", "Path traversal not allowed")
+		return
+	}
+	// Keep the configured-root identity stable through the whole operation,
+	// exactly like the established selected-delete path: settings updates take
+	// the write lock and cannot retarget the folder mid-deletion.
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	cfg := s.config
+
+	clientPath, err := filepath.Abs(delReq.Path)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid path", "Path is not a configured local model folder")
+		return
+	}
+	clientKey := pathIdentityKey(clientPath)
+	candidate := ""
+	registered := false
+	for _, root := range localCacheRoots(cfg.cacheRoot(), cfg.LocalDir, cfg.LocalScanDirs, cfg.DownloadRoutes) {
+		// The listing's own rules decide which roots may present this folder
+		// as "Local": friendly-view roots route through their own branch, and
+		// skipped owners (reserved names such as hub/models under the cache
+		// root) are never repositories.
+		if root.Source != cacheSourceLocal || root.skipsOwner(parts[0]) {
+			continue
+		}
+		expected, absErr := filepath.Abs(filepath.Join(root.Path, parts[0], parts[1]))
+		if absErr == nil && pathIdentityKey(expected) == clientKey {
+			candidate = filepath.Join(root.Path, parts[0], parts[1])
+			registered = isRegisteredLocalSelectionRoot(cfg, root.Path)
+			break
+		}
+	}
+	if candidate == "" {
+		writeError(w, http.StatusBadRequest, "Invalid path", "Path is not a configured local model folder")
+		return
+	}
+	if !registered {
+		writeError(w, http.StatusConflict, "Location is not eligible for local deletion", "This location is not a currently configured local scan or download root")
+		return
+	}
+
+	// Anchored scope with symlink-component rejection and alias-race binding
+	// checks — the established selected-delete opener, unchanged.
+	repoRoot, physicalRepo, err := openSelectedLocalRepo(candidate, s.selectedDeleteHooks.beforeRootOpen)
+	if err != nil {
+		writeError(w, http.StatusConflict, "Selection is unsafe", err.Error())
+		return
+	}
+	defer repoRoot.Close()
+	if s.selectedDeleteHooks.afterRootOpen != nil {
+		s.selectedDeleteHooks.afterRootOpen()
+	}
+	opened, openedErr := repoRoot.Stat(".")
+	bound, boundErr := os.Stat(candidate)
+	if openedErr != nil || boundErr != nil || !os.SameFile(opened, bound) {
+		writeError(w, http.StatusConflict, "Selection is stale", "The configured location changed while deletion was being admitted")
+		return
+	}
+
+	// Configured-descendant protection with the established semantics: an
+	// unresolved or repo-owning boundary refuses (selectedDeleteExclusions
+	// returns !ok), and a configured root nested inside this folder also
+	// refuses, because removing the whole folder would remove that other
+	// registered root with it.
+	selected := &cacheSelectionLocation{ID: "local-folder", Source: cacheSourceLocal, Path: candidate, kind: "local"}
+	excluded, boundariesComplete := selectedDeleteExclusions(cfg, selected, physicalRepo, filepath.Dir(filepath.Dir(physicalRepo)))
+	if !boundariesComplete {
+		writeError(w, http.StatusConflict, "Location could not be verified", "A configured descendant boundary could not be safely resolved")
+		return
+	}
+	if len(excluded) > 0 {
+		writeError(w, http.StatusConflict, "Location could not be verified", "A configured scan-root boundary is nested inside this model folder; whole-folder deletion is refused")
+		return
+	}
+
+	// In-process destructive window over the whole folder: conflicts with any
+	// active or queued writer inside it and holds the dispatch gate, the same
+	// directory-scope primitive the whole-repository endpoint uses.
+	release, ok := s.jobs.beginCacheMutation(physicalRepo)
+	if !ok {
+		writeError(w, http.StatusConflict, "Repository is busy", "An active download or another cache operation is using this repository; retry when it finishes")
+		return
+	}
+	defer release()
+	if s.selectedDeleteHooks.afterReservation != nil {
+		s.selectedDeleteHooks.afterReservation()
+	}
+	opened, openedErr = repoRoot.Stat(".")
+	bound, boundErr = os.Stat(candidate)
+	if openedErr != nil || boundErr != nil || !os.SameFile(opened, bound) {
+		writeError(w, http.StatusConflict, "Selection is stale", "The configured location changed while deletion was being admitted")
+		return
+	}
+
+	// Cross-process admission against live writers in other processes sharing
+	// this local root: exclusive tree admission over the whole model folder —
+	// shared on ancestors, exclusive on the folder before any descent — so a
+	// flat writer under or above the tree, including one already admitted for
+	// a file inside it that does not exist yet, refuses with the established
+	// 409 family, and the ownerRoot-confined removal below runs inside the
+	// held tree lease. The lease scales with the tree's directories, not its
+	// files, and the tree path raises the ownership file-descriptor limit for
+	// its window the same way the cache twin does.
+	flatAdmission, err := hfdownloader.OpenFlatAdmission(r.Context(), "")
+	if err != nil {
+		writeCacheDeleteAdmission(w, err)
+		return
+	}
+	treeRelease, err := flatAdmission.AdmitTreeRemoval(r.Context(), physicalRepo)
+	if err != nil {
+		writeCacheDeleteAdmission(w, err)
+		return
+	}
+	defer treeRelease()
+
+	// Single-model gate (additive, fail-closed): the whole-folder unit is
+	// available only while the folder holds exactly one model's files. The
+	// classification runs under the held tree lease — admitted writers cannot
+	// change the contents — and refuses before anything is removed.
+	names, err := localFolderFileNames(repoRoot)
+	if err != nil {
+		writeError(w, http.StatusConflict, "Location could not be verified", err.Error())
+		return
+	}
+	keys, unclassified := smartdl.SingleModelFolderKeys(names)
+	if reason := singleModelFolderReason(len(keys), unclassified, false); reason != "" {
+		writeError(w, http.StatusConflict, "Folder is not a single model", reason)
+		return
+	}
+
+	ownerRoot, modelName, err := openLocalFolderOwner(repoRoot, physicalRepo)
+	if err != nil {
+		writeError(w, http.StatusConflict, "Selection is stale", err.Error())
+		return
+	}
+	defer ownerRoot.Close()
+	opened, openedErr = repoRoot.Stat(".")
+	bound, boundErr = os.Stat(candidate)
+	if openedErr != nil || boundErr != nil || !os.SameFile(opened, bound) {
+		writeError(w, http.StatusConflict, "Selection is stale", "The configured location changed while deletion was being admitted")
+		return
+	}
+
+	// The whole folder is the removal unit. The owner-anchored Root confines
+	// the recursive removal to this single entry of the validated owner
+	// directory: Root.RemoveAll unlinks symlink entries without following
+	// them and refuses any component that would escape the root.
+	if err := ownerRoot.RemoveAll(modelName); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"success": false, "message": "Model folder was only partially removed", "errors": []string{err.Error()}})
+		return
+	}
+	if _, err := ownerRoot.Lstat(modelName); err == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"success": false, "message": "Model folder was only partially removed", "errors": []string{"the model folder is still present after removal"}})
+		return
+	} else if !os.IsNotExist(err) {
+		writeJSON(w, http.StatusOK, map[string]any{"success": false, "message": "Model folder was only partially removed", "errors": []string{err.Error()}})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"message": fmt.Sprintf("Deleted the whole model folder for %s", repo),
+	})
+}
+
+// handleFriendlyViewOnlyCacheDelete removes the friendly-view tree of a model
+// whose Hub repository is absent, applying the established friendly leg's
+// safety layers: server-derived path only, cache containment, expected
+// structure, symlink rejection, resolved-path confinement, the in-process
+// destructive window, cache-owned tree admission, and safeDeleteFriendlyPath
+// for the removal itself. Partial removal answers with the established
+// 200-with-errors shape.
+func (s *Server) handleFriendlyViewOnlyCacheDelete(w http.ResponseWriter, r *http.Request, repo string, parts []string, absCacheDir, absFriendly string) {
+	friendlyInfo, err := os.Lstat(absFriendly)
+	if os.IsNotExist(err) {
+		writeError(w, http.StatusNotFound, "Repository not found in cache", repo)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to check path", err.Error())
+		return
+	}
+	if friendlyInfo.Mode()&os.ModeSymlink != 0 {
+		writeError(w, http.StatusBadRequest, "Invalid path", "Cannot delete symlinked directories")
+		return
+	}
+	if !friendlyInfo.IsDir() {
+		writeError(w, http.StatusBadRequest, "Invalid path", "Friendly view entry is not a directory")
+		return
+	}
+	absCacheDirWithSep := absCacheDir + string(filepath.Separator)
+	if !hfdownloader.PathInside(absCacheDir, absFriendly) || absFriendly == absCacheDir {
+		writeError(w, http.StatusBadRequest, "Invalid path", "Path outside cache directory")
+		return
+	}
+	rel, relErr := filepath.Rel(absCacheDir, absFriendly)
+	if relErr != nil || rel != filepath.Join("models", parts[0], parts[1]) {
+		writeError(w, http.StatusBadRequest, "Invalid path", "Path does not match expected cache structure")
+		return
+	}
+	realFriendly, err := filepath.EvalSymlinks(absFriendly)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid path", "Cannot resolve repository path safely")
+		return
+	}
+	if realFriendly != absFriendly && (!hfdownloader.PathInside(absCacheDir, realFriendly) || realFriendly == absCacheDir) {
+		writeError(w, http.StatusBadRequest, "Invalid path", "Resolved path outside cache directory")
+		return
+	}
+
+	release, ok := s.jobs.beginCacheMutation(absFriendly)
+	if !ok {
+		writeError(w, http.StatusConflict, "Repository is busy", "An active download or another cache operation is using this repository; retry when it finishes")
+		return
+	}
+	defer release()
+	admission, err := hfdownloader.OpenCacheAdmission(r.Context(), absCacheDir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to delete cache", err.Error())
+		return
+	}
+	friendlyRelease, err := admission.AdmitTreeRemoval(r.Context(), absFriendly)
+	if err != nil {
+		writeCacheDeleteAdmission(w, err)
+		return
+	}
+	defer friendlyRelease()
+
+	if err := safeDeleteFriendlyPath(absFriendly, absCacheDirWithSep); err != nil && !os.IsNotExist(err) {
+		writeJSON(w, http.StatusOK, map[string]any{"success": false, "message": "Friendly view removal failed", "errors": []string{err.Error()}})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"message": fmt.Sprintf("Deleted %s from cache", repo),
+	})
+}
+
+// openLocalFolderOwner anchors the validated model folder's owner directory
+// the same way openSelectedLocalRepo anchors the folder itself: open the
+// resolved path, then require the opened handle to match every observed
+// binding, so a swapped alias cannot retarget the final directory removal.
+// The returned Root confines RemoveAll to this single entry of the original
+// owner directory.
+func openLocalFolderOwner(repoRoot *os.Root, physicalRepo string) (*os.Root, string, error) {
+	ownerDir, name := filepath.Dir(physicalRepo), filepath.Base(physicalRepo)
+	ownerRoot, err := os.OpenRoot(ownerDir + string(filepath.Separator) + ".")
+	if err != nil {
+		return nil, "", fmt.Errorf("model folder owner could not be opened: %w", err)
+	}
+	opened, err := ownerRoot.Stat(".")
+	if err != nil {
+		ownerRoot.Close()
+		return nil, "", fmt.Errorf("model folder owner could not be inspected: %w", err)
+	}
+	bound, err := os.Stat(ownerDir)
+	if err != nil || !os.SameFile(opened, bound) {
+		ownerRoot.Close()
+		return nil, "", fmt.Errorf("model folder owner changed while deletion was being admitted")
+	}
+	entry, err := ownerRoot.Lstat(name)
+	if err != nil || !entry.IsDir() || entry.Mode()&os.ModeSymlink != 0 {
+		ownerRoot.Close()
+		return nil, "", fmt.Errorf("model folder changed while deletion was being admitted")
+	}
+	anchor, err := repoRoot.Stat(".")
+	if err != nil || !os.SameFile(entry, anchor) {
+		ownerRoot.Close()
+		return nil, "", fmt.Errorf("model folder changed while deletion was being admitted")
+	}
+	return ownerRoot, name, nil
+}
+
+// localFolderFileNames enumerates every non-directory entry's
+// folder-relative name (slash-separated, per the fs.WalkDir contract) inside
+// the admitted folder through the same rooted walk the selected-delete path
+// uses: directory opens stay anchored, symlinked directories are never
+// descended (their contents are also never removed), and any read failure
+// aborts the enumeration instead of yielding a partial list. The relative
+// path — not just the base name — feeds the single-model classifier, so
+// parent directories stay part of the key.
+func localFolderFileNames(root *os.Root) ([]string, error) {
+	var names []string
+	err := fs.WalkDir(localSelectionWalkFS{root: root}, ".", func(name string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if name == "." || entry.IsDir() {
+			return nil
+		}
+		names = append(names, name)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return names, nil
 }
 
 // writeCacheDeleteAdmission reports a refused or failed cache-tree admission before anything

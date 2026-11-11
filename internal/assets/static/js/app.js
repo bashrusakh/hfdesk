@@ -4290,6 +4290,18 @@ async function loadRepositoryDetails(entry) {
                 <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
               </svg>
               Delete entire model cache
+            </button>` : data.type === 'model' && data.source === 'Local' && data.wholeFolderDeletable === true ? `<button class="btn btn-danger" onclick="confirmDeleteCache(${escapeCacheDetailAttribute(JSON.stringify(data.repo))}, ${escapeCacheDetailAttribute(JSON.stringify(data.type))}, ${escapeCacheDetailAttribute(JSON.stringify('Local'))}, ${escapeCacheDetailAttribute(JSON.stringify(data.path))})">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
+              </svg>
+              Delete entire model folder
+            </button>` : data.type === 'model' && data.source === 'Friendly view' ? `<button class="btn btn-danger" onclick="confirmDeleteCache(${escapeCacheDetailAttribute(JSON.stringify(data.repo))}, ${escapeCacheDetailAttribute(JSON.stringify(data.type))}, ${escapeCacheDetailAttribute(JSON.stringify('Friendly view'))}, ${escapeCacheDetailAttribute(JSON.stringify(data.path))})">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
+              </svg>
+              Delete entire model cache
             </button>` : ''}
             <button class="btn btn-ghost" onclick="hideModal()">Close</button>
           </div>
@@ -4723,8 +4735,23 @@ async function loadRepositoryDetails(entry) {
     }
   }
 
-  // Delete a cached repo with confirmation
-  window.confirmDeleteCache = function(repo, type) {
+  // Delete a cached repo with confirmation. Local sources pass the exact
+  // folder Details showed, so the confirmation names the folder and the
+  // request can only ever delete that folder; HF-cache calls keep the original
+  // two-argument form and byte-identical request.
+  window.confirmDeleteCache = function(repo, type, source = '', path = '') {
+    const wholeFolder = source === 'Local' || source === 'Friendly view';
+    const message = wholeFolder
+      ? `Are you sure you want to delete the whole model folder <strong>${escapeHtml(path)}</strong>?`
+      : `Are you sure you want to delete <strong>${escapeHtml(repo)}</strong> from the cache?`;
+    const note = wholeFolder
+      ? source === 'Local'
+        ? "This will permanently delete everything in that folder, including any of your own files stored there. This action cannot be undone."
+        : "This will permanently delete everything in that folder, including any of your own files stored there, and the rest of this model's HF cache when present. This action cannot be undone."
+      : `This will permanently remove all cached files for this ${type}. This action cannot be undone.`;
+    const confirmTarget = wholeFolder
+      ? `deleteCache(${escapeCacheDetailAttribute(JSON.stringify(repo))}, ${escapeCacheDetailAttribute(JSON.stringify(type))}, ${escapeCacheDetailAttribute(JSON.stringify(source))}, ${escapeCacheDetailAttribute(JSON.stringify(path))})`
+      : `deleteCache('${escapeHtml(repo)}', '${escapeHtml(type)}')`;
     showModal('Delete from Cache', `
       <div class="delete-confirm">
         <div class="delete-warning">
@@ -4733,11 +4760,11 @@ async function loadRepositoryDetails(entry) {
             <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
           </svg>
         </div>
-        <p class="delete-message">Are you sure you want to delete <strong>${escapeHtml(repo)}</strong> from the cache?</p>
-        <p class="delete-note">This will permanently remove all cached files for this ${type}. This action cannot be undone.</p>
+        <p class="delete-message">${message}</p>
+        <p class="delete-note">${note}</p>
         <div class="form-actions" style="margin-top: 20px;">
           <button class="btn btn-ghost" onclick="hideModal()">Cancel</button>
-          <button class="btn btn-danger" onclick="deleteCache('${escapeHtml(repo)}', '${escapeHtml(type)}')">
+          <button class="btn btn-danger" onclick="${confirmTarget}">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
               <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
             </svg>
@@ -4748,10 +4775,12 @@ async function loadRepositoryDetails(entry) {
     `);
   };
 
-  // Actually delete the cache
-  window.deleteCache = async function(repo, type) {
+  // Actually delete the cache. Local/friendly calls carry the source
+  // discriminator and the confirmed folder; the HF path sends no body, exactly
+  // as before.
+  window.deleteCache = async function(repo, type, source = '', path = '') {
     try {
-      const result = await api('DELETE', `/cache/${repo}?type=${type}`);
+      const result = await api('DELETE', `/cache/${repo}?type=${type}`, source ? { source, path } : null);
       hideModal();
       // The server can answer HTTP 200 with a structured partial-failure
       // result: the Hub repository was removed but the friendly view could not

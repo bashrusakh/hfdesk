@@ -9,6 +9,9 @@ let currentSelection = null;
 let delayNextSelection = null;
 let delayNextDetails = null;
 let detailsSource = 'Local';
+let detailsPath = '/friendly/model';
+let detailsWholeFolder = null;
+let datasetSource = 'HF cache';
 let detailsFiles = [];
 let deleteMode = 'success';
 let deletedBodies = [];
@@ -129,6 +132,8 @@ const context = {
       result = locationID
         ? { ...currentSelection, locations: currentSelection.locations.filter(location => location.id === locationID) }
         : currentSelection;
+    } else if (options.method === 'DELETE' && path.startsWith('/api/cache/')) {
+      result = { success: true, message: 'Fixture removed the whole model folder' };
     } else if (path.startsWith('/api/cache/')) {
       if (delayNextDetails) {
         const delay = delayNextDetails;
@@ -136,7 +141,7 @@ const context = {
         await delay.promise;
       }
       const dataset = path.includes('type=dataset');
-      result = { repo: dataset ? 'org/data' : 'org/model', type: dataset ? 'dataset' : 'model', owner: 'org', name: dataset ? 'data' : 'model', files: dataset ? [] : detailsFiles, path: dataset ? '/datasets/data' : '/friendly/model', sizeHuman: '1 GB', fileCount: 30, source: dataset ? 'HF cache' : detailsSource };
+      result = { repo: dataset ? 'org/data' : 'org/model', type: dataset ? 'dataset' : 'model', owner: 'org', name: dataset ? 'data' : 'model', files: dataset ? [] : detailsFiles, path: dataset ? '/datasets/data' : detailsPath, sizeHuman: '1 GB', fileCount: 30, source: dataset ? datasetSource : detailsSource, wholeFolderDeletable: detailsWholeFolder };
     } else if (path === '/api/cache') {
       result = { repos: [], stats: {} };
     } else {
@@ -192,7 +197,11 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(modalHTML.includes('&lt;img src=x onerror=alert(1)&gt;') && !modalHTML.includes('<img src=x'), 'server-provided filenames are escaped');
   assert.equal(nodes.get('#cacheSelectionSection').querySelectorAll('.cache-selection-delete').filter(button => button.disabled).length, 1, 'only the unverifiable local group is disabled');
   assert(modalHTML.includes('Only this group will be removed.'));
-  assert(!modalHTML.includes('onclick="confirmDeleteCache'), 'model groups must not call whole-repository delete');
+  // The action bar legitimately renders the whole-folder button for local
+  // sources now, so the group-section scope carries the original claim that
+  // GGUF group rows never call whole-repository delete.
+  const groupSectionHTML = nodes.get('#cacheSelectionSection').html || '';
+  assert(!groupSectionHTML.includes('onclick="confirmDeleteCache'), 'model groups must not call whole-repository delete');
   assert(!calls.some(call => call.method === 'DELETE'));
   assert(!modalHTML.includes('cache-selection-pick'), 'Delete is direct; no redundant Select action');
 
@@ -277,6 +286,115 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(modalHTML.includes('Delete entire model cache'));
   assert(!modalHTML.includes('Delete this GGUF group'));
   assert(!calls.some(call => call.method === 'DELETE'), 'displaying the legacy action must not execute it');
+
+  // Whole-model folder deletion extends the details action bar to local
+  // sources. These rows drive the rendered onclick arguments end-to-end:
+  // (a) the HF request stays byte-identical with a null body; (b) a Local
+  // model with NO GGUF files at all (the acceptance pin) renders the folder
+  // button, confirms with the strengthened folder copy, and sends the exact
+  // folder; (c) Friendly view routes its tree with the folder pin; (d) local
+  // datasets get no button (the decided scope).
+  function decodeAttrValue(value) {
+    return value.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  }
+  function onclickArgs(fnName) {
+    const match = modalHTML.match(new RegExp(`onclick="${fnName}\\(([^"]*)\\)"`));
+    assert(match, `${fnName} onclick is rendered in the current modal`);
+    const decoded = decodeAttrValue(match[1]);
+    try {
+      return JSON.parse(`[${decoded}]`);
+    } catch (_) {
+      // The legacy HF confirmation quotes arguments as JS strings.
+      return JSON.parse(`[${decoded.replace(/'/g, '"')}]`);
+    }
+  }
+  async function openWholeFolderDetails(source, path, files, wholeFolder = true) {
+    calls.length = 0;
+    detailsSource = source;
+    detailsPath = path;
+    detailsFiles = files;
+    detailsWholeFolder = wholeFolder;
+    currentSelection = { repo: 'org/model', type: 'model', locations: [] };
+    await window.test.showCacheDetails('org/model', 'model');
+  }
+  async function driveWholeRepoDelete() {
+    const confirmArgs = onclickArgs('confirmDeleteCache');
+    await window.confirmDeleteCache(...confirmArgs);
+    const confirmHTML = modalHTML;
+    await window.deleteCache(...onclickArgs('deleteCache'));
+    return { confirmHTML, confirmArgs };
+  }
+
+  // (a) HF cache: byte-identical button markup, unchanged confirmation copy,
+  // unchanged request — query only, body stays null.
+  await openWholeFolderDetails('HF cache', '/cache/hub/org--model', [{ name: 'weights.safetensors', sizeHuman: '1 GB' }]);
+  const hfButton = modalHTML.match(/onclick="(confirmDeleteCache[^"]*)"/);
+  assert(hfButton, 'HF model details render the whole-repository button');
+  assert.equal(hfButton[1], 'confirmDeleteCache(&quot;org/model&quot;, &quot;model&quot;)', 'HF whole-repo button stays byte-identical');
+  const hfDrive = await driveWholeRepoDelete();
+  assert.equal(hfDrive.confirmArgs.length, 2, 'HF confirmation takes only repo and type');
+  assert(hfDrive.confirmHTML.includes('Are you sure you want to delete <strong>org/model</strong> from the cache?'), 'HF confirmation copy unchanged');
+  assert(hfDrive.confirmHTML.includes('This will permanently remove all cached files for this model. This action cannot be undone.'), 'HF confirmation note unchanged');
+  const hfDelete = calls.find(call => call.method === 'DELETE');
+  assert.equal(hfDelete.path, '/api/cache/org/model?type=model', 'HF request path unchanged');
+  assert.deepEqual(hfDelete.body, null, 'HF request body unchanged');
+
+  // (b) Local model without any GGUF files: folder button, strengthened
+  // confirm copy naming the folder and the user's own files, and the exact
+  // folder in the request body.
+  await openWholeFolderDetails('Local', '/models-local/org/model', [
+    { name: 'config.json', sizeHuman: '1 KB' },
+    { name: 'model-00001-of-00002.safetensors', sizeHuman: '2 GB' },
+    { name: 'model-00002-of-00002.safetensors', sizeHuman: '2 GB' }
+  ]);
+  assert(!modalHTML.includes('.gguf'), 'the acceptance-pin model has no GGUF files at all');
+  assert(modalHTML.includes('Delete entire model folder'), 'Local model renders the folder button');
+  const localDrive = await driveWholeRepoDelete();
+  assert.deepEqual(localDrive.confirmArgs, ['org/model', 'model', 'Local', '/models-local/org/model'], 'the rendered onclick carries source and folder');
+  assert(localDrive.confirmHTML.includes('Are you sure you want to delete the whole model folder <strong>/models-local/org/model</strong>?'), 'the confirm copy names the folder');
+  assert(localDrive.confirmHTML.includes('including any of your own files stored there'), 'the confirm copy warns about the user\'s own files');
+  assert(localDrive.confirmHTML.includes('This action cannot be undone.'), 'the confirm copy states it cannot be undone');
+  const localDelete = calls.find(call => call.method === 'DELETE');
+  assert.equal(localDelete.path, '/api/cache/org/model?type=model', 'the local request keeps the established endpoint');
+  assert.deepEqual(Object.keys(localDelete.body).sort(), ['path', 'source'], 'the local request body carries exactly the discriminator and folder');
+  assert.deepEqual(localDelete.body, { source: 'Local', path: '/models-local/org/model' }, 'the local request body pins the confirmed folder');
+
+  // (c) Friendly view: cache-label button, strengthened confirm copy, and the
+  // friendly folder in the request body.
+  await openWholeFolderDetails('Friendly view', '/friendly-cache/models/org/model', [{ name: 'weights.safetensors', sizeHuman: '4 GB' }]);
+  assert(modalHTML.includes('Delete entire model cache'), 'friendly view renders the cache button');
+  const friendlyDrive = await driveWholeRepoDelete();
+  assert.deepEqual(friendlyDrive.confirmArgs, ['org/model', 'model', 'Friendly view', '/friendly-cache/models/org/model'], 'the friendly onclick carries source and folder');
+  assert(friendlyDrive.confirmHTML.includes('Are you sure you want to delete the whole model folder <strong>/friendly-cache/models/org/model</strong>?'), 'the friendly confirm copy names the folder');
+  assert(friendlyDrive.confirmHTML.includes('including any of your own files stored there'), 'the friendly confirm copy warns about the user\'s own files');
+  const friendlyDelete = calls.find(call => call.method === 'DELETE');
+  assert.deepEqual(friendlyDelete.body, { source: 'Friendly view', path: '/friendly-cache/models/org/model' }, 'the friendly request body pins the confirmed folder');
+
+  // (d) The decided scope is models only: a local dataset listing offers no
+  // whole-repository button at all.
+  datasetSource = 'Local';
+  calls.length = 0;
+  await window.test.showCacheDetails('org/data', 'dataset');
+  assert(!modalHTML.includes('Delete entire'), 'local datasets get no whole-repository button');
+  assert(!modalHTML.includes('confirmDeleteCache'), 'local datasets never offer whole-repository delete');
+  assert(!calls.some(call => call.method === 'DELETE'), 'no local-dataset delete is sent');
+  datasetSource = 'HF cache';
+  detailsPath = '/friendly/model';
+
+  // (e) A shared pile folder is never a whole-folder target: the server marks
+  // it ineligible (wholeFolderDeletable false) and the Local button does not
+  // render, while the per-group rows for its models remain available.
+  calls.length = 0;
+  detailsSource = 'Local';
+  detailsPath = '/piles/org/shared';
+  detailsFiles = ['modelA-Q4_K_M', 'modelB-Q5_K_M', 'modelC-Q6_K', 'modelD-Q8_0', 'modelE-Q4_K_S'].map(n => ({ name: `${n}.gguf`, sizeHuman: '4 GB' }));
+  detailsWholeFolder = false;
+  currentSelection = JSON.parse(JSON.stringify(selectionFixture));
+  await window.test.showCacheDetails('org/model', 'model');
+  assert(!modalHTML.includes('Delete entire model folder'), 'a shared pile folder never renders the whole-folder button');
+  assert(!modalHTML.includes('onclick="confirmDeleteCache'), 'a pile listing offers no whole-repository delete at all');
+  assert.equal((modalHTML.match(/class="cache-selection-group"/g) || []).length, 10, 'the pile keeps its per-group rows for targeted deletion');
+  detailsWholeFolder = null;
 
   async function openLocalDetails() {
     detailsSource = 'Local';

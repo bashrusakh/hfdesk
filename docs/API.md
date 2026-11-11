@@ -1695,6 +1695,96 @@ friendly view, in this process or in another process sharing the cache; when
 cache ownership cannot be established on the filesystem it fails closed with
 `500` instead of removing anything.
 
+The same endpoint accepts an optional JSON body that extends the details-modal
+Delete button to local sources; without a body its behavior is byte-for-byte
+unchanged:
+
+```json
+{ "source": "Local", "path": "/models/owner/model" }
+```
+
+`source` must be exactly `Local` or `Friendly view` — the listing labels whose
+details dialog was confirmed — and `path` must be present with it; a body
+missing either field, an unknown `source`, a `path` without a `source`, or a
+body with `type=dataset` (or a dataset repository) returns `400`: whole-folder
+deletion is model-only, and local datasets keep no such scope. In the flat
+local layout the server cannot distinguish a model folder from a dataset
+folder — there is no identity on disk — so that models-only boundary is
+exactly the request's `type` gate plus the UI affordance, not an on-disk
+classification. The server never
+trusts `path`. For `source=Local` it must identity-match `Join(root, owner,
+name)` for a currently configured scan/download root whose listing label is
+`Local`, after the listing's own rules (skipped owners such as `hub`/`models`
+under the cache root never qualify); a path matching no such root returns
+`400 Invalid path` ("Path is not a configured local model folder"), and a path
+matching a root that fails the registered-roots check returns fail-closed
+`409 Location is not eligible for local deletion`. For
+`source=Friendly view` it must identity-match the model's server-derived
+friendly-view folder; otherwise `400 Invalid path`.
+
+Whole-folder deletion requires the folder to hold exactly one model's files.
+The server classifies every weight file's folder-relative name through the
+shared naming rules with a strictly right-anchored, byte-aligned reduction: a
+quantization token, shard suffix or precision marker is stripped only when it
+reaches the end of the name, and only the canonical `<model>.mmproj-<quant>`
+companion shape cuts — an interior occurrence never cuts, so two distinct
+file names are never merged by an interior excision; the only designed merges
+are quant/shard/precision variants of one name, the canonical companion, and
+one pipeline's component roles — pipeline membership is decided strictly by
+the FIRST directory component, and the path below the role directory stays
+part of the comparison. Weight files whose first directory is a recognized
+Diffusers component directory are pipeline members: uniformly named component
+roles count as one shared pipeline key (a real `unet`/`vae`/`text_encoder`
+tree is one model), a role directory whose recorded bases (sub-path plus file
+base) are not all equal yields distinct keys — two models' parts or an
+adapter pile inside one role directory refuse — and pipeline weights mixed
+with any top-level weight yield multiple keys, each refused. Every other key
+keeps every directory component verbatim: an interior component is never
+dropped, so `a/unet/x` and `a/x` — and `a/b/unet/x` and `a/b/x` — remain
+distinct, as do `a/…` and `b/…`. A folder whose component roles cannot be
+told apart by names alone — one model's `unet` beside another's `vae`, each
+internally uniform — stays eligible: the conservative floor of
+name-based classification. One distinct model key makes the folder eligible;
+two or more keys, no recognized weight files, or any weight name the rules
+cannot confidently reduce make it ineligible, and the `DELETE` refuses with
+`409 Folder is not a single model` before removing anything — shared or piled
+folders keep per-group deletion only. The classification is conservative:
+folders that merely look alike stay ineligible (a UX loss, never a data risk).
+`GET /api/cache/{owner}/{repo}` and `GET /api/cache` expose the result for
+`Local` sources as `wholeFolderDeletable` (an explicit `true` or `false`) with
+`wholeFolderDeleteReason` on ineligible folders; other sources omit both
+fields, and the details modal renders the whole-folder button only when
+`wholeFolderDeletable` is `true`.
+
+`source=Local` deletes the whole model folder — the folder is the model unit.
+Every established layer applies: the strict repository-ID/traversal/charset
+validation above; owner/model symlink-component rejection through the anchored
+open (`409 Selection is unsafe`); fail-closed configured-boundary refusal when
+the folder contains another configured root or is owned by one
+(`409 Location could not be verified`); the in-process destructive window
+(`409 Repository is busy` when a live writer owns the folder in this process,
+including queued writers held by the dispatch gate) and exclusive flat-realm
+tree admission over the model folder itself (`409 Repository is busy` when a
+flat writer in this or another process holds a lease under or over that tree —
+including a writer already admitted for a file inside it that does not exist
+yet — via the established `writeCacheDeleteAdmission` family; an unresolvable
+admission fails closed with `500`); repeated binding rechecks (`409 Selection is
+stale`); and a final
+removal confined to an `os.Root` anchored at the folder's owner directory, so
+no symlink inside or above the folder can redirect it outside. Success answers
+`200 {"success": true, "message": ...}`. A removal that does not complete
+answers the established whole-repository shape — `200 {"success": false,
+"message": ..., "errors": [...]}` — instead of hiding the partial result.
+
+`source=Friendly view` uses the established endpoint semantics when the
+repository resolves as an HF cache item: the Hub repository and its friendly
+view are both removed with the layers above. When the Hub repository is absent,
+only the friendly tree is removed, with the same containment, expected
+structure, symlink and resolved-path checks (`400`), the in-process destructive
+window and cache-owned tree admission (`409 Repository is busy` /
+fail-closed `500`), the same `200` success / `200` with `errors` reporting, and
+`404` when neither the Hub repository nor the friendly folder exists.
+
 `locationId` is optional. When supplied, it must match a currently discovered
 location for this repo/type; unknown or stale IDs return `400` rather than
 falling back to another location. Local IDs are derived from the configured
@@ -1828,6 +1918,12 @@ Delete removes only the selected repository under H and its friendly view under
 R, with separate confinement checks. Shared H deletion can affect other clients
 using that repository. Failure to remove the friendly view after Hub deletion
 returns `success: false` with `errors`, rather than hiding partial failure.
+Repositories discovered by independent local scans and by the friendly view are
+reached through the optional `source`/`path` body described under the selected
+delete above: for `Local` the whole model folder is removed with flat-realm
+admission, for `Friendly view` the friendly tree (plus the Hub pair when it
+exists) is removed with cache-owned admission; local datasets are unchanged and
+offer no whole-folder scope.
 
 ## Mirror
 
