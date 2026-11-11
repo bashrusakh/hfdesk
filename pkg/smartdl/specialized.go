@@ -4,7 +4,6 @@
 package smartdl
 
 import (
-	"path/filepath"
 	"strings"
 )
 
@@ -543,16 +542,6 @@ func detectSpecializedType(files []FileInfo, metadata map[string]interface{}) Re
 	}
 	if hasONNXFiles(files) && !hasRootWeights(files) {
 		return TypeONNX
-	}
-	return ""
-}
-
-// getONNXModelDir returns the directory containing ONNX files.
-func getONNXModelDir(files []FileInfo) string {
-	for _, f := range files {
-		if strings.HasSuffix(strings.ToLower(f.Name), ".onnx") {
-			return filepath.Dir(f.Path)
-		}
 	}
 	return ""
 }

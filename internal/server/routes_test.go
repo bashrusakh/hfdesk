@@ -1148,13 +1148,6 @@ func (g *stallGuard) awaitBlocked() bool {
 	}
 }
 
-// release unblocks the stalled request so the run can advance to
-// termination (the stalling endpoint then serves 404-style failures
-// from the closed listener).
-func (g *stallGuard) release() {
-	g.endpoint.Close()
-}
-
 // jobSettingsCacheDir re-derives the settings.CacheDir runJob would hand
 // to hfdownloader.Run for the given manager/job, following the
 // production freeze contract: frozen job.OutputDir for cache mode, frozen

@@ -732,20 +732,6 @@ func linuxIDToUint32(id int64) (uint32, error) {
 	return uint32(id), nil
 }
 
-func (m *systemdManager) executableAccess(ctx context.Context, path string, mode uint32, account *user.User, workingDirectory string) (executableAccess, error) {
-	if m.scope == ScopeUser {
-		return checkExecutableAccess(ctx, path, currentExecutableAccessIdentity(), mode, workingDirectory)
-	}
-	if account == nil {
-		return executableAccessUnknown, nil
-	}
-	target, err := linuxExecutableAccessIdentity(account)
-	if err != nil {
-		return executableAccessUnknown, nil
-	}
-	return checkExecutableAccess(ctx, path, target, mode, workingDirectory)
-}
-
 func checkExecutableAccess(ctx context.Context, path string, identity accessAccount, mode uint32, workingDirectory string) (executableAccess, error) {
 	if sameAccessIdentity(identity, currentExecutableAccessIdentity()) {
 		if identity.UID != 0 && accessProbeHasCapabilities() {

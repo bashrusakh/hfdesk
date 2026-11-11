@@ -714,22 +714,6 @@ func selectedWriteEvidenceMayWrite(evidence selectedWriteEvidence, targetIdentit
 	return false
 }
 
-// jobMayWriteSelectedPathWithinBase reports whether any proven repository
-// spelling of the target inside one writable namespace survives the job's
-// filters and excludes.
-func jobMayWriteSelectedPathWithinBase(inv writableNamespaceInventory, targetIdentity string, job *Job) bool {
-	candidates, ok := inv.selectedPathCandidates(targetIdentity)
-	if !ok {
-		return true
-	}
-	for _, candidate := range candidates {
-		if hfdownloader.GGUFPathMayBeEmitted(candidate, hfdownloader.Job{Filters: job.Filters, Excludes: job.Excludes, ExactMatch: job.ExactMatch, IsDataset: job.IsDataset}) {
-			return true
-		}
-	}
-	return false
-}
-
 // frozenPhysicalPaths returns the physical spellings of frozen mutation
 // entries. Reservations compare frozen values, but the batched writer checks
 // resolve each target against the job's inventoried namespaces.

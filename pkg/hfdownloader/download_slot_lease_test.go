@@ -625,12 +625,6 @@ func (r *slotNoticeRecorder) endWait() bool {
 	return true
 }
 
-func (r *slotNoticeRecorder) counts() (begins, ends int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.begins, r.ends
-}
-
 // Failed acquisition keeps the slot returned so error reporting cannot wait
 // for an unrelated transfer.
 func TestDownloadSlotLeaseFailedDomainAcquisitionDoesNotRetakeTheSlot(t *testing.T) {
