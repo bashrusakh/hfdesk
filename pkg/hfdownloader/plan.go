@@ -411,6 +411,20 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// Strict manual selection resolves against the walked tree once, before
+	// any filter, GGUF, or dataset evaluation: every selected path must exist
+	// (ErrNoFilterMatch-style guard, exact and all-or-nothing) and the
+	// resulting set is the sole inclusion source below. A successful
+	// resolution is itself the direct-match proof for the final guard, so
+	// retained companions can never satisfy (or spoil) it.
+	var strictSet map[string]struct{}
+	if job.StrictFiles {
+		strictSet, err = resolveStrictSelection(fileNodes, job.Filters)
+		if err != nil {
+			return nil, err
+		}
+		directFilterMatch = true
+	}
 	baseNames := make([]string, 0, len(fileNodes))
 	datasetFiles := make([]datasetselection.File, len(fileNodes))
 	for _, n := range fileNodes {
@@ -419,7 +433,7 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 		}
 		baseNames = append(baseNames, strings.ToLower(n.Path))
 		datasetFiles[len(baseNames)-1] = datasetselection.File{Path: n.Path}
-		if len(job.Filters) > 0 && !isExcludedPath(n.Path, job.Excludes) {
+		if len(job.Filters) > 0 && !job.StrictFiles && !isExcludedPath(n.Path, job.Excludes) {
 			for _, filter := range job.Filters {
 				if filterMatchesPath(n.Path, filter, job.ExactMatch) {
 					directFilterMatch = true
@@ -437,13 +451,13 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 			datasetDataRoles[evidence.InputIndex] = true
 		}
 	}
-	ggufMode := isGGUFFilterDownloadWithExcludes(baseNames, job.Filters, job.Excludes, job.ExactMatch)
+	ggufMode := !job.StrictFiles && isGGUFFilterDownloadWithExcludes(baseNames, job.Filters, job.Excludes, job.ExactMatch)
 	var datasetEvaluation datasetDecisionEvaluation
 	// A recognized dataset group remains the governing selection when its files
 	// coexist with GGUFs that happen to match the same filter. GGUF mode is the
 	// fallback only when no dataset group is recognized (e.g. a dataset repo
 	// containing a GGUF-only quant selection).
-	datasetGroupRequest := job.IsDataset && len(job.Filters) > 0
+	datasetGroupRequest := !job.StrictFiles && job.IsDataset && len(job.Filters) > 0
 	var recognizedDatasetGroup bool
 	if datasetGroupRequest {
 		membership := datasetMembership
@@ -635,7 +649,19 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 			!GGUFPathSelected(rel, job.Filters, job.Excludes, job.ExactMatch) {
 			continue
 		}
-		if datasetGroupRequest {
+		if job.StrictFiles {
+			// Strict manual selection: include only explicitly selected
+			// repository-relative paths. No substring matching, no basename
+			// aliasing, no companion/metadata retention, no GGUF inference,
+			// and no dataset-membership widening; attribution stays empty so
+			// destinations remain repository-relative. Membership is
+			// exact-spelling (resolveStrictSelection proved the selected path
+			// IS a tree path), so the plan item keeps the selection's spelling
+			// and a case-variant tree file is never substituted for it.
+			if _, ok := strictSet[rel]; !ok {
+				continue
+			}
+		} else if datasetGroupRequest {
 			// Inclusion and attribution come from one concrete dataset world.
 		} else if ggufMode {
 			// GGUF-only selection is matched-only: keep selected GGUF/mmproj and
@@ -1343,6 +1369,85 @@ func isConventionalCompanionDirectory(relativePath string) bool {
 
 func isDatasetServiceMetadata(relativePath string) bool {
 	return strings.EqualFold(path.Base(strings.ReplaceAll(relativePath, "\\", "/")), "dataset_info.json")
+}
+
+// ValidateFileSelection normalizes and validates a strict file selection
+// (the Filters of a StrictFiles job) and returns the canonical selection.
+// Entries are normalized by converting "\" separators to "/" and stripping a
+// leading "./" root alias (the established request spelling for root-level
+// files); every normalized entry must then be a canonical repository-relative
+// path — the same accepted domain as the repo tree itself — so empty,
+// absolute, trailing-slash, ".", "..", and non-canonical spellings are
+// rejected with ErrInvalidFileSelection naming the entry. Deduplication
+// compares exact spellings: a repeated normalized path collapses to one
+// entry, while two entries that differ only in case are rejected with
+// ErrInvalidFileSelection naming both — on case-insensitive filesystems they
+// are one file, so silently keeping the first would break exactness. The
+// result is never empty: an empty input is an invalid selection, not
+// "download everything".
+//
+// Entries are otherwise used verbatim: no whitespace trimming, no
+// case-insensitive matching, and no basename or substring interpretation.
+func ValidateFileSelection(paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("%w: selection is empty", ErrInvalidFileSelection)
+	}
+	normalized := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	folded := make(map[string]string, len(paths))
+	for _, p := range paths {
+		cleaned := strings.ReplaceAll(p, `\`, "/")
+		cleaned = strings.TrimPrefix(cleaned, "./")
+		if unsafeRepoPath(cleaned) {
+			return nil, fmt.Errorf("%w: %q is not a canonical repository-relative file path", ErrInvalidFileSelection, p)
+		}
+		if _, dup := seen[cleaned]; dup {
+			continue
+		}
+		fold := strings.ToLower(cleaned)
+		if first, clash := folded[fold]; clash {
+			return nil, fmt.Errorf("%w: %q and %q differ only in case and are one file on case-insensitive filesystems; keep one spelling", ErrInvalidFileSelection, first, cleaned)
+		}
+		seen[cleaned] = struct{}{}
+		folded[fold] = cleaned
+		normalized = append(normalized, cleaned)
+	}
+	return normalized, nil
+}
+
+// resolveStrictSelection maps a strict file selection onto the walked tree
+// and returns the exact-spelling path set that drives plan inclusion.
+// Matching is exact equality over complete repository-relative paths
+// (case-sensitive, after ValidateFileSelection's separator/alias
+// normalization): a selected spelling either IS a tree path — then the plan
+// item is that very spelling — or it is a miss, so a case-variant tree file
+// is never substituted for the selection. No substring widening and no
+// basename aliasing: a single-segment entry selects only the root-level file
+// of that name. Selection is all-or-nothing: any selected path absent from
+// the tree fails the plan with ErrNoFileMatch naming the missing paths
+// instead of downloading a subset.
+func resolveStrictSelection(nodes []hfNode, selection []string) (map[string]struct{}, error) {
+	normalized, err := ValidateFileSelection(selection)
+	if err != nil {
+		return nil, err
+	}
+	inTree := make(map[string]struct{}, len(nodes))
+	for _, n := range nodes {
+		inTree[n.Path] = struct{}{}
+	}
+	selected := make(map[string]struct{}, len(normalized))
+	var missing []string
+	for _, p := range normalized {
+		if _, ok := inTree[p]; !ok {
+			missing = append(missing, p)
+			continue
+		}
+		selected[p] = struct{}{}
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("%w: %s", ErrNoFileMatch, strings.Join(missing, ", "))
+	}
+	return selected, nil
 }
 
 // filterMatches reports whether filter fLower matches the file name nameLower

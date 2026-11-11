@@ -140,6 +140,25 @@ counted, so the sentence never grows with the inventory. The notice surfaces
 as `Plan.Notices`, in the `POST /api/plan` response, on the download's
 warning channel, and in the exported `ScanPlan` preview's warning events.
 
+With StrictFiles, Filters is instead a strict manual file selection: each
+filter is one complete repository-relative file path, matched by exact
+spelling (case-sensitive) against the walked tree — no substring widening, no
+basename aliasing (a single-segment entry names the root-level file only), no
+companion/metadata retention, no GGUF inference, and no dataset-membership
+selection; ExactMatch has no effect. ValidateFileSelection normalizes each
+entry (backslashes to "/", a leading "./" alias stripped; repeated
+normalized spellings collapse to one entry) and, together with validate,
+rejects an empty selection, a non-canonical path, two entries differing only
+in case (they are one file on case-insensitive filesystems), and the
+combinations with Excludes, AppendFilterSubdir or a branch variant — all as
+ErrInvalidFileSelection naming the offending entry or field — before any
+network work. The selection is all-or-nothing: every path must exist at the
+resolved revision spelled exactly that way or the plan fails with
+ErrNoFileMatch naming the missing paths. Directory entries are not expanded
+— a trailing-slash entry is non-canonical — so callers express a directory
+as its member file paths. Storage, verification, resume and revision
+isolation are unchanged; StrictFiles narrows plan composition only.
+
 With AppendFilterSubdir, matched files are organized into subdirectories:
 
 	job := hfdownloader.Job{

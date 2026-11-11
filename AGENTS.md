@@ -336,15 +336,15 @@ or job ownership behavior. This section is the agent-level summary; when it and
   from the same 2-minute family (`metadataFetchTimeout` in `pkg/smartdl`,
   mirrored with `treePageFetchTimeout` and hfdownloader's
   `metadataFetchTimeout`): the refs API, config/metadata file content
-  (`fetchFile`, including its `/resolve/` retry), safetensors ranged header
-  reads, and the model-info lineage lookup. Expiry follows each site's class:
-  a required read — a metadata body read or an LFS/pointer resolve the
+  (`fetchFile`, including its `/resolve/` retry), and the model-info lineage
+  lookup. Expiry follows each site's class: a required read — a metadata body
+  read or an LFS/pointer resolve the
   analysis reports as a named-file failure — fails with the actionable
   budget error, which never matches `context.DeadlineExceeded|Canceled`,
   while the optional sites (refs, lineage, EXL branch config lookups, plain
   non-LFS transport failures) degrade exactly as they already do on any
   error, just bounded now. Exclusions are unchanged: the auth-check probe
-  keeps `authCheckTimeout` (5s), the EXL branch lookups and header-probe pass
+  keeps `authCheckTimeout` (5s), the EXL branch lookups
   keep their 15s contexts, and a caller deadline wins over every internal
   cap.
 - Recommended download output should remain a structured request body, not a

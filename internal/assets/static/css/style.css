@@ -5586,6 +5586,172 @@ button.quant-dl-btn:hover {
 }
 
 /* ============================================
+   Files tab — exact-selection file tree
+   ============================================ */
+
+.file-tree-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 4px 12px 10px;
+}
+
+.file-tree-search {
+  flex: 1;
+  min-width: 150px;
+  max-width: 320px;
+  padding: 7px 10px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+  font-size: 12px;
+  font-family: var(--font-family);
+  outline: none;
+}
+
+.file-tree-search:focus {
+  border-color: var(--color-primary);
+}
+
+.file-tree-route {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  white-space: nowrap;
+}
+
+.file-tree-route .search-select {
+  padding: 7px 10px;
+  font-size: 12px;
+  max-width: 240px;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.file-tree {
+  max-height: 420px;
+  overflow-y: auto;
+  border-top: 1px solid var(--color-border);
+}
+
+.file-tree-check {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--color-primary);
+  cursor: pointer;
+}
+
+.file-tree-caret {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--color-text-muted);
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.file-tree-caret:hover {
+  color: var(--color-text);
+}
+
+.file-tree-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.file-tree-name-dir {
+  font-weight: 600;
+}
+
+.file-tree-meta {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+.file-tree-dir .quant-size {
+  margin-left: auto;
+}
+
+.file-tree-lfs {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--color-info);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-full);
+  padding: 1px 6px;
+}
+
+.file-tree-status {
+  flex-shrink: 0;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+}
+
+.file-tree-empty {
+  padding: 18px 12px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.file-tree-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border-top: 1px solid var(--color-border);
+}
+
+.file-tree-summary {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.file-tree-overlap {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  margin-top: 2px;
+}
+
+.file-tree-guarantee {
+  font-size: 10.5px;
+  color: var(--color-text-muted);
+  margin-top: 2px;
+}
+
+.file-tree-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+/* ============================================
    Scroll arrows — contextual top/bottom
    ============================================ */
 

@@ -35,6 +35,22 @@ var (
 	// change the emitted files for a recognized dataset-group selection.
 	ErrAmbiguousSelection = errors.New("dataset selection is ambiguous")
 
+	// ErrInvalidFileSelection is returned when a strict file selection
+	// (StrictFiles) is empty, contains a path that is not a canonical
+	// repository-relative file path, contains two entries that differ only
+	// in case (one file on case-insensitive filesystems), or is combined
+	// with a request field that contradicts exactness (Excludes,
+	// AppendFilterSubdir, or a branch variant). Distinguishable via
+	// errors.Is; the wrapped details name the offending entry or field.
+	ErrInvalidFileSelection = errors.New("invalid strict file selection")
+
+	// ErrNoFileMatch is returned when a strict file selection is well-formed
+	// but at least one selected path does not exist in the repository tree at
+	// the resolved revision. A strict selection is all-or-nothing: the plan
+	// fails and names the missing paths instead of downloading a subset.
+	// Distinguishable via errors.Is.
+	ErrNoFileMatch = errors.New("selected file paths do not exist in the repository")
+
 	// ErrAppendFilterSubdirPathFilter is returned when AppendFilterSubdir is
 	// enabled together with a path-shaped filter (one containing "/" or "\",
 	// including a "./" prefix or trailing separator, or the exact components
