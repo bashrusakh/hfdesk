@@ -876,6 +876,10 @@ shape: substring, `.ext`, `./name`, `dir/`, a full path) or a
 dataset-membership selection of the pattern's own label — so retained
 companions never count, excludes apply before the credit, and a
 membership selection can leave every direct pattern unselected and named.
+filters_unmatched names patterns that matched no file at selection; a
+pattern whose matches were all removed by `shardRanges` is not named (the
+ranged result is visible in the plan preview and the shard-range notices
+describe the range's effect).
 The notice never repeats a pattern whose miss the split-mention notices
 above already report: that pinned coverage wins for the pattern, and this
 producer extends to everything else (direct patterns, shaped selectors,
@@ -1142,10 +1146,10 @@ warning explain that the historical Hub path is unknown. The resolved associatio
 is saved through normal state persistence. No old-cache search, file moves, or
 recovery of an unrecorded historical ENV path is performed.
 
-Job snapshots also expose `warnings`, the typed plan warnings the job's own
-plan reported once planning finished (see the `warnings` surface under Plan
-above), omitted when empty. The field is an output of the job's scan, not
-part of its identity: it never participates in deduplication.
+Job snapshots also expose `warnings`, an array of strings carrying the
+plan's `notices` sentences plus the downloader's non-fatal diagnostics
+described above, omitted when empty. The field is an output of the job's
+scan, not part of its identity: it never participates in deduplication.
 
 ## Settings
 

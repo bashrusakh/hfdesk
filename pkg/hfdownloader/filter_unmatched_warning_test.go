@@ -143,6 +143,23 @@ func TestPlanRepoFilterUnmatchedNotice(t *testing.T) {
 			wantAllOf:  []string{`filter "q9" matched nothing`},
 		},
 		{
+			// Boundary pin (amended ruling): per-pattern credit is taken at
+			// SELECTION stage, so a pattern whose every matched file the
+			// user's own shard range removed is NOT named — selecting both
+			// shards and then narrowing is a deliberate intersection (the
+			// strict-composition shape at the loose-filter level). An
+			// effective range emits no shard notice either, so wantAllOf
+			// []string{} pins the whole notices surface empty: any future
+			// change naming this pattern fails here.
+			name:  "pattern ranged out of every match stays silent",
+			files: shardTree,
+			job: Job{Repo: "owner/repo",
+				Filters: []string{"00002-of", "00001-of"}, ShardRanges: "1"},
+			wantPaths:  []string{"model-00001-of-00002.safetensors"},
+			wantNotice: "",
+			wantAllOf:  []string{},
+		},
+		{
 			name:  "excluded-only path counts as unmatched",
 			files: quantTree,
 			job: Job{Repo: "owner/repo",
@@ -194,6 +211,18 @@ func TestPlanRepoFilterUnmatchedNotice(t *testing.T) {
 			if tc.wantNotice == "" {
 				if len(found) != 0 {
 					t.Fatalf("notices = %q, want no filters_unmatched notice", plan.Notices)
+				}
+				// On the no-notice path an empty wantAllOf pins the WHOLE
+				// surface (no filters_unmatched and no shard-family notice
+				// either); nil carries as empty for the exact comparison.
+				if tc.wantAllOf != nil {
+					notices := plan.Notices
+					if notices == nil {
+						notices = []string{}
+					}
+					if !reflect.DeepEqual(notices, tc.wantAllOf) {
+						t.Fatalf("notices = %q, want exactly %q", plan.Notices, tc.wantAllOf)
+					}
 				}
 				return
 			}
@@ -303,5 +332,33 @@ func TestPlanRepoUnmatchedNoticeReportsUncoveredDatasetLabel(t *testing.T) {
 	if len(found) != 1 || found[0] != `filter "train" matched nothing` {
 		t.Fatalf("filter notices = %q, want exactly [%q] (all: %q)",
 			found, `filter "train" matched nothing`, plan.Notices)
+	}
+}
+
+// TestPlanRepoFilterUnmatchedNoticeBoundsLongList pins the bounded form of
+// the filters_unmatched notice: with more than warningSegmentCap unmatched
+// patterns exactly ONE notice names the first five patterns in request
+// order and counts the rest, riding Plan.Notices alone.
+func TestPlanRepoFilterUnmatchedNoticeBoundsLongList(t *testing.T) {
+	files := []hfNode{
+		{Type: "file", Path: "model-Q4_K_M.gguf", Size: 10, LFS: &hfLfsInfo{Size: 10}},
+		{Type: "file", Path: "config.json", Size: 5},
+	}
+	// Six patterns select nothing while "q4" keeps the request alive:
+	// warningSegmentCap=5 are named, the sixth is counted.
+	plan, err := planWithFilters(t, files, Job{
+		Repo:    "owner/repo",
+		Filters: []string{"q4", "zz1", "zz2", "zz3", "zz4", "zz5", "zz6"},
+	})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	const want = `filters "zz1", "zz2", "zz3", "zz4", "zz5", and 1 more matched nothing`
+	found := filterNotices(plan)
+	if len(found) != 1 || found[0] != want {
+		t.Fatalf("filter notices = %q, want exactly [%q] (all: %q)", found, want, plan.Notices)
+	}
+	if !reflect.DeepEqual(plan.Notices, []string{want}) {
+		t.Errorf("notices = %q, want exactly [%q]", plan.Notices, want)
 	}
 }
