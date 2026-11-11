@@ -6,6 +6,7 @@ package pe
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -168,130 +169,6 @@ func TestSubsystemName(t *testing.T) {
 	}
 }
 
-// TestMachineReadsTheCOFFHeader proves that the machine type is read out of
-// the COFF header, whatever optional header follows it.
-func TestMachineReadsTheCOFFHeader(t *testing.T) {
-	cases := []struct {
-		name    string
-		magic   uint16
-		size    int
-		machine uint16
-	}{
-		{"PE32", magicPE32, testOptionalHeaderSize32, MachineI386},
-		{"PE32Plus", magicPE32Plus, testOptionalHeaderSize64, MachineAMD64},
-		{"ARM64", magicPE32Plus, testOptionalHeaderSize64, MachineARM64},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			image := buildPEImageWithMachine(SubsystemWindowsCUI, tc.magic, tc.size, tc.machine)
-
-			machine, err := MachineOf(bytes.NewReader(image))
-			assertNoError(t, err, "MachineOf: %v", err)
-			if machine != tc.machine {
-				t.Errorf("machine = 0x%04X, want 0x%04X", machine, tc.machine)
-			}
-		})
-	}
-}
-
-// TestMachineReadsTheFile proves that the machine type is read out of a file
-// on disk.
-func TestMachineReadsTheFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "hfdesk.exe")
-	image := buildPEImageWithMachine(SubsystemWindowsCUI, magicPE32Plus, testOptionalHeaderSize64, MachineAMD64)
-	err := os.WriteFile(path, image, 0o600)
-	assertNoError(t, err, "write the image: %v", err)
-
-	machine, err := Machine(path)
-	assertNoError(t, err, "Machine: %v", err)
-	if machine != MachineAMD64 {
-		t.Errorf("machine = 0x%04X, want 0x%04X", machine, MachineAMD64)
-	}
-}
-
-// TestMachineRejectsANonPEFile proves that a file that is not a PE image is
-// rejected instead of being read as one.
-func TestMachineRejectsANonPEFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "notes.txt")
-	text := []byte(strings.Repeat("this is not a PE image\n", 8))
-	if err := os.WriteFile(path, text, 0o600); err != nil {
-		t.Fatalf("write the file: %v", err)
-	}
-
-	_, err := Machine(path)
-	if err == nil {
-		t.Fatal("Machine accepted a file that is not a PE image")
-	}
-	if !strings.Contains(err.Error(), "not a PE image") {
-		t.Errorf("error = %q, want it to say that the file is not a PE image", err.Error())
-	}
-}
-
-// TestMachineRejectsATruncatedImage proves that a file that ends inside the
-// PE signature and COFF header is rejected instead of being read as a partial
-// header.
-func TestMachineRejectsATruncatedImage(t *testing.T) {
-	image := buildPEImageWithMachine(SubsystemWindowsCUI, magicPE32Plus, testOptionalHeaderSize64, MachineAMD64)
-
-	// The image is cut in the middle of the COFF header, so the read of
-	// the header comes up short.
-	truncated := image[:testPeHeaderOffset+machineOffset+1]
-
-	_, err := MachineOf(bytes.NewReader(truncated))
-	if err == nil {
-		t.Fatal("MachineOf accepted a truncated image")
-	}
-	if !strings.Contains(err.Error(), "unexpected EOF") {
-		t.Errorf("error = %q, want it to report the truncated header", err.Error())
-	}
-}
-
-// TestMachineRejectsAnImageWithoutThePESignature proves that a file with a
-// DOS header but without a PE header is rejected.
-func TestMachineRejectsAnImageWithoutThePESignature(t *testing.T) {
-	image := buildPEImageWithMachine(SubsystemWindowsCUI, magicPE32Plus, testOptionalHeaderSize64, MachineAMD64)
-	copy(image[testPeHeaderOffset:], []byte("PX\x00\x00"))
-
-	_, err := MachineOf(bytes.NewReader(image))
-	if err == nil {
-		t.Fatal("MachineOf accepted an image without the PE signature")
-	}
-	if !strings.Contains(err.Error(), "not a PE image") {
-		t.Errorf("error = %q, want it to say that the file is not a PE image", err.Error())
-	}
-}
-
-// TestMachineRejectsAMissingFile proves that a file that does not exist is
-// reported as an error, so a caller never reads a missing program as an image
-// it can judge.
-func TestMachineRejectsAMissingFile(t *testing.T) {
-	_, err := Machine(filepath.Join(t.TempDir(), "missing.exe"))
-	if err == nil {
-		t.Fatal("Machine accepted a file that does not exist")
-	}
-	if !strings.Contains(err.Error(), "missing.exe") {
-		t.Errorf("error = %q, want it to name the file", err.Error())
-	}
-}
-
-// TestMachineReadsTheArchitectureOfAnUnknownOptionalHeader proves that the
-// machine type is the fact the package reads out of the COFF header: an
-// optional header this package cannot judge names no architecture of its own,
-// so the machine type is still reported.
-func TestMachineReadsTheArchitectureOfAnUnknownOptionalHeader(t *testing.T) {
-	image := buildPEImageWithMachine(SubsystemWindowsGUI, magicPE32, testOptionalHeaderSize32, MachineI386)
-	binary.LittleEndian.PutUint16(image[testPeHeaderOffset+optionalHeaderOffset:], 0x107)
-
-	if _, err := SubsystemOf(bytes.NewReader(image)); err == nil {
-		t.Fatal("SubsystemOf accepted an unknown optional header")
-	}
-	machine, err := MachineOf(bytes.NewReader(image))
-	assertNoError(t, err, "MachineOf: %v", err)
-	if machine != MachineI386 {
-		t.Errorf("machine = 0x%04X, want 0x%04X", machine, MachineI386)
-	}
-}
-
 func TestExecutableMachineRejectsTheCOFFOnlyStub(t *testing.T) {
 	image := buildPEImageWithMachine(SubsystemWindowsCUI, magicPE32Plus, testOptionalHeaderSize64, MachineAMD64)
 	stub := image[:testPeHeaderOffset+peSignatureSize]
@@ -299,9 +176,10 @@ func TestExecutableMachineRejectsTheCOFFOnlyStub(t *testing.T) {
 	if _, err := ExecutableMachineOf(bytes.NewReader(stub)); err == nil {
 		t.Fatal("ExecutableMachineOf accepted a COFF-only stub without an optional header or section table")
 	}
-	// Field extraction intentionally remains a separate, weaker contract.
-	if machine, err := MachineOf(bytes.NewReader(stub)); err != nil || machine != MachineAMD64 {
-		t.Errorf("MachineOf(COFF-only stub) = 0x%04X, %v, want the extracted machine 0x%04X", machine, err, MachineAMD64)
+	// Field extraction from the same header still succeeds: the rejection
+	// is the structural check, not an unreadable header.
+	if machine, err := readCOFFMachineField(bytes.NewReader(stub)); err != nil || machine != MachineAMD64 {
+		t.Errorf("readCOFFMachineField(COFF-only stub) = 0x%04X, %v, want the extracted machine 0x%04X", machine, err, MachineAMD64)
 	}
 }
 
@@ -466,6 +344,18 @@ func buildPEImageWithMachine(subsystem int, magic uint16, optionalHeaderSize int
 	image := buildPEImage(subsystem, magic, optionalHeaderSize)
 	binary.LittleEndian.PutUint16(image[testPeHeaderOffset+machineOffset:], machine)
 	return image
+}
+
+// readCOFFMachineField extracts the machine field out of the COFF header of a
+// PE image without any structural checks. The COFF-only-stub test uses it as
+// the contrast that proves ExecutableMachineOf's rejection comes from the
+// structural check, not from an unreadable header.
+func readCOFFMachineField(r io.ReaderAt) (uint16, error) {
+	_, header, err := readPEHeader(r)
+	if err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint16(header[machineOffset : machineOffset+machineSize]), nil
 }
 
 // assertNoError fails the test when the call it wraps reported a failure,

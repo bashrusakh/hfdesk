@@ -30,8 +30,8 @@ func TestNewPropagatesTheVersion(t *testing.T) {
 	if server.Version != "1.2.3-test" {
 		t.Errorf("server version = %q, want %q", server.Version, "1.2.3-test")
 	}
-	if application.Config().Port != 8080 {
-		t.Errorf("config port = %d, want 8080", application.Config().Port)
+	if application.cfg.Port != 8080 {
+		t.Errorf("config port = %d, want 8080", application.cfg.Port)
 	}
 }
 

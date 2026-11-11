@@ -133,8 +133,8 @@ func New(o Options, version string) (*App, error) {
 }
 
 // Start binds the listener and starts serving in the background. It returns
-// an error when the address cannot be bound. After it returns nil, URL and
-// Config are available.
+// an error when the address cannot be bound. After it returns nil, URL is
+// available.
 func (a *App) Start(ctx context.Context) error {
 	a.mu.Lock()
 	if a.started {
@@ -219,14 +219,6 @@ func (a *App) waitForBoundAddr(ctx context.Context, done <-chan struct{}) error 
 // non-default port and an OS-assigned port are both reported correctly.
 func (a *App) URL() string {
 	return a.server.BrowserURL()
-}
-
-// Config returns the effective server configuration.
-//
-// It is the configuration the application was started with. Later settings
-// changes are applied to the server's own copy of the configuration.
-func (a *App) Config() server.Config {
-	return a.cfg
 }
 
 // Wait blocks until the server stops. When ctx is cancelled the server
