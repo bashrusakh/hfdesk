@@ -1580,6 +1580,95 @@ func canonicalFixtureUnits(t *testing.T) []canonicalUnit {
 	}
 }
 
+// TestSystemdUnitIdentityPinsTheAccountRules checks the identity directives
+// unitIdentity renders for the live rollback identity verification: the unit
+// always names the account of the request, it names the primary group of a
+// resolvable account by its name, and it never guesses a group when the
+// account is unknown or the group cannot be resolved.
+func TestSystemdUnitIdentityPinsTheAccountRules(t *testing.T) {
+	t.Run("an unknown account names no group", func(t *testing.T) {
+		opts := systemdTestOptions(t, ScopeSystem)
+		opts.ServiceUser = "hfdesk-svc"
+
+		identity, err := unitIdentity(opts, nil)
+		assertNoError(t, err, "unitIdentity() = %v, want nil", err)
+		want := "User=" + systemdQuote(opts.ServiceUser) + "\n"
+		if identity != want {
+			t.Errorf("unitIdentity(opts, nil) = %q, want exactly %q", identity, want)
+		}
+	})
+
+	t.Run("the group of the account is its primary group by name", func(t *testing.T) {
+		account, ok := systemdAccountWithAnotherPrimaryGroup(t)
+		if !ok {
+			t.Skip("skipping: the machine knows no account whose primary group carries another name")
+		}
+		group, err := user.LookupGroupId(account.Gid)
+		assertNoError(t, err, "LookupGroupId(%q) = %v, want nil", account.Gid, err)
+		opts := systemdTestOptions(t, ScopeSystem)
+		opts.ServiceUser = account.Username
+
+		identity, err := unitIdentity(opts, account)
+		assertNoError(t, err, "unitIdentity() = %v, want nil", err)
+		want := "User=" + systemdQuote(account.Username) + "\nGroup=" + systemdQuote(group.Name) + "\n"
+		if identity != want {
+			t.Errorf("unitIdentity() = %q, want exactly %q", identity, want)
+		}
+	})
+
+	t.Run("an unresolvable primary group is never guessed", func(t *testing.T) {
+		account := systemdUnresolvableAccount(t)
+		opts := systemdTestOptions(t, ScopeSystem)
+		opts.ServiceUser = account.Username
+
+		identity, err := unitIdentity(opts, account)
+		assertNoError(t, err, "unitIdentity() = %v, want nil", err)
+		want := "User=" + systemdQuote(account.Username) + "\n"
+		if identity != want {
+			t.Errorf("unitIdentity() = %q, want exactly %q", identity, want)
+		}
+	})
+}
+
+// TestSystemdCanonicalUnitForInstallPinsTheWrittenGroupRules checks the two
+// Group= rules of the live write path through writtenServiceGroup: without
+// identity context the unit names no group at all, and a primary group the
+// machine cannot resolve is left out instead of guessed.
+func TestSystemdCanonicalUnitForInstallPinsTheWrittenGroupRules(t *testing.T) {
+	t.Run("no identity context names no group", func(t *testing.T) {
+		// The current account resolves on every machine, so a write
+		// path that resolved a group without identity context would
+		// fill facts.group and fail this check.
+		account := systemdCurrentAccount(t)
+		opts := systemdTestOptions(t, ScopeSystem)
+		opts.ServiceUser = account.Username
+
+		facts, err := canonicalUnitForInstall(opts, nil)
+		assertNoError(t, err, "canonicalUnitForInstall() = %v, want nil", err)
+		if facts.user != account.Username {
+			t.Fatalf("the written account = %q, want %q: the group rules run behind the account of the unit", facts.user, account.Username)
+		}
+		if facts.group != "" {
+			t.Errorf("the written group without identity context = %q, want none", facts.group)
+		}
+	})
+
+	t.Run("an unresolvable primary group is left out instead of guessed", func(t *testing.T) {
+		account := systemdUnresolvableAccount(t)
+		opts := systemdTestOptions(t, ScopeSystem)
+		opts.ServiceUser = account.Username
+
+		facts, err := canonicalUnitForInstall(opts, &unitWriteIdentity{account: account})
+		assertNoError(t, err, "canonicalUnitForInstall() = %v, want nil", err)
+		if facts.user != account.Username {
+			t.Fatalf("the written account = %q, want %q", facts.user, account.Username)
+		}
+		if facts.group != "" {
+			t.Errorf("the written group of an unresolvable primary group = %q, want none", facts.group)
+		}
+	})
+}
+
 func TestSystemdCanonicalUnitGoldenBytes(t *testing.T) {
 	t.Setenv("HOME", "/home/golden")
 	for _, tc := range []struct {
