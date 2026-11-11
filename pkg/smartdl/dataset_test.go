@@ -192,8 +192,9 @@ func TestAnalyzeDatasetMembershipWithRevision(t *testing.T) {
 		t.Fatalf("dataset groups = %+v, want train/test/customdata", info.Dataset)
 	}
 	items := DatasetToSelectableItems(info.Dataset)
-	if len(items) != 3 {
-		t.Fatalf("selectable items = %+v, want three definite groups", items)
+	// Three split groups plus the customdata config preset row.
+	if len(items) != 4 {
+		t.Fatalf("selectable items = %+v, want three definite groups and one config preset", items)
 	}
 	byID := make(map[string]SelectableItem, len(items))
 	for _, item := range items {
