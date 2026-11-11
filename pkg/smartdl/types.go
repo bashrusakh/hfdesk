@@ -671,6 +671,14 @@ func (r *RepoInfo) RecommendedFilterValues() []string {
 			if len(item.Files) == 0 {
 				recommended = append(recommended, item.FilterValue)
 			}
+		} else if item.Category == "component" && len(item.Files) > 0 {
+			// A ready Diffusers component carries its chosen weight set: the
+			// recommendation sends those exact members like GGUF artifacts,
+			// never the folder token. A weightless component falls through to
+			// its legacy folder filter.
+			for _, file := range item.Files {
+				recommended = append(recommended, exactArtifactFilter(file))
+			}
 		} else {
 			recommended = append(recommended, item.FilterValue)
 		}
@@ -700,12 +708,23 @@ func (r *RepoInfo) PopulateDownloadSelection() {
 			break
 		}
 	}
+	// Recommended filters contributed as exact path selectors (a Diffusers
+	// component's chosen weight set, see RecommendedFilterValues) need
+	// exactMatch like GGUF artifacts; a recommendation without them keeps the
+	// legacy folder-token body byte-identical.
+	exactArtifacts := false
+	for _, item := range r.SelectableItems {
+		if item.Recommended && item.UpstreamRepo == "" && item.Category == "component" && len(item.Files) > 0 {
+			exactArtifacts = true
+			break
+		}
+	}
 
 	r.RecommendedDownload = &DownloadSelection{
 		Repo:          r.Repo,
 		Dataset:       r.IsDataset,
 		Filters:       r.RecommendedFilters,
-		ExactMatch:    r.IsDataset || r.Type == TypeGGUF,
+		ExactMatch:    r.IsDataset || r.Type == TypeGGUF || exactArtifacts,
 		BranchVariant: recommendedBranchVariant,
 	}
 	if r.Branch != "" && r.Branch != "main" {

@@ -554,8 +554,11 @@ func TestRecommendationPrecedenceAcrossBranchAvailability(t *testing.T) {
 		}
 		filters := append([]string(nil), rd.Filters...)
 		sort.Strings(filters)
-		if want := []string{"unet", "vae"}; !reflect.DeepEqual(filters, want) {
-			t.Fatalf("recommended filters = %v, want the required diffusers components %v (base hid the rows via its whole-tree payload scan)", filters, want)
+		// Authorized B3 shape shift: the weighted unet now contributes its
+		// chosen weight set as exact path selectors (the GGUF-artifact
+		// mechanism), while the weightless vae keeps its legacy folder token.
+		if want := []string{"unet/diffusion_pytorch_model.safetensors", "vae"}; !reflect.DeepEqual(filters, want) {
+			t.Fatalf("recommended filters = %v, want the chosen weight set plus the weightless folder filter %v (base hid the rows via its whole-tree payload scan)", filters, want)
 		}
 	})
 
