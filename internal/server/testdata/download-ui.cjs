@@ -395,6 +395,39 @@ async function run(entry, type, { dataset = false, manual = '', low = false, cho
   ui.setAnalysis(datasetAnalysis);
   ui.renderFilesTab(datasetAnalysis);
   assert(!filesPanel.innerHTML.includes('nonSelectableRoute'), 'a dataset tree must not offer a destination picker');
+  // D5b config presets: the Dataset Configs category renders above Dataset
+  // Splits, exactly one Recommended badge sits on the config row, and
+  // downloading that row posts its folder filter with exactMatch.
+  const configPresetAnalysis = { repo: 'fixture/configs', type: 'gguf', branch: 'main', is_dataset: true, files: [{ path: 'cc100/train/part.parquet', size: 10 }] };
+  ui.setAnalysis(configPresetAnalysis);
+  const configPresetHtml = ui.renderSelectableItems([
+    { id: 'cc100/', label: 'cc100 (train+test)', category: 'config', filter_value: 'cc100/',
+      recommended: true, size_human: '4.1 GB', files: ['cc100/train/part.parquet'] },
+    { id: 'wiki/', label: 'wiki (validation)', category: 'config', filter_value: 'wiki/', size_human: '300 B' },
+    { id: 'train', label: 'Train', category: 'split', filter_value: 'train', size_human: '3.0 GB' },
+    { id: 'test', label: 'Test', category: 'split', filter_value: 'test', size_human: '1.1 GB' }
+  ], 'configPresetItems');
+  const configCatPos = configPresetHtml.indexOf('Dataset Configs');
+  const splitCatPos = configPresetHtml.indexOf('Dataset Splits');
+  assert(configCatPos !== -1 && splitCatPos !== -1, 'both dataset categories must render: ' + configPresetHtml);
+  assert(configCatPos < splitCatPos, 'Dataset Configs must render above Dataset Splits');
+  const recBadges = configPresetHtml.match(/★ rec/g) || [];
+  assert.equal(recBadges.length, 1, 'exactly one Recommended badge must render');
+  assert(configPresetHtml.slice(configCatPos, splitCatPos).includes('★ rec'),
+    'the Recommended badge must sit on the config preset, not a split');
+  const configRow = /data-fv="cc100\/"[\s\S]*?data-download="([^"]+)"/.exec(configPresetHtml);
+  assert(configRow, 'the config preset row must carry a download payload');
+  calls.length = 0;
+  messages.length = 0;
+  await window.downloadQuantFromButton({ dataset: { download: configRow[1] }, closest: () => null });
+  const configDownload = calls.find(c => c.path === '/api/download');
+  assert(configDownload, 'config preset download request missing');
+  const configPreview = calls.find(c => c.path === '/api/diskfree');
+  assert(configPreview && configPreview.body, 'config preset must check the disk first');
+  assert.deepEqual(configDownload.body, configPreview.body, 'guard and creation must use the identical config request');
+  assert.deepEqual(configDownload.body.filters, ['cc100/'], 'config row must send its folder filter');
+  assert.equal(configDownload.body.exactMatch, true, 'the config folder filter is exact');
+  assert.equal(configDownload.body.dataset, true, 'the config preset stays a dataset request');
   // No configured destinations leave both analysis surfaces without a picker.
   if (!Object.keys(fixture.routes || {}).length) {
     const noRouteAnalysis = { repo: 'fixture/model', type: 'gguf', files: [{ path: 'model.bin', size: 7 }] };

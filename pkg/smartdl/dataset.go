@@ -304,13 +304,126 @@ func HasMultipleFormats(info *DatasetInfo) bool {
 	return len(info.Formats) > 1
 }
 
-// DatasetToSelectableItems converts dataset splits to SelectableItems.
+// datasetConfigGroup rolls a repository config's member files into one
+// whole-config preset row: the config's folder selector, the splits its
+// files belong to, and the summed size of those members.
+type datasetConfigGroup struct {
+	name   string
+	folder string
+	splits []string
+	files  []string
+	size   int64
+	// train reports whether any member file belongs to the train split —
+	// the split the established dataset recommendation logic marks Recommended.
+	train bool
+}
+
+// configFolderSelector returns the directory selector for the config
+// component detectConfig found in p: data/<config>/... selects through
+// "data/<config>/", a root-level <config>/... through "<config>/". The
+// trailing slash is the established exact-match directory-filter grammar,
+// so the selector picks the config folder at a path-component boundary.
+func configFolderSelector(p, config string) string {
+	parts := strings.Split(p, "/")
+	if len(parts) >= 3 && parts[0] == "data" && parts[1] == config {
+		return "data/" + config + "/"
+	}
+	return config + "/"
+}
+
+// datasetConfigGroups groups every split member file by its detectConfig
+// config and returns the groups in deterministic config-name order.
+func datasetConfigGroups(info *DatasetInfo) []*datasetConfigGroup {
+	byName := make(map[string]*datasetConfigGroup)
+	var groups []*datasetConfigGroup
+	for _, split := range info.Splits {
+		for _, file := range split.Files {
+			config := detectConfig(file.Path)
+			if config == "" {
+				continue
+			}
+			g := byName[config]
+			if g == nil {
+				g = &datasetConfigGroup{name: config, folder: configFolderSelector(file.Path, config)}
+				byName[config] = g
+				groups = append(groups, g)
+			} else if folder := configFolderSelector(file.Path, config); folder != g.folder {
+				// Members span both canonical config layouts; the bare
+				// <config>/ selector still selects the folder at a component
+				// boundary in either spelling.
+				g.folder = config + "/"
+			}
+			if split.Name == "train" {
+				g.train = true
+			}
+			present := false
+			for _, existing := range g.splits {
+				if existing == split.Name {
+					present = true
+					break
+				}
+			}
+			if !present {
+				g.splits = append(g.splits, split.Name)
+			}
+			g.files = append(g.files, file.Path)
+			g.size += file.Size
+		}
+	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i].name < groups[j].name })
+	return groups
+}
+
+// label renders the preset row label, e.g. "cc100 (train+test)": the config
+// name followed by its splits in the established split-priority order.
+func (g *datasetConfigGroup) label() string {
+	names := append([]string(nil), g.splits...)
+	sort.Slice(names, func(i, j int) bool {
+		pi, pj := splitPriority(names[i]), splitPriority(names[j])
+		if pi != pj {
+			return pi < pj
+		}
+		return names[i] < names[j]
+	})
+	return fmt.Sprintf("%s (%s)", g.name, strings.Join(names, "+"))
+}
+
+// DatasetToSelectableItems converts dataset configs and splits to
+// SelectableItems. Config preset rows come first so the UI's
+// "Dataset Configs" category renders above "Dataset Splits". Exactly one
+// row can carry Recommended: when exactly one config holds the train
+// split — the split the existing dataset recommendation logic marks
+// Recommended — that config's preset takes the badge and every split row
+// stays unbadged; with no unique winner (several train-bearing configs or
+// none) the badge falls back to the existing split-level rule unchanged.
 func DatasetToSelectableItems(info *DatasetInfo) []SelectableItem {
 	if info == nil || len(info.Splits) == 0 {
 		return nil
 	}
 
 	var items []SelectableItem
+
+	configGroups := datasetConfigGroups(info)
+	trainConfigs := 0
+	for _, g := range configGroups {
+		if g.train {
+			trainConfigs++
+		}
+	}
+	configRecommended := trainConfigs == 1
+	for _, g := range configGroups {
+		items = append(items, SelectableItem{
+			ID:          g.folder,
+			Label:       g.label(),
+			Description: fmt.Sprintf("Dataset config (%d files)", len(g.files)),
+			Size:        g.size,
+			SizeHuman:   humanSize(g.size),
+			Recommended: configRecommended && g.train,
+			Category:    "config",
+			FilterValue: g.folder,
+			Files:       g.files,
+		})
+	}
 
 	// Add splits
 	splitDescriptions := map[string]string{
@@ -339,7 +452,7 @@ func DatasetToSelectableItems(info *DatasetInfo) []SelectableItem {
 			Description: desc,
 			Size:        split.Size,
 			SizeHuman:   split.SizeHuman,
-			Recommended: split.Name == "train",
+			Recommended: !configRecommended && split.Name == "train",
 			Category:    "split",
 			FilterValue: split.Name,
 		}

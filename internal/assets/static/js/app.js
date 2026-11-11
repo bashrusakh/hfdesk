@@ -6313,6 +6313,7 @@ async function loadRepositoryDetails(entry) {
       'quantization': 'Quantizations',
       'variant': 'Variants',
       'component': 'Components',
+      'config': 'Dataset Configs',
       'split': 'Dataset Splits',
       'format': 'Weight Format',
       'precision': 'Precision',

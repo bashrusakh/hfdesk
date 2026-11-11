@@ -564,7 +564,7 @@ type SelectableItem struct {
 
 	Recommended bool `json:"recommended,omitempty"`
 
-	// Category groups items (e.g., "quantization", "variant", "component", "split", "format").
+	// Category groups items (e.g., "quantization", "variant", "component", "split", "config", "format").
 	Category string `json:"category,omitempty"`
 
 	// FilterValue is the legacy filter/display token. For GGUF selections, use
