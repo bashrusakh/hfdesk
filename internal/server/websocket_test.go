@@ -32,21 +32,6 @@ func TestWSHub_Broadcast(t *testing.T) {
 		Status: JobStatusRunning,
 	}
 	hub.BroadcastJob(job)
-
-	// Test BroadcastEvent
-	hub.BroadcastEvent(map[string]string{"event": "test"})
-}
-
-func TestWSHub_ClientCount(t *testing.T) {
-	hub := NewWSHub()
-	go hub.Run()
-
-	time.Sleep(10 * time.Millisecond)
-
-	count := hub.ClientCount()
-	if count != 0 {
-		t.Errorf("Expected 0 clients, got %d", count)
-	}
 }
 
 // TestWSClient_WritePumpOneMessagePerFrame guards the frontend contract that

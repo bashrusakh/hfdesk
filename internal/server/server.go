@@ -365,16 +365,6 @@ func (s *Server) ActiveJobCounts() (running, queued int) {
 	return s.jobs.activeCounts()
 }
 
-// setBoundAddr records the effective bound address of the server without a
-// listener to ask: no address-family behavior is known for it, so BrowserURL
-// keeps its earlier derivation for that bind.
-func (s *Server) setBoundAddr(addr net.Addr) {
-	s.boundAddrMu.Lock()
-	s.boundAddr = addr
-	s.boundIPv6Only, s.boundFamilyKnown = false, false
-	s.boundAddrMu.Unlock()
-}
-
 // setBoundListener records the effective bound address of the server together
 // with the address-family behavior of the listener it came from, so a
 // wildcard bind can name a loopback address the listener really answers on.
@@ -652,14 +642,6 @@ func (s *Server) serveListener(ctx context.Context, listener net.Listener, handl
 		go s.wsHub.Run()
 	}
 	return s.serveHTTPListener(ctx, listener, shutdownTimeout)
-}
-
-func (s *Server) serveHTTP(ctx context.Context, addr string, handler http.Handler, shutdownTimeout time.Duration) error {
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return s.closeJobsAfterListenError(fmt.Errorf("listen on %s: %w", addr, err), shutdownTimeout)
-	}
-	return s.serveListener(ctx, listener, handler, shutdownTimeout)
 }
 
 func (s *Server) serveHTTPListener(ctx context.Context, listener net.Listener, shutdownTimeout time.Duration) error {

@@ -1552,17 +1552,17 @@ func TestJobDestinationBaseUsesFrozenLocalRepoAndDatasetNamespace(t *testing.T) 
 	if got, want := jobDestinationBase(job), filepath.Join("/cache", "models", "owner", "model"); got != want {
 		t.Fatalf("model destination=%q want %q", got, want)
 	}
-	if !jobMayWriteSelectedPath(job, filepath.Join("/cache", "models", "owner", "model", "model-Q4_K_M.gguf")) {
+	if !jobMayWriteSelectedPaths(job, []string{filepath.Join("/cache", "models", "owner", "model", "model-Q4_K_M.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("redirected model destination was not recognized as a selected-path writer")
 	}
-	if jobMayWriteSelectedPath(job, filepath.Join("/cache", "models", "upstream", "source", "model-Q4_K_M.gguf")) {
+	if jobMayWriteSelectedPaths(job, []string{filepath.Join("/cache", "models", "upstream", "source", "model-Q4_K_M.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("API repository spelling incorrectly authorized a different physical destination")
 	}
 	job.IsDataset = true
 	if got, want := jobDestinationBase(job), filepath.Join("/cache", "datasets", "owner", "model"); got != want {
 		t.Fatalf("dataset destination=%q want %q", got, want)
 	}
-	if jobMayWriteSelectedPath(job, filepath.Join("/cache", "models", "owner", "model", "model-Q4_K_M.gguf")) {
+	if jobMayWriteSelectedPaths(job, []string{filepath.Join("/cache", "models", "owner", "model", "model-Q4_K_M.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("dataset writer leaked into the separate model namespace")
 	}
 	job.Flat, job.LocalDir, job.LocalRepo = true, "/flat", "nested/../custom/path"
@@ -1763,10 +1763,10 @@ func TestJobMayWriteSelectedSnapshotEntry(t *testing.T) {
 	}
 	job := &Job{OutputDir: cache.Root, HubDir: cache.HubDir(), Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"Q4_K_M"}}
 	selected := filepath.Join(rd.SnapshotsDir(), "saved-version", "model-Q4_K_M.gguf")
-	if !jobMayWriteSelectedPath(job, selected) {
+	if !jobMayWriteSelectedPaths(job, []string{selected}, inventoryWritableNamespace) {
 		t.Fatal("HF writer was not recognized as a possible writer beneath the frozen repository snapshots")
 	}
-	if !jobMayWriteSelectedPath(job, filepath.Join(rd.SnapshotsDir(), "saved-version", "model-Q5_K_M.gguf")) {
+	if !jobMayWriteSelectedPaths(job, []string{filepath.Join(rd.SnapshotsDir(), "saved-version", "model-Q5_K_M.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("pre-plan model projection inferred pure-GGUF mode from the quant filter")
 	}
 	dataset, err := cache.Repo("owner/model", hfdownloader.RepoTypeDataset)
@@ -1775,7 +1775,7 @@ func TestJobMayWriteSelectedSnapshotEntry(t *testing.T) {
 	}
 	job.IsDataset = true
 	job.LocalRepo = "owner/model"
-	if !jobMayWriteSelectedPath(job, filepath.Join(dataset.SnapshotsDir(), "saved-version", "data-Q4_K_M.gguf")) {
+	if !jobMayWriteSelectedPaths(job, []string{filepath.Join(dataset.SnapshotsDir(), "saved-version", "data-Q4_K_M.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("dataset HF writer was not recognized beneath its frozen repository snapshots")
 	}
 }
@@ -1803,7 +1803,7 @@ func TestSelectedDeleteReservationsUseRepoRelativeFilterPaths(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			job := &Job{OutputDir: cacheDir, HubDir: cache.HubDir(), Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{tc.filter}, ExactMatch: tc.exact}
-			if !jobMayWriteSelectedPath(job, tc.target) {
+			if !jobMayWriteSelectedPaths(job, []string{tc.target}, inventoryWritableNamespace) {
 				t.Fatalf("writer was not recognized for filter %q and target %q", tc.filter, tc.target)
 			}
 
@@ -1862,12 +1862,12 @@ func TestJobMayWriteSelectedPathConservesInternalAliasAndSnapshotMappings(t *tes
 		t.Fatal(err)
 	}
 	physical := filepath.Join(actual, "model.gguf")
-	if !jobMayWriteSelectedPath(job, physical) {
+	if !jobMayWriteSelectedPaths(job, []string{physical}, inventoryWritableNamespace) {
 		t.Fatal("internal directory alias was treated as a proven non-match")
 	}
 
 	job.Filters = []string{"Q5_K_M"}
-	if !jobMayWriteSelectedPath(job, filepath.Join(actual, "model-Q4_K_M.gguf")) {
+	if !jobMayWriteSelectedPaths(job, []string{filepath.Join(actual, "model-Q4_K_M.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("pre-plan model projection must allow for unmatched non-LFS companions")
 	}
 
@@ -1879,7 +1879,7 @@ func TestJobMayWriteSelectedPathConservesInternalAliasAndSnapshotMappings(t *tes
 	job.Filters = []string{"weights/model.gguf"}
 	job.HubDir = cache.HubDir()
 	snapshot := filepath.Join(rd.SnapshotsDir(), "unknown-commit", "weights", "model.gguf")
-	if !jobMayWriteSelectedPath(job, snapshot) {
+	if !jobMayWriteSelectedPaths(job, []string{snapshot}, inventoryWritableNamespace) {
 		t.Fatal("snapshot path filter was not matched below the unknown commit prefix")
 	}
 }
@@ -1894,7 +1894,7 @@ func TestSelectedDeleteIgnoresUnrelatedRepoDespiteInternalAliasAndPathFilter(t *
 	}
 	symlinkOrSkip(t, actual, filepath.Join(base, "weights"))
 	other := filepath.Join(storage, "models", "owner", "b", "model.gguf")
-	if jobMayWriteSelectedPath(job, other) {
+	if jobMayWriteSelectedPaths(job, []string{other}, inventoryWritableNamespace) {
 		t.Fatal("internal alias in repo A conservatively blocked unrelated repo B")
 	}
 
@@ -2005,19 +2005,19 @@ func TestJobMayWriteSelectedPathConservesBareAndNestedAliasMappings(t *testing.T
 		}
 		t.Fatal(err)
 	}
-	if !jobMayWriteSelectedPath(job, filepath.Join(physical, "model.gguf")) {
+	if !jobMayWriteSelectedPaths(job, []string{filepath.Join(physical, "model.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("bare directory filter missed a sibling alias spelling")
 	}
 
 	nestedAlias := filepath.Join(base, "physical", "weights")
 	symlinkOrSkip(t, filepath.Join(base, "physical", "nested"), nestedAlias)
 	job.Filters = []string{"weights/model.gguf"}
-	if !jobMayWriteSelectedPath(job, filepath.Join(physical, "model.gguf")) {
+	if !jobMayWriteSelectedPaths(job, []string{filepath.Join(physical, "model.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("full path filter missed a nested alias destination")
 	}
 
 	job.Filters = []string{"Q5_K_M"}
-	if !jobMayWriteSelectedPath(job, filepath.Join(base, "canonical", "model-Q4_K_M.gguf")) {
+	if !jobMayWriteSelectedPaths(job, []string{filepath.Join(base, "canonical", "model-Q4_K_M.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("pre-plan model projection must not infer pure-GGUF mode from the filter alone")
 	}
 }
@@ -2038,10 +2038,10 @@ func TestJobMayWriteSelectedPathFailsClosedForUnknownAliasParent(t *testing.T) {
 		OutputDir: storage, Repo: "upstream/source", LocalRepo: "owner/model",
 		Filters: []string{"weights/model.gguf"}, ExactMatch: true,
 	}
-	if !jobMayWriteSelectedPath(job, filepath.Join(alias, "model.gguf")) {
+	if !jobMayWriteSelectedPaths(job, []string{filepath.Join(alias, "model.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("unresolved alias parent was treated as a proven non-match")
 	}
-	if !jobMayWriteSelectedPath(job, filepath.Join(jobDestinationBase(job), "missing-parent", "model.gguf")) {
+	if !jobMayWriteSelectedPaths(job, []string{filepath.Join(jobDestinationBase(job), "missing-parent", "model.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("missing parent mapping was treated as a proven non-match")
 	}
 }
@@ -2072,7 +2072,7 @@ func TestSelectedDeleteBlocksPunctuatedBareDirectoryFilterThroughAlias(t *testin
 	writeSelectionFile(t, actual, "model-Q4_K_M.gguf")
 	target := filepath.Join(actual, "model-Q4_K_M.gguf")
 
-	if !jobMayWriteSelectedPath(job, target) {
+	if !jobMayWriteSelectedPaths(job, []string{target}, inventoryWritableNamespace) {
 		t.Fatal("punctuated bare directory filter matched through an alias was treated as a proven non-match")
 	}
 
@@ -2158,7 +2158,7 @@ func TestSelectedDeleteBlocksAliasDestinationOutsideWriterBase(t *testing.T) {
 	writeSelectionFile(t, outside, "model.gguf")
 	target := filepath.Join(outside, "model.gguf")
 
-	if !jobMayWriteSelectedPath(job, target) {
+	if !jobMayWriteSelectedPaths(job, []string{target}, inventoryWritableNamespace) {
 		t.Fatal("alias destination outside the writer base was treated as a proven non-match")
 	}
 
@@ -2244,11 +2244,11 @@ func TestSelectedDeleteBlocksSnapshotBaseAliasWriter(t *testing.T) {
 	symlinkOrSkip(t, physical, jobSnapshotBase(job))
 	target := filepath.Join(physical, "saved-commit", "weights", "model.gguf")
 
-	if !jobMayWriteSelectedPath(job, target) {
+	if !jobMayWriteSelectedPaths(job, []string{target}, inventoryWritableNamespace) {
 		t.Fatal("snapshot-base alias mapping was treated as a proven non-match")
 	}
 	job.Filters = []string{"Q5_K_M"}
-	if !jobMayWriteSelectedPath(job, filepath.Join(physical, "saved-commit", "weights", "model-Q4_K_M.gguf")) {
+	if !jobMayWriteSelectedPaths(job, []string{filepath.Join(physical, "saved-commit", "weights", "model-Q4_K_M.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("pre-plan model projection inferred pure-GGUF mode from the quant filter")
 	}
 	job.Filters = []string{"weights/model.gguf"}
@@ -2355,7 +2355,7 @@ func TestSelectedDeleteBlocksMultiComponentRevisionSnapshotWriter(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	if !jobMayWriteSelectedPath(job, target) {
+	if !jobMayWriteSelectedPaths(job, []string{target}, inventoryWritableNamespace) {
 		t.Fatal("multi-component revision snapshot path was treated as a proven non-match")
 	}
 
@@ -2473,13 +2473,13 @@ func TestJobAdmissionPredicateResolvesSelectedRootAliases(t *testing.T) {
 	}
 	job := &Job{OutputDir: actual, Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"Q4_K_M"}}
 	target := filepath.Join(alias, "models", "owner", "model", "model-Q4_K_M.gguf")
-	if !jobMayWriteSelectedPath(job, target) {
+	if !jobMayWriteSelectedPaths(job, []string{target}, inventoryWritableNamespace) {
 		t.Fatal("shared writer predicate missed a selected entry beneath a configured-root alias")
 	}
-	if !jobMayWriteSelectedPath(job, filepath.Join(actual, "models", "owner", "model", "model-Q4_K_M.gguf")) {
+	if !jobMayWriteSelectedPaths(job, []string{filepath.Join(actual, "models", "owner", "model", "model-Q4_K_M.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("shared writer predicate missed the canonical spelling of the selected entry")
 	}
-	if !jobMayWriteSelectedPath(job, filepath.Join(alias, "models", "owner", "model", "model-Q5_K_M.gguf")) {
+	if !jobMayWriteSelectedPaths(job, []string{filepath.Join(alias, "models", "owner", "model", "model-Q5_K_M.gguf")}, inventoryWritableNamespace) {
 		t.Fatal("pre-plan model projection inferred pure-GGUF mode through the alias")
 	}
 
@@ -2514,10 +2514,10 @@ func TestJobAdmissionPredicateResolvesSelectedRootAliases(t *testing.T) {
 	if _, _, err := s.jobs.CreateJob(DownloadRequest{Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"Q4_K_M"}}); !errors.Is(err, errSelectionWriterBusy) {
 		t.Fatalf("new matching aliased writer crossed reservation: %v", err)
 	}
-	if !jobMayWriteSelectedPath(&Job{OutputDir: actual, Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"Q5_K_M"}}, target) {
+	if !jobMayWriteSelectedPaths(&Job{OutputDir: actual, Repo: "upstream/source", LocalRepo: "owner/model", Filters: []string{"Q5_K_M"}}, []string{target}, inventoryWritableNamespace) {
 		t.Fatal("pre-plan Q5 model projection failed to account for non-LFS companions")
 	}
-	if jobMayWriteSelectedPath(&Job{OutputDir: actual, Repo: "other/source", LocalRepo: "other/model", Filters: []string{"Q5_K_M"}}, target) {
+	if jobMayWriteSelectedPaths(&Job{OutputDir: actual, Repo: "other/source", LocalRepo: "other/model", Filters: []string{"Q5_K_M"}}, []string{target}, inventoryWritableNamespace) {
 		t.Fatal("unrelated repository outside the writable namespace was treated as a writer")
 	}
 	release()
@@ -2953,7 +2953,7 @@ func TestAliasedExcludedRemotePathStillBlocksSelectedEntry(t *testing.T) {
 	if got, err := mutationEntryIdentity(plannedOutput); err != nil || got != pathIdentityKey(selected) {
 		t.Fatalf("planned output identity=%q err=%v, selected entry=%q", got, err, selected)
 	}
-	if !jobMayWriteSelectedPath(job, selected) {
+	if !jobMayWriteSelectedPaths(job, []string{selected}, inventoryWritableNamespace) {
 		t.Fatal("physical alias component was incorrectly applied as the remote path exclusion")
 	}
 

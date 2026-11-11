@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/bashrusakh/hfdesk/pkg/smartdl"
 )
 
 // splitSelectionGroup returns the selection group that owns memberPath.
@@ -34,10 +36,10 @@ func splitSelectionPaths(group cacheSelectionGroup) []string {
 	return paths
 }
 
-// TestCacheQuantLabelRequiresCompleteToken pins the classifier boundary rules
+// TestGGUFQuantTypeRequiresCompleteToken pins the classifier boundary rules
 // shared with the downloader: an extended token is not a shorter known quant,
 // and legacy split shards are stripped before matching.
-func TestCacheQuantLabelRequiresCompleteToken(t *testing.T) {
+func TestGGUFQuantTypeRequiresCompleteToken(t *testing.T) {
 	for name, want := range map[string]string{
 		"model-Q4_K_M.gguf":                            "Q4_K_M",
 		"UD-Q4_K_XL.gguf":                              "UD_Q4_K_XL",
@@ -49,8 +51,8 @@ func TestCacheQuantLabelRequiresCompleteToken(t *testing.T) {
 		"model-Q4_K_M_EXTRA_00001-of-00002.gguf":       "",
 		"model-Q4_K_M_EXTRA_00001-of-00002.gguf-split": "",
 	} {
-		if got := cacheQuantLabel(name); got != want {
-			t.Errorf("cacheQuantLabel(%q) = %q, want %q", name, got, want)
+		if got := smartdl.GGUFQuantType(name, name); got != want {
+			t.Errorf("GGUFQuantType(%q) = %q, want %q", name, got, want)
 		}
 	}
 }

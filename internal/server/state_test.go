@@ -188,7 +188,7 @@ func TestSaveLoadJobsStatePathHelpers(t *testing.T) {
 	if err := SaveJobsState([]*Job{job}); err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := LoadJobsState()
+	loaded, err := loadJobsState(JobsStatePath())
 	if err != nil {
 		t.Fatal(err)
 	}

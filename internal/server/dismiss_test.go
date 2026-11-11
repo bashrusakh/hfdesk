@@ -11,11 +11,11 @@ import (
 	"time"
 )
 
-// TestDismissJob_OnlyTerminalStates ensures DismissJob refuses to remove
-// jobs that are still queued or running — a user can't accidentally wipe
+// TestDismissJobResult_OnlyTerminalStates ensures DismissJobResult refuses to
+// remove jobs that are still queued or running — a user can't accidentally wipe
 // a live download by clicking the wrong button. Paused jobs are terminal
 // from the "visible in list" standpoint and can be dismissed.
-func TestDismissJob_OnlyTerminalStates(t *testing.T) {
+func TestDismissJobResult_OnlyTerminalStates(t *testing.T) {
 	m := newTestJobManager(t, Config{}, nil)
 
 	cases := []struct {
@@ -40,9 +40,10 @@ func TestDismissJob_OnlyTerminalStates(t *testing.T) {
 				CreatedAt: time.Now(),
 			}
 
-			got := m.DismissJob(id)
+			result, _ := m.DismissJobResult(id)
+			got := result == DismissJobOK
 			if got != tc.wantRemove {
-				t.Errorf("DismissJob(%q) = %v, want %v", tc.status, got, tc.wantRemove)
+				t.Errorf("DismissJobResult(%q) removed = %v, want %v", tc.status, got, tc.wantRemove)
 			}
 			_, present := m.jobs[id]
 			if tc.wantRemove && present {
@@ -57,17 +58,17 @@ func TestDismissJob_OnlyTerminalStates(t *testing.T) {
 	}
 }
 
-// TestDismissJob_SurvivesPageRefresh verifies the core #68-secondary
+// TestDismissJobResult_SurvivesPageRefresh verifies the core #68-secondary
 // guarantee: once a job is dismissed, it no longer appears in the list
 // that sendInitialState uses to rehydrate a reconnecting browser.
-func TestDismissJob_SurvivesPageRefresh(t *testing.T) {
+func TestDismissJobResult_SurvivesPageRefresh(t *testing.T) {
 	m := newTestJobManager(t, Config{}, nil)
 
 	m.jobs["live"] = &Job{ID: "live", Status: JobStatusRunning, CreatedAt: time.Now()}
 	m.jobs["gone"] = &Job{ID: "gone", Status: JobStatusCompleted, CreatedAt: time.Now()}
 
-	if !m.DismissJob("gone") {
-		t.Fatal("DismissJob(gone) returned false")
+	if res, _ := m.DismissJobResult("gone"); res != DismissJobOK {
+		t.Fatal("DismissJobResult(gone) did not remove the completed job")
 	}
 
 	jobs := m.ListJobs()

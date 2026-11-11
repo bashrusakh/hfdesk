@@ -144,18 +144,6 @@ func (h *WSHub) BroadcastJob(job *Job) {
 	h.Broadcast("job_update", job)
 }
 
-// BroadcastEvent sends a progress event to all clients.
-func (h *WSHub) BroadcastEvent(event any) {
-	h.Broadcast("event", event)
-}
-
-// ClientCount returns the number of connected clients.
-func (h *WSHub) ClientCount() int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return len(h.clients)
-}
-
 // handleWebSocket handles WebSocket connections.
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	upgrader := websocket.Upgrader{

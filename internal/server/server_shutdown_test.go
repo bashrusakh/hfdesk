@@ -6,6 +6,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -296,6 +297,18 @@ type failingAcceptListener struct {
 }
 
 func (l failingAcceptListener) Accept() (net.Conn, error) { return nil, l.err }
+
+// serveHTTP binds addr and serves handler on the listener it obtains, with the
+// shared HTTP server configuration and graceful shutdown sequence. It is the
+// test-layer fixture for the bind-then-serve path; production serves through
+// Listen + Serve.
+func (s *Server) serveHTTP(ctx context.Context, addr string, handler http.Handler, shutdownTimeout time.Duration) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return s.closeJobsAfterListenError(fmt.Errorf("listen on %s: %w", addr, err), shutdownTimeout)
+	}
+	return s.serveListener(ctx, listener, handler, shutdownTimeout)
+}
 
 func reserveServerTestAddr(t *testing.T) string {
 	t.Helper()

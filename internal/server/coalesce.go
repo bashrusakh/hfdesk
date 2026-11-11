@@ -110,19 +110,6 @@ func (c *jobCoalescer) schedule(job *Job) {
 	c.mu.Unlock()
 }
 
-// stop halts pending timers and rejects further schedule calls. Safe to call
-// multiple times.
-func (c *jobCoalescer) stop() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.stopped = true
-	for id, t := range c.timers {
-		t.Stop()
-		delete(c.timers, id)
-	}
-	c.pending = map[string]*Job{}
-}
-
 // isTerminalJobStatus reports whether a status represents a state the user
 // cares about seeing right away (so it shouldn't be delayed by the throttle).
 func isTerminalJobStatus(s JobStatus) bool {

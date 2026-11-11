@@ -608,10 +608,6 @@ type writableNamespaceBase struct {
 	snapshot bool
 }
 
-func jobMayWriteSelectedPath(job *Job, target string) bool {
-	return jobMayWriteSelectedPaths(job, []string{target}, inventoryWritableNamespace)
-}
-
 // selectedWriteEvidence is an immutable reservation-attempt snapshot. Its
 // namespace inventories are built before evaluation; evaluation only consumes
 // these values and never consults the filesystem or mutable Job slices.
