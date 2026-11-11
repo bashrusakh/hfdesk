@@ -1695,6 +1695,54 @@ friendly view, in this process or in another process sharing the cache; when
 cache ownership cannot be established on the filesystem it fails closed with
 `500` instead of removing anything.
 
+The same endpoint accepts an optional JSON body that extends the details-modal
+Delete button to local sources; without a body its behavior is byte-for-byte
+unchanged:
+
+```json
+{ "source": "Local", "path": "/models/owner/model" }
+```
+
+`source` must be exactly `Local` or `Friendly view` — the listing labels whose
+details dialog was confirmed — and `path` must be present with it; a body
+missing either field, an unknown `source`, a `path` without a `source`, or a
+body with `type=dataset` (or a dataset repository) returns `400`: whole-folder
+deletion is model-only, and local datasets keep no such scope. The server never
+trusts `path`. For `source=Local` it must identity-match `Join(root, owner,
+name)` for a currently configured scan/download root whose listing label is
+`Local`, after the listing's own rules (skipped owners such as `hub`/`models`
+under the cache root never qualify) and the registered-roots check; otherwise
+`400 Invalid path` ("Path is not a configured local model folder"). For
+`source=Friendly view` it must identity-match the model's server-derived
+friendly-view folder; otherwise `400 Invalid path`.
+
+`source=Local` deletes the whole model folder — the folder is the model unit.
+Every established layer applies: the strict repository-ID/traversal/charset
+validation above; owner/model symlink-component rejection through the anchored
+open (`409 Selection is unsafe`); fail-closed configured-boundary refusal when
+the folder contains another configured root or is owned by one
+(`409 Location could not be verified`); the in-process destructive window
+(`409 Repository is busy` when a live writer owns the folder in this process,
+including queued writers held by the dispatch gate) and flat-realm entry
+admission over the folder's enumerated entries (`409 Repository is busy` when a
+flat writer in this or another process holds any of them, via the established
+`writeCacheDeleteAdmission` family; an unresolvable admission fails closed with
+`500`); repeated binding rechecks (`409 Selection is stale`); and a final
+removal confined to an `os.Root` anchored at the folder's owner directory, so
+no symlink inside or above the folder can redirect it outside. Success answers
+`200 {"success": true, "message": ...}`. A removal that does not complete
+answers the established whole-repository shape — `200 {"success": false,
+"message": ..., "errors": [...]}` — instead of hiding the partial result.
+
+`source=Friendly view` uses the established endpoint semantics when the
+repository resolves as an HF cache item: the Hub repository and its friendly
+view are both removed with the layers above. When the Hub repository is absent,
+only the friendly tree is removed, with the same containment, expected
+structure, symlink and resolved-path checks (`400`), the in-process destructive
+window and cache-owned tree admission (`409 Repository is busy` /
+fail-closed `500`), the same `200` success / `200` with `errors` reporting, and
+`404` when neither the Hub repository nor the friendly folder exists.
+
 `locationId` is optional. When supplied, it must match a currently discovered
 location for this repo/type; unknown or stale IDs return `400` rather than
 falling back to another location. Local IDs are derived from the configured
@@ -1828,6 +1876,12 @@ Delete removes only the selected repository under H and its friendly view under
 R, with separate confinement checks. Shared H deletion can affect other clients
 using that repository. Failure to remove the friendly view after Hub deletion
 returns `success: false` with `errors`, rather than hiding partial failure.
+Repositories discovered by independent local scans and by the friendly view are
+reached through the optional `source`/`path` body described under the selected
+delete above: for `Local` the whole model folder is removed with flat-realm
+admission, for `Friendly view` the friendly tree (plus the Hub pair when it
+exists) is removed with cache-owned admission; local datasets are unchanged and
+offer no whole-folder scope.
 
 ## Mirror
 
