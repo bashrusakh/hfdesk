@@ -311,7 +311,7 @@ func estimateParameters(info *TransformersInfo) int64 {
 		}
 
 		// Layer norms: 2 * hidden_size per layer + 1 final
-		layerNorm := 2 * h * l + h
+		layerNorm := 2*h*l + h
 
 		return embedding + attention + ffn + layerNorm
 	}
@@ -404,20 +404,20 @@ func inferTaskFromArchitecture(arch string) (string, string) {
 // describeArchitecture provides a human-readable description of the architecture.
 func describeArchitecture(arch string) string {
 	descriptions := map[string]string{
-		"LlamaForCausalLM":              "Meta Llama decoder-only transformer",
-		"MistralForCausalLM":            "Mistral AI decoder-only transformer with sliding window attention",
-		"Qwen2ForCausalLM":              "Alibaba Qwen2 decoder-only transformer",
-		"Phi3ForCausalLM":               "Microsoft Phi-3 small language model",
-		"PhiForCausalLM":                "Microsoft Phi small language model",
-		"GPT2LMHeadModel":               "OpenAI GPT-2 decoder-only transformer",
-		"GPTNeoForCausalLM":             "EleutherAI GPT-Neo decoder-only transformer",
-		"GPTNeoXForCausalLM":            "EleutherAI GPT-NeoX decoder-only transformer",
-		"GPTJForCausalLM":               "EleutherAI GPT-J decoder-only transformer",
-		"FalconForCausalLM":             "TII Falcon decoder-only transformer",
-		"BertForSequenceClassification": "BERT encoder for sequence classification",
-		"BertForTokenClassification":    "BERT encoder for token classification",
-		"BertForQuestionAnswering":      "BERT encoder for question answering",
-		"BertModel":                     "BERT encoder base model",
+		"LlamaForCausalLM":                 "Meta Llama decoder-only transformer",
+		"MistralForCausalLM":               "Mistral AI decoder-only transformer with sliding window attention",
+		"Qwen2ForCausalLM":                 "Alibaba Qwen2 decoder-only transformer",
+		"Phi3ForCausalLM":                  "Microsoft Phi-3 small language model",
+		"PhiForCausalLM":                   "Microsoft Phi small language model",
+		"GPT2LMHeadModel":                  "OpenAI GPT-2 decoder-only transformer",
+		"GPTNeoForCausalLM":                "EleutherAI GPT-Neo decoder-only transformer",
+		"GPTNeoXForCausalLM":               "EleutherAI GPT-NeoX decoder-only transformer",
+		"GPTJForCausalLM":                  "EleutherAI GPT-J decoder-only transformer",
+		"FalconForCausalLM":                "TII Falcon decoder-only transformer",
+		"BertForSequenceClassification":    "BERT encoder for sequence classification",
+		"BertForTokenClassification":       "BERT encoder for token classification",
+		"BertForQuestionAnswering":         "BERT encoder for question answering",
+		"BertModel":                        "BERT encoder base model",
 		"RobertaForSequenceClassification": "RoBERTa encoder for sequence classification",
 		"RobertaModel":                     "RoBERTa encoder base model",
 		"T5ForConditionalGeneration":       "T5 encoder-decoder for text-to-text",
@@ -508,6 +508,11 @@ func TransformersToSelectableItems(info *TransformersInfo, files []FileInfo) []S
 		})
 	}
 
+	// Additive rare weight-format families (ONNX/TFLite/Flax/OpenVINO). These
+	// rows never carry the recommendation badge, so the safetensors > pytorch
+	// bin > everything else precedence above is unchanged.
+	items = append(items, rareFormatRows(files)...)
+
 	// Detect precision variants by checking file paths
 	precisions := detectPrecisionVariants(files)
 	if len(precisions) > 1 {
@@ -561,4 +566,135 @@ func detectPrecisionVariants(files []FileInfo) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+// rareFormatRows builds the additive "format" rows for weight-format families
+// beyond safetensors/pytorch bin. The grouping rule is extension/layout based:
+//
+//   - ONNX:    basenames ending in ".onnx";
+//   - TFLite:  basenames ending in ".tflite";
+//   - Flax:    basenames ending in ".msgpack";
+//   - OpenVINO: an IR pair — every ".xml" that has a same-directory,
+//     same-basename ".bin" weight file, plus those ".bin" members. An
+//     unpaired ".xml" or an unrelated ".bin" (e.g. pytorch_model.bin) is not
+//     part of the family.
+//
+// Each row is purely additive: Recommended stays false so the established
+// recommendation precedence (safetensors > pytorch bin > everything else) is
+// unchanged. Files carries the family's exact artifact paths (Size is their
+// summed size). FilterValue selects the family through the established filter
+// grammar: the extension form (".onnx"/".tflite"/".msgpack", like the existing
+// ".bin" token) for single-extension families, and for OpenVINO the shared
+// directory form ("openvino/fp32/", which selects every member of the layout)
+// when all pair members live under one common directory, falling back to
+// ".xml" for root-level or unshared layouts.
+func rareFormatRows(files []FileInfo) []SelectableItem {
+	var onnx, tflite, msgpack, openvino []FileInfo
+
+	type pairKey struct{ dir, base string }
+	parentDir := func(p string) string {
+		if i := strings.LastIndex(p, "/"); i >= 0 {
+			return p[:i]
+		}
+		return ""
+	}
+	xmlKeys := make(map[pairKey]bool)
+	binKeys := make(map[pairKey]bool)
+	for _, f := range files {
+		lower := strings.ToLower(f.Name)
+		key := pairKey{parentDir(artifactPath(f)), strings.TrimSuffix(lower, filepath.Ext(lower))}
+		switch {
+		case strings.HasSuffix(lower, ".xml"):
+			xmlKeys[key] = true
+		case strings.HasSuffix(lower, ".bin"):
+			binKeys[key] = true
+		}
+	}
+	for _, f := range files {
+		lower := strings.ToLower(f.Name)
+		key := pairKey{parentDir(artifactPath(f)), strings.TrimSuffix(lower, filepath.Ext(lower))}
+		switch {
+		case strings.HasSuffix(lower, ".onnx"):
+			onnx = append(onnx, f)
+		case strings.HasSuffix(lower, ".tflite"):
+			tflite = append(tflite, f)
+		case strings.HasSuffix(lower, ".msgpack"):
+			msgpack = append(msgpack, f)
+		case strings.HasSuffix(lower, ".xml") && binKeys[key]:
+			openvino = append(openvino, f)
+		case strings.HasSuffix(lower, ".bin") && xmlKeys[key]:
+			openvino = append(openvino, f)
+		}
+	}
+
+	var rows []SelectableItem
+	add := func(id, label, desc, filter string, members []FileInfo) {
+		if len(members) == 0 {
+			return
+		}
+		var size int64
+		paths := make([]string, 0, len(members))
+		for _, f := range members {
+			size += f.Size
+			paths = append(paths, artifactPath(f))
+		}
+		rows = append(rows, SelectableItem{
+			ID:          id,
+			Label:       label,
+			Description: desc,
+			Size:        size,
+			SizeHuman:   humanSize(size),
+			Recommended: false,
+			Category:    "format",
+			FilterValue: filter,
+			Files:       paths,
+		})
+	}
+
+	add("onnx", "ONNX", "ONNX runtime format", ".onnx", onnx)
+	add("tflite", "TFLite", "TensorFlow Lite format", ".tflite", tflite)
+	add("flax", "Flax", "Flax checkpoint (.msgpack)", ".msgpack", msgpack)
+
+	if len(openvino) > 0 {
+		paths := make([]string, 0, len(openvino))
+		for _, f := range openvino {
+			paths = append(paths, artifactPath(f))
+		}
+		filter := commonParentDir(paths)
+		if filter == "" {
+			filter = ".xml"
+		}
+		add("openvino", "OpenVINO", "OpenVINO IR (.xml + .bin)", filter, openvino)
+	}
+	return rows
+}
+
+// commonParentDir returns the shared repository-relative directory (with a
+// trailing "/" for the directory-filter form) of every path, or "" when any
+// path sits at the repository root or the paths share no directory.
+func commonParentDir(paths []string) string {
+	var common []string
+	for i, p := range paths {
+		slash := strings.LastIndex(p, "/")
+		if slash < 0 {
+			return ""
+		}
+		dir := strings.Split(p[:slash], "/")
+		if i == 0 {
+			common = dir
+			continue
+		}
+		n := 0
+		for n < len(common) && n < len(dir) && common[n] == dir[n] {
+			n++
+		}
+		common = common[:n]
+		if len(common) == 0 {
+			return ""
+		}
+	}
+	if len(common) == 0 {
+		return ""
+	}
+	return strings.Join(common, "/") + "/"
 }

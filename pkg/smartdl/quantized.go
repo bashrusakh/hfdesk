@@ -10,14 +10,17 @@ import (
 )
 
 var quantMethodDescriptions = map[string]string{
-	"gptq":         "GPTQ - GPU-accelerated post-training quantization",
-	"awq":          "AWQ - Activation-aware Weight Quantization",
-	"exl2":         "EXL2 - ExLlamaV2 mixed-precision quantization",
-	"exl3":         "EXL3 - ExLlamaV3 quantization",
-	"bitsandbytes": "bitsandbytes INT8/INT4 quantization",
-	"bnb":          "bitsandbytes INT8/INT4 quantization",
-	"hqq":          "HQQ - Half-Quadratic Quantization",
-	"eetq":         "EETQ - Easy and Efficient Quantization",
+	"gptq":               "GPTQ - GPU-accelerated post-training quantization",
+	"awq":                "AWQ - Activation-aware Weight Quantization",
+	"exl2":               "EXL2 - ExLlamaV2 mixed-precision quantization",
+	"exl3":               "EXL3 - ExLlamaV3 quantization",
+	"bitsandbytes":       "bitsandbytes INT8/INT4 quantization",
+	"bnb":                "bitsandbytes INT8/INT4 quantization",
+	"hqq":                "HQQ - Half-Quadratic Quantization",
+	"eetq":               "EETQ - Easy and Efficient Quantization",
+	"fp8":                "FP8 - 8-bit floating-point quantization",
+	"compressed-tensors": "compressed-tensors - sparsity and quantization compression",
+	"mlx":                "MLX - Apple MLX quantized weights",
 }
 
 // recognizedNonEXLMethod reports whether method is a quantization method this
@@ -192,11 +195,17 @@ func quantizationConfig(metadata map[string]interface{}) map[string]interface{} 
 	if nested, ok := config["quantization_config"].(map[string]interface{}); ok {
 		return nested
 	}
+	// MLX-style repositories declare quantization in a nested config.json
+	// "quantization" block instead of quantization_config.
+	if nested, ok := config["quantization"].(map[string]interface{}); ok {
+		return nested
+	}
 	return config
 }
 
 // hasQuantizationConfig reports whether the metadata contains a dedicated
-// quantization file or a nested config.json quantization object. A legacy
+// quantization file or a nested config.json quantization object — either the
+// quantization_config key or the MLX-style "quantization" block. A legacy
 // top-level config.json map alone is not enough to opt into type projection.
 func hasQuantizationConfig(metadata map[string]interface{}) bool {
 	for _, path := range []string{"quantize_config.json", "quantization_config.json"} {
@@ -208,7 +217,10 @@ func hasQuantizationConfig(metadata map[string]interface{}) bool {
 	if !ok {
 		return false
 	}
-	_, ok = config["quantization_config"].(map[string]interface{})
+	if _, ok := config["quantization_config"].(map[string]interface{}); ok {
+		return true
+	}
+	_, ok = config["quantization"].(map[string]interface{})
 	return ok
 }
 
@@ -297,6 +309,12 @@ func detectBackends(info *QuantizedInfo) []string {
 		backends = append(backends, "hqq", "transformers")
 	case "eetq":
 		backends = append(backends, "eetq", "transformers")
+	case "fp8":
+		backends = append(backends, "transformers", "vllm")
+	case "compressed-tensors":
+		backends = append(backends, "vllm", "transformers")
+	case "mlx":
+		backends = append(backends, "mlx-lm")
 	}
 
 	return backends
@@ -399,6 +417,10 @@ func QuantizedToSelectableItems(info *QuantizedInfo, files []FileInfo) []Selecta
 			FilterValue:  ".bin",
 		})
 	}
+
+	// Additive rare weight-format families (ONNX/TFLite/Flax/OpenVINO); they
+	// never carry the recommendation badge, so the precedence above is intact.
+	items = append(items, rareFormatRows(files)...)
 
 	return items
 }

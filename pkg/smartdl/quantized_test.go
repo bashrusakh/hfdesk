@@ -732,3 +732,175 @@ func TestAnalyzeQuantizedNestedConfigPreservesPrecisionSemantics(t *testing.T) {
 		t.Fatalf("nested raw metadata was changed: %+v", outer)
 	}
 }
+
+// --- Part 1: the quantized converter emits the additive family rows too ---
+
+func TestQuantizedToSelectableItemsRareFormats(t *testing.T) {
+	info := &QuantizedInfo{Method: "gptq"}
+	files := []FileInfo{
+		{Name: "model.safetensors", Path: "model.safetensors", Size: 1000},
+		{Name: "model.onnx", Path: "model.onnx", Size: 50},
+		{Name: "openvino/model.xml", Path: "openvino/model.xml", Size: 10},
+		{Name: "openvino/model.bin", Path: "openvino/model.bin", Size: 20},
+	}
+	items := QuantizedToSelectableItems(info, files)
+
+	var recommended []string
+	sawOnnx, sawOpenVINO := false, false
+	for _, item := range items {
+		if item.Recommended {
+			recommended = append(recommended, item.ID)
+		}
+		switch item.ID {
+		case "onnx":
+			sawOnnx = true
+			if item.FilterValue != ".onnx" || item.Size != 50 {
+				t.Errorf("onnx row = %+v, want filter .onnx size 50", item)
+			}
+		case "openvino":
+			sawOpenVINO = true
+			if item.FilterValue != "openvino/" || item.Size != 30 {
+				t.Errorf("openvino row = %+v, want filter openvino/ size 30", item)
+			}
+		}
+	}
+	if !sawOnnx || !sawOpenVINO {
+		t.Fatalf("missing family rows: %+v", items)
+	}
+	if len(recommended) != 1 || recommended[0] != "safetensors" {
+		t.Fatalf("recommended rows = %v, want only safetensors", recommended)
+	}
+}
+
+// --- Part 2: extended quantization method table and config sources ---
+
+func TestExtendedQuantMethodDescriptionsAndBackends(t *testing.T) {
+	for _, method := range []string{"fp8", "compressed-tensors", "mlx"} {
+		t.Run(method, func(t *testing.T) {
+			if quantMethodDescriptions[method] == "" {
+				t.Errorf("missing description for %q", method)
+			}
+			if !recognizedNonEXLMethod(method) {
+				t.Errorf("recognizedNonEXLMethod(%q) = false, want true", method)
+			}
+		})
+	}
+
+	fp8 := analyzeQuantized(map[string]interface{}{
+		"quantization_config.json": map[string]interface{}{"quant_method": "fp8"},
+	})
+	if fp8 == nil || fp8.Method != "fp8" || fp8.MethodDescription == "" {
+		t.Fatalf("fp8 projection = %+v", fp8)
+	}
+	if !SupportsBackend(fp8, "transformers") || !SupportsBackend(fp8, "vllm") {
+		t.Errorf("fp8 backends = %v, want transformers and vllm", fp8.Backends)
+	}
+
+	ct := analyzeQuantized(map[string]interface{}{
+		"quantize_config.json": map[string]interface{}{"quant_method": "compressed-tensors"},
+	})
+	if ct == nil || ct.Method != "compressed-tensors" || ct.MethodDescription == "" {
+		t.Fatalf("compressed-tensors projection = %+v", ct)
+	}
+	if !SupportsBackend(ct, "vllm") || !SupportsBackend(ct, "transformers") {
+		t.Errorf("compressed-tensors backends = %v, want vllm and transformers", ct.Backends)
+	}
+}
+
+// TestAnalyzeQuantizedFromMLXQuantizationBlock pins the MLX-style config.json
+// "quantization" block as a config source: the method, description, declared
+// width and group size all come from the block.
+func TestAnalyzeQuantizedFromMLXQuantizationBlock(t *testing.T) {
+	metadata := map[string]interface{}{
+		"config.json": map[string]interface{}{
+			"architectures": []interface{}{"LlamaForCausalLM"},
+			"quantization": map[string]interface{}{
+				"quant_method": "mlx",
+				"bits":         float64(4),
+				"group_size":   float64(64),
+			},
+		},
+	}
+	if !hasQuantizationConfig(metadata) {
+		t.Fatal("hasQuantizationConfig = false for the MLX quantization block")
+	}
+	info := analyzeQuantized(metadata)
+	if info == nil {
+		t.Fatal("analyzeQuantized returned nil")
+	}
+	if info.Method != "mlx" {
+		t.Errorf("Method = %q, want mlx", info.Method)
+	}
+	if info.MethodDescription == "" {
+		t.Error("missing mlx description")
+	}
+	if info.Bits != 4 {
+		t.Errorf("Bits = %d, want 4 from the block", info.Bits)
+	}
+	if info.GroupSize != 64 {
+		t.Errorf("GroupSize = %d, want 64 from the block", info.GroupSize)
+	}
+	if !SupportsBackend(info, "mlx-lm") {
+		t.Errorf("backends = %v, want mlx-lm", info.Backends)
+	}
+	if info.ModelArchitecture != "LlamaForCausalLM" {
+		t.Errorf("ModelArchitecture = %q, want LlamaForCausalLM", info.ModelArchitecture)
+	}
+}
+
+// TestHasQuantizationConfigSources keeps the projection gate's contract: a
+// plain legacy config.json map alone still does not opt into projection, the
+// two dedicated/nested sources keep working, and the MLX block is now a source.
+func TestHasQuantizationConfigSources(t *testing.T) {
+	if hasQuantizationConfig(nil) {
+		t.Error("empty metadata must not opt into projection")
+	}
+	if hasQuantizationConfig(map[string]interface{}{
+		"config.json": map[string]interface{}{"model_type": "llama"},
+	}) {
+		t.Error("legacy top-level config.json alone must not opt into projection")
+	}
+	if !hasQuantizationConfig(map[string]interface{}{
+		"config.json": map[string]interface{}{
+			"quantization_config": map[string]interface{}{"quant_method": "gptq"},
+		},
+	}) {
+		t.Error("nested quantization_config must opt into projection")
+	}
+	if !hasQuantizationConfig(map[string]interface{}{
+		"quantize_config.json": map[string]interface{}{"quant_method": "gptq"},
+	}) {
+		t.Error("dedicated quantize_config.json must opt into projection")
+	}
+}
+
+// TestQuantizationConfigSourcePrecedence documents that the new MLX block is
+// consulted only after the pre-existing sources.
+func TestQuantizationConfigSourcePrecedence(t *testing.T) {
+	dedicated := map[string]interface{}{"quant_method": "gptq"}
+	nested := map[string]interface{}{"quant_method": "exl2"}
+	mlx := map[string]interface{}{"quant_method": "mlx"}
+	metadata := map[string]interface{}{
+		"quantize_config.json":     dedicated,
+		"quantization_config.json": nested,
+		"config.json": map[string]interface{}{
+			"quantization_config": nested,
+			"quantization":        mlx,
+		},
+	}
+	if got := quantizationConfig(metadata); got["quant_method"] != "gptq" {
+		t.Fatalf("dedicated file precedence broken: %+v", got)
+	}
+	delete(metadata, "quantize_config.json")
+	if got := quantizationConfig(metadata); got["quant_method"] != "exl2" {
+		t.Fatalf("quantization_config precedence broken: %+v", got)
+	}
+	delete(metadata, "quantization_config.json")
+	if got := quantizationConfig(metadata); got["quant_method"] != "exl2" {
+		t.Fatalf("nested quantization_config must beat the MLX block: %+v", got)
+	}
+	delete(metadata["config.json"].(map[string]interface{}), "quantization_config")
+	if got := quantizationConfig(metadata); got["quant_method"] != "mlx" {
+		t.Fatalf("MLX block not selected: %+v", got)
+	}
+}
