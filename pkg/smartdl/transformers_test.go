@@ -695,45 +695,73 @@ func TestRareFormatRowsAbsentWithoutFamilyFiles(t *testing.T) {
 	}
 }
 
+// TestRareFormatRowsOpenVINOFilterRule pins the ACCEPTANCE contract of the
+// OpenVINO family row: the UI routes this row through the exact-artifact
+// request path, so item.files IS the download. Whatever the layout, files
+// must be exactly the paired IR members — both members of a root pair, every
+// pair of a shared-directory layout — and never an unpaired ".xml", an
+// unrelated ".bin", a subtree extra, or a same-named directory elsewhere.
 func TestRareFormatRowsOpenVINOFilterRule(t *testing.T) {
-	t.Run("root-level pairs fall back to the xml extension token", func(t *testing.T) {
+	t.Run("root pair selects exactly both members", func(t *testing.T) {
 		rows := rareFormatRows([]FileInfo{
 			{Path: "model.xml", Name: "model.xml", Size: 10},
 			{Path: "model.bin", Name: "model.bin", Size: 20},
+			{Path: "notes.xml", Name: "notes.xml", Size: 30},
+			{Path: "pytorch_model.bin", Name: "pytorch_model.bin", Size: 40},
 		})
-		if len(rows) != 1 || rows[0].FilterValue != ".xml" {
-			t.Fatalf("rows = %+v, want one openvino row filtered by .xml", rows)
+		if len(rows) != 1 {
+			t.Fatalf("rows = %+v, want one openvino row", rows)
 		}
-		if !reflect.DeepEqual(rows[0].Files, []string{"model.xml", "model.bin"}) {
-			t.Fatalf("files = %v, want the complete IR pair", rows[0].Files)
+		want := []string{"model.xml", "model.bin"}
+		if !reflect.DeepEqual(rows[0].Files, want) {
+			t.Fatalf("files = %v, want exactly the IR pair %v: the unpaired xml and the unrelated bin must be excluded", rows[0].Files, want)
+		}
+		if rows[0].Size != 30 {
+			t.Fatalf("size = %d, want 30: excluded files must not contribute", rows[0].Size)
 		}
 	})
 
-	t.Run("subdirectory layouts share their common directory token", func(t *testing.T) {
+	t.Run("shared-directory layout selects exactly the paired members", func(t *testing.T) {
 		rows := rareFormatRows([]FileInfo{
 			{Path: "openvino/fp32/model.xml", Name: "model.xml", Size: 10},
 			{Path: "openvino/fp32/model.bin", Name: "model.bin", Size: 20},
 			{Path: "openvino/fp16/model.xml", Name: "model.xml", Size: 30},
 			{Path: "openvino/fp16/model.bin", Name: "model.bin", Size: 40},
+			{Path: "openvino/notes.xml", Name: "notes.xml", Size: 50},
+			{Path: "backup/openvino/weights.xml", Name: "weights.xml", Size: 60},
 		})
 		if len(rows) != 1 {
 			t.Fatalf("rows = %+v, want one openvino row", rows)
 		}
-		if rows[0].FilterValue != "openvino/" {
-			t.Fatalf("filter = %q, want openvino/", rows[0].FilterValue)
+		want := []string{
+			"openvino/fp32/model.xml", "openvino/fp32/model.bin",
+			"openvino/fp16/model.xml", "openvino/fp16/model.bin",
+		}
+		if !reflect.DeepEqual(rows[0].Files, want) {
+			t.Fatalf("files = %v, want exactly the paired members %v: subtree extras and same-named directories elsewhere must be excluded", rows[0].Files, want)
 		}
 		if rows[0].Size != 100 {
 			t.Fatalf("size = %d, want 100", rows[0].Size)
 		}
 	})
 
-	t.Run("cross-directory files are not an IR pair", func(t *testing.T) {
+	t.Run("cross-directory files select nothing", func(t *testing.T) {
 		rows := rareFormatRows([]FileInfo{
 			{Path: "a/model.xml", Name: "model.xml", Size: 10},
 			{Path: "b/model.bin", Name: "model.bin", Size: 20},
 		})
 		if len(rows) != 0 {
-			t.Fatalf("rows = %+v, want none: the pair must share a directory", rows)
+			t.Fatalf("rows = %+v, want no row: both pair members must share a directory", rows)
+		}
+	})
+
+	t.Run("unpaired members select nothing", func(t *testing.T) {
+		rows := rareFormatRows([]FileInfo{
+			{Path: "model.xml", Name: "model.xml", Size: 10},
+			{Path: "other.bin", Name: "other.bin", Size: 20},
+		})
+		if len(rows) != 0 {
+			t.Fatalf("rows = %+v, want no row without a same-basename pair", rows)
 		}
 	})
 }

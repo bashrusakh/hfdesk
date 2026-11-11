@@ -171,6 +171,12 @@ func TestAnalyzeRootTypePrecedence(t *testing.T) {
 				if !seen["safetensors"] || !seen["pytorch"] {
 					t.Fatalf("missing existing format choices: %+v", info.SelectableItems)
 				}
+				if !seen["onnx"] {
+					t.Fatalf("missing additive ONNX row: %+v", info.SelectableItems)
+				}
+				if len(info.SelectableItems) != 3 {
+					t.Fatalf("selectable items = %+v, want exactly 3: safetensors, pytorch, onnx", info.SelectableItems)
+				}
 				if len(recommended) != 1 || recommended[0] != "safetensors" {
 					t.Fatalf("format recommendation changed: %v, want only safetensors", recommended)
 				}
