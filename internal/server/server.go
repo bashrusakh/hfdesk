@@ -279,26 +279,13 @@ func New(cfg Config) *Server {
 	return s
 }
 
-// ListenAndServe starts the HTTP server.
-//
-// It binds the configured address and serves the listener through Serve, so
-// the effective bound address is known as soon as the listener exists.
-func (s *Server) ListenAndServe(ctx context.Context) error {
-	listener, err := s.Listen()
-	if err != nil {
-		return err
-	}
-	return s.Serve(ctx, listener)
-}
-
 // Listen binds the configured address and returns the listener.
 //
 // It exists for a host that runs the serve path itself: the return of Listen
 // is the own-liveness fact of that host — its own listener is bound — which
 // the readiness of a start has to combine with the probe of the address. A
 // bind that fails closes the job manager within the shutdown budget and
-// returns the failure joined with the result of that cleanup, exactly as the
-// bind of ListenAndServe always did.
+// returns the failure joined with the result of that cleanup.
 func (s *Server) Listen() (net.Listener, error) {
 	cfg := s.snapshotConfig()
 	addr := fmt.Sprintf("%s:%d", cfg.Addr, cfg.Port)
@@ -312,10 +299,10 @@ func (s *Server) Listen() (net.Listener, error) {
 
 // Serve runs the HFDesk HTTP server on a caller-provided listener.
 //
-// It uses the same handler chain and the same graceful shutdown sequence as
-// ListenAndServe: the job manager is quiesced first, HTTP is drained within
-// the shutdown timeout, and the job manager is closed afterwards. The
-// effective bound address of the listener is recorded, so BoundAddr and
+// It uses the same handler chain and the same graceful shutdown sequence:
+// the job manager is quiesced first, HTTP is drained within the shutdown
+// timeout, and the job manager is closed afterwards. The effective bound
+// address of the listener is recorded, so BoundAddr and
 // BrowserURL report the real address even when the caller asked for an
 // OS-assigned port.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {

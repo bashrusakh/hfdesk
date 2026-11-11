@@ -1424,14 +1424,6 @@ func isAllDigits(s string) bool {
 	return true
 }
 
-// RepoTypeFromJob returns the RepoType matching job.IsDataset.
-func RepoTypeFromJob(job Job) RepoType {
-	if job.IsDataset {
-		return RepoTypeDataset
-	}
-	return RepoTypeModel
-}
-
 // isFailFastError reports whether err is a permanent file/part error (an
 // *APIError with a fail-fast status: 401/403/404). It is used to distinguish
 // "abort the whole job" from ordinary retryable/network failures when

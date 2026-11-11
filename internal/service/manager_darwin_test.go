@@ -69,8 +69,8 @@ func darwinSystemOptions(t *testing.T) InstallOptions {
 // TestRenderPlistForTheUserScope checks the property list of a LaunchAgent.
 func TestRenderPlistForTheUserScope(t *testing.T) {
 	opts := darwinUserOptions(t)
-	rendered, err := renderPlist(opts, nil)
-	assertNoError(t, err, "renderPlist(): %v", err)
+	rendered, err := renderPlistWithRunAtLoad(opts, nil, true)
+	assertNoError(t, err, "renderPlistWithRunAtLoad(): %v", err)
 
 	registration, err := parsePlist([]byte(rendered))
 	assertNoError(t, err, "parsePlist(): %v", err)
@@ -129,8 +129,8 @@ func TestRenderPlistForTheSystemScope(t *testing.T) {
 	account := darwinCurrentAccount(t)
 	opts.ServiceUser = account.Name
 
-	rendered, err := renderPlist(opts, account)
-	assertNoError(t, err, "renderPlist(): %v", err)
+	rendered, err := renderPlistWithRunAtLoad(opts, account, true)
+	assertNoError(t, err, "renderPlistWithRunAtLoad(): %v", err)
 
 	registration, err := parsePlist([]byte(rendered))
 	assertNoError(t, err, "parsePlist(): %v", err)
@@ -198,8 +198,8 @@ func TestRenderPlistCarriesNoCredential(t *testing.T) {
 			// credential carries the sentinel.
 			setCredentialFields(&opts, darwinCredentialSentinel)
 
-			rendered, err := renderPlist(opts, account)
-			assertNoError(t, err, "renderPlist(): %v", err)
+			rendered, err := renderPlistWithRunAtLoad(opts, account, true)
+			assertNoError(t, err, "renderPlistWithRunAtLoad(): %v", err)
 			if strings.Contains(rendered, darwinCredentialSentinel) {
 				t.Errorf("the property list carries the credential sentinel:\n%s", rendered)
 			}
@@ -260,8 +260,8 @@ func TestRenderPlistCarriesNoCredential(t *testing.T) {
 // own bounded rotating log file into the log directory of the instance.
 func TestRenderPlistKeepsTheLogFilesOfTheSupervisorOut(t *testing.T) {
 	opts := darwinUserOptions(t)
-	rendered, err := renderPlist(opts, nil)
-	assertNoError(t, err, "renderPlist(): %v", err)
+	rendered, err := renderPlistWithRunAtLoad(opts, nil, true)
+	assertNoError(t, err, "renderPlistWithRunAtLoad(): %v", err)
 
 	for _, forbidden := range []string{"StandardOutPath", "StandardErrorPath", "nohup"} {
 		if strings.Contains(rendered, forbidden) {
@@ -280,8 +280,8 @@ func TestRenderPlistKeepsTheLogFilesOfTheSupervisorOut(t *testing.T) {
 // and the bind address are recovered from a property list.
 func TestParsePlistRecoversTheRegistration(t *testing.T) {
 	opts := darwinUserOptions(t)
-	rendered, err := renderPlist(opts, nil)
-	assertNoError(t, err, "renderPlist(): %v", err)
+	rendered, err := renderPlistWithRunAtLoad(opts, nil, true)
+	assertNoError(t, err, "renderPlistWithRunAtLoad(): %v", err)
 	registration, err := parsePlist([]byte(rendered))
 	assertNoError(t, err, "parsePlist(): %v", err)
 
@@ -336,8 +336,8 @@ func TestParsePlistRecoversTheConfigFileAndTheCacheDir(t *testing.T) {
 			opts := darwinUserOptions(t)
 			opts.CacheDir = tc.cacheDir
 
-			rendered, err := renderPlist(opts, nil)
-			assertNoError(t, err, "renderPlist(): %v", err)
+			rendered, err := renderPlistWithRunAtLoad(opts, nil, true)
+			assertNoError(t, err, "renderPlistWithRunAtLoad(): %v", err)
 			registration, err := parsePlist([]byte(rendered))
 			assertNoError(t, err, "parsePlist(): %v", err)
 
@@ -688,8 +688,8 @@ func TestPlutilAcceptsTheRenderedPlist(t *testing.T) {
 				opts.ServiceUser = current.Name
 				account = current
 			}
-			rendered, err := renderPlist(opts, account)
-			assertNoError(t, err, "renderPlist(): %v", err)
+			rendered, err := renderPlistWithRunAtLoad(opts, account, true)
+			assertNoError(t, err, "renderPlistWithRunAtLoad(): %v", err)
 			path := filepath.Join(t.TempDir(), launchdLabel()+".plist")
 			if err := os.WriteFile(path, []byte(rendered), 0o644); err != nil {
 				t.Fatalf("write the property list: %v", err)
@@ -765,8 +765,8 @@ func TestStatusReportsAMissingExecutable(t *testing.T) {
 			LogDir:     filepath.Join(stateDir, "logs"),
 		},
 	}
-	rendered, err := renderPlist(opts, nil)
-	assertNoError(t, err, "renderPlist(): %v", err)
+	rendered, err := renderPlistWithRunAtLoad(opts, nil, true)
+	assertNoError(t, err, "renderPlistWithRunAtLoad(): %v", err)
 	path := launchd.plistPath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("create the registration directory: %v", err)
@@ -1494,8 +1494,8 @@ func TestLaunchdRenderPlistCarriesTheServiceAccount(t *testing.T) {
 		opts := darwinSystemOptions(t)
 		opts.ServiceUser = account.Name
 
-		rendered, err := renderPlist(opts, account)
-		assertNoError(t, err, "renderPlist(): %v", err)
+		rendered, err := renderPlistWithRunAtLoad(opts, account, true)
+		assertNoError(t, err, "renderPlistWithRunAtLoad(): %v", err)
 		registration, err := parsePlist([]byte(rendered))
 		assertNoError(t, err, "parsePlist(): %v", err)
 		if registration.UserName != account.Name {
@@ -1509,16 +1509,16 @@ func TestLaunchdRenderPlistCarriesTheServiceAccount(t *testing.T) {
 	t.Run("the machine-wide instance needs an account", func(t *testing.T) {
 		opts := darwinSystemOptions(t)
 
-		if _, err := renderPlist(opts, nil); err == nil {
-			t.Error("renderPlist() = nil, want the refusal of a machine-wide instance without an account")
+		if _, err := renderPlistWithRunAtLoad(opts, nil, true); err == nil {
+			t.Error("renderPlistWithRunAtLoad() = nil, want the refusal of a machine-wide instance without an account")
 		}
 	})
 
 	t.Run("the user scope instance runs as the user itself", func(t *testing.T) {
 		opts := darwinUserOptions(t)
 
-		rendered, err := renderPlist(opts, nil)
-		assertNoError(t, err, "renderPlist(): %v", err)
+		rendered, err := renderPlistWithRunAtLoad(opts, nil, true)
+		assertNoError(t, err, "renderPlistWithRunAtLoad(): %v", err)
 		registration, err := parsePlist([]byte(rendered))
 		assertNoError(t, err, "parsePlist(): %v", err)
 		if registration.UserName != "" || registration.GroupName != "" {
@@ -2566,8 +2566,8 @@ func TestLaunchdStopWaitCoversTheShutdownOfTheServer(t *testing.T) {
 	}
 
 	opts := darwinUserOptions(t)
-	rendered, err := renderPlist(opts, nil)
-	assertNoError(t, err, "renderPlist(): %v", err)
+	rendered, err := renderPlistWithRunAtLoad(opts, nil, true)
+	assertNoError(t, err, "renderPlistWithRunAtLoad(): %v", err)
 	registration, err := parsePlist([]byte(rendered))
 	assertNoError(t, err, "parsePlist(): %v", err)
 	if registration.ExitTimeOut == 0 {
@@ -2801,8 +2801,8 @@ func darwinSupplementaryGroup(t *testing.T) (int, bool) {
 // writes it to the registration of the manager.
 func darwinWriteRegistration(t *testing.T, launchd *launchdManager, opts InstallOptions) {
 	t.Helper()
-	rendered, err := renderPlist(opts, nil)
-	assertNoError(t, err, "renderPlist(): %v", err)
+	rendered, err := renderPlistWithRunAtLoad(opts, nil, true)
+	assertNoError(t, err, "renderPlistWithRunAtLoad(): %v", err)
 	path := launchd.plistPath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("create the registration directory: %v", err)

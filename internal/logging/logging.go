@@ -483,16 +483,6 @@ func NewComponentLogger(component string) *ComponentLogger {
 	return &ComponentLogger{component: component}
 }
 
-// Component returns the component name of the logger.
-func (l *ComponentLogger) Component() string {
-	return l.component
-}
-
-// Log emits a record at the given level.
-func (l *ComponentLogger) Log(ctx context.Context, level slog.Level, msg string, args ...any) {
-	l.logger().Log(ctx, level, msg, args...)
-}
-
 // Debug emits a debug record.
 func (l *ComponentLogger) Debug(msg string, args ...any) {
 	l.logger().Debug(msg, args...)

@@ -13,9 +13,6 @@ var (
 	// ErrInvalidRepo is returned when the repository ID is not in "owner/name" format.
 	ErrInvalidRepo = errors.New("invalid repository ID: expected owner/name format")
 
-	// ErrMissingRepo is returned when no repository is specified.
-	ErrMissingRepo = errors.New("missing repository ID")
-
 	// ErrUnauthorized is returned when authentication is required but not provided.
 	ErrUnauthorized = errors.New("unauthorized: this repository requires authentication")
 
@@ -91,33 +88,6 @@ var (
 	// evidence). The pair is preserved for manual removal; use errors.Is to detect it.
 	ErrStagingOwnershipUnproven = errors.New("the staging state cannot be proven to belong to a live or dead owner")
 )
-
-// DownloadError wraps an error with file context.
-type DownloadError struct {
-	Path string
-	Err  error
-}
-
-func (e *DownloadError) Error() string {
-	return fmt.Sprintf("download %s: %v", e.Path, e.Err)
-}
-
-func (e *DownloadError) Unwrap() error {
-	return e.Err
-}
-
-// VerificationError is returned when file verification fails.
-type VerificationError struct {
-	Path     string
-	Expected string
-	Actual   string
-	Method   string // "sha256", "size", "etag"
-}
-
-func (e *VerificationError) Error() string {
-	return fmt.Sprintf("verification failed for %s: %s mismatch (expected %s, got %s)",
-		e.Path, e.Method, e.Expected, e.Actual)
-}
 
 // APIError represents an error from the HuggingFace API.
 type APIError struct {

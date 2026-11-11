@@ -41,8 +41,13 @@ func TestIntegration_FullDownloadFlow(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start server in background
-	go srv.ListenAndServe(ctx)
+	// Start server in background: bind first, then serve the listener,
+	// the live production pattern of the host.
+	listener, err := srv.Listen()
+	if err != nil {
+		t.Fatalf("Listen(): %v", err)
+	}
+	go srv.Serve(ctx, listener)
 	time.Sleep(200 * time.Millisecond)
 
 	baseURL := "http://127.0.0.1:" + strconv.Itoa(port)
@@ -126,7 +131,11 @@ func TestIntegration_DryRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go srv.ListenAndServe(ctx)
+	listener, err := srv.Listen()
+	if err != nil {
+		t.Fatalf("Listen(): %v", err)
+	}
+	go srv.Serve(ctx, listener)
 	time.Sleep(200 * time.Millisecond)
 
 	baseURL := "http://127.0.0.1:" + strconv.Itoa(port)

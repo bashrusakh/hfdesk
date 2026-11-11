@@ -118,8 +118,7 @@ func runInstance(ctx context.Context, opts RunOptions, listening chan<- struct{}
 
 	// The server owns the graceful shutdown path (quiesce, HTTP drain, job
 	// manager close); the host only waits for it. The bind happens here
-	// instead of inside ListenAndServe so the host can report its own
-	// listener before it serves.
+	// first so the host can report its own listener before it serves.
 	srv := server.New(cfg)
 	listener, err := srv.Listen()
 	if err != nil {
