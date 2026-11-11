@@ -36,7 +36,12 @@ func TestDownloadUIDestination(t *testing.T) {
 	for _, mode := range []string{"parent", "fine", "local", "cache"} {
 		t.Run(mode, func(t *testing.T) {
 			root := t.TempDir()
-			cfg := Config{CacheDir: filepath.Join(root, "cache"), MaxActive: 1}
+			// The start flow's post-start dry run (the filters_unmatched
+			// plaque) must plan against this local fixture hub, never the
+			// real endpoint.
+			hub := shardRangeHub(shardRangeContent())
+			defer hub.Close()
+			cfg := Config{CacheDir: filepath.Join(root, "cache"), MaxActive: 1, Endpoint: hub.URL}
 			if mode != "cache" {
 				cfg.LocalDir = filepath.Join(root, "local")
 			}

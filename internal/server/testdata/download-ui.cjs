@@ -9,16 +9,175 @@ const messages = [];
 let lowDestination = false;
 let sequence = 0;
 const window = {};
+// The template oracle. makeNode used to auto-vivify a memoized stub child for
+// ANY selector, so a job-card assertion passed even when the real template no
+// longer contained the node it claimed to check (or updateJobCard's selector
+// drifted). Once markup is assigned through innerHTML — the real template a
+// browser would parse — a queried selector must match an element parsed from
+// that markup; otherwise querySelector throws instead of returning a stub.
+// Nodes without assigned markup keep the memoizing stub behavior: there is no
+// real template to discriminate against.
+const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img',
+  'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+
+// parseMarkup turns assigned markup into element records with their class and
+// attribute sets plus a parent link, mirroring what a browser would parse.
+function parseMarkup(markup) {
+  const elements = [];
+  const stack = [];
+  const tagRe = /<(\/?)([a-zA-Z][\w-]*)((?:"[^"]*"|'[^']*'|[^>"'])*)>/g;
+  let match;
+  while ((match = tagRe.exec(markup)) !== null) {
+    const tag = match[2].toLowerCase();
+    if (match[1] === '/') {
+      if (stack.length) stack.pop();
+      continue;
+    }
+    const element = { tag, classes: new Set(), attrs: new Map(), parent: stack[stack.length - 1] || null };
+    const attrRe = /([a-zA-Z_:][-\w:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
+    let attr;
+    while ((attr = attrRe.exec(match[3])) !== null) {
+      const name = attr[1].toLowerCase();
+      const value = attr[2] !== undefined ? attr[2] : attr[3] !== undefined ? attr[3] : attr[4] !== undefined ? attr[4] : '';
+      if (name === 'class') {
+        for (const cls of value.split(/\s+/)) if (cls) element.classes.add(cls);
+      } else {
+        element.attrs.set(name, value);
+      }
+    }
+    elements.push(element);
+    if (!/\/\s*$/.test(match[3]) && !VOID_TAGS.has(tag)) stack.push(element);
+  }
+  return elements;
+}
+
+// parseCompound parses tag/.class/#id/[attr](="value") pieces of one compound
+// selector. It returns null for anything the oracle cannot evaluate
+// (pseudo-classes, unquoted nesting), so the caller fails closed rather than
+// silently accepting a selector it never checked.
+function parseCompound(token) {
+  const parts = /^([a-zA-Z][\w-]*)((?:[.#][\w-]+|\[[^\]]+\])*)$|^((?:[.#][\w-]+|\[[^\]]+\])+)$/.exec(token);
+  if (!parts) return null;
+  const compound = { tag: parts[1] ? parts[1].toLowerCase() : '', classes: [], attrs: [] };
+  const rest = parts[2] !== undefined ? parts[2] : parts[3];
+  const pieceRe = /[.#][\w-]+|\[[^\]]+\]/g;
+  let piece;
+  while ((piece = pieceRe.exec(rest)) !== null) {
+    const text = piece[0];
+    if (text[0] === '.') { compound.classes.push(text.slice(1)); continue; }
+    if (text[0] === '#') { compound.attrs.push(['id', text.slice(1)]); continue; }
+    const attr = /^\[([\w-]+)(?:([~|^$*]?=)"?([^"\]]*)"?)?\]$/.exec(text);
+    if (!attr) return null;
+    compound.attrs.push([attr[1].toLowerCase(), attr[3] === undefined ? null : attr[3]]);
+  }
+  return compound;
+}
+
+function matchesCompound(element, compound) {
+  if (compound.tag && element.tag !== compound.tag) return false;
+  for (const cls of compound.classes) if (!element.classes.has(cls)) return false;
+  for (const [name, value] of compound.attrs) {
+    if (!element.attrs.has(name)) return false;
+    if (value !== null && element.attrs.get(name) !== value) return false;
+  }
+  return true;
+}
+
+function chainMatches(element, chain) {
+  let index = chain.length - 1;
+  if (!matchesCompound(element, chain[index].compound)) return false;
+  let current = element;
+  while (index > 0) {
+    index--;
+    if (chain[index + 1].combinator === 'child') {
+      current = current.parent;
+      if (!current || !matchesCompound(current, chain[index].compound)) return false;
+      continue;
+    }
+    let ancestor = current.parent;
+    while (ancestor && !matchesCompound(ancestor, chain[index].compound)) ancestor = ancestor.parent;
+    if (!ancestor) return false;
+    current = ancestor;
+  }
+  return true;
+}
+
+// markupHasSelector reports whether some element of the parsed markup matches
+// the selector. Unsupported selector syntax throws: an unverifiable query must
+// not pass as if it had been checked.
+function markupHasSelector(elements, selector) {
+  for (const alternative of selector.split(',')) {
+    const tokens = alternative.replace(/\s*>\s*/g, ' > ').trim().split(/\s+/).filter(Boolean);
+    const chain = [];
+    let pending = ' ';
+    for (const token of tokens) {
+      if (token === '>') {
+        if (!chain.length || pending !== ' ') throw new Error('oracle cannot verify selector ' + JSON.stringify(selector));
+        pending = 'child';
+        continue;
+      }
+      const compound = parseCompound(token);
+      if (!compound) throw new Error('oracle cannot verify selector ' + JSON.stringify(selector));
+      chain.push({ compound, combinator: chain.length === 0 ? null : pending });
+      pending = ' ';
+    }
+    if (!chain.length) throw new Error('oracle cannot verify selector ' + JSON.stringify(selector));
+    for (const element of elements) if (chainMatches(element, chain)) return true;
+  }
+  return false;
+}
+
+// makeNode is the observed DOM: a small element stub whose querySelector
+// memoizes one child per selector, so real render code (createJobCard /
+// updateJobCard) can write fields the assertions then read back. Reads of
+// innerHTML keep the historical textContent-derived escaping (escapeHtml
+// depends on it) until code assigns innerHTML itself.
+function makeNode() {
+  const children = new Map();
+  let text = '';
+  let html = null;
+  let parsed = [];
+  return {
+    get textContent() { return text; },
+    set textContent(value) { text = String(value); html = null; parsed = []; },
+    get innerHTML() {
+      if (html !== null) return html;
+      return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    },
+    set innerHTML(value) { html = String(value); parsed = parseMarkup(html); children.clear(); },
+    className: '',
+    title: '',
+    style: { display: '' },
+    dataset: {},
+    classList: {
+      add() {},
+      remove() {},
+      contains() { return false; },
+      toggle() {},
+    },
+    onclick: null,
+    appendChild(child) { return child; },
+    removeChild(child) { return child; },
+    remove() {},
+    addEventListener() {},
+    querySelector(selector) {
+      if (html !== null && !markupHasSelector(parsed, selector)) {
+        throw new Error(
+          'selector ' + JSON.stringify(selector) + ' matches no element in this node\'s markup; ' +
+          'the queried element must pre-exist in the real template, not only in the memoizing stub');
+      }
+      if (!children.has(selector)) children.set(selector, makeNode());
+      return children.get(selector);
+    },
+    querySelectorAll() { return []; },
+  };
+}
 const context = {
   window,
   confirm: () => true,
   document: {
     readyState: 'loading', addEventListener() {},
-    createElement() {
-      return { textContent: '', get innerHTML() {
-        return String(this.textContent).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      } };
-    },
+    createElement() { return makeNode(); },
     querySelector: selector => nodes.get(selector) || null,
     querySelectorAll: () => []
   },
@@ -51,7 +210,9 @@ source = source.replace('  // Start\n', `
     routeSelectValue, renderSelectableItems, renderFilesTab,
     resetFileTree, fileTreeToggleFile, startDownload,
     saveSettings, resetSettings,
-    setAnalysis(value) { currentAnalysis = value; }
+    setAnalysis(value) { currentAnalysis = value; },
+    setAdvancedOptions(value) { advancedOptions = value; },
+    createJobCard, updateJobCard
   };
   showToast = (message, type) => window.messages.push({message, type});
   navigateTo = () => {};
@@ -189,6 +350,44 @@ async function run(entry, type, { dataset = false, manual = '', low = false, cho
   assert.deepEqual(fileDownload.body.filters, ['nested/model.bin']);
   assert.equal(fileDownload.body.strictFiles, true, 'nested file list posts a strict selection');
   assert(messages.some(m => m.message === 'Queued: 1 file'), 'nested file-list toast keeps the selection count');
+  // D4 start-flow plaque: with custom filters, Start queues the download
+  // first (non-blocking) and then dry-runs the identical request; the
+  // filters_unmatched notice of that fresh plan surfaces as a warning
+  // toast naming exactly the unmatched pattern.
+  calls.length = 0;
+  messages.length = 0;
+  const plaqueAnalysis = { repo: 'owner/plaque', type: 'gguf', branch: 'main' };
+  ui.setAnalysis(plaqueAnalysis);
+  select('nonSelectableRoute', plaqueAnalysis);
+  nodes.set('#dlModalLocalDir', { value: '' });
+  ui.setAdvancedOptions({ filter: '.safetensors,q4', exclude: '', shardRanges: '' });
+  await window.startWizardDownload('owner/plaque', false);
+  assert(calls.find(c => c.path === '/api/download'), 'start flow must queue the download (non-blocking)');
+  const plaquePlan = calls.find(c => c.path === '/api/plan');
+  assert(plaquePlan && plaquePlan.body.dryRun === true, 'start flow must dry-run the same request for the plaque');
+  assert.equal(plaquePlan.body.filters.join(','), '.safetensors,q4', 'plaque plan must use the started filters');
+  assert(messages.some(m => m.type === 'warning' && m.message === 'filter "q4" matched nothing'),
+    'unmatched filter must surface as a warning toast: ' + JSON.stringify(messages));
+  ui.setAdvancedOptions({ filter: '', exclude: '', shardRanges: '' });
+
+  // D4 job-card warnings: the card's single warnings block renders what
+  // the job's own plan reported through job.warnings (strings) and hides
+  // it when the plan reported none.
+  const warnedJob = {
+    id: 'warn-1', repo: 'owner/plaque', revision: 'main', status: 'running',
+    progress: { totalFiles: 1, completedFiles: 0, totalBytes: 10, downloadedBytes: 5 },
+    warnings: ['filter "q4" matched nothing']
+  };
+  const card = ui.createJobCard(warnedJob);
+  assert(card.innerHTML.includes('data-role="warnings"'),
+    'the real job-card template must pre-contain the data-role="warnings" node');
+  ui.updateJobCard(card, warnedJob);
+  const warnBlock = card.querySelector('[data-role="warnings"]');
+  assert(warnBlock.innerHTML.includes('filter "q4" matched nothing'),
+    'job card must render the unmatched-filter warning: ' + warnBlock.innerHTML);
+  assert.notEqual(warnBlock.style.display, 'none', 'job warnings block must be visible');
+  ui.updateJobCard(card, { ...warnedJob, warnings: undefined });
+  assert.equal(warnBlock.style.display, 'none', 'job warnings block must hide when the plan reported none');
   // Dataset renderers must not offer inert controls, even with routes configured.
   ui.setAnalysis({ repo: 'fixture/data', type: 'gguf', is_dataset: true });
   assert(!ui.renderSelectableItems([{label: 'Data', id: 'data'}], 'items').includes('quantRouteSelect'));

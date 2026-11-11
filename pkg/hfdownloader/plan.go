@@ -222,8 +222,10 @@ type Plan struct {
 	// Notices are bounded, informational messages about files the plan
 	// deliberately did not select or selectors that had no effect — the
 	// split-mention files the split-precedence rule dropped for a filter
-	// naming their mentioned split, and ineffective shard ranges (named
-	// below at ShardRanges). A notice never changes the plan, its items,
+	// naming their mentioned split, ineffective shard ranges (named below
+	// at ShardRanges), and filter patterns that selected nothing while the
+	// request's other filters kept the selection alive (named after the
+	// shard block below). A notice never changes the plan, its items,
 	// or the download outcome, and it never replaces an error.
 	Notices []string `json:"notices,omitempty"`
 }
@@ -309,6 +311,18 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 	// dataset request.
 	var recognizedDatasetLabels []string
 	var membershipDataSelected []bool
+	// membershipSelectedLabel carries the concrete group label of each
+	// membership-selected data node (empty otherwise), so a recognized
+	// group-label filter is credited only by selected data of its own
+	// label — another label's selection never counts as its match.
+	var membershipSelectedLabel []string
+	// filterMatched is the per-pattern selection proof aligned with
+	// job.Filters: a pattern is credited only by a SELECTED file — a
+	// direct path match or its own membership label — never by a retained
+	// companion. It feeds the filters_unmatched notice, which is built
+	// only after the ErrNoFilterMatch checks below, so a total-zero
+	// selection keeps its error and never becomes a notice.
+	filterMatched := make([]bool, len(job.Filters))
 
 	mode := planAddressingMode{revision: job.Revision, commit: job.Revision}
 	custom := isCustomHubEndpoint(cfg.Endpoint)
@@ -561,10 +575,16 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 			// concrete world: an emitted data record is selected, while a
 			// retained companion (companion role) carries no selection proof —
 			// the per-node mirror of the datasetMembershipMatch predicate above.
+			// The concrete label rides along so a group-label filter is credited
+			// only by selected data carrying that very label.
 			membershipDataSelected = make([]bool, len(fileNodes))
+			membershipSelectedLabel = make([]string, len(fileNodes))
 			for i := range datasetEvaluation.Records {
-				membershipDataSelected[i] = datasetEvaluation.Records[i].Selected &&
-					world.DataLabels[i] != "" && !world.Companion[i]
+				if datasetEvaluation.Records[i].Selected &&
+					world.DataLabels[i] != "" && !world.Companion[i] {
+					membershipDataSelected[i] = true
+					membershipSelectedLabel[i] = world.DataLabels[i]
+				}
 			}
 			if len(job.Filters) > 0 && !directFilterMatch && !datasetMembershipMatch {
 				return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
@@ -613,6 +633,18 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 				selectionFilters = append(selectionFilters, filter)
 			}
 		}
+	}
+	// labelFilters and filterNorms project that same membership-only rule
+	// onto job.Filters indices for the per-pattern credit below: a filter
+	// whose normalized text is a recognized dataset group label selects
+	// through membership evidence only, and recognizedDatasetLabels stays
+	// nil outside a filtered dataset request, so every filter is a direct
+	// selector for ordinary model requests.
+	labelFilters := make([]bool, len(job.Filters))
+	filterNorms := make([]string, len(job.Filters))
+	for i, filter := range job.Filters {
+		filterNorms[i] = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
+		labelFilters[i] = containsString(recognizedDatasetLabels, filterNorms[i])
 	}
 	for nodeIndex, n := range fileNodes {
 		if err := ctx.Err(); err != nil {
@@ -855,6 +887,28 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 			DestinationSubdir: destinationSubdir,
 		})
 		selectedItems = append(selectedItems, selected)
+		// Per-pattern selection credit: only a file that actually entered
+		// the plan as SELECTED can match a pattern. A direct selector is
+		// credited by its own path match; a membership-only group label is
+		// credited only by selected data carrying that exact label, so
+		// retained companions and other labels' selections never count.
+		if selected {
+			for i, filter := range job.Filters {
+				if filterMatched[i] {
+					continue
+				}
+				if labelFilters[i] {
+					if membershipDataSelected != nil && membershipDataSelected[nodeIndex] &&
+						strings.EqualFold(membershipSelectedLabel[nodeIndex], filterNorms[i]) {
+						filterMatched[i] = true
+					}
+					continue
+				}
+				if filterMatchesPath(rel, filter, job.ExactMatch) {
+					filterMatched[i] = true
+				}
+			}
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -867,7 +921,12 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 		return nil, fmt.Errorf("%w: filters=%q exact=%t", ErrNoFilterMatch, job.Filters, job.ExactMatch)
 	}
 	plan := &Plan{Items: items, Commit: commitSHA, CommitPinned: commitPinned, CommitResolved: commitResolved}
-	plan.Notices = splitMentionNotices(job, datasetMembership, fileNodes, items)
+	// splitCovered names the distinct filter labels the split-mention
+	// notices below already report (their pinned behavior wins); the
+	// filters_unmatched notice skips exactly those patterns so no pattern
+	// is reported twice.
+	splitNotices, splitCovered := splitMentionNotices(job, datasetMembership, fileNodes, items)
+	plan.Notices = splitNotices
 	// Shard ranges narrow the already-matched set, after notices (which
 	// describe the split-precedence rule, not this selector) and before the
 	// custom-endpoint probe walk, so only files that will actually download
@@ -900,6 +959,15 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 		// unnarrowed set, the shard notices below describe this selector, and
 		// both ride Plan.Notices -> warning events -> Job.Warnings unchanged.
 		plan.Notices = append(plan.Notices, shardNotices...)
+	}
+	// The filters_unmatched notice joins Plan.Notices only after the
+	// ErrNoFilterMatch checks above have passed (a total-zero selection
+	// returned an error instead) and after the shard-range block, so the
+	// established split-mention and shard notices keep their positions. A
+	// pattern whose miss a split-notice already reports is skipped there
+	// (their pinned coverage wins), so no pattern is reported twice.
+	if unmatched := unmatchedFilters(job.Filters, filterMatched, splitCovered); len(unmatched) > 0 {
+		plan.Notices = append(plan.Notices, unmatchedFilterNotice(unmatched))
 	}
 	if forced == nil && custom && !job.BranchVariant && mode.pinned {
 		probeDeadline := time.Now().Add(addressingProbeBudget)
@@ -1017,10 +1085,14 @@ const splitMentionNoticePathCap = 5
 // named once, under the spelling the planner keeps. Paths are listed sorted
 // and bounded, so the same tree and filters always produce the same
 // notices. Files that are in the plan (selected by another filter) and
-// files the request itself excluded are never reported.
-func splitMentionNotices(job Job, membership datasetselection.Result, fileNodes []hfNode, items []PlanItem) []string {
+// files the request itself excluded are never reported. The returned
+// covered set names the distinct labels these notices actually report
+// (lowercased/trimmed, first occurrence winning), so the caller's
+// filters_unmatched notice can skip exactly those patterns and no miss is
+// ever reported twice; it is nil when nothing was reported.
+func splitMentionNotices(job Job, membership datasetselection.Result, fileNodes []hfNode, items []PlanItem) ([]string, map[string]struct{}) {
 	if !job.IsDataset || len(job.Filters) == 0 {
-		return nil
+		return nil, nil
 	}
 	// The planner treats an exact duplicate and a case-variant of a planned
 	// path as the same logical file; key plan membership by the fold so the
@@ -1030,6 +1102,7 @@ func splitMentionNotices(job Job, membership datasetselection.Result, fileNodes 
 		plannedFold[strings.ToLower(item.RelativePath)] = struct{}{}
 	}
 	var notices []string
+	var covered map[string]struct{}
 	seenLabel := make(map[string]struct{}, len(job.Filters))
 	for _, filter := range job.Filters {
 		label := strings.ToLower(strings.TrimSpace(filter))
@@ -1068,8 +1141,12 @@ func splitMentionNotices(job Job, membership datasetselection.Result, fileNodes 
 		}
 		sort.Strings(excluded)
 		notices = append(notices, formatSplitMentionNotice(label, excluded))
+		if covered == nil {
+			covered = make(map[string]struct{})
+		}
+		covered[label] = struct{}{}
 	}
-	return notices
+	return notices, covered
 }
 
 // formatSplitMentionNotice renders one notice as a single readable sentence
@@ -1125,11 +1202,10 @@ func joinWithAnd(values []string) string {
 	return strings.Join(values[:len(values)-1], ", ") + " and " + values[len(values)-1]
 }
 
-// shardWarningSegmentCap bounds how many ineffective spans one notice
-// lists; the remaining count is stated instead, so the sentence never grows
-// with the caller's expression. The no-shards notice names the whole
-// expression instead, which is itself bounded by the request that wrote it.
-const shardWarningSegmentCap = 5
+// warningSegmentCap bounds how many patterns or spans one unmatched-filter
+// or shard notice lists; the remaining count is stated instead, so the
+// sentence never grows with the caller's expression.
+const warningSegmentCap = 5
 
 // parseShardFile reports whether rel names a split artifact in the
 // established "<prefix>-NNNNN-of-MMMMM.<ext>" form and, when it does,
@@ -1190,7 +1266,7 @@ func parseShardFile(rel string) (number int, family string, ok bool) {
 // surface as plan notices instead of failing: a matched set without a
 // single selected shard file appends one notice naming the whole
 // expression, and one notice names the spans selecting no existing index
-// (bounded by shardWarningSegmentCap, the rest counted). selectedKept
+// (bounded by warningSegmentCap, the rest counted). selectedKept
 // reports how many selected items survived, so the caller fails
 // ErrNoFilterMatch when
 // ranges empty a non-empty selection even though retained companions remain
@@ -1265,7 +1341,7 @@ func narrowShardRanges(items []PlanItem, selected []bool, ranges []shardRange, e
 	if len(ineffective) > 0 {
 		shardNotices = append(shardNotices, fmt.Sprintf(
 			"shard range segments selected no shard (indices present: 1-%d): %s",
-			largestFamily, joinShardSegments(ineffective)))
+			largestFamily, joinBoundedSegments(ineffective)))
 	}
 	narrowed := make([]PlanItem, 0, len(items))
 	selectedKept := 0
@@ -1281,14 +1357,58 @@ func narrowShardRanges(items []PlanItem, selected []bool, ranges []shardRange, e
 	return narrowed, selectedKept, shardNotices
 }
 
-// joinShardSegments renders ineffective segments as a bounded list: at most
-// shardWarningSegmentCap are named, the rest are counted.
-func joinShardSegments(segments []string) string {
-	if len(segments) <= shardWarningSegmentCap {
+// joinBoundedSegments renders segments as a bounded list: at most
+// warningSegmentCap are named, the rest are counted. It is the single
+// bounded segment join shared by every plan-notice message.
+func joinBoundedSegments(segments []string) string {
+	if len(segments) <= warningSegmentCap {
 		return strings.Join(segments, ", ")
 	}
 	return fmt.Sprintf("%s, and %d more",
-		strings.Join(segments[:shardWarningSegmentCap], ", "), len(segments)-shardWarningSegmentCap)
+		strings.Join(segments[:warningSegmentCap], ", "), len(segments)-warningSegmentCap)
+}
+
+// unmatchedFilters returns the requested filter patterns that credited no
+// selected file, in request order, with exact duplicates collapsed
+// (first occurrence wins) so one missing pattern is named once. A pattern
+// whose lowercased/trimmed label a split-mention notice already reports is
+// skipped — that pinned coverage wins, so one miss is never reported
+// twice. The caller runs it only after the ErrNoFilterMatch checks have
+// passed, so a request whose filters selected nothing reports the error,
+// never this list.
+func unmatchedFilters(filters []string, filterMatched []bool, splitCovered map[string]struct{}) []string {
+	var unmatched []string
+	seen := make(map[string]struct{}, len(filters))
+	for i, filter := range filters {
+		if filterMatched[i] {
+			continue
+		}
+		if _, covered := splitCovered[strings.ToLower(strings.TrimSpace(filter))]; covered {
+			continue
+		}
+		if _, dup := seen[filter]; dup {
+			continue
+		}
+		seen[filter] = struct{}{}
+		unmatched = append(unmatched, filter)
+	}
+	return unmatched
+}
+
+// unmatchedFilterNotice renders the filters_unmatched notice for patterns
+// that selected nothing: one bounded sentence naming each pattern (quoted,
+// at most warningSegmentCap listed and the rest counted), in the same
+// shape as the split-mention and shard notices so every plan diagnostic
+// rides Plan.Notices -> warning events -> Job.Warnings unchanged.
+func unmatchedFilterNotice(filters []string) string {
+	quoted := make([]string, len(filters))
+	for i, filter := range filters {
+		quoted[i] = strconv.Quote(filter)
+	}
+	if len(filters) == 1 {
+		return fmt.Sprintf("filter %s matched nothing", quoted[0])
+	}
+	return fmt.Sprintf("filters %s matched nothing", joinBoundedSegments(quoted))
 }
 
 func isCustomHubEndpoint(endpoint string) bool {

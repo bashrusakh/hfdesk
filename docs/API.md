@@ -781,7 +781,12 @@ without belonging to it, one notice names how many were excluded, the split
 label, the directories they live in, and at most five of the excluded paths
 (stating how many more were left unnamed). An ineffective shard-range
 selection adds its own notices to the same array (documented under
-`shardRanges` below). Notices are deterministic and
+`shardRanges` below). A filter pattern that selected nothing while the
+request's other filters kept the selection alive adds a
+`filters_unmatched` notice naming the unmatched patterns (documented
+below) — except that a pattern whose miss a split-mention notice already
+reports is skipped there, so no pattern is ever reported twice. Notices
+are deterministic and
 non-fatal: they never change `files`, `totalSize`, `totalFiles`, or the
 download outcome, and they never replace an error. The bundled client
 renders them in the plan preview, and a download job reports the same
@@ -859,6 +864,29 @@ array defined above (a download job then reports the same sentences in its
 Notices are deterministic and non-fatal: they never change `files`,
 `totalSize`, `totalFiles`, or the download outcome, and they never replace
 an error.
+
+A request whose filters select nothing at all keeps failing with
+`no_filter_match`; but when the request's other filters still select files
+and a pattern selected none, the plan carries a `filters_unmatched` notice
+naming exactly the unmatched patterns — one sentence such as
+`filter "q4" matched nothing`, or `filters "q4", "fp16" matched nothing`
+when several are unmatched (at most five are named; the rest are counted).
+Matching counts only **selected** files — a direct filter match (any
+shape: substring, `.ext`, `./name`, `dir/`, a full path) or a
+dataset-membership selection of the pattern's own label — so retained
+companions never count, excludes apply before the credit, and a
+membership selection can leave every direct pattern unselected and named.
+filters_unmatched names patterns that matched no file at selection; a
+pattern whose matches were all removed by `shardRanges` is not named (the
+ranged result is visible in the plan preview, and an ineffective range is
+named by the shard-range notices).
+The notice never repeats a pattern whose miss the split-mention notices
+above already report: that pinned coverage wins for the pattern, and this
+producer extends to everything else (direct patterns, shaped selectors,
+and dataset labels the split family does not cover), so no pattern is
+ever reported twice. Like every notice it rides `notices` → a download
+job's `warnings` list, and the bundled start flow shows it as a
+non-blocking warning toast right after the download is queued.
 
 ### Strict file selection
 
@@ -1086,8 +1114,9 @@ resumed or retried attempt re-runs the plan and the downloader emits the same
 messages again, and a repeat adds no entry and consumes none of the bound. A
 warning reports a fact about the download without failing it and without
 changing the selection — for example a revision that is not pinned to an
-immutable commit, a plan notice such as a split-precedence exclusion or an
-ineffective shard range, resume
+immutable commit, a plan notice such as a split-precedence exclusion, an
+ineffective shard range, or a filter pattern that matched nothing
+(`filter "q4" matched nothing`), resume
 state that cannot be used without HTTP range support (reported once per
 download, naming the count and a bounded list of the affected files, not once
 per file), or a best-effort metadata write (a ref, friendly directory,
@@ -1116,6 +1145,11 @@ Legacy jobs without `hubDir` are resolved once on restore using their recorded
 warning explain that the historical Hub path is unknown. The resolved association
 is saved through normal state persistence. No old-cache search, file moves, or
 recovery of an unrecorded historical ENV path is performed.
+
+Job snapshots also expose `warnings`, an array of strings carrying the
+plan's `notices` sentences plus the downloader's non-fatal diagnostics
+described above, omitted when empty. The field is an output of the job's
+scan, not part of its identity: it never participates in deduplication.
 
 ## Settings
 

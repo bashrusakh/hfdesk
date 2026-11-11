@@ -48,7 +48,7 @@ type Job struct {
 	OutputDir          string            `json:"outputDir"`
 	HubDir             string            `json:"hubDir,omitempty"` // Exact frozen Hub; OutputDir remains the friendly/app root.
 	DestinationWarning string            `json:"destinationWarning,omitempty"`
-	Warnings           []string          `json:"warnings,omitempty"`      // The downloader's distinct non-fatal diagnostics, one entry each in first-arrival order, bounded at maxJobWarnings (distinct from the server-computed DestinationWarning).
+	Warnings           []string          `json:"warnings,omitempty"`      // The downloader's distinct non-fatal diagnostics (plan notices such as filters_unmatched among them), one entry each in first-arrival order, delivered through warning events and bounded at maxJobWarnings (distinct from the server-computed DestinationWarning).
 	LocalDir           string            `json:"localDir,omitempty"`      // Effective local-dir for this job (per-request or server-global)
 	LocalRepo          string            `json:"localRepo,omitempty"`     // Override destination folder name (used for upstream mmproj)
 	ShardRanges        string            `json:"shardRanges,omitempty"`   // Shard-range selection narrowing the filters (see hfdownloader.Job.ShardRanges)

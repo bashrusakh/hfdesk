@@ -3092,6 +3092,25 @@ async function loadRepositoryDetails(entry) {
       await api('POST', '/download', body);
       showToast(`Download started: ${repo}`, 'success');
       navigateTo('jobs');
+      // Non-blocking start-flow plaque: the download is already queued, so
+      // this second plan only reports unmatched-filter notices for the
+      // request just started. The answer comes from a fresh server-side
+      // plan of the identical request taken right after Start — it is
+      // known only once that plan returns; only filters_unmatched notices
+      // are surfaced here (prefix-matched from the plan's `notices`, the
+      // response shape every plan diagnostic rides), any plan failure is
+      // ignored, and the job's own card reports the same sentences through
+      // its `warnings` list when the job's plan completes.
+      if (filters.length > 0) {
+        try {
+          const plan = await api('POST', '/plan', { ...body, dryRun: true });
+          const unmatched = (Array.isArray(plan?.notices) ? plan.notices : [])
+            .filter(n => typeof n === 'string' && (n.startsWith('filter "') || n.startsWith('filters "')));
+          if (unmatched.length) showToast(unmatched.join(' '), 'warning');
+        } catch (_) {
+          // The plaque is informational: never block or fail the start.
+        }
+      }
     } catch (e) {
       showToast(`Failed: ${e.message}`, 'error');
     }

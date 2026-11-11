@@ -86,10 +86,15 @@ type PlanResponse struct {
 	// Notices are informational, bounded sentences: split-mention files the
 	// split-precedence rule dropped for a filter naming their mentioned
 	// split (naming the count, the split label, the directories and at most
-	// five excluded paths), and ineffective shard ranges (naming the whole
-	// expression or up to five ineffective spans — see shardRanges). A
-	// notice never changes files, totalSize, or totalFiles, and it is
-	// omitted when empty.
+	// five excluded paths), ineffective shard ranges (naming the whole
+	// expression or up to five ineffective spans — see shardRanges), and
+	// filter patterns that selected nothing while the request's other
+	// filters kept the selection alive (naming up to five unmatched
+	// patterns, for example `filter "q4" matched nothing`; a pattern whose
+	// miss a split-mention notice already reports is never repeated here).
+	// A notice never changes files, totalSize, or totalFiles, and it is
+	// omitted when empty. A real download reports the same sentences in its
+	// job snapshot `warnings` once its plan completes.
 	Notices []string `json:"notices,omitempty"`
 }
 
