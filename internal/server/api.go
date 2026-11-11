@@ -1315,6 +1315,11 @@ func hasLocalWeightFile(dir string, excluded []string) bool {
 		if err != nil || info.IsDir() {
 			return nil
 		}
+		// A staging shape under blobs/ is not weight content, whatever its
+		// name reads like (the tmp-<file> destination matches a GGUF suffix).
+		if filepath.Base(filepath.Dir(path)) == "blobs" && isBlobStagingArtifactName(info.Name()) {
+			return nil
+		}
 		if smartdl.IsGGUFFileName(info.Name()) || strings.EqualFold(filepath.Ext(info.Name()), ".safetensors") {
 			found = true
 		}
@@ -1405,21 +1410,22 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 	var fileCount int
 	var files []CachedFileInfo
 	var newest time.Time
+	counted := make(map[string]bool)
+	var countedFiles []os.FileInfo
 
 	err := walkLocalCacheRepo(repoDir, excluded, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
 		}
 		fileInfo := info
-		if info.Mode()&os.ModeSymlink != 0 {
-			if realPath, evalErr := filepath.EvalSymlinks(path); evalErr == nil {
-				if realInfo, statErr := os.Stat(realPath); statErr == nil {
-					fileInfo = realInfo
-				}
+		resolved, evalErr := filepath.EvalSymlinks(path)
+		resolvedOK := false
+		if evalErr == nil {
+			if realInfo, statErr := os.Stat(resolved); statErr == nil {
+				fileInfo = realInfo
+				resolvedOK = true
 			}
 		}
-		totalSize += fileInfo.Size()
-		fileCount++
 		if fileInfo.ModTime().After(newest) {
 			newest = fileInfo.ModTime()
 		}
@@ -1435,6 +1441,33 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 				IsLFS:     fileInfo.Size() > 10*1024*1024,
 			})
 		}
+		// Statistics count distinct published physical files: no staging
+		// shapes under blobs/, one contribution per physical file — the
+		// resolved path is the fast path, os.SameFile confirms identity.
+		if filepath.Base(filepath.Dir(path)) == "blobs" && isBlobStagingArtifactName(info.Name()) {
+			return nil
+		}
+		if !resolvedOK {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return nil
+			}
+			totalSize += info.Size()
+			fileCount++
+			return nil
+		}
+		key := pathIdentityKey(resolved)
+		if counted[key] {
+			return nil
+		}
+		counted[key] = true
+		for _, seen := range countedFiles {
+			if os.SameFile(fileInfo, seen) {
+				return nil
+			}
+		}
+		countedFiles = append(countedFiles, fileInfo)
+		totalSize += fileInfo.Size()
+		fileCount++
 		return nil
 	})
 	if err != nil {
