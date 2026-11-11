@@ -1724,15 +1724,24 @@ friendly-view folder; otherwise `400 Invalid path`.
 
 Whole-folder deletion requires the folder to hold exactly one model's files.
 The server classifies every weight file's folder-relative name through the
-shared naming rules with a strictly right-anchored reduction: a quantization
-token, shard suffix or precision marker is stripped only when it reaches the
-end of the name, only the canonical `<model>.mmproj-<quant>` companion shape
-cuts, and only recognized Diffusers component directories are dropped from
-the key while any other parent directory stays in it — an interior
-occurrence never cuts, so two distinct file names are never merged into one
-key. One distinct model key makes the folder eligible; two or more keys, no
-recognized weight files, or any weight name the rules cannot confidently
-reduce make it ineligible, and the `DELETE` refuses with
+shared naming rules with a strictly right-anchored, byte-aligned reduction: a
+quantization token, shard suffix or precision marker is stripped only when it
+reaches the end of the name, and only the canonical `<model>.mmproj-<quant>`
+companion shape cuts — an interior occurrence never cuts, so two distinct
+file names are never merged by an interior excision; the only designed merges
+are quant/shard/precision variants of one name, the canonical companion, and
+one pipeline's component roles. Weight files under recognized Diffusers
+component directories are pipeline members: uniformly named component roles
+count as one shared pipeline key (a real `unet`/`vae`/`text_encoder` tree is
+one model), a component directory holding more than one distinct base yields
+distinct keys, and pipeline weights mixed with any top-level weight yield
+multiple keys — each refused. Any other parent directory stays in its key
+(`a/…` and `b/…` remain distinct), and a folder whose component roles cannot
+be told apart by names alone — one model's `unet` beside another's `vae`,
+each internally uniform — stays eligible: the conservative floor of
+name-based classification. One distinct model key makes the folder eligible;
+two or more keys, no recognized weight files, or any weight name the rules
+cannot confidently reduce make it ineligible, and the `DELETE` refuses with
 `409 Folder is not a single model` before removing anything — shared or piled
 folders keep per-group deletion only. The classification is conservative:
 folders that merely look alike stay ineligible (a UX loss, never a data risk).

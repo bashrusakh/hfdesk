@@ -1471,11 +1471,12 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 	// Whole-folder eligibility is computed for Local sources along the same
 	// walk and the same excluded-subroot view the listing already uses, so
 	// the flag and the delete-time classifier see the same file set. The
-	// classifier keys folder-relative paths: parent directories stay in the
-	// key unless they are recognized Diffusers component directories.
+	// collected folder-relative paths go to the folder-level classifier in
+	// one call: per-file reductions, the pipeline-key rule for Diffusers
+	// component directories, and fail-closed unclassifiable names.
 	classifyFolder := source == cacheSourceLocal
-	folderKeys := map[string]bool{}
-	folderUnclassified := false
+	folderPaths := []string{}
+	folderRelErr := false
 
 	err := walkLocalCacheRepo(repoDir, excluded, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
@@ -1484,16 +1485,9 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 		if classifyFolder {
 			relPath, relErr := filepath.Rel(repoDir, path)
 			if relErr != nil {
-				folderUnclassified = true
+				folderRelErr = true
 			} else {
-				key, weight, ok := smartdl.WeightFileModelKey(relPath)
-				if weight {
-					if !ok {
-						folderUnclassified = true
-					} else {
-						folderKeys[key] = true
-					}
-				}
+				folderPaths = append(folderPaths, relPath)
 			}
 		}
 		fileInfo := info
@@ -1588,6 +1582,8 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 		Capabilities:   ggufMeta.Capabilities,
 	}
 	if classifyFolder {
+		keys, unclassified := smartdl.SingleModelFolderKeys(folderPaths)
+		unclassified = unclassified || folderRelErr
 		// The nested-boundary factor is repo-scoped: only a configured root
 		// nested UNDER THIS folder makes it ineligible, mirroring what the
 		// DELETE endpoint's selectedDeleteExclusions computes for this repo —
@@ -1605,7 +1601,7 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 				}
 			}
 		}
-		reason := singleModelFolderReason(len(folderKeys), folderUnclassified, nestedRepoRoot)
+		reason := singleModelFolderReason(len(keys), unclassified, nestedRepoRoot)
 		eligible := reason == ""
 		info.WholeFolderDeletable = &eligible
 		if !eligible {
@@ -2542,19 +2538,7 @@ func (s *Server) handleLocalModelFolderDelete(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusConflict, "Location could not be verified", err.Error())
 		return
 	}
-	keys := map[string]bool{}
-	unclassified := false
-	for _, entryName := range names {
-		key, weight, ok := smartdl.WeightFileModelKey(entryName)
-		if !weight {
-			continue
-		}
-		if !ok {
-			unclassified = true
-			continue
-		}
-		keys[key] = true
-	}
+	keys, unclassified := smartdl.SingleModelFolderKeys(names)
 	if reason := singleModelFolderReason(len(keys), unclassified, false); reason != "" {
 		writeError(w, http.StatusConflict, "Folder is not a single model", reason)
 		return

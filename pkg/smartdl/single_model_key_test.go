@@ -37,6 +37,14 @@ func TestWeightFileModelKey(t *testing.T) {
 		{"tiny-Q4_K_M-llama.gguf", "tiny-Q4_K_M-llama", true, true},
 		{"x-mmproj-y.gguf", "x-mmproj-y", true, true},
 		{"model.fp16.ema.safetensors", "model.fp16.ema", true, true},
+		// F6: the ".mmproj-" cut must be byte-aligned. Compensating Unicode
+		// ToLower length changes (Ⱥ grows 2→3, ẞ shrinks 3→2) must not shift
+		// the delimiter's byte offset — each name keeps its own exact key and
+		// the companion reduces only by its byte-exact ".mmproj-" prefix.
+		{"AȺȺ.m.gguf", "AȺȺ.m", true, true},
+		{"AȺȺ.mmproj-zẞẞ.gguf", "AȺȺ", true, true},
+		{"AȺȺȺ.mm.gguf", "AȺȺȺ.mm", true, true},
+		{"AȺȺȺ.mmproj-zẞẞẞ.gguf", "AȺȺȺ", true, true},
 		// Non-weights carry no identity.
 		{"config.json", "", false, false},
 		{"notes.txt", "", false, false},
@@ -63,6 +71,9 @@ func TestWeightFileModelKey(t *testing.T) {
 		{"x-mmproj-y.gguf", "x.gguf"},                                                // any-"mmproj" cut merged these
 		{"a/pytorch_lora_weights.safetensors", "b/pytorch_lora_weights.safetensors"}, // nested adapters
 		{"modelA.safetensors", "modelA-v2.safetensors"},
+		// F6 pairs: a shifted byte offset in the ".mmproj-" cut merged these.
+		{"AȺȺ.m.gguf", "AȺȺ.mmproj-zẞẞ.gguf"},
+		{"AȺȺȺ.mm.gguf", "AȺȺȺ.mmproj-zẞẞẞ.gguf"},
 	}
 	for _, pair := range distinct {
 		ka, _, _ := WeightFileModelKey(pair[0])
@@ -83,5 +94,72 @@ func TestWeightFileModelKey(t *testing.T) {
 		if ka != kb || ka == "" {
 			t.Errorf("one-model pair %q and %q must share a non-empty key, got %q and %q", pair[0], pair[1], ka, kb)
 		}
+	}
+}
+
+// The folder-level pipeline-key rule: one real Diffusers tree is one model
+// (a shared pipeline key), while two models in one role directory or
+// pipeline weights mixed with top-level weights yield multiple keys; the
+// per-folder outcomes are deterministic (sorted) and fail closed.
+func TestSingleModelFolderKeys(t *testing.T) {
+	one := []struct {
+		name  string
+		paths []string
+	}{
+		{"real pipeline tree", []string{
+			"text_encoder/pytorch_model.bin", "unet/diffusion_pytorch_model.safetensors",
+			"vae/diffusion_pytorch_model.safetensors", "tokenizer/merges.txt",
+			"scheduler/scheduler_config.json",
+		}},
+		{"one base in two component dirs", []string{
+			"unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors",
+		}},
+		{"three quants of one base", []string{"model-Q4_K_M.gguf", "model-Q5_K_M.gguf", "model-Q6_K_S.gguf"}},
+		{"canonical companion", []string{"model.gguf", "model.mmproj-f16.gguf"}},
+		{"shard family with config", []string{"model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors", "config.json"}},
+	}
+	for _, tc := range one {
+		keys, unclassified := SingleModelFolderKeys(tc.paths)
+		if unclassified || len(keys) != 1 {
+			t.Errorf("%s: keys=%v unclassified=%v, want exactly one key", tc.name, keys, unclassified)
+		}
+	}
+	// The pipeline tree's shared key is the pipeline sentinel itself.
+	if keys, _ := SingleModelFolderKeys(one[0].paths); len(keys) != 1 || keys[0] != pipelineModelKey {
+		t.Errorf("real pipeline tree keys=%v, want [%q]", keys, pipelineModelKey)
+	}
+	many := []struct {
+		name  string
+		paths []string
+	}{
+		{"two models in one component dir", []string{"unet/modelA.safetensors", "unet/modelB.safetensors"}},
+		{"pipeline mixed with a top-level GGUF", []string{
+			"unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors",
+			"x-Q4_K_M.gguf",
+		}},
+		{"adapters in sibling dirs", []string{
+			"a/pytorch_lora_weights.safetensors", "b/pytorch_lora_weights.safetensors",
+		}},
+		{"pile of five models", []string{
+			"modelA-Q4_K_M.gguf", "modelB-Q5_K_M.gguf", "modelC-Q6_K.gguf",
+			"modelD-Q8_0.gguf", "modelE-Q4_K_S.gguf",
+		}},
+	}
+	for _, tc := range many {
+		keys, unclassified := SingleModelFolderKeys(tc.paths)
+		if unclassified || len(keys) < 2 {
+			t.Errorf("%s: keys=%v unclassified=%v, want at least two keys", tc.name, keys, unclassified)
+		}
+	}
+	// Sorted, deterministic output for the mixed case: pipeline + top-level.
+	if keys, _ := SingleModelFolderKeys(many[1].paths); len(keys) != 2 || keys[0] != pipelineModelKey || keys[1] != "x" {
+		t.Errorf("mixed keys=%v, want [%q \"x\"]", keys, pipelineModelKey)
+	}
+	// Fail-closed outcomes.
+	if keys, unclassified := SingleModelFolderKeys([]string{"config.json", "notes.txt"}); unclassified || len(keys) != 0 {
+		t.Errorf("weightless folder: keys=%v unclassified=%v, want none", keys, unclassified)
+	}
+	if _, unclassified := SingleModelFolderKeys([]string{"unet/Q4_K_M.safetensors"}); !unclassified {
+		t.Error("unclassifiable weight name must fail closed")
 	}
 }

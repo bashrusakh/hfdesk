@@ -561,6 +561,21 @@ func TestLocalModelFolderDelete_SingleModelGate(t *testing.T) {
 		{"adapter pile in sibling dirs", []string{
 			"a/pytorch_lora_weights.safetensors", "b/pytorch_lora_weights.safetensors",
 		}, true, http.StatusConflict, "multiple models"},
+		// Pipeline-key rule (owner decision): a real Diffusers tree is ONE
+		// model with role-named components — eligible; two models inside one
+		// role dir, and pipeline weights mixed with top-level weights, refuse.
+		{"real Diffusers pipeline tree", []string{
+			"text_encoder/pytorch_model.bin", "unet/diffusion_pytorch_model.safetensors",
+			"vae/diffusion_pytorch_model.safetensors", "tokenizer/merges.txt",
+			"scheduler/scheduler_config.json",
+		}, true, http.StatusOK, ""},
+		{"two models inside one component dir", []string{
+			"unet/modelA.safetensors", "unet/modelB.safetensors",
+		}, true, http.StatusConflict, "multiple models"},
+		{"component tree mixed with a top-level GGUF", []string{
+			"unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors",
+			"x-Q4_K_M.gguf",
+		}, true, http.StatusConflict, "multiple models"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
