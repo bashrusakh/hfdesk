@@ -6,6 +6,7 @@ package server
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
@@ -187,6 +188,24 @@ func TestLocalCacheScanDoesNotListStagingOnlyRepositories(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mixed, "model.gguf"), []byte("real weights"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// F2(a): an in-namespace staging name nested under blobs/sub/ must not
+	// make the staging-only directory listable either.
+	subStaging := filepath.Join(stagingOnly, "blobs", "sub", "tmp-model.gguf")
+	if err := os.MkdirAll(filepath.Dir(subStaging), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(subStaging, []byte("staging"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// F2(b): outside the repository-root blobs/ namespace, a staging-shaped
+	// name in a nested snapshots/<c>/blobs/ directory is content and keeps
+	// the directory's weight status.
+	if err := os.MkdirAll(filepath.Join(scanBase, "owner", "nested-weight", "snapshots", "commit1", "blobs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scanBase, "owner", "nested-weight", "snapshots", "commit1", "blobs", "tmp-model.gguf"), []byte("real weight bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	// Second shape: a scan root pointing at a hub makes the staging-only
 	// blobs directory itself a candidate repository directory.
 	hubRoot := filepath.Join(t.TempDir(), "hub")
@@ -216,5 +235,76 @@ func TestLocalCacheScanDoesNotListStagingOnlyRepositories(t *testing.T) {
 	}
 	if !listed["owner/mixed"] {
 		t.Error("a directory with one real GGUF beside staging artifacts was not listed")
+	}
+	if !listed["owner/nested-weight"] {
+		t.Error("a repo whose only weight sits under a nested snapshots/<c>/blobs/ dir was not listed")
+	}
+}
+
+// TestLocalCacheStatsBlobsNamespaceAndStagingIdentity pins, on one scan:
+// F2 stats cells — staging shapes anywhere under the repository-root blobs/
+// subtree count nothing (even nested in blobs/sub/), while a nested
+// snapshots/<c>/blobs/ directory is OUTSIDE the namespace and counts as
+// content; F3 cells — a physical staging identity counts nowhere even
+// through a content-named symlink or hard link, while an independent copy
+// counts; and the grouped metadata cell — staging names never leak a
+// phantom Quantizations entry.
+func TestLocalCacheStatsBlobsNamespaceAndStagingIdentity(t *testing.T) {
+	scanBase := t.TempDir()
+	writeAll := func(files map[string]string) {
+		for rel, data := range files {
+			p := filepath.Join(scanBase, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	const staged, lock = "staged payload", "nested lock bytes"
+	writeAll(map[string]string{
+		"owner/proj-symlink/blobs/tmp-model.gguf":                          staged,
+		"owner/proj-symlink/snapshots/commit1/weights.safetensors":         "weights",
+		"owner/proj-hardlink/blobs/tmp-model.gguf":                         staged,
+		"owner/proj-hardlink/snapshots/commit1/weights.safetensors":        "weights",
+		"owner/proj-hardlink/snapshots/commit1/real-copy.gguf":             staged,
+		"owner/nested-ns/blobs/tmp-Q5_K_XL.gguf":                           "phantom quant bait",
+		"owner/nested-ns/blobs/sub/" + stagingTestSHA[:16] + ".incomplete": "in-ns nested staging",
+		"owner/nested-ns/model-Q4_K_M.gguf":                                "real weight",
+		"owner/nested-out/snapshots/commit1/blobs/x.lock":                  lock,
+		"owner/nested-out/model.gguf":                                      "real weight",
+	})
+	if err := os.Symlink("../../blobs/tmp-model.gguf", filepath.Join(scanBase, filepath.FromSlash("owner/proj-symlink/snapshots/commit1/copied.gguf"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(scanBase, "owner", "proj-hardlink", "blobs", "tmp-model.gguf"), filepath.Join(scanBase, "owner", "proj-hardlink", "snapshots", "commit1", "linked.gguf")); err != nil {
+		t.Fatal(err)
+	}
+
+	repos, err := scanLocalCachedRepos(t.TempDir(), "", []string{scanBase}, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[string]CachedRepoInfo)
+	for _, entry := range repos {
+		byID[entry.Repo] = entry
+	}
+	checkStats := func(id string, wantSize int64, wantCount int) {
+		entry, ok := byID[id]
+		if !ok {
+			t.Fatalf("%s was not listed", id)
+		}
+		if entry.Size != wantSize || entry.FileCount != wantCount {
+			t.Errorf("%s size/count = %d/%d, want %d/%d", id, entry.Size, entry.FileCount, wantSize, wantCount)
+		}
+	}
+	checkStats("owner/proj-symlink", int64(len("weights")), 1)              // F3(i): symlink to staging counts nothing
+	checkStats("owner/proj-hardlink", int64(len("weights")+len(staged)), 2) // F3(ii): hard link to staging counts nothing, independent copy counts
+	checkStats("owner/nested-ns", int64(len("real weight")), 1)             // F2(a): in-namespace nested staging excluded
+	checkStats("owner/nested-out", int64(len(lock)+len("real weight")), 2)  // F2(b): outside the namespace counts
+
+	if want := []string{"Q4_K_M"}; !reflect.DeepEqual(byID["owner/nested-ns"].Quantizations, want) {
+		t.Errorf("nested-ns quantizations = %v, want %v (staging names must not leak metadata)", byID["owner/nested-ns"].Quantizations, want)
 	}
 }

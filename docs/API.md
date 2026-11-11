@@ -1451,8 +1451,9 @@ content. A `blobs/` name that carries a staging shape is treated as a staging
 artifact by every surface, including deletion, even if it was published
 content, so it is never counted in the statistics (`size`, `sizeHuman`,
 `fileCount`), copied, verified or deleted as cached content. The exclusion is
-scoped to `blobs/`: a file outside that namespace
-(for example a snapshot entry named `tokenizer.model.meta`) is content and is
+scoped to the repository-root `blobs/` subtree: a file outside that
+namespace (for example a snapshot entry named `tokenizer.model.meta`, or a
+name under a nested `snapshots/<commit>/blobs/` directory) is content and is
 both copied and verified by the mirror. A blob key that names a staging shape is
 refused before placement by the public storage paths (`StoreDownloadedFile`,
 `FinalizeBlob`), so a successful store always has a reachable result. The
@@ -1461,8 +1462,10 @@ canonical list and boundary rules are in `pkg/hfdownloader/doc.go`.
 For repositories discovered by independent local scans, the `size`,
 `sizeHuman` and `fileCount` fields apply that classification to the whole
 repository directory: they sum each distinct published physical file exactly
-once, no matter how many snapshot or friendly-view links resolve to it, and a
-link with no resolvable target adds neither size nor count. The optional
+once, no matter how many snapshot or friendly-view links resolve to it; a
+physical file whose identity carries a staging name inside the
+repository-root `blobs/` subtree counts nothing, however it is projected; and
+a link with no resolvable target adds neither size nor count. The optional
 `files` array is unaffected by these rules: it stays the full enumeration of
 every path present under the directory, staging artifacts included.
 

@@ -717,7 +717,7 @@ func copyRepoCache(repoPath, srcCache, dstCache string) error {
 		if err != nil {
 			return fmt.Errorf("path traversal: %q would escape the destination repository: %w", rel, err)
 		}
-		if !info.IsDir() && filepath.Dir(rel) == "blobs" && isBlobStagingArtifactName(info.Name()) {
+		if !info.IsDir() && inCacheBlobsNamespace(repoPath, rel) && isBlobStagingArtifactName(info.Name()) {
 			return nil
 		}
 		// Existing destination directory links must never redirect writes
@@ -825,7 +825,7 @@ func verifyRepoCache(repoPath, srcCache, dstCache string) error {
 		if err != nil {
 			return err
 		}
-		if filepath.Dir(rel) == "blobs" && isBlobStagingArtifactName(info.Name()) {
+		if inCacheBlobsNamespace(repoPath, rel) && isBlobStagingArtifactName(info.Name()) {
 			return nil
 		}
 		if !mirrorVerifyCoversEntry(rel) {
