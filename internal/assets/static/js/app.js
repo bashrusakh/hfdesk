@@ -2057,7 +2057,7 @@ async function loadRepositoryDetails(entry) {
       return 'branchVariant:' + item.revision;
     }
     const files = Array.isArray(item?.files) ? item.files : [];
-    if (files.length && ['quantization', 'vision_encoder', 'format'].includes(item.category)) {
+    if (files.length && ['quantization', 'vision_encoder', 'format', 'component'].includes(item.category)) {
       return `artifact:${JSON.stringify(files.map(normalizeRepoPath))}`;
     }
     return item?.filter_value || item?.id || '';
@@ -6234,7 +6234,7 @@ async function loadRepositoryDetails(entry) {
     const fv = item.filter_value || item.id || '';
     const files = Array.isArray(item.files) ? item.files : [];
     const isBranch = item?.branch_variant === true && !!item?.revision;
-    const exactArtifact = files.length > 0 && ['quantization', 'vision_encoder', 'format'].includes(item.category);
+    const exactArtifact = files.length > 0 && ['quantization', 'vision_encoder', 'format', 'component'].includes(item.category);
     const statusKey = isBranch ? selectableStatusKey(item) : (exactArtifact ? selectableStatusKey(item) : fv);
     const dlRepo = item.upstream_repo || repo;
     const statusRepo = repo;

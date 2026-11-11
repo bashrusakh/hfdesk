@@ -461,6 +461,43 @@ async function run(entry, type, { dataset = false, manual = '', low = false, cho
     'family row must send exactly item.files through the exact-artifact path');
   assert.equal(familyDownload.body.exactMatch, true, 'family row selection must be exact');
   assert(!familyDownload.body.strictFiles, 'the exact-artifact path does not escalate to strictFiles');
+  // Best-set component rows: a ready component carries its chosen weight set
+  // as item.files, so its request routes through the exact-artifact path with
+  // exactly those members, while a weightless component row keeps its legacy
+  // folder-filter request byte-identical and its plain token status key.
+  const componentAnalysis = { repo: 'fixture/pipeline', type: 'diffusers', branch: 'main',
+    files: [{ path: 'unet/diffusion_pytorch_model.fp16.safetensors', size: 10 }] };
+  ui.setAnalysis(componentAnalysis);
+  const componentHtml = ui.renderSelectableItems([
+    { id: 'unet', label: 'Unet (fp16)', category: 'component', filter_value: 'unet',
+      recommended: true, size_human: '10 B', files: ['unet/diffusion_pytorch_model.fp16.safetensors'] },
+    { id: 'tokenizer', label: 'tokenizer', category: 'component', filter_value: 'tokenizer',
+      size_human: '20 B' }
+  ], 'componentItems');
+  const readyRow = /data-fv="unet"[\s\S]*?data-status-key="([^"]+)"[\s\S]*?data-download="([^"]+)"/.exec(componentHtml);
+  const thinRow = /data-fv="tokenizer"[\s\S]*?data-status-key="([^"]+)"[\s\S]*?data-download="([^"]+)"/.exec(componentHtml);
+  assert(readyRow && thinRow, 'both component rows must carry download payloads: ' + componentHtml);
+  assert.equal(decodeURIComponent(readyRow[1]).startsWith('artifact:'), true,
+    'a ready component row is status-keyed by its chosen files');
+  assert.equal(thinRow[1], 'tokenizer', 'a weightless component row keeps its plain token status key');
+  calls.length = 0;
+  messages.length = 0;
+  await window.downloadQuantFromButton({ dataset: { download: readyRow[2] }, closest: () => null });
+  const readyDownload = calls.find(c => c.path === '/api/download');
+  assert(readyDownload, 'ready component download request missing');
+  assert.deepEqual(readyDownload.body,
+    { repo: 'fixture/pipeline', revision: 'main', dataset: false,
+      filters: ['unet/diffusion_pytorch_model.fp16.safetensors'], exactMatch: true },
+    'a ready component row must send exactly item.files through the exact-artifact path');
+  calls.length = 0;
+  messages.length = 0;
+  await window.downloadQuantFromButton({ dataset: { download: thinRow[2] }, closest: () => null });
+  const thinDownload = calls.find(c => c.path === '/api/download');
+  assert(thinDownload, 'weightless component download request missing');
+  assert.deepEqual(thinDownload.body,
+    { repo: 'fixture/pipeline', revision: 'main', dataset: false,
+      filters: ['tokenizer'], exactMatch: true },
+    'a weightless component row request must stay byte-identical to the legacy folder-filter body');
   // No configured destinations leave both analysis surfaces without a picker.
   if (!Object.keys(fixture.routes || {}).length) {
     const noRouteAnalysis = { repo: 'fixture/model', type: 'gguf', files: [{ path: 'model.bin', size: 7 }] };

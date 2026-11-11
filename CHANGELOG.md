@@ -35,6 +35,8 @@
 
 ### Changed
 
+- Downloading a Diffusers component takes its best weight set and nothing else: a ready component row (like `Unet (fp16) · 5.2 GB`) carries `files` = exactly the chosen set — fp16 safetensors over default safetensors over pytorch `.bin`, every shard of one `<prefix>-NNNNN-of-MMMMM` family together, ONNX/OpenVINO/Flax/tflite conversions never included — with `size` summing only those files, the row downloads exactly those paths with `exactMatch: true`, and a recommended component's chosen set flows into `recommended_download` the way GGUF artifacts do; components without weights (tokenizer/scheduler/config-only folders) keep their exact legacy folder-filter requests and the `variant` rows are unchanged, so a component download no longer drags every conversion copy behind a folder filter (measured upstream on SDXL: ~39 GiB → ~7 GiB).
+
 - `hfdesk service status` names a masked registration by its mask kind. A persistent mask reports `State: masked` instead of `stopped` and keeps the exit code `0`; a runtime mask reports `State: masked-runtime` instead of `not-installed`, and its exit code changes from `1` to `0`, so a script that branched on the old code sees the new one.
 
 - Dataset split membership now has one documented precedence rule: a file

@@ -314,7 +314,7 @@ Important response fields:
 }
 ```
 
-`recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract. GGUF recommendations use exact artifact selectors from `selectable_items[].files` rather than the legacy quant token, and set `exactMatch: true`: root-level paths are prefixed with `./`, while nested paths keep their complete repository-relative spelling. Dataset recommendations also set `exactMatch: true`, but use the group's `filter_value` as the selector. A dataset that holds config folders additionally exposes one `config` category item per config (see the dataset selection notes below); when exactly one config holds the train split — the established dataset recommendation rule — that config preset is the single recommended row and `recommended_download` selects its config-folder `filter_value` instead of the bare `train` split, while with no unique train-bearing config the recommendation stays on the split rows as before. Other model recommendations keep their existing filter values and leave `exactMatch` unset. Exactly one non-MTP GGUF quantization artifact is recommended: the first `Q4_K_M`/`UD_Q4_K_M` in the analyzer's deterministic order, or otherwise the first non-MTP quality>=4 artifact under 10 GiB. When the `availableRamBytes` setting is set (> 0, see Settings), that pick is restricted to non-MTP artifacts whose estimated RAM fits the budget: the same two rules run over the fitting artifacts, a fitting artifact matched by neither rule is picked by the existing quality ordering (highest quality, then smallest size), and when nothing fits the smallest-RAM non-MTP artifact is recommended. With the setting unset (`0`/absent) the recommendation is byte-identical to the rule stated here, and MTP variants are never auto-recommended in either mode. A preferred local `mmproj` companion remains separately recommended and is bundled into the same request. Branch rows never displace this: even when EXL2/EXL3 branch refs are listed as selectable items (see below), `recommended_download` names a branch only when the main tree carries no recognized model payload by name/layout; branch rows are always available and downloadable, and file names never prove calibration.
+`recommended_download` is a ready-to-send request body for `POST /api/download`. It replaces the old CLI-command string contract. GGUF recommendations use exact artifact selectors from `selectable_items[].files` rather than the legacy quant token, and set `exactMatch: true`: root-level paths are prefixed with `./`, while nested paths keep their complete repository-relative spelling. Dataset recommendations also set `exactMatch: true`, but use the group's `filter_value` as the selector. A dataset that holds config folders additionally exposes one `config` category item per config (see the dataset selection notes below); when exactly one config holds the train split — the established dataset recommendation rule — that config preset is the single recommended row and `recommended_download` selects its config-folder `filter_value` instead of the bare `train` split, while with no unique train-bearing config the recommendation stays on the split rows as before. Other model recommendations keep their existing filter values and leave `exactMatch` unset — except a Diffusers component recommendation whose row carries its chosen weight set (see the Diffusers component selection below): it contributes the chosen files' exact paths like a GGUF artifact and sets `exactMatch: true`, while components without weights keep their folder filter and unset `exactMatch`. Exactly one non-MTP GGUF quantization artifact is recommended: the first `Q4_K_M`/`UD_Q4_K_M` in the analyzer's deterministic order, or otherwise the first non-MTP quality>=4 artifact under 10 GiB. When the `availableRamBytes` setting is set (> 0, see Settings), that pick is restricted to non-MTP artifacts whose estimated RAM fits the budget: the same two rules run over the fitting artifacts, a fitting artifact matched by neither rule is picked by the existing quality ordering (highest quality, then smallest size), and when nothing fits the smallest-RAM non-MTP artifact is recommended. With the setting unset (`0`/absent) the recommendation is byte-identical to the rule stated here, and MTP variants are never auto-recommended in either mode. A preferred local `mmproj` companion remains separately recommended and is bundled into the same request. Branch rows never displace this: even when EXL2/EXL3 branch refs are listed as selectable items (see below), `recommended_download` names a branch only when the main tree carries no recognized model payload by name/layout; branch rows are always available and downloadable, and file names never prove calibration.
 
 `recommended_download` targets exactly one repository (`repo`, the analyzed repository). A recommended item whose `upstream_repo` is set is an mmproj companion discovered in an upstream base-model repository; its `files` paths are relative to that upstream repository, so they are omitted from `recommended_filters` and `recommended_download`. Download such a companion through its individual `selectable_items[]` entry, which retains `upstream_repo` and the exact upstream `files`. Recommended items from the analyzed repository are still included. If every recommended item is upstream, `recommended_download` is omitted.
 
@@ -521,6 +521,38 @@ selection identities: prefix root-level entries with `./` in `filters`, and
 send nested entries unchanged. `filter_value` is a legacy human/filter token,
 not a unique artifact identity when multiple artifacts share a quant label.
 The analyzer's `recommended_download` already contains encoded exact selectors.
+
+For Diffusers `selectable_items`, a `component` row whose folder holds weights
+carries `files` = exactly that component's best weight set, chosen only among
+eligible sets. A non-sharded file is a trivially complete one-member set; a
+`<prefix>-NNNNN-of-MMMMM` shard family is eligible only when its present
+indices are exactly the distinct set `1..M` — no gaps, no duplicates, no
+out-of-range member such as `-00003-of-00002` — with the declared `M` equal to
+the member count. Among eligible sets the class order is absolute: fp16
+safetensors beat default safetensors, which beat pytorch `.bin` files; within
+the winning class plain naming beats a precision-marked twin, and the
+lexicographically smallest member set wins. Every shard of the chosen
+`<prefix>-NNNNN-of-MMMMM.safetensors` family joins — half a family is never
+selected — conversions never join (ONNX `.onnx`, OpenVINO IR: each `.xml` with
+its same-basename `.bin`, Flax `.msgpack`, `.tflite`, and any weight file
+under `onnx/`/`openvino/`/`flax/`/`tflite/` subfolders), and `size`/`size_human`
+sum exactly those files. A component with no eligible set — a family split
+across spellings (`m.fp16-00001-of-00002` beside `m-00002-of-00002`),
+declared-total mismatches in either direction, index holes, or a
+conversions-only folder — falls through to the legacy weightless folder
+behavior unchanged: no `files`, the whole-folder size, and its folder-filter
+request. The row label names the chosen set's variant (`Unet (fp16)`), and the
+row downloads exactly `files` when sent with `exactMatch: true`; `filter_value`
+stays the component name as the row's identity for legacy consumers, while
+status keys follow the same exact-files gate as the request: a weighted row's
+status key is `artifact:[…]` (the JSON array of its `files`, such as
+`artifact:["unet/diffusion_pytorch_model.safetensors"]`), and only a
+weightless row keeps the component-name token key. The losing sets stay
+available as thin alternatives through the Files tab and manual filters, the
+`variant` category rows (fp16/fp32/bf16 detection) are unchanged, and a
+component without weights (tokenizer/scheduler/config-only folders) carries no
+`files` and keeps its legacy folder-filter request. The same chosen set is
+exposed as `diffusers.components[].files` in the analysis response.
 
 For datasets, `/api/analyze/...?...dataset=true` exposes only groups whose
 membership can be inferred from conventional split paths/names or
