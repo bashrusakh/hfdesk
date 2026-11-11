@@ -1722,6 +1722,21 @@ matching a root that fails the registered-roots check returns fail-closed
 `source=Friendly view` it must identity-match the model's server-derived
 friendly-view folder; otherwise `400 Invalid path`.
 
+Whole-folder deletion requires the folder to hold exactly one model's files.
+The server classifies every weight file name in the folder through the shared
+naming rules (quantization tokens, shard suffixes, precision markers,
+vision-encoder companions): one distinct model key makes the folder eligible;
+two or more keys, no recognized weight files, or any weight name the rules
+cannot confidently reduce make it ineligible, and the `DELETE` refuses with
+`409 Folder is not a single model` before removing anything — shared or piled
+folders keep per-group deletion only. The classification is conservative:
+folders that merely look alike stay ineligible (a UX loss, never a data risk).
+`GET /api/cache/{owner}/{repo}` and `GET /api/cache` expose the result for
+`Local` sources as `wholeFolderDeletable` (an explicit `true` or `false`) with
+`wholeFolderDeleteReason` on ineligible folders; other sources omit both
+fields, and the details modal renders the whole-folder button only when
+`wholeFolderDeletable` is `true`.
+
 `source=Local` deletes the whole model folder — the folder is the model unit.
 Every established layer applies: the strict repository-ID/traversal/charset
 validation above; owner/model symlink-component rejection through the anchored

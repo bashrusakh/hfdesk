@@ -510,3 +510,98 @@ func TestFlatAdmissionTreeRemoval_WriterAndVanishRules(t *testing.T) {
 	}
 	creatorLease()
 }
+
+// Whole-folder eligibility: the folder must be exactly one model's folder.
+// Refusal rows (the rehearsal S2 pile, the S3b shared root, the -v2 twin, an
+// unclassifiable weight name, a weightless folder) must refuse with nothing
+// removed and expose wholeFolderDeletable=false + a reason on details; the
+// eligibility matrix pins what stays deletable with the flag set. The refusal
+// rows fail against the pre-gate handler, which deleted every one of them.
+func TestLocalModelFolderDelete_SingleModelGate(t *testing.T) {
+	cases := []struct {
+		name       string
+		files      []string // repo-relative
+		listed     bool     // details/listing reports this folder at all
+		wantCode   int
+		wantDetail string
+	}{
+		{"S2 shared pile of five models", []string{
+			"modelA-Q4_K_M.gguf", "modelB-Q5_K_M.gguf", "modelC-Q6_K.gguf",
+			"modelD-Q8_0.gguf", "modelE-Q4_K_S.gguf", "user-notes.txt",
+		}, true, http.StatusConflict, "multiple models"},
+		{"S3b shared root with nested models", []string{
+			"alpha/alpha-Q4_K_M.gguf", "beta/beta-Q5_K_M.gguf", "user file.txt",
+		}, true, http.StatusConflict, "multiple models"},
+		{"same base with a -v2 twin", []string{
+			"modelA.safetensors", "modelA-v2.safetensors",
+		}, true, http.StatusConflict, "multiple models"},
+		{"unclassifiable weight name", []string{"Q4_K_M.gguf"}, true, http.StatusConflict, "could not be classified"},
+		{"no recognized weight files", []string{"config.json", "notes.txt"}, false, http.StatusConflict, "No recognizable model weight"},
+		{"three quants of one base", []string{
+			"model-Q4_K_M.gguf", "model-Q5_K_M.gguf", "model-Q6_K.gguf",
+		}, true, http.StatusOK, ""},
+		{"shard family with config and notes", []string{
+			"model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
+			"config.json", "user-notes.txt",
+		}, true, http.StatusOK, ""},
+		{"gguf with mmproj companion", []string{
+			"model-Q4_K_M.gguf", "model.mmproj-f16.gguf",
+		}, true, http.StatusOK, ""},
+		{"diffusers tree with one base", []string{
+			"unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors", "unet/config.json",
+		}, true, http.StatusOK, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scanRoot := t.TempDir()
+			folder := filepath.Join(scanRoot, "org", "model")
+			for _, rel := range tc.files {
+				mustWriteFile(t, filepath.Join(folder, rel), "w")
+			}
+			s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir(), LocalScanDirs: []string{scanRoot}})
+			assertExposure := func() {
+				t.Helper()
+				w := cacheRequest(t, s, http.MethodGet, "/api/cache/org/model?type=model", "")
+				var details map[string]any
+				if err := json.Unmarshal(w.Body.Bytes(), &details); err != nil {
+					t.Fatal(err)
+				}
+				raw, present := details["wholeFolderDeletable"]
+				if !present {
+					t.Fatalf("details must expose wholeFolderDeletable, body=%s", w.Body.String())
+				}
+				if raw != (tc.wantCode == http.StatusOK) {
+					t.Fatalf("wholeFolderDeletable=%v, want %v", raw, tc.wantCode == http.StatusOK)
+				}
+				if tc.wantCode != http.StatusOK {
+					reason, _ := details["wholeFolderDeleteReason"].(string)
+					if !strings.Contains(reason, tc.wantDetail) {
+						t.Fatalf("wholeFolderDeleteReason=%q must contain %q", reason, tc.wantDetail)
+					}
+				}
+			}
+			// Eligible folders are checked before deletion (they disappear on
+			// success); refusal folders are checked after the refusal proves
+			// nothing was removed.
+			if tc.listed && tc.wantCode == http.StatusOK {
+				assertExposure()
+			}
+			w := cacheRequest(t, s, http.MethodDelete, "/api/cache/org/model?type=model", localFolderDeleteBody(folder))
+			if w.Code != tc.wantCode {
+				t.Fatalf("status=%d body=%s, want %d", w.Code, w.Body.String(), tc.wantCode)
+			}
+			if tc.wantCode == http.StatusConflict {
+				if !strings.Contains(w.Body.String(), "Folder is not a single model") || !strings.Contains(w.Body.String(), tc.wantDetail) {
+					t.Fatalf("refusal must name the gate and the reason, body=%s", w.Body.String())
+				}
+				mustExist(t, folder)
+				mustExist(t, filepath.Join(folder, tc.files[0]))
+				if tc.listed {
+					assertExposure()
+				}
+			} else {
+				mustBeGone(t, folder)
+			}
+		})
+	}
+}

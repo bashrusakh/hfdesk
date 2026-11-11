@@ -10,6 +10,7 @@ let delayNextSelection = null;
 let delayNextDetails = null;
 let detailsSource = 'Local';
 let detailsPath = '/friendly/model';
+let detailsWholeFolder = null;
 let datasetSource = 'HF cache';
 let detailsFiles = [];
 let deleteMode = 'success';
@@ -140,7 +141,7 @@ const context = {
         await delay.promise;
       }
       const dataset = path.includes('type=dataset');
-      result = { repo: dataset ? 'org/data' : 'org/model', type: dataset ? 'dataset' : 'model', owner: 'org', name: dataset ? 'data' : 'model', files: dataset ? [] : detailsFiles, path: dataset ? '/datasets/data' : detailsPath, sizeHuman: '1 GB', fileCount: 30, source: dataset ? datasetSource : detailsSource };
+      result = { repo: dataset ? 'org/data' : 'org/model', type: dataset ? 'dataset' : 'model', owner: 'org', name: dataset ? 'data' : 'model', files: dataset ? [] : detailsFiles, path: dataset ? '/datasets/data' : detailsPath, sizeHuman: '1 GB', fileCount: 30, source: dataset ? datasetSource : detailsSource, wholeFolderDeletable: detailsWholeFolder };
     } else if (path === '/api/cache') {
       result = { repos: [], stats: {} };
     } else {
@@ -307,11 +308,12 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
       return JSON.parse(`[${decoded.replace(/'/g, '"')}]`);
     }
   }
-  async function openWholeFolderDetails(source, path, files) {
+  async function openWholeFolderDetails(source, path, files, wholeFolder = true) {
     calls.length = 0;
     detailsSource = source;
     detailsPath = path;
     detailsFiles = files;
+    detailsWholeFolder = wholeFolder;
     currentSelection = { repo: 'org/model', type: 'model', locations: [] };
     await window.test.showCacheDetails('org/model', 'model');
   }
@@ -378,6 +380,21 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(!calls.some(call => call.method === 'DELETE'), 'no local-dataset delete is sent');
   datasetSource = 'HF cache';
   detailsPath = '/friendly/model';
+
+  // (e) A shared pile folder is never a whole-folder target: the server marks
+  // it ineligible (wholeFolderDeletable false) and the Local button does not
+  // render, while the per-group rows for its models remain available.
+  calls.length = 0;
+  detailsSource = 'Local';
+  detailsPath = '/piles/org/shared';
+  detailsFiles = ['modelA-Q4_K_M', 'modelB-Q5_K_M', 'modelC-Q6_K', 'modelD-Q8_0', 'modelE-Q4_K_S'].map(n => ({ name: `${n}.gguf`, sizeHuman: '4 GB' }));
+  detailsWholeFolder = false;
+  currentSelection = JSON.parse(JSON.stringify(selectionFixture));
+  await window.test.showCacheDetails('org/model', 'model');
+  assert(!modalHTML.includes('Delete entire model folder'), 'a shared pile folder never renders the whole-folder button');
+  assert(!modalHTML.includes('onclick="confirmDeleteCache'), 'a pile listing offers no whole-repository delete at all');
+  assert.equal((modalHTML.match(/class="cache-selection-group"/g) || []).length, 10, 'the pile keeps its per-group rows for targeted deletion');
+  detailsWholeFolder = null;
 
   async function openLocalDetails() {
     detailsSource = 'Local';

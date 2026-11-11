@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -1050,6 +1051,13 @@ type CachedRepoInfo struct {
 	HasMMProj      bool             `json:"hasMMProj,omitempty"`
 	MMProjFiles    []string         `json:"mmprojFiles,omitempty"`
 	Capabilities   []string         `json:"capabilities,omitempty"`
+	// WholeFolderDeletable reports, for Local sources only, whether the
+	// folder holds exactly one model's files and may be deleted as one
+	// whole-folder unit; ineligible folders carry WholeFolderDeleteReason.
+	// Other sources leave both fields unset (a pointer keeps an explicit
+	// false distinguishable from an absent field).
+	WholeFolderDeletable    *bool  `json:"wholeFolderDeletable,omitempty"`
+	WholeFolderDeleteReason string `json:"wholeFolderDeleteReason,omitempty"`
 }
 
 // CachedFileInfo represents a file in the cache.
@@ -1460,10 +1468,26 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 		}
 		identities[bkey] = append(identities[bkey], &identity{fi, false})
 	}
+	// Whole-folder eligibility is computed for Local sources along the same
+	// walk and the same excluded-subroot view the listing already uses, so
+	// the flag and the delete-time classifier see the same file set.
+	classifyFolder := source == cacheSourceLocal
+	folderKeys := map[string]bool{}
+	folderUnclassified := false
 
 	err := walkLocalCacheRepo(repoDir, excluded, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
+		}
+		if classifyFolder {
+			key, weight, ok := smartdl.WeightFileModelKey(info.Name())
+			if weight {
+				if !ok {
+					folderUnclassified = true
+				} else {
+					folderKeys[key] = true
+				}
+			}
 		}
 		fileInfo := info
 		identityPath := path
@@ -1538,7 +1562,7 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 	}
 	ggufMeta := collectCacheGGUFMetadata(repoDir, includeFiles, excluded)
 
-	return &CachedRepoInfo{
+	info := &CachedRepoInfo{
 		Repo:           owner + "/" + name,
 		Owner:          owner,
 		Name:           name,
@@ -1555,7 +1579,36 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 		HasMMProj:      ggufMeta.HasMMProj,
 		MMProjFiles:    ggufMeta.MMProjFiles,
 		Capabilities:   ggufMeta.Capabilities,
-	}, nil
+	}
+	if classifyFolder {
+		eligible := singleModelFolderReason(len(folderKeys), folderUnclassified, len(excluded) > 0) == ""
+		info.WholeFolderDeletable = &eligible
+		if !eligible {
+			info.WholeFolderDeleteReason = singleModelFolderReason(len(folderKeys), folderUnclassified, len(excluded) > 0)
+		}
+	}
+	return info, nil
+}
+
+// singleModelFolderReason returns why a local folder is not exactly one
+// model's folder, or "" when it is. It is deliberately fail-closed in the
+// established refusal direction: an unclassified weight name, a folder with
+// no recognized model weight files, a nested configured scan-root boundary,
+// or two or more distinct model keys all refuse — a shared pile is never a
+// whole-folder target, and per-group deletion remains the way to remove one
+// variant from it.
+func singleModelFolderReason(keyCount int, unclassified, nestedRoot bool) string {
+	switch {
+	case unclassified:
+		return "A weight file name in this folder could not be classified; whole-folder deletion is refused"
+	case nestedRoot:
+		return "A configured scan-root boundary is nested inside this model folder; whole-folder deletion is refused"
+	case keyCount == 0:
+		return "No recognizable model weight files were found in this folder"
+	case keyCount > 1:
+		return "This folder contains files of multiple models; use per-group deletion to remove one variant"
+	}
+	return ""
 }
 
 // scanLocalCachedRepos walks every local cache root (Friendly view,
@@ -2455,6 +2508,33 @@ func (s *Server) handleLocalModelFolderDelete(w http.ResponseWriter, r *http.Req
 	}
 	defer treeRelease()
 
+	// Single-model gate (additive, fail-closed): the whole-folder unit is
+	// available only while the folder holds exactly one model's files. The
+	// classification runs under the held tree lease — admitted writers cannot
+	// change the contents — and refuses before anything is removed.
+	names, err := localFolderFileNames(repoRoot)
+	if err != nil {
+		writeError(w, http.StatusConflict, "Location could not be verified", err.Error())
+		return
+	}
+	keys := map[string]bool{}
+	unclassified := false
+	for _, entryName := range names {
+		key, weight, ok := smartdl.WeightFileModelKey(entryName)
+		if !weight {
+			continue
+		}
+		if !ok {
+			unclassified = true
+			continue
+		}
+		keys[key] = true
+	}
+	if reason := singleModelFolderReason(len(keys), unclassified, false); reason != "" {
+		writeError(w, http.StatusConflict, "Folder is not a single model", reason)
+		return
+	}
+
 	ownerRoot, modelName, err := openLocalFolderOwner(repoRoot, physicalRepo)
 	if err != nil {
 		writeError(w, http.StatusConflict, "Selection is stale", err.Error())
@@ -2595,6 +2675,29 @@ func openLocalFolderOwner(repoRoot *os.Root, physicalRepo string) (*os.Root, str
 		return nil, "", fmt.Errorf("model folder changed while deletion was being admitted")
 	}
 	return ownerRoot, name, nil
+}
+
+// localFolderFileNames enumerates every non-directory entry name of the
+// admitted folder through the same rooted walk the selected-delete path uses:
+// directory opens stay anchored, symlinked directories are never descended
+// (their contents are also never removed), and any read failure aborts the
+// enumeration instead of yielding a partial list.
+func localFolderFileNames(root *os.Root) ([]string, error) {
+	var names []string
+	err := fs.WalkDir(localSelectionWalkFS{root: root}, ".", func(name string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if name == "." || entry.IsDir() {
+			return nil
+		}
+		names = append(names, entry.Name())
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return names, nil
 }
 
 // writeCacheDeleteAdmission reports a refused or failed cache-tree admission before anything// is removed: a conflict keeps the endpoint's accepted 409; any other failure stops the
