@@ -550,14 +550,18 @@ filters where appropriate. A README-only filter does not activate GGUF-only
 selection.
 
 Alongside the `split` rows, dataset analysis emits one `config` category item
-per detected config folder (the UI renders the `Dataset Configs` category
+per `detectConfig` name (the UI renders the `Dataset Configs` category
 above `Dataset Splits`): `files` rolls up the config's member files, `label`
 composes the config name with its splits in split-priority order (for example
 `cc100 (train+test)`), `size_human` is the rolled-up member size, and both
 `id` and `filter_value` are the config's directory selector — `cc100/` for a
 root-level config folder, `data/cc100/` under a `data/` prefix — which, sent
 with `exactMatch: true`, selects the whole config directory at a
-path-component boundary like any other explicit directory filter. Exactly one
+path-component boundary like any other explicit directory filter. Grouping is
+per `detectConfig` name, so a config whose members span `cc100/…` and
+`data/cc100/…` yields ONE row; in that mixed-layout case the folder selector
+falls back to the bare `cc100/` form, whose component-boundary match covers
+both spellings. Exactly one
 `config` or `split` item carries `recommended`: the unique config holding the
 train split when there is one, otherwise the existing split-level rule
 (the `train` split row), and no row when neither applies. Split rows, their
