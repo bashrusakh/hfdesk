@@ -9,7 +9,6 @@ package hfdownloader
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -131,18 +130,6 @@ func removeStagingArtifactsOwned(staging, metaPath string) bool {
 	}
 	defer lock.release()
 	return removeOwnedStagingLocked(staging, metaPath)
-}
-
-// writeStagingMeta takes the local gate for test/seeding writes; it does not
-// establish destination ownership. Downloader rewrites use
-// writeStagingMetaOwnedLocked under the held domain and metadata gate.
-func writeStagingMeta(metaPath string, meta *IncompleteMeta) error {
-	lock := &stagingStateLock{path: stagingLockPath(metaPath)}
-	if err := lock.acquire(context.Background(), stagingLockWait); err != nil {
-		return fmt.Errorf("serialize staging record %s: %w", metaPath, err)
-	}
-	defer lock.release()
-	return writeStagingMetaFile(metaPath, meta)
 }
 
 // writeStagingMetaOwnedLocked requires the metadata gate and destination

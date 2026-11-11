@@ -87,10 +87,6 @@ type datasetDecisionUniqueEvaluation struct {
 	valid     bool
 }
 
-func compileDatasetDecisionContext(nodes []hfNode, membership datasetselection.Result, filters, excludes []string, exact, isDataset, ggufMode bool) datasetDecisionContext {
-	return compileDatasetDecisionContextWithContext(context.Background(), nodes, membership, filters, excludes, exact, isDataset, ggufMode)
-}
-
 func compileDatasetDecisionContextWithContext(ctx context.Context, nodes []hfNode, membership datasetselection.Result, filters, excludes []string, exact, isDataset, ggufMode bool) datasetDecisionContext {
 	if ctx == nil {
 		ctx = context.Background()

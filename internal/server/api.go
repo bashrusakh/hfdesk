@@ -238,7 +238,7 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// PlanRepo returns the same plan ScanPlan streams as plan_item events,
+	// PlanRepo returns the plan with its repository-relative item paths,
 	// plus the plan's bounded notices, which the response carries in its
 	// own field.
 	plan, err := hfdownloader.PlanRepo(ctx, dlJob, settings)

@@ -11,26 +11,6 @@ import (
 	"strings"
 )
 
-// BlobEntryKind classifies a cache blobs/ entry name.
-type BlobEntryKind int
-
-const (
-	// BlobEntryStaging denotes a reserved staging-name shape, excluded from
-	// published-content surfaces regardless of the entry's actual provenance.
-	BlobEntryStaging BlobEntryKind = iota
-	// BlobEntryCanonical denotes a canonical 64-hex SHA-256 blob name.
-	BlobEntryCanonical
-	// BlobEntryUnusual denotes a noncanonical, nonreserved name accepted as
-	// published content by the storage API and cache surfaces.
-	BlobEntryUnusual
-)
-
-// IsCanonicalBlobName accepts exactly 64 hexadecimal SHA-256 characters,
-// in upper or lower case.
-func IsCanonicalBlobName(name string) bool {
-	return canonicalSHA256(name)
-}
-
 // IsStagingArtifactName checks reserved staging-name shapes. Callers must
 // apply the exclusion only inside blobs/, not to same-shaped content elsewhere.
 func IsStagingArtifactName(name string) bool {
@@ -76,22 +56,4 @@ func IsStagingArtifactName(name string) bool {
 		return true
 	}
 	return false
-}
-
-// ClassifyBlobEntryName classifies blobs/ names, with reserved staging shapes
-// taking precedence over published-name classes.
-func ClassifyBlobEntryName(name string) BlobEntryKind {
-	if IsStagingArtifactName(name) {
-		return BlobEntryStaging
-	}
-	if IsCanonicalBlobName(name) {
-		return BlobEntryCanonical
-	}
-	return BlobEntryUnusual
-}
-
-// IsPublishedBlobName reports whether name is nonreserved: canonical digests
-// and unusual names are content; staging-shaped names are excluded.
-func IsPublishedBlobName(name string) bool {
-	return ClassifyBlobEntryName(name) != BlobEntryStaging
 }

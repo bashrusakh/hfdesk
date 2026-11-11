@@ -39,12 +39,6 @@ func TestStagingArtifactNameCoversEveryProducerShape(t *testing.T) {
 		if !IsStagingArtifactName(name) {
 			t.Errorf("producer shape %q was not classified as a staging artifact", name)
 		}
-		if got := ClassifyBlobEntryName(name); got != BlobEntryStaging {
-			t.Errorf("producer shape %q classified as %v, want staging", name, got)
-		}
-		if IsPublishedBlobName(name) {
-			t.Errorf("producer shape %q was reported as published content", name)
-		}
 	}
 
 	published := []string{
@@ -61,20 +55,11 @@ func TestStagingArtifactNameCoversEveryProducerShape(t *testing.T) {
 		if IsStagingArtifactName(name) {
 			t.Errorf("published name %q was classified as a staging artifact", name)
 		}
-		if !IsPublishedBlobName(name) {
-			t.Errorf("published name %q was not reported as content", name)
-		}
 	}
 
-	// A canonical digest is the normal published name; anything else that is
-	// not a staging artifact is an unusual published name.
-	if got := ClassifyBlobEntryName(sha); got != BlobEntryCanonical {
-		t.Errorf("canonical digest classified as %v, want canonical", got)
-	}
-	if got := ClassifyBlobEntryName("opaque-key"); got != BlobEntryUnusual {
-		t.Errorf("unusual published name classified as %v, want unusual", got)
-	}
-	if !IsCanonicalBlobName(sha) || IsCanonicalBlobName("opaque-key") {
+	// A canonical digest is the normal published name; the canonical form
+	// (exactly 64 hexadecimal characters) is recognized by canonicalSHA256.
+	if !canonicalSHA256(sha) || canonicalSHA256("opaque-key") {
 		t.Error("the canonical blob name check does not recognize the canonical digest form")
 	}
 

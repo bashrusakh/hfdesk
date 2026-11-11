@@ -64,8 +64,8 @@ func TestIsGGUFFilterDownload(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isGGUFFilterDownload(tc.files, tc.filters, tc.exact); got != tc.want {
-				t.Errorf("isGGUFFilterDownload(%v, %v) = %v, want %v", tc.files, tc.filters, got, tc.want)
+			if got := isGGUFFilterDownloadWithExcludes(tc.files, tc.filters, nil, tc.exact); got != tc.want {
+				t.Errorf("isGGUFFilterDownloadWithExcludes(%v, %v, nil) = %v, want %v", tc.files, tc.filters, got, tc.want)
 			}
 		})
 	}

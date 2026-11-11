@@ -930,7 +930,7 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 	// Shard ranges narrow the already-matched set, after notices (which
 	// describe the split-precedence rule, not this selector) and before the
 	// custom-endpoint probe walk, so only files that will actually download
-	// are probed. PlanRepo, ScanPlan and Download all reach this point
+	// are probed. PlanRepo and Download all reach this point
 	// through scanRepo, which keeps plan/dry-run/download parity in one
 	// owner. Split-mention notices above deliberately run on the unnarrowed
 	// set so a ranged-out shard is never misreported as split-rule-excluded;
@@ -1888,7 +1888,8 @@ func isFilterDelimiter(r rune) bool {
 	return r == '-' || r == '.' || r == ' '
 }
 
-// isGGUFFilterDownload reports whether the given filters select only GGUF files
+// isGGUFFilterDownloadWithExcludes reports whether the given filters (minus
+// the excludes) select only GGUF files
 // (`.gguf` or legacy `.gguf-split` shards) in the supplied set of file paths
 // (all expected lowercased). When true the
 // download is treated as GGUF-only: because a GGUF file is self-contained, the
@@ -1897,10 +1898,6 @@ func isFilterDelimiter(r rune) bool {
 // fp16/ transformers metadata. A filter can match both GGUF and non-GGUF files
 // (for example, a selected directory), so mixed selections retain the normal
 // companion scope instead.
-func isGGUFFilterDownload(baseNames, filters []string, exact bool) bool {
-	return isGGUFFilterDownloadWithExcludes(baseNames, filters, nil, exact)
-}
-
 func isGGUFFilterDownloadWithExcludes(baseNames, filters, excludes []string, exact bool) bool {
 	if len(filters) == 0 {
 		return false
@@ -2085,46 +2082,6 @@ func refuseReservedLocalOwner(repo string) error {
 	if IsBranchVariantReservedName(owner) {
 		return fmt.Errorf("repository owner %q is reserved for the app's branch-variant storage", owner)
 	}
-	return nil
-}
-
-// ScanPlan scans a repository and emits plan_item events via the progress
-// callback, preceded by warning events for the plan's notices (the same
-// warning channel Download uses). This is useful for dry-run/preview
-// functionality.
-func ScanPlan(ctx context.Context, job Job, cfg Settings, progress ProgressFunc) error {
-	plan, err := PlanRepo(ctx, job, cfg)
-	if err != nil {
-		return err
-	}
-
-	if progress != nil {
-		if !plan.CommitPinned {
-			progress(ProgressEvent{Time: time.Now().UTC(), Level: "warn", Event: "warning", Repo: job.Repo, Revision: job.Revision,
-				Message: "revision is not pinned to an immutable commit; the plan is revision-addressed"})
-		}
-		// Plan notices are informational diagnostics (bounded at their
-		// source, currently the split-mention exclusions of the
-		// split-precedence rule). They ride the warning channel exactly as
-		// Download emits them, before the plan_item list: they describe
-		// files that are not in the plan, so they read naturally first.
-		for _, notice := range plan.Notices {
-			progress(ProgressEvent{Time: time.Now().UTC(), Level: "warn", Event: "warning", Repo: job.Repo, Revision: job.Revision,
-				Message: notice})
-		}
-		for _, item := range plan.Items {
-			progress(ProgressEvent{
-				Time:     time.Now().UTC(),
-				Event:    "plan_item",
-				Repo:     job.Repo,
-				Revision: job.Revision,
-				Path:     item.RelativePath,
-				Total:    item.Size,
-				IsLFS:    item.LFS,
-			})
-		}
-	}
-
 	return nil
 }
 

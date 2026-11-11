@@ -83,7 +83,7 @@ func TestPlanUnknownDatasetGGUFSelectedDeleteOrdering(t *testing.T) {
 					writer := &Job{OutputDir: storage, Repo: "owner/data", LocalRepo: "owner/data", IsDataset: true}
 					target := filepath.Join(jobDestinationBase(writer), tc.reservation)
 					if tc.name == "unrelated target control" {
-						other, err := hfdownloader.NewHFCache(storage).Repo("owner/other", hfdownloader.RepoTypeDataset)
+						other, err := newTestHFCache(storage).Repo("owner/other", hfdownloader.RepoTypeDataset)
 						if err != nil {
 							t.Fatal(err)
 						}

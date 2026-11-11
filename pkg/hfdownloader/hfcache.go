@@ -50,15 +50,6 @@ func DefaultCacheDir() string {
 	return filepath.Join(home, ".cache", "huggingface")
 }
 
-// NewHFCache creates a new HFCache with the given root directory.
-// If root is empty, it uses DefaultCacheDir().
-func NewHFCache(root string) *HFCache {
-	if root == "" {
-		root = DefaultCacheDir()
-	}
-	return NewHFCacheResolved(root, os.Getenv("HF_HUB_CACHE"))
-}
-
 // NewHFCacheWithOwnershipDir is retained for source compatibility, but a
 // cache-owned HFCache cannot relocate its Hub anchor through OwnershipDir.
 // Ownership operations on the returned cache report the configuration error.
@@ -1013,25 +1004,6 @@ func (r *RepoDir) storeDownloadedFileInDomain(ctx context.Context, tempFile, rel
 	}
 
 	return result, nil
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	return out.Close()
 }
 
 // copyFileAtomicCtx copies to a sibling temp and renames only on success, so

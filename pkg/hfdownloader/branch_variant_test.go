@@ -1608,8 +1608,8 @@ func TestLocalBranchVariantPayloadAndCompletionRecordLocations(t *testing.T) {
 	}
 
 	// The reserved space lives outside the ordinary repository tree.
-	if PathInside(repoBase, space.Path()) {
-		t.Fatalf("reserved space %q is inside the repository tree %q", space.Path(), repoBase)
+	if PathInside(repoBase, space.space) {
+		t.Fatalf("reserved space %q is inside the repository tree %q", space.space, repoBase)
 	}
 
 	// The payload path owner rejects a revision that cannot become a safe

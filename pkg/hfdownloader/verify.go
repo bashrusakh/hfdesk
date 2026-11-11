@@ -29,12 +29,8 @@ func (c contextReader) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
-func computeSHA256(path string) (string, error) {
-	return computeSHA256Ctx(context.Background(), path)
-}
-
 // computeSHA256Ctx checks cancellation between reads and returns the context
-// error if hashing is interrupted. computeSHA256 uses a background context.
+// error if hashing is interrupted.
 // Counters record each opened-file hash attempt and its initial logical size,
 // not necessarily bytes actually read when an attempt fails or is cancelled.
 func computeSHA256Ctx(ctx context.Context, path string) (string, error) {
@@ -62,13 +58,9 @@ func computeSHA256Ctx(ctx context.Context, path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func verifySHA256(path string, expected string) error {
-	return verifySHA256Ctx(context.Background(), path, expected)
-}
-
-// verifySHA256Ctx is verifySHA256 bounded by ctx (see computeSHA256Ctx). It is
-// used by the downloader so a cancelled job does not wait for a multi-GB
-// re-hash before surfacing a sibling's permanent error.
+// verifySHA256Ctx computes and compares the digest bounded by ctx (see
+// computeSHA256Ctx). It is used by the downloader so a cancelled job does not
+// wait for a multi-GB re-hash before surfacing a sibling's permanent error.
 func verifySHA256Ctx(ctx context.Context, path string, expected string) error {
 	sum, err := computeSHA256Ctx(ctx, path)
 	if err != nil {
@@ -78,10 +70,6 @@ func verifySHA256Ctx(ctx context.Context, path string, expected string) error {
 		return fmt.Errorf("sha256 mismatch: expected %s got %s", expected, sum)
 	}
 	return nil
-}
-
-func shouldSkipLocal(it PlanItem, dst string) (bool, string, error) {
-	return shouldSkipLocalCtx(context.Background(), it, dst)
 }
 
 // shouldSkipLocalCtx makes the pre-download decision context-aware, so a long

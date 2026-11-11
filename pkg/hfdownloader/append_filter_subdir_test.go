@@ -222,7 +222,7 @@ func TestDownload_GGUFSelectionKeepsExplicitNonGGUFAtRepoPath(t *testing.T) {
 	}
 }
 
-func TestScanPlanKeepsRepositoryRelativePathsWithAppendFilterSubdir(t *testing.T) {
+func TestPlanRepoKeepsRepositoryRelativePathsWithAppendFilterSubdir(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/revision/main"):
@@ -236,20 +236,19 @@ func TestScanPlanKeepsRepositoryRelativePathsWithAppendFilterSubdir(t *testing.T
 	defer server.Close()
 
 	for _, appendSubdir := range []bool{false, true} {
-		var paths []string
-		err := ScanPlan(context.Background(), Job{
+		plan, err := PlanRepo(context.Background(), Job{
 			Repo: "owner/model", Revision: "main", Filters: []string{"Q4_K_M"}, ExactMatch: true,
 			AppendFilterSubdir: appendSubdir,
-		}, Settings{Endpoint: server.URL}, func(event ProgressEvent) {
-			if event.Event == "plan_item" {
-				paths = append(paths, event.Path)
-			}
-		})
+		}, Settings{Endpoint: server.URL})
 		if err != nil {
-			t.Fatalf("ScanPlan append=%t: %v", appendSubdir, err)
+			t.Fatalf("PlanRepo append=%t: %v", appendSubdir, err)
+		}
+		var paths []string
+		for _, item := range plan.Items {
+			paths = append(paths, item.RelativePath)
 		}
 		if len(paths) != 1 || paths[0] != "model-Q4_K_M.gguf" {
-			t.Errorf("ScanPlan append=%t paths=%v; want repository-relative preview path", appendSubdir, paths)
+			t.Errorf("PlanRepo append=%t paths=%v; want repository-relative plan path", appendSubdir, paths)
 		}
 	}
 }

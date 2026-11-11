@@ -122,10 +122,6 @@ const (
 	proxyURLAmbiguous
 )
 
-// redactedProxyAuthority replaces the authority of a proxy URL that cannot
-// be shown. It is a display marker, not a host.
-const redactedProxyAuthority = "<redacted>"
-
 // proxyParseFailureReason explains why a proxy URL failed to parse without
 // quoting the URL or any part of it that could be a credential.
 //
@@ -262,30 +258,6 @@ func isURLScheme(text string) bool {
 func isHostWithPort(authority string) bool {
 	_, err := url.Parse("http://" + authority)
 	return err == nil
-}
-
-// sanitizeProxyURL removes the credentials from a proxy URL so that it can be
-// shown or reported.
-//
-// The userinfo of the URL is its credential and is dropped. An authority
-// that is not a host is dropped as a whole, because it may be a credential
-// that was not terminated by an "@": its host can be the user and its port
-// can be the password of that credential.
-//
-// A URL whose authority cannot be located is replaced by a fixed
-// description: no part of it may be shown.
-func sanitizeProxyURL(raw string) string {
-	prefix, host, rest, shape := splitProxyURL(raw)
-	switch shape {
-	case proxyURLUnlocatable:
-		return "invalid proxy URL"
-	case proxyURLAmbiguous:
-		// The authority may be a credential, so it is replaced by a
-		// marker instead of being shown.
-		return prefix + redactedProxyAuthority + rest
-	default:
-		return prefix + host + rest
-	}
 }
 
 // ProxyErrorReason renders the reason of a proxy configuration failure
@@ -674,26 +646,4 @@ func GetProxyInfo() *ProxyInfo {
 	}
 
 	return info
-}
-
-// GetProxyInfoString returns a human-readable description of the proxy configuration.
-//
-// The description never carries the proxy credentials: the userinfo of the
-// URL is dropped, and the separate credentials of the configuration are not
-// shown either. The description is shown to the user and reaches the API
-// responses, so the user of the proxy is as sensitive as its password.
-func GetProxyInfoString(proxyCfg *ProxyConfig) string {
-	if proxyCfg == nil || proxyCfg.URL == "" {
-		// Check environment
-		for _, name := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"} {
-			if value := os.Getenv(name); value != "" {
-				// The environment value can carry the credentials of
-				// the proxy just like the configured URL does.
-				return fmt.Sprintf("Environment: %s", sanitizeProxyURL(value))
-			}
-		}
-		return "None (direct connection)"
-	}
-
-	return sanitizeProxyURL(proxyCfg.URL)
 }

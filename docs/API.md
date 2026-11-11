@@ -852,8 +852,8 @@ independently of `appendFilterSubdir`, and the downloader applies it only when
 that job flag is enabled, so Go consumers must check the flag before combining
 it with `RelativePath`. `Subdir` is the matched-filter attribution where
 applicable; it can be empty for ordinary non-LFS model files whose destination
-remains repository-relative. `ScanPlan` preview events and the `/api/plan`
-response remain repository-relative.
+remains repository-relative. The `/api/plan` response remains
+repository-relative.
 
 `AppendFilterSubdir` is limited to single-component group/token filters because
 the filter becomes a destination directory name. `PlanRepo` and `Download`

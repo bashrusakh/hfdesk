@@ -159,7 +159,7 @@ func TestDatasetRawFixtureLiteralMembershipOracle(t *testing.T) {
 			for i := range tt.files {
 				membershipFiles[i] = datasetselection.File{Path: tt.files[i].Path}
 			}
-			c := compileDatasetDecisionContext(tt.files, datasetselection.Recognize(membershipFiles), []string{tt.filter}, tt.excludes, tt.exact, true, false)
+			c := compileDatasetDecisionContextWithContext(context.Background(), tt.files, datasetselection.Recognize(membershipFiles), []string{tt.filter}, tt.excludes, tt.exact, true, false)
 			for i, want := range tt.roles {
 				got := c.Inputs[i].Alternatives
 				if len(got) != len(want) {
@@ -271,7 +271,7 @@ func TestDatasetVocabTxtIsKnownCompanion(t *testing.T) {
 	}
 	membershipFiles := []datasetselection.File{{Path: files[0].Path}, {Path: files[1].Path}}
 	membership := datasetselection.Recognize(membershipFiles)
-	c := compileDatasetDecisionContext(files, membership, []string{"train.csv"}, nil, true, true, false)
+	c := compileDatasetDecisionContextWithContext(context.Background(), files, membership, []string{"train.csv"}, nil, true, true, false)
 
 	// vocab.txt is a known tokenizer companion in a conventional directory, so
 	// the role override removes its data(default) alternative and retains it.

@@ -33,8 +33,6 @@ func pathDerivedPayload(size int) []byte {
 type pathDerivedHubState struct {
 	firstGet chan struct{}
 	release  chan struct{}
-	mu       sync.Mutex
-	gets     int
 
 	firstGetOnce sync.Once
 	releaseOnce  sync.Once
@@ -60,9 +58,6 @@ func newPathDerivedHub(t *testing.T, rel string, full []byte, hold bool) (*httpt
 			_, _ = w.Write([]byte("[" + node + "]"))
 		case strings.Contains(r.URL.Path, "/resolve/") || strings.Contains(r.URL.Path, "/raw/"):
 			if r.Method == http.MethodGet {
-				state.mu.Lock()
-				state.gets++
-				state.mu.Unlock()
 				state.firstGetOnce.Do(func() { close(state.firstGet) })
 				if hold {
 					half := len(full) / 2
