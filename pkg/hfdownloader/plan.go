@@ -1551,46 +1551,6 @@ func datasetDirectPathMatch(nodes []hfNode, job Job, recognizedLabels []string) 
 	return false
 }
 
-func containsPath(dirs map[string]struct{}, dir string) bool {
-	for current := dir; current != "." && current != "/"; current = path.Dir(current) {
-		if _, ok := dirs[current]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-// matchedFilterDirectories returns the directories that contain a matched file
-// or an ancestor of one. They define the companion scope for active non-GGUF
-// filters: root files remain shared companions, while unrelated component
-// metadata does not leak into the plan. GGUF mode intentionally has no
-// companion scope because it is matched-only.
-func matchedFilterDirectories(fileNodes []hfNode, job Job, ggufMode bool) map[string]struct{} {
-	dirs := make(map[string]struct{})
-	if len(job.Filters) == 0 || ggufMode {
-		return dirs
-	}
-	for _, n := range fileNodes {
-		if isExcludedPath(n.Path, job.Excludes) {
-			continue
-		}
-		matched := false
-		for _, filter := range job.Filters {
-			if filterMatchesPath(n.Path, filter, job.ExactMatch) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			continue
-		}
-		for dir := path.Dir(strings.ReplaceAll(n.Path, "\\", "/")); dir != "." && dir != "/"; dir = path.Dir(dir) {
-			dirs[dir] = struct{}{}
-		}
-	}
-	return dirs
-}
-
 func isExcludedPath(rel string, excludes []string) bool {
 	nameLower := strings.ToLower(filepath.Base(rel))
 	relLower := strings.ToLower(rel)
