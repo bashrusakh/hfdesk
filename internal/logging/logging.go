@@ -488,17 +488,6 @@ func (l *ComponentLogger) Component() string {
 	return l.component
 }
 
-// With returns a logger that adds the given attributes to every record.
-func (l *ComponentLogger) With(args ...any) *ComponentLogger {
-	if len(args) == 0 {
-		return l
-	}
-	combined := make([]any, 0, len(l.args)+len(args))
-	combined = append(combined, l.args...)
-	combined = append(combined, args...)
-	return &ComponentLogger{component: l.component, args: combined}
-}
-
 // Log emits a record at the given level.
 func (l *ComponentLogger) Log(ctx context.Context, level slog.Level, msg string, args ...any) {
 	l.logger().Log(ctx, level, msg, args...)

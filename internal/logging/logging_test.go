@@ -209,7 +209,9 @@ func TestPackageLevelComponentLoggerReachesInstalledPipeline(t *testing.T) {
 func TestComponentLoggerLevelsAndAttributes(t *testing.T) {
 	p, _ := installForTest(t, Options{})
 
-	logger := NewComponentLogger("jobs").With("queue", "default")
+	// The child logger is built directly: bound attributes live on the
+	// ComponentLogger value and reach every record through logger().
+	logger := &ComponentLogger{component: "jobs", args: []any{"queue", "default"}}
 	logger.Debug("debug")
 	logger.Info("info")
 	logger.Warn("warn")

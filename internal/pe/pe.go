@@ -153,24 +153,9 @@ func SubsystemOf(r io.ReaderAt) (int, error) {
 	return int(binary.LittleEndian.Uint16(field)), nil
 }
 
-// Machine returns the machine type of the PE image at path: the architecture
-// the image was built for, e.g. MachineAMD64.
-//
-// It returns an error when the file cannot be read or when it is not a PE
-// image.
-func Machine(path string) (uint16, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return 0, fmt.Errorf("open %s: %w", path, err)
-	}
-	defer file.Close()
-
-	return MachineOf(file)
-}
-
 // ExecutableMachine returns the machine type of a structurally usable Windows
-// executable at path. Unlike Machine, it checks the mandatory executable
-// headers and section table before returning the COFF field.
+// executable at path. It checks the mandatory executable headers and section
+// table before returning the machine field of the COFF header.
 //
 // This is a bounded structural check, not a recreation of the Windows loader:
 // it rejects missing or truncated mandatory headers and section data, but does
@@ -186,8 +171,7 @@ func ExecutableMachine(path string) (uint16, error) {
 }
 
 // ExecutableMachineOf reads the machine type after checking the required
-// Windows executable structure. MachineOf remains the field-extraction API for
-// callers that need only the COFF value.
+// Windows executable structure.
 func ExecutableMachineOf(r io.ReaderAt) (uint16, error) {
 	peOffset, header, err := readPEHeader(r)
 	if err != nil {
@@ -266,23 +250,6 @@ func ExecutableMachineOf(r io.ReaderAt) (uint16, error) {
 		}
 	}
 
-	return binary.LittleEndian.Uint16(header[machineOffset : machineOffset+machineSize]), nil
-}
-
-// MachineOf reads the machine type out of the headers of a PE image.
-//
-// It returns an error when the image is truncated or when it is not a PE
-// image at all: a file that carries no MZ signature or no PE signature is not
-// a PE image this package can judge.
-//
-// The machine type is a field of the COFF header and not of the optional
-// header, so an image whose optional header this package cannot judge still
-// names the architecture it was built for.
-func MachineOf(r io.ReaderAt) (uint16, error) {
-	_, header, err := readPEHeader(r)
-	if err != nil {
-		return 0, err
-	}
 	return binary.LittleEndian.Uint16(header[machineOffset : machineOffset+machineSize]), nil
 }
 
