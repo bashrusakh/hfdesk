@@ -79,9 +79,10 @@ func analyzeDiffusers(files []FileInfo, metadata map[string]interface{}) *Diffus
 				}
 			}
 
-			// Calculate component size from files. A component with weights
-			// reports exactly its best weight set (files, size); a weightless
-			// folder keeps the whole-folder size it has always had.
+			// Calculate component size from files. A component whose folder
+			// holds an eligible weight set reports exactly that set (files,
+			// size); a folder with no eligible set keeps the whole-folder
+			// size it has always had.
 			comp.Size = calculateComponentSize(files, key)
 			comp.SizeHuman = humanSize(comp.Size)
 			if set, ok := bestWeightSet(files, key); ok {
@@ -138,16 +139,55 @@ type componentWeightSet struct {
 	marker string
 }
 
+// weightGroup gathers one candidate set: a plain file's own path, or every
+// member of one shard family in one directory and extension.
+type weightGroup struct {
+	files    []FileInfo
+	size     int64
+	class    int
+	marker   string
+	declared int
+	// indices holds each shard member's present index NNNNN; nil for a
+	// plain-file group.
+	indices []int
+	// declaredMismatch records members spelling different MMMMM totals.
+	declaredMismatch bool
+}
+
+// eligible reports whether the group is a complete, well-indexed family: a
+// plain file is a trivially complete one-member set; a shard family needs one
+// declared total M, M members, and present indices forming exactly the
+// distinct set 1..M — no gaps, no duplicates, no out-of-range members.
+// Ineligible groups never join selection, so a component whose groups all
+// fail falls through to its legacy weightless row.
+func (g *weightGroup) eligible() bool {
+	if g.indices == nil {
+		return true
+	}
+	if g.declaredMismatch || g.declared < 1 || len(g.files) != g.declared {
+		return false
+	}
+	seen := make(map[int]bool, len(g.indices))
+	for _, i := range g.indices {
+		if i < 1 || i > g.declared || seen[i] {
+			return false
+		}
+		seen[i] = true
+	}
+	return len(seen) == g.declared
+}
+
 // splitShardSuffix parses a "<prefix>-NNNNN-of-MMMMM" file stem. ok reports
-// shard-shaped spelling; declared is the family total MMMMM.
-func splitShardSuffix(stem string) (prefix string, declared int, ok bool) {
+// shard-shaped spelling; index is the present member NNNNN and declared is
+// the family total MMMMM.
+func splitShardSuffix(stem string) (prefix string, index, declared int, ok bool) {
 	idx := strings.LastIndex(stem, "-of-")
 	if idx <= 0 || idx+4 >= len(stem) {
-		return stem, 0, false
+		return stem, 0, 0, false
 	}
 	digits := stem[idx+4:]
 	if strings.TrimFunc(digits, func(r rune) bool { return r >= '0' && r <= '9' }) != "" {
-		return stem, 0, false
+		return stem, 0, 0, false
 	}
 	left := stem[:idx]
 	nd := 0
@@ -158,13 +198,17 @@ func splitShardSuffix(stem string) (prefix string, declared int, ok bool) {
 		nd++
 	}
 	if nd == 0 || nd >= len(left) || left[len(left)-1-nd] != '-' {
-		return stem, 0, false
+		return stem, 0, 0, false
 	}
 	n, err := strconv.Atoi(digits)
 	if err != nil {
-		return stem, 0, false
+		return stem, 0, 0, false
 	}
-	return left[:len(left)-1-nd], n, true
+	m, err := strconv.Atoi(left[len(left)-nd:])
+	if err != nil {
+		return stem, 0, 0, false
+	}
+	return left[:len(left)-1-nd], m, n, true
 }
 
 // precisionMarker returns the precision marker recognized in a weight
@@ -203,7 +247,7 @@ func pathPrecisionMarker(rel string) string {
 func weightFileMarker(path string) string {
 	name := path[strings.LastIndex(path, "/")+1:]
 	stem := strings.TrimSuffix(name, filepath.Ext(name))
-	if prefix, _, ok := splitShardSuffix(stem); ok {
+	if prefix, _, _, ok := splitShardSuffix(stem); ok {
 		stem = prefix
 	}
 	if marker := precisionMarker(stem); marker != "" {
@@ -212,14 +256,20 @@ func weightFileMarker(path string) string {
 	return pathPrecisionMarker(path)
 }
 
-// bestWeightSet picks the best weight set inside component/: fp16 safetensors
-// > default safetensors > .bin. Conversions never join — by extension
+// bestWeightSet picks the best weight set inside component/: fp16
+// safetensors > default safetensors > .bin, absolute among eligible sets.
+// Only a complete, well-indexed family is eligible: a plain file is a
+// trivially complete one-member set, and a shard family needs its present
+// indices to be exactly the distinct set 1..M with the declared M equal to
+// the member count. Conversions never join — by extension
 // (.onnx/.msgpack/.tflite/.xml), because a .bin beside a same-basename .xml is
 // an OpenVINO member, or because it lives under an onnx/openvino/flax/tflite
-// subfolder. Within the winning class a complete set beats an incomplete
-// shard family, plain naming beats a precision-marked twin, and the
-// lexicographically smallest sorted member list wins; a shard family joins
-// whole or not at all. ok is false for a component without weights.
+// subfolder. Within the winning class plain naming beats a precision-marked
+// twin and the lexicographically smallest sorted member list wins; a shard
+// family joins whole or not at all. ok is false for a component without
+// weights and for one whose every group fails eligibility — split-spelling
+// families, declared-total mismatches, index holes and conversions-only
+// folders all fall through to the legacy weightless folder row.
 func bestWeightSet(files []FileInfo, component string) (componentWeightSet, bool) {
 	prefix := component + "/"
 	openvinoStems := make(map[string]bool)
@@ -229,13 +279,6 @@ func bestWeightSet(files []FileInfo, component string) (componentWeightSet, bool
 		}
 	}
 
-	type weightGroup struct {
-		files    []FileInfo
-		size     int64
-		class    int
-		marker   string
-		declared int
-	}
 	var groups = make(map[string]*weightGroup)
 
 	for _, f := range files {
@@ -243,6 +286,14 @@ func bestWeightSet(files []FileInfo, component string) (componentWeightSet, bool
 			continue
 		}
 		ext := strings.ToLower(filepath.Ext(f.Name))
+		if ext != ".safetensors" && ext != ".bin" {
+			continue
+		}
+		// A conversion folder's payload never joins, whatever weight
+		// format it was converted into.
+		if inConversionDir(strings.TrimPrefix(f.Path[:strings.LastIndex(f.Path, "/")+1], prefix)) {
+			continue
+		}
 		var class int
 		switch ext {
 		case ".safetensors":
@@ -255,16 +306,11 @@ func bestWeightSet(files []FileInfo, component string) (componentWeightSet, bool
 			if openvinoStems[strings.TrimSuffix(f.Path, filepath.Ext(f.Name))] {
 				continue
 			}
-			if inConversionDir(strings.TrimPrefix(f.Path[:strings.LastIndex(f.Path, "/")], prefix)) {
-				continue
-			}
 			class = 2
-		default:
-			continue
 		}
 
 		stem := strings.TrimSuffix(f.Name, filepath.Ext(f.Name))
-		family, declared, isShard := splitShardSuffix(stem)
+		family, idx, declared, isShard := splitShardSuffix(stem)
 		key := f.Path
 		if isShard {
 			key = f.Path[:strings.LastIndex(f.Path, "/")] + "\x00" + ext + "\x00" + family
@@ -273,22 +319,26 @@ func bestWeightSet(files []FileInfo, component string) (componentWeightSet, bool
 		if g == nil {
 			g = &weightGroup{class: class, marker: weightFileMarker(f.Path), declared: declared}
 			groups[key] = g
+		} else if isShard && declared != g.declared {
+			g.declaredMismatch = true
 		}
 		g.files = append(g.files, f)
 		g.size += f.Size
+		if isShard {
+			g.indices = append(g.indices, idx)
+		}
 	}
 
 	var best *weightGroup
-	var bestRank [3]int
+	var bestRank [2]int
 	var bestKey string
 	for _, g := range groups {
-		complete := g.declared == 0 || len(g.files) == g.declared
-		rank := [3]int{g.class, 0, 0}
-		if !complete {
-			rank[1] = 1
+		if !g.eligible() {
+			continue
 		}
+		rank := [2]int{g.class, 0}
 		if g.marker != "" && g.class != 0 {
-			rank[2] = 1
+			rank[1] = 1
 		}
 		sort.Slice(g.files, func(i, j int) bool { return g.files[i].Path < g.files[j].Path })
 		memberPaths := make([]string, 0, len(g.files))
@@ -314,9 +364,9 @@ func bestWeightSet(files []FileInfo, component string) (componentWeightSet, bool
 	return componentWeightSet{files: best.files, size: size, marker: marker}, true
 }
 
-// rankLess orders candidate sets by (class, completeness, plain naming,
-// member list).
-func rankLess(aRank [3]int, aKey string, bRank [3]int, bKey string) bool {
+// rankLess orders eligible candidate sets by (class, plain naming, member
+// list); completeness is already an eligibility gate, never a tie-break.
+func rankLess(aRank [2]int, aKey string, bRank [2]int, bKey string) bool {
 	for i := range aRank {
 		if aRank[i] != bRank[i] {
 			return aRank[i] < bRank[i]
@@ -326,7 +376,7 @@ func rankLess(aRank [3]int, aKey string, bRank [3]int, bKey string) bool {
 }
 
 // inConversionDir reports whether a component-relative directory is a known
-// conversion folder, so its .bin payloads never read as pytorch weights.
+// conversion folder, so its weight payloads never join a set in any format.
 func inConversionDir(relDir string) bool {
 	for _, seg := range strings.Split(relDir, "/") {
 		switch strings.ToLower(seg) {

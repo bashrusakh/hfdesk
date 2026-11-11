@@ -523,23 +523,36 @@ not a unique artifact identity when multiple artifacts share a quant label.
 The analyzer's `recommended_download` already contains encoded exact selectors.
 
 For Diffusers `selectable_items`, a `component` row whose folder holds weights
-carries `files` = exactly that component's best weight set: fp16 safetensors
-beat default safetensors, which beat pytorch `.bin` files; within the winning
-class a complete shard family beats an incomplete one, plain naming beats a
-precision-marked twin, and the lexicographically smallest member set wins.
-Every shard of the chosen `<prefix>-NNNNN-of-MMMMM.safetensors` family joins —
-half a family is never selected — conversions never join (ONNX `.onnx`,
-OpenVINO IR: each `.xml` with its same-basename `.bin`, Flax `.msgpack`,
-`.tflite`, and `.bin` files under `onnx/`/`openvino/`/`flax/`/`tflite/`
-subfolders), and `size`/`size_human` sum exactly those files. The row label
-names the chosen set's variant (`Unet (fp16)`), and the row downloads exactly
-`files` when sent with `exactMatch: true`; `filter_value` stays the component
-name for status keys and legacy consumers. The losing sets stay available as
-thin alternatives through the Files tab and manual filters, the `variant`
-category rows (fp16/fp32/bf16 detection) are unchanged, and a component
-without weights (tokenizer/scheduler/config-only folders) carries no `files`
-and keeps its legacy folder-filter request. The same chosen set is exposed as
-`diffusers.components[].files` in the analysis response.
+carries `files` = exactly that component's best weight set, chosen only among
+eligible sets. A non-sharded file is a trivially complete one-member set; a
+`<prefix>-NNNNN-of-MMMMM` shard family is eligible only when its present
+indices are exactly the distinct set `1..M` — no gaps, no duplicates, no
+out-of-range member such as `-00003-of-00002` — with the declared `M` equal to
+the member count. Among eligible sets the class order is absolute: fp16
+safetensors beat default safetensors, which beat pytorch `.bin` files; within
+the winning class plain naming beats a precision-marked twin, and the
+lexicographically smallest member set wins. Every shard of the chosen
+`<prefix>-NNNNN-of-MMMMM.safetensors` family joins — half a family is never
+selected — conversions never join (ONNX `.onnx`, OpenVINO IR: each `.xml` with
+its same-basename `.bin`, Flax `.msgpack`, `.tflite`, and any weight file
+under `onnx/`/`openvino/`/`flax/`/`tflite/` subfolders), and `size`/`size_human`
+sum exactly those files. A component with no eligible set — a family split
+across spellings (`m.fp16-00001-of-00002` beside `m-00002-of-00002`),
+declared-total mismatches in either direction, index holes, or a
+conversions-only folder — falls through to the legacy weightless folder
+behavior unchanged: no `files`, the whole-folder size, and its folder-filter
+request. The row label names the chosen set's variant (`Unet (fp16)`), and the
+row downloads exactly `files` when sent with `exactMatch: true`; `filter_value`
+stays the component name as the row's identity for legacy consumers, while
+status keys follow the same exact-files gate as the request: a weighted row's
+status key is `artifact:[…]` (the JSON array of its `files`, such as
+`artifact:["unet/diffusion_pytorch_model.safetensors"]`), and only a
+weightless row keeps the component-name token key. The losing sets stay
+available as thin alternatives through the Files tab and manual filters, the
+`variant` category rows (fp16/fp32/bf16 detection) are unchanged, and a
+component without weights (tokenizer/scheduler/config-only folders) carries no
+`files` and keeps its legacy folder-filter request. The same chosen set is
+exposed as `diffusers.components[].files` in the analysis response.
 
 For datasets, `/api/analyze/...?...dataset=true` exposes only groups whose
 membership can be inferred from conventional split paths/names or

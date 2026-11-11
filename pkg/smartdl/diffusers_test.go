@@ -501,8 +501,9 @@ func TestBestWeightSetPrecedence(t *testing.T) {
 
 // TestBestWeightSetShardFamily pins the shard rule: one
 // <prefix>-NNNNN-of-MMMMM family joins whole (all three shards, never two of
-// three), class precedence is absolute, and completeness only breaks ties
-// inside the winning class.
+// three) and only when it is a complete, well-indexed family; class
+// precedence is absolute among eligible sets, and a component with no
+// eligible set falls through to its legacy weightless row.
 func TestBestWeightSetShardFamily(t *testing.T) {
 	t.Run("a complete fp16 family joins whole and outranks the default set", func(t *testing.T) {
 		set, ok := bestWeightSet([]FileInfo{
@@ -528,27 +529,25 @@ func TestBestWeightSetShardFamily(t *testing.T) {
 		}
 	})
 
-	t.Run("class precedence is absolute over completeness", func(t *testing.T) {
-		// The repo itself lacks the third fp16 shard; the fp16 class still
-		// wins and takes every present member of the family.
+	t.Run("an incomplete fp16 family yields to the complete default set", func(t *testing.T) {
+		// The fp16 family lacks its third shard, so it is not a complete,
+		// well-indexed family and never joins selection: class precedence
+		// rules only among eligible sets, and the complete default set wins.
 		set, ok := bestWeightSet([]FileInfo{
 			wfile("unet/model.fp16-00001-of-00003.safetensors", 100),
 			wfile("unet/model.fp16-00002-of-00003.safetensors", 110),
 			wfile("unet/other.safetensors", 500),
 		}, "unet")
 		if !ok {
-			t.Fatal("ok = false, want the fp16 family chosen")
+			t.Fatal("ok = false, want the complete default set chosen")
 		}
-		want := []string{
-			"unet/model.fp16-00001-of-00003.safetensors",
-			"unet/model.fp16-00002-of-00003.safetensors",
-		}
+		want := []string{"unet/other.safetensors"}
 		if got := setPaths(set); !reflect.DeepEqual(got, want) {
-			t.Fatalf("chosen set = %v, want the fp16 family's present members %v", got, want)
+			t.Fatalf("chosen set = %v, want the complete default set %v: the half fp16 family must never be selectable", got, want)
 		}
 	})
 
-	t.Run("completeness breaks ties inside one class", func(t *testing.T) {
+	t.Run("a complete default set beats the incomplete family beside it", func(t *testing.T) {
 		set, ok := bestWeightSet([]FileInfo{
 			wfile("unet/model-00001-of-00003.safetensors", 100),
 			wfile("unet/model-00002-of-00003.safetensors", 110),
@@ -563,9 +562,86 @@ func TestBestWeightSetShardFamily(t *testing.T) {
 	})
 }
 
+// TestBestWeightSetFamilyEligibility pins the eligibility gate: a shard
+// family joins selection only when its present indices are exactly the
+// distinct set 1..M with the declared M equal to the member count. Every
+// ineligible shape — a split-spelling family, a declared-total mismatch in
+// either direction, an index hole — leaves no eligible set, so the component
+// falls through to its legacy weightless row.
+func TestBestWeightSetFamilyEligibility(t *testing.T) {
+	// itemRow runs the analyze → selectable-row path for a unet folder
+	// holding exactly the given files plus a model_index.json naming unet.
+	itemRow := func(t *testing.T, files []FileInfo) *SelectableItem {
+		t.Helper()
+		all := append([]FileInfo{wfile("model_index.json", 500)}, files...)
+		metadata := map[string]interface{}{
+			"model_index.json": map[string]interface{}{
+				"_class_name": "StableDiffusionPipeline",
+				"unet":        []interface{}{"diffusers", "UNet2DConditionModel"},
+			},
+		}
+		items := DiffusersToSelectableItems(analyzeDiffusers(all, metadata))
+		for i := range items {
+			if items[i].ID == "unet" {
+				return &items[i]
+			}
+		}
+		t.Fatal("unet row not found")
+		return nil
+	}
+
+	t.Run("a split-spelling family leaves the component weightless", func(t *testing.T) {
+		files := []FileInfo{
+			wfile("unet/config.json", 40),
+			wfile("unet/m.fp16-00001-of-00002.safetensors", 100),
+			wfile("unet/m-00002-of-00002.safetensors", 110),
+		}
+		if set, ok := bestWeightSet(files, "unet"); ok {
+			t.Fatalf("set = %v, want no eligible set: one family spelled two ways is two broken halves", setPaths(set))
+		}
+		row := itemRow(t, files)
+		if len(row.Files) != 0 {
+			t.Fatalf("row files = %v, want none: the component keeps its weightless folder row", row.Files)
+		}
+		if row.Label != "unet" || row.FilterValue != "unet" || row.Size != 250 || row.SizeHuman != humanSize(250) {
+			t.Fatalf("row = %+v, want the untouched legacy folder row (label/filter \"unet\", whole-folder 250 bytes)", row)
+		}
+	})
+
+	t.Run("two shards of a declared three are ineligible", func(t *testing.T) {
+		if set, ok := bestWeightSet([]FileInfo{
+			wfile("unet/model-00001-of-00003.safetensors", 100),
+			wfile("unet/model-00002-of-00003.safetensors", 110),
+		}, "unet"); ok {
+			t.Fatalf("set = %v, want no eligible set: present indices {1,2} are not exactly 1..3", setPaths(set))
+		}
+	})
+
+	t.Run("three shards of a declared two are ineligible", func(t *testing.T) {
+		if set, ok := bestWeightSet([]FileInfo{
+			wfile("unet/model-00001-of-00002.safetensors", 100),
+			wfile("unet/model-00002-of-00002.safetensors", 110),
+			wfile("unet/model-00003-of-00002.safetensors", 120),
+		}, "unet"); ok {
+			t.Fatalf("set = %v, want no eligible set: the out-of-range third member breaks the declared total", setPaths(set))
+		}
+	})
+
+	t.Run("an index hole makes the family ineligible", func(t *testing.T) {
+		if set, ok := bestWeightSet([]FileInfo{
+			wfile("unet/model-00002-of-00002.safetensors", 110),
+			wfile("unet/model-00003-of-00002.safetensors", 120),
+		}, "unet"); ok {
+			t.Fatalf("set = %v, want no eligible set: present indices {2,3} are not exactly 1..2", setPaths(set))
+		}
+	})
+}
+
 // TestBestWeightSetExcludesConversions pins that ONNX, OpenVINO (the .xml +
 // same-basename .bin pair, and conversion subfolders), Flax/msgpack and
-// tflite copies join nothing, while an unpaired pytorch .bin still qualifies.
+// tflite copies join nothing whatever their weight format — a conversion
+// folder excludes .safetensors as surely as .bin — while an unpaired pytorch
+// .bin still qualifies.
 func TestBestWeightSetExcludesConversions(t *testing.T) {
 	files := []FileInfo{
 		wfile("unet/model.safetensors", 500),
@@ -608,6 +684,15 @@ func TestBestWeightSetExcludesConversions(t *testing.T) {
 			wfile("unet/model.bin", 600),
 		}, "unet"); ok {
 			t.Fatalf("set = %v, want none: conversions never form a set", setPaths(set))
+		}
+	})
+
+	t.Run("a safetensors under a conversion dir joins nothing", func(t *testing.T) {
+		if set, ok := bestWeightSet([]FileInfo{
+			wfile("unet/config.json", 40),
+			wfile("unet/onnx/model.safetensors", 700),
+		}, "unet"); ok {
+			t.Fatalf("set = %v, want none: a conversion folder's weights never join, whatever the format", setPaths(set))
 		}
 	})
 }
