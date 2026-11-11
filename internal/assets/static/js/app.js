@@ -5088,6 +5088,11 @@ async function loadRepositoryDetails(entry) {
       $('#retries').value = data.retries ?? 4;
       $('#verify').value = data.verify || 'size';
       $('#endpoint').value = data.endpoint || '';
+      const ramGbInput = $('#availableRamGb');
+      if (ramGbInput) {
+        const ramBytes = Number(data.availableRamBytes) || 0;
+        ramGbInput.value = ramBytes > 0 ? String(ramBytes / (1024 * 1024 * 1024)) : '';
+      }
 
       // Load proxy settings
       if (data.proxy) {
@@ -5250,6 +5255,7 @@ async function loadRepositoryDetails(entry) {
       return;
     }
     const retries = parseInt($('#retries')?.value);
+    const ramGb = parseFloat($('#availableRamGb')?.value);
 
     // Build the route map by merging the labeled fields onto the currently
     // loaded map. Keys not surfaced by the UI (e.g. "llm") survive a dashboard
@@ -5279,7 +5285,12 @@ async function loadRepositoryDetails(entry) {
       maxSpeed: mbitToMaxSpeedStr($('#maxSpeed')?.value),
       retries: Number.isNaN(retries) ? 4 : retries,
       verify: $('#verify')?.value || 'size',
-      endpoint: $('#endpoint')?.value || ''
+      endpoint: $('#endpoint')?.value || '',
+      // RAM budget for the recommended GGUF quantization: empty/invalid or
+      // non-positive input clears the budget (0 = unset).
+      availableRamBytes: Number.isFinite(ramGb) && ramGb > 0
+        ? Math.round(ramGb * 1024 * 1024 * 1024)
+        : 0
     };
 
     const cacheDirValue = $('#cacheDirInput')?.value?.trim() || '';
@@ -5389,6 +5400,7 @@ async function loadRepositoryDetails(entry) {
     setVal('#retries', '4');
     setVal('#verify', 'size');
     setVal('#endpoint', '');
+    setVal('#availableRamGb', '');
     setVal('#proxyUrl', '');
     setVal('#proxyUsername', '');
     setVal('#proxyPassword', '');

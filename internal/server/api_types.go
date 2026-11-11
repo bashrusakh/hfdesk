@@ -128,6 +128,9 @@ type SettingsResponse struct {
 	// DownloadRoutes maps internal route keys to destination directories.
 	// Opt-in; empty/omitted means routed downloads are disabled.
 	DownloadRoutes map[string]string `json:"downloadRoutes,omitempty"`
+	// AvailableRAMBytes is the optional RAM budget in bytes for the
+	// recommended GGUF quantization; 0 means unset.
+	AvailableRAMBytes int64 `json:"availableRamBytes"`
 	// Proxy settings
 	Proxy *ProxySettingsResponse `json:"proxy,omitempty"`
 	// Config file paths

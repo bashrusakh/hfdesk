@@ -63,6 +63,9 @@ type ConfigFile struct {
 	// directory for routed downloads. Opt-in: empty means use LocalDir/HF
 	// cache as before.
 	DownloadRoutes map[string]string `json:"download-routes,omitempty" yaml:"download-routes,omitempty"`
+	// AvailableRAMBytes is the RAM budget for the recommended GGUF
+	// quantization. 0/absent means unset.
+	AvailableRAMBytes int64 `json:"available-ram-bytes,omitempty" yaml:"available-ram-bytes,omitempty"`
 }
 
 // ProxyConfig holds proxy settings for the config file.
@@ -339,6 +342,9 @@ func ApplyConfigToServer(serverCfg *Config) error {
 		// never advertises one. This keeps load and save agreeing on the key
 		// set, so echoing the loaded map back cannot fail validation.
 		serverCfg.DownloadRoutes = sanitizeDownloadRoutes(fileCfg.DownloadRoutes)
+	}
+	if serverCfg.AvailableRAMBytes == 0 && fileCfg.AvailableRAMBytes > 0 {
+		serverCfg.AvailableRAMBytes = fileCfg.AvailableRAMBytes
 	}
 
 	// Apply proxy settings if not already set

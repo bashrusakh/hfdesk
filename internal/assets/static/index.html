@@ -877,6 +877,13 @@
                     </select>
                   </div>
                 </div>
+                <div class="settings-row">
+                  <label for="availableRamGb" title="Restrict the recommended GGUF quantization to ones whose estimated RAM fits this budget. Leave empty for no budget: the recommendation then works exactly as before. When nothing fits, the smallest-RAM quant is recommended.">Recommended quant RAM budget</label>
+                  <div class="settings-control">
+                    <input type="number" id="availableRamGb" min="0" step="1" placeholder="unset" aria-describedby="availableRamGbHelp">
+                    <div class="form-hint" id="availableRamGbHelp">In GiB. Empty = no budget; applies to new analyses.</div>
+                  </div>
+                </div>
               </div>
             </div>
 
