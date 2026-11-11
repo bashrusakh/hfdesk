@@ -641,35 +641,141 @@ func mmprojArtifactID(f FileInfo) string {
 
 // recommendedQuantIndex returns the index of the single quantization artifact
 // that the default/recommended GGUF selection should include. Quantizations are
-// ordered by descending size, then name, then path (see analyzeGGUF). The rule
-// is deterministic:
+// ordered by descending size, then name, then path (see analyzeGGUF).
+//
+// With budget <= 0 (unset) the rule is deterministic and unchanged:
 //
 //  1. the first non-MTP Q4_K_M/UD_Q4_K_M artifact (the conventional default);
 //  2. otherwise the first non-MTP artifact with quality >= 4 and size < 10 GiB.
 //
+// With budget > 0 the candidate set is restricted to non-MTP artifacts whose
+// EstimatedRAM fits the budget, then the same two rules run in order over that
+// set (rule 2 keeps its size guard). When some artifacts fit but neither rule
+// matches, the fittest candidate is the highest-quality fitting artifact
+// (smaller size wins a quality tie; list order breaks exact ties) — the same
+// quality heuristic RecommendGGUF sorts by. When NOTHING fits, the fallback is
+// the non-MTP artifact with the smallest EstimatedRAM (list order breaks ties);
+// a repository with no non-MTP artifact still returns -1, because MTP variants
+// are never auto-recommended in any mode.
+//
 // Exactly one index is returned, so a repository containing several artifacts
 // with the same quant token cannot put all of them in one recommended request.
-func recommendedQuantIndex(quants []GGUFQuantization) int {
+func recommendedQuantIndex(quants []GGUFQuantization, budget int64) int {
+	if budget <= 0 {
+		for i := range quants {
+			q := &quants[i]
+			if !q.IsMTP && (q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M") {
+				return i
+			}
+		}
+		for i := range quants {
+			q := &quants[i]
+			if !q.IsMTP && q.Quality >= 4 && q.File.Size < 10*1024*1024*1024 { // < 10 GiB
+				return i
+			}
+		}
+		return -1
+	}
+
+	fitting := make([]int, 0, len(quants))
 	for i := range quants {
 		q := &quants[i]
-		if !q.IsMTP && (q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M") {
+		if !q.IsMTP && q.EstimatedRAM <= budget {
+			fitting = append(fitting, i)
+		}
+	}
+	if len(fitting) == 0 {
+		// Nothing fits: fall back to the smallest-RAM non-MTP artifact.
+		best := -1
+		for i := range quants {
+			q := &quants[i]
+			if q.IsMTP {
+				continue
+			}
+			if best == -1 || q.EstimatedRAM < quants[best].EstimatedRAM {
+				best = i
+			}
+		}
+		return best
+	}
+	for _, i := range fitting {
+		q := &quants[i]
+		if q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M" {
 			return i
 		}
 	}
-	for i := range quants {
+	for _, i := range fitting {
 		q := &quants[i]
-		if !q.IsMTP && q.Quality >= 4 && q.File.Size < 10*1024*1024*1024 { // < 10 GiB
+		if q.Quality >= 4 && q.File.Size < 10*1024*1024*1024 { // < 10 GiB
 			return i
 		}
 	}
-	return -1
+	// Fits, but no established rule matches: highest quality, then smallest
+	// size, then earliest in the analyzer's deterministic order.
+	best := fitting[0]
+	for _, i := range fitting[1:] {
+		q, b := &quants[i], &quants[best]
+		if q.Quality > b.Quality || (q.Quality == b.Quality && q.File.Size < b.File.Size) {
+			best = i
+		}
+	}
+	return best
+}
+
+// ApplyGGUFRAMBudget re-picks the single recommended GGUF quantization row
+// under an optional RAM budget (bytes; <= 0 means unset and is a no-op).
+// Callers apply it to an analyzed repository after selectable items were built
+// and then re-run RepoInfo.PopulateDownloadSelection so the recommended
+// download follows the new pick. Only rows derived from this repository's
+// quantization artifacts are touched: vision-encoder rows, branch-variant rows
+// and every other category keep their existing recommendation state.
+func ApplyGGUFRAMBudget(info *RepoInfo, budget int64) {
+	if info == nil || budget <= 0 || info.Type != TypeGGUF || info.GGUF == nil {
+		return
+	}
+	quants := info.GGUF.Quantizations
+	idx := recommendedQuantIndex(quants, budget)
+	keys := make(map[string]int, len(quants))
+	for i := range quants {
+		keys[quantArtifactsKey(quants[i])] = i
+	}
+	for i := range info.SelectableItems {
+		item := &info.SelectableItems[i]
+		if item.Category != "quantization" {
+			continue
+		}
+		j, ok := keys[quantArtifactsKeyOfFiles(item.Files)]
+		if !ok {
+			continue
+		}
+		item.Recommended = j == idx
+	}
+}
+
+// quantArtifactsKey builds the identity key of one quantization artifact's
+// file set: sorted repo-relative paths joined by a separator that cannot
+// occur in a path.
+func quantArtifactsKey(q GGUFQuantization) string {
+	files := q.Files
+	if len(files) == 0 {
+		files = []string{q.File.Path}
+	}
+	return quantArtifactsKeyOfFiles(files)
+}
+
+func quantArtifactsKeyOfFiles(files []string) string {
+	sorted := append([]string(nil), files...)
+	sort.Strings(sorted)
+	return strings.Join(sorted, "\x00")
 }
 
 // GGUFToSelectableItems converts GGUF quantizations to SelectableItems.
 // This provides a unified interface for the web UI.
 //
 // Exactly one non-MTP quantization artifact is Recommended, following the
-// deterministic rule in recommendedQuantIndex. When the repo contains mmproj
+// deterministic rule in recommendedQuantIndex. A configured RAM budget does
+// not change this build step: ApplyGGUFRAMBudget re-picks the recommended row
+// afterwards for callers whose setting is set. When the repo contains mmproj
 // vision-encoder files (multimodal models), an additional SelectableItem with
 // Category="vision_encoder" is emitted for the preferred mmproj file. It is
 // Recommended=true by default so that the recommended download selection
@@ -684,7 +790,7 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 
 	items := make([]SelectableItem, 0, len(info.Quantizations)+1)
 
-	recommendedIndex := recommendedQuantIndex(info.Quantizations)
+	recommendedIndex := recommendedQuantIndex(info.Quantizations, 0)
 
 	// Keep FilterValue compatible as a legacy label, but derive row uniqueness
 	// from artifact paths below; a quant token or basename is not identity.

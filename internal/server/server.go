@@ -93,6 +93,12 @@ type Config struct {
 	// empty means every download uses LocalDir/HF cache exactly as before.
 	DownloadRoutes map[string]string
 
+	// AvailableRAMBytes is the optional RAM budget (bytes) for the recommended
+	// GGUF quantization: 0/absent means unset and keeps the recommendation
+	// unchanged; when set, analysis restricts the recommended quant to one
+	// whose estimated RAM fits the budget (see smartdl.ApplyGGUFRAMBudget).
+	AvailableRAMBytes int64
+
 	// Authentication
 	AuthUser string // Basic auth username (empty = no auth)
 	AuthPass string // Basic auth password

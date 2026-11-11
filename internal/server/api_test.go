@@ -1353,6 +1353,75 @@ func TestStallTimeoutPersistsAndReloads(t *testing.T) {
 	}
 }
 
+// availableRamBytes saved through POST /api/settings must round-trip through
+// GET, persist to the config file, survive a restart via ApplyConfigToServer,
+// clear explicitly with 0 (persisted as an absent key), and reject a negative
+// value without touching state.
+func TestAvailableRAMBytesPersistsAndReloads(t *testing.T) {
+	path := isolateTokenConfig(t)
+
+	cfg := DefaultConfig()
+	cfg.CacheDir = t.TempDir()
+	s := New(cfg)
+	if resp := requireTokenSettingsOK(t, s, `{"availableRamBytes":17179869184}`); strings.Contains(resp, "warning") {
+		t.Fatalf("unexpected persistence warning: %s", resp)
+	}
+	if got := settingsFor(t, s).AvailableRAMBytes; got != 17179869184 {
+		t.Fatalf("GET availableRamBytes = %d, want 17179869184", got)
+	}
+	if got := s.snapshotConfig().AvailableRAMBytes; got != 17179869184 {
+		t.Fatalf("live config AvailableRAMBytes = %d, want 17179869184", got)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if !bytes.Contains(data, []byte("available-ram-bytes")) {
+		t.Fatalf("available-ram-bytes not persisted to config file: %s", data)
+	}
+
+	// Fresh server + ApplyConfigToServer must observe the persisted value.
+	restarted := DefaultConfig()
+	if err := ApplyConfigToServer(&restarted); err != nil {
+		t.Fatalf("ApplyConfigToServer: %v", err)
+	}
+	if restarted.AvailableRAMBytes != 17179869184 {
+		t.Errorf("after reload AvailableRAMBytes = %d, want 17179869184", restarted.AvailableRAMBytes)
+	}
+
+	// An explicit 0 clears the budget and is persisted as an absent key.
+	requireTokenSettingsOK(t, s, `{"availableRamBytes":0}`)
+	if got := settingsFor(t, s).AvailableRAMBytes; got != 0 {
+		t.Fatalf("GET after clear = %d, want 0", got)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if bytes.Contains(data, []byte("available-ram-bytes")) {
+		t.Fatalf("cleared budget must not persist a key: %s", data)
+	}
+
+	// A negative budget is rejected in validation, before any state change.
+	if w := postTokenSettings(s, `{"availableRamBytes":-1}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("negative budget status = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if got := settingsFor(t, s).AvailableRAMBytes; got != 0 {
+		t.Fatalf("rejected update changed state: %d", got)
+	}
+
+	// A missing config file leaves the budget unset.
+	os.Remove(path)
+	fresh := DefaultConfig()
+	if err := ApplyConfigToServer(&fresh); err != nil {
+		t.Fatalf("ApplyConfigToServer: %v", err)
+	}
+	if fresh.AvailableRAMBytes != 0 {
+		t.Errorf("missing key produced AvailableRAMBytes = %d, want 0", fresh.AvailableRAMBytes)
+	}
+}
+
 // --- Backoff / negative-stall-timeout regression coverage ---
 
 // TestApplyConfigToServer_StallTimeoutRejectsNegative verifies finding #4 at the

@@ -4,23 +4,24 @@
 package smartdl
 
 import (
+	"reflect"
 	"testing"
 )
 
 func TestParseTransformersConfig(t *testing.T) {
 	t.Run("full config", func(t *testing.T) {
 		cfg := map[string]interface{}{
-			"architectures":          []interface{}{"LlamaForCausalLM"},
-			"model_type":             "llama",
-			"hidden_size":            float64(4096),
-			"num_hidden_layers":      float64(32),
-			"num_attention_heads":    float64(32),
-			"intermediate_size":      float64(11008),
-			"vocab_size":             float64(32000),
+			"architectures":           []interface{}{"LlamaForCausalLM"},
+			"model_type":              "llama",
+			"hidden_size":             float64(4096),
+			"num_hidden_layers":       float64(32),
+			"num_attention_heads":     float64(32),
+			"intermediate_size":       float64(11008),
+			"vocab_size":              float64(32000),
 			"max_position_embeddings": float64(4096),
-			"torch_dtype":            "float16",
-			"bos_token_id":           float64(1),
-			"eos_token_id":           float64(2),
+			"torch_dtype":             "float16",
+			"bos_token_id":            float64(1),
+			"eos_token_id":            float64(2),
 		}
 
 		info := &TransformersInfo{}
@@ -96,14 +97,14 @@ func TestParseTransformersConfig(t *testing.T) {
 
 func TestParseTokenizerConfig(t *testing.T) {
 	cfg := map[string]interface{}{
-		"tokenizer_class":   "LlamaTokenizerFast",
-		"vocab_size":        float64(32000),
-		"model_max_length":  float64(4096),
-		"padding_side":      "left",
-		"truncation_side":   "right",
-		"add_bos_token":     true,
-		"add_eos_token":     false,
-		"chat_template":     "{% for message in messages %}...",
+		"tokenizer_class":  "LlamaTokenizerFast",
+		"vocab_size":       float64(32000),
+		"model_max_length": float64(4096),
+		"padding_side":     "left",
+		"truncation_side":  "right",
+		"add_bos_token":    true,
+		"add_eos_token":    false,
+		"chat_template":    "{% for message in messages %}...",
 	}
 
 	tok := parseTokenizerConfig(cfg)
@@ -143,7 +144,7 @@ func TestAnalyzeWeightFiles(t *testing.T) {
 		{Name: "model-00001-of-00004.safetensors", Path: "model-00001-of-00004.safetensors", Size: 4000000000},
 		{Name: "model-00002-of-00004.safetensors", Path: "model-00002-of-00004.safetensors", Size: 4000000000},
 		{Name: "pytorch_model.bin", Path: "pytorch_model.bin", Size: 14000000000},
-		{Name: "config.json", Path: "config.json", Size: 1000}, // Not a weight file
+		{Name: "config.json", Path: "config.json", Size: 1000},         // Not a weight file
 		{Name: "optimizer.pt", Path: "optimizer.pt", Size: 5000000000}, // Should be skipped
 	}
 
@@ -573,12 +574,12 @@ func TestAnalyzeTransformers(t *testing.T) {
 
 	metadata := map[string]interface{}{
 		"config.json": map[string]interface{}{
-			"architectures":          []interface{}{"LlamaForCausalLM"},
-			"model_type":             "llama",
-			"hidden_size":            float64(4096),
-			"num_hidden_layers":      float64(32),
-			"vocab_size":             float64(32000),
-			"torch_dtype":            "float16",
+			"architectures":     []interface{}{"LlamaForCausalLM"},
+			"model_type":        "llama",
+			"hidden_size":       float64(4096),
+			"num_hidden_layers": float64(32),
+			"vocab_size":        float64(32000),
+			"torch_dtype":       "float16",
 		},
 		"tokenizer_config.json": map[string]interface{}{
 			"tokenizer_class":  "LlamaTokenizerFast",
@@ -619,5 +620,196 @@ func TestAnalyzeTransformers(t *testing.T) {
 	// Check that backends are set
 	if len(info.Backends) == 0 {
 		t.Error("Backends should not be empty")
+	}
+}
+
+// --- Part 1: additive rare weight-format family rows ---
+
+func TestRareFormatRowsFamilies(t *testing.T) {
+	files := []FileInfo{
+		{Path: "onnx/model.onnx", Name: "model.onnx", Size: 111},
+		{Path: "model.tflite", Name: "model.tflite", Size: 222},
+		{Path: "flax/model.msgpack", Name: "model.msgpack", Size: 333},
+		{Path: "openvino/model.xml", Name: "model.xml", Size: 444},
+		{Path: "openvino/model.bin", Name: "model.bin", Size: 555},
+		// Unpaired members must not join the OpenVINO family.
+		{Path: "pytorch_model.bin", Name: "pytorch_model.bin", Size: 9999},
+		{Path: "notes.xml", Name: "notes.xml", Size: 7},
+	}
+	rows := rareFormatRows(files)
+
+	want := map[string]struct {
+		filter string
+		files  []string
+		size   int64
+	}{
+		"onnx":     {".onnx", []string{"onnx/model.onnx"}, 111},
+		"tflite":   {".tflite", []string{"model.tflite"}, 222},
+		"flax":     {".msgpack", []string{"flax/model.msgpack"}, 333},
+		"openvino": {"openvino/", []string{"openvino/model.xml", "openvino/model.bin"}, 999},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("got %d rows, want %d: %+v", len(rows), len(want), rows)
+	}
+	for _, row := range rows {
+		exp, ok := want[row.ID]
+		if !ok {
+			t.Errorf("unexpected row ID %q", row.ID)
+			continue
+		}
+		if row.Category != "format" {
+			t.Errorf("row %q category = %q, want format", row.ID, row.Category)
+		}
+		if row.Recommended {
+			t.Errorf("row %q must never carry the recommendation badge", row.ID)
+		}
+		if row.Description == "" || row.Label == "" || row.SizeHuman == "" {
+			t.Errorf("row %q missing display fields: %+v", row.ID, row)
+		}
+		if row.FilterValue != exp.filter {
+			t.Errorf("row %q filter = %q, want %q", row.ID, row.FilterValue, exp.filter)
+		}
+		if !reflect.DeepEqual(row.Files, exp.files) {
+			t.Errorf("row %q files = %v, want %v", row.ID, row.Files, exp.files)
+		}
+		if row.Size != exp.size {
+			t.Errorf("row %q size = %d, want %d", row.ID, row.Size, exp.size)
+		}
+		if row.SizeHuman != humanSize(exp.size) {
+			t.Errorf("row %q sizeHuman = %q, want %q", row.ID, row.SizeHuman, humanSize(exp.size))
+		}
+	}
+}
+
+func TestRareFormatRowsAbsentWithoutFamilyFiles(t *testing.T) {
+	rows := rareFormatRows([]FileInfo{
+		{Path: "model.safetensors", Name: "model.safetensors", Size: 10},
+		{Path: "pytorch_model.bin", Name: "pytorch_model.bin", Size: 10},
+		{Path: "tokenizer.json", Name: "tokenizer.json", Size: 10},
+	})
+	if len(rows) != 0 {
+		t.Fatalf("got %d rows, want none without family files: %+v", len(rows), rows)
+	}
+	if rows := rareFormatRows(nil); rows != nil {
+		t.Fatalf("nil files = %+v, want nil", rows)
+	}
+}
+
+// TestRareFormatRowsOpenVINOFilterRule pins the ACCEPTANCE contract of the
+// OpenVINO family row: the UI routes this row through the exact-artifact
+// request path, so item.files IS the download. Whatever the layout, files
+// must be exactly the paired IR members — both members of a root pair, every
+// pair of a shared-directory layout — and never an unpaired ".xml", an
+// unrelated ".bin", a subtree extra, or a same-named directory elsewhere.
+func TestRareFormatRowsOpenVINOFilterRule(t *testing.T) {
+	t.Run("root pair selects exactly both members", func(t *testing.T) {
+		rows := rareFormatRows([]FileInfo{
+			{Path: "model.xml", Name: "model.xml", Size: 10},
+			{Path: "model.bin", Name: "model.bin", Size: 20},
+			{Path: "notes.xml", Name: "notes.xml", Size: 30},
+			{Path: "pytorch_model.bin", Name: "pytorch_model.bin", Size: 40},
+		})
+		if len(rows) != 1 {
+			t.Fatalf("rows = %+v, want one openvino row", rows)
+		}
+		want := []string{"model.xml", "model.bin"}
+		if !reflect.DeepEqual(rows[0].Files, want) {
+			t.Fatalf("files = %v, want exactly the IR pair %v: the unpaired xml and the unrelated bin must be excluded", rows[0].Files, want)
+		}
+		if rows[0].Size != 30 {
+			t.Fatalf("size = %d, want 30: excluded files must not contribute", rows[0].Size)
+		}
+	})
+
+	t.Run("shared-directory layout selects exactly the paired members", func(t *testing.T) {
+		rows := rareFormatRows([]FileInfo{
+			{Path: "openvino/fp32/model.xml", Name: "model.xml", Size: 10},
+			{Path: "openvino/fp32/model.bin", Name: "model.bin", Size: 20},
+			{Path: "openvino/fp16/model.xml", Name: "model.xml", Size: 30},
+			{Path: "openvino/fp16/model.bin", Name: "model.bin", Size: 40},
+			{Path: "openvino/notes.xml", Name: "notes.xml", Size: 50},
+			{Path: "backup/openvino/weights.xml", Name: "weights.xml", Size: 60},
+		})
+		if len(rows) != 1 {
+			t.Fatalf("rows = %+v, want one openvino row", rows)
+		}
+		want := []string{
+			"openvino/fp32/model.xml", "openvino/fp32/model.bin",
+			"openvino/fp16/model.xml", "openvino/fp16/model.bin",
+		}
+		if !reflect.DeepEqual(rows[0].Files, want) {
+			t.Fatalf("files = %v, want exactly the paired members %v: subtree extras and same-named directories elsewhere must be excluded", rows[0].Files, want)
+		}
+		if rows[0].Size != 100 {
+			t.Fatalf("size = %d, want 100", rows[0].Size)
+		}
+	})
+
+	t.Run("cross-directory files select nothing", func(t *testing.T) {
+		rows := rareFormatRows([]FileInfo{
+			{Path: "a/model.xml", Name: "model.xml", Size: 10},
+			{Path: "b/model.bin", Name: "model.bin", Size: 20},
+		})
+		if len(rows) != 0 {
+			t.Fatalf("rows = %+v, want no row: both pair members must share a directory", rows)
+		}
+	})
+
+	t.Run("unpaired members select nothing", func(t *testing.T) {
+		rows := rareFormatRows([]FileInfo{
+			{Path: "model.xml", Name: "model.xml", Size: 10},
+			{Path: "other.bin", Name: "other.bin", Size: 20},
+		})
+		if len(rows) != 0 {
+			t.Fatalf("rows = %+v, want no row without a same-basename pair", rows)
+		}
+	})
+}
+
+// TestMixedRepoFormatRowsKeepRecommendation pins the preserved behavior: the
+// new family rows are additive and never steal the recommendation from the
+// dual-format safetensors row, and the recommended filters are unchanged.
+func TestMixedRepoFormatRowsKeepRecommendation(t *testing.T) {
+	info := &TransformersInfo{
+		WeightFiles: []WeightFile{
+			{Name: "model.safetensors", Format: "safetensors", Size: 14_000_000_000},
+			{Name: "pytorch_model.bin", Format: "pytorch_bin", Size: 14_000_000_000},
+		},
+	}
+	files := []FileInfo{
+		{Name: "model.safetensors", Path: "model.safetensors", Size: 14_000_000_000},
+		{Name: "pytorch_model.bin", Path: "pytorch_model.bin", Size: 14_000_000_000},
+		{Name: "model.onnx", Path: "onnx/model.onnx", Size: 111},
+		{Name: "model.tflite", Path: "model.tflite", Size: 222},
+		{Name: "model.msgpack", Path: "flax/model.msgpack", Size: 333},
+	}
+	items := TransformersToSelectableItems(info, files)
+
+	find := func(id string) *SelectableItem {
+		for i := range items {
+			if items[i].ID == id {
+				return &items[i]
+			}
+		}
+		return nil
+	}
+	for _, id := range []string{"safetensors", "pytorch", "onnx", "tflite", "flax"} {
+		if find(id) == nil {
+			t.Errorf("missing additive row %q: %+v", id, items)
+		}
+	}
+	var recommended []string
+	for _, item := range items {
+		if item.Recommended {
+			recommended = append(recommended, item.ID)
+		}
+	}
+	if !reflect.DeepEqual(recommended, []string{"safetensors"}) {
+		t.Fatalf("recommended rows = %v, want only safetensors", recommended)
+	}
+
+	repo := &RepoInfo{Repo: "owner/repo", Type: TypeTransformers, SelectableItems: items}
+	if got, want := repo.RecommendedFilterValues(), []string{"safetensors"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("RecommendedFilterValues() = %v, want %v", got, want)
 	}
 }

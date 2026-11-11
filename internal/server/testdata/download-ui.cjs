@@ -428,6 +428,39 @@ async function run(entry, type, { dataset = false, manual = '', low = false, cho
   assert.deepEqual(configDownload.body.filters, ['cc100/'], 'config row must send its folder filter');
   assert.equal(configDownload.body.exactMatch, true, 'the config folder filter is exact');
   assert.equal(configDownload.body.dataset, true, 'the config preset stays a dataset request');
+  // Family-exact selection: a rare-format family row (OpenVINO here) routes
+  // through the exact-artifact request path, so its request carries exactly
+  // item.files, while the pre-existing files-less format row keeps its legacy
+  // token request byte-identical.
+  const familyAnalysis = { repo: 'fixture/family', type: 'transformers', branch: 'main',
+    files: [{ path: 'model.xml', size: 10 }, { path: 'model.bin', size: 20 }] };
+  ui.setAnalysis(familyAnalysis);
+  const familyHtml = ui.renderSelectableItems([
+    { id: 'safetensors', label: 'SafeTensors', category: 'format', filter_value: 'safetensors',
+      recommended: true, size_human: '1.0 B' },
+    { id: 'openvino', label: 'OpenVINO', category: 'format', filter_value: '.xml',
+      size_human: '30 B', files: ['model.xml', 'model.bin'] }
+  ], 'familyItems');
+  const safeRow = /data-fv="safetensors"[\s\S]*?data-download="([^"]+)"/.exec(familyHtml);
+  const familyRow = /data-fv="\.xml"[\s\S]*?data-download="([^"]+)"/.exec(familyHtml);
+  assert(safeRow && familyRow, 'both format rows must carry download payloads: ' + familyHtml);
+  calls.length = 0;
+  messages.length = 0;
+  await window.downloadQuantFromButton({ dataset: { download: safeRow[1] }, closest: () => null });
+  const safeDownload = calls.find(c => c.path === '/api/download');
+  assert(safeDownload, 'safetensors row download request missing');
+  assert.deepEqual(safeDownload.body,
+    { repo: 'fixture/family', revision: 'main', dataset: false, filters: ['safetensors'], exactMatch: true },
+    'files-less format row request must stay byte-identical to the legacy token body');
+  calls.length = 0;
+  messages.length = 0;
+  await window.downloadQuantFromButton({ dataset: { download: familyRow[1] }, closest: () => null });
+  const familyDownload = calls.find(c => c.path === '/api/download');
+  assert(familyDownload, 'family row download request missing');
+  assert.deepEqual(familyDownload.body.filters, ['./model.xml', './model.bin'],
+    'family row must send exactly item.files through the exact-artifact path');
+  assert.equal(familyDownload.body.exactMatch, true, 'family row selection must be exact');
+  assert(!familyDownload.body.strictFiles, 'the exact-artifact path does not escalate to strictFiles');
   // No configured destinations leave both analysis surfaces without a picker.
   if (!Object.keys(fixture.routes || {}).length) {
     const noRouteAnalysis = { repo: 'fixture/model', type: 'gguf', files: [{ path: 'model.bin', size: 7 }] };

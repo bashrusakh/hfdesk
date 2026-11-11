@@ -2057,7 +2057,7 @@ async function loadRepositoryDetails(entry) {
       return 'branchVariant:' + item.revision;
     }
     const files = Array.isArray(item?.files) ? item.files : [];
-    if (files.length && ['quantization', 'vision_encoder'].includes(item.category)) {
+    if (files.length && ['quantization', 'vision_encoder', 'format'].includes(item.category)) {
       return `artifact:${JSON.stringify(files.map(normalizeRepoPath))}`;
     }
     return item?.filter_value || item?.id || '';
@@ -5088,6 +5088,11 @@ async function loadRepositoryDetails(entry) {
       $('#retries').value = data.retries ?? 4;
       $('#verify').value = data.verify || 'size';
       $('#endpoint').value = data.endpoint || '';
+      const ramGbInput = $('#availableRamGb');
+      if (ramGbInput) {
+        const ramBytes = Number(data.availableRamBytes) || 0;
+        ramGbInput.value = ramBytes > 0 ? String(ramBytes / (1024 * 1024 * 1024)) : '';
+      }
 
       // Load proxy settings
       if (data.proxy) {
@@ -5250,6 +5255,7 @@ async function loadRepositoryDetails(entry) {
       return;
     }
     const retries = parseInt($('#retries')?.value);
+    const ramGb = parseFloat($('#availableRamGb')?.value);
 
     // Build the route map by merging the labeled fields onto the currently
     // loaded map. Keys not surfaced by the UI (e.g. "llm") survive a dashboard
@@ -5279,7 +5285,12 @@ async function loadRepositoryDetails(entry) {
       maxSpeed: mbitToMaxSpeedStr($('#maxSpeed')?.value),
       retries: Number.isNaN(retries) ? 4 : retries,
       verify: $('#verify')?.value || 'size',
-      endpoint: $('#endpoint')?.value || ''
+      endpoint: $('#endpoint')?.value || '',
+      // RAM budget for the recommended GGUF quantization: empty/invalid or
+      // non-positive input clears the budget (0 = unset).
+      availableRamBytes: Number.isFinite(ramGb) && ramGb > 0
+        ? Math.round(ramGb * 1024 * 1024 * 1024)
+        : 0
     };
 
     const cacheDirValue = $('#cacheDirInput')?.value?.trim() || '';
@@ -5389,6 +5400,7 @@ async function loadRepositoryDetails(entry) {
     setVal('#retries', '4');
     setVal('#verify', 'size');
     setVal('#endpoint', '');
+    setVal('#availableRamGb', '');
     setVal('#proxyUrl', '');
     setVal('#proxyUsername', '');
     setVal('#proxyPassword', '');
@@ -6222,7 +6234,7 @@ async function loadRepositoryDetails(entry) {
     const fv = item.filter_value || item.id || '';
     const files = Array.isArray(item.files) ? item.files : [];
     const isBranch = item?.branch_variant === true && !!item?.revision;
-    const exactArtifact = files.length > 0 && ['quantization', 'vision_encoder'].includes(item.category);
+    const exactArtifact = files.length > 0 && ['quantization', 'vision_encoder', 'format'].includes(item.category);
     const statusKey = isBranch ? selectableStatusKey(item) : (exactArtifact ? selectableStatusKey(item) : fv);
     const dlRepo = item.upstream_repo || repo;
     const statusRepo = repo;

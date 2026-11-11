@@ -514,6 +514,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		LocalDir:           cfg.LocalDir,
 		LocalScanDirs:      cfg.LocalScanDirs,
 		DownloadRoutes:     cfg.DownloadRoutes,
+		AvailableRAMBytes:  cfg.AvailableRAMBytes,
 		ConfigFile:         ConfigPath(),
 		TargetsFile:        runtimepaths.Current().TargetsFile(),
 	}
@@ -553,6 +554,9 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		Retries            *int               `json:"retries,omitempty"`
 		StallTimeout       *string            `json:"stallTimeout,omitempty"`
 		Endpoint           *string            `json:"endpoint,omitempty"`
+		// AvailableRAMBytes is the RAM budget for the recommended GGUF
+		// quantization; an explicit 0 clears the budget.
+		AvailableRAMBytes *int64 `json:"availableRamBytes,omitempty"`
 		// Proxy settings
 		Proxy *struct {
 			URL                *string `json:"url,omitempty"`
@@ -605,6 +609,11 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		newMaxSpeed = trimmed
+	}
+	if req.AvailableRAMBytes != nil && *req.AvailableRAMBytes < 0 {
+		writeError(w, http.StatusBadRequest, "Invalid availableRamBytes",
+			"expected a non-negative number of bytes; 0 clears the RAM budget")
+		return
 	}
 	if req.DownloadRoutes != nil {
 		// Sanitize rather than reject: the UI echoes the loaded map on save, so
@@ -675,6 +684,9 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.Endpoint != nil {
 			c.Endpoint = *req.Endpoint
+		}
+		if req.AvailableRAMBytes != nil {
+			c.AvailableRAMBytes = *req.AvailableRAMBytes
 		}
 
 		// Update proxy settings. Build a fresh ProxyConfig (copy-on-write)
@@ -766,6 +778,7 @@ func settingsFileProjection(cfg Config) *ConfigFile {
 		StallTimeout:       cfg.StallTimeout,
 		Endpoint:           cfg.Endpoint,
 		DownloadRoutes:     cfg.DownloadRoutes,
+		AvailableRAMBytes:  cfg.AvailableRAMBytes,
 	}
 	if cfg.Proxy != nil {
 		fileCfg.Proxy = &ProxyConfig{
@@ -918,6 +931,15 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		}
 		writeError(w, http.StatusInternalServerError, "Analysis failed", err.Error())
 		return
+	}
+
+	// Apply the configured RAM budget (0/absent = unset) to the recommended
+	// GGUF quantization pick, then rebuild the derived recommendation fields.
+	// With the setting unset this block does not run, so the analysis response
+	// is byte-identical to the pre-setting behavior.
+	if cfg.AvailableRAMBytes > 0 {
+		smartdl.ApplyGGUFRAMBudget(info, cfg.AvailableRAMBytes)
+		info.PopulateDownloadSelection()
 	}
 
 	writeJSON(w, http.StatusOK, info)

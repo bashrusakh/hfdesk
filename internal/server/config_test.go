@@ -98,3 +98,29 @@ func TestApplyConfigToServer_TokenPrecedence(t *testing.T) {
 		})
 	}
 }
+
+// TestApplyConfigToServer_RejectsNegativeAvailableRAM guards the loud
+// rejection: a hand-edited negative available-ram-bytes must fail the load
+// with an actionable error instead of being silently read as unset, matching
+// the API's 400 for the same value.
+func TestApplyConfigToServer_RejectsNegativeAvailableRAM(t *testing.T) {
+	path := isolateTokenConfig(t)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("remove config: %v", err)
+	}
+	if err := SaveConfigFile(&ConfigFile{AvailableRAMBytes: -5}); err != nil {
+		t.Fatalf("SaveConfigFile: %v", err)
+	}
+
+	cfg := DefaultConfig()
+	err := ApplyConfigToServer(&cfg)
+	if err == nil {
+		t.Fatal("negative available-ram-bytes must be rejected, not silently treated as unset")
+	}
+	if !strings.Contains(err.Error(), "available-ram-bytes") {
+		t.Errorf("error %q must name available-ram-bytes", err)
+	}
+	if cfg.AvailableRAMBytes != 0 {
+		t.Errorf("AvailableRAMBytes = %d after a rejected load, want 0", cfg.AvailableRAMBytes)
+	}
+}

@@ -155,8 +155,31 @@ func TestAnalyzeRootTypePrecedence(t *testing.T) {
 			if tc.want == TypeTransformers && (info.Transformers == nil || len(info.Transformers.WeightFiles) == 0) {
 				t.Fatalf("missing transformers analysis/choices: %+v", info)
 			}
-			if tc.name == "mixed formats" && len(info.SelectableItems) != 2 {
-				t.Fatalf("missing existing format choices: %+v", info.SelectableItems)
+			// The established dual-format choices must remain on the mixed
+			// fixture; additive rare-format rows (the ONNX family row here,
+			// from the format-enrichment work) may extend the list, but no
+			// new badge may steal the recommendation.
+			if tc.name == "mixed formats" {
+				var recommended []string
+				seen := map[string]bool{}
+				for _, item := range info.SelectableItems {
+					seen[item.ID] = true
+					if item.Recommended {
+						recommended = append(recommended, item.ID)
+					}
+				}
+				if !seen["safetensors"] || !seen["pytorch"] {
+					t.Fatalf("missing existing format choices: %+v", info.SelectableItems)
+				}
+				if !seen["onnx"] {
+					t.Fatalf("missing additive ONNX row: %+v", info.SelectableItems)
+				}
+				if len(info.SelectableItems) != 3 {
+					t.Fatalf("selectable items = %+v, want exactly 3: safetensors, pytorch, onnx", info.SelectableItems)
+				}
+				if len(recommended) != 1 || recommended[0] != "safetensors" {
+					t.Fatalf("format recommendation changed: %v, want only safetensors", recommended)
+				}
 			}
 			if tc.name == "EXL2" && (info.Quantized == nil || info.Quantized.BitsPerWeight != 4.5) {
 				t.Fatalf("EXL2 lost: %+v", info.Quantized)
