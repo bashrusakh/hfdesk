@@ -8,6 +8,13 @@ import (
 	"testing"
 )
 
+// isSplitShard reports whether a filename carries a split-GGUF shard suffix.
+// It is the filename oracle used by TestStripSplitSuffixLegacyGGUFSplit; the
+// live production path uses ParseGGUFSplitShard / stripSplitSuffix.
+func isSplitShard(name string) bool {
+	return splitSuffixPattern.MatchString(name)
+}
+
 // TestAnalyzeGGUF_LegacyGGUFSplitShards verifies that the legacy
 // ".gguf-split" shard extension participates in GGUF detection, grouping, and
 // recommendation exactly like ".gguf" shards.

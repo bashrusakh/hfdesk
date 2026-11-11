@@ -12,19 +12,6 @@ import (
 	"github.com/bashrusakh/hfdesk/internal/datasetselection"
 )
 
-// Known dataset file formats and their descriptions.
-var formatDescriptions = map[string]string{
-	"parquet": "Apache Parquet columnar format (recommended)",
-	"arrow":   "Apache Arrow IPC format",
-	"json":    "JSON Lines format",
-	"jsonl":   "JSON Lines format",
-	"csv":     "Comma-separated values",
-	"txt":     "Plain text",
-	"tar":     "WebDataset tar archives",
-	"tar.gz":  "Compressed WebDataset archives",
-	"zip":     "Compressed archive",
-}
-
 // Standard split names.
 var standardSplits = []string{"train", "test", "validation", "dev", "eval"}
 
@@ -144,42 +131,6 @@ func isDataFileExtension(ext string) bool {
 	return dataExts[ext]
 }
 
-// detectSplit extracts split name from file path or name.
-func detectSplit(path, name string) string {
-	pathLower := strings.ToLower(path)
-	nameLower := strings.ToLower(name)
-
-	// Check for standard splits in path
-	for _, split := range standardSplits {
-		if strings.Contains(pathLower, "/"+split+"/") ||
-			strings.HasPrefix(pathLower, split+"/") ||
-			strings.Contains(nameLower, split+"-") ||
-			strings.Contains(nameLower, split+"_") ||
-			strings.HasPrefix(nameLower, split+".") ||
-			strings.HasPrefix(nameLower, split+"-") {
-			return split
-		}
-	}
-
-	// Check for data/ prefix (common pattern)
-	if strings.HasPrefix(pathLower, "data/") {
-		parts := strings.Split(path, "/")
-		if len(parts) >= 2 {
-			// Check if second part is a split name
-			candidate := strings.ToLower(parts[1])
-			for _, split := range standardSplits {
-				if candidate == split {
-					return split
-				}
-			}
-			// Return as config/split hybrid
-			return candidate
-		}
-	}
-
-	return ""
-}
-
 // detectConfig extracts configuration/subset name from path.
 func detectConfig(path string) string {
 	// Common patterns: data/<config>/<split>/ or <config>/train/
@@ -249,59 +200,6 @@ func selectPrimaryFormat(formats []string) string {
 		return formats[0]
 	}
 	return ""
-}
-
-// GetSplitByName finds a split by name.
-func GetSplitByName(info *DatasetInfo, name string) *DatasetSplit {
-	for i := range info.Splits {
-		if info.Splits[i].Name == name {
-			return &info.Splits[i]
-		}
-	}
-	return nil
-}
-
-// CalculateSelectedSize calculates total size for selected splits.
-func CalculateSelectedSize(info *DatasetInfo, selectedSplits []string) int64 {
-	if len(selectedSplits) == 0 {
-		// No selection = all splits
-		var total int64
-		for _, split := range info.Splits {
-			total += split.Size
-		}
-		return total
-	}
-
-	selected := make(map[string]bool)
-	for _, s := range selectedSplits {
-		selected[s] = true
-	}
-
-	var total int64
-	for _, split := range info.Splits {
-		if selected[split.Name] {
-			total += split.Size
-		}
-	}
-	return total
-}
-
-// GetFormatDescription returns description for a format.
-func GetFormatDescription(format string) string {
-	if desc, ok := formatDescriptions[format]; ok {
-		return desc
-	}
-	return "Data format"
-}
-
-// HasMultipleConfigs checks if dataset has multiple configurations.
-func HasMultipleConfigs(info *DatasetInfo) bool {
-	return len(info.Configs) > 1
-}
-
-// HasMultipleFormats checks if dataset has multiple formats available.
-func HasMultipleFormats(info *DatasetInfo) bool {
-	return len(info.Formats) > 1
 }
 
 // datasetConfigGroup rolls a repository config's member files into one

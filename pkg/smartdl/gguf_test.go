@@ -394,10 +394,10 @@ func TestAnalyzeGGUF(t *testing.T) {
 	})
 }
 
-func TestParseGGUFQuantization(t *testing.T) {
+func TestQuantizationFromGroupSingleFile(t *testing.T) {
 	t.Run("standard quantization", func(t *testing.T) {
 		file := FileInfo{Name: "model.Q4_K_M.gguf", Path: "model.Q4_K_M.gguf", Size: 4000000000}
-		quant := parseGGUFQuantization(file)
+		quant := quantizationFromGroup([]FileInfo{file})
 
 		if quant == nil {
 			t.Fatal("expected non-nil")
@@ -418,7 +418,7 @@ func TestParseGGUFQuantization(t *testing.T) {
 
 	t.Run("importance matrix quantization", func(t *testing.T) {
 		file := FileInfo{Name: "model.IQ2_XS.gguf", Path: "model.IQ2_XS.gguf", Size: 1000000000}
-		quant := parseGGUFQuantization(file)
+		quant := quantizationFromGroup([]FileInfo{file})
 
 		if quant.Name != "IQ2_XS" {
 			t.Errorf("Name = %q", quant.Name)
@@ -430,7 +430,7 @@ func TestParseGGUFQuantization(t *testing.T) {
 
 	t.Run("float precision", func(t *testing.T) {
 		file := FileInfo{Name: "model-F16.gguf", Path: "model-F16.gguf", Size: 14000000000}
-		quant := parseGGUFQuantization(file)
+		quant := quantizationFromGroup([]FileInfo{file})
 
 		if quant.Name != "F16" {
 			t.Errorf("Name = %q", quant.Name)
@@ -442,76 +442,13 @@ func TestParseGGUFQuantization(t *testing.T) {
 
 	t.Run("RAM estimate included", func(t *testing.T) {
 		file := FileInfo{Name: "model.Q4_K_M.gguf", Path: "model.Q4_K_M.gguf", Size: 4000000000}
-		quant := parseGGUFQuantization(file)
+		quant := quantizationFromGroup([]FileInfo{file})
 
 		if quant.EstimatedRAM == 0 {
 			t.Error("EstimatedRAM should be non-zero")
 		}
 		if quant.EstimatedRAMHuman == "" {
 			t.Error("EstimatedRAMHuman should not be empty")
-		}
-	})
-}
-
-func TestRecommendGGUF(t *testing.T) {
-	info := &GGUFInfo{
-		Quantizations: []GGUFQuantization{
-			{Name: "Q8_0", Quality: 5, EstimatedRAM: 10 * 1024 * 1024 * 1024},  // 10GB
-			{Name: "Q5_K_M", Quality: 5, EstimatedRAM: 6 * 1024 * 1024 * 1024}, // 6GB
-			{Name: "Q4_K_M", Quality: 4, EstimatedRAM: 5 * 1024 * 1024 * 1024}, // 5GB
-			{Name: "Q2_K", Quality: 1, EstimatedRAM: 2 * 1024 * 1024 * 1024},   // 2GB
-		},
-	}
-
-	t.Run("8GB available", func(t *testing.T) {
-		available := int64(8 * 1024 * 1024 * 1024) // 8GB
-		recommended := RecommendGGUF(info, available)
-
-		// Should recommend Q5_K_M, Q4_K_M, Q2_K (not Q8_0)
-		if len(recommended) != 3 {
-			t.Errorf("expected 3 recommendations, got %d", len(recommended))
-		}
-		// First should be highest quality that fits
-		if recommended[0].Name != "Q5_K_M" {
-			t.Errorf("first recommendation = %q, want Q5_K_M", recommended[0].Name)
-		}
-		for _, r := range recommended {
-			if !r.Recommended {
-				t.Errorf("%s should have Recommended=true", r.Name)
-			}
-		}
-	})
-
-	t.Run("4GB available", func(t *testing.T) {
-		available := int64(4 * 1024 * 1024 * 1024) // 4GB
-		recommended := RecommendGGUF(info, available)
-
-		// Should only recommend Q2_K
-		if len(recommended) != 1 {
-			t.Errorf("expected 1 recommendation, got %d", len(recommended))
-		}
-		if recommended[0].Name != "Q2_K" {
-			t.Errorf("recommendation = %q, want Q2_K", recommended[0].Name)
-		}
-	})
-
-	t.Run("16GB available", func(t *testing.T) {
-		available := int64(16 * 1024 * 1024 * 1024) // 16GB
-		recommended := RecommendGGUF(info, available)
-
-		// Should recommend all
-		if len(recommended) != 4 {
-			t.Errorf("expected 4 recommendations, got %d", len(recommended))
-		}
-	})
-
-	t.Run("1GB available", func(t *testing.T) {
-		available := int64(1 * 1024 * 1024 * 1024) // 1GB
-		recommended := RecommendGGUF(info, available)
-
-		// Should recommend none
-		if len(recommended) != 0 {
-			t.Errorf("expected 0 recommendations, got %d", len(recommended))
 		}
 	})
 }

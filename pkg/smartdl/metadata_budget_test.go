@@ -134,7 +134,7 @@ func TestAnalyze_StalledMetadataBodyFailsWithinFetchBudget(t *testing.T) {
 			"unbounded config body read or a starved runner",
 			func(ctx context.Context) (*RepoInfo, error) {
 				return NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).
-					Analyze(ctx, "owner/model", false)
+					AnalyzeWithRevision(ctx, "owner/model", false, "main")
 			})
 
 		if info != nil || err == nil {
@@ -204,7 +204,7 @@ func TestAnalyze_StalledRefsBodyDegradesWithinFetchBudget(t *testing.T) {
 		"unbounded refs body read or a starved runner",
 		func(ctx context.Context) (*RepoInfo, error) {
 			return NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).
-				Analyze(ctx, "owner/model", false)
+				AnalyzeWithRevision(ctx, "owner/model", false, "main")
 		})
 
 	if err != nil {

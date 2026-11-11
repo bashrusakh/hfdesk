@@ -79,7 +79,7 @@ func analyzeFixtureFiles(t *testing.T, paths []string, lfs map[string]bool, raw,
 		}
 	}))
 	defer srv.Close()
-	return NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).Analyze(context.Background(), "owner/model", dataset)
+	return NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(context.Background(), "owner/model", dataset, "main")
 }
 
 func TestAnalyzeLFSResolveFailureIsExplicit(t *testing.T) {
@@ -218,7 +218,7 @@ func TestFetchFileReadsWholeChunkedBody(t *testing.T) {
 	if err := json.Unmarshal(got, &parsed); err != nil {
 		t.Fatal(err)
 	}
-	info, err := a.Analyze(context.Background(), "owner/model", false)
+	info, err := a.AnalyzeWithRevision(context.Background(), "owner/model", false, "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +284,7 @@ func TestAnalyzeMetadataReadFailure(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	_, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).Analyze(context.Background(), "owner/model", false)
+	_, err := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()}).AnalyzeWithRevision(context.Background(), "owner/model", false, "main")
 	if err == nil || !strings.Contains(err.Error(), "quantization_config.json") || !strings.Contains(err.Error(), "unexpected EOF") {
 		t.Fatalf("read failure hidden/recovered: %v", err)
 	}
@@ -458,7 +458,7 @@ func TestAnalyzeQuantOnlyLFSRepo(t *testing.T) {
 	if q.Method != "exl3" {
 		t.Fatalf("method = %q, want exl3", q.Method)
 	}
-	if IsGPTQ(q) || info.Type == TypeGPTQ || info.Type == TypeAWQ {
+	if q.Method == "gptq" || info.Type == TypeGPTQ || info.Type == TypeAWQ {
 		t.Fatalf("GPTQ misclassification: %s %+v", info.Type, q)
 	}
 	if len(q.Backends) != 0 {

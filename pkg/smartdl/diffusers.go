@@ -447,59 +447,6 @@ func detectPrecisions(files []FileInfo) []string {
 	return result
 }
 
-// GetComponentFiles returns all files belonging to a component.
-func GetComponentFiles(files []FileInfo, componentName string) []FileInfo {
-	var result []FileInfo
-	prefix := componentName + "/"
-
-	for _, f := range files {
-		// Files directly in component directory
-		if strings.HasPrefix(f.Path, prefix) {
-			result = append(result, f)
-			continue
-		}
-
-		// Root-level files with component prefix
-		if filepath.Dir(f.Path) == "." && strings.HasPrefix(f.Name, componentName) {
-			result = append(result, f)
-		}
-	}
-
-	return result
-}
-
-// CalculateDownloadSize calculates total size for selected components and variant.
-func CalculateDownloadSize(info *DiffusersInfo, files []FileInfo, selectedComponents []string, variant string) int64 {
-	var total int64
-	selected := make(map[string]bool)
-	for _, c := range selectedComponents {
-		selected[c] = true
-	}
-
-	for _, f := range files {
-		// Check if file belongs to a selected component
-		dir := strings.Split(f.Path, "/")[0]
-		if !selected[dir] && len(selected) > 0 {
-			continue
-		}
-
-		// Check variant match
-		name := strings.ToLower(f.Name)
-		if variant != "" {
-			// Skip files that are different variant
-			for _, v := range []string{"fp16", "fp32", "bf16"} {
-				if v != variant && (strings.Contains(name, "."+v+".") || strings.Contains(name, "_"+v+".")) {
-					continue
-				}
-			}
-		}
-
-		total += f.Size
-	}
-
-	return total
-}
-
 // DiffusersToSelectableItems converts Diffusers components and variants to SelectableItems.
 func DiffusersToSelectableItems(info *DiffusersInfo) []SelectableItem {
 	if info == nil {

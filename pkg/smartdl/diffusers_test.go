@@ -302,36 +302,6 @@ func TestDetectPrecisions(t *testing.T) {
 	}
 }
 
-func TestGetComponentFiles(t *testing.T) {
-	files := []FileInfo{
-		{Path: "unet/diffusion_pytorch_model.safetensors", Name: "diffusion_pytorch_model.safetensors"},
-		{Path: "unet/config.json", Name: "config.json"},
-		{Path: "vae/diffusion_pytorch_model.safetensors", Name: "diffusion_pytorch_model.safetensors"},
-		{Path: "config.json", Name: "config.json"},
-	}
-
-	t.Run("unet component", func(t *testing.T) {
-		result := GetComponentFiles(files, "unet")
-		if len(result) != 2 {
-			t.Errorf("expected 2 files, got %d", len(result))
-		}
-	})
-
-	t.Run("vae component", func(t *testing.T) {
-		result := GetComponentFiles(files, "vae")
-		if len(result) != 1 {
-			t.Errorf("expected 1 file, got %d", len(result))
-		}
-	})
-
-	t.Run("nonexistent component", func(t *testing.T) {
-		result := GetComponentFiles(files, "nonexistent")
-		if len(result) != 0 {
-			t.Errorf("expected 0 files, got %d", len(result))
-		}
-	})
-}
-
 func TestDiffusersToSelectableItems(t *testing.T) {
 	t.Run("nil info", func(t *testing.T) {
 		items := DiffusersToSelectableItems(nil)
@@ -389,37 +359,6 @@ func TestDiffusersToSelectableItems(t *testing.T) {
 		}
 		if unetItem.Category != "component" {
 			t.Errorf("unet category = %q, want 'component'", unetItem.Category)
-		}
-	})
-}
-
-func TestCalculateDownloadSize(t *testing.T) {
-	info := &DiffusersInfo{
-		Components: []DiffusersComponent{
-			{Name: "unet"},
-			{Name: "vae"},
-		},
-	}
-
-	files := []FileInfo{
-		{Path: "unet/model.safetensors", Name: "model.safetensors", Size: 3000000000},
-		{Path: "unet/model.fp16.safetensors", Name: "model.fp16.safetensors", Size: 1500000000},
-		{Path: "vae/model.safetensors", Name: "model.safetensors", Size: 300000000},
-		{Path: "text_encoder/model.safetensors", Name: "model.safetensors", Size: 500000000},
-	}
-
-	t.Run("all components no variant", func(t *testing.T) {
-		size := CalculateDownloadSize(info, files, []string{"unet", "vae"}, "")
-		// Should include unet + vae files
-		if size < 3000000000 {
-			t.Errorf("size = %d, expected > 3GB", size)
-		}
-	})
-
-	t.Run("single component", func(t *testing.T) {
-		size := CalculateDownloadSize(info, files, []string{"vae"}, "")
-		if size != 300000000 {
-			t.Errorf("size = %d, expected 300000000", size)
 		}
 	})
 }

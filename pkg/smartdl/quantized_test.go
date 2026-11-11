@@ -4,6 +4,7 @@
 package smartdl
 
 import (
+	"slices"
 	"testing"
 )
 
@@ -374,131 +375,6 @@ func TestEstimateVRAM(t *testing.T) {
 	})
 }
 
-func TestIsGPTQ(t *testing.T) {
-	tests := []struct {
-		method   string
-		expected bool
-	}{
-		{"gptq", true},
-		{"awq", false},
-		{"exl2", false},
-		{"", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.method, func(t *testing.T) {
-			info := &QuantizedInfo{Method: tt.method}
-			if got := IsGPTQ(info); got != tt.expected {
-				t.Errorf("IsGPTQ() = %v, want %v", got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestIsAWQ(t *testing.T) {
-	tests := []struct {
-		method   string
-		expected bool
-	}{
-		{"awq", true},
-		{"gptq", false},
-		{"exl2", false},
-		{"", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.method, func(t *testing.T) {
-			info := &QuantizedInfo{Method: tt.method}
-			if got := IsAWQ(info); got != tt.expected {
-				t.Errorf("IsAWQ() = %v, want %v", got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestIsEXL2(t *testing.T) {
-	tests := []struct {
-		method   string
-		expected bool
-	}{
-		{"exl2", true},
-		{"gptq", false},
-		{"awq", false},
-		{"", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.method, func(t *testing.T) {
-			info := &QuantizedInfo{Method: tt.method}
-			if got := IsEXL2(info); got != tt.expected {
-				t.Errorf("IsEXL2() = %v, want %v", got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestVRAMHuman(t *testing.T) {
-	tests := []struct {
-		name     string
-		vram     int64
-		expected string
-	}{
-		{"zero", 0, "0 B"},
-		{"bytes", 512, "512 B"},
-		{"kilobytes", 1536, "1.5 KiB"},
-		{"megabytes", 256 * 1024 * 1024, "256.0 MiB"},
-		{"gigabytes", 8 * 1024 * 1024 * 1024, "8.0 GiB"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			info := &QuantizedInfo{EstimatedVRAM: tt.vram}
-			result := VRAMHuman(info)
-			if result != tt.expected {
-				t.Errorf("VRAMHuman() = %q, want %q", result, tt.expected)
-			}
-		})
-	}
-}
-
-func TestSupportsBackend(t *testing.T) {
-	info := &QuantizedInfo{
-		Backends: []string{"auto-gptq", "exllamav2", "transformers"},
-	}
-
-	t.Run("supported backend", func(t *testing.T) {
-		if !SupportsBackend(info, "auto-gptq") {
-			t.Error("should support auto-gptq")
-		}
-		if !SupportsBackend(info, "exllamav2") {
-			t.Error("should support exllamav2")
-		}
-	})
-
-	t.Run("unsupported backend", func(t *testing.T) {
-		if SupportsBackend(info, "vllm") {
-			t.Error("should not support vllm")
-		}
-		if SupportsBackend(info, "unknown") {
-			t.Error("should not support unknown")
-		}
-	})
-
-	t.Run("empty backends", func(t *testing.T) {
-		emptyInfo := &QuantizedInfo{Backends: []string{}}
-		if SupportsBackend(emptyInfo, "any") {
-			t.Error("should not support any backend with empty list")
-		}
-	})
-
-	t.Run("nil backends", func(t *testing.T) {
-		nilInfo := &QuantizedInfo{}
-		if SupportsBackend(nilInfo, "any") {
-			t.Error("should not support any backend with nil list")
-		}
-	})
-}
-
 func TestQuantizedToSelectableItems(t *testing.T) {
 	t.Run("nil info", func(t *testing.T) {
 		items := QuantizedToSelectableItems(nil, nil)
@@ -792,7 +668,7 @@ func TestExtendedQuantMethodDescriptionsAndBackends(t *testing.T) {
 	if fp8 == nil || fp8.Method != "fp8" || fp8.MethodDescription == "" {
 		t.Fatalf("fp8 projection = %+v", fp8)
 	}
-	if !SupportsBackend(fp8, "transformers") || !SupportsBackend(fp8, "vllm") {
+	if !slices.Contains(fp8.Backends, "transformers") || !slices.Contains(fp8.Backends, "vllm") {
 		t.Errorf("fp8 backends = %v, want transformers and vllm", fp8.Backends)
 	}
 
@@ -802,7 +678,7 @@ func TestExtendedQuantMethodDescriptionsAndBackends(t *testing.T) {
 	if ct == nil || ct.Method != "compressed-tensors" || ct.MethodDescription == "" {
 		t.Fatalf("compressed-tensors projection = %+v", ct)
 	}
-	if !SupportsBackend(ct, "vllm") || !SupportsBackend(ct, "transformers") {
+	if !slices.Contains(ct.Backends, "vllm") || !slices.Contains(ct.Backends, "transformers") {
 		t.Errorf("compressed-tensors backends = %v, want vllm and transformers", ct.Backends)
 	}
 }
@@ -840,7 +716,7 @@ func TestAnalyzeQuantizedFromMLXQuantizationBlock(t *testing.T) {
 	if info.GroupSize != 64 {
 		t.Errorf("GroupSize = %d, want 64 from the block", info.GroupSize)
 	}
-	if !SupportsBackend(info, "mlx-lm") {
+	if !slices.Contains(info.Backends, "mlx-lm") {
 		t.Errorf("backends = %v, want mlx-lm", info.Backends)
 	}
 	if info.ModelArchitecture != "LlamaForCausalLM" {

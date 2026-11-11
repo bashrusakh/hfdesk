@@ -99,44 +99,6 @@ func analyzeLoRA(metadata map[string]interface{}) *LoRAInfo {
 	return info
 }
 
-// IsQLoRA checks if the adapter is a QLoRA (quantized LoRA).
-func IsQLoRA(info *LoRAInfo) bool {
-	return info.AdapterType == "qlora" || info.QuantType != ""
-}
-
-// RequiresBaseModel returns true if the adapter requires a base model.
-func RequiresBaseModel(info *LoRAInfo) bool {
-	return info.BaseModel != ""
-}
-
-// GetEffectiveRank returns the effective rank considering alpha scaling.
-func GetEffectiveRank(info *LoRAInfo) float64 {
-	if info.Rank == 0 {
-		return 0
-	}
-	if info.Alpha == 0 {
-		return float64(info.Rank)
-	}
-	return info.Alpha / float64(info.Rank)
-}
-
-// EstimateAdapterSize estimates the adapter's parameter count.
-// Formula: 2 * rank * hidden_dim * num_target_modules (approximate)
-func EstimateAdapterSize(info *LoRAInfo, hiddenDim int) int64 {
-	if info.Rank == 0 || hiddenDim == 0 {
-		return 0
-	}
-
-	numModules := len(info.TargetModules)
-	if numModules == 0 {
-		numModules = 4 // Default assumption for typical LoRA configs
-	}
-
-	// Each LoRA adapter has A (rank x hidden) and B (hidden x rank) matrices
-	paramsPerModule := int64(2 * info.Rank * hiddenDim)
-	return paramsPerModule * int64(numModules)
-}
-
 // LoRAToRelatedDownloads creates RelatedDownload entries for LoRA adapters.
 // This indicates the base model that is required for the adapter to work.
 func LoRAToRelatedDownloads(info *LoRAInfo) []RelatedDownload {

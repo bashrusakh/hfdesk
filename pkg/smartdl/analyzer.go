@@ -67,12 +67,6 @@ func NewAnalyzer(opts AnalyzerOptions) *Analyzer {
 	}
 }
 
-// Analyze fetches and analyzes a HuggingFace repository using the default "main" revision.
-// If isDataset is false, it will first try to fetch as a model, then as a dataset if not found.
-func (a *Analyzer) Analyze(ctx context.Context, repo string, isDataset bool) (*RepoInfo, error) {
-	return a.AnalyzeWithRevision(ctx, repo, isDataset, "main")
-}
-
 // AnalyzeWithRevision fetches and analyzes a HuggingFace repository at a specific revision.
 // If isDataset is false, it will first try to fetch as a model, then as a dataset if not found.
 // If both namespaces exist, it returns ErrBothExist so the caller can ask the

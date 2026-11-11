@@ -232,11 +232,6 @@ func stripSplitSuffix(name string) string {
 	return splitSuffixPattern.ReplaceAllString(name, "")
 }
 
-// isSplitShard reports whether a filename carries a split-GGUF shard suffix.
-func isSplitShard(name string) bool {
-	return splitSuffixPattern.MatchString(name)
-}
-
 // GGUFSplitShard describes the recognized shard suffix of a split-GGUF
 // filename. Start and End delimit the decimal shard index within the original
 // name, so callers that group shards can replace only the variable part while
@@ -472,12 +467,6 @@ func analyzeGGUF(files []FileInfo) *GGUFInfo {
 	return info
 }
 
-// parseGGUFQuantization extracts quantization info from a single GGUF file.
-// It is a thin wrapper over quantizationFromGroup for the single-file case.
-func parseGGUFQuantization(f FileInfo) *GGUFQuantization {
-	return quantizationFromGroup([]FileInfo{f})
-}
-
 // quantizationFromGroup builds a single GGUFQuantization from one or more files
 // that belong to the same quantization. For split GGUFs the group holds every
 // shard; sizes are summed and RAM is estimated from the combined total. The
@@ -575,28 +564,6 @@ func estimateRAM(fileSize int64) int64 {
 	return int64(float64(fileSize)*1.1) + overhead
 }
 
-// RecommendGGUF recommends quantizations based on available RAM.
-func RecommendGGUF(info *GGUFInfo, availableRAM int64) []GGUFQuantization {
-	var recommended []GGUFQuantization
-
-	for _, q := range info.Quantizations {
-		if q.EstimatedRAM <= availableRAM {
-			q.Recommended = true
-			recommended = append(recommended, q)
-		}
-	}
-
-	// Sort by quality (best that fits in RAM first)
-	sort.Slice(recommended, func(i, j int) bool {
-		if recommended[i].Quality != recommended[j].Quality {
-			return recommended[i].Quality > recommended[j].Quality
-		}
-		return recommended[i].File.Size < recommended[j].File.Size
-	})
-
-	return recommended
-}
-
 // preferredMMProj picks the preferred multimodal projector file from a set.
 // Preference order by precision: F16 > BF16 > F32 > first file. Returns the
 // chosen FileInfo and a narrow filter string (lowercased basename without
@@ -652,8 +619,8 @@ func mmprojArtifactID(f FileInfo) string {
 // EstimatedRAM fits the budget, then the same two rules run in order over that
 // set (rule 2 keeps its size guard). When some artifacts fit but neither rule
 // matches, the fittest candidate is the highest-quality fitting artifact
-// (smaller size wins a quality tie; list order breaks exact ties) — the same
-// quality heuristic RecommendGGUF sorts by. When NOTHING fits, the fallback is
+// (smaller size wins a quality tie; list order breaks exact ties). When
+// NOTHING fits, the fallback is
 // the non-MTP artifact with the smallest EstimatedRAM (list order breaks ties);
 // a repository with no non-MTP artifact still returns -1, because MTP variants
 // are never auto-recommended in any mode.

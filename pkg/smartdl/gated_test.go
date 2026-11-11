@@ -122,7 +122,7 @@ func TestAnalyze_AuthCheck(t *testing.T) {
 			}
 			analyzer := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: client, Token: tc.token})
 
-			info, err := analyzer.Analyze(context.Background(), "owner/repo", tc.dataset)
+			info, err := analyzer.AnalyzeWithRevision(context.Background(), "owner/repo", tc.dataset, "main")
 			if tc.wantGated {
 				var gated *GatedRepoError
 				if !errors.As(err, &gated) {
@@ -249,7 +249,7 @@ func TestAnalyze_TreeGatedRepo(t *testing.T) {
 			defer srv.Close()
 
 			analyzer := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client(), Token: "hf_secret"})
-			info, err := analyzer.Analyze(context.Background(), "owner/repo", tc.dataset)
+			info, err := analyzer.AnalyzeWithRevision(context.Background(), "owner/repo", tc.dataset, "main")
 
 			switch {
 			case tc.wantGated:
@@ -368,7 +368,7 @@ func TestAnalyzeAutoDetectionStillReturnsBothExist(t *testing.T) {
 	defer srv.Close()
 
 	analyzer := NewAnalyzer(AnalyzerOptions{Endpoint: srv.URL, HTTPClient: srv.Client()})
-	info, err := analyzer.Analyze(context.Background(), repo, false)
+	info, err := analyzer.AnalyzeWithRevision(context.Background(), repo, false, "main")
 	if info != nil || !errors.Is(err, ErrBothExist) {
 		t.Fatalf("info = %v, error = %v; want ErrBothExist", info, err)
 	}
