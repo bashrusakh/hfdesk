@@ -576,6 +576,11 @@ func TestLocalModelFolderDelete_SingleModelGate(t *testing.T) {
 			"unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors",
 			"x-Q4_K_M.gguf",
 		}, true, http.StatusConflict, "multiple models"},
+		// F8 at the API level: dropping a component-NAMED interior directory
+		// merged these two folder-relative names and approved the folder.
+		{"component-named dir at non-first position", []string{
+			"a/unet/x.safetensors", "a/x.safetensors",
+		}, true, http.StatusConflict, "multiple models"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -1730,15 +1730,20 @@ reaches the end of the name, and only the canonical `<model>.mmproj-<quant>`
 companion shape cuts — an interior occurrence never cuts, so two distinct
 file names are never merged by an interior excision; the only designed merges
 are quant/shard/precision variants of one name, the canonical companion, and
-one pipeline's component roles. Weight files under recognized Diffusers
-component directories are pipeline members: uniformly named component roles
-count as one shared pipeline key (a real `unet`/`vae`/`text_encoder` tree is
-one model), a component directory holding more than one distinct base yields
-distinct keys, and pipeline weights mixed with any top-level weight yield
-multiple keys — each refused. Any other parent directory stays in its key
-(`a/…` and `b/…` remain distinct), and a folder whose component roles cannot
-be told apart by names alone — one model's `unet` beside another's `vae`,
-each internally uniform — stays eligible: the conservative floor of
+one pipeline's component roles — pipeline membership is decided strictly by
+the FIRST directory component, and the path below the role directory stays
+part of the comparison. Weight files whose first directory is a recognized
+Diffusers component directory are pipeline members: uniformly named component
+roles count as one shared pipeline key (a real `unet`/`vae`/`text_encoder`
+tree is one model), a role directory whose recorded bases (sub-path plus file
+base) are not all equal yields distinct keys — two models' parts or an
+adapter pile inside one role directory refuse — and pipeline weights mixed
+with any top-level weight yield multiple keys, each refused. Every other key
+keeps every directory component verbatim: an interior component is never
+dropped, so `a/unet/x` and `a/x` — and `a/b/unet/x` and `a/b/x` — remain
+distinct, as do `a/…` and `b/…`. A folder whose component roles cannot be
+told apart by names alone — one model's `unet` beside another's `vae`, each
+internally uniform — stays eligible: the conservative floor of
 name-based classification. One distinct model key makes the folder eligible;
 two or more keys, no recognized weight files, or any weight name the rules
 cannot confidently reduce make it ineligible, and the `DELETE` refuses with

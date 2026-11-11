@@ -194,11 +194,19 @@ func reduceWeightFileKey(relPath string) (dirs []string, reduced string, weight,
 // classification. See reduceWeightFileKey for the strictly right-anchored,
 // byte-aligned rule.
 //
+// Directory scoping: pipeline membership is decided ONLY by the first
+// directory component — only a first component in diffusersComponentDirs is
+// dropped from this per-file key; any component-NAMED directory deeper in
+// the path is an ordinary directory and every directory component is kept
+// verbatim. An interior component must never be dropped: `a/unet/x` and
+// `a/x` are distinct folder-relative names and stay distinct keys.
+//
 // The exact merge claim: two distinct file names are never merged by an
 // interior excision; the only designed merges are quant/shard/precision
 // variants of one name, the canonical "<model>.mmproj-<quant>" companion,
 // and — at the folder level, see SingleModelFolderKeys — one pipeline's
-// component roles.
+// component roles (strictly first-component membership with the sub-path
+// below the role directory preserved).
 //
 // Three outcomes: a non-weight file returns ("", false, false) and carries
 // no model identity (config/tokenizer/notes files never multiply keys); a
@@ -213,10 +221,14 @@ func WeightFileModelKey(relPath string) (key string, weight, ok bool) {
 		return "", isWeight, good
 	}
 	kept := make([]string, 0, len(dirs))
-	for _, dir := range dirs {
-		if dir != "" && !diffusersComponentDirs[dir] {
-			kept = append(kept, dir)
+	for i, dir := range dirs {
+		if dir == "" {
+			continue
 		}
+		if i == 0 && diffusersComponentDirs[dir] {
+			continue
+		}
+		kept = append(kept, dir)
 	}
 	key = strings.Join(kept, "/")
 	if key != "" {
@@ -239,16 +251,23 @@ const pipelineModelKey = ":pipeline"
 // Pipeline-key rule (owner decision), layered on the per-file reduction:
 //
 //  1. a weight file whose FIRST directory is a recognized Diffusers
-//     component directory is a pipeline member; every uniformly named
-//     component role contributes ONE shared pipeline key, so a real tree
+//     component directory is a pipeline member — membership is strictly
+//     first-component-based; every uniformly named component role
+//     contributes ONE shared pipeline key, so a real tree
 //     (text_encoder/pytorch_model.bin + unet/diffusion_pytorch_model +
 //     vae/diffusion_pytorch_model) is one model with role-named components;
-//  2. within one component directory, distinct reduced bases become distinct
-//     keys — two models' parts in one role directory are refused;
+//  2. within one component directory, the role's recorded base includes the
+//     sub-path BELOW the role directory plus the reduced file base
+//     (unet/a/pytorch_lora_weights and unet/b/pytorch_lora_weights are two
+//     distinct bases) and also distinct reduced bases alone — so two
+//     models' parts, or an adapter pile, inside one role directory are
+//     refused; a plain component payload records only its reduced base,
+//     keeping the uniform-role pipeline merge for the real SD/SDXL shapes;
 //  3. a pipeline key together with any non-component weight key gives two or
 //     more keys — pipeline weights mixed with top-level weights are refused;
-//  4. non-component nested directories keep their directories in their keys
-//     (a/lora and b/lora stay distinct).
+//  4. non-component keys keep EVERY directory component verbatim: an
+//     interior component is never dropped, so a/unet/x and a/x — and
+//     a/b/unet/x and a/b/x — stay distinct.
 //
 // Accepted floor, stated honestly: name-based classification cannot tell one
 // model's component directory from another's when each role directory is
@@ -276,16 +295,24 @@ func SingleModelFolderKeys(paths []string) ([]string, bool) {
 			if roleBases[dirs[0]] == nil {
 				roleBases[dirs[0]] = map[string]bool{}
 			}
-			roleBases[dirs[0]][reduced] = true
+			// The role's recorded base includes the sub-path BELOW the role
+			// directory (F9): unet/a/lora and unet/b/lora are two distinct
+			// bases, so an adapter pile inside a role directory refuses
+			// exactly as it does at top level. A plain component payload
+			// records only its reduced base, keeping the uniform-role
+			// pipeline merge for the real SD/SDXL shapes.
+			basis := reduced
+			if len(dirs) > 1 {
+				basis = strings.Join(dirs[1:], "/") + "/" + reduced
+			}
+			roleBases[dirs[0]][basis] = true
 			continue
 		}
-		kept := make([]string, 0, len(dirs))
-		for _, dir := range dirs {
-			if dir != "" && !diffusersComponentDirs[dir] {
-				kept = append(kept, dir)
-			}
-		}
-		key := strings.Join(kept, "/")
+		// General keys keep EVERY directory component verbatim (F8): this
+		// branch only runs when the FIRST component is not a pipeline
+		// component, and a component-NAMED directory deeper in the path must
+		// never be dropped — `a/unet/x` and `a/x` are distinct names.
+		key := strings.Join(dirs, "/")
 		if key != "" {
 			key += "/"
 		}

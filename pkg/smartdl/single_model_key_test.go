@@ -33,6 +33,13 @@ func TestWeightFileModelKey(t *testing.T) {
 		// Any other parent directory stays in the key.
 		{"a/pytorch_lora_weights.safetensors", "a/pytorch_lora_weights", true, true},
 		{"b/pytorch_lora_weights.safetensors", "b/pytorch_lora_weights", true, true},
+		// F8: a component-NAMED directory at a non-first position is NOT a
+		// pipeline component — every directory component stays verbatim in the
+		// general key, so these pairs must never merge.
+		{"a/unet/x.safetensors", "a/unet/x", true, true},
+		{"a/x.safetensors", "a/x", true, true},
+		{"a/b/unet/x.safetensors", "a/b/unet/x", true, true},
+		{"a/b/x.safetensors", "a/b/x", true, true},
 		// F3: an interior span never cuts — the full name is the key.
 		{"tiny-Q4_K_M-llama.gguf", "tiny-Q4_K_M-llama", true, true},
 		{"x-mmproj-y.gguf", "x-mmproj-y", true, true},
@@ -74,6 +81,9 @@ func TestWeightFileModelKey(t *testing.T) {
 		// F6 pairs: a shifted byte offset in the ".mmproj-" cut merged these.
 		{"AȺȺ.m.gguf", "AȺȺ.mmproj-zẞẞ.gguf"},
 		{"AȺȺȺ.mm.gguf", "AȺȺȺ.mmproj-zẞẞẞ.gguf"},
+		// F8 pairs: dropping a component-NAMED interior directory merged these.
+		{"a/unet/x.safetensors", "a/x.safetensors"},
+		{"a/b/unet/x.safetensors", "a/b/x.safetensors"},
 	}
 	for _, pair := range distinct {
 		ka, _, _ := WeightFileModelKey(pair[0])
@@ -132,6 +142,20 @@ func TestSingleModelFolderKeys(t *testing.T) {
 		name  string
 		paths []string
 	}{
+		// F8 folder: a component-named interior directory must not collapse
+		// distinct folder-relative names.
+		{"component-named dir at non-first position", []string{
+			"a/unet/x.safetensors", "a/x.safetensors",
+		}},
+		{"component-named dir deeper", []string{
+			"a/b/unet/x.safetensors", "a/b/x.safetensors",
+		}},
+		// F9 folder: sub-paths below a role directory are part of the role's
+		// recorded basis, so an adapter pile inside unet/ refuses just as it
+		// does at top level.
+		{"adapter pile inside a role dir", []string{
+			"unet/a/pytorch_lora_weights.safetensors", "unet/b/pytorch_lora_weights.safetensors",
+		}},
 		{"two models in one component dir", []string{"unet/modelA.safetensors", "unet/modelB.safetensors"}},
 		{"pipeline mixed with a top-level GGUF", []string{
 			"unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors",
@@ -152,7 +176,10 @@ func TestSingleModelFolderKeys(t *testing.T) {
 		}
 	}
 	// Sorted, deterministic output for the mixed case: pipeline + top-level.
-	if keys, _ := SingleModelFolderKeys(many[1].paths); len(keys) != 2 || keys[0] != pipelineModelKey || keys[1] != "x" {
+	if keys, _ := SingleModelFolderKeys([]string{
+		"unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors",
+		"x-Q4_K_M.gguf",
+	}); len(keys) != 2 || keys[0] != pipelineModelKey || keys[1] != "x" {
 		t.Errorf("mixed keys=%v, want [%q \"x\"]", keys, pipelineModelKey)
 	}
 	// Fail-closed outcomes.
