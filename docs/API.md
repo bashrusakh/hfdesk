@@ -878,8 +878,8 @@ companions never count, excludes apply before the credit, and a
 membership selection can leave every direct pattern unselected and named.
 filters_unmatched names patterns that matched no file at selection; a
 pattern whose matches were all removed by `shardRanges` is not named (the
-ranged result is visible in the plan preview and the shard-range notices
-describe the range's effect).
+ranged result is visible in the plan preview, and an ineffective range is
+named by the shard-range notices).
 The notice never repeats a pattern whose miss the split-mention notices
 above already report: that pinned coverage wins for the pattern, and this
 producer extends to everything else (direct patterns, shaped selectors,
