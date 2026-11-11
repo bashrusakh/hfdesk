@@ -110,6 +110,28 @@ func TestSubsystemRejectsATruncatedImage(t *testing.T) {
 	}
 }
 
+// TestSubsystemRejectsAnImageTruncatedInsideThePEHeader proves that a file
+// that ends inside the 24 byte PE header fails the header read itself,
+// before the signature check or any field extraction runs.
+func TestSubsystemRejectsAnImageTruncatedInsideThePEHeader(t *testing.T) {
+	image := buildPEImage(SubsystemWindowsGUI, magicPE32, testOptionalHeaderSize32)
+
+	// The image is cut inside the 24 byte PE header, so the read of the
+	// header comes up short.
+	truncated := image[:testPeHeaderOffset+peSignatureSize-1]
+
+	_, err := SubsystemOf(bytes.NewReader(truncated))
+	if err == nil {
+		t.Fatal("SubsystemOf accepted an image truncated inside the PE header")
+	}
+	if !strings.Contains(err.Error(), "read the PE header") {
+		t.Errorf("error = %q, want it to report the failed PE header read", err.Error())
+	}
+	if !strings.Contains(err.Error(), "unexpected EOF") {
+		t.Errorf("error = %q, want it to report the truncated header", err.Error())
+	}
+}
+
 // TestSubsystemRejectsAnImageWithoutThePESignature proves that a file with a
 // DOS header but without a PE header is rejected.
 func TestSubsystemRejectsAnImageWithoutThePESignature(t *testing.T) {
@@ -214,6 +236,7 @@ func TestExecutableMachineAcceptsOptionalHeadersWithFewerDeclaredDirectories(t *
 		{"PE32+ with no directories", magicPE32Plus, testOptionalHeaderFixedSize64, MachineAMD64},
 		{"PE32+ with one directory", magicPE32Plus, testOptionalHeaderFixedSize64 + dataDirectoryEntrySize, MachineAMD64},
 		{"PE32+ with all current directories", magicPE32Plus, testOptionalHeaderSize64, MachineAMD64},
+		{"PE32+ ARM64 with all current directories", magicPE32Plus, testOptionalHeaderSize64, MachineARM64},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -256,6 +279,21 @@ func TestExecutableMachineReadsStructurallyCompleteImage(t *testing.T) {
 	image := buildPEImageWithMachine(SubsystemWindowsCUI, magicPE32Plus, testOptionalHeaderSize64, MachineAMD64)
 	machine, err := ExecutableMachineOf(bytes.NewReader(image))
 	assertNoError(t, err, "ExecutableMachineOf: %v", err)
+	if machine != MachineAMD64 {
+		t.Errorf("machine = 0x%04X, want 0x%04X", machine, MachineAMD64)
+	}
+}
+
+// TestExecutableMachineReadsTheFile proves that the machine type is read
+// out of a PE file on disk through the path-based entry point.
+func TestExecutableMachineReadsTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hfdesk.exe")
+	image := buildPEImageWithMachine(SubsystemWindowsCUI, magicPE32Plus, testOptionalHeaderSize64, MachineAMD64)
+	err := os.WriteFile(path, image, 0o600)
+	assertNoError(t, err, "write the image: %v", err)
+
+	machine, err := ExecutableMachine(path)
+	assertNoError(t, err, "ExecutableMachine: %v", err)
 	if machine != MachineAMD64 {
 		t.Errorf("machine = 0x%04X, want 0x%04X", machine, MachineAMD64)
 	}
