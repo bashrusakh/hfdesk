@@ -228,45 +228,6 @@ Environment=%s
 WantedBy=%s
 `
 
-// renderUnit renders the systemd unit of an installation.
-//
-// The function renders the text of the unit and never changes anything on
-// the machine. The command of the unit is the canonical argument vector of
-// the shared contract, so every platform registers the same command.
-//
-// The account is the service account the installation resolved for a
-// machine-wide instance. It is nil for a user scope instance, which runs as
-// the user of the session.
-func renderUnit(opts InstallOptions, account *user.User) (string, error) {
-	home, err := unitHomeDir(opts)
-	if err != nil {
-		return "", err
-	}
-	workingDirectory, err := systemdWorkingDirectoryValue(opts.Paths.StateDir)
-	if err != nil {
-		return "", err
-	}
-	identity, err := unitIdentity(opts, account)
-	if err != nil {
-		return "", err
-	}
-
-	target := "default.target"
-	if opts.Scope == ScopeSystem {
-		target = "multi-user.target"
-	}
-
-	return fmt.Sprintf(unitTemplate,
-		"",
-		identity,
-		systemdExecStart(opts),
-		workingDirectory,
-		systemdStopTimeout(),
-		systemdQuote("HOME="+home),
-		target,
-	), nil
-}
-
 func systemdExecStart(opts InstallOptions) string {
 	words := make([]string, 0, len(RunArgs(opts))+1)
 	words = append(words, systemdQuoteCommandAlways(opts.Executable))

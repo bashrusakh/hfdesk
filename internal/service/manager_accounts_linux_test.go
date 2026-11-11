@@ -438,8 +438,9 @@ func TestSystemdGrantInstanceDirs(t *testing.T) {
 	cacheOwner, cacheGroup := systemdOwner(t, cache)
 
 	m := &systemdManager{scope: ScopeSystem}
-	err := m.grantInstanceDirs(opts, account, created)
-	assertNoError(t, err, "grantInstanceDirs() = %v, want nil", err)
+	identity := systemdAccessIdentityForInstall(opts.Scope, opts, false, systemdLoadedConfig{}, false, account)
+	err := m.grantInstanceDirsForDirsWithIdentity(opts, identity, created, instanceDirs(opts))
+	assertNoError(t, err, "grantInstanceDirsForDirsWithIdentity() = %v, want nil", err)
 
 	// Every directory the installation created belongs to the account: the
 	// parents it created for the directories of the instance belong to it
@@ -504,14 +505,15 @@ func TestSystemdGrantInstanceDirsRefusesAPreExistingDirectory(t *testing.T) {
 	configOwner, configGroup := systemdOwner(t, config)
 
 	m := &systemdManager{scope: ScopeSystem}
-	err := m.grantInstanceDirs(opts, account, created)
+	identity := systemdAccessIdentityForInstall(opts.Scope, opts, false, systemdLoadedConfig{}, false, account)
+	err := m.grantInstanceDirsForDirsWithIdentity(opts, identity, created, instanceDirs(opts))
 	if err == nil {
-		t.Fatal("grantInstanceDirs() = nil, want the refusal of a pre-existing directory")
+		t.Fatal("grantInstanceDirsForDirsWithIdentity() = nil, want the refusal of a pre-existing directory")
 	}
 	want := fmt.Sprintf("service: the state dir %q of the machine-wide instance is not writable by the service account %q: grant it to the account (for example %q) and install again",
 		state, account.Username, "chown "+account.Username+" "+state)
 	if err.Error() != want {
-		t.Errorf("grantInstanceDirs() = %q, want %q", err, want)
+		t.Errorf("grantInstanceDirsForDirsWithIdentity() = %q, want %q", err, want)
 	}
 
 	// The directory that existed before the installation still belongs to
@@ -565,8 +567,9 @@ func TestSystemdGrantInstanceDirsKeepsAWritablePreExistingDirectory(t *testing.T
 	}
 
 	m := &systemdManager{scope: ScopeSystem}
-	err := m.grantInstanceDirs(opts, account, created)
-	assertNoError(t, err, "grantInstanceDirs() = %v, want nil for a pre-existing directory the account can write into", err)
+	identity := systemdAccessIdentityForInstall(opts.Scope, opts, false, systemdLoadedConfig{}, false, account)
+	err := m.grantInstanceDirsForDirsWithIdentity(opts, identity, created, instanceDirs(opts))
+	assertNoError(t, err, "grantInstanceDirsForDirsWithIdentity() = %v, want nil for a pre-existing directory the account can write into", err)
 
 	// The directories still belong to their owner: the installation grants
 	// only the directories it created itself.
@@ -676,13 +679,14 @@ func TestSystemdGrantInstanceDirsRefusesADirectoryOfTheMachine(t *testing.T) {
 	stateOwner, stateGroup := systemdOwner(t, opts.Paths.StateDir)
 
 	m := &systemdManager{scope: ScopeSystem}
-	err := m.grantInstanceDirs(opts, account, nil)
+	identity := systemdAccessIdentityForInstall(opts.Scope, opts, false, systemdLoadedConfig{}, false, account)
+	err := m.grantInstanceDirsForDirsWithIdentity(opts, identity, nil, instanceDirs(opts))
 	if err == nil {
-		t.Fatal("grantInstanceDirs() = nil, want the refusal of a directory of the machine")
+		t.Fatal("grantInstanceDirsForDirsWithIdentity() = nil, want the refusal of a directory of the machine")
 	}
 	want := `service: the config dir "/etc" is a directory of the machine: the instance needs a directory of its own, name one below a directory of the machine`
 	if err.Error() != want {
-		t.Errorf("grantInstanceDirs() = %q, want %q", err, want)
+		t.Errorf("grantInstanceDirsForDirsWithIdentity() = %q, want %q", err, want)
 	}
 
 	// The refusal granted nothing: the state directory still belongs to
@@ -704,6 +708,8 @@ func TestSystemdCheckServiceAccountAccess(t *testing.T) {
 	account, err := user.Current()
 	assertNoError(t, err, "Current() = %v, want nil", err)
 	other := systemdSecondAccount(t)
+	otherAccess, err := linuxSystemdAccessIdentity(other, other.Gid, nil)
+	assertNoError(t, err, "the access identity of the second account = %v, want nil", err)
 
 	root := t.TempDir()
 	owned := filepath.Join(root, "owned")
@@ -747,12 +753,14 @@ func TestSystemdCheckServiceAccountAccess(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := checkDirWritableByAccount(tc.path, tc.account)
+			identity, err := linuxSystemdAccessIdentity(tc.account, tc.account.Gid, nil)
+			assertNoError(t, err, "the access identity of %q = %v, want nil", tc.account.Username, err)
+			err = checkDirWritableByIdentity(tc.path, identity)
 			if tc.wantErr && err == nil {
-				t.Errorf("checkDirWritableByAccount(%q) = nil, want a refusal", tc.path)
+				t.Errorf("checkDirWritableByIdentity(%q) = nil, want a refusal", tc.path)
 			}
 			if !tc.wantErr && err != nil {
-				t.Errorf("checkDirWritableByAccount(%q) = %v, want nil", tc.path, err)
+				t.Errorf("checkDirWritableByIdentity(%q) = %v, want nil", tc.path, err)
 			}
 		})
 	}
@@ -768,8 +776,8 @@ func TestSystemdCheckServiceAccountAccess(t *testing.T) {
 		// The account cannot write into the cache of the scope, and the
 		// installation does not check it: the cache lives inside the
 		// state directory of the instance.
-		if err := m.checkServiceAccountAccess(opts, other); err != nil {
-			t.Errorf("checkServiceAccountAccess() = %v, want nil for the cache of the scope", err)
+		if err := m.checkServiceAccountAccessWithIdentity(opts, other.Username, &otherAccess); err != nil {
+			t.Errorf("checkServiceAccountAccessWithIdentity() = %v, want nil for the cache of the scope", err)
 		}
 	})
 
@@ -778,8 +786,8 @@ func TestSystemdCheckServiceAccountAccess(t *testing.T) {
 		opts.Paths.StateDir = filepath.Join(root, "state")
 		opts.CacheDir = foreign
 		opts.HubDir = filepath.Join(foreign, "hub")
-		if err := m.checkServiceAccountAccess(opts, other); err == nil {
-			t.Error("checkServiceAccountAccess() = nil, want the refusal of the named cache")
+		if err := m.checkServiceAccountAccessWithIdentity(opts, other.Username, &otherAccess); err == nil {
+			t.Error("checkServiceAccountAccessWithIdentity() = nil, want the refusal of the named cache")
 		}
 	})
 
@@ -788,8 +796,8 @@ func TestSystemdCheckServiceAccountAccess(t *testing.T) {
 		opts.CacheDir = foreign
 
 		user := &systemdManager{scope: ScopeUser}
-		if err := user.checkServiceAccountAccess(opts, other); err != nil {
-			t.Errorf("checkServiceAccountAccess() = %v, want nil for a user scope instance", err)
+		if err := user.checkServiceAccountAccessWithIdentity(opts, other.Username, &otherAccess); err != nil {
+			t.Errorf("checkServiceAccountAccessWithIdentity() = %v, want nil for a user scope instance", err)
 		}
 	})
 }
@@ -829,8 +837,10 @@ func TestSystemdCheckServiceAccountAccessSkipsAMissingDirectoryInsideTheStateRoo
 	// so the account can use the local directory as well.
 	opts.LocalDir = filepath.Join(state, "output")
 
-	if err := m.checkServiceAccountAccess(opts, other); err != nil {
-		t.Errorf("checkServiceAccountAccess() = %v, want nil for a directory inside the state directory of the instance", err)
+	otherAccess, err := linuxSystemdAccessIdentity(other, other.Gid, nil)
+	assertNoError(t, err, "the access identity of the second account = %v, want nil", err)
+	if err := m.checkServiceAccountAccessWithIdentity(opts, other.Username, &otherAccess); err != nil {
+		t.Errorf("checkServiceAccountAccessWithIdentity() = %v, want nil for a directory inside the state directory of the instance", err)
 	}
 
 	// A directory outside of the state directory is still checked: the
@@ -841,8 +851,8 @@ func TestSystemdCheckServiceAccountAccessSkipsAMissingDirectoryInsideTheStateRoo
 	err = os.Chmod(foreign, 0o700)
 	assertNoError(t, err, "close the foreign directory: %v", err)
 	opts.LocalDir = foreign
-	if err := m.checkServiceAccountAccess(opts, other); err == nil {
-		t.Error("checkServiceAccountAccess() = nil, want the refusal of a directory outside of the state directory of the instance")
+	if err := m.checkServiceAccountAccessWithIdentity(opts, other.Username, &otherAccess); err == nil {
+		t.Error("checkServiceAccountAccessWithIdentity() = nil, want the refusal of a directory outside of the state directory of the instance")
 	}
 }
 
@@ -922,6 +932,9 @@ func TestSystemdCheckServiceAccountAccessChecksAnExistingDirectoryInsideTheState
 	opts.HubDir = ""
 	opts.LocalDir = ""
 
+	otherAccess, err := linuxSystemdAccessIdentity(other, other.Gid, nil)
+	assertNoError(t, err, "the access identity of the second account = %v, want nil", err)
+
 	cases := []struct {
 		name    string
 		cache   string
@@ -937,20 +950,20 @@ func TestSystemdCheckServiceAccountAccessChecksAnExistingDirectoryInsideTheState
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			opts.CacheDir = tc.cache
-			err := m.checkServiceAccountAccess(opts, other)
+			err := m.checkServiceAccountAccessWithIdentity(opts, other.Username, &otherAccess)
 			if !tc.wantErr {
 				if err != nil {
-					t.Errorf("checkServiceAccountAccess() = %v, want nil for the directory %q", err, tc.cache)
+					t.Errorf("checkServiceAccountAccessWithIdentity() = %v, want nil for the directory %q", err, tc.cache)
 				}
 				return
 			}
 			if err == nil {
-				t.Fatalf("checkServiceAccountAccess() = nil, want the refusal of the directory %q", tc.cache)
+				t.Fatalf("checkServiceAccountAccessWithIdentity() = nil, want the refusal of the directory %q", tc.cache)
 			}
 			// The refusal names the directory, the account and the
 			// access that is missing.
 			message := err.Error()
-			assertNames(t, message, "checkServiceAccountAccess()", []string{
+			assertNames(t, message, "checkServiceAccountAccessWithIdentity()", []string{
 				"the service account " + strconv.Quote(other.Username),
 				strconv.Quote(tc.cache),
 				"cannot write",
@@ -1027,6 +1040,9 @@ func TestSystemdCheckServiceAccountAccessUsesTheRealLocationOfTheDirectory(t *te
 	opts.HubDir = ""
 	opts.LocalDir = ""
 
+	otherAccess, err := linuxSystemdAccessIdentity(other, other.Gid, nil)
+	assertNoError(t, err, "the access identity of the second account = %v, want nil", err)
+
 	cases := []struct {
 		name    string
 		cache   string
@@ -1040,18 +1056,18 @@ func TestSystemdCheckServiceAccountAccessUsesTheRealLocationOfTheDirectory(t *te
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			opts.CacheDir = tc.cache
-			err := m.checkServiceAccountAccess(opts, other)
+			err := m.checkServiceAccountAccessWithIdentity(opts, other.Username, &otherAccess)
 			if !tc.wantErr {
 				if err != nil {
-					t.Errorf("checkServiceAccountAccess() = %v, want nil for the directory %q", err, tc.cache)
+					t.Errorf("checkServiceAccountAccessWithIdentity() = %v, want nil for the directory %q", err, tc.cache)
 				}
 				return
 			}
 			if err == nil {
-				t.Fatalf("checkServiceAccountAccess() = nil, want the refusal of the directory %q", tc.cache)
+				t.Fatalf("checkServiceAccountAccessWithIdentity() = nil, want the refusal of the directory %q", tc.cache)
 			}
 			message := err.Error()
-			assertNames(t, message, "checkServiceAccountAccess()", []string{
+			assertNames(t, message, "checkServiceAccountAccessWithIdentity()", []string{
 				"the service account " + strconv.Quote(other.Username),
 				strconv.Quote(tc.cache),
 				"cannot write",
@@ -1084,23 +1100,23 @@ func TestSystemdCheckServiceAccountAccessUsesTheRealLocationOfTheDirectory(t *te
 		// directory: the service creates it, and the account owns the
 		// real state directory after the installation.
 		opts.CacheDir = filepath.Join(link, "output")
-		if err := m.checkServiceAccountAccess(opts, other); err != nil {
-			t.Errorf("checkServiceAccountAccess() = %v, want nil for a directory inside the state directory of the instance", err)
+		if err := m.checkServiceAccountAccessWithIdentity(opts, other.Username, &otherAccess); err != nil {
+			t.Errorf("checkServiceAccountAccessWithIdentity() = %v, want nil for a directory inside the state directory of the instance", err)
 		}
 
 		// The same directory named by its real location is inside the
 		// state directory as well.
 		opts.CacheDir = filepath.Join(real, "output")
-		if err := m.checkServiceAccountAccess(opts, other); err != nil {
-			t.Errorf("checkServiceAccountAccess() = %v, want nil for a directory inside the state directory of the instance", err)
+		if err := m.checkServiceAccountAccessWithIdentity(opts, other.Username, &otherAccess); err != nil {
+			t.Errorf("checkServiceAccountAccessWithIdentity() = %v, want nil for a directory inside the state directory of the instance", err)
 		}
 
 		// The directory that exists already inside the linked state
 		// directory belongs to whoever owns it: the account cannot write
 		// into it, and the installation refuses it.
 		opts.CacheDir = models
-		if err := m.checkServiceAccountAccess(opts, other); err == nil {
-			t.Error("checkServiceAccountAccess() = nil, want the refusal of an existing directory inside the state directory of the instance")
+		if err := m.checkServiceAccountAccessWithIdentity(opts, other.Username, &otherAccess); err == nil {
+			t.Error("checkServiceAccountAccessWithIdentity() = nil, want the refusal of an existing directory inside the state directory of the instance")
 		}
 	})
 }
@@ -1194,12 +1210,14 @@ func TestSystemdAccessCheckUsesTheEffectivePermission(t *testing.T) {
 			if err := os.Chmod(dir, tc.mode); err != nil {
 				t.Fatalf("set the mode of the directory: %v", err)
 			}
-			err := checkDirWritableByAccount(dir, tc.account)
+			identity, err := linuxSystemdAccessIdentity(tc.account, tc.account.Gid, nil)
+			assertNoError(t, err, "the access identity of %q = %v, want nil", tc.account.Username, err)
+			err = checkDirWritableByIdentity(dir, identity)
 			if tc.wantErr && err == nil {
-				t.Errorf("checkDirWritableByAccount(%q) = nil, want a refusal", dir)
+				t.Errorf("checkDirWritableByIdentity(%q) = nil, want a refusal", dir)
 			}
 			if !tc.wantErr && err != nil {
-				t.Errorf("checkDirWritableByAccount(%q) = %v, want nil", dir, err)
+				t.Errorf("checkDirWritableByIdentity(%q) = %v, want nil", dir, err)
 			}
 		})
 	}
@@ -1218,8 +1236,10 @@ func TestSystemdAccessCheckUsesTheEffectivePermission(t *testing.T) {
 		// The parent is closed for everybody but its owner.
 		err = os.Chmod(parent, 0o700)
 		assertNoError(t, err, "close the parent directory: %v", err)
-		if err := checkDirWritableByAccount(child, other); err == nil {
-			t.Error("checkDirWritableByAccount() = nil, want the refusal of a directory the account cannot reach")
+		otherAccess, err := linuxSystemdAccessIdentity(other, other.Gid, nil)
+		assertNoError(t, err, "the access identity of the test account = %v, want nil", err)
+		if err := checkDirWritableByIdentity(child, otherAccess); err == nil {
+			t.Error("checkDirWritableByIdentity() = nil, want the refusal of a directory the account cannot reach")
 		}
 	})
 }
@@ -1293,6 +1313,9 @@ func TestSystemdAccessCheckResolvesTheSymlinksOfThePath(t *testing.T) {
 	err = os.Symlink(filepath.Join("..", "open", "data"), openLink)
 	assertNoError(t, err, "create the link into the open directory: %v", err)
 
+	otherAccess, err := linuxSystemdAccessIdentity(other, other.Gid, nil)
+	assertNoError(t, err, "the access identity of the second account = %v, want nil", err)
+
 	cases := []struct {
 		name    string
 		path    string
@@ -1320,12 +1343,12 @@ func TestSystemdAccessCheckResolvesTheSymlinksOfThePath(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := checkDirWritableByAccount(tc.path, other)
+			err := checkDirWritableByIdentity(tc.path, otherAccess)
 			if tc.wantErr && err == nil {
-				t.Errorf("checkDirWritableByAccount(%q) = nil, want the refusal of the real location of the path", tc.path)
+				t.Errorf("checkDirWritableByIdentity(%q) = nil, want the refusal of the real location of the path", tc.path)
 			}
 			if !tc.wantErr && err != nil {
-				t.Errorf("checkDirWritableByAccount(%q) = %v, want nil for the real location of the path", tc.path, err)
+				t.Errorf("checkDirWritableByIdentity(%q) = %v, want nil for the real location of the path", tc.path, err)
 			}
 		})
 	}
@@ -1333,13 +1356,12 @@ func TestSystemdAccessCheckResolvesTheSymlinksOfThePath(t *testing.T) {
 
 // TestSystemdAccessCheckUsesTheSupplementaryGroups checks that the access
 // check of a directory the service account has to use knows the
-// supplementary groups of the account.
+// supplementary groups carried by the access identity.
 //
-// The groups of an account are read from the group database of the machine,
-// so the test needs a group the account of the test belongs to. The test
-// skips itself when the machine knows no such group.
+// The directory belongs to a supplementary group of the machine, so the
+// test skips itself when the machine knows no such group to give the
+// directory to.
 func TestSystemdAccessCheckUsesTheSupplementaryGroups(t *testing.T) {
-	current := systemdCurrentAccount(t)
 	group, ok := systemdSupplementaryGroup(t)
 	if !ok {
 		t.Skip("skipping: the machine knows no supplementary group of the account of the test")
@@ -1351,40 +1373,36 @@ func TestSystemdAccessCheckUsesTheSupplementaryGroups(t *testing.T) {
 	assertNoError(t, err, "create the directory: %v", err)
 	gid, err := strconv.Atoi(group)
 	assertNoError(t, err, "the group id %q is not a number: %v", group, err)
-	// The directory belongs to the group of the account, not to the
-	// account itself.
+	// The directory belongs to the group, not to the account of the test.
 	if err := os.Chown(dir, os.Getuid(), gid); err != nil {
 		t.Fatalf("give the directory to the group %q: %v", group, err)
 	}
 
-	// The account of the check carries the name of the account of the
-	// test, so the group database of the machine gives it the
-	// supplementary group of the account of the test. It owns nothing of
-	// the test.
-	account := &user.User{
-		Username: current.Username,
-		Uid:      "65534",
-		Gid:      current.Gid,
-		Name:     current.Name,
-		HomeDir:  current.HomeDir,
+	// The identity of the check owns nothing of the test and reaches the
+	// directory only through the supplementary group its access identity
+	// carries.
+	identity := accessAccount{
+		UID:    65534,
+		GID:    os.Getgid(),
+		Groups: []int{os.Getgid(), gid},
 	}
 
-	// The group permissions apply to the account: it can create entries
+	// The group permissions apply to the identity: it can create entries
 	// in the directory and it can reach it.
 	if err := os.Chmod(dir, 0o770); err != nil {
 		t.Fatalf("make the directory usable: %v", err)
 	}
-	if err := checkDirWritableByAccount(dir, account); err != nil {
-		t.Errorf("checkDirWritableByAccount() = %v, want nil for a directory of the supplementary group of the account", err)
+	if err := checkDirWritableByIdentity(dir, identity); err != nil {
+		t.Errorf("checkDirWritableByIdentity() = %v, want nil for a directory of the supplementary group of the identity", err)
 	}
 
-	// The group has no execute permission: the account cannot use the
+	// The group has no execute permission: the identity cannot use the
 	// directory.
 	if err := os.Chmod(dir, 0o620); err != nil {
 		t.Fatalf("close the directory: %v", err)
 	}
-	if err := checkDirWritableByAccount(dir, account); err == nil {
-		t.Error("checkDirWritableByAccount() = nil, want the refusal of a directory without the execute permission of the group")
+	if err := checkDirWritableByIdentity(dir, identity); err == nil {
+		t.Error("checkDirWritableByIdentity() = nil, want the refusal of a directory without the execute permission of the group")
 	}
 }
 
@@ -1539,17 +1557,20 @@ func TestSystemdUserScopeNeedsNoServiceAccount(t *testing.T) {
 	if account != nil {
 		t.Errorf("a user scope instance resolved the account %q, want none", account.Username)
 	}
-	if err := m.checkServiceAccountAccess(opts, account); err != nil {
-		t.Errorf("checkServiceAccountAccess() = %v, want nil for a user scope instance", err)
+	if err := m.checkServiceAccountAccessWithIdentity(opts, "", nil); err != nil {
+		t.Errorf("checkServiceAccountAccessWithIdentity() = %v, want nil for a user scope instance", err)
 	}
-	if err := m.grantInstanceDirs(opts, account, nil); err != nil {
-		t.Errorf("grantInstanceDirs() = %v, want nil for a user scope instance", err)
+	identity := systemdAccessIdentityForInstall(opts.Scope, opts, false, systemdLoadedConfig{}, false, account)
+	if err := m.grantInstanceDirsForDirsWithIdentity(opts, identity, nil, instanceDirs(opts)); err != nil {
+		t.Errorf("grantInstanceDirsForDirsWithIdentity() = %v, want nil for a user scope instance", err)
 	}
 
 	// The unit of a user scope instance names no account, even when the
 	// command line named one.
-	unit, err := renderUnit(opts, nil)
-	assertNoError(t, err, "renderUnit() = %v, want nil", err)
+	facts, err := canonicalUnitForInstall(opts, nil)
+	assertNoError(t, err, "canonicalUnitForInstall() = %v, want nil", err)
+	unit, err := renderCanonicalUnit(facts)
+	assertNoError(t, err, "renderCanonicalUnit() = %v, want nil", err)
 	for _, directive := range unitDirectives(unit) {
 		if strings.HasPrefix(directive, "User=") || strings.HasPrefix(directive, "Group=") {
 			t.Errorf("a user scope unit names an account: %q", directive)
@@ -1577,7 +1598,7 @@ func TestSystemdCreatedDirOrder(t *testing.T) {
 	for _, dir := range instanceDirs(opts) {
 		created[dir.path] = createdDirs(dir.path)
 	}
-	order := createdDirOrder(opts, created)
+	order := createdDirOrderForDirs(instanceDirs(opts), created)
 
 	want := []string{
 		filepath.Join(root, "etc"),
@@ -1589,7 +1610,7 @@ func TestSystemdCreatedDirOrder(t *testing.T) {
 		filepath.Join(root, "var", "log", "hfdesk"),
 	}
 	if strings.Join(order, "\n") != strings.Join(want, "\n") {
-		t.Errorf("createdDirOrder() =\n%s\nwant\n%s", strings.Join(order, "\n"), strings.Join(want, "\n"))
+		t.Errorf("createdDirOrderForDirs() =\n%s\nwant\n%s", strings.Join(order, "\n"), strings.Join(want, "\n"))
 	}
 }
 
