@@ -96,7 +96,6 @@ func (f *contentionDownloadFixture) settings() Settings {
 type downloadOutcome struct {
 	skips  []string
 	err    error
-	fatal  bool
 	events []ProgressEvent
 }
 

@@ -2117,12 +2117,6 @@ type plistData struct {
 	RunAtLoad bool
 }
 
-// renderPlist renders the launchd property list of a first installation:
-// the autostart key carries the default that starts the instance.
-func renderPlist(opts InstallOptions, account *serviceAccount) (string, error) {
-	return renderPlistWithRunAtLoad(opts, account, true)
-}
-
 // renderPlistWithRunAtLoad renders the launchd property list of an
 // installation with the given autostart value.
 //
