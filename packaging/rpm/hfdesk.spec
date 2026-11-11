@@ -16,6 +16,9 @@
 %global appname hfdesk
 %global appdesc HuggingFace Model Downloader
 %{!?appversion:%global appversion 1.2.1}
+# This package repackages a prebuilt, stripped (-s -w) binary: there is no
+# debug info to split, and an empty debugfiles.list fails on current rpm.
+%global debug_package %{nil}
 
 Name:           %{appname}
 Version:        %{?hfdesk_rpm_version}%{!?hfdesk_rpm_version:%{appversion}}
