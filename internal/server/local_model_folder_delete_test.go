@@ -14,6 +14,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -65,13 +66,12 @@ func friendlyFolderDeleteBody(folder string) string {
 	return fmt.Sprintf(`{"source":"Friendly view","path":%q}`, folder)
 }
 
-func decodeDeleteResponse(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
+func requireDeleteSuccess(t *testing.T, w *httptest.ResponseRecorder) {
 	t.Helper()
 	var resp map[string]any
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode response %q: %v", w.Body.String(), err)
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil || resp["success"] != true {
+		t.Fatalf("expected success response, got %s", w.Body.String())
 	}
-	return resp
 }
 
 // The acceptance pin (issue (a)): a local model with NO GGUF files at all —
@@ -114,10 +114,7 @@ func TestLocalModelFolderDelete_RemovesWholeNonGGUFFolder(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("non-GGUF local folder delete: status=%d body=%s", w.Code, w.Body.String())
 	}
-	resp := decodeDeleteResponse(t, w)
-	if success, _ := resp["success"].(bool); !success {
-		t.Fatalf("expected success, got %v", resp)
-	}
+	requireDeleteSuccess(t, w)
 	mustBeGone(t, folder)
 	mustExist(t, filepath.Join(sibling, "keep.txt"))
 	if runtime.GOOS != "windows" {
@@ -125,47 +122,35 @@ func TestLocalModelFolderDelete_RemovesWholeNonGGUFFolder(t *testing.T) {
 	}
 }
 
-// A configured scan-root boundary nested inside the model folder refuses the
-// whole-folder deletion (fail closed) and nothing is removed: the folder unit
-// cannot be deleted without taking the other registered root with it.
-func TestLocalModelFolderDelete_RefusesProtectedDescendantRoot(t *testing.T) {
+// Configured-boundary protection refuses fail-closed in both directions the
+// established selected-delete semantics project: a scan-root nested inside the
+// folder (whole-folder deletion would take that other registered root with
+// it), and a separately configured root owning the folder from above.
+func TestLocalModelFolderDelete_RefusesConfiguredBoundaries(t *testing.T) {
 	scanRoot := t.TempDir()
 	folder := filepath.Join(scanRoot, "org", "model")
 	mustWriteFile(t, filepath.Join(folder, "weights.safetensors"), "w")
 	innerRoot := filepath.Join(folder, "inner")
 	mustWriteFile(t, filepath.Join(innerRoot, "x", "keep.gguf"), "keep")
-
-	s := newTestServerWithConfig(t, Config{
-		CacheDir:      t.TempDir(),
-		LocalScanDirs: []string{scanRoot, innerRoot},
-	})
-
-	w := cacheRequest(t, s, http.MethodDelete, "/api/cache/org/model?type=model", localFolderDeleteBody(folder))
-	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "nested inside this model folder") {
-		t.Fatalf("descendant root must refuse with 409: status=%d body=%s", w.Code, w.Body.String())
+	cases := []struct {
+		name     string
+		scanDirs []string
+		want     string
+	}{
+		{"descendant root nested inside the folder", []string{scanRoot, innerRoot}, "nested inside this model folder"},
+		{"configured root owning the folder", []string{scanRoot, filepath.Join(scanRoot, "org")}, "configured descendant boundary"},
 	}
-	mustExist(t, filepath.Join(folder, "weights.safetensors"))
-	mustExist(t, filepath.Join(innerRoot, "x", "keep.gguf"))
-}
-
-// A separately configured root that contains this repo takes ownership from
-// above: selectedDeleteExclusions returns !ok and the deletion refuses, exactly
-// like the established selected-delete path.
-func TestLocalModelFolderDelete_RefusesRootContainingFolder(t *testing.T) {
-	scanRoot := t.TempDir()
-	folder := filepath.Join(scanRoot, "org", "model")
-	mustWriteFile(t, filepath.Join(folder, "weights.safetensors"), "w")
-
-	s := newTestServerWithConfig(t, Config{
-		CacheDir:      t.TempDir(),
-		LocalScanDirs: []string{scanRoot, filepath.Join(scanRoot, "org")},
-	})
-
-	w := cacheRequest(t, s, http.MethodDelete, "/api/cache/org/model?type=model", localFolderDeleteBody(folder))
-	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "configured descendant boundary") {
-		t.Fatalf("repo owned by a nested configured root must refuse with 409: status=%d body=%s", w.Code, w.Body.String())
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir(), LocalScanDirs: tc.scanDirs})
+			w := cacheRequest(t, s, http.MethodDelete, "/api/cache/org/model?type=model", localFolderDeleteBody(folder))
+			if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), tc.want) {
+				t.Fatalf("boundary must refuse with 409: status=%d body=%s, want %q", w.Code, w.Body.String(), tc.want)
+			}
+			mustExist(t, filepath.Join(folder, "weights.safetensors"))
+			mustExist(t, filepath.Join(innerRoot, "x", "keep.gguf"))
+		})
 	}
-	mustExist(t, filepath.Join(folder, "weights.safetensors"))
 }
 
 // Scope and path validation: outside-root, traversal, wrong-source (friendly
@@ -182,50 +167,41 @@ func TestLocalModelFolderDelete_PathAndScopeRefusals(t *testing.T) {
 
 	cases := []struct {
 		name       string
+		repo       string
 		query      string
 		body       string
 		wantCode   int
 		wantDetail string
 	}{
-		{"unknown source", "?type=model", fmt.Sprintf(`{"source":"External","path":%q}`, folder), http.StatusBadRequest, "Invalid deletion scope"},
-		{"missing path", "?type=model", `{"source":"Local"}`, http.StatusBadRequest, "source and path are required together"},
-		{"stray path without source", "?type=model", fmt.Sprintf(`{"path":%q}`, folder), http.StatusBadRequest, "source and path are required together"},
-		{"dataset scope", "?type=dataset", localFolderDeleteBody(folder), http.StatusBadRequest, "Whole-folder deletion is only available for models"},
-		{"outside-root path", "?type=model", localFolderDeleteBody(filepath.Join(outside, "org", "model")), http.StatusBadRequest, "Path is not a configured local model folder"},
-		{"traversal path", "?type=model", localFolderDeleteBody(filepath.Join(scanRoot, "org", "model", "..", "..", "..", "etc")), http.StatusBadRequest, "Path is not a configured local model folder"},
-		{"friendly namespace claimed as Local", "?type=model", localFolderDeleteBody(filepath.Join(cacheDir, "models", "org", "model")), http.StatusBadRequest, "Path is not a configured local model folder"},
-		{"malformed body", "?type=model", `{oops`, http.StatusBadRequest, "Invalid request body"},
+		{"unknown source", "", "?type=model", fmt.Sprintf(`{"source":"External","path":%q}`, folder), http.StatusBadRequest, "Invalid deletion scope"},
+		{"missing path", "", "?type=model", `{"source":"Local"}`, http.StatusBadRequest, "source and path are required together"},
+		{"stray path without source", "", "?type=model", fmt.Sprintf(`{"path":%q}`, folder), http.StatusBadRequest, "source and path are required together"},
+		{"dataset scope", "", "?type=dataset", localFolderDeleteBody(folder), http.StatusBadRequest, "Whole-folder deletion is only available for models"},
+		{"outside-root path", "", "?type=model", localFolderDeleteBody(filepath.Join(outside, "org", "model")), http.StatusBadRequest, "Path is not a configured local model folder"},
+		{"traversal path", "", "?type=model", localFolderDeleteBody(filepath.Join(scanRoot, "org", "model", "..", "..", "..", "etc")), http.StatusBadRequest, "Path is not a configured local model folder"},
+		{"friendly namespace claimed as Local", "", "?type=model", localFolderDeleteBody(filepath.Join(cacheDir, "models", "org", "model")), http.StatusBadRequest, "Path is not a configured local model folder"},
+		{"malformed body", "", "?type=model", `{oops`, http.StatusBadRequest, "Invalid request body"},
+		// The folder name comes from the repo id, never from the client path:
+		// a matching template whose folder is absent reaches the anchored
+		// opener and refuses through the established unsafe family.
+		{"missing folder", "org/absent", "?type=model", localFolderDeleteBody(filepath.Join(scanRoot, "org", "absent")), http.StatusConflict, "Selection is unsafe"},
+		// A body without the discriminator behaves exactly like no body: the
+		// legacy Hub-only flow runs and the local folder is untouched.
+		{"empty object body is legacy", "", "?type=model", "{}", http.StatusNotFound, "Repository not found in cache"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			w := cacheRequest(t, s, http.MethodDelete, "/api/cache/org/model"+tc.query, tc.body)
+			repo := tc.repo
+			if repo == "" {
+				repo = "org/model"
+			}
+			w := cacheRequest(t, s, http.MethodDelete, "/api/cache/"+repo+tc.query, tc.body)
 			if w.Code != tc.wantCode || !strings.Contains(w.Body.String(), tc.wantDetail) {
 				t.Fatalf("status=%d body=%s, want %d containing %q", w.Code, w.Body.String(), tc.wantCode, tc.wantDetail)
 			}
 			mustExist(t, filepath.Join(folder, "weights.safetensors"))
 		})
 	}
-
-	// The folder name comes from the repo id, never from the client path: a
-	// matching template whose folder is absent reaches the anchored opener and
-	// refuses through the established unsafe-selection family.
-	t.Run("missing folder", func(t *testing.T) {
-		w := cacheRequest(t, s, http.MethodDelete, "/api/cache/org/absent?type=model", localFolderDeleteBody(filepath.Join(scanRoot, "org", "absent")))
-		if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "Selection is unsafe") {
-			t.Fatalf("missing folder must refuse with 409 unsafe: status=%d body=%s", w.Code, w.Body.String())
-		}
-		mustExist(t, filepath.Join(folder, "weights.safetensors"))
-	})
-
-	// A body without the discriminator behaves exactly like no body at all:
-	// the legacy Hub-only flow runs and the local folder is untouched.
-	t.Run("empty object body is legacy", func(t *testing.T) {
-		w := cacheRequest(t, s, http.MethodDelete, "/api/cache/org/model?type=model", "{}")
-		if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "Repository not found in cache") {
-			t.Fatalf("discriminator-less body must run the legacy flow: status=%d body=%s", w.Code, w.Body.String())
-		}
-		mustExist(t, filepath.Join(folder, "weights.safetensors"))
-	})
 }
 
 // Owner/model symlink components are refused before any removal, and neither
@@ -302,30 +278,45 @@ func TestLocalModelFolderDelete_BusyLiveWriter(t *testing.T) {
 // A cross-process flat-realm writer holding one of the folder's files refuses
 // the deletion through the writeCacheDeleteAdmission 409 family; releasing the
 // lease lets the same request succeed.
+// Cross-process admission pins the whole-folder delete against flat writers in
+// this or another process: a live lease on an existing file, and — the F1
+// created-in-window race — a live lease on a file inside the folder that does
+// not exist yet, which an entry-snapshot admission over enumerated files
+// cannot exclude (that scenario fails against such a handler).
 func TestLocalModelFolderDelete_BusyCrossProcessAdmission(t *testing.T) {
 	scanRoot := t.TempDir()
 	folder := filepath.Join(scanRoot, "org", "model")
 	file := filepath.Join(folder, "weights.safetensors")
 	mustWriteFile(t, file, "w")
 	s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir(), LocalScanDirs: []string{scanRoot}})
-
 	ctx := context.Background()
 	admission, err := hfdownloader.OpenFlatAdmission(ctx, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	releaseLease, err := admission.AdmitFileWrites(ctx, []string{file})
+	expectBusy := func(scenario string) {
+		t.Helper()
+		w := cacheRequest(t, s, http.MethodDelete, "/api/cache/org/model?type=model", localFolderDeleteBody(folder))
+		if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "Repository is busy") {
+			t.Fatalf("%s: live flat writer must refuse with 409 busy: status=%d body=%s", scenario, w.Code, w.Body.String())
+		}
+		mustExist(t, file)
+		mustExist(t, folder)
+	}
+	lease, err := admission.AdmitFileWrites(ctx, []string{file})
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := cacheRequest(t, s, http.MethodDelete, "/api/cache/org/model?type=model", localFolderDeleteBody(folder))
-	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "Repository is busy") {
-		t.Fatalf("live flat writer must refuse with 409 busy: status=%d body=%s", w.Code, w.Body.String())
+	expectBusy("existing-file lease")
+	lease()
+	missing := filepath.Join(folder, "weights.safetensors.incomplete")
+	lease, err = admission.AdmitFileWrites(ctx, []string{missing})
+	if err != nil {
+		t.Fatalf("writer admission for a not-yet-created file: %v", err)
 	}
-	mustExist(t, file)
-	releaseLease()
-
-	w = cacheRequest(t, s, http.MethodDelete, "/api/cache/org/model?type=model", localFolderDeleteBody(folder))
+	expectBusy("not-yet-created-file lease")
+	lease()
+	w := cacheRequest(t, s, http.MethodDelete, "/api/cache/org/model?type=model", localFolderDeleteBody(folder))
 	if w.Code != http.StatusOK {
 		t.Fatalf("delete after lease release: status=%d body=%s", w.Code, w.Body.String())
 	}
@@ -355,10 +346,7 @@ func TestFriendlyViewDelete_RemovesFriendlyOnlyTree(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("friendly-only delete: status=%d body=%s", w.Code, w.Body.String())
 	}
-	resp := decodeDeleteResponse(t, w)
-	if success, _ := resp["success"].(bool); !success {
-		t.Fatalf("expected success, got %v", resp)
-	}
+	requireDeleteSuccess(t, w)
 	mustBeGone(t, friendly)
 	mustExist(t, filepath.Join(cacheDir, "models", "org"))
 }
@@ -381,10 +369,7 @@ func TestFriendlyViewDelete_RemovesHubAndFriendlyPair(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("friendly-with-hub delete: status=%d body=%s", w.Code, w.Body.String())
 	}
-	resp := decodeDeleteResponse(t, w)
-	if success, _ := resp["success"].(bool); !success {
-		t.Fatalf("expected success, got %v", resp)
-	}
+	requireDeleteSuccess(t, w)
 	mustBeGone(t, rd.Path())
 	mustBeGone(t, friendly)
 }
@@ -483,4 +468,45 @@ func TestFriendlyViewDelete_Refusals(t *testing.T) {
 			mustExist(t, filepath.Join(cacheDir, "models", "org", "model"))
 		})
 	}
+}
+
+// A flat writer admitted for a path UNDER the folder that does not exist yet
+// (the F1 created-in-window scenario, e.g. a transfer's staging pair) makes the
+// whole-folder delete answer 409 and remove NOTHING — pinned as the second
+// scenario of TestLocalModelFolderDelete_BusyCrossProcessAdmission above.
+// Unit pin for FlatAdmission.AdmitTreeRemoval's two documented rules, placed
+// in this file because the correction's file scope excludes new pkg test
+// files: refuse on a live writer under the tree, and the re-verified-vanish
+// release excludes a creator of the gone target until released.
+func TestFlatAdmissionTreeRemoval_WriterAndVanishRules(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	tree := filepath.Join(base, "owner", "model")
+	mustWriteFile(t, filepath.Join(tree, "w.bin"), "w")
+	admission, err := hfdownloader.OpenFlatAdmission(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := admission.AdmitFileWrites(ctx, []string{filepath.Join(tree, "w.bin")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admission.AdmitTreeRemoval(ctx, tree); !errors.Is(err, hfdownloader.ErrOwnershipBusy) {
+		t.Fatalf("tree removal over a live writer must refuse busy, got %v", err)
+	}
+	lease()
+	gone := filepath.Join(base, "never-created")
+	release, err := admission.AdmitTreeRemoval(ctx, gone)
+	if err != nil {
+		t.Fatalf("vanished target must be admitted by re-verified vanish: %v", err)
+	}
+	if _, err := admission.AdmitFileWrites(ctx, []string{gone}); !errors.Is(err, hfdownloader.ErrOwnershipBusy) {
+		t.Fatalf("a creator racing the admitted vanish must be refused busy, got %v", err)
+	}
+	release()
+	creatorLease, err := admission.AdmitFileWrites(ctx, []string{gone})
+	if err != nil {
+		t.Fatalf("creator admission after release: %v", err)
+	}
+	creatorLease()
 }

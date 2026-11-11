@@ -1707,12 +1707,18 @@ unchanged:
 details dialog was confirmed — and `path` must be present with it; a body
 missing either field, an unknown `source`, a `path` without a `source`, or a
 body with `type=dataset` (or a dataset repository) returns `400`: whole-folder
-deletion is model-only, and local datasets keep no such scope. The server never
+deletion is model-only, and local datasets keep no such scope. In the flat
+local layout the server cannot distinguish a model folder from a dataset
+folder — there is no identity on disk — so that models-only boundary is
+exactly the request's `type` gate plus the UI affordance, not an on-disk
+classification. The server never
 trusts `path`. For `source=Local` it must identity-match `Join(root, owner,
 name)` for a currently configured scan/download root whose listing label is
 `Local`, after the listing's own rules (skipped owners such as `hub`/`models`
-under the cache root never qualify) and the registered-roots check; otherwise
-`400 Invalid path` ("Path is not a configured local model folder"). For
+under the cache root never qualify); a path matching no such root returns
+`400 Invalid path` ("Path is not a configured local model folder"), and a path
+matching a root that fails the registered-roots check returns fail-closed
+`409 Location is not eligible for local deletion`. For
 `source=Friendly view` it must identity-match the model's server-derived
 friendly-view folder; otherwise `400 Invalid path`.
 
@@ -1723,11 +1729,13 @@ open (`409 Selection is unsafe`); fail-closed configured-boundary refusal when
 the folder contains another configured root or is owned by one
 (`409 Location could not be verified`); the in-process destructive window
 (`409 Repository is busy` when a live writer owns the folder in this process,
-including queued writers held by the dispatch gate) and flat-realm entry
-admission over the folder's enumerated entries (`409 Repository is busy` when a
-flat writer in this or another process holds any of them, via the established
-`writeCacheDeleteAdmission` family; an unresolvable admission fails closed with
-`500`); repeated binding rechecks (`409 Selection is stale`); and a final
+including queued writers held by the dispatch gate) and exclusive flat-realm
+tree admission over the model folder itself (`409 Repository is busy` when a
+flat writer in this or another process holds a lease under or over that tree —
+including a writer already admitted for a file inside it that does not exist
+yet — via the established `writeCacheDeleteAdmission` family; an unresolvable
+admission fails closed with `500`); repeated binding rechecks (`409 Selection is
+stale`); and a final
 removal confined to an `os.Root` anchored at the folder's owner directory, so
 no symlink inside or above the folder can redirect it outside. Success answers
 `200 {"success": true, "message": ...}`. A removal that does not complete

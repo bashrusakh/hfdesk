@@ -263,7 +263,9 @@ payload I/O. Supported path identity details depend on the platform/filesystem;
 do not claim universal casefold, bind-view or cross-client alias detection.
 Tree mutations must use exclusive tree admission. Server HTTP DELETE, mirror
 `deleteExtra` removal and the HF branch of selected-GGUF deletion take it
-through `AdmitTreeRemoval` before removing anything; the local-root branch of
+through `AdmitTreeRemoval` before removing anything; the server HTTP DELETE
+whole-model-folder branch takes it through `FlatAdmission.AdmitTreeRemoval`
+against the flat `Settings.OwnershipDir` realm; the local-root branch of
 selected-GGUF deletion takes `AdmitFileWrites` entry admission over exactly the
 member paths it unlinks, against the flat `Settings.OwnershipDir` realm that
 flat writers resolve the same way (`DefaultOwnershipDir()` when unset). Both

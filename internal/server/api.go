@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -2332,12 +2331,12 @@ type cacheDeleteRequest struct {
 // established deletion paths applies here: strict repo-ID validation (layers
 // 1-4), registered-roots-only resolution, owner/model symlink-component
 // rejection through the anchored open, configured-descendant fail-closed
-// refusal, the in-process destructive window, cross-process flat-realm
-// admission over the enumerated entries through writeCacheDeleteAdmission,
-// repeated SameFile binding rechecks, and a final removal confined to an
-// os.Root anchored at the folder's owner directory. Partial removal answers
-// with the established whole-repository 200-with-errors shape instead of
-// hiding the failure.
+// refusal, the in-process destructive window, cross-process exclusive
+// flat-realm tree admission over the model folder through
+// writeCacheDeleteAdmission, repeated SameFile binding rechecks, and a final
+// removal confined to an os.Root anchored at the folder's owner directory.
+// Partial removal answers with the established whole-repository
+// 200-with-errors shape instead of hiding the failure.
 func (s *Server) handleLocalModelFolderDelete(w http.ResponseWriter, r *http.Request, repo string, parts []string, delReq cacheDeleteRequest) {
 	if !hfdownloader.IsValidModelName(repo) || !filepath.IsLocal(repo) {
 		writeError(w, http.StatusBadRequest, "Invalid repository ID", "Path traversal not allowed")
@@ -2416,19 +2415,6 @@ func (s *Server) handleLocalModelFolderDelete(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Fresh complete enumeration through the anchored root: every
-	// non-directory entry of the folder, never descending symlinked
-	// directories and never leaving the root.
-	rels, err := localFolderEntries(repoRoot)
-	if err != nil {
-		writeError(w, http.StatusConflict, "Location could not be verified", err.Error())
-		return
-	}
-	physicalPaths := make([]string, 0, len(rels))
-	for _, rel := range rels {
-		physicalPaths = append(physicalPaths, filepath.Join(physicalRepo, filepath.FromSlash(rel)))
-	}
-
 	// In-process destructive window over the whole folder: conflicts with any
 	// active or queued writer inside it and holds the dispatch gate, the same
 	// directory-scope primitive the whole-repository endpoint uses.
@@ -2449,25 +2435,25 @@ func (s *Server) handleLocalModelFolderDelete(w http.ResponseWriter, r *http.Req
 	}
 
 	// Cross-process admission against live writers in other processes sharing
-	// this local root. The flat realm is entry-scoped (a directory key does
-	// not conflict with file writers inside it), so the lease covers exactly
-	// the enumerated entries — as strong as the flat writers' own
-	// coordination, mirroring the established selected-delete local branch.
-	// A file created inside the residual window is either removed with the
-	// whole-folder unit below or surfaces as an incomplete removal.
-	if len(physicalPaths) > 0 {
-		flatAdmission, err := hfdownloader.OpenFlatAdmission(r.Context(), "")
-		if err != nil {
-			writeCacheDeleteAdmission(w, err)
-			return
-		}
-		entriesRelease, err := flatAdmission.AdmitFileWrites(r.Context(), physicalPaths)
-		if err != nil {
-			writeCacheDeleteAdmission(w, err)
-			return
-		}
-		defer entriesRelease()
+	// this local root: exclusive tree admission over the whole model folder —
+	// shared on ancestors, exclusive on the folder before any descent — so a
+	// flat writer under or above the tree, including one already admitted for
+	// a file inside it that does not exist yet, refuses with the established
+	// 409 family, and the ownerRoot-confined removal below runs inside the
+	// held tree lease. The lease scales with the tree's directories, not its
+	// files, and the tree path raises the ownership file-descriptor limit for
+	// its window the same way the cache twin does.
+	flatAdmission, err := hfdownloader.OpenFlatAdmission(r.Context(), "")
+	if err != nil {
+		writeCacheDeleteAdmission(w, err)
+		return
 	}
+	treeRelease, err := flatAdmission.AdmitTreeRemoval(r.Context(), physicalRepo)
+	if err != nil {
+		writeCacheDeleteAdmission(w, err)
+		return
+	}
+	defer treeRelease()
 
 	ownerRoot, modelName, err := openLocalFolderOwner(repoRoot, physicalRepo)
 	if err != nil {
@@ -2611,30 +2597,7 @@ func openLocalFolderOwner(repoRoot *os.Root, physicalRepo string) (*os.Root, str
 	return ownerRoot, name, nil
 }
 
-// localFolderEntries enumerates every non-directory entry of the admitted
-// folder through the same rooted walk the selected-delete path uses: directory
-// opens stay anchored, symlinked directories are never descended, and any read
-// failure aborts the enumeration instead of yielding a partial list.
-func localFolderEntries(root *os.Root) ([]string, error) {
-	var rels []string
-	err := fs.WalkDir(localSelectionWalkFS{root: root}, ".", func(name string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if name == "." || entry.IsDir() {
-			return nil
-		}
-		rels = append(rels, name)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return rels, nil
-}
-
-// writeCacheDeleteAdmission reports a refused or failed cache-tree admission before anything
-// is removed: a conflict keeps the endpoint's accepted 409; any other failure stops the
+// writeCacheDeleteAdmission reports a refused or failed cache-tree admission before anything// is removed: a conflict keeps the endpoint's accepted 409; any other failure stops the
 // deletion rather than proceeding without cross-process exclusion.
 func writeCacheDeleteAdmission(w http.ResponseWriter, err error) {
 	if errors.Is(err, hfdownloader.ErrOwnershipBusy) {

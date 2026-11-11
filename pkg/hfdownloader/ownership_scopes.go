@@ -1187,3 +1187,64 @@ func (a *FlatAdmission) AdmitFileWrites(ctx context.Context, paths []string) (fu
 	}
 	return lease.Release, nil
 }
+
+// AdmitTreeRemoval takes exclusive admission for the tree at target — shared on
+// ancestors, exclusive on the target directory before any enumeration or
+// descent — and returns the release held until removal finishes. It never
+// waits: a live writer under or above the tree refuses with ErrOwnershipBusy.
+//
+// Re-verified-vanish rule: a target that no longer exists cannot be admitted by
+// enumeration, and a bare or wrapped ENOENT from resolution is not by itself
+// proof that the target is gone — it can also come from a mid-resolution race
+// or a lock node that could not be bootstrapped while the tree still exists. On
+// any ENOENT the call first establishes the creator-side admission for the
+// target — the same writer-preparation keys this realm takes for a missing
+// path (shared ancestor entries, the parent's child-bootstrap gate when the
+// chain is missing, and the target's creation entry keys) — creating no
+// payload entries while it does so, and re-verifies the target under it. Only a
+// target still gone while that admission is held is returned as an admitted
+// removal, with the creator-side release held through the caller's tolerant
+// removal so a creator racing the removal is excluded. A target found to exist
+// escalates back to full tree admission; when admission cannot be established
+// at all, the call fails closed — never with an os.ErrNotExist identity —
+// instead of returning a release.
+func (a *FlatAdmission) AdmitTreeRemoval(ctx context.Context, target string) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	const maxVanishReverifyAttempts = 3
+	var lastNotFound error
+	for attempt := 0; attempt < maxVanishReverifyAttempts; attempt++ {
+		lease, treeErr := a.realm.acquireTreeRemoval(ctx, target, 0)
+		if treeErr == nil {
+			return lease.Release, nil
+		}
+		if !errors.Is(treeErr, os.ErrNotExist) {
+			return nil, treeErr
+		}
+		lastNotFound = treeErr
+		prep, prepErr := a.realm.prepareWriter(ctx, []string{target}, 0)
+		if prepErr != nil {
+			// Busy: a creator is active — refusal, not vanish, with the busy
+			// identity passing through (callers keep their 409). Any other
+			// failure fails closed via admissionUnestablishedError, never
+			// readable as a vanished target.
+			return nil, admissionUnestablishedError(target, prepErr)
+		}
+		_, statErr := os.Lstat(prep.canonical[0])
+		switch {
+		case statErr == nil:
+			// The target exists again: this was not a vanish. Release the
+			// creator-side gate before escalating to full tree admission.
+			prep.Release()
+		case errors.Is(statErr, os.ErrNotExist):
+			// Re-verified vanished: hold the creator-side admission as the
+			// removal's release; nothing can create the target meanwhile.
+			return prep.Release, nil
+		default:
+			prep.Release()
+			return nil, fmt.Errorf("re-verify vanished removal target %q: %w", target, statErr)
+		}
+	}
+	return nil, admissionUnestablishedError(target, lastNotFound)
+}
