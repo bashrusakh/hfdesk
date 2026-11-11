@@ -1723,11 +1723,16 @@ matching a root that fails the registered-roots check returns fail-closed
 friendly-view folder; otherwise `400 Invalid path`.
 
 Whole-folder deletion requires the folder to hold exactly one model's files.
-The server classifies every weight file name in the folder through the shared
-naming rules (quantization tokens, shard suffixes, precision markers,
-vision-encoder companions): one distinct model key makes the folder eligible;
-two or more keys, no recognized weight files, or any weight name the rules
-cannot confidently reduce make it ineligible, and the `DELETE` refuses with
+The server classifies every weight file's folder-relative name through the
+shared naming rules with a strictly right-anchored reduction: a quantization
+token, shard suffix or precision marker is stripped only when it reaches the
+end of the name, only the canonical `<model>.mmproj-<quant>` companion shape
+cuts, and only recognized Diffusers component directories are dropped from
+the key while any other parent directory stays in it — an interior
+occurrence never cuts, so two distinct file names are never merged into one
+key. One distinct model key makes the folder eligible; two or more keys, no
+recognized weight files, or any weight name the rules cannot confidently
+reduce make it ineligible, and the `DELETE` refuses with
 `409 Folder is not a single model` before removing anything — shared or piled
 folders keep per-group deletion only. The classification is conservative:
 folders that merely look alike stay ineligible (a UX loss, never a data risk).

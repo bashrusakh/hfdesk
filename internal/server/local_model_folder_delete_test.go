@@ -550,6 +550,17 @@ func TestLocalModelFolderDelete_SingleModelGate(t *testing.T) {
 		{"diffusers tree with one base", []string{
 			"unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors", "unet/config.json",
 		}, true, http.StatusOK, ""},
+		// F3 counterexamples: the interior-span reduction used to merge both
+		// pairs into one key and approved the pile for whole-folder deletion.
+		{"interior quant span pile (tiny…llama)", []string{
+			"tiny-Q4_K_M-llama.gguf", "tinyllama.gguf",
+		}, true, http.StatusConflict, "multiple models"},
+		{"near-miss mmproj pile", []string{
+			"x-mmproj-y.gguf", "x.gguf",
+		}, true, http.StatusConflict, "multiple models"},
+		{"adapter pile in sibling dirs", []string{
+			"a/pytorch_lora_weights.safetensors", "b/pytorch_lora_weights.safetensors",
+		}, true, http.StatusConflict, "multiple models"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -604,4 +615,38 @@ func TestLocalModelFolderDelete_SingleModelGate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// F4: the nested-boundary factor on the wholeFolderDeletable flag is
+// repo-scoped. A configured root nested under a SIBLING folder must not
+// invalidate this folder's flag or reason — mirroring what the DELETE
+// endpoint's selectedDeleteExclusions computes for this repo (which already
+// proceeds in this situation).
+func TestLocalModelFolderDelete_NestedSiblingRootKeepsFlag(t *testing.T) {
+	scanRoot := t.TempDir()
+	folder := filepath.Join(scanRoot, "org", "model")
+	mustWriteFile(t, filepath.Join(folder, "model.gguf"), "w")
+	sibling := filepath.Join(scanRoot, "org", "other")
+	mustWriteFile(t, filepath.Join(sibling, "other.gguf"), "w")
+	s := newTestServerWithConfig(t, Config{CacheDir: t.TempDir(), LocalScanDirs: []string{scanRoot, sibling}})
+
+	w := cacheRequest(t, s, http.MethodGet, "/api/cache/org/model?type=model", "")
+	var details map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &details); err != nil {
+		t.Fatal(err)
+	}
+	raw, present := details["wholeFolderDeletable"]
+	if !present || raw != true {
+		t.Fatalf("a configured root under a sibling folder must not invalidate this folder's flag, got present=%v value=%v body=%s", present, raw, w.Body.String())
+	}
+	if reason, _ := details["wholeFolderDeleteReason"].(string); reason != "" {
+		t.Fatalf("no reason belongs on an eligible folder, got %q", reason)
+	}
+
+	w = cacheRequest(t, s, http.MethodDelete, "/api/cache/org/model?type=model", localFolderDeleteBody(folder))
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete with a sibling nested root: status=%d body=%s", w.Code, w.Body.String())
+	}
+	mustBeGone(t, folder)
+	mustExist(t, filepath.Join(sibling, "other.gguf"))
 }

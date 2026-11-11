@@ -1470,7 +1470,9 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 	}
 	// Whole-folder eligibility is computed for Local sources along the same
 	// walk and the same excluded-subroot view the listing already uses, so
-	// the flag and the delete-time classifier see the same file set.
+	// the flag and the delete-time classifier see the same file set. The
+	// classifier keys folder-relative paths: parent directories stay in the
+	// key unless they are recognized Diffusers component directories.
 	classifyFolder := source == cacheSourceLocal
 	folderKeys := map[string]bool{}
 	folderUnclassified := false
@@ -1480,12 +1482,17 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 			return nil
 		}
 		if classifyFolder {
-			key, weight, ok := smartdl.WeightFileModelKey(info.Name())
-			if weight {
-				if !ok {
-					folderUnclassified = true
-				} else {
-					folderKeys[key] = true
+			relPath, relErr := filepath.Rel(repoDir, path)
+			if relErr != nil {
+				folderUnclassified = true
+			} else {
+				key, weight, ok := smartdl.WeightFileModelKey(relPath)
+				if weight {
+					if !ok {
+						folderUnclassified = true
+					} else {
+						folderKeys[key] = true
+					}
 				}
 			}
 		}
@@ -1581,10 +1588,28 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 		Capabilities:   ggufMeta.Capabilities,
 	}
 	if classifyFolder {
-		eligible := singleModelFolderReason(len(folderKeys), folderUnclassified, len(excluded) > 0) == ""
+		// The nested-boundary factor is repo-scoped: only a configured root
+		// nested UNDER THIS folder makes it ineligible, mirroring what the
+		// DELETE endpoint's selectedDeleteExclusions computes for this repo —
+		// a configured root under a sibling folder never affects this flag.
+		nestedRepoRoot := false
+		repoKey, absErr := filepath.Abs(repoDir)
+		if absErr != nil {
+			nestedRepoRoot = true // fail closed
+		} else {
+			repoKey = pathIdentityKey(repoKey)
+			for _, sub := range excluded {
+				if withinLocalRoot(repoKey, sub) {
+					nestedRepoRoot = true
+					break
+				}
+			}
+		}
+		reason := singleModelFolderReason(len(folderKeys), folderUnclassified, nestedRepoRoot)
+		eligible := reason == ""
 		info.WholeFolderDeletable = &eligible
 		if !eligible {
-			info.WholeFolderDeleteReason = singleModelFolderReason(len(folderKeys), folderUnclassified, len(excluded) > 0)
+			info.WholeFolderDeleteReason = reason
 		}
 	}
 	return info, nil
@@ -2677,11 +2702,14 @@ func openLocalFolderOwner(repoRoot *os.Root, physicalRepo string) (*os.Root, str
 	return ownerRoot, name, nil
 }
 
-// localFolderFileNames enumerates every non-directory entry name of the
-// admitted folder through the same rooted walk the selected-delete path uses:
-// directory opens stay anchored, symlinked directories are never descended
-// (their contents are also never removed), and any read failure aborts the
-// enumeration instead of yielding a partial list.
+// localFolderFileNames enumerates every non-directory entry's
+// folder-relative name (slash-separated, per the fs.WalkDir contract) inside
+// the admitted folder through the same rooted walk the selected-delete path
+// uses: directory opens stay anchored, symlinked directories are never
+// descended (their contents are also never removed), and any read failure
+// aborts the enumeration instead of yielding a partial list. The relative
+// path — not just the base name — feeds the single-model classifier, so
+// parent directories stay part of the key.
 func localFolderFileNames(root *os.Root) ([]string, error) {
 	var names []string
 	err := fs.WalkDir(localSelectionWalkFS{root: root}, ".", func(name string, entry fs.DirEntry, walkErr error) error {
@@ -2691,7 +2719,7 @@ func localFolderFileNames(root *os.Root) ([]string, error) {
 		if name == "." || entry.IsDir() {
 			return nil
 		}
-		names = append(names, entry.Name())
+		names = append(names, name)
 		return nil
 	})
 	if err != nil {
@@ -2700,7 +2728,8 @@ func localFolderFileNames(root *os.Root) ([]string, error) {
 	return names, nil
 }
 
-// writeCacheDeleteAdmission reports a refused or failed cache-tree admission before anything// is removed: a conflict keeps the endpoint's accepted 409; any other failure stops the
+// writeCacheDeleteAdmission reports a refused or failed cache-tree admission before anything
+// is removed: a conflict keeps the endpoint's accepted 409; any other failure stops the
 // deletion rather than proceeding without cross-process exclusion.
 func writeCacheDeleteAdmission(w http.ResponseWriter, err error) {
 	if errors.Is(err, hfdownloader.ErrOwnershipBusy) {
