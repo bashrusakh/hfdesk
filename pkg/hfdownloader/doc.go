@@ -181,6 +181,30 @@ only when the job enables `AppendFilterSubdir`; consumers must check that flag
 before combining it with `PlanItem.RelativePath` to determine the download
 destination. `ScanPlan` preview event paths remain repository-relative.
 
+A job with `ShardRanges` narrows a filtered selection to specific shards of
+split files: a comma-separated list of 1-based inclusive spans such as
+"1-100,120-185" (a bare "N" is the single index N), requiring non-empty
+`Filters` — a malformed expression, an empty span such as "10-5", or ranges
+without filters fail with `ErrInvalidShardRanges` before any network work.
+Within the matched file set, files named in the established split form
+"<prefix>-NNNNN-of-MMMMM.<ext>" are grouped per family (the relative path
+with the shard token removed), ordered by the shard number written in their
+names and indexed 1..M in that order — so ranges address POSITIONS in
+written-number order, not the written numbers themselves: for a family whose
+written shard numbers contain gaps the positions and the numbers differ (for
+complete families they coincide) — and only shards whose index falls
+inside the spans are planned. Non-shard-shaped files are unaffected and
+ranges only narrow: a selection the ranges empty fails with
+`ErrNoFilterMatch` even when retained companion files that matched nothing
+remain planned, while ineffective ranges — a matched set with no shard
+file at all, or a span selecting no existing index — become plan notices
+naming the whole expression or the ineffective spans; they never change the
+plan, its items or the download outcome, and surface in `Plan.Notices`, in
+the `POST /api/plan` response, on the download's warning channel, and in
+the exported `ScanPlan` preview's warning events — the same channels as the
+split-mention notice above. Shard ranges change plan selection only: resume identity,
+verification, ownership and publication semantics are unaffected.
+
 # Ownership: one destination domain
 
 Exactly one participating writer may own an item at a time. Each operation

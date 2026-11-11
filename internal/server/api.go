@@ -57,6 +57,20 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// validateShardRangesRequest is the request-shape boundary for shard-range
+// selections, mirroring validateBranchVariantRequest: one check shared by
+// the download and plan endpoints so a dry run cannot accept a request the
+// real download rejects, and a malformed range fails with a named 400 before
+// any Hub contact. An absent (exactly empty) field is skipped; any other
+// value must parse and must come with a non-empty filter selection, since
+// ranges only narrow a selection.
+func validateShardRangesRequest(req DownloadRequest) error {
+	if req.ShardRanges == "" {
+		return nil
+	}
+	return hfdownloader.ValidateShardRanges(req.ShardRanges, req.Filters)
+}
+
 // handleStartDownload starts a new download job.
 func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 	var req DownloadRequest
@@ -92,6 +106,13 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validateBranchVariantRequest(req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid branch variant request", err.Error())
+		return
+	}
+	// Fail closed before the dry-run/plan branch and before CreateJob, so a
+	// bad range never reaches the Hub or becomes a queued job.
+	if err := validateShardRangesRequest(req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_shard_ranges",
+			"Invalid shard ranges", err.Error())
 		return
 	}
 
@@ -174,6 +195,11 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		writeError(w, http.StatusBadRequest, "Invalid branch variant request", err.Error())
 		return
 	}
+	if err := validateShardRangesRequest(req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_shard_ranges",
+			"Invalid shard ranges", err.Error())
+		return
+	}
 
 	dlJob := hfdownloader.Job{
 		Repo:               req.Repo,
@@ -185,6 +211,7 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		StrictFiles:        req.StrictFiles,
 		AppendFilterSubdir: req.AppendFilterSubdir,
 		BranchVariant:      req.BranchVariant,
+		ShardRanges:        req.ShardRanges,
 	}
 
 	// Take a snapshot of the server config; every read below uses it
@@ -232,6 +259,13 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		if errors.Is(err, hfdownloader.ErrAppendFilterSubdirPathFilter) {
 			writeAPIError(w, http.StatusBadRequest, "invalid_append_filter_subdir",
 				"AppendFilterSubdir cannot be combined with path-shaped filters", err.Error())
+			return
+		}
+		// Normally rejected at the request boundary above; the mapping keeps
+		// the named 400 even if a future caller reaches PlanRepo directly.
+		if errors.Is(err, hfdownloader.ErrInvalidShardRanges) {
+			writeAPIError(w, http.StatusBadRequest, "invalid_shard_ranges",
+				"Invalid shard ranges", err.Error())
 			return
 		}
 		if errors.Is(err, hfdownloader.ErrInvalidFileSelection) {

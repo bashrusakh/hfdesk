@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -82,6 +83,86 @@ func validate(job Job, cfg Settings) error {
 		if err := validateAppendFilterSubdirFilters(job.Filters); err != nil {
 			return err
 		}
+	}
+	if job.ShardRanges != "" {
+		// Ranges only narrow a filtered selection; a malformed expression or
+		// ranges without filters fails here, before any network or plan work,
+		// so PlanRepo and Download both fail closed the same way.
+		if err := ValidateShardRanges(job.ShardRanges, job.Filters); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// shardRange is one parsed shard-range segment: the inclusive span of shard
+// indices it selects and the spelling the caller wrote it with, which
+// warnings reproduce verbatim.
+type shardRange struct {
+	start, end int
+	text       string
+}
+
+// parseShardRanges parses a shard-range expression such as "1-100,120-185"
+// into inclusive spans. Segments are comma-separated, whitespace around a
+// segment is trimmed, and each segment is either a single index "N" or a
+// span "N-M" of positive integers with N <= M; the order of segments does
+// not matter. Anything else fails closed: an empty expression, an empty
+// segment, a zero or negative index, a reversed span, a non-numeric token,
+// and an index that does not fit an int are all ErrInvalidShardRanges.
+func parseShardRanges(expr string) ([]shardRange, error) {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return nil, fmt.Errorf("%w: expression is empty", ErrInvalidShardRanges)
+	}
+	segments := strings.Split(expr, ",")
+	ranges := make([]shardRange, 0, len(segments))
+	for _, raw := range segments {
+		text := strings.TrimSpace(raw)
+		if text == "" {
+			return nil, fmt.Errorf("%w: empty segment in %q", ErrInvalidShardRanges, expr)
+		}
+		startText, endText, hasEnd := strings.Cut(text, "-")
+		start, err := parseShardIndex(startText)
+		if err != nil {
+			return nil, err
+		}
+		end := start
+		if hasEnd {
+			end, err = parseShardIndex(endText)
+			if err != nil {
+				return nil, err
+			}
+			if end < start {
+				return nil, fmt.Errorf("%w: span %q ends before it starts", ErrInvalidShardRanges, text)
+			}
+		}
+		ranges = append(ranges, shardRange{start: start, end: end, text: text})
+	}
+	return ranges, nil
+}
+
+// parseShardIndex parses one 1-based shard index, failing closed on empty,
+// non-numeric, zero, negative and overflowing input.
+func parseShardIndex(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("%w: %q is not a positive shard index", ErrInvalidShardRanges, s)
+	}
+	return n, nil
+}
+
+// ValidateShardRanges reports whether expr is a well-formed shard-range
+// expression for a non-empty filter selection. The server calls it at the
+// request boundary so a bad range fails as a named client error before any
+// Hub contact; validate() re-runs the same check for direct library callers.
+func ValidateShardRanges(expr string, filters []string) error {
+	if _, err := parseShardRanges(expr); err != nil {
+		return err
+	}
+	if len(filters) == 0 {
+		return fmt.Errorf("%w: ranges only narrow a selection, so filters must be non-empty", ErrInvalidShardRanges)
 	}
 	return nil
 }

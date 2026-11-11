@@ -2949,7 +2949,7 @@ async function loadRepositoryDetails(entry) {
     const hfLink = $('#modelsDetailHFLink');
     if (header) header.style.display = 'none';
     if (hfLink) hfLink.hidden = true;
-    advancedOptions = { filter: '', exclude: '' };
+    advancedOptions = { filter: '', exclude: '', shardRanges: '' };
     const input = $('#analyzeInput');
     if (input) input.value = '';
     _syncModelsSearchClear();
@@ -3009,10 +3009,11 @@ async function loadRepositoryDetails(entry) {
     updateScrollArrows();
   };
 
-  // Store advanced options (filter/exclude only - revision comes from analysis)
+  // Store advanced options (filter/exclude/shard ranges only - revision comes from analysis)
   let advancedOptions = {
     filter: '',
-    exclude: ''
+    exclude: '',
+    shardRanges: ''
   };
 
   // Show advanced options modal
@@ -3030,6 +3031,11 @@ async function loadRepositoryDetails(entry) {
         <input type="text" id="advExclude" value="${escapeHtml(advancedOptions.exclude)}" placeholder="e.g., fp16,bf16">
         <p class="form-hint">Skip files matching these patterns</p>
       </div>
+      <div class="form-group">
+        <label for="advShardRanges">Shard Ranges</label>
+        <input type="text" id="advShardRanges" value="${escapeHtml(advancedOptions.shardRanges)}" placeholder="e.g., 1-100,120-185">
+        <p class="form-hint">Download only these shard indices of split files (e.g. *.safetensors shards); requires a File Filter</p>
+      </div>
       <div class="form-actions">
         <button class="btn btn-secondary" onclick="hideModal()">Cancel</button>
         <button class="btn btn-primary" onclick="applyAdvancedOptions()">Apply</button>
@@ -3041,6 +3047,7 @@ async function loadRepositoryDetails(entry) {
   window.applyAdvancedOptions = function() {
     advancedOptions.filter = $('#advFilter')?.value || '';
     advancedOptions.exclude = $('#advExclude')?.value || '';
+    advancedOptions.shardRanges = $('#advShardRanges')?.value || '';
 
     hideModal();
     showToast('Options applied', 'success');
@@ -3057,6 +3064,12 @@ async function loadRepositoryDetails(entry) {
       ? advancedOptions.exclude.split(',').map(s => s.trim()).filter(Boolean)
       : [];
 
+    // Send the shard-range selection verbatim (trimmed): ranges only narrow
+    // a filter selection, and the server rejects malformed ranges or ranges
+    // without filters with a named 400 — dropping the typed value here would
+    // hide the user's input instead of surfacing that message.
+    const shardRanges = (advancedOptions.shardRanges || '').trim();
+
     // Non-selectable types (e.g. audio) send the destination chosen in the
     // file list's "Save to" select; '' keeps the previous behavior.
     const routeKey = isDataset ? '' : routeSelectValue('nonSelectableRoute');
@@ -3072,6 +3085,7 @@ async function loadRepositoryDetails(entry) {
         // exact enough that q6_k does not also pull q6_k_xl.
         exactMatch: filters.length > 0
       };
+      if (shardRanges) body.shardRanges = shardRanges;
       if (routeKey) body.routeKey = routeKey;
 
       if (!await checkDownloadDiskSpace(body)) return;
@@ -3386,7 +3400,8 @@ async function loadRepositoryDetails(entry) {
     const mmproj = filters.find(f => /mmproj/i.test(f)) || '';
     return {
       quant: quant || (filters.length ? filters.join(', ') : ''),
-      mmproj
+      mmproj,
+      shards: (job.shardRanges || '').trim()
     };
   }
 
@@ -3431,6 +3446,7 @@ async function loadRepositoryDetails(entry) {
               <span data-role="revision"></span>
               <span data-role="quant" class="job-chip" style="display:none"></span>
               <span data-role="mmproj" class="job-chip job-chip-vision" style="display:none">mmproj</span>
+              <span data-role="shards" class="job-chip" style="display:none"></span>
             </div>
           </div>
           <div class="job-header-right">
@@ -3575,10 +3591,20 @@ async function loadRepositoryDetails(entry) {
       mmprojEl.style.display = 'none';
     }
 
+    const shardsEl = el.querySelector('[data-role="shards"]');
+    if (jobLabels.shards) {
+      const shardsText = 'shards ' + jobLabels.shards;
+      if (shardsEl.textContent !== shardsText) shardsEl.textContent = shardsText;
+      if (shardsEl.style.display === 'none') shardsEl.style.display = '';
+    } else if (shardsEl.style.display !== 'none') {
+      shardsEl.style.display = 'none';
+    }
+
     // Collapse the meta line entirely when it has nothing to show (no
-    // non-default revision, no quant, no mmproj) so it adds no height.
+    // non-default revision, no quant, no mmproj, no shard ranges) so it adds
+    // no height.
     const revVisible = el.querySelector('[data-role="revision"]').style.display !== 'none';
-    const metaVisible = revVisible || !!jobLabels.quant || !!jobLabels.mmproj;
+    const metaVisible = revVisible || !!jobLabels.quant || !!jobLabels.mmproj || !!jobLabels.shards;
     const metaLine = el.querySelector('.job-meta-line');
     metaLine.style.display = metaVisible ? '' : 'none';
 

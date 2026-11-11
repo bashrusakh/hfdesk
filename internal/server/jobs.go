@@ -51,6 +51,7 @@ type Job struct {
 	Warnings           []string          `json:"warnings,omitempty"`      // The downloader's distinct non-fatal diagnostics, one entry each in first-arrival order, bounded at maxJobWarnings (distinct from the server-computed DestinationWarning).
 	LocalDir           string            `json:"localDir,omitempty"`      // Effective local-dir for this job (per-request or server-global)
 	LocalRepo          string            `json:"localRepo,omitempty"`     // Override destination folder name (used for upstream mmproj)
+	ShardRanges        string            `json:"shardRanges,omitempty"`   // Shard-range selection narrowing the filters (see hfdownloader.Job.ShardRanges)
 	BranchVariant      bool              `json:"branchVariant,omitempty"` // Whole EXL branch selected by revision
 	Flat               bool              `json:"flat,omitempty"`          // Save real files (flat mode) instead of HF cache layout
 	ExactMatch         bool              `json:"exactMatch,omitempty"`    // Match filters by whole name segment, not substring
@@ -501,7 +502,8 @@ func stringSlicesEqual(a, b []string) bool {
 }
 
 // CreateJob creates a new download job, or returns the existing one when
-// repo, revision, dataset, destination and filters match an active job.
+// repo, revision, dataset, destination, filters and shard ranges match an
+// active job.
 // Different filters on the same repo (e.g. Q4_K_M vs mmproj-f16) create
 // independent jobs.
 //
@@ -551,7 +553,10 @@ resolveRequest:
 	// Check for existing active job with identical parameters.
 	// Deduplication is filter-aware: only match when filters and excludes
 	// are also identical, so the user can download a quantization and a
-	// vision encoder (mmproj) for the same repo at the same time.
+	// vision encoder (mmproj) for the same repo at the same time. Shard
+	// ranges participate in the same identity: two requests that differ only
+	// in their shardRange selection describe different file sets, so they
+	// must not collapse into one job.
 	//
 	// Destination identity uses the frozen OutputDir (not LocalDir):
 	// LocalDir changes meaning whenever the settings/routes change between
@@ -581,6 +586,7 @@ resolveRequest:
 			existing.BranchVariant == req.BranchVariant &&
 			existing.StrictFiles == req.StrictFiles &&
 			((existing.StrictFiles && req.StrictFiles) || existing.ExactMatch == req.ExactMatch) &&
+			existing.ShardRanges == req.ShardRanges &&
 			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
 			stringSlicesEqual(existing.Filters, req.Filters) &&
 			stringSlicesEqual(existing.Excludes, req.Excludes) {
@@ -604,6 +610,7 @@ resolveRequest:
 		BranchVariant: req.BranchVariant,
 		Flat:          flat,
 		ExactMatch:    req.ExactMatch,
+		ShardRanges:   req.ShardRanges,
 		StrictFiles:   req.StrictFiles,
 		RouteKey:      routeKey,
 		Status:        JobStatusQueued,
@@ -681,6 +688,7 @@ resolveRequest:
 				existing.BranchVariant == req.BranchVariant &&
 				existing.StrictFiles == req.StrictFiles &&
 				((existing.StrictFiles && req.StrictFiles) || existing.ExactMatch == req.ExactMatch) &&
+				existing.ShardRanges == req.ShardRanges &&
 				(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
 				stringSlicesEqual(existing.Filters, req.Filters) && stringSlicesEqual(existing.Excludes, req.Excludes) {
 				a.Close()
@@ -1779,6 +1787,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		AppendFilterSubdir: false,
 		LocalRepo:          job.LocalRepo,
 		BranchVariant:      job.BranchVariant,
+		ShardRanges:        job.ShardRanges,
 	}
 
 	// Snapshot the manager config under the lock: a concurrent POST /api/settings

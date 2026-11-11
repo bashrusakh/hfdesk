@@ -64,6 +64,16 @@ type DownloadRequest struct {
 	// destination is used as the job's flat/local directory. An explicit
 	// localDir takes priority; an unknown key is rejected with 400.
 	RouteKey string `json:"routeKey,omitempty"`
+	// ShardRanges narrows a filtered selection to specific shard indices of
+	// split files ("<prefix>-NNNNN-of-MMMMM.<ext>"): comma-separated
+	// inclusive 1-based spans such as "1-100,120-185", where a bare "N" is
+	// the single index N. It requires non-empty filters; a malformed
+	// expression, an empty span (10-5) or ranges without filters are
+	// rejected with 400 invalid_shard_ranges before any Hub contact. Within
+	// each shard family the shards are indexed 1..M in written-number order
+	// and only shards whose index falls in the spans are planned; files that
+	// are not shard-shaped are unaffected. See hfdownloader.Job.ShardRanges.
+	ShardRanges string `json:"shardRanges,omitempty"`
 }
 
 // PlanResponse is the response for a dry-run/plan request.
@@ -73,12 +83,13 @@ type PlanResponse struct {
 	Files      []PlanFile `json:"files"`
 	TotalSize  int64      `json:"totalSize"`
 	TotalFiles int        `json:"totalFiles"`
-	// Notices are informational messages about files the plan deliberately
-	// did not select (currently split-mention files the split-precedence
-	// rule dropped for a filter naming their mentioned split). Each notice
-	// is one bounded sentence naming the count, the split label, the
-	// directories, and at most five excluded paths. A notice never changes
-	// files, totalSize, or totalFiles, and it is omitted when empty.
+	// Notices are informational, bounded sentences: split-mention files the
+	// split-precedence rule dropped for a filter naming their mentioned
+	// split (naming the count, the split label, the directories and at most
+	// five excluded paths), and ineffective shard ranges (naming the whole
+	// expression or up to five ineffective spans — see shardRanges). A
+	// notice never changes files, totalSize, or totalFiles, and it is
+	// omitted when empty.
 	Notices []string `json:"notices,omitempty"`
 }
 
