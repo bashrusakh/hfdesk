@@ -691,9 +691,8 @@ func oracleConventionalCompanionDirectory(filePath string) bool {
 	return false
 }
 
-// concreteOracleSkipped is a deliberately small independent reference for
-// the evaluator's direct-selection and input-order retention rules. It does
-// not call the production world evaluator or validate helper.
+// concreteOracleEligible is a deliberately small independent reference for the
+// evaluator's direct-selection/order rules; it calls no production helpers.
 func concreteOracleEligible(c datasetDecisionContext, w datasetDecisionWorld, collisions map[uint]bool) []bool {
 	n := len(c.Inputs)
 	eligible := make([]bool, n)
@@ -713,36 +712,6 @@ func concreteOracleEligible(c datasetDecisionContext, w datasetDecisionWorld, co
 	return eligible
 }
 
-// concreteOracleSkipped adds exact/case-folded output suppression after the
-// independent raw eligibility oracle; it never defines kernel eligibility.
-func concreteOracleSkipped(c datasetDecisionContext, w datasetDecisionWorld, collisions map[uint]bool) []bool {
-	eligible := concreteOracleEligible(c, w, collisions)
-	skipped := make([]bool, len(c.Inputs))
-	seenExact := map[string]bool{}
-	seenFold := map[string]bool{}
-	for i, in := range c.Inputs {
-		if seenExact[in.Path] {
-			skipped[i] = true
-			continue
-		}
-		seenExact[in.Path] = true
-		if in.Excluded {
-			skipped[i] = true
-			continue
-		}
-		fold := strings.ToLower(in.Path)
-		if seenFold[fold] {
-			skipped[i] = true
-			continue
-		}
-		if !eligible[i] {
-			skipped[i] = true
-			continue
-		}
-		seenFold[fold] = true
-	}
-	return skipped
-}
 func cloneDecisionWorld(w datasetDecisionWorld) datasetDecisionWorld {
 	out := datasetDecisionWorld{DataLabels: map[int]string{}, Companion: map[int]bool{}, SharedToken: map[uint]bool{}}
 	for k, v := range w.DataLabels {

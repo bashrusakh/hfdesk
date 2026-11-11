@@ -21,45 +21,6 @@ import (
 	"time"
 )
 
-type progressReader struct {
-	reader     io.Reader
-	total      int64
-	downloaded int64
-	path       string
-	emit       func(ProgressEvent)
-	lastEmit   time.Time
-	interval   time.Duration
-}
-
-func newProgressReader(r io.Reader, total int64, path string, emit func(ProgressEvent)) *progressReader {
-	return &progressReader{
-		reader:   r,
-		total:    total,
-		path:     path,
-		emit:     emit,
-		lastEmit: time.Now(),
-		interval: 200 * time.Millisecond, // Emit at most 5 times per second
-	}
-}
-
-func (pr *progressReader) Read(p []byte) (n int, err error) {
-	n, err = pr.reader.Read(p)
-	if n > 0 {
-		pr.downloaded += int64(n)
-		// Throttle emissions to avoid flooding
-		if time.Since(pr.lastEmit) >= pr.interval || err == io.EOF {
-			pr.emit(ProgressEvent{
-				Event:      "file_progress",
-				Path:       pr.path,
-				Downloaded: pr.downloaded,
-				Total:      pr.total,
-			})
-			pr.lastEmit = time.Now()
-		}
-	}
-	return n, err
-}
-
 // multipartLayoutMetaPath names the obsolete pre-#140 layout record, used only for cleanup.
 func multipartLayoutMetaPath(dst string) string {
 	return dst + ".parts.json"

@@ -40,12 +40,6 @@ type pathDerivedHubState struct {
 	releaseOnce  sync.Once
 }
 
-func (s *pathDerivedHubState) payloadGets() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.gets
-}
-
 func (s *pathDerivedHubState) releasePayload() {
 	s.releaseOnce.Do(func() { close(s.release) })
 }
