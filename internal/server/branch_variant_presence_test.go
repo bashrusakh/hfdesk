@@ -947,7 +947,7 @@ func TestBranchVariantLocalRedownloadRefetchesSameSizeHashlessFile(t *testing.T)
 	if err := hfdownloader.Download(context.Background(), job, cfg, nil); err != nil {
 		t.Fatalf("download A: %v", err)
 	}
-	payload := filepath.Join(presenceLocalSpace(t, root).Path(), "payload", revision, "config.json")
+	payload := filepath.Join(root, hfdownloader.BranchVariantLocalSpaceName, presenceRepo, "payload", revision, "config.json")
 	if body, err := os.ReadFile(payload); err != nil || string(body) != configA {
 		t.Fatalf("payload after A = %q err=%v, want %q", body, err, configA)
 	}
@@ -1026,7 +1026,7 @@ func TestBranchVariantLocalSlashRevisionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := filepath.Join(space.Path(), "payload", "exl", "4_25"); payloadDir != want {
+	if want := filepath.Join(root, hfdownloader.BranchVariantLocalSpaceName, presenceRepo, "payload", revision); payloadDir != want {
 		t.Fatalf("payload dir = %q, want %q", payloadDir, want)
 	}
 	if _, err := os.Stat(filepath.Join(payloadDir, "model.safetensors")); err != nil {
@@ -1041,7 +1041,7 @@ func TestBranchVariantLocalSlashRevisionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := filepath.Join(space.Path(), "records", "exl", "4_25", commit); recordDir != want {
+	if want := filepath.Join(root, hfdownloader.BranchVariantLocalSpaceName, presenceRepo, "records", revision, commit); recordDir != want {
 		t.Fatalf("completion record dir = %q, want %q", recordDir, want)
 	}
 	manifest, err := hfdownloader.ReadManifest(filepath.Join(recordDir, hfdownloader.ManifestFilename))

@@ -154,12 +154,6 @@ func NewBranchVariantLocalSpace(root, repo string) (BranchVariantLocalSpace, err
 	}, nil
 }
 
-// Path returns the directory of the space itself:
-// <root>/.hfdesk-branch-variants/<owner>/<repo>.
-func (space BranchVariantLocalSpace) Path() string {
-	return space.space
-}
-
 // PayloadDir returns the directory that receives the payload files of one
 // revision inside the space: <space>/payload/<revision>.
 //

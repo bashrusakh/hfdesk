@@ -36,6 +36,15 @@ func TestDefaultCacheDir(t *testing.T) {
 	})
 }
 
+// NewHFCache creates a new HFCache with the given root directory.
+// If root is empty, it uses DefaultCacheDir().
+func NewHFCache(root string) *HFCache {
+	if root == "" {
+		root = DefaultCacheDir()
+	}
+	return NewHFCacheResolved(root, os.Getenv("HF_HUB_CACHE"))
+}
+
 func TestNewHFCache(t *testing.T) {
 	t.Run("empty root uses default", func(t *testing.T) {
 		cache := NewHFCache("")
@@ -430,31 +439,6 @@ func TestRepoDir_ListSnapshots(t *testing.T) {
 			t.Errorf("expected 2 snapshots, got %d", len(snapshots))
 		}
 	})
-}
-
-func TestCopyFile(t *testing.T) {
-	tmpDir := t.TempDir()
-	content := []byte("test content for copy")
-
-	src := filepath.Join(tmpDir, "src.txt")
-	dst := filepath.Join(tmpDir, "dst.txt")
-
-	if err := os.WriteFile(src, content, 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := copyFile(src, dst); err != nil {
-		t.Fatalf("copyFile error: %v", err)
-	}
-
-	// Verify content
-	dstContent, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatalf("read dst error: %v", err)
-	}
-	if string(dstContent) != string(content) {
-		t.Error("copied content mismatch")
-	}
 }
 
 func TestIsProcessAlive(t *testing.T) {

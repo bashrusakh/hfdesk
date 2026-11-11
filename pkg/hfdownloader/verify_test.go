@@ -24,9 +24,9 @@ func TestComputeSHA256(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		hash, err := computeSHA256(filePath)
+		hash, err := computeSHA256Ctx(context.Background(), filePath)
 		if err != nil {
-			t.Fatalf("computeSHA256 error: %v", err)
+			t.Fatalf("computeSHA256Ctx error: %v", err)
 		}
 
 		// Note: The actual hash depends on exact bytes
@@ -45,9 +45,9 @@ func TestComputeSHA256(t *testing.T) {
 		// SHA256 of empty file
 		expectedHash := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
-		hash, err := computeSHA256(filePath)
+		hash, err := computeSHA256Ctx(context.Background(), filePath)
 		if err != nil {
-			t.Fatalf("computeSHA256 error: %v", err)
+			t.Fatalf("computeSHA256Ctx error: %v", err)
 		}
 
 		if hash != expectedHash {
@@ -56,7 +56,7 @@ func TestComputeSHA256(t *testing.T) {
 	})
 
 	t.Run("file not found", func(t *testing.T) {
-		_, err := computeSHA256(filepath.Join(tmpDir, "nonexistent.txt"))
+		_, err := computeSHA256Ctx(context.Background(), filepath.Join(tmpDir, "nonexistent.txt"))
 		if err == nil {
 			t.Error("expected error for nonexistent file")
 		}
@@ -69,9 +69,9 @@ func TestComputeSHA256(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		hash, err := computeSHA256(filePath)
+		hash, err := computeSHA256Ctx(context.Background(), filePath)
 		if err != nil {
-			t.Fatalf("computeSHA256 error: %v", err)
+			t.Fatalf("computeSHA256Ctx error: %v", err)
 		}
 
 		if len(hash) != 64 {
@@ -92,9 +92,9 @@ func TestVerifySHA256(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		err := verifySHA256(filePath, expectedHash)
+		err := verifySHA256Ctx(context.Background(), filePath, expectedHash)
 		if err != nil {
-			t.Errorf("verifySHA256 unexpected error: %v", err)
+			t.Errorf("verifySHA256Ctx unexpected error: %v", err)
 		}
 	})
 
@@ -108,9 +108,9 @@ func TestVerifySHA256(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		err := verifySHA256(filePath, upperHash)
+		err := verifySHA256Ctx(context.Background(), filePath, upperHash)
 		if err != nil {
-			t.Errorf("verifySHA256 should be case insensitive: %v", err)
+			t.Errorf("verifySHA256Ctx should be case insensitive: %v", err)
 		}
 	})
 
@@ -123,14 +123,14 @@ func TestVerifySHA256(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		err := verifySHA256(filePath, wrongHash)
+		err := verifySHA256Ctx(context.Background(), filePath, wrongHash)
 		if err == nil {
 			t.Error("expected error for mismatching hash")
 		}
 	})
 
 	t.Run("file not found", func(t *testing.T) {
-		err := verifySHA256(filepath.Join(tmpDir, "nonexistent.txt"), "abc")
+		err := verifySHA256Ctx(context.Background(), filepath.Join(tmpDir, "nonexistent.txt"), "abc")
 		if err == nil {
 			t.Error("expected error for nonexistent file")
 		}
@@ -144,7 +144,7 @@ func TestShouldSkipLocal(t *testing.T) {
 		item := PlanItem{RelativePath: "test.txt", Size: 100}
 		dst := filepath.Join(tmpDir, "nonexistent.txt")
 
-		skip, reason, err := shouldSkipLocal(item, dst)
+		skip, reason, err := shouldSkipLocalCtx(context.Background(), item, dst)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -163,7 +163,7 @@ func TestShouldSkipLocal(t *testing.T) {
 		}
 
 		item := PlanItem{RelativePath: "test.txt", Size: 1000} // Different size
-		skip, _, err := shouldSkipLocal(item, filePath)
+		skip, _, err := shouldSkipLocalCtx(context.Background(), item, filePath)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -180,7 +180,7 @@ func TestShouldSkipLocal(t *testing.T) {
 		}
 
 		item := PlanItem{RelativePath: "test.txt", Size: int64(len(content)), LFS: false}
-		skip, reason, err := shouldSkipLocal(item, filePath)
+		skip, reason, err := shouldSkipLocalCtx(context.Background(), item, filePath)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -203,7 +203,7 @@ func TestShouldSkipLocal(t *testing.T) {
 		hash := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 		item := PlanItem{RelativePath: "test.txt", Size: 0, LFS: true, SHA256: hash}
 
-		skip, reason, err := shouldSkipLocal(item, filePath)
+		skip, reason, err := shouldSkipLocalCtx(context.Background(), item, filePath)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -226,7 +226,7 @@ func TestShouldSkipLocal(t *testing.T) {
 		wrongHash := "0000000000000000000000000000000000000000000000000000000000000000"
 		item := PlanItem{RelativePath: "test.txt", Size: int64(len(content)), LFS: true, SHA256: wrongHash}
 
-		skip, _, err := shouldSkipLocal(item, filePath)
+		skip, _, err := shouldSkipLocalCtx(context.Background(), item, filePath)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -243,7 +243,7 @@ func TestShouldSkipLocal(t *testing.T) {
 		}
 
 		item := PlanItem{RelativePath: "test.txt", Size: int64(len(content)), LFS: true, SHA256: ""}
-		skip, reason, err := shouldSkipLocal(item, filePath)
+		skip, reason, err := shouldSkipLocalCtx(context.Background(), item, filePath)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -263,7 +263,7 @@ func TestShouldSkipLocal(t *testing.T) {
 		}
 
 		item := PlanItem{RelativePath: "test.txt", Size: 0, LFS: false} // Size 0 = unknown
-		skip, _, err := shouldSkipLocal(item, filePath)
+		skip, _, err := shouldSkipLocalCtx(context.Background(), item, filePath)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -320,7 +320,7 @@ func TestShouldSkipLocalByHash(t *testing.T) {
 		}
 		// The ordinary rule is unchanged: the same file is still reused on
 		// size equality there.
-		ordinarySkip, ordinaryReason, err := shouldSkipLocal(item, filePath)
+		ordinarySkip, ordinaryReason, err := shouldSkipLocalCtx(context.Background(), item, filePath)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

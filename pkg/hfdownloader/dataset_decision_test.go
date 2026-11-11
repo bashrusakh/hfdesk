@@ -16,6 +16,38 @@ import (
 	"github.com/bashrusakh/hfdesk/internal/datasetselection"
 )
 
+// datasetDecisionWorldFromAlternatives is a strict test/construction helper:
+// singleton evidence is filled automatically, but ambiguous inputs require an
+// explicit actual alternative and every shared collision bit is required.
+func datasetDecisionWorldFromAlternatives(c datasetDecisionContext, choices map[int]datasetDecisionRoleLabel, shared map[uint]bool) (datasetDecisionWorld, error) {
+	w := datasetDecisionWorld{DataLabels: make(map[int]string), Companion: make(map[int]bool), SharedToken: make(map[uint]bool)}
+	for i := range choices {
+		if i < 0 || i >= len(c.Inputs) {
+			return datasetDecisionWorld{}, fmt.Errorf("role choice refers to unknown input %d", i)
+		}
+	}
+	for bit, value := range shared {
+		w.SharedToken[bit] = value
+	}
+	for i, in := range c.Inputs {
+		choice, ok := choices[i]
+		if !ok && len(in.Alternatives) == 1 {
+			choice, ok = in.Alternatives[0], true
+		}
+		if !ok {
+			return datasetDecisionWorld{}, fmt.Errorf("input %d has ambiguous evidence and no explicit choice", i)
+		}
+		if choice.Role == datasetselection.EvidenceRoleCompanion {
+			w.Companion[i] = true
+		} else if choice.Role == datasetselection.EvidenceRoleData {
+			w.DataLabels[i] = strings.ToLower(choice.Label)
+		} else {
+			return datasetDecisionWorld{}, fmt.Errorf("input %d has unsupported role %q", i, choice.Role)
+		}
+	}
+	return w, validateDatasetDecisionWorld(c, w)
+}
+
 type blockingDecisionContext struct {
 	context.Context
 	reached chan struct{}
@@ -60,7 +92,7 @@ func compileDecisionFixture(nodes []hfNode, filters, excludes []string) datasetD
 	for i := range nodes {
 		files[i] = datasetselection.File{Path: nodes[i].Path}
 	}
-	return compileDatasetDecisionContext(nodes, datasetselection.Recognize(files), filters, excludes, true, true, false)
+	return compileDatasetDecisionContextWithContext(context.Background(), nodes, datasetselection.Recognize(files), filters, excludes, true, true, false)
 }
 
 func TestDatasetKnownMetadataNamesAreCompanionOnlyAtAnyDepth(t *testing.T) {
@@ -1703,7 +1735,7 @@ func BenchmarkDatasetDecisionCompileAndAllQueriesStableAmbiguous(b *testing.B) {
 					b.ReportAllocs()
 					b.ResetTimer()
 					for n := 0; n < b.N; n++ {
-						c := compileDatasetDecisionContext(nodes, membership, filters, nil, true, true, false)
+						c := compileDatasetDecisionContextWithContext(context.Background(), nodes, membership, filters, nil, true, true, false)
 						if !stableDirectEvaluation(c) {
 							b.Fatal("benchmark inventory is not a stable direct-selection context")
 						}
@@ -1747,7 +1779,7 @@ func BenchmarkDatasetDecisionCompileAndAllQueriesMaskedRoleAmbiguity(b *testing.
 					b.ReportAllocs()
 					b.ResetTimer()
 					for n := 0; n < b.N; n++ {
-						c := compileDatasetDecisionContext(nodes, membership, filters, excludes, true, true, false)
+						c := compileDatasetDecisionContextWithContext(context.Background(), nodes, membership, filters, excludes, true, true, false)
 						if !stableDatasetDecisionEvaluation(c) {
 							b.Fatal("benchmark inventory does not satisfy masked-role proof")
 						}
@@ -1787,7 +1819,7 @@ func BenchmarkDatasetDecisionCompileAndAllQueriesRealTokenCollision(b *testing.B
 					b.ReportAllocs()
 					b.ResetTimer()
 					for n := 0; n < b.N; n++ {
-						c := compileDatasetDecisionContext(nodes, membership, filters, nil, true, true, false)
+						c := compileDatasetDecisionContextWithContext(context.Background(), nodes, membership, filters, nil, true, true, false)
 						if len(collisionTokenBits(c)) == 0 || !stableDatasetDecisionEvaluation(c) {
 							b.Fatal("inventory does not have the real-token stable-selection proof")
 						}
@@ -1834,7 +1866,7 @@ func BenchmarkDatasetDecisionAllEmitAndNonEmitQueriesWithUnknownRoot(b *testing.
 				b.ReportAllocs()
 				b.ResetTimer()
 				for n := 0; n < b.N; n++ {
-					c := compileDatasetDecisionContext(nodes, membership, []string{"train", ".parquet", ".json"}, []string{"test/part.csv"}, true, true, false)
+					c := compileDatasetDecisionContextWithContext(context.Background(), nodes, membership, []string{"train", ".parquet", ".json"}, []string{"test/part.csv"}, true, true, false)
 					for i := range c.Inputs {
 						_ = canEmitDatasetDecision(c, i)
 						_ = canNotEmitDatasetDecision(c, i)
@@ -2019,7 +2051,7 @@ func BenchmarkDatasetDecisionCompileAndAllQueriesUnmaskedMetadata(b *testing.B) 
 			b.ReportAllocs()
 			b.ResetTimer()
 			for n := 0; n < b.N; n++ {
-				c := compileDatasetDecisionContext(nodes, membership, []string{"train"}, nil, true, true, false)
+				c := compileDatasetDecisionContextWithContext(context.Background(), nodes, membership, []string{"train"}, nil, true, true, false)
 				for i := range c.Inputs {
 					_ = canEmitDatasetDecision(c, i)
 					_ = canNotEmitDatasetDecision(c, i)
@@ -2051,7 +2083,7 @@ func TestCompileDatasetDecisionContextCopiesEvidence(t *testing.T) {
 		DefiniteRole:   datasetselection.EvidenceRoleData,
 	}
 	membership := datasetselection.Result{Evidence: []datasetselection.Evidence{evidence}}
-	c := compileDatasetDecisionContext([]hfNode{{Path: "train.csv"}}, membership, []string{"train"}, nil, true, true, false)
+	c := compileDatasetDecisionContextWithContext(context.Background(), []hfNode{{Path: "train.csv"}}, membership, []string{"train"}, nil, true, true, false)
 	membership.Evidence[0].PossibleLabels[0] = "changed"
 	membership.Evidence[0].PossibleRoles[0] = datasetselection.EvidenceRoleCompanion
 	if got := c.Inputs[0].Alternatives; !reflect.DeepEqual(got, []datasetDecisionRoleLabel{{datasetselection.EvidenceRoleData, "train"}}) {

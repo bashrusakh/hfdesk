@@ -7,11 +7,50 @@ package hfdownloader
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 )
+
+// acquireDefaultScopedBlobDomain builds the scope path set from the same
+// production builder the downloader uses (appendPartialOwnershipPaths), so
+// the helper cannot drift from production and drops no route-owned artifact —
+// notably the single-route identity sidecar dst.part.meta — from coverage.
+func acquireDefaultScopedBlobDomain(ctx context.Context, key, dst string) (*blobDomain, error) {
+	ownerDir, err := resolveOwnershipDir("")
+	if err != nil {
+		return nil, err
+	}
+	realm, err := newOwnershipRealm(ownerDir)
+	if err != nil {
+		return nil, err
+	}
+	proofPath := key
+	paths := appendUniqueOwnershipPaths([]string{key, dst}, appendPartialOwnershipPaths(nil, dst)...)
+	if strings.HasPrefix(key, flatDomainKeyPrefix) {
+		proofPath = strings.TrimPrefix(key, flatDomainKeyPrefix)
+		paths = appendPartialOwnershipPaths(paths, proofPath)
+	} else if strings.HasPrefix(filepath.Base(key), "path-") {
+		proofPath = dst
+	} else {
+		paths = appendUniqueOwnershipPaths(paths, key+".incomplete", key+".incomplete.meta")
+	}
+	return acquireBlobDomainScoped(ctx, key, dst, realm, paths, proofPath)
+}
+
+// writeStagingMeta takes the local gate for test/seeding writes; it does not
+// establish destination ownership. Downloader rewrites use
+// writeStagingMetaOwnedLocked under the held domain and metadata gate.
+func writeStagingMeta(metaPath string, meta *IncompleteMeta) error {
+	lock := &stagingStateLock{path: stagingLockPath(metaPath)}
+	if err := lock.acquire(context.Background(), stagingLockWait); err != nil {
+		return fmt.Errorf("serialize staging record %s: %w", metaPath, err)
+	}
+	defer lock.release()
+	return writeStagingMetaFile(metaPath, meta)
+}
 
 func testDomainIdentity(dst string) (key, lockSrc string) {
 	if k, ok := cacheDstDomainKey(dst); ok {

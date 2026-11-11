@@ -454,27 +454,6 @@ type ProgressEvent struct {
 //	}
 type ProgressFunc func(ProgressEvent)
 
-// DefaultSettings returns Settings with sensible defaults filled in.
-//
-// Use this as a starting point and override specific fields:
-//
-//	cfg := hfdownloader.DefaultSettings()
-//	cfg.CacheDir = "/custom/path"
-//	cfg.Token = os.Getenv("HF_TOKEN")
-func DefaultSettings() Settings {
-	return Settings{
-		CacheDir:           "", // Empty = use DefaultCacheDir()
-		Concurrency:        8,
-		MaxActiveDownloads: 4,
-		MultipartThreshold: "256MiB",
-		Verify:             "size",
-		Retries:            4,
-		BackoffInitial:     "400ms",
-		BackoffMax:         "10s",
-		StallTimeout:       "60s",
-	}
-}
-
 // BuildHFCache creates an HFCache from Settings.
 // This is the recommended way to get a cache instance.
 func (s Settings) BuildHFCache() (*HFCache, error) {

@@ -468,9 +468,8 @@ func TestDownloadLogsNeverCarryCredentials(t *testing.T) {
 }
 
 // TestProxyURLErrorCarriesNoCredentials proves that a proxy configuration
-// failure cannot carry the proxy credentials: neither into an error that
-// reaches the callers (and from there the API responses and the log
-// records) nor into the human readable proxy description.
+// failure cannot carry the proxy credentials into an error that reaches the
+// callers (and from there the API responses and the log records).
 func TestProxyURLErrorCarriesNoCredentials(t *testing.T) {
 	const (
 		proxyUser = "proxyuser"
@@ -518,15 +517,6 @@ func TestProxyURLErrorCarriesNoCredentials(t *testing.T) {
 			}
 			if !strings.Contains(message, "invalid proxy URL") {
 				t.Errorf("proxy error %q lost its context", message)
-			}
-
-			// The human readable description masks the password as well,
-			// including when the URL does not parse at all.
-			description := GetProxyInfoString(&ProxyConfig{URL: tc.url})
-			for _, secret := range []string{proxyUser, proxyPass, "%zz"} {
-				if strings.Contains(description, secret) {
-					t.Errorf("proxy description %q still carries %q", description, secret)
-				}
 			}
 		})
 	}

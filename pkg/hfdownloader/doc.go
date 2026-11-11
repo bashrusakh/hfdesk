@@ -137,8 +137,8 @@ paths. The notice is informational
 only: it changes no plan item, no selection and no download outcome. It is
 bounded: the paths and directories it names are capped and the rest are
 counted, so the sentence never grows with the inventory. The notice surfaces
-as `Plan.Notices`, in the `POST /api/plan` response, on the download's
-warning channel, and in the exported `ScanPlan` preview's warning events.
+as `Plan.Notices`, in the `POST /api/plan` response, and on the download's
+warning channel.
 
 With StrictFiles, Filters is instead a strict manual file selection: each
 filter is one complete repository-relative file path, matched by exact
@@ -179,7 +179,7 @@ planned item, separate from `PlanItem.Subdir` filter attribution. It is
 populated even when `AppendFilterSubdir` is disabled. The downloader applies it
 only when the job enables `AppendFilterSubdir`; consumers must check that flag
 before combining it with `PlanItem.RelativePath` to determine the download
-destination. `ScanPlan` preview event paths remain repository-relative.
+destination. Plan item paths remain repository-relative.
 
 A job with `ShardRanges` narrows a filtered selection to specific shards of
 split files: a comma-separated list of 1-based inclusive spans such as
@@ -200,9 +200,8 @@ remain planned, while ineffective ranges — a matched set with no shard
 file at all, or a span selecting no existing index — become plan notices
 naming the whole expression or the ineffective spans; they never change the
 plan, its items or the download outcome, and surface in `Plan.Notices`, in
-the `POST /api/plan` response, on the download's warning channel, and in
-the exported `ScanPlan` preview's warning events — the same channels as the
-split-mention notice above. Shard ranges change plan selection only: resume identity,
+the `POST /api/plan` response, and on the download's warning channel —
+the same channels as the split-mention notice above. Shard ranges change plan selection only: resume identity,
 verification, ownership and publication semantics are unaffected.
 
 # Ownership: one destination domain

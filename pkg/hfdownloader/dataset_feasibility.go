@@ -1202,35 +1202,3 @@ func collisionTokenBits(c datasetDecisionContext) map[uint]bool {
 	}
 	return bits
 }
-
-// datasetDecisionWorldFromAlternatives is a strict test/construction helper:
-// singleton evidence is filled automatically, but ambiguous inputs require an
-// explicit actual alternative and every shared collision bit is required.
-func datasetDecisionWorldFromAlternatives(c datasetDecisionContext, choices map[int]datasetDecisionRoleLabel, shared map[uint]bool) (datasetDecisionWorld, error) {
-	w := datasetDecisionWorld{DataLabels: make(map[int]string), Companion: make(map[int]bool), SharedToken: make(map[uint]bool)}
-	for i := range choices {
-		if i < 0 || i >= len(c.Inputs) {
-			return datasetDecisionWorld{}, fmt.Errorf("role choice refers to unknown input %d", i)
-		}
-	}
-	for bit, value := range shared {
-		w.SharedToken[bit] = value
-	}
-	for i, in := range c.Inputs {
-		choice, ok := choices[i]
-		if !ok && len(in.Alternatives) == 1 {
-			choice, ok = in.Alternatives[0], true
-		}
-		if !ok {
-			return datasetDecisionWorld{}, fmt.Errorf("input %d has ambiguous evidence and no explicit choice", i)
-		}
-		if choice.Role == datasetselection.EvidenceRoleCompanion {
-			w.Companion[i] = true
-		} else if choice.Role == datasetselection.EvidenceRoleData {
-			w.DataLabels[i] = strings.ToLower(choice.Label)
-		} else {
-			return datasetDecisionWorld{}, fmt.Errorf("input %d has unsupported role %q", i, choice.Role)
-		}
-	}
-	return w, validateDatasetDecisionWorld(c, w)
-}
