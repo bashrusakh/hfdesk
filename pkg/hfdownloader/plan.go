@@ -690,18 +690,10 @@ func scanRepoMode(ctx context.Context, httpc *http.Client, token string, job Job
 		}
 		// Check excludes first - if file matches any exclude pattern, skip it
 		// Credits: Exclude feature suggested by jeroenkroese (#41)
-		excluded := false
-		for _, ex := range job.Excludes {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			exLower := strings.ToLower(ex)
-			if strings.Contains(nameLower, exLower) || strings.Contains(relLower, exLower) {
-				excluded = true
-				break
-			}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		if excluded {
+		if isExcludedPath(rel, job.Excludes) {
 			continue
 		}
 
@@ -1551,12 +1543,23 @@ func datasetDirectPathMatch(nodes []hfNode, job Job, recognizedLabels []string) 
 	return false
 }
 
+// normalizeRepoPath is the single owner of repository-path folding: backslash
+// separators fold to "/" and case folds to lower, on every platform (plain
+// string folding, never filepath). Comparisons of repository paths and path
+// tokens fold through this helper; their matching modes (substring, exact)
+// stay with their callers.
+func normalizeRepoPath(p string) string {
+	return strings.ToLower(strings.ReplaceAll(p, "\\", "/"))
+}
+
+// isExcludedPath reports whether the repository-relative path contains any
+// exclude token as a substring, comparing path and token through
+// normalizeRepoPath so one path's separator and case spellings match on every
+// platform.
 func isExcludedPath(rel string, excludes []string) bool {
-	nameLower := strings.ToLower(filepath.Base(rel))
-	relLower := strings.ToLower(rel)
+	relNorm := normalizeRepoPath(rel)
 	for _, ex := range excludes {
-		exLower := strings.ToLower(ex)
-		if strings.Contains(nameLower, exLower) || strings.Contains(relLower, exLower) {
+		if strings.Contains(relNorm, normalizeRepoPath(ex)) {
 			return true
 		}
 	}
@@ -1572,10 +1575,8 @@ func isExcludedPath(rel string, excludes []string) bool {
 // reachable writable namespaces and prefers complete frozen destinations
 // when available; the projection does not imply a global conflict.
 func GGUFPathMayBeEmitted(relativePath string, job Job) bool {
-	for _, exclude := range job.Excludes {
-		if strings.Contains(strings.ToLower(relativePath), strings.ToLower(exclude)) {
-			return false
-		}
+	if isExcludedPath(relativePath, job.Excludes) {
+		return false
 	}
 	if !job.IsDataset {
 		return true
@@ -1824,8 +1825,8 @@ func filterMatches(nameLower, fLower string, exact bool) bool {
 // while exact mode treats directory components, filename segments, extensions,
 // and explicit directory prefixes as separate forms.
 func filterMatchesPath(rel, filter string, exact bool) bool {
-	rel = strings.ToLower(strings.ReplaceAll(rel, "\\", "/"))
-	filter = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(filter), "\\", "/"))
+	rel = normalizeRepoPath(rel)
+	filter = normalizeRepoPath(strings.TrimSpace(filter))
 	if rel == "" || filter == "" {
 		return false
 	}
