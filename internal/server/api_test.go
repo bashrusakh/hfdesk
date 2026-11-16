@@ -17,7 +17,9 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
@@ -1654,6 +1656,238 @@ func TestAPI_ParseFiltersFromRepo(t *testing.T) {
 	}
 	if len(resp.Filters) != 2 {
 		t.Errorf("Expected 2 filters, got %d", len(resp.Filters))
+	}
+}
+
+// TestAPI_ParseFiltersFromRepoPlanTwin pins expansion parity on the plan
+// endpoint: /api/plan parses owner/name:file,file exactly like
+// /api/download does — the colon is stripped from repo and each comma-split
+// segment of the file part reaches the planner as a filter. The negative row
+// proves application: with the colon leaked into repo instead, the same
+// request would fail at the Hub's repo lookup with 500, never with a named
+// no_filter_match that quotes both derived filters.
+func TestAPI_ParseFiltersFromRepoPlanTwin(t *testing.T) {
+	hub := shardRangeHub(shardRangeContent())
+	defer hub.Close()
+	s, mux := newShardRangeServer(t, hub, Config{})
+
+	code, plan, raw := postPlanResponse(t, mux, "/api/plan",
+		DownloadRequest{Repo: "owner/model:model-00001,model-00003"})
+	if code != http.StatusOK {
+		t.Fatalf("plan status=%d, want 200 after shorthand expansion; body=%s", code, raw)
+	}
+	if plan.Repo != "owner/model" {
+		t.Fatalf("plan repo=%q, want the colon-stripped owner/model", plan.Repo)
+	}
+
+	code, _, raw = postPlanResponse(t, mux, "/api/plan",
+		DownloadRequest{Repo: "owner/model:q4_0,q8_0"})
+	if code != http.StatusBadRequest {
+		t.Fatalf("unmatched shorthand plan status=%d, want 400; body=%s", code, raw)
+	}
+	var errResp ErrorResponse
+	if err := json.Unmarshal([]byte(raw), &errResp); err != nil {
+		t.Fatal(err)
+	}
+	if errResp.ErrorDetail == nil || errResp.ErrorDetail.Code != "no_filter_match" {
+		t.Fatalf("error_detail=%+v, want code no_filter_match; body=%s", errResp.ErrorDetail, raw)
+	}
+	for _, derived := range []string{`"q4_0"`, `"q8_0"`} {
+		if !strings.Contains(errResp.ErrorDetail.Details, derived) {
+			t.Fatalf("details=%q, want the comma-split shorthand segment %s applied as a filter", errResp.ErrorDetail.Details, derived)
+		}
+	}
+
+	// LOCK pin: an EMPTY file part (`owner/model:`) leaves the request
+	// unfiltered — both endpoints plan the whole tree (a filter derived
+	// from an empty segment would match nothing and fail no_filter_match).
+	for _, path := range []string{"/api/plan", "/api/download"} {
+		req := DownloadRequest{Repo: "owner/model:"}
+		req.DryRun = path == "/api/download"
+		code, plan, raw := postPlanResponse(t, mux, path, req)
+		if code != http.StatusOK {
+			t.Fatalf("%s empty-file-part status=%d, want 200 unfiltered plan; body=%s", path, code, raw)
+		}
+		if plan.Repo != "owner/model" {
+			t.Fatalf("%s empty-file-part plan repo=%q, want the colon-stripped owner/model", path, plan.Repo)
+		}
+		want := "model-00001-of-00003.safetensors,model-00002-of-00003.safetensors,model-00003-of-00003.safetensors,config.json"
+		if got := strings.Join(planPathsOf(plan), ","); got != want {
+			t.Fatalf("%s empty-file-part paths=%s, want the unfiltered full tree %s", path, got, want)
+		}
+	}
+
+	// LOCK pins: the expansion's segment rules (trimmed; segments empty
+	// after trimming dropped) are observable only on the admitted job
+	// snapshot — the planner trims independently, and a dry-run plan never
+	// echoes filters.
+	for _, tc := range []struct {
+		repo string
+		want []string
+		end  JobStatus
+	}{
+		{"owner/model: model-00001 , model-00003 ", []string{"model-00001", "model-00003"}, JobStatusCompleted},
+		{"owner/model:q4_0,,q5_0", []string{"q4_0", "q5_0"}, JobStatusFailed},
+		{"owner/model: q4_0 , , q8_0 ", []string{"q4_0", "q8_0"}, JobStatusFailed},
+	} {
+		body, err := json.Marshal(DownloadRequest{Repo: tc.repo})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/download", bytes.NewReader(body)))
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("%q admission status=%d, want 202; body=%s", tc.repo, w.Code, w.Body.String())
+		}
+		var admitted Job
+		if err := json.Unmarshal(w.Body.Bytes(), &admitted); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(admitted.Filters, tc.want) {
+			t.Fatalf("%q derived filters=%v, want exactly %v", tc.repo, admitted.Filters, tc.want)
+		}
+		waitJobStatus(t, s.jobs, admitted.ID, tc.end, 10*time.Second)
+	}
+
+	// An explicit EMPTY filters array (raw JSON — the request struct's
+	// omitempty marshal cannot express it) must behave byte-identically to
+	// the omitted form: len(Filters)==0 still expands the shorthand, so the
+	// plan fails no_filter_match quoting the derived filter, never the
+	// combined-filters invalid_file_selection 400.
+	rawPlan := func(body string) (int, string) {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/plan", bytes.NewBufferString(body)))
+		return w.Code, w.Body.String()
+	}
+	omittedCode, omitted := rawPlan(`{"repo":"owner/model:q4_0"}`)
+	emptyCode, explicitEmpty := rawPlan(`{"repo":"owner/model:q4_0","filters":[]}`)
+	if omittedCode != http.StatusBadRequest || emptyCode != omittedCode || explicitEmpty != omitted {
+		t.Fatalf("explicit empty filters must behave byte-identically to the omitted form: omitted=(%d, %q) explicit-empty=(%d, %q)",
+			omittedCode, omitted, emptyCode, explicitEmpty)
+	}
+	var emptyResp ErrorResponse
+	if err := json.Unmarshal([]byte(explicitEmpty), &emptyResp); err != nil {
+		t.Fatal(err)
+	}
+	if emptyResp.ErrorDetail == nil || emptyResp.ErrorDetail.Code != "no_filter_match" ||
+		!strings.Contains(emptyResp.ErrorDetail.Details, `"q4_0"`) {
+		t.Fatalf("error_detail=%+v, want no_filter_match quoting the derived filter \"q4_0\"; body=%s", emptyResp.ErrorDetail, explicitEmpty)
+	}
+
+	// A multi-colon repo splits after the FIRST colon only: exactly one
+	// derived filter "a:b" (never "a" and "b") reaches the admitted snapshot
+	// beside the colon-stripped repo; the job then fails matching nothing.
+	body, err := json.Marshal(DownloadRequest{Repo: "owner/model:a:b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/download", bytes.NewReader(body)))
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("multi-colon admission status=%d, want 202; body=%s", w.Code, w.Body.String())
+	}
+	var multi Job
+	if err := json.Unmarshal(w.Body.Bytes(), &multi); err != nil {
+		t.Fatal(err)
+	}
+	if multi.Repo != "owner/model" || !reflect.DeepEqual(multi.Filters, []string{"a:b"}) {
+		t.Fatalf("multi-colon snapshot repo=%q filters=%v, want repo \"owner/model\" and exactly one filter [a:b]", multi.Repo, multi.Filters)
+	}
+	waitJobStatus(t, s.jobs, multi.ID, JobStatusFailed, 10*time.Second)
+
+	// Endpoint parity for the drop rule: on /api/plan the expansion drops
+	// the empty segment too — the no_filter_match details quote exactly the
+	// two derived filters, with no empty filter among them.
+	code, _, raw = postPlanResponse(t, mux, "/api/plan",
+		DownloadRequest{Repo: "owner/model:q4_0,,q5_0"})
+	if code != http.StatusBadRequest {
+		t.Fatalf("drop shorthand plan status=%d, want 400; body=%s", code, raw)
+	}
+	if err := json.Unmarshal([]byte(raw), &errResp); err != nil {
+		t.Fatal(err)
+	}
+	if errResp.ErrorDetail == nil || errResp.ErrorDetail.Code != "no_filter_match" ||
+		!strings.Contains(errResp.ErrorDetail.Details, `"q4_0"`) ||
+		!strings.Contains(errResp.ErrorDetail.Details, `"q5_0"`) ||
+		strings.Contains(errResp.ErrorDetail.Details, `""`) {
+		t.Fatalf("details=%q, want exactly the derived filters q4_0 and q5_0 with no empty filter; body=%s", errResp.ErrorDetail.Details, raw)
+	}
+
+	// F1.3 plan-side trim half: the no_filter_match details quote the
+	// DERIVED filters verbatim (PlanRepo never rewrites them), so a
+	// whitespace-padded segment must appear in its TRIMMED spelling — an
+	// expansion that failed to trim would put the padded spelling here.
+	code, _, raw = postPlanResponse(t, mux, "/api/plan",
+		DownloadRequest{Repo: "owner/model: nosuch "})
+	if code != http.StatusBadRequest {
+		t.Fatalf("padded shorthand plan status=%d, want 400; body=%s", code, raw)
+	}
+	if err := json.Unmarshal([]byte(raw), &errResp); err != nil {
+		t.Fatal(err)
+	}
+	if errResp.ErrorDetail == nil || errResp.ErrorDetail.Code != "no_filter_match" ||
+		!strings.Contains(errResp.ErrorDetail.Details, `filters=["nosuch"]`) {
+		t.Fatalf("details=%q, want the trimmed derived segment quoted as filters=[\"nosuch\"]; body=%s", errResp.ErrorDetail.Details, raw)
+	}
+	if strings.Contains(errResp.ErrorDetail.Details, `" nosuch "`) {
+		t.Fatalf("details=%q, must not quote the untrimmed segment spelling %q", errResp.ErrorDetail.Details, `" nosuch "`)
+	}
+}
+
+// TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact pins
+// the reconciliation with strict mode: a non-strict request whose repo keeps
+// the colon cannot be expanded (filters were sent explicitly), so both
+// endpoints reject it with a named 400 invalid_file_selection before any Hub
+// contact and admit no job. Previously /api/plan failed late with a 500
+// scan error and /api/download admitted a job doomed at the Hub's repo
+// lookup.
+func TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact(t *testing.T) {
+	var hubRequests atomic.Int64
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hubRequests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer hub.Close()
+	s := newTestServerWithConfig(t, Config{
+		CacheDir: t.TempDir(), LocalDir: t.TempDir(), Endpoint: hub.URL,
+		MaxActive: 1, Proxy: &hfdownloader.ProxyConfig{NoEnvProxy: true},
+	})
+	mux := http.NewServeMux()
+	s.registerAPIRoutes(mux)
+
+	// Row 1 pins the documented details string verbatim (F2); row 2 (F3)
+	// pins the strictFiles side of the expansion condition: strict + colon
+	// + EMPTY filters takes the same named 400 instead of expanding.
+	for _, tc := range []struct {
+		name        string
+		req         DownloadRequest
+		wantDetails string
+	}{
+		{"non-strict with explicit filters", DownloadRequest{Repo: "owner/model:q4_0", Filters: []string{"q5_0"}},
+			"the owner/name:file shorthand cannot be combined with explicit filters — send one or the other"},
+		{"strict with an empty filters list", DownloadRequest{Repo: "owner/model:q4_0", StrictFiles: true},
+			"invalid strict file selection: the owner/name:file shorthand is not supported with strictFiles — send file paths in filters"},
+	} {
+		for _, path := range []string{"/api/plan", "/api/download"} {
+			code, resp, body := postStrict(mux, path, tc.req)
+			if code != http.StatusBadRequest || resp.ID != "" {
+				t.Errorf("%s %s: status=%d body=%s, want 400 with no admitted job", path, tc.name, code, body)
+				continue
+			}
+			if resp.ErrorDetail == nil || resp.ErrorDetail.Code != "invalid_file_selection" {
+				t.Errorf("%s %s: error_detail=%+v, want code invalid_file_selection; body=%s", path, tc.name, resp.ErrorDetail, body)
+				continue
+			}
+			if resp.ErrorDetail.Details != tc.wantDetails {
+				t.Errorf("%s %s: details=%q, want exactly %q", path, tc.name, resp.ErrorDetail.Details, tc.wantDetails)
+			}
+		}
+	}
+	if got := hubRequests.Load(); got != 0 {
+		t.Errorf("rejected requests reached the hub %d time(s), want none", got)
+	}
+	if jobs := s.jobs.ListJobs(); len(jobs) != 0 {
+		t.Errorf("rejected requests admitted %d job(s), want none", len(jobs))
 	}
 }
 

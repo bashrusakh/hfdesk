@@ -818,6 +818,25 @@ Request:
 }
 ```
 
+`repo` accepts the `owner/name:file` **colon shorthand**: when `strictFiles`
+is false and `filters` is empty (omitted or `[]`), the part after the first
+`:` is split on commas, each segment is trimmed, segments that are empty
+after trimming are dropped, and the remaining segments become the
+request's `filters` — `{"repo": "owner/name:q4_0,q5_0"}` plans `owner/name`
+with filters `["q4_0", "q5_0"]`, identically on `POST /api/plan` and
+`POST /api/download`. An empty file part (`owner/name:`) leaves the request
+unfiltered. The shorthand cannot be combined with an explicit selection: a
+non-strict request whose `repo` keeps the colon while `filters` is also
+non-empty cannot be expanded, so both endpoints reject it with `400`
+`invalid_file_selection` **before any Hub contact**, with details
+`the owner/name:file shorthand cannot be combined with explicit filters —
+send one or the other` (previously the colon leaked into the repo id and the
+request failed later at the Hub's repo lookup — a `500` scan error on plan,
+a doomed admitted job on download). With `strictFiles: true` the colon is
+rejected with the same code whether or not `filters` is set, with a hint to
+send the file paths in `filters` (documented under Strict file selection
+below).
+
 Returns the files that would be downloaded without starting a job. Each HTTP
 response item exposes only `path`, `size`, and `lfs`; `path` is
 repository-relative. The response does not include filter-attribution or
@@ -875,7 +894,10 @@ never make a filtered request succeed.
 shards of split files. Syntax: comma-separated inclusive spans of 1-based
 shard indices, each `N` or `N-M` (`1-100,120-185`, where `N` alone is the
 single index `N`); whitespace around a segment is trimmed and segment order
-does not matter. The field requires a non-empty `filters` selection. Within
+does not matter. The field requires a non-empty selection: an explicit
+`filters` list or the filters derived from the `owner/name:file` shorthand
+(the ranges check runs after the shorthand expansion, so shorthand-derived
+filters satisfy the requirement and ranges then narrow them). Within
 the matched file set, files named in the established split form
 `<prefix>-NNNNN-of-MMMMM.<ext>` are grouped per family (the path with the
 shard token removed), ordered by the shard number written in their names and
@@ -886,18 +908,21 @@ positions in written-number order, not the written numbers themselves: for a
 family whose written shard numbers contain gaps the positions and the
 numbers differ (for complete families they coincide). Files that are not
 shard-shaped (configs, index files, unsharded weights) are never affected,
-and ranges only narrow: a filter that names an absent path keeps its
-established `no_filter_match` behavior, and a filter whose files all fall
-outside the ranges fails the same way when no matched file remains —
-retained companion files that matched nothing never keep such a request
-alive.
+and ranges only narrow: in a non-strict request a filter that names an
+absent path keeps its established `no_filter_match` behavior, while under
+`strictFiles` an absent selected path fails with `no_file_match` **before**
+narrowing runs; in either mode a selection whose files all fall
+outside the ranges fails with `no_filter_match` when no selected file
+remains — retained companion files that matched nothing never keep such a
+request alive.
 
 A malformed expression — an empty expression or segment, a non-numeric
 token, a zero or negative index, a reversed span such as `10-5`, or ranges
-without filters — is rejected with HTTP 400 and error code
-`invalid_shard_ranges` before any Hub contact, identically on `POST
-/api/plan` and `POST /api/download` (including `dryRun: true`), so a dry run
-never accepts a request the real download rejects.
+without any selection (no explicit `filters` and no shorthand with a
+non-empty file part to derive them from) — is rejected with HTTP 400 and
+error code `invalid_shard_ranges` before any Hub contact, identically on
+`POST /api/plan` and `POST /api/download` (including `dryRun: true`), so a
+dry run never accepts a request the real download rejects.
 
 Ranges never fail silently: their diagnostics ride the established `notices`
 array defined above (a download job then reports the same sentences in its
@@ -1001,7 +1026,10 @@ Uses the same request shape as `/api/plan`. Starts or reuses a download job.
 
 Notes:
 
-- `repo` is required and must be `owner/name`.
+- `repo` is required: `owner/name`, or the `owner/name:file` colon shorthand
+  in the non-strict shape documented under Plan above (empty `filters`;
+  combined with explicit `filters` it is a `400` `invalid_file_selection`
+  before any Hub contact).
 - `revision` defaults to `main`.
 - `shardRanges` participates in job identity: an identical request (same
   repo, revision, destination, filters and ranges) reuses the running job,
