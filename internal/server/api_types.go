@@ -13,8 +13,11 @@ type DownloadRequest struct {
 	// AppendFilterSubdir makes the download pipeline apply filter
 	// subdirectories exactly like the Go library (pkg/hfdownloader): a plan
 	// item's file lands under its winning filter's subdirectory
-	// (<filter>/repository-relative-path) in flat/friendly destinations,
-	// while the HF snapshot path stays repository-relative; plan responses
+	// (<filter>/repository-relative-path) in flat/friendly destinations — the
+	// prefixing applies only to plan items carrying a destination subdir (the
+	// GGUF/LFS shapes the feature targets); other plan items keep their
+	// repository-relative paths — while the HF snapshot path stays
+	// repository-relative; plan responses
 	// themselves remain repository-relative on every surface. A path-shaped
 	// filter combined with this flag is rejected before any Hub contact with
 	// 400 invalid_append_filter_subdir on ALL request surfaces (plan,

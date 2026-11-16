@@ -958,9 +958,13 @@ inside the run).
 Over the HTTP API this option now behaves like the Go library: a real
 download with `appendFilterSubdir: true` creates filter subdirectories, so a
 flat or friendly-view file lands under its winning filter's directory
-(`<filter>/repository-relative-path`) while the HF snapshot path stays
-repository-relative; plan responses themselves remain repository-relative on
-every surface. The job snapshot exposes the flag as `appendFilterSubdir` via
+(`<filter>/repository-relative-path`) — the prefixing applies only to plan
+items carrying a destination subdir (the GGUF/LFS shapes the feature
+targets); other plan items — ordinary non-GGUF/non-LFS model files and
+dataset data rows — keep their repository-relative paths — while the HF
+snapshot path stays repository-relative; plan responses themselves remain
+repository-relative on every surface. The job snapshot exposes the flag as
+`appendFilterSubdir` via
 the `POST /api/download` response, `GET /api/jobs`, and `jobs_state.json`, and
 the flag participates in job deduplication: two requests differing only in
 `appendFilterSubdir` are independent jobs.
@@ -1124,7 +1128,10 @@ Notes:
 - `appendFilterSubdir` applies the library's filter-subdirectory layout: a
   real download with `appendFilterSubdir: true` lands each flat/friendly file
   under its winning filter's directory (`<filter>/repository-relative-path`)
-  while the HF snapshot path stays repository-relative, and a path-shaped
+  — the prefixing applies only to plan items carrying a destination subdir
+  (the GGUF/LFS shapes the feature targets); other plan items keep their
+  repository-relative paths — while the HF snapshot path stays
+  repository-relative, and a path-shaped
   filter combined with the flag is rejected on this endpoint too with `400`
   `invalid_append_filter_subdir` before any Hub contact and before any job is
   admitted (plan and dry-run answer the same way, documented under Plan

@@ -618,6 +618,9 @@ type selectedWriteEvidence struct {
 	exactMatch  bool
 	isDataset   bool
 	aliases     bool
+	// appendFilterSubdir marks evidence whose flat/friendly destinations the
+	// planner prefixes with a single-component filter directory.
+	appendFilterSubdir bool
 }
 
 // jobMayWriteSelectedPaths builds each job namespace inventory once and reuses
@@ -656,11 +659,12 @@ func buildSelectedWriteEvidence(job *Job, inventory func(string) (writableNamesp
 	// proof for every writable namespace of the job. Any unknown or outward
 	// mapping short-circuits to the conservative possible-writer answer.
 	evidence := selectedWriteEvidence{
-		inventories: make([]writableNamespaceInventory, 0, len(bases)),
-		filters:     append([]string(nil), job.Filters...),
-		excludes:    append([]string(nil), job.Excludes...),
-		exactMatch:  job.ExactMatch,
-		isDataset:   job.IsDataset,
+		inventories:        make([]writableNamespaceInventory, 0, len(bases)),
+		filters:            append([]string(nil), job.Filters...),
+		excludes:           append([]string(nil), job.Excludes...),
+		exactMatch:         job.ExactMatch,
+		isDataset:          job.IsDataset,
+		appendFilterSubdir: job.AppendFilterSubdir,
 	}
 	for _, writable := range bases {
 		inv, ok := inventory(writable.path)
@@ -682,6 +686,7 @@ func buildSelectedWriteEvidence(job *Job, inventory func(string) (writableNamesp
 // role remains conservative here. A matching known complete plan is instead
 // evaluated against its frozen destinations in MayWriteDescriptor.
 func selectedWriteEvidenceMayWrite(evidence selectedWriteEvidence, targetIdentities []string) bool {
+	selection := hfdownloader.Job{Filters: evidence.filters, Excludes: evidence.excludes, ExactMatch: evidence.exactMatch, IsDataset: evidence.isDataset}
 	for _, targetIdentity := range targetIdentities {
 		targetReachedNamespace := false
 		for _, inv := range evidence.inventories {
@@ -692,8 +697,18 @@ func selectedWriteEvidenceMayWrite(evidence selectedWriteEvidence, targetIdentit
 			if len(candidates) > 0 {
 				targetReachedNamespace = true
 				for _, candidate := range candidates {
-					if hfdownloader.GGUFPathMayBeEmitted(candidate, hfdownloader.Job{Filters: evidence.filters, Excludes: evidence.excludes, ExactMatch: evidence.exactMatch, IsDataset: evidence.isDataset}) {
+					if hfdownloader.GGUFPathMayBeEmitted(candidate, selection) {
 						return true
+					}
+					// appendFilterSubdir prefixes flat/friendly spellings with a
+					// single-component filter the selection rules never saw; OR in
+					// the unprefixed spelling so no exclude derives a negative
+					// (snapshot spellings are already repository-relative).
+					if evidence.appendFilterSubdir && !inv.snapshotNamespace {
+						if idx := strings.IndexByte(candidate, '/'); idx >= 0 &&
+							hfdownloader.GGUFPathMayBeEmitted(candidate[idx+1:], selection) {
+							return true
+						}
 					}
 				}
 			}

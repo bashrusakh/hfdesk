@@ -164,9 +164,12 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 	// download the same named 400 the plan and dry-run branch already answer
 	// with through PlanRepo — no job is admitted and no Hub contact happens.
 	// The dry-run branch above keeps reaching the identical verdict through
-	// PlanRepo untouched, and every earlier boundary gate (repo shape,
-	// shorthand, strict, branch variant, shard ranges, routeKey) keeps its
-	// precedence over this one.
+	// PlanRepo untouched, and every earlier request-boundary gate (repo
+	// shape, shorthand, strict, branch variant, shard ranges) keeps its
+	// precedence over this one. routeKey is not one of them: it resolves at
+	// job creation (validatedRouteKey inside CreateJob), after this gate, so
+	// a request that is both routeKey-invalid and path-filter+flag invalid
+	// answers invalid_append_filter_subdir here, not invalid routeKey.
 	if err := validateAppendFilterSubdirRequest(req); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_append_filter_subdir",
 			"AppendFilterSubdir cannot be combined with path-shaped filters", err.Error())
