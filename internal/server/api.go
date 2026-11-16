@@ -213,7 +213,8 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 	// The repo gates run before routeKey, matching handleStartDownload: a
 	// request failing both answers the repo-side verdict — 400 Invalid repo
 	// format for a malformed repo, 400 invalid_file_selection for the
-	// unexpandable shorthand — not Invalid routeKey.
+	// unexpandable shorthand (each instead of Invalid routeKey), while a
+	// missing repo keeps 400 Missing required field: repo as before.
 	if _, err := validatedRouteKey(req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
 		return
