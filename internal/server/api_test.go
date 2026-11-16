@@ -1898,11 +1898,14 @@ func TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact(t *test
 // to the reference handler, before any Hub contact and with no job admitted.
 // Previously /api/download already answered 400 while /api/plan let a
 // malformed repo that reached the scan fall through to PlanRepo and surface
-// as 500 "Failed to scan repository"; the strict rows below pin the other
-// disclosed before-state, where strict selection answered 400
-// invalid_file_selection for these shapes. The colon-shorthand guards keep
-// precedence for the owner/name:file non-strict spelling: an unexpandable
-// shorthand shape still yields the named invalid_file_selection (covered by
+// as 500 "Failed to scan repository"; the strict rows below pin the
+// disclosed strict-corner before-states: strict selection answered 400
+// invalid_file_selection for the colon, empty-selection, and own-selection-
+// shape-error shapes, while a strict request whose malformed repo carried an
+// otherwise valid selection fell through to that 500. The colon-shorthand
+// guards keep precedence for the owner/name:file non-strict spelling: an
+// unexpandable shorthand shape still yields the named invalid_file_selection
+// (covered by
 // TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact).
 func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
 	var hubRequests atomic.Int64
@@ -1941,6 +1944,8 @@ func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
 		{"strict nested path with a valid selection", `{"repo": "a/b/c", "strictFiles": true, "filters": ["model.gguf"]}`, "Invalid repo format"},
 		{"strict traversal shorthand", `{"repo": "../n:f", "strictFiles": true}`, "Invalid repo format"},
 		{"strict nested path colon value", `{"repo": "a/b/c:d", "strictFiles": true}`, "Invalid repo format"},
+		{"strict colon-only owner segment", `{"repo": ":f", "strictFiles": true}`, "Invalid repo format"},
+		{"strict malformed repo with a non-canonical entry", `{"repo": "invalid", "strictFiles": true, "filters": ["a/../b"]}`, "Invalid repo format"},
 	} {
 		planCode, plan := post("/api/plan", tc.body)
 		if planCode != http.StatusBadRequest || plan.Error != tc.want {

@@ -846,7 +846,9 @@ Invalid repo format`, as on `POST /api/download`.
 `repo` is validated at the request boundary exactly like `POST /api/download`,
 before any Hub contact: a missing `repo` answers `400`
 `Missing required field: repo`, and a value that is not a plain `owner/name`
-pair answers `400 Invalid repo format` with details `Expected owner/name`
+pair — per the check's actual rule stated below, exactly two slash-separated
+segments in `IsValidModelName`'s accepted spellings — answers `400 Invalid
+repo format` with details `Expected owner/name`
 (when no earlier boundary gate rejected the request — for example a strict
 selection — a malformed `repo` previously fell through to the scan and failed
 with `500 Failed to scan repository`). The `owner/name:file` colon-shorthand
