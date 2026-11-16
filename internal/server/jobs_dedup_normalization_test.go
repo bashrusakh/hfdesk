@@ -196,3 +196,40 @@ func TestCreateJobDedupAppendFilterSubdirOrderSemantic(t *testing.T) {
 		t.Errorf("appendFilterSubdir filter-order swap must not dedup; existing=%v ids %s/%s", existing, other.ID, first.ID)
 	}
 }
+
+// TestCreateJobShardRangeWhitespaceInert pins whitespace around shardRanges
+// segments and at the expression's edges as inert for identity: the shard
+// parser trims outer and per-segment whitespace before parsing spans, so a
+// whitespace-only difference describes the same request and must join the
+// same queued/running job where a byte comparison queued two. The
+// distinct-span control (`1-3` vs `2-4`) is already pinned by
+// TestCreateJobShardRangeSegmentOrderIdentity.
+func TestCreateJobShardRangeWhitespaceInert(t *testing.T) {
+	mgr, cleanup := newRouteTestManager(t, Config{CacheDir: t.TempDir()})
+	defer cleanup()
+
+	base := DownloadRequest{
+		Repo: "dedup/shard-whitespace", Filters: []string{".safetensors"},
+		ExactMatch: true, ShardRanges: "1-3,5",
+	}
+	first, existing, err := mgr.CreateJob(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing {
+		t.Fatal("first request should create a new job")
+	}
+
+	for _, ranges := range []string{"1-3, 5", " 1-3,5 "} {
+		padded := base
+		padded.ShardRanges = ranges
+		same, existing, err := mgr.CreateJob(padded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !existing || same.ID != first.ID {
+			t.Errorf("whitespace-only shardRanges difference %q should dedup against %q; existing=%v ids %s/%s",
+				ranges, base.ShardRanges, existing, same.ID, first.ID)
+		}
+	}
+}
