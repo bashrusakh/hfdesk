@@ -299,6 +299,57 @@ func TestExecutableMachineReadsTheFile(t *testing.T) {
 	}
 }
 
+// TestExecutableMachineRejectsAMissingFile proves that a file that does not
+// exist is reported as an error that names the path.
+func TestExecutableMachineRejectsAMissingFile(t *testing.T) {
+	_, err := ExecutableMachine(filepath.Join(t.TempDir(), "missing.exe"))
+	if err == nil {
+		t.Fatal("ExecutableMachine accepted a file that does not exist")
+	}
+	if !strings.Contains(err.Error(), "missing.exe") {
+		t.Errorf("error = %q, want it to name the file", err.Error())
+	}
+}
+
+// TestExecutableMachineReadsADistinctMachineFromTheFile proves the path-based
+// entry point delegates to the file content instead of returning a fixed
+// value: the fixture carries the I386 spec literal 0x014C, written as raw
+// little-endian bytes rather than through the MachineI386 constant, and that
+// distinct value must come back unchanged.
+func TestExecutableMachineReadsADistinctMachineFromTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hfdesk.exe")
+	image := buildPEImageWithMachine(SubsystemWindowsCUI, magicPE32, testOptionalHeaderSize32, 0)
+	copy(image[testPeHeaderOffset+machineOffset:], []byte{0x4C, 0x01}) // 0x014C little-endian
+	if err := os.WriteFile(path, image, 0o600); err != nil {
+		t.Fatalf("write the image: %v", err)
+	}
+
+	machine, err := ExecutableMachine(path)
+	assertNoError(t, err, "ExecutableMachine: %v", err)
+	if machine != 0x014C {
+		t.Errorf("machine = 0x%04X, want 0x014C read from the file, distinct from MachineARM64", machine)
+	}
+}
+
+// TestMachineARM64MatchesThePECOFFSpecLiteral pins the MachineARM64 constant
+// to the PE/COFF spec literal 0xAA64 independently of the fixture builder: the
+// fixture writes the raw little-endian bytes of the literal instead of the
+// constant, so the constant and the fixture cannot drift together silently.
+func TestMachineARM64MatchesThePECOFFSpecLiteral(t *testing.T) {
+	if MachineARM64 != 0xAA64 {
+		t.Errorf("MachineARM64 = 0x%04X, want the spec literal 0xAA64", MachineARM64)
+	}
+
+	image := buildPEImageWithMachine(SubsystemWindowsCUI, magicPE32Plus, testOptionalHeaderSize64, 0)
+	copy(image[testPeHeaderOffset+machineOffset:], []byte{0x64, 0xAA}) // 0xAA64 little-endian
+
+	machine, err := ExecutableMachineOf(bytes.NewReader(image))
+	assertNoError(t, err, "ExecutableMachineOf: %v", err)
+	if machine != 0xAA64 {
+		t.Errorf("machine = 0x%04X, want the spec literal 0xAA64", machine)
+	}
+}
+
 // buildPEImage builds a coherent small PE32/PE32+ image with one code section
 // and a directory count that matches the optional-header size.
 func buildPEImage(subsystem int, magic uint16, optionalHeaderSize int) []byte {
