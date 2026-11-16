@@ -4,14 +4,212 @@
 package server
 
 import (
+	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 	"github.com/bashrusakh/hfdesk/pkg/smartdl"
 )
+
+// backdate pins a path's mtimes to a known instant so a fixture's published
+// content carries a date distinct from the fresh staging artifacts written
+// alongside it.
+func backdate(t *testing.T, path string, when time.Time) {
+	t.Helper()
+	if err := os.Chtimes(path, when, when); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// findRepoEntry returns the listed entry for repoID, or nil.
+func findRepoEntry(repos []CachedRepoInfo, repoID string) *CachedRepoInfo {
+	for i := range repos {
+		if repos[i].Repo == repoID {
+			return &repos[i]
+		}
+	}
+	return nil
+}
+
+// listedCacheRepos fetches GET /api/cache and returns its repository entries.
+func listedCacheRepos(t *testing.T, s *Server) []CachedRepoInfo {
+	t.Helper()
+	w := cacheRequest(t, s, "GET", "/api/cache", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("cache listing: status %d body %s", w.Code, w.Body.String())
+	}
+	var listed struct {
+		Repos []CachedRepoInfo `json:"repos"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	return listed.Repos
+}
+
+// TestLocalCacheDownloadedDateExcludesStagingArtifacts pins the Local Cache
+// "downloaded" date rule on both mtime-derived date surfaces: the HF-cache
+// listing (which previously read the blobs DIRECTORY's own mtime) and the
+// local-scan walk's newest-mtime tracker. A published file's date must win
+// over a fresh staging artifact written by an active or interrupted download;
+// no new name matching is introduced — the one staging classifier decides.
+func TestLocalCacheDownloadedDateExcludesStagingArtifacts(t *testing.T) {
+	publishedWhen := time.Date(2021, 5, 4, 10, 0, 0, 0, time.UTC)
+	wantDate := publishedWhen.Format("2006-01-02")
+	today := time.Now().Format("2006-01-02")
+
+	// Surface 1: HF-cache entries from GET /api/cache.
+	isolateCacheState(t)
+	cacheRoot := t.TempDir()
+	blobs := filepath.Join(cacheRoot, "hub", "models--owner--stagedate", "blobs")
+	if err := os.MkdirAll(blobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	publishedBlob := filepath.Join(blobs, stagingTestSHA)
+	if err := os.WriteFile(publishedBlob, []byte(stagingTestContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(blobs, stagingTestSHA+".incomplete"), []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backdate(t, publishedBlob, publishedWhen)
+
+	hubEntry := findRepoEntry(listedCacheRepos(t, newTestServerWithConfig(t, Config{CacheDir: cacheRoot})), "owner/stagedate")
+	if hubEntry == nil {
+		t.Fatal("hub repository was not listed")
+	}
+	if hubEntry.Downloaded != wantDate {
+		t.Errorf("HF-cache downloaded date = %q, want %q (the fresh staging artifact must not move the date to %q)",
+			hubEntry.Downloaded, wantDate, today)
+	}
+
+	// Surface 2: the local-scan walk behind Local/Friendly entries.
+	scanBase := t.TempDir()
+	repoDir := filepath.Join(scanBase, "owner", "stagedate")
+	if err := os.MkdirAll(filepath.Join(repoDir, "blobs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	localPublished := filepath.Join(repoDir, "model.gguf")
+	if err := os.WriteFile(localPublished, []byte("real weights"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "blobs", stagingTestSHA+".incomplete"), []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backdate(t, localPublished, publishedWhen)
+
+	repos, err := scanLocalCachedRepos(t.TempDir(), "", []string{scanBase}, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localEntry := findRepoEntry(repos, "owner/stagedate")
+	if localEntry == nil {
+		t.Fatalf("local repository was not listed: %+v", repos)
+	}
+	if localEntry.Downloaded != wantDate {
+		t.Errorf("local-scan downloaded date = %q, want %q (the fresh in-blobs staging artifact must not move the date to %q)",
+			localEntry.Downloaded, wantDate, today)
+	}
+}
+
+// TestLocalCacheDownloadedDateEmptyWhenOnlyStagingArtifacts pins the no-date
+// representation: a hub repository whose blobs hold ONLY staging artifacts
+// (an active or interrupted download) shows no downloaded date — it must not
+// read like "today". The local-scan surface never lists a staging-only folder
+// (TestLocalCacheScanDoesNotListStagingOnlyRepositories), so the HF-cache
+// listing is the surface that can carry such an entry.
+func TestLocalCacheDownloadedDateEmptyWhenOnlyStagingArtifacts(t *testing.T) {
+	isolateCacheState(t)
+	cacheRoot := t.TempDir()
+	blobs := filepath.Join(cacheRoot, "hub", "models--owner--pending", "blobs")
+	if err := os.MkdirAll(blobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range stagingArtifactNames() {
+		if err := os.WriteFile(filepath.Join(blobs, name), []byte("staging artifact"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entry := findRepoEntry(listedCacheRepos(t, newTestServerWithConfig(t, Config{CacheDir: cacheRoot})), "owner/pending")
+	if entry == nil {
+		t.Fatal("staging-only hub repository was not listed")
+	}
+	if entry.Downloaded != "" {
+		t.Errorf("staging-only downloaded date = %q, want no date (it must not read like %q)",
+			entry.Downloaded, time.Now().Format("2006-01-02"))
+	}
+}
+
+// TestLocalCacheDownloadedDatePublishedOnlyUnchanged pins the preserved
+// neighbor: a folder whose files are all published keeps the pre-fix date —
+// the newest published mtime wins, on the local scan and on the HF-cache
+// listing alike.
+func TestLocalCacheDownloadedDatePublishedOnlyUnchanged(t *testing.T) {
+	olderWhen := time.Date(2021, 5, 4, 10, 0, 0, 0, time.UTC)
+	newerWhen := time.Date(2022, 7, 8, 9, 30, 0, 0, time.UTC)
+	wantDate := newerWhen.Format("2006-01-02")
+
+	// Local scan: two published files with distinct mtimes → newest wins.
+	scanBase := t.TempDir()
+	repoDir := filepath.Join(scanBase, "owner", "publishedonly")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, when := range map[string]time.Time{
+		"model.gguf":        olderWhen,
+		"extra.safetensors": newerWhen,
+	} {
+		p := filepath.Join(repoDir, name)
+		if err := os.WriteFile(p, []byte("real weights"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		backdate(t, p, when)
+	}
+	repos, err := scanLocalCachedRepos(t.TempDir(), "", []string{scanBase}, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := findRepoEntry(repos, "owner/publishedonly")
+	if entry == nil {
+		t.Fatalf("published-only repository was not listed: %+v", repos)
+	}
+	if entry.Downloaded != wantDate {
+		t.Errorf("published-only local-scan downloaded date = %q, want %q", entry.Downloaded, wantDate)
+	}
+
+	// HF-cache listing: two published blobs, the blobs directory's own mtime
+	// aligned with the newest one, so the listing date is the same before and
+	// after the fix.
+	isolateCacheState(t)
+	cacheRoot := t.TempDir()
+	blobs := filepath.Join(cacheRoot, "hub", "models--owner--publishedonly", "blobs")
+	if err := os.MkdirAll(blobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	olderBlob := filepath.Join(blobs, stagingTestSHA)
+	newerBlob := filepath.Join(blobs, "unusual-published-name.bin")
+	for p, when := range map[string]time.Time{olderBlob: olderWhen, newerBlob: newerWhen} {
+		if err := os.WriteFile(p, []byte("published content"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		backdate(t, p, when)
+	}
+	backdate(t, blobs, newerWhen)
+
+	hubEntry := findRepoEntry(listedCacheRepos(t, newTestServerWithConfig(t, Config{CacheDir: cacheRoot})), "owner/publishedonly")
+	if hubEntry == nil {
+		t.Fatal("published-only hub repository was not listed")
+	}
+	if hubEntry.Downloaded != wantDate {
+		t.Errorf("published-only HF-cache downloaded date = %q, want %q", hubEntry.Downloaded, wantDate)
+	}
+}
 
 // TestLocalCacheStatsExcludeStagingAndCountPhysicalFilesOnce pins the local
 // scan statistics rule (issue #146): size/fileCount count each distinct

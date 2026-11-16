@@ -1501,9 +1501,6 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 				}
 			}
 		}
-		if fileInfo.ModTime().After(newest) {
-			newest = fileInfo.ModTime()
-		}
 		if includeFiles {
 			relPath, relErr := filepath.Rel(repoDir, path)
 			if relErr != nil {
@@ -1551,6 +1548,12 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 		identities[bkey] = append(identities[bkey], &identity{fileInfo, true})
 		totalSize += fileInfo.Size()
 		fileCount++
+		// The downloaded date tracks published content only: it moves
+		// exactly where a file counts, so in-blobs staging artifacts and
+		// projections of a staging identity never move the date.
+		if fileInfo.ModTime().After(newest) {
+			newest = fileInfo.ModTime()
+		}
 		return nil
 	})
 	if err != nil {
@@ -1745,10 +1748,17 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		blobsDir := rd.BlobsDir()
 		var totalSize int64
 		var fileCount int
+		// The mtime-derived downloaded date comes from published files only:
+		// the blobs directory's own mtime also moves when an active or
+		// interrupted download creates a staging artifact inside it.
+		var blobsNewest time.Time
 		filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
 			if err == nil && !info.IsDir() && !isBlobStagingArtifactName(info.Name()) {
 				totalSize += info.Size()
 				fileCount++
+				if info.ModTime().After(blobsNewest) {
+					blobsNewest = info.ModTime()
+				}
 			}
 			return nil
 		})
@@ -1771,8 +1781,8 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var downloaded string
-		if info, err := os.Stat(blobsDir); err == nil {
-			downloaded = info.ModTime().Format("2006-01-02")
+		if !blobsNewest.IsZero() {
+			downloaded = blobsNewest.Format("2006-01-02")
 		}
 
 		var manifest *ManifestInfo
