@@ -2082,6 +2082,16 @@ async function loadRepositoryDetails(entry) {
     return filters.map(normalizeArtifactPath);
   }
 
+  // defaultDetailTab is the tab a freshly rendered analysis starts on. A
+  // recognized repository keeps Overview as its default even when it offers no
+  // selectable items: formats such as a plain Transformers base model still
+  // have a description worth opening on. Only an unrecognized/generic
+  // repository has no smart selection, so its file tree is the download path
+  // and the default tab. The Files tab stays visible for every analysis.
+  function defaultDetailTab(analysis) {
+    return analysis && analysis.type === 'generic' ? 'files' : 'overview';
+  }
+
   function renderAnalysisResult(data) {
     const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
     if (!resultDiv) return;
@@ -2329,7 +2339,7 @@ async function loadRepositoryDetails(entry) {
     // Recognized formats open on Overview; an unrecognized/generic analysis
     // has no smart selection, so its file tree is the download path and the
     // default tab. The Files tab itself is always visible.
-    detailActiveTab = hasSelectableItems ? 'overview' : 'files';
+    detailActiveTab = defaultDetailTab(data);
     detailScrollPositions.overview = 0;
     detailScrollPositions.files = 0;
     const scroller = $('#analyzeResult');
