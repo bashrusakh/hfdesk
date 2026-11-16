@@ -206,7 +206,9 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 
 	// Mirror handleStartDownload's repo format boundary after the shorthand
 	// guard (which keeps invalid_file_selection precedence), so a malformed
-	// repo id fails closed here instead of surfacing as a 500 scan error.
+	// repo id fails closed here: shapes that previously reached the scan no
+	// longer surface its 500 error, and strict-corner shapes take this named
+	// 400 before strict selection, matching handleStartDownload.
 	if !hfdownloader.IsValidModelName(req.Repo) {
 		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
 		return

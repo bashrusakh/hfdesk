@@ -1897,8 +1897,11 @@ func TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact(t *test
 // pair answers 400 "Invalid repo format" on BOTH endpoints, byte-identical
 // to the reference handler, before any Hub contact and with no job admitted.
 // Previously /api/download already answered 400 while /api/plan let a
-// malformed repo fall through to PlanRepo and surface as 500 "Failed to scan
-// repository". The colon-shorthand guards keep precedence: an unexpandable
+// malformed repo that reached the scan fall through to PlanRepo and surface
+// as 500 "Failed to scan repository"; the strict rows below pin the other
+// disclosed before-state, where strict selection answered 400
+// invalid_file_selection for these shapes. The colon-shorthand guards keep
+// precedence for the owner/name:file non-strict spelling: an unexpandable
 // shorthand shape still yields the named invalid_file_selection (covered by
 // TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact).
 func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
@@ -1932,6 +1935,8 @@ func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
 		{"missing repo", `{}`, "Missing required field: repo"},
 		{"repo without an owner", `{"repo": "invalid"}`, "Invalid repo format"},
 		{"repo with a nested path", `{"repo": "a/b/c"}`, "Invalid repo format"},
+		{"strict repo with a non-owner/name colon", `{"repo": "x:y", "strictFiles": true}`, "Invalid repo format"},
+		{"strict repo without an owner", `{"repo": "invalid", "strictFiles": true}`, "Invalid repo format"},
 	} {
 		planCode, plan := post("/api/plan", tc.body)
 		if planCode != http.StatusBadRequest || plan.Error != tc.want {

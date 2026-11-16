@@ -832,19 +832,36 @@ non-empty cannot be expanded, so both endpoints reject it with `400`
 `the owner/name:file shorthand cannot be combined with explicit filters —
 send one or the other` (previously the colon leaked into the repo id and the
 request failed later at the Hub's repo lookup — a `500` scan error on plan,
-a doomed admitted job on download). With `strictFiles: true` the colon is
-rejected with the same code whether or not `filters` is set, with a hint to
-send the file paths in `filters` (documented under Strict file selection
-below).
+a doomed admitted job on download). With `strictFiles: true` the
+`owner/name:file` shorthand colon is rejected with the same code whether or
+not `filters` is set, with a hint to send the file paths in `filters`
+(documented under Strict file selection below); a colon value that is not
+`owner/name`-shaped (for example `x:y` or `a/b/c:d`) instead reaches the
+`repo` boundary check below first and answers `400 Invalid repo format`, as
+on `POST /api/download`.
 
 `repo` is validated at the request boundary exactly like `POST /api/download`,
 before any Hub contact: a missing `repo` answers `400`
 `Missing required field: repo`, and a value that is not a plain `owner/name`
 pair answers `400 Invalid repo format` with details `Expected owner/name`
-(previously a malformed `repo` fell through to the scan and failed with
-`500 Failed to scan repository`). The colon-shorthand rules above are
-unchanged and keep precedence over this check — an unexpandable shorthand
-shape still fails with the named `400 invalid_file_selection`.
+(when no earlier boundary gate rejected the request — for example a strict
+selection — a malformed `repo` previously fell through to the scan and failed
+with `500 Failed to scan repository`). The `owner/name:file` colon-shorthand
+rules above are unchanged for that spelling and keep precedence over this
+check in their non-strict shape: an unexpandable `owner/name:file` shorthand
+still fails with the named `400 invalid_file_selection`. One strict-corner
+verdict changed and is disclosed here: a strict request whose `repo` is not
+`owner/name`-shaped is now answered `400 Invalid repo format` at this check
+first, where previously a colon value such as `x:y` or `a/b/c:d` answered
+`400 invalid_file_selection` regardless of `filters`, a malformed `repo` with
+an empty selection (for example `{"repo":"invalid","strictFiles":true}`)
+answered `400 invalid_file_selection`, and a non-colon malformed `repo` whose
+strict selection was otherwise valid fell through to the `500` scan error.
+`POST /api/download` has always answered `400 Invalid repo format` for these
+shapes, so this check brings plan to its longstanding verdict; the
+`owner/name:file` spelling passes this check itself (it splits into exactly
+two `/` segments), so strict mode's `400 invalid_file_selection` for that
+shorthand is unchanged.
 
 Returns the files that would be downloaded without starting a job. Each HTTP
 response item exposes only `path`, `size`, and `lfs`; `path` is
