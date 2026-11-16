@@ -1951,6 +1951,10 @@ func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
 		{"strict repo with a malformed shard range", `{"repo": "invalid", "strictFiles": true, "filters": ["model.gguf"], "shardRanges": "abc"}`, "Invalid repo format"},
 		{"non-strict repo with a malformed shard range", `{"repo": "invalid", "shardRanges": "abc"}`, "Invalid repo format"},
 		{"non-strict colon with explicit filters keeps the guard", `{"repo": "x:y", "filters": ["model.gguf"]}`, "Invalid file selection"},
+		{"non-strict malformed repo with a branch variant", `{"repo": "invalid", "branchVariant": true}`, "Invalid repo format"},
+		{"non-strict expanded repo with a branch variant", `{"repo": "x:y", "branchVariant": true}`, "Invalid repo format"},
+		{"strict nested repo with a branch variant", `{"repo": "a/b/c", "branchVariant": true, "strictFiles": true, "filters": ["model.gguf"]}`, "Invalid repo format"},
+		{"control: check-passing repo keeps the branch-variant verdict", `{"repo": "owner/model", "branchVariant": true}`, "Invalid branch variant request"},
 	} {
 		const unexpandableGuardDetails = "the owner/name:file shorthand cannot be combined with explicit filters — send one or the other"
 		planCode, plan := post("/api/plan", tc.body)

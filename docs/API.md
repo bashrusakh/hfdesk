@@ -856,8 +856,10 @@ selection — a malformed `repo` previously fell through to the scan and failed
 with `500 Failed to scan repository`). The `owner/name:file` colon-shorthand
 rules above are unchanged for that spelling and keep precedence over this
 check in their non-strict shape: an unexpandable `owner/name:file` shorthand
-still fails with the named `400 invalid_file_selection`. Two verdict classes
-changed at this check; first, the strict corner: a strict request whose
+still fails with the named `400 invalid_file_selection`. Verdict changes at
+this check fall in three corners: the scan-reaching change (both modes —
+including the non-strict expanded-repo class), the strict corner, and the
+downstream named-gate corner. In the strict corner, a strict request whose
 `repo` is not `owner/name`-shaped is now answered `400 Invalid repo format`
 at this check first, where previously a colon value such as `x:y` or
 `a/b/c:d` answered
@@ -871,8 +873,9 @@ naming that problem, or `invalid_shard_ranges` naming the bad range
 expression. A non-colon malformed `repo` whose strict selection was
 otherwise valid fell through to the `500` scan error.
 `POST /api/download` has always answered `400 Invalid repo format` for these
-shapes, so this check brings plan to its longstanding verdict. Second, where
-another boundary gate downstream of this check rejected the request first —
+shapes, so this check brings plan to its longstanding verdict. In the
+downstream named-gate corner: where another boundary gate downstream of this
+check rejected the request first —
 a malformed `shardRanges` (it answered `400 invalid_shard_ranges` naming the
 bad expression) or a branch-variant request (it answered `400 Invalid branch
 variant request` in non-strict shape; strict shape answered `400
@@ -891,13 +894,15 @@ spellings like `../n:f` (a traversal component) — for each of these colon
 spellings `/api/plan` previously answered `400 invalid_file_selection` with
 the strict-colon hint.
 The colon's `400 invalid_file_selection` is therefore unchanged for
-check-passing spellings in strict mode and whenever explicit `filters` are
-set, and for any colon spelling in the non-strict explicit-`filters` form
-(the unexpandable-shorthand guard keeps precedence there); only failing
-spellings in strict mode and in the non-strict expandable form moved to
-`400 Invalid repo format` (a whole-value-failing spelling whose expanded
-repo passes — for example `owner/name:sub/file.gguf` with no explicit
-`filters` — keeps its old verdict).
+check-passing spellings in strict mode and whenever explicit non-empty
+`filters` are set, and for any colon spelling in the non-strict form with
+explicit non-empty `filters` (the unexpandable-shorthand guard keeps
+precedence there); only failing spellings — failing the check as it runs
+there (whole value in strict, expanded repo in the expandable form) — in
+strict mode and in the non-strict expandable form moved to `400 Invalid
+repo format` (a whole-value-failing spelling whose expanded repo passes —
+for example `owner/name:sub/file.gguf` with no explicit `filters` — keeps
+its old verdict).
 
 Returns the files that would be downloaded without starting a job. Each HTTP
 response item exposes only `path`, `size`, and `lfs`; `path` is
