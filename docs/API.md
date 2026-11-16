@@ -845,8 +845,10 @@ Invalid repo format`, as on `POST /api/download`.
 
 `repo` is validated at the request boundary exactly like `POST /api/download`
 (the endpoints validate in the same order: the repo gates run before
-`routeKey` on both, so a request failing both reports `Invalid repo
-format`), before any Hub contact: a missing `repo` answers `400`
+`routeKey` on both, so a request failing both answers the repo-side
+verdict: `400 Invalid repo format` for a malformed `repo`, `400
+invalid_file_selection` for the unexpandable shorthand), before any Hub
+contact: a missing `repo` answers `400`
 `Missing required field: repo`, and a value that is not a plain `owner/name`
 pair — per the check's actual rule stated below, exactly two slash-separated
 segments in `IsValidModelName`'s accepted spellings — answers `400 Invalid
