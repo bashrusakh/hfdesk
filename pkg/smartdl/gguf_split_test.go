@@ -236,7 +236,7 @@ func TestExportedGGUFClassifier(t *testing.T) {
 		{"model-Q4_K_M-00001-of-00002.gguf-split", "model-Q4_K_M-00001-of-00002.gguf-split", "Q4_K_M", true},
 		{"model Q5_K_M 00002-of-00002.gguf-split", "model Q5_K_M 00002-of-00002.gguf-split", "Q5_K_M", true},
 		{"shard-00001-of-00002.gguf", "variants/UD-Q4_K_XL/shard-00001-of-00002.gguf", "UD_Q4_K_XL", true},
-		{"PQ2_0.gguf", "PQ2_0.gguf", "", true},
+		{"PQ2_0.gguf", "PQ2_0.gguf", "PQ2_0", true},
 		{"model-Q4_K_M_EXTRA.gguf", "model-Q4_K_M_EXTRA.gguf", "", true},
 		{"config.json", "config.json", "", false},
 	} {
