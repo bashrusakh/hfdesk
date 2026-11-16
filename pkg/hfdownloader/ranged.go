@@ -1093,6 +1093,10 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	}
 	metaPath := stg + ".meta"
 
+	// Staging creation/preallocation can run for minutes on a non-sparse or
+	// network filesystem; announce the window before the first byte.
+	emit(ProgressEvent{Event: "file_preparing", Path: it.RelativePath, Message: "preparing staging file"})
+
 	// Claim under the item's held domain and local metadata gate; only a known
 	// content-addressed publication target is completion proof.
 	state, err := claimStaging(ctx, stg, pub, metaPath, it, job, opts.Commit, opts.CommitPinned, cfg, opts.ContentAddressed, opts.Domain)

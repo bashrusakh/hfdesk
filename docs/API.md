@@ -1302,9 +1302,11 @@ either. A disabled friendly view is not an error. Skipped same-SHA items are
 reconciled after all files finish and receive their own snapshot/friendly
 entries. A waiting item does not occupy one of the job's active-download slots,
 so other files proceed even with a low limit. Progress reports distinguish
-transfer, finalizing, completion, skipped, error, and cancellation states, and
-`file_finalizing` is emitted before the pre-publication proof. The detailed
-ownership and resume contract is in `pkg/hfdownloader/doc.go`.
+preparation, transfer, finalizing, completion, skipped, error, and cancellation
+states. `file_preparing` marks local staging creation/preallocation before the
+first transfer byte, and `file_finalizing` is emitted before the
+pre-publication proof. The detailed ownership and resume contract is in
+`pkg/hfdownloader/doc.go`.
 
 Job responses include `warnings`, an array of strings omitted when empty: the
 downloader's non-fatal diagnostics for the job, one entry per distinct
