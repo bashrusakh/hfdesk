@@ -6,6 +6,10 @@
 
 - GGUF quantization recognition now includes the two PrismML ternary packings **PTQ1_0** (dense trit packing, 1.75 bits/weight) and **PQ2_0** (one trit per 2-bit slot, 2.13 bits/weight): repositories such as `prism-ml/Ternary-Bonsai-2-27B-gguf` show labelled quantization rows instead of `Unknown`, both descriptions state that they require the PrismML llama.cpp fork because mainline llama.cpp, Ollama and LM Studio cannot load them, and neither type is ever auto-recommended — the ordinary recommendation rules and the smallest-RAM budget fallback skip them, while both remain selectable explicitly. Exact tokens only: the standard `Q2_0` token still parses as before, and extended or prefix-variant spellings stay unclassified.
 
+### Fixed
+
+- A GGUF `vision_encoder` (mmproj) row is no longer marked recommended on its own: in a repository with LLM quantization artifacts the preferred projector is recommended only together with a recommended quantization, so the `★ rec` badge and `recommended_download` never point at a lone mmproj file — when no quantization meets the existing recommendation rule, nothing is recommended and `recommended_download` is absent. An mmproj-only repository still recommends its preferred projector, and a RAM-budget re-pick applies the same rule: a projector cannot stay recommended without a recommended quant, and when the budget picks a quant its projector is bundled again. The quantization recommendation rule, per-row download controls, and the badge rendering are unchanged.
+
 ## [1.3.0-beta.3] - 2026-11-17
 
 Beta release of the upcoming `v1.3.0`; the artifacts are pre-release builds for testing and are not marked as the latest stable release.

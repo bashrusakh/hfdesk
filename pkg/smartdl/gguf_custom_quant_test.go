@@ -153,9 +153,10 @@ func TestPrismMLTernaryTypesSkippedInRAMFallback(t *testing.T) {
 		info := analyzeGGUF([]FileInfo{
 			ggufRecommendationTestFile("model-PTQ1_0.gguf", 5_950_000_000),
 			ggufRecommendationTestFile("model-PQ2_0.gguf", 7_210_000_000),
+			ggufRecommendationTestFile("mmproj-F16.gguf", 100_000_000),
 		})
-		if info == nil || len(info.Quantizations) != 2 {
-			t.Fatalf("fixture produced %+v, want two custom packings", info)
+		if info == nil || len(info.Quantizations) != 2 || len(info.MMProjFiles) != 1 {
+			t.Fatalf("fixture produced %+v, want two custom packings and one projector", info)
 		}
 		if got := recommendedQuantIndex(info.Quantizations, 1); got != -1 {
 			t.Fatalf("fallback recommended index = %d, want -1", got)
@@ -163,7 +164,7 @@ func TestPrismMLTernaryTypesSkippedInRAMFallback(t *testing.T) {
 		repo := &RepoInfo{Repo: "owner/repo", Type: TypeGGUF, GGUF: info, SelectableItems: GGUFToSelectableItems(info)}
 		ApplyGGUFRAMBudget(repo, 1)
 		for _, item := range repo.SelectableItems {
-			if item.Category == "quantization" && item.Recommended {
+			if item.Recommended {
 				t.Fatalf("custom-only fallback recommended %+v", item)
 			}
 		}
