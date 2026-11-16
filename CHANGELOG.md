@@ -200,6 +200,7 @@
 
 ### Removed
 
+- The unused exported sentinel `hfdownloader.ErrInvalidRepo` was removed — it had no production references — and invalid repo IDs keep their existing error text from `validate`, `HFCache.Repo`, and the manifest helpers.
 - The obsolete stale-timeout configuration was removed with the age-based
   ownership lease (#140): `hfdownloader.Settings.StaleTimeout`,
   `hfdownloader.HFCache.StaleTimeout`, `hfdownloader.DefaultStaleTimeout` and

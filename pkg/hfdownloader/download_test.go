@@ -54,11 +54,12 @@ func TestJob_Validation(t *testing.T) {
 
 // validateJob is a test helper
 func validateJob(job Job) error {
+	invalidRepo := errors.New("invalid repository ID: expected owner/name format")
 	if job.Repo == "" {
-		return ErrInvalidRepo
+		return invalidRepo
 	}
 	if !IsValidModelName(job.Repo) {
-		return ErrInvalidRepo
+		return invalidRepo
 	}
 	return nil
 }
