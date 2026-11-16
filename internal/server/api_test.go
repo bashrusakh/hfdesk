@@ -1937,6 +1937,7 @@ func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
 		{"repo with a nested path", `{"repo": "a/b/c"}`, "Invalid repo format"},
 		{"strict repo with a non-owner/name colon", `{"repo": "x:y", "strictFiles": true}`, "Invalid repo format"},
 		{"strict repo without an owner", `{"repo": "invalid", "strictFiles": true}`, "Invalid repo format"},
+		{"strict shorthand whose file part contains a slash", `{"repo": "owner/name:sub/file.gguf", "strictFiles": true}`, "Invalid repo format"},
 	} {
 		planCode, plan := post("/api/plan", tc.body)
 		if planCode != http.StatusBadRequest || plan.Error != tc.want {

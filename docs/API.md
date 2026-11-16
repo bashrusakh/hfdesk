@@ -832,13 +832,16 @@ non-empty cannot be expanded, so both endpoints reject it with `400`
 `the owner/name:file shorthand cannot be combined with explicit filters —
 send one or the other` (previously the colon leaked into the repo id and the
 request failed later at the Hub's repo lookup — a `500` scan error on plan,
-a doomed admitted job on download). With `strictFiles: true` the
-`owner/name:file` shorthand colon is rejected with the same code whether or
+a doomed admitted job on download). With `strictFiles: true` a shorthand
+whose whole value passes the boundary check below — exactly two
+slash-separated segments in `IsValidModelName`'s accepted spellings, such as
+`owner/model:q4_0` or `o:x/n` — is rejected with the same code whether or
 not `filters` is set, with a hint to send the file paths in `filters`
-(documented under Strict file selection below); a colon value that is not
-`owner/name`-shaped (for example `x:y` or `a/b/c:d`) instead reaches the
-`repo` boundary check below first and answers `400 Invalid repo format`, as
-on `POST /api/download`.
+(documented under Strict file selection below); a colon value that fails
+that check — `x:y`, `a/b/c:d`, a shorthand whose file part contains `/` such
+as `owner/name:sub/file.gguf`, or a traversal spelling like `../n:f` —
+instead reaches the `repo` boundary check below first and answers `400
+Invalid repo format`, as on `POST /api/download`.
 
 `repo` is validated at the request boundary exactly like `POST /api/download`,
 before any Hub contact: a missing `repo` answers `400`
@@ -858,10 +861,20 @@ an empty selection (for example `{"repo":"invalid","strictFiles":true}`)
 answered `400 invalid_file_selection`, and a non-colon malformed `repo` whose
 strict selection was otherwise valid fell through to the `500` scan error.
 `POST /api/download` has always answered `400 Invalid repo format` for these
-shapes, so this check brings plan to its longstanding verdict; the
-`owner/name:file` spelling passes this check itself (it splits into exactly
-two `/` segments), so strict mode's `400 invalid_file_selection` for that
-shorthand is unchanged.
+shapes, so this check brings plan to its longstanding verdict. The check's
+actual rule: it accepts a `repo` of exactly two slash-separated segments in
+`IsValidModelName`'s accepted spellings — an `owner/name` pair, where a
+`:file`-style suffix inside the name segment still passes (`owner/model:q4_0`)
+and a colon in the owner segment passes too (`o:x/n`). A strict request
+whose `repo` fails that rule is now answered `400 Invalid repo format` at
+this check first — including a shorthand whose file part contains `/`
+(`owner/name:sub/file.gguf` splits into three segments) and degenerate
+spellings like `../n:f` (a traversal component) — for each of these colon
+spellings `/api/plan` previously answered `400 invalid_file_selection` with
+the strict-colon hint.
+Strict mode's `400 invalid_file_selection` for the colon is therefore
+unchanged only for check-passing spellings — the `owner/model:q4_0` class and
+the `o:x/n` class — with or without `filters`.
 
 Returns the files that would be downloaded without starting a job. Each HTTP
 response item exposes only `path`, `size`, and `lfs`; `path` is
@@ -1012,10 +1025,16 @@ trailing-slash directory entry is rejected as non-canonical.
 - The selection is all-or-nothing, and request-shape problems fail with `400`
   before any Hub contact on both endpoints:
   - empty `filters` → `400` `invalid_file_selection`
-  - an `owner/name:file` colon shorthand combined with `strictFiles` → `400`
+  - an `owner/name:file` colon shorthand combined with `strictFiles`, when
+    the value passes the `repo` boundary check (exactly two slash-separated
+    segments, such as `owner/model:q4_0` or `o:x/n`) → `400`
     `invalid_file_selection`, with a hint that the shorthand is not
     supported in strict mode — send the file paths in `filters`; the colon
-    in `repo` is rejected this way whether or not `filters` is set
+    is rejected this way whether or not `filters` is set. A colon spelling
+    that fails that check (for example `x:y`, `a/b/c:d`, or a shorthand
+    whose file part contains `/` such as `owner/name:sub/file.gguf`) →
+    `400 Invalid repo format` first on both endpoints, as disclosed in the
+    Plan section
   - a non-canonical entry (empty, absolute, trailing `/`, `.`, `..`, or a
     spelling that does not clean to itself such as `a/../b`) → `400`
     `invalid_file_selection`, naming the entry
