@@ -60,7 +60,9 @@ func listedCacheRepos(t *testing.T, s *Server) []CachedRepoInfo {
 // no new name matching is introduced — the one staging classifier decides.
 func TestLocalCacheDownloadedDateExcludesStagingArtifacts(t *testing.T) {
 	publishedWhen := time.Date(2021, 5, 4, 10, 0, 0, 0, time.UTC)
-	wantDate := publishedWhen.Format("2006-01-02")
+	// The product formats the file's stat mtime in the local zone, so the
+	// expected calendar date must be derived in the local zone too.
+	wantDate := publishedWhen.In(time.Local).Format("2006-01-02")
 	today := time.Now().Format("2006-01-02")
 
 	// Surface 1: HF-cache entries from GET /api/cache.
@@ -153,7 +155,7 @@ func TestLocalCacheDownloadedDateEmptyWhenOnlyStagingArtifacts(t *testing.T) {
 func TestLocalCacheDownloadedDatePublishedOnlyUnchanged(t *testing.T) {
 	olderWhen := time.Date(2021, 5, 4, 10, 0, 0, 0, time.UTC)
 	newerWhen := time.Date(2022, 7, 8, 9, 30, 0, 0, time.UTC)
-	wantDate := newerWhen.Format("2006-01-02")
+	wantDate := newerWhen.In(time.Local).Format("2006-01-02")
 
 	// Local scan: two published files with distinct mtimes → newest wins.
 	scanBase := t.TempDir()
@@ -221,7 +223,7 @@ func TestLocalCacheDownloadedDatePublishedOnlyUnchanged(t *testing.T) {
 // though the residue's published-named path visited the forward count point.
 func TestLocalCacheDownloadedDateUnCountedResidueIdentity(t *testing.T) {
 	publishedWhen := time.Date(2021, 5, 4, 10, 0, 0, 0, time.UTC)
-	wantDate := publishedWhen.Format("2006-01-02")
+	wantDate := publishedWhen.In(time.Local).Format("2006-01-02")
 	today := time.Now().Format("2006-01-02")
 
 	scanBase := t.TempDir()
