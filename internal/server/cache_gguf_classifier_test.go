@@ -46,7 +46,7 @@ func TestGGUFQuantTypeRequiresCompleteToken(t *testing.T) {
 		"model-Q4_K_M-00001-of-00002.gguf-split":       "Q4_K_M",
 		"model Q5_K_M 00001-of-00002.gguf-split":       "Q5_K_M",
 		"model-Q6_K_00001-of-00002.gguf":               "Q6_K",
-		"PQ2_0.gguf":                                   "",
+		"PQ2_0.gguf":                                   "PQ2_0",
 		"model-Q4_K_M_EXTRA.gguf":                      "",
 		"model-Q4_K_M_EXTRA_00001-of-00002.gguf":       "",
 		"model-Q4_K_M_EXTRA_00001-of-00002.gguf-split": "",
@@ -78,8 +78,8 @@ func TestLocalCacheSplitGGUFDiscoveryAndMetadata(t *testing.T) {
 		t.Fatal(".gguf-split-only repository was not recognized as a local weight repo")
 	}
 	meta := collectCacheGGUFMetadata(repoDir, true, nil)
-	if want := []string{"Q4_K_M", "Q6_K"}; !reflect.DeepEqual(meta.Quantizations, want) {
-		t.Fatalf("cache quantizations = %v, want %v (PQ2_0/extended tokens must stay Unknown)", meta.Quantizations, want)
+	if want := []string{"PQ2_0", "Q4_K_M", "Q6_K"}; !reflect.DeepEqual(meta.Quantizations, want) {
+		t.Fatalf("cache quantizations = %v, want %v (extended tokens must stay Unknown)", meta.Quantizations, want)
 	}
 	if meta.HasMMProj {
 		t.Fatal("split-only LLM repo reported an mmproj companion")
@@ -92,7 +92,7 @@ func TestLocalCacheSplitGGUFDiscoveryAndMetadata(t *testing.T) {
 	if len(repos) != 1 || repos[0].Repo != "owner/split-only" {
 		t.Fatalf("local scan = %+v, want only owner/split-only", repos)
 	}
-	if want := []string{"Q4_K_M", "Q6_K"}; !reflect.DeepEqual(repos[0].Quantizations, want) {
+	if want := []string{"PQ2_0", "Q4_K_M", "Q6_K"}; !reflect.DeepEqual(repos[0].Quantizations, want) {
 		t.Fatalf("scanned quantizations = %v, want %v", repos[0].Quantizations, want)
 	}
 	repo, err := findLocalCachedRepo(cacheDir, root, nil, nil, "owner/split-only", true)
@@ -183,7 +183,10 @@ func TestCacheSelectionGroupsSplitSuffixDelimiters(t *testing.T) {
 			t.Errorf("shards %q and %q split into %q/%q", tc.members[0], tc.members[1], group.ID, other.ID)
 		}
 	}
-	for _, name := range []string{"PQ2_0.gguf", "model-Q4_K_M_EXTRA.gguf"} {
+	if group := splitSelectionGroup(t, location, "PQ2_0.gguf"); group.Quant != "PQ2_0" {
+		t.Errorf("PQ2_0.gguf quant = %q, want PQ2_0", group.Quant)
+	}
+	for _, name := range []string{"model-Q4_K_M_EXTRA.gguf"} {
 		group := splitSelectionGroup(t, location, name)
 		if group.Quant != "" {
 			t.Errorf("%s quant = %q, want Unknown", name, group.Quant)

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- GGUF quantization recognition now includes the two PrismML ternary packings **PTQ1_0** (dense trit packing, 1.75 bits/weight) and **PQ2_0** (one trit per 2-bit slot, 2.13 bits/weight): repositories such as `prism-ml/Ternary-Bonsai-2-27B-gguf` show labelled quantization rows instead of `Unknown`, both descriptions state that they require the PrismML llama.cpp fork because mainline llama.cpp, Ollama and LM Studio cannot load them, and neither type is ever auto-recommended — the ordinary recommendation rules and the smallest-RAM budget fallback skip them, while both remain selectable explicitly. Exact tokens only: the standard `Q2_0` token still parses as before, and extended or prefix-variant spellings stay unclassified.
+
 ## [1.3.0-beta.3] - 2026-11-17
 
 Beta release of the upcoming `v1.3.0`; the artifacts are pre-release builds for testing and are not marked as the latest stable release.

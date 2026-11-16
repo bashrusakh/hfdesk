@@ -80,6 +80,11 @@ var quantQuality = map[string]int{
 	// Other native GGUF formats
 	"MXFP4_MOE": 4,
 
+	// PrismML ternary packings: custom GGUF types that require the PrismML
+	// llama.cpp fork and are never auto-recommended.
+	"PTQ1_0": 2,
+	"PQ2_0":  2,
+
 	// APEX MoE-aware mixed precision quantization profiles
 	"APEX_QUALITY":    5,
 	"APEX_I_QUALITY":  5,
@@ -152,6 +157,10 @@ var quantDescriptions = map[string]string{
 	// Other native GGUF formats
 	"MXFP4_MOE": "MXFP4 MoE quantization",
 
+	// PrismML ternary packings (custom runtime; never auto-recommended)
+	"PTQ1_0": "PTQ1_0 — ternary g128, 1.75 bits/weight · requires the PrismML llama.cpp fork",
+	"PQ2_0":  "PQ2_0 — ternary g128, 2.13 bits/weight · requires the PrismML llama.cpp fork",
+
 	// APEX MoE-aware mixed precision quantization profiles
 	"APEX_QUALITY":    "APEX Quality profile",
 	"APEX_I_QUALITY":  "APEX importance-matrix Quality profile",
@@ -172,12 +181,17 @@ var quantDescriptions = map[string]string{
 //     S/M/L/XL/XXL suffixes (XL/XXL are unsloth "Unsloth Dynamic" quants)
 //   - F16/F32/BF16 float precisions
 //   - MXFP4_MOE and APEX profile-style GGUF quantizations
+//   - PTQ1_0/PQ2_0 PrismML ternary packings (custom llama.cpp fork)
 //   - space-delimited quant names as well as path/underscore delimiters
 //
 // Alternation order inside the _K suffix group puts longer literals first
 // (XXL before XL before L) so the longest applicable suffix is always captured.
+//
+// Group 3 captures the standard token and group 4 the PrismML custom token.
+// Keeping the custom token outside the optional UD prefix group means the
+// Unsloth Dynamic modifier never combines with a custom-runtime type.
 var (
-	quantPattern = regexp.MustCompile(`(?i)(?:^|[-_./\s])((UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|APEX[-_](?:I[-_])?(?:BALANCED|COMPACT|MINI|QUALITY)|MXFP4_MOE|BF16|F(?:16|32)))(?:\s|[-./]|$)`)
+	quantPattern = regexp.MustCompile(`(?i)(?:^|[-_./\s])((UD[-_])?(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:[01]|K(?:_(?:XXL|XL|L|M|S))?)|APEX[-_](?:I[-_])?(?:BALANCED|COMPACT|MINI|QUALITY)|MXFP4_MOE|BF16|F(?:16|32))|(PTQ1_0|PQ2_0))(?:\s|[-./]|$)`)
 
 	// Match parameter count: 7B, 13B, 70B, 1.5B, etc.
 	paramPattern = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)[Bb]`)
@@ -280,8 +294,11 @@ func ggufQuantType(f FileInfo) string {
 			continue
 		}
 		candidate = stripSplitSuffix(candidate)
-		if m := quantPattern.FindStringSubmatch(strings.ToUpper(candidate)); len(m) >= 3 {
+		if m := quantPattern.FindStringSubmatch(strings.ToUpper(candidate)); len(m) >= 5 {
 			quant := strings.ReplaceAll(strings.ToUpper(m[3]), "-", "_")
+			if quant == "" {
+				quant = strings.ToUpper(m[4])
+			}
 			if m[2] != "" {
 				return "UD_" + quant
 			}
@@ -612,18 +629,23 @@ func mmprojArtifactID(f FileInfo) string {
 //
 // With budget <= 0 (unset) the rule is deterministic and unchanged:
 //
-//  1. the first non-MTP Q4_K_M/UD_Q4_K_M artifact (the conventional default);
-//  2. otherwise the first non-MTP artifact with quality >= 4 and size < 10 GiB.
+//  1. the first auto-recommendable Q4_K_M/UD_Q4_K_M artifact (the conventional
+//     default);
+//  2. otherwise the first auto-recommendable artifact with quality >= 4 and
+//     size < 10 GiB.
 //
-// With budget > 0 the candidate set is restricted to non-MTP artifacts whose
-// EstimatedRAM fits the budget, then the same two rules run in order over that
-// set (rule 2 keeps its size guard). When some artifacts fit but neither rule
-// matches, the fittest candidate is the highest-quality fitting artifact
-// (smaller size wins a quality tie; list order breaks exact ties). When
-// NOTHING fits, the fallback is
-// the non-MTP artifact with the smallest EstimatedRAM (list order breaks ties);
-// a repository with no non-MTP artifact still returns -1, because MTP variants
-// are never auto-recommended in any mode.
+// With budget > 0 the candidate set is restricted to auto-recommendable
+// artifacts whose EstimatedRAM fits the budget, then the same two rules run in
+// order over that set (rule 2 keeps its size guard). When some artifacts fit
+// but neither rule matches, the fittest candidate is the highest-quality
+// fitting artifact (smaller size wins a quality tie; list order breaks exact
+// ties). When NOTHING fits, the fallback is the auto-recommendable artifact
+// with the smallest EstimatedRAM (list order breaks ties); a repository with no
+// auto-recommendable artifact still returns -1.
+//
+// Auto-recommendable means non-MTP and not a custom-runtime packing: MTP
+// variants and the PrismML ternary types (PTQ1_0, PQ2_0) are offered as
+// explicit choices but never auto-recommended in any mode.
 //
 // Exactly one index is returned, so a repository containing several artifacts
 // with the same quant token cannot put all of them in one recommended request.
@@ -631,13 +653,13 @@ func recommendedQuantIndex(quants []GGUFQuantization, budget int64) int {
 	if budget <= 0 {
 		for i := range quants {
 			q := &quants[i]
-			if !q.IsMTP && (q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M") {
+			if autoRecommendable(q) && (q.Name == "Q4_K_M" || q.Name == "UD_Q4_K_M") {
 				return i
 			}
 		}
 		for i := range quants {
 			q := &quants[i]
-			if !q.IsMTP && q.Quality >= 4 && q.File.Size < 10*1024*1024*1024 { // < 10 GiB
+			if autoRecommendable(q) && q.Quality >= 4 && q.File.Size < 10*1024*1024*1024 { // < 10 GiB
 				return i
 			}
 		}
@@ -647,16 +669,16 @@ func recommendedQuantIndex(quants []GGUFQuantization, budget int64) int {
 	fitting := make([]int, 0, len(quants))
 	for i := range quants {
 		q := &quants[i]
-		if !q.IsMTP && q.EstimatedRAM <= budget {
+		if autoRecommendable(q) && q.EstimatedRAM <= budget {
 			fitting = append(fitting, i)
 		}
 	}
 	if len(fitting) == 0 {
-		// Nothing fits: fall back to the smallest-RAM non-MTP artifact.
+		// Nothing fits: fall back to the smallest-RAM auto-recommendable artifact.
 		best := -1
 		for i := range quants {
 			q := &quants[i]
-			if q.IsMTP {
+			if !autoRecommendable(q) {
 				continue
 			}
 			if best == -1 || q.EstimatedRAM < quants[best].EstimatedRAM {
@@ -736,14 +758,30 @@ func quantArtifactsKeyOfFiles(files []string) string {
 	return strings.Join(sorted, "\x00")
 }
 
+// isCustomRuntimeQuant reports whether a canonical quant label is a custom
+// packing that stock llama.cpp cannot load. Such artifacts stay selectable but
+// must never be chosen by the automatic recommendation.
+func isCustomRuntimeQuant(name string) bool {
+	return name == "PTQ1_0" || name == "PQ2_0"
+}
+
+// autoRecommendable reports whether a quantization may be chosen by
+// recommendedQuantIndex. MTP variants and custom-runtime packings are offered
+// as explicit choices but never auto-recommended.
+func autoRecommendable(q *GGUFQuantization) bool {
+	return !q.IsMTP && !isCustomRuntimeQuant(q.Name)
+}
+
 // GGUFToSelectableItems converts GGUF quantizations to SelectableItems.
 // This provides a unified interface for the web UI.
 //
-// Exactly one non-MTP quantization artifact is Recommended, following the
-// deterministic rule in recommendedQuantIndex. A configured RAM budget does
-// not change this build step: ApplyGGUFRAMBudget re-picks the recommended row
-// afterwards for callers whose setting is set. When the repo contains mmproj
-// vision-encoder files (multimodal models), an additional SelectableItem with
+// Exactly one auto-recommendable quantization artifact is Recommended, following
+// the deterministic rule in recommendedQuantIndex; a repository whose artifacts
+// are all MTP or custom-runtime packings has no recommended quant row. A
+// configured RAM budget does not change this build step: ApplyGGUFRAMBudget
+// re-picks the recommended row afterwards for callers whose setting is set.
+// When the repo contains mmproj vision-encoder files (multimodal models), an
+// additional SelectableItem with
 // Category="vision_encoder" is emitted for the preferred mmproj file. It is
 // Recommended=true by default so that the recommended download selection
 // auto-bundles the vision encoder alongside the chosen LLM quant.
