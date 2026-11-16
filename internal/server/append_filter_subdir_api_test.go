@@ -187,3 +187,71 @@ func TestNormalDownloadPathFilterWithAppendSubdirStillRuns(t *testing.T) {
 		t.Fatalf("path filter was applied as a destination directory: %s is a directory", target)
 	}
 }
+
+// Contract pin: a REAL download with a single-component filter and
+// appendFilterSubdir lands the file FLAT. Planning gives such an item a
+// non-empty DestinationSubdir (the matched filter), so wiring the request
+// flag through runJob would move the file under <filter>/ and fail this
+// test — that is its job: the HTTP API never creates filter subdirectories.
+func TestRealDownloadSingleComponentFilterWithAppendFilterSubdirLandsFlat(t *testing.T) {
+	const payload = "data"
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/revision/main"):
+			_, _ = w.Write([]byte(`{"sha":"deadbeef"}`))
+		case strings.Contains(r.URL.Path, "/tree/"):
+			_, _ = w.Write([]byte(`[{"type":"file","path":"model-Q4_K_M.gguf","size":4}]`))
+		case r.URL.Path == "/owner/model/raw/deadbeef/model-Q4_K_M.gguf":
+			_, _ = w.Write([]byte(payload))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
+
+	root := t.TempDir()
+	s := newTestServerWithConfig(t, Config{
+		CacheDir:  t.TempDir(),
+		LocalDir:  root,
+		Endpoint:  hub.URL,
+		MaxActive: 1,
+		Proxy:     &hfdownloader.ProxyConfig{NoEnvProxy: true},
+	})
+	mux := http.NewServeMux()
+	s.registerAPIRoutes(mux)
+
+	body, err := json.Marshal(DownloadRequest{
+		Repo: "owner/model", Filters: []string{"q4_k_m"},
+		ExactMatch: true, AppendFilterSubdir: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/download", bytes.NewReader(body)))
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status=%d, want 202 admitted job; body=%s", w.Code, w.Body.String())
+	}
+	var admitted Job
+	if err := json.Unmarshal(w.Body.Bytes(), &admitted); err != nil {
+		t.Fatal(err)
+	}
+	finished := waitJobStatus(t, s.jobs, admitted.ID, JobStatusCompleted, 10*time.Second)
+	if finished.Status != JobStatusCompleted {
+		t.Fatalf("job status=%s err=%q; want completed", finished.Status, finished.Error)
+	}
+
+	base, err := hfdownloader.DestinationBase(root, "owner/model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(base, "model-Q4_K_M.gguf")
+	got, err := os.ReadFile(target)
+	if err != nil || string(got) != payload {
+		t.Fatalf("flat destination %s = %q, err=%v; want %q (a <filter>/ prefix means the flag was wired through)", target, got, err, payload)
+	}
+	subdirTarget := filepath.Join(base, "q4_k_m", "model-Q4_K_M.gguf")
+	if _, err := os.Stat(subdirTarget); err == nil {
+		t.Fatalf("filter subdirectory landed at %s: the HTTP API must download flat", subdirTarget)
+	}
+}
