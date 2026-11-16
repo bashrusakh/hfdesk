@@ -83,6 +83,7 @@ The ProgressFunc callback receives events throughout the download:
   - scan_start: Repository scanning has begun
   - plan_item: A file has been added to the download plan
   - file_start: Download of a file has started
+  - file_preparing: Local preparation before transfer (staging creation/preallocation, resume validation) is running
   - file_progress: Periodic progress update during download
   - file_finalizing: Transfer finished; local finalization (strict hash verification, publish rename, cache entries) is running
   - file_done: File download complete (or skipped)
@@ -92,6 +93,12 @@ The ProgressFunc callback receives events throughout the download:
 
 `file_finalizing` is emitted before the pre-publication proof (including for an
 exact-size inherited partial), so the UI can show finalization.
+
+`file_preparing` is emitted before a file's first `file_progress` while the
+downloader creates or preallocates its staging payload and validates any
+resume state. A job-level `preparing` phase is shown only while no file is
+transferring and at least one is preparing; like `finalizing`, it suppresses
+network speed and ETA.
 
 # Filter Matching
 

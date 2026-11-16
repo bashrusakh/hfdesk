@@ -1302,9 +1302,11 @@ either. A disabled friendly view is not an error. Skipped same-SHA items are
 reconciled after all files finish and receive their own snapshot/friendly
 entries. A waiting item does not occupy one of the job's active-download slots,
 so other files proceed even with a low limit. Progress reports distinguish
-transfer, finalizing, completion, skipped, error, and cancellation states, and
-`file_finalizing` is emitted before the pre-publication proof. The detailed
-ownership and resume contract is in `pkg/hfdownloader/doc.go`.
+preparation, transfer, finalizing, completion, skipped, error, and cancellation
+states. `file_preparing` marks local staging creation/preallocation before the
+first transfer byte, and `file_finalizing` is emitted before the
+pre-publication proof. The detailed ownership and resume contract is in
+`pkg/hfdownloader/doc.go`.
 
 Job responses include `warnings`, an array of strings omitted when empty: the
 downloader's non-fatal diagnostics for the job, one entry per distinct
@@ -1880,11 +1882,18 @@ Whole-folder deletion requires the folder to hold exactly one model's files.
 The server classifies every weight file's folder-relative name through the
 shared naming rules with a strictly right-anchored, byte-aligned reduction: a
 quantization token, shard suffix or precision marker is stripped only when it
-reaches the end of the name, and only the canonical `<model>.mmproj-<quant>`
-companion shape cuts — an interior occurrence never cuts, so two distinct
+reaches the end of the name. An mmproj companion is recognized by its explicit
+basename shape — a leading `mmproj-`, a `.mmproj-` or `-mmproj-` delimiter
+after a model part, or exactly `mmproj.gguf`, case-insensitively and with any
+token after `mmproj-` — and contributes no model key, so one model's weights
+plus any number of companions still classify as one model. This deletion rule
+is deliberately narrower than the cache-metadata/selection `mmproj` substring
+rule: an unrelated name that merely contains `mmproj` keeps its own key, so an
+incidental interior occurrence never silently merges two models. Apart from
+recognized companions, an interior occurrence never cuts, so two distinct
 file names are never merged by an interior excision; the only designed merges
-are quant/shard/precision variants of one name, the canonical companion, and
-one pipeline's component roles — pipeline membership is decided strictly by
+are quant/shard/precision variants of one name and one pipeline's component
+roles — pipeline membership is decided strictly by
 the FIRST directory component, and the path below the role directory stays
 part of the comparison. Weight files whose first directory is a recognized
 Diffusers component directory are pipeline members: uniformly named component
@@ -1899,8 +1908,9 @@ distinct, as do `a/…` and `b/…`. A folder whose component roles cannot be
 told apart by names alone — one model's `unet` beside another's `vae`, each
 internally uniform — stays eligible: the conservative floor of
 name-based classification. One distinct model key makes the folder eligible;
-two or more keys, no recognized weight files, or any weight name the rules
-cannot confidently reduce make it ineligible, and the `DELETE` refuses with
+two or more keys, no recognized weight files (a folder of only companions has
+no model key), or any weight name the rules cannot confidently reduce make it
+ineligible, and the `DELETE` refuses with
 `409 Folder is not a single model` before removing anything — shared or piled
 folders keep per-group deletion only. The classification is conservative:
 folders that merely look alike stay ineligible (a UX loss, never a data risk).
