@@ -858,8 +858,12 @@ verdict changed and is disclosed here: a strict request whose `repo` is not
 first, where previously a colon value such as `x:y` or `a/b/c:d` answered
 `400 invalid_file_selection` regardless of `filters`, a malformed `repo` with
 an empty selection (for example `{"repo":"invalid","strictFiles":true}`)
-answered `400 invalid_file_selection`, and a non-colon malformed `repo` whose
-strict selection was otherwise valid fell through to the `500` scan error.
+answered `400 invalid_file_selection`, a strict selection that carried its
+own shape error (a non-canonical entry, a case-colliding pair, or a
+combination with `excludes`, a branch variant, or `appendFilterSubdir`)
+answered `400 invalid_file_selection` naming that problem, and a non-colon
+malformed `repo` whose strict selection was otherwise valid fell through to
+the `500` scan error.
 `POST /api/download` has always answered `400 Invalid repo format` for these
 shapes, so this check brings plan to its longstanding verdict. The check's
 actual rule: it accepts a `repo` of exactly two slash-separated segments in
@@ -1023,7 +1027,11 @@ trailing-slash directory entry is rejected as non-canonical.
   one entry (`./a.bin` and `a.bin` are the same entry). Entries are otherwise
   used verbatim — no whitespace trimming and no case folding.
 - The selection is all-or-nothing, and request-shape problems fail with `400`
-  before any Hub contact on both endpoints:
+  before any Hub contact on both endpoints. The following shapes are answered
+  this way when the request passes the `repo` boundary check documented under
+  Plan: a request whose `repo` fails that check answers `400 Invalid repo
+  format` first on both endpoints (disclosed under Plan), before any
+  selection-shape verdict below:
   - empty `filters` → `400` `invalid_file_selection`
   - an `owner/name:file` colon shorthand combined with `strictFiles`, when
     the value passes the `repo` boundary check (exactly two slash-separated
