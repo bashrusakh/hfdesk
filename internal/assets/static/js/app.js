@@ -3557,6 +3557,28 @@ async function loadRepositoryDetails(entry) {
         || null;
   }
 
+  // Local phases run without a transfer rate or ETA. The badge names the phase
+  // and the speed/ETA slot carries a size hint; unknown or absent values
+  // (including newer phases) fall back to the plain running row.
+  const JOB_LOCAL_PHASES = {
+    preparing: { label: 'preparing' },
+    finalizing: { label: 'finalizing' }
+  };
+
+  function jobLocalPhase(job, status) {
+    if (status !== 'running' || typeof job.phase !== 'string') return '';
+    return Object.prototype.hasOwnProperty.call(JOB_LOCAL_PHASES, job.phase) ? job.phase : '';
+  }
+
+  // One hint pill replaces the speed and ETA pills at a comparable width, so a
+  // phase does not add a stats line of its own.
+  function jobPhaseHint(phaseKey, totalBytes) {
+    const label = JOB_LOCAL_PHASES[phaseKey].label;
+    if (!(totalBytes > 0)) return label;
+    const size = formatBytes(totalBytes);
+    return phaseKey === 'preparing' ? `writing ${size} to disk` : `finalizing ${size}`;
+  }
+
   function createJobCard(job) {
     const el = document.createElement('div');
     el.className = 'job-card';
@@ -3573,7 +3595,7 @@ async function loadRepositoryDetails(entry) {
             </div>
           </div>
           <div class="job-header-right">
-            <span class="job-status" data-role="status"></span>
+            <span class="job-status" data-role="status" role="status"></span>
             <span class="job-actions" data-role="actions"></span>
           </div>
         </div>
@@ -3584,6 +3606,7 @@ async function loadRepositoryDetails(entry) {
         </div>
         <div class="job-stats">
           <span data-role="pct">0.0%</span>
+          <span data-role="phase" style="display: none"></span>
           <span data-role="speed" style="display: none"></span>
           <span data-role="eta" style="display: none"></span>
           <span data-role="bytes"></span>
@@ -3626,17 +3649,21 @@ async function loadRepositoryDetails(entry) {
     const downloadedBytes = p.downloadedBytes || 0;
     const pct = totalBytes > 0 ? (downloadedBytes / totalBytes * 100) : 0;
     const status = job.status || 'queued';
-    const speed = (status === 'running' && p.bytesPerSecond) || 0;
+    const phaseKey = jobLocalPhase(job, status);
+    const speed = (status === 'running' && !phaseKey && p.bytesPerSecond) || 0;
     const jobLabels = getJobQuantLabel(job);
 
-    // Status badge. While running, a "finalizing" phase (post-download
-    // friendly-view/manifest work) is surfaced so the job doesn't look stuck
-    // at 100%.
+    // Status badge. A local phase names what the job is doing while the
+    // transfer rate is unavailable, so a preparing/finalizing job does not
+    // look stuck at 0% or 100%.
     const statusEl = el.querySelector('[data-role="status"]');
-    const displayStatus = (status === 'running' && job.phase === 'finalizing') ? 'finalizing' : status;
+    const displayStatus = phaseKey ? JOB_LOCAL_PHASES[phaseKey].label : status;
     if (statusEl.textContent !== displayStatus) {
       statusEl.textContent = displayStatus;
-      statusEl.className = 'job-status ' + displayStatus;
+    }
+    const statusClass = 'job-status ' + (phaseKey || status);
+    if (statusEl.className !== statusClass) {
+      statusEl.className = statusClass;
     }
 
     // Action buttons — only swap when the category changes, to avoid
@@ -3660,6 +3687,20 @@ async function loadRepositoryDetails(entry) {
     const pctEl = el.querySelector('[data-role="pct"]');
     if (pctEl.textContent !== pctText) pctEl.textContent = pctText;
 
+    // Phase hint fills the speed/ETA slot while the job is doing local I/O.
+    // The progress bar and percentage keep their real values.
+    const phaseEl = el.querySelector('[data-role="phase"]');
+    if (phaseKey) {
+      const phaseText = jobPhaseHint(phaseKey, totalBytes);
+      if (phaseEl.textContent !== phaseText) phaseEl.textContent = phaseText;
+      if (phaseEl.title !== phaseText) phaseEl.title = phaseText;
+      if (phaseEl.style.display === 'none') phaseEl.style.display = '';
+    } else if (phaseEl.style.display !== 'none') {
+      phaseEl.style.display = 'none';
+      phaseEl.textContent = '';
+      phaseEl.title = '';
+    }
+
     const speedEl = el.querySelector('[data-role="speed"]');
     if (speed > 0) {
       const speedText = formatBytes(speed) + '/s';
@@ -3671,7 +3712,7 @@ async function loadRepositoryDetails(entry) {
 
     const etaEl = el.querySelector('[data-role="eta"]');
     const eta = p.etaSeconds || 0;
-    if (eta > 0 && totalBytes > downloadedBytes) {
+    if (!phaseKey && eta > 0 && totalBytes > downloadedBytes) {
       // Progress frames arrive ~4x per second; rewriting the ETA on every
       // frame makes the trailing seconds flicker. Refresh it at most once a
       // second — well within how fast a remaining-time estimate can

@@ -1426,6 +1426,7 @@ a {
   border-radius: var(--radius-full);
   font-size: 12px;
   font-weight: 500;
+  white-space: nowrap;
 }
 
 .job-status.downloading,
@@ -1439,7 +1440,8 @@ a {
   color: var(--color-success);
 }
 
-.job-status.finalizing {
+.job-status.finalizing,
+.job-status.preparing {
   background: rgba(139, 92, 246, 0.2);
   color: #a78bfa;
 }
@@ -1528,6 +1530,17 @@ a {
   background: transparent;
   border: none;
   padding: 0 4px;
+}
+
+/* The phase hint replaces the speed/ETA pills during local I/O. A block
+   container lets a long size label ellipsize instead of wrapping. */
+.job-stats > [data-role="phase"] {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .job-meta-line {
