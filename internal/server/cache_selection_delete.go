@@ -991,6 +991,13 @@ func hfJobRepoDir(job *Job) (*hfdownloader.RepoDir, error) {
 // repository directory, and a local branch variant's entries land in the
 // reserved payload directory the downloader really writes to. An HF-cache job
 // also lists its per-commit snapshot path, the other place it writes.
+//
+// When the job carries appendFilterSubdir, flat/friendly entries take the
+// item's winning-filter prefix (the planner's own DestinationSubdir, joined
+// exactly as the downloader joins it) while the HF snapshot entry stays
+// repository-relative — the same asymmetry as hfdownloader's cache-entry
+// links — so the interlock guards the paths the job really writes instead of
+// an unprefixed phantom.
 func jobPlannedWriteEntries(job *Job, plan hfdownloader.Plan) ([]string, bool) {
 	base := jobDestinationBase(job)
 	if base == "" {
@@ -1010,7 +1017,11 @@ func jobPlannedWriteEntries(job *Job, plan hfdownloader.Plan) ([]string, bool) {
 	entries := make([]string, 0, len(plan.Items)*2)
 	complete := true
 	for _, item := range plan.Items {
-		friendly, err := hfdownloader.SafeJoin(base, item.RelativePath)
+		rel := item.RelativePath
+		if job.AppendFilterSubdir && item.DestinationSubdir != "" {
+			rel = filepath.ToSlash(filepath.Join(item.DestinationSubdir, item.RelativePath))
+		}
+		friendly, err := hfdownloader.SafeJoin(base, rel)
 		if err != nil {
 			complete = false
 			continue

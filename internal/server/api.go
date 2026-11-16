@@ -73,6 +73,32 @@ func validateShardRangesRequest(req DownloadRequest) error {
 	return hfdownloader.ValidateShardRanges(req.ShardRanges, req.Filters)
 }
 
+// validateAppendFilterSubdirRequest is the real-download request-boundary
+// gate for appendFilterSubdir. It mirrors hfdownloader's
+// validateAppendFilterSubdirFilters (the two must move in lockstep: a filter
+// naming a repository path cannot become a destination directory), so a
+// path-shaped filter + flag request fails closed with the same
+// ErrAppendFilterSubdirPathFilter family the plan and dry-run surfaces
+// answer with through PlanRepo — before CreateJob admits a job and before
+// any Hub contact, instead of the job dying inside runJob's validate at run
+// time. Without the flag, path-shaped filters stay valid.
+func validateAppendFilterSubdirRequest(req DownloadRequest) error {
+	if !req.AppendFilterSubdir {
+		return nil
+	}
+	var pathFilters []string
+	for _, filter := range req.Filters {
+		normalized := strings.ReplaceAll(filter, `\`, "/")
+		if normalized == "." || normalized == ".." || strings.Contains(normalized, "/") {
+			pathFilters = append(pathFilters, filter)
+		}
+	}
+	if len(pathFilters) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %q", hfdownloader.ErrAppendFilterSubdirPathFilter, pathFilters)
+}
+
 // handleStartDownload starts a new download job.
 func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 	var req DownloadRequest
@@ -129,6 +155,21 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 
 	if req.DryRun {
 		s.handlePlanInternal(w, req)
+		return
+	}
+
+	// Fail closed before CreateJob: runJob now applies appendFilterSubdir to
+	// the downloader, whose validate() rejects a path-shaped filter + flag
+	// inside the run (after admission, after Hub work starts). Give the real
+	// download the same named 400 the plan and dry-run branch already answer
+	// with through PlanRepo — no job is admitted and no Hub contact happens.
+	// The dry-run branch above keeps reaching the identical verdict through
+	// PlanRepo untouched, and every earlier boundary gate (repo shape,
+	// shorthand, strict, branch variant, shard ranges, routeKey) keeps its
+	// precedence over this one.
+	if err := validateAppendFilterSubdirRequest(req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_append_filter_subdir",
+			"AppendFilterSubdir cannot be combined with path-shaped filters", err.Error())
 		return
 	}
 

@@ -74,6 +74,16 @@ type Job struct {
 	// can render the selection ("N files") from /api/jobs.
 	StrictFiles bool `json:"strictFiles,omitempty"`
 
+	// AppendFilterSubdir is the request's appendFilterSubdir flag, frozen on
+	// the job at creation: runJob passes it to the downloader, which lands
+	// flat/friendly files under each file's winning filter subdirectory
+	// (<filter>/) while the HF snapshot path stays repository-relative. It
+	// participates in job deduplication and the write-decision identity,
+	// persists through the snapshot/state machinery (an older
+	// jobs_state.json without the field loads as false), and appears on the
+	// API as appendFilterSubdir.
+	AppendFilterSubdir bool `json:"appendFilterSubdir,omitempty"`
+
 	// RouteKey is the download route key requested at creation (internal/audit
 	// only). The resolved destination lives in LocalDir; this field is never a
 	// path and must not be re-resolved at run time.
@@ -506,16 +516,19 @@ func stringSlicesEqual(a, b []string) bool {
 // describes req under CreateJob's deduplication identity. It is the single
 // owner of that comparison so the admission and re-run blocks cannot drift
 // apart: repo, revision, dataset flag, frozen destination identity, LocalRepo,
-// branch variant, strict selection, exact-match rule, shard ranges, the
-// queued/running status gate, and the filter/exclude selections. Excludes
-// compare as the pure matchers they are (order-insensitive, the slices
-// themselves untouched); Filters compare order-insensitively too, except
-// under the request's appendFilterSubdir, where the planner attributes each
-// file to its winning filter (longest match, ties to the first listed
-// filter) and list order can therefore name different destination
-// subdirectories; ShardRanges compares as sorted per-span spellings
-// (segment order is inert per the shard parser's contract); and every
-// scalar field compares byte-identically.
+// branch variant, appendFilterSubdir, strict selection, exact-match rule,
+// shard ranges, the queued/running status gate, and the filter/exclude
+// selections. appendFilterSubdir compares exactly (it now shapes where the
+// job writes, so two requests differing in it are two layouts and two jobs),
+// which also makes the ordered-Filters rule below unambiguous: it is only
+// ever evaluated for a same-flag pair — with the flag set on both sides, the
+// planner attributes each file to its winning filter (longest match, ties to
+// the first listed filter) and list order can therefore name different
+// destination subdirectories; with it unset on both, Filters compare
+// order-insensitively. Excludes compare as the pure matchers they are
+// (order-insensitive, the slices themselves untouched); ShardRanges compares
+// as sorted per-span spellings (segment order is inert per the shard parser's
+// contract); and every scalar field compares byte-identically.
 func sameJobRequest(existing *Job, req DownloadRequest, revision, reqDestKey, hubDir string, flat bool) bool {
 	filtersMatch := stringSlicesEqual(existing.Filters, req.Filters)
 	if req.AppendFilterSubdir {
@@ -529,6 +542,7 @@ func sameJobRequest(existing *Job, req DownloadRequest, revision, reqDestKey, hu
 		pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) &&
 		existing.LocalRepo == req.LocalRepo &&
 		existing.BranchVariant == req.BranchVariant &&
+		existing.AppendFilterSubdir == req.AppendFilterSubdir &&
 		existing.StrictFiles == req.StrictFiles &&
 		((existing.StrictFiles && req.StrictFiles) || existing.ExactMatch == req.ExactMatch) &&
 		sameShardRanges(existing.ShardRanges, req.ShardRanges) &&
@@ -671,9 +685,12 @@ resolveRequest:
 		ShardRanges:   req.ShardRanges,
 		StrictFiles:   req.StrictFiles,
 		RouteKey:      routeKey,
-		Status:        JobStatusQueued,
-		CreatedAt:     time.Now(),
-		Progress:      JobProgress{},
+		// Frozen like the rest of the request identity: runJob applies it,
+		// the write-decision snapshot carries it, and dedup splits on it.
+		AppendFilterSubdir: req.AppendFilterSubdir,
+		Status:             JobStatusQueued,
+		CreatedAt:          time.Now(),
+		Progress:           JobProgress{},
 		// partialFilesMu is allocated at job creation so cloneJobLocked
 		// can read it without a nil check; the tracker map is left
 		// nil until runJob wires it.
@@ -1760,7 +1777,7 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 		Excludes:           job.Excludes,
 		ExactMatch:         job.ExactMatch,
 		StrictFiles:        job.StrictFiles,
-		AppendFilterSubdir: false,
+		AppendFilterSubdir: job.AppendFilterSubdir,
 		LocalRepo:          job.LocalRepo,
 		BranchVariant:      job.BranchVariant,
 		ShardRanges:        job.ShardRanges,

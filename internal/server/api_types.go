@@ -10,10 +10,18 @@ type DownloadRequest struct {
 	Dataset  bool     `json:"dataset,omitempty"`
 	Filters  []string `json:"filters,omitempty"`
 	Excludes []string `json:"excludes,omitempty"`
-	// AppendFilterSubdir is accepted at the request boundary, but the
-	// download pipeline does not apply filter subdirectories: over the HTTP
-	// API, plan responses stay repository-relative and downloads land flat.
-	// The Go library (pkg/hfdownloader) honors the option when a job sets it.
+	// AppendFilterSubdir makes the download pipeline apply filter
+	// subdirectories exactly like the Go library (pkg/hfdownloader): a plan
+	// item's file lands under its winning filter's subdirectory
+	// (<filter>/repository-relative-path) in flat/friendly destinations,
+	// while the HF snapshot path stays repository-relative; plan responses
+	// themselves remain repository-relative on every surface. A path-shaped
+	// filter combined with this flag is rejected before any Hub contact with
+	// 400 invalid_append_filter_subdir on ALL request surfaces (plan,
+	// dry-run, and the real download alike), so only single-component
+	// group/token filters are accepted with it. The flag participates in job
+	// deduplication and the write-decision identity, and the job snapshot
+	// exposes it as appendFilterSubdir via /api/jobs and jobs_state.json.
 	AppendFilterSubdir bool `json:"appendFilterSubdir,omitempty"`
 	DryRun             bool `json:"dryRun,omitempty"`
 	// ExactMatch uses case-insensitive matching against repository-relative

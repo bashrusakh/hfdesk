@@ -948,16 +948,22 @@ the filter becomes a destination directory name. `PlanRepo` and `Download`
 reject a path-shaped filter (one containing `/` or `\`, including a `./` prefix
 or trailing separator, or the `.`/`..` components) with
 `ErrAppendFilterSubdirPathFilter` before any network or plan work. Such filters
-remain valid when `AppendFilterSubdir` is disabled. `POST /api/plan` and a
-dry-run `POST /api/download` request report this combination as HTTP 400 with
-error code `invalid_append_filter_subdir`; a normal non-dry-run download remains
-admitted and runs without filter subdirectories, matching the existing download
-pipeline.
+remain valid when `AppendFilterSubdir` is disabled. All three request surfaces
+report this combination the same way: `POST /api/plan`, a dry-run
+`POST /api/download`, and a real `POST /api/download` answer HTTP 400 with
+error code `invalid_append_filter_subdir` before any Hub contact, and a real
+download admits no job (the boundary rejects it instead of letting the job die
+inside the run).
 
-Over the HTTP API this option never creates filter subdirectories: it is a
-Go-library option, and on every HTTP surface plan responses stay
-repository-relative while downloads land flat at each file's
-repository-relative path, whatever `appendFilterSubdir` the request carries.
+Over the HTTP API this option now behaves like the Go library: a real
+download with `appendFilterSubdir: true` creates filter subdirectories, so a
+flat or friendly-view file lands under its winning filter's directory
+(`<filter>/repository-relative-path`) while the HF snapshot path stays
+repository-relative; plan responses themselves remain repository-relative on
+every surface. The job snapshot exposes the flag as `appendFilterSubdir` via
+the `POST /api/download` response, `GET /api/jobs`, and `jobs_state.json`, and
+the flag participates in job deduplication: two requests differing only in
+`appendFilterSubdir` are independent jobs.
 
 When `filters` is non-empty and no non-excluded repository-relative path matches
 or recognized dataset-group membership selects data, the request fails with
@@ -1115,11 +1121,15 @@ Notes:
   combined with explicit `filters` it is a `400` `invalid_file_selection`
   before any Hub contact).
 - `revision` defaults to `main`.
-- `appendFilterSubdir` is accepted but has no layout effect on any HTTP
-  surface: the HTTP API creates no filter subdirectories, so plan responses
-  stay repository-relative and a downloaded file lands flat at its
-  repository-relative path with no `<filter>/` prefix. It is a Go-library
-  option (documented under Plan above).
+- `appendFilterSubdir` applies the library's filter-subdirectory layout: a
+  real download with `appendFilterSubdir: true` lands each flat/friendly file
+  under its winning filter's directory (`<filter>/repository-relative-path`)
+  while the HF snapshot path stays repository-relative, and a path-shaped
+  filter combined with the flag is rejected on this endpoint too with `400`
+  `invalid_append_filter_subdir` before any Hub contact and before any job is
+  admitted (plan and dry-run answer the same way, documented under Plan
+  above). The job snapshot returned by `POST /api/download`, `GET /api/jobs`
+  and `jobs_state.json` exposes the field as `appendFilterSubdir`.
 - `shardRanges` participates in job identity: an identical request (same
   repo, revision, destination, filters and ranges) reuses the running job,
   and two requests whose range expressions differ only in the order of their
@@ -1128,10 +1138,13 @@ Notes:
   segment order as inert. Requests differing only in span spelling (`1-3`
   versus `1,2,3`), in the multiplicity of a repeated span (`1-3,1-3` versus
   `1-3`), in their spans, or in empty versus non-empty ranges still start
-  independent jobs. `filters` compare order-insensitively, except when a
-  request sets `appendFilterSubdir: true`, where filter order is part of
-  identity: the winning filter names each file's destination subdirectory,
-  so re-ordered filters start independent jobs. The job snapshot returned by
+  independent jobs. `appendFilterSubdir` itself participates in job identity
+  as an exact field: two requests differing only in the flag start
+  independent jobs (they describe different layouts — prefixed versus flat).
+  `filters` compare order-insensitively, except when both requests carry
+  `appendFilterSubdir: true`, where filter order is part of identity: the
+  winning filter names each file's destination subdirectory, so re-ordered
+  filters start independent jobs. The job snapshot returned by
   `POST /api/download`, `GET /api/jobs` and `jobs_state.json` exposes the
   field as `shardRanges`, and the bundled Downloads view labels it on the
   job's chip. Planning, `dryRun: true` and the real download apply ranges
