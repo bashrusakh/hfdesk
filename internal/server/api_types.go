@@ -5,13 +5,17 @@ package server
 
 // DownloadRequest is the request body for starting a download.
 type DownloadRequest struct {
-	Repo               string   `json:"repo"`
-	Revision           string   `json:"revision,omitempty"`
-	Dataset            bool     `json:"dataset,omitempty"`
-	Filters            []string `json:"filters,omitempty"`
-	Excludes           []string `json:"excludes,omitempty"`
-	AppendFilterSubdir bool     `json:"appendFilterSubdir,omitempty"`
-	DryRun             bool     `json:"dryRun,omitempty"`
+	Repo     string   `json:"repo"`
+	Revision string   `json:"revision,omitempty"`
+	Dataset  bool     `json:"dataset,omitempty"`
+	Filters  []string `json:"filters,omitempty"`
+	Excludes []string `json:"excludes,omitempty"`
+	// AppendFilterSubdir is accepted at the request boundary, but the
+	// download pipeline does not apply filter subdirectories: over the HTTP
+	// API, plan responses stay repository-relative and downloads land flat.
+	// The Go library (pkg/hfdownloader) honors the option when a job sets it.
+	AppendFilterSubdir bool `json:"appendFilterSubdir,omitempty"`
+	DryRun             bool `json:"dryRun,omitempty"`
 	// ExactMatch uses case-insensitive matching against repository-relative
 	// paths instead of substring matching. Exact filters can select directory
 	// components and their descendants with a trailing slash (for example,
