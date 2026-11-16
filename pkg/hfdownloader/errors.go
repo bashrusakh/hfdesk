@@ -10,9 +10,6 @@ import (
 
 // Common errors returned by the library.
 var (
-	// ErrInvalidRepo is returned when the repository ID is not in "owner/name" format.
-	ErrInvalidRepo = errors.New("invalid repository ID: expected owner/name format")
-
 	// ErrUnauthorized is returned when authentication is required but not provided.
 	ErrUnauthorized = errors.New("unauthorized: this repository requires authentication")
 
