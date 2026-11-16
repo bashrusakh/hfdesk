@@ -265,6 +265,55 @@ func TestLocalCacheDownloadedDateUnCountedResidueIdentity(t *testing.T) {
 	}
 }
 
+// TestLocalCacheDownloadedDateUnCountedResidueIdentityHF is the HF twin of
+// the local-scan residue test above: on the HF-listing surface (GET
+// /api/cache) the same interrupted-publication residue — blobs/<sha>
+// hard-linked to blobs/<sha>.incomplete, sharing one inode — must contribute
+// no date AND no count/size, so the entry reports the backdated published
+// blob's date and only that blob's bytes: the residue's fresh shared-inode
+// mtime must not win the date, and its content-named path must not enter the
+// size/count stats. Count and date derive from the same counted set.
+func TestLocalCacheDownloadedDateUnCountedResidueIdentityHF(t *testing.T) {
+	publishedWhen := time.Date(2021, 5, 4, 10, 0, 0, 0, time.UTC)
+	wantDate := publishedWhen.In(time.Local).Format("2006-01-02")
+	today := time.Now().Format("2006-01-02")
+
+	isolateCacheState(t)
+	cacheRoot := t.TempDir()
+	blobs := filepath.Join(cacheRoot, "hub", "models--owner--hfresidue", "blobs")
+	if err := os.MkdirAll(blobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	publishedBlob := filepath.Join(blobs, stagingTestSHA)
+	if err := os.WriteFile(publishedBlob, []byte(stagingTestContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backdate(t, publishedBlob, publishedWhen)
+	// The residue: the content-named blob and its staging-named sibling
+	// share one inode, both freshly written (mtime = today).
+	residue := filepath.Join(blobs, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	if err := os.WriteFile(residue, []byte("staged residue"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(residue, residue+".incomplete"); err != nil {
+		t.Fatalf("hard-link residue fixture: %v", err)
+	}
+
+	entry := findRepoEntry(listedCacheRepos(t, newTestServerWithConfig(t, Config{CacheDir: cacheRoot})), "owner/hfresidue")
+	if entry == nil {
+		t.Fatal("residue hub repository was not listed")
+	}
+	if entry.Downloaded != wantDate {
+		t.Errorf("HF residue downloaded date = %q, want %q (the residue's fresh shared-inode mtime must not move the date to %q)",
+			entry.Downloaded, wantDate, today)
+	}
+	wantSize := int64(len(stagingTestContent))
+	if entry.Size != wantSize || entry.FileCount != 1 {
+		t.Errorf("HF residue stats size/count = %d/%d, want %d/1 (the residue identity contributes no count or size)",
+			entry.Size, entry.FileCount, wantSize)
+	}
+}
+
 // TestLocalCacheStatsExcludeStagingAndCountPhysicalFilesOnce pins the local
 // scan statistics rule (issue #146): size/fileCount count each distinct
 // published physical file exactly once — a snapshot or friendly-view symlink
