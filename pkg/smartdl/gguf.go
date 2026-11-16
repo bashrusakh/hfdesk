@@ -694,8 +694,10 @@ func recommendedQuantIndex(quants []GGUFQuantization, budget int64) int {
 // Callers apply it to an analyzed repository after selectable items were built
 // and then re-run RepoInfo.PopulateDownloadSelection so the recommended
 // download follows the new pick. Only rows derived from this repository's
-// quantization artifacts are touched: vision-encoder rows, branch-variant rows
-// and every other category keep their existing recommendation state.
+// quantization artifacts are re-picked: branch-variant rows and every other
+// category keep their existing recommendation state. Vision-encoder rows are
+// reconciled with the new pick so a projector is recommended exactly when a
+// quant row is (or when the repository has no LLM quant rows at all).
 func ApplyGGUFRAMBudget(info *RepoInfo, budget int64) {
 	if info == nil || budget <= 0 || info.Type != TypeGGUF || info.GGUF == nil {
 		return
@@ -716,6 +718,32 @@ func ApplyGGUFRAMBudget(info *RepoInfo, budget int64) {
 			continue
 		}
 		item.Recommended = j == idx
+	}
+	setPreferredMMProjRecommendation(info.SelectableItems, info.GGUF.MMProjFiles, ggufProjectorRecommended(quants, idx))
+}
+
+// ggufProjectorRecommended reports whether the preferred mmproj belongs in the
+// recommended selection. An mmproj-only repository recommends its projector;
+// a repository with LLM quantizations recommends the projector only alongside
+// a recommended quant, never as the lone selection.
+func ggufProjectorRecommended(quants []GGUFQuantization, quantIndex int) bool {
+	return len(quants) == 0 || quantIndex >= 0
+}
+
+// setPreferredMMProjRecommendation marks only the preferred vision-encoder item
+// as Recommended when recommended is true, and clears every vision-encoder row
+// otherwise. Rows are matched by the repository path used to build them.
+func setPreferredMMProjRecommendation(items []SelectableItem, mmprojFiles []FileInfo, recommended bool) {
+	if len(mmprojFiles) == 0 {
+		return
+	}
+	preferred, _ := preferredMMProj(mmprojFiles)
+	preferredPath := artifactPath(preferred)
+	for i := range items {
+		if items[i].Category != "vision_encoder" {
+			continue
+		}
+		items[i].Recommended = recommended && len(items[i].Files) > 0 && items[i].Files[0] == preferredPath
 	}
 }
 
@@ -739,14 +767,16 @@ func quantArtifactsKeyOfFiles(files []string) string {
 // GGUFToSelectableItems converts GGUF quantizations to SelectableItems.
 // This provides a unified interface for the web UI.
 //
-// Exactly one non-MTP quantization artifact is Recommended, following the
-// deterministic rule in recommendedQuantIndex. A configured RAM budget does
-// not change this build step: ApplyGGUFRAMBudget re-picks the recommended row
-// afterwards for callers whose setting is set. When the repo contains mmproj
-// vision-encoder files (multimodal models), an additional SelectableItem with
+// Exactly one non-MTP quantization artifact is Recommended when
+// recommendedQuantIndex finds a suitable one, following that deterministic
+// rule. A configured RAM budget does not change this build step:
+// ApplyGGUFRAMBudget re-picks the recommended row afterwards for callers whose
+// setting is set. When the repo contains mmproj vision-encoder files
+// (multimodal models), an additional SelectableItem with
 // Category="vision_encoder" is emitted for the preferred mmproj file. It is
-// Recommended=true by default so that the recommended download selection
-// auto-bundles the vision encoder alongside the chosen LLM quant.
+// Recommended only when a quant row is also Recommended (or the repository has
+// no LLM quantizations at all), so the projector always accompanies a chosen
+// model instead of becoming the recommended download on its own.
 func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 	if info == nil {
 		return nil
@@ -758,6 +788,7 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 	items := make([]SelectableItem, 0, len(info.Quantizations)+1)
 
 	recommendedIndex := recommendedQuantIndex(info.Quantizations, 0)
+	projectorRecommended := ggufProjectorRecommended(info.Quantizations, recommendedIndex)
 
 	// Keep FilterValue compatible as a legacy label, but derive row uniqueness
 	// from artifact paths below; a quant token or basename is not identity.
@@ -829,8 +860,9 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 	// of being limited to one. Files are compared by repository path, not
 	// basename: two directories may each contain "mmproj-F16.gguf", and those
 	// are distinct artifacts. The preferred file (preferredMMProj precedence)
-	// is the only one marked Recommended so the recommended selection still
-	// auto-bundles a sensible mmproj alongside the chosen quant (issue #76).
+	// is the only one marked Recommended, and only alongside a recommended
+	// quant, so the recommended selection auto-bundles a sensible mmproj with
+	// the chosen quant (issue #76) without ever recommending a lone projector.
 	// FilterValue stays a legacy basename token; Files carries the exact
 	// artifact identity (including the directory).
 	if len(info.MMProjFiles) > 0 {
@@ -861,13 +893,13 @@ func GGUFToSelectableItems(info *GGUFInfo) []SelectableItem {
 				Description:  mmDesc,
 				Size:         f.Size,
 				SizeHuman:    f.SizeHuman,
-				Recommended:  artifactPath(f) == preferredPath,
 				Category:     "vision_encoder",
 				FilterValue:  filter,
 				Files:        []string{artifactPath(f)},
 				UpstreamRepo: info.MMProjUpstreamRepo,
 			})
 		}
+		setPreferredMMProjRecommendation(items, info.MMProjFiles, projectorRecommended)
 	}
 
 	return disambiguateGGUFSelectableItems(items)
