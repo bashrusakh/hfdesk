@@ -233,5 +233,23 @@ func ExampleSettings_performance() {
 		BackoffMax:         "30s",    // Longer max for rate limiting
 		Verify:             "sha256", // Full verification
 	}
-	_ = cfg
+
+	fmt.Printf("OutputDir: %s\n", cfg.OutputDir)
+	fmt.Printf("Concurrency: %d\n", cfg.Concurrency)
+	fmt.Printf("MaxActiveDownloads: %d\n", cfg.MaxActiveDownloads)
+	fmt.Printf("MultipartThreshold: %s\n", cfg.MultipartThreshold)
+	fmt.Printf("Retries: %d\n", cfg.Retries)
+	fmt.Printf("BackoffInitial: %s\n", cfg.BackoffInitial)
+	fmt.Printf("BackoffMax: %s\n", cfg.BackoffMax)
+	fmt.Printf("Verify: %s\n", cfg.Verify)
+
+	// Output:
+	// OutputDir: ./Models
+	// Concurrency: 16
+	// MaxActiveDownloads: 4
+	// MultipartThreshold: 16MiB
+	// Retries: 6
+	// BackoffInitial: 200ms
+	// BackoffMax: 30s
+	// Verify: sha256
 }
