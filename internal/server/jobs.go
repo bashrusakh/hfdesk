@@ -57,7 +57,7 @@ type Job struct {
 	Flat               bool              `json:"flat,omitempty"`          // Save real files (flat mode) instead of HF cache layout
 	ExactMatch         bool              `json:"exactMatch,omitempty"`    // Match filters by whole name segment, not substring
 	Status             JobStatus         `json:"status"`
-	Phase              string            `json:"phase,omitempty"` // sub-state while running, e.g. "finalizing"
+	Phase              string            `json:"phase,omitempty"` // sub-state while running, e.g. "preparing" or "finalizing"
 	Progress           JobProgress       `json:"progress"`
 	Error              string            `json:"error,omitempty"`
 	CreatedAt          time.Time         `json:"createdAt"`
@@ -279,6 +279,8 @@ func (m *JobManager) LoadState() {
 	legacyResolved := false
 	for _, j := range jobs {
 		j.cancel = nil
+		// Phase is a running-only sub-state; a restored job has no live run.
+		j.Phase = ""
 		if j.LocalDir == "" && j.HubDir == "" {
 			cache := m.config.cacheForRoot(j.OutputDir)
 			j.OutputDir, j.HubDir = cache.Root, cache.HubDir()
@@ -355,6 +357,7 @@ func (m *JobManager) Close(ctx context.Context) error {
 				continue
 			}
 			job.Status = JobStatusPaused
+			job.Phase = ""
 			if job.cancel != nil {
 				cancels = append(cancels, job.cancel)
 			}
@@ -849,6 +852,7 @@ func (m *JobManager) CancelJob(id string) bool {
 		job.cancel()
 	}
 	job.Status = JobStatusCancelled
+	job.Phase = ""
 	m.signalWriteDecisionLocked()
 	now := time.Now()
 	job.EndedAt = &now
@@ -892,6 +896,7 @@ func (m *JobManager) PauseJob(id string) bool {
 		job.cancel()
 	}
 	job.Status = JobStatusPaused
+	job.Phase = ""
 	m.signalWriteDecisionLocked()
 	snapshot := m.cloneJobLocked(job)
 	m.mu.Unlock()
@@ -1056,6 +1061,7 @@ func resetAndQueueRestartLocked(m *JobManager, job *Job, retry bool) *Job {
 	// claims the new generation.
 	job.generation++
 	job.Status = JobStatusQueued
+	job.Phase = ""
 	m.signalWriteDecisionLocked()
 	if retry {
 		job.Error = ""
@@ -1575,6 +1581,32 @@ func updateJobETA(job *Job, transferred int64, now time.Time) {
 // pkg/smartdl's analysis_warnings.
 const maxJobWarnings = 20
 
+// refreshPreparingPhase projects per-file local preparation onto the job-wide
+// phase. It is shown only while at least one file is preparing and no file is
+// in transfer; the preparing file itself is excluded from the transfer check
+// because file_start marks it active before its local preparation starts.
+func refreshPreparingPhase(job *Job) {
+	preparing := false
+	transferring := false
+	for i := range job.Files {
+		switch job.Files[i].Status {
+		case "preparing":
+			preparing = true
+		case "active":
+			transferring = true
+		}
+	}
+	if preparing && !transferring {
+		job.Phase = "preparing"
+		job.Progress.BytesPerSecond = 0
+		job.Progress.EtaSeconds = 0
+		return
+	}
+	if job.Phase == "preparing" {
+		job.Phase = ""
+	}
+}
+
 // applyJobProgress folds one downloader progress event into the job's
 // aggregate state. The caller must hold the manager lock. now feeds the
 // speed/ETA estimators and is passed in for deterministic testing.
@@ -1596,10 +1628,30 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 				break
 			}
 		}
+		refreshPreparingPhase(job)
+
+	case "file_preparing":
+		// Local preparation (staging creation/preallocation or resume
+		// validation) runs before the first byte. Mark the file so the job can
+		// expose the preparing phase instead of plain running at 0 B/s.
+		matched := false
+		for i := range job.Files {
+			if job.Files[i].Path == evt.Path {
+				job.Files[i].Status = "preparing"
+				matched = true
+				break
+			}
+		}
+		if matched {
+			refreshPreparingPhase(job)
+		}
 
 	case "file_progress":
 		for i := range job.Files {
 			if job.Files[i].Path == evt.Path {
+				if job.Files[i].Status == "preparing" || job.Files[i].Status == "pending" {
+					job.Files[i].Status = "active"
+				}
 				if !job.Files[i].progressed {
 					// First real progress for this file: record the bytes
 					// already on disk (resume position) so they aren't
@@ -1611,6 +1663,7 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 				break
 			}
 		}
+		refreshPreparingPhase(job)
 		// total drives the progress bar (includes skipped/already-present
 		// bytes); transferred drives the speed (only bytes moved this run).
 		// During the resume-recovery window (resumeFloor > 0) the running
@@ -1650,6 +1703,12 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 				break
 			}
 		}
+		// A file still preparing keeps the preparing phase while no transfer
+		// is running; only once preparation ends can the job be finalizing.
+		refreshPreparingPhase(job)
+		if job.Phase == "preparing" {
+			break
+		}
 		// Once no file is left downloading, the whole job is in local
 		// post-processing: surface the phase and stop showing the stale
 		// speed/ETA from the last transfer window.
@@ -1674,6 +1733,7 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 				break
 			}
 		}
+		refreshPreparingPhase(job)
 		job.Progress.CompletedFiles++
 		// Recalculate total downloaded (skipped/completed files included).
 		// Speed is intentionally not updated here: a skipped file emits only
@@ -1700,6 +1760,11 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 		job.Phase = "finalizing"
 		job.Progress.BytesPerSecond = 0
 		job.Progress.EtaSeconds = 0
+
+	case "done", "error":
+		// Terminal downloader events must not leave a running-only sub-state
+		// (preparing or finalizing) on the job's final snapshot.
+		job.Phase = ""
 
 	case "warning":
 		// Keep the downloader's non-fatal diagnostics (unpinned revision,
@@ -1903,6 +1968,8 @@ func (m *JobManager) runJob(job *Job, activityID uint64) {
 	} else {
 		job.Status = JobStatusCompleted
 	}
+	// Phase is a running-only sub-state; a finished job must not retain it.
+	job.Phase = ""
 	m.signalWriteDecisionLocked()
 	endSnap := m.cloneJobLocked(job)
 	// This job finished and freed a slot; start the next queued job.

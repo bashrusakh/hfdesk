@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -313,5 +314,82 @@ func TestDownloadMultipart_EmitsFileFinalizing(t *testing.T) {
 	}
 	if finalizingAt < fullProgressAt {
 		t.Errorf("file_finalizing (index %d) emitted before the 100%% progress reading (index %d)", finalizingAt, fullProgressAt)
+	}
+}
+
+// TestDownloadMultipart_EmitsFilePreparing verifies that a fresh ranged
+// download announces local staging preparation before any range request or
+// progress byte. Without it a size-proportional preallocation runs at 0 B/s
+// with no status while the staging file is created.
+func TestDownloadMultipart_EmitsFilePreparing(t *testing.T) {
+	tmpDir := t.TempDir()
+	full := rangedTestPayload(10000)
+	var networkStarted atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(full)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		networkStarted.Store(true)
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+	}))
+	defer srv.Close()
+
+	dst := filepath.Join(tmpDir, "prep.bin")
+	it := PlanItem{
+		RelativePath: "prep.bin",
+		URL:          srv.URL + "/prep.bin",
+		Size:         int64(len(full)),
+		AcceptRanges: true,
+	}
+
+	var (
+		mu     sync.Mutex
+		events []ProgressEvent
+	)
+	preparingBeforeNetwork := false
+	emit := func(ev ProgressEvent) {
+		if ev.Event == "file_preparing" {
+			preparingBeforeNetwork = !networkStarted.Load()
+		}
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	if _, err := downloadMultipart(context.Background(), srv.Client(), "", Job{Repo: "o/r"}, Settings{Concurrency: 4, Retries: 0}, it, dst, withTestDomain(t, dst, multipartOpts{}), emit); err != nil {
+		t.Fatalf("downloadMultipart: %v", err)
+	}
+
+	preparingAt, firstProgressAt := -1, -1
+	var preparing ProgressEvent
+	for i, ev := range events {
+		if ev.Event == "file_preparing" && preparingAt == -1 {
+			preparingAt = i
+			preparing = ev
+		}
+		if ev.Event == "file_progress" && firstProgressAt == -1 {
+			firstProgressAt = i
+		}
+	}
+	if preparingAt == -1 {
+		t.Fatal("no file_preparing event emitted")
+	}
+	if preparing.Path != it.RelativePath {
+		t.Errorf("file_preparing path = %q, want %q", preparing.Path, it.RelativePath)
+	}
+	if preparing.Message == "" {
+		t.Error("file_preparing event has no message")
+	}
+	if !preparingBeforeNetwork {
+		t.Error("file_preparing was emitted after the first range request")
+	}
+	if firstProgressAt == -1 {
+		t.Fatal("no file_progress event emitted")
+	}
+	if preparingAt > firstProgressAt {
+		t.Errorf("file_preparing (index %d) emitted after the first progress reading (index %d)", preparingAt, firstProgressAt)
 	}
 }

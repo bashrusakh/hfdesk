@@ -392,6 +392,7 @@ type Settings struct {
 //   - "scan_start": Repository scanning has begun
 //   - "plan_item": A file has been added to the download plan
 //   - "file_start": Download of a file has started
+//   - "file_preparing": Local preparation before transfer is running
 //   - "file_progress": Periodic progress update during download
 //   - "file_done": File download complete (check Message for "skip" info)
 //   - "retry": A retry attempt is being made

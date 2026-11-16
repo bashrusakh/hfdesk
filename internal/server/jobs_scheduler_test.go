@@ -206,6 +206,137 @@ func TestApplyJobProgress_FileFinalizingPhase(t *testing.T) {
 	}
 }
 
+// TestApplyJobProgress_FilePreparingPhase verifies that local preparation
+// before the first byte surfaces the preparing phase and zeroes the stale
+// transfer speed/ETA, then clears as soon as transfer progress resumes.
+func TestApplyJobProgress_FilePreparingPhase(t *testing.T) {
+	job := &Job{}
+	now := time.Now()
+	apply := func(evt hfdownloader.ProgressEvent) {
+		applyJobProgress(job, evt, now)
+	}
+
+	apply(hfdownloader.ProgressEvent{Event: "plan_item", Path: "a.gguf", Total: 100})
+	apply(hfdownloader.ProgressEvent{Event: "file_start", Path: "a.gguf"})
+	job.Progress.BytesPerSecond = 2_000_000
+	job.Progress.EtaSeconds = 60
+
+	apply(hfdownloader.ProgressEvent{Event: "file_preparing", Path: "a.gguf", Message: "preparing staging file"})
+	if job.Files[0].Status != "preparing" {
+		t.Fatalf("file a status = %q, want preparing", job.Files[0].Status)
+	}
+	if job.Phase != "preparing" {
+		t.Fatalf("phase = %q, want preparing", job.Phase)
+	}
+	if job.Progress.BytesPerSecond != 0 || job.Progress.EtaSeconds != 0 {
+		t.Fatalf("stale speed/ETA not cleared: %d B/s, %d s",
+			job.Progress.BytesPerSecond, job.Progress.EtaSeconds)
+	}
+
+	apply(hfdownloader.ProgressEvent{Event: "file_progress", Path: "a.gguf", Downloaded: 1, Total: 100})
+	if job.Phase != "" {
+		t.Fatalf("phase = %q after transfer resumed, want empty", job.Phase)
+	}
+	if job.Files[0].Status != "active" {
+		t.Fatalf("file a status = %q after progress, want active", job.Files[0].Status)
+	}
+}
+
+// TestApplyJobProgress_FilePreparingDoesNotOverrideTransfer verifies that one
+// file preparing while another is transferring leaves the job phase alone.
+func TestApplyJobProgress_FilePreparingDoesNotOverrideTransfer(t *testing.T) {
+	job := &Job{}
+	now := time.Now()
+	apply := func(evt hfdownloader.ProgressEvent) {
+		applyJobProgress(job, evt, now)
+	}
+
+	apply(hfdownloader.ProgressEvent{Event: "plan_item", Path: "a.gguf", Total: 100})
+	apply(hfdownloader.ProgressEvent{Event: "plan_item", Path: "b.gguf", Total: 100})
+	apply(hfdownloader.ProgressEvent{Event: "file_start", Path: "b.gguf"})
+	apply(hfdownloader.ProgressEvent{Event: "file_progress", Path: "b.gguf", Downloaded: 50, Total: 100})
+	job.Progress.BytesPerSecond = 1_000_000
+	job.Progress.EtaSeconds = 10
+
+	apply(hfdownloader.ProgressEvent{Event: "file_start", Path: "a.gguf"})
+	apply(hfdownloader.ProgressEvent{Event: "file_preparing", Path: "a.gguf", Message: "preparing staging file"})
+	if job.Files[0].Status != "preparing" {
+		t.Fatalf("file a status = %q, want preparing", job.Files[0].Status)
+	}
+	if job.Phase != "" {
+		t.Fatalf("phase = %q while b is transferring, want empty", job.Phase)
+	}
+	if job.Progress.BytesPerSecond != 1_000_000 || job.Progress.EtaSeconds != 10 {
+		t.Fatalf("active transfer's speed/ETA changed: %d B/s, %d s",
+			job.Progress.BytesPerSecond, job.Progress.EtaSeconds)
+	}
+}
+
+// TestApplyJobProgress_FilePreparingClearsOnTerminal verifies that a job which
+// finishes immediately after preparation does not retain the phase, and that a
+// terminal error does not either.
+func TestApplyJobProgress_FilePreparingClearsOnTerminal(t *testing.T) {
+	cases := []struct {
+		name string
+		evt  hfdownloader.ProgressEvent
+	}{
+		{name: "file_done", evt: hfdownloader.ProgressEvent{Event: "file_done", Path: "a.gguf"}},
+		{name: "done", evt: hfdownloader.ProgressEvent{Event: "done"}},
+		{name: "error", evt: hfdownloader.ProgressEvent{Level: "error", Event: "error", Message: "disk full"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			job := &Job{}
+			now := time.Now()
+			apply := func(evt hfdownloader.ProgressEvent) {
+				applyJobProgress(job, evt, now)
+			}
+			apply(hfdownloader.ProgressEvent{Event: "plan_item", Path: "a.gguf", Total: 100})
+			apply(hfdownloader.ProgressEvent{Event: "file_start", Path: "a.gguf"})
+			apply(hfdownloader.ProgressEvent{Event: "file_preparing", Path: "a.gguf", Message: "preparing staging file"})
+			if job.Phase != "preparing" {
+				t.Fatalf("phase = %q before terminal event, want preparing", job.Phase)
+			}
+
+			apply(tc.evt)
+			if job.Phase != "" {
+				t.Fatalf("phase = %q after %s, want empty", job.Phase, tc.name)
+			}
+			if tc.name == "file_done" && job.Files[0].Status != "complete" {
+				t.Fatalf("file a status = %q after file_done, want complete", job.Files[0].Status)
+			}
+		})
+	}
+}
+
+// TestJobManager_CancelClearsPreparingPhase verifies that a cancelled job
+// cannot keep exposing the running-only preparing sub-state.
+func TestJobManager_CancelClearsPreparingPhase(t *testing.T) {
+	m := newLifecycleTestManager(t, Config{})
+	job := &Job{
+		ID:             "preparing",
+		Repo:           "owner/model",
+		Status:         JobStatusRunning,
+		Phase:          "preparing",
+		CreatedAt:      time.Now(),
+		partialFilesMu: &sync.Mutex{},
+	}
+	m.mu.Lock()
+	m.jobs[job.ID] = job
+	m.mu.Unlock()
+
+	if !m.CancelJob(job.ID) {
+		t.Fatal("CancelJob returned false")
+	}
+	got, ok := m.GetJob(job.ID)
+	if !ok || got.Status != JobStatusCancelled {
+		t.Fatalf("cancelled job state = %#v, %v", got, ok)
+	}
+	if got.Phase != "" {
+		t.Fatalf("phase = %q after cancellation, want empty", got.Phase)
+	}
+}
+
 // TestApplyJobProgress_DownloadedBytesMonotonic guards against the
 // regression where, on a paused/resumed job, the first file_done or
 // file_progress event after resume would recalculate DownloadedBytes
