@@ -177,10 +177,6 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 		writeError(w, http.StatusBadRequest, "Missing required field: repo", "")
 		return
 	}
-	if _, err := validatedRouteKey(req); err != nil {
-		writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
-		return
-	}
 
 	if strings.Contains(req.Repo, ":") && len(req.Filters) == 0 && !req.StrictFiles {
 		parts := strings.SplitN(req.Repo, ":", 2)
@@ -211,6 +207,13 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 	// 400 before strict selection, matching handleStartDownload.
 	if !hfdownloader.IsValidModelName(req.Repo) {
 		writeError(w, http.StatusBadRequest, "Invalid repo format", "Expected owner/name")
+		return
+	}
+
+	// The repo gates run before routeKey, matching handleStartDownload: a
+	// request failing both answers 400 Invalid repo format, not Invalid routeKey.
+	if _, err := validatedRouteKey(req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid routeKey", "routeKey must be one of the configured route keys")
 		return
 	}
 

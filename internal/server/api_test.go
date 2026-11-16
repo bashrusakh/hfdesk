@@ -1955,6 +1955,8 @@ func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
 		{"non-strict expanded repo with a branch variant", `{"repo": "x:y", "branchVariant": true}`, "Invalid repo format"},
 		{"strict nested repo with a branch variant", `{"repo": "a/b/c", "branchVariant": true, "strictFiles": true, "filters": ["model.gguf"]}`, "Invalid repo format"},
 		{"control: check-passing repo keeps the branch-variant verdict", `{"repo": "owner/model", "branchVariant": true}`, "Invalid branch variant request"},
+		{"both-failing repo and routeKey answer the repo gate first", `{"repo": "x:y", "routeKey": "bogus"}`, "Invalid repo format"},
+		{"bad routeKey with a passing repo keeps its verdict", `{"repo": "owner/model", "routeKey": "bogus"}`, "Invalid routeKey"},
 	} {
 		const unexpandableGuardDetails = "the owner/name:file shorthand cannot be combined with explicit filters — send one or the other"
 		planCode, plan := post("/api/plan", tc.body)
