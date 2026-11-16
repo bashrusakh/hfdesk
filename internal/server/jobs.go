@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -501,6 +502,73 @@ func stringSlicesEqual(a, b []string) bool {
 	return true
 }
 
+// sameJobRequest reports whether an existing queued/running job already
+// describes req under CreateJob's deduplication identity. It is the single
+// owner of that comparison so the admission and re-run blocks cannot drift
+// apart: repo, revision, dataset flag, frozen destination identity, LocalRepo,
+// branch variant, strict selection, exact-match rule, shard ranges, the
+// queued/running status gate, and the filter/exclude selections. Excludes
+// compare as the pure matchers they are (order-insensitive, the slices
+// themselves untouched); Filters compare order-insensitively too, except
+// under the request's appendFilterSubdir, where the planner attributes each
+// file to its winning filter (longest match, ties to the first listed
+// filter) and list order can therefore name different destination
+// subdirectories; ShardRanges compares as sorted per-span spellings
+// (segment order is inert per the shard parser's contract); and every
+// scalar field compares byte-identically.
+func sameJobRequest(existing *Job, req DownloadRequest, revision, reqDestKey, hubDir string, flat bool) bool {
+	filtersMatch := stringSlicesEqual(existing.Filters, req.Filters)
+	if req.AppendFilterSubdir {
+		filtersMatch = slices.Equal(existing.Filters, req.Filters)
+	}
+	return existing.Repo == req.Repo &&
+		existing.Revision == revision &&
+		existing.IsDataset == req.Dataset &&
+		pathIdentityKey(existing.OutputDir) == reqDestKey &&
+		existing.Flat == flat &&
+		pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) &&
+		existing.LocalRepo == req.LocalRepo &&
+		existing.BranchVariant == req.BranchVariant &&
+		existing.StrictFiles == req.StrictFiles &&
+		((existing.StrictFiles && req.StrictFiles) || existing.ExactMatch == req.ExactMatch) &&
+		sameShardRanges(existing.ShardRanges, req.ShardRanges) &&
+		(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
+		filtersMatch &&
+		stringSlicesEqual(existing.Excludes, req.Excludes)
+}
+
+// sameShardRanges reports whether two shardRanges expressions describe the
+// same request. An expression equals itself byte-identically; otherwise both
+// sides are non-empty valid expressions (validation rejects malformed
+// expressions at the request boundary, before identity ever runs) and
+// compare as sorted multisets of their per-span spelling: segment order is
+// inert per parseShardRanges' contract, each span keeps its own spelling
+// ("1-3" and "1,2,3" stay distinct), duplicate spans keep their multiplicity
+// ("1-3,1-3" differs from "1-3"), and an empty expression never equals a
+// non-empty one.
+func sameShardRanges(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if a == "" || b == "" {
+		return false
+	}
+	return slices.Equal(shardRangeKeys(a), shardRangeKeys(b))
+}
+
+// shardRangeKeys renders expr as its sorted per-span spellings, mirroring
+// parseShardRanges' segment handling (outer trim, comma split, per-segment
+// trim) without re-validating: well-formedness belongs to validation.
+func shardRangeKeys(expr string) []string {
+	segments := strings.Split(strings.TrimSpace(expr), ",")
+	keys := make([]string, len(segments))
+	for i, segment := range segments {
+		keys[i] = strings.TrimSpace(segment)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
 // CreateJob creates a new download job, or returns the existing one when
 // repo, revision, dataset, destination, filters and shard ranges match an
 // active job.
@@ -553,10 +621,13 @@ resolveRequest:
 	// Check for existing active job with identical parameters.
 	// Deduplication is filter-aware: only match when filters and excludes
 	// are also identical, so the user can download a quantization and a
-	// vision encoder (mmproj) for the same repo at the same time. Shard
+	// vision encoder (mmproj) for the same repo at the same time — compared
+	// as order-insensitive selections, except that filter order stays part
+	// of identity under the request's appendFilterSubdir attribution. Shard
 	// ranges participate in the same identity: two requests that differ only
 	// in their shardRange selection describe different file sets, so they
-	// must not collapse into one job.
+	// must not collapse into one job, while a mere re-ordering of the same
+	// segments (inert per the parser's contract) is the same request.
 	//
 	// Destination identity uses the frozen OutputDir (not LocalDir):
 	// LocalDir changes meaning whenever the settings/routes change between
@@ -576,20 +647,7 @@ resolveRequest:
 		return nil, false, errJobManagerStopping
 	}
 	for _, existing := range m.jobs {
-		if existing.Repo == req.Repo &&
-			existing.Revision == revision &&
-			existing.IsDataset == req.Dataset &&
-			pathIdentityKey(existing.OutputDir) == reqDestKey &&
-			existing.Flat == flat &&
-			pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) &&
-			existing.LocalRepo == req.LocalRepo &&
-			existing.BranchVariant == req.BranchVariant &&
-			existing.StrictFiles == req.StrictFiles &&
-			((existing.StrictFiles && req.StrictFiles) || existing.ExactMatch == req.ExactMatch) &&
-			existing.ShardRanges == req.ShardRanges &&
-			(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
-			stringSlicesEqual(existing.Filters, req.Filters) &&
-			stringSlicesEqual(existing.Excludes, req.Excludes) {
+		if sameJobRequest(existing, req, revision, reqDestKey, hubDir, flat) {
 			snapshot := m.cloneJobLocked(existing)
 			m.mu.Unlock()
 			return snapshot, true, nil
@@ -682,15 +740,7 @@ resolveRequest:
 		// Re-run dedup while still holding the commit lock even when the
 		// inventory snapshot changed; an equal concurrent admission wins.
 		for _, existing := range m.jobs {
-			if existing.Repo == req.Repo && existing.Revision == revision && existing.IsDataset == req.Dataset &&
-				pathIdentityKey(existing.OutputDir) == reqDestKey && existing.Flat == flat &&
-				pathIdentityKey(existing.HubDir) == pathIdentityKey(hubDir) && existing.LocalRepo == req.LocalRepo &&
-				existing.BranchVariant == req.BranchVariant &&
-				existing.StrictFiles == req.StrictFiles &&
-				((existing.StrictFiles && req.StrictFiles) || existing.ExactMatch == req.ExactMatch) &&
-				existing.ShardRanges == req.ShardRanges &&
-				(existing.Status == JobStatusQueued || existing.Status == JobStatusRunning) &&
-				stringSlicesEqual(existing.Filters, req.Filters) && stringSlicesEqual(existing.Excludes, req.Excludes) {
+			if sameJobRequest(existing, req, revision, reqDestKey, hubDir, flat) {
 				a.Close()
 				snapshot := m.cloneJobLocked(existing)
 				m.mu.Unlock()

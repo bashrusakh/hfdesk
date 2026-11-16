@@ -53,8 +53,10 @@ jobs:
             --define '_srcrpmdir /tmp/rpm-output' \
             --define 'appversion 1.3.0-beta.1' \
             --define 'hfdesk_rpm_version 1.3.0~beta.1'
-          rpm_file=$(find /tmp/rpm-output -name '*.rpm' -type f -print -quit)
-          test -n "$rpm_file"
+          rpm_matches=$(find /tmp/rpm-output -type f -name 'hfdesk-[0-9]*.x86_64.rpm')
+          rpm_count=$(printf '%s\n' "$rpm_matches" | sed '/^$/d' | wc -l)
+          [ "$rpm_count" -eq 1 ] || { echo "expected exactly one main RPM (hfdesk-*.x86_64.rpm) under /tmp/rpm-output, found $rpm_count: $rpm_matches"; exit 1; }
+          rpm_file=$rpm_matches
           rpm -qp --qf '%{VERSION}\n' "$rpm_file" | grep -Fx '1.3.0~beta.1'
           rpm -qp --qf '%{RELEASE}\n' "$rpm_file" | grep -Fx '1'
           beta_version=$(rpm -qp --qf '%{VERSION}' "$rpm_file")
