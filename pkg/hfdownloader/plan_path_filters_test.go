@@ -92,6 +92,62 @@ func TestFilterMatchesPath(t *testing.T) {
 	}
 }
 
+// TestIsExcludedPathFoldsSeparatorsAndCase pins excludes to the shared
+// repository-path fold: one path written with "\" or "/" in any case spelling
+// is one token, on every platform (plain string folding, never filepath), and
+// a token in neither the basename nor the path still excludes nothing.
+func TestIsExcludedPathFoldsSeparatorsAndCase(t *testing.T) {
+	for _, tc := range []struct {
+		name, rel, exclude string
+		want               bool
+	}{
+		{"backslash exclude matches slash path", "dir/file.bin", `dir\file`, true},
+		{"slash exclude matches backslash path", `dir\file.bin`, "dir/file", true},
+		{"case folded on the exclude side", "dir/file.bin", `DIR\File`, true},
+		{"case folded on the path side", `Dir\File.Bin`, "DIR/file", true},
+		{"basename token still excludes through the path", "a/b/model-q6_k.gguf", "q6_k", true},
+		{"token in neither basename nor path excludes nothing", "dir/file.bin", "q6_k", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isExcludedPath(tc.rel, []string{tc.exclude}); got != tc.want {
+				t.Fatalf("isExcludedPath(%q, [%q]) = %v, want %v", tc.rel, tc.exclude, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGGUFPathMayBeEmittedFoldsExcludes pins the emitted-path projection to
+// the same fold as excludes: separator/case spellings of an excluded token
+// dominate the conservative projection, other tokens still admit it.
+func TestGGUFPathMayBeEmittedFoldsExcludes(t *testing.T) {
+	if GGUFPathMayBeEmitted("dir/file.gguf", Job{Excludes: []string{`DIR\File`}}) {
+		t.Fatal("projection admitted a path whose separator/case spelling matches an exclude")
+	}
+	if GGUFPathMayBeEmitted(`dir\file.gguf`, Job{Excludes: []string{"DIR/File"}}) {
+		t.Fatal("projection admitted a backslash spelling of an excluded path")
+	}
+	if !GGUFPathMayBeEmitted("dir/file.gguf", Job{Excludes: []string{"q6_k"}}) {
+		t.Fatal("projection ruled out a path whose token is in neither basename nor path")
+	}
+}
+
+// TestPlanRepoExcludeFoldsSeparatorsAndCase pins the plan loop's exclude
+// skip to the same fold as the per-path predicates.
+func TestPlanRepoExcludeFoldsSeparatorsAndCase(t *testing.T) {
+	srv := mockHFServerForPlan(t, []hfNode{
+		{Type: "file", Path: "dir/file.bin", Size: 10},
+		{Type: "file", Path: "keep.bin", Size: 11},
+	})
+	defer srv.Close()
+	plan, err := PlanRepo(context.Background(), Job{
+		Repo: "owner/repo", Excludes: []string{`DIR\File`},
+	}, Settings{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("PlanRepo: %v", err)
+	}
+	assertPaths(t, planPaths(plan), []string{"keep.bin"})
+}
+
 func TestGGUFPathSelectedUsesDirectoryTokenMatcher(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
