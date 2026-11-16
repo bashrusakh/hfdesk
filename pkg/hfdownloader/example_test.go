@@ -17,10 +17,14 @@ func ExampleDownload() {
 		Revision: "main",
 	}
 
+	dir, cleanup := exampleOutputDir()
+	defer cleanup()
+
 	cfg := hfdownloader.Settings{
-		OutputDir:          "./example_output",
+		OutputDir:          dir,
 		Concurrency:        4,
 		MaxActiveDownloads: 2,
+		Endpoint:           exampleEndpoint(), // a local stub so the example runs offline
 	}
 
 	// Progress callback
@@ -41,8 +45,10 @@ func ExampleDownload() {
 		fmt.Printf("Error: %v\n", err)
 	}
 
-	// Cleanup
-	os.RemoveAll("./example_output")
+	// Output:
+	// Scanning repository...
+	// Downloaded: config.json
+	// Complete!
 }
 
 func ExampleDownload_withFilters() {
@@ -52,14 +58,26 @@ func ExampleDownload_withFilters() {
 		Filters: []string{"q4_k_m", "q5_k_m"}, // Case-insensitive matching
 	}
 
+	dir, cleanup := exampleOutputDir()
+	defer cleanup()
+
 	cfg := hfdownloader.Settings{
-		OutputDir: "./Models",
+		OutputDir: dir,
+		Endpoint:  exampleEndpoint(), // a local stub so the example runs offline
 	}
 
 	err := hfdownloader.Download(context.Background(), job, cfg, nil)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
+		return
 	}
+	for _, p := range exampleRelativeFiles(dir) {
+		fmt.Println(p)
+	}
+
+	// Output:
+	// TheBloke/Mistral-7B-Instruct-v0.2-GGUF/mistral-7b-instruct-v0.2.Q4_K_M.gguf
+	// TheBloke/Mistral-7B-Instruct-v0.2-GGUF/mistral-7b-instruct-v0.2.Q5_K_M.gguf
 }
 
 func ExampleDownload_dataset() {
@@ -69,14 +87,26 @@ func ExampleDownload_dataset() {
 		IsDataset: true,
 	}
 
+	dir, cleanup := exampleOutputDir()
+	defer cleanup()
+
 	cfg := hfdownloader.Settings{
-		OutputDir: "./Datasets",
+		OutputDir: dir,
+		Endpoint:  exampleEndpoint(), // a local stub so the example runs offline
 	}
 
 	err := hfdownloader.Download(context.Background(), job, cfg, nil)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
+		return
 	}
+	for _, p := range exampleRelativeFiles(dir) {
+		fmt.Println(p)
+	}
+
+	// Output:
+	// facebook/flores/dataset_infos.json
+	// facebook/flores/dev.dev
 }
 
 func ExamplePlanRepo() {
@@ -84,7 +114,9 @@ func ExamplePlanRepo() {
 		Repo: "hf-internal-testing/tiny-random-gpt2",
 	}
 
-	cfg := hfdownloader.Settings{}
+	cfg := hfdownloader.Settings{
+		Endpoint: exampleEndpoint(), // a local stub so the example runs offline
+	}
 
 	plan, err := hfdownloader.PlanRepo(context.Background(), job, cfg)
 	if err != nil {
@@ -100,6 +132,10 @@ func ExamplePlanRepo() {
 		}
 		fmt.Printf("  %s (%d bytes)%s\n", item.RelativePath, item.Size, lfsTag)
 	}
+
+	// Output:
+	// Found 1 files:
+	//   config.json (647 bytes)
 }
 
 func ExampleIsValidModelName() {
@@ -130,22 +166,41 @@ func ExampleJob_filterSubdirs() {
 		AppendFilterSubdir: true, // Creates separate subdirectories
 	}
 
-	// This will create:
-	// ./Models/TheBloke/Llama-2-7B-GGUF/q4_0/llama-2-7b.Q4_0.gguf
-	// ./Models/TheBloke/Llama-2-7B-GGUF/q5_0/llama-2-7b.Q5_0.gguf
+	// This will create (under the output directory):
+	// TheBloke/Llama-2-7B-GGUF/q4_0/llama-2-7b.Q4_0.gguf
+	// TheBloke/Llama-2-7B-GGUF/q5_0/llama-2-7b.Q5_0.gguf
+
+	dir, cleanup := exampleOutputDir()
+	defer cleanup()
 
 	cfg := hfdownloader.Settings{
-		OutputDir: "./Models",
+		OutputDir: dir,
+		Endpoint:  exampleEndpoint(), // a local stub so the example runs offline
 	}
 
-	_ = hfdownloader.Download(context.Background(), job, cfg, nil)
+	err := hfdownloader.Download(context.Background(), job, cfg, nil)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	for _, p := range exampleRelativeFiles(dir) {
+		fmt.Println(p)
+	}
+
+	// Output:
+	// TheBloke/Llama-2-7B-GGUF/q4_0/llama-2-7b.Q4_0.gguf
+	// TheBloke/Llama-2-7B-GGUF/q5_0/llama-2-7b.Q5_0.gguf
 }
 
 func ExampleSettings_withAuth() {
 	// For private or gated repositories
+	dir, cleanup := exampleOutputDir()
+	defer cleanup()
+
 	cfg := hfdownloader.Settings{
-		OutputDir: "./Models",
+		OutputDir: dir,
 		Token:     os.Getenv("HF_TOKEN"), // Use environment variable
+		Endpoint:  exampleEndpoint(),     // a local stub so the example runs offline
 	}
 
 	job := hfdownloader.Job{
@@ -155,7 +210,14 @@ func ExampleSettings_withAuth() {
 	err := hfdownloader.Download(context.Background(), job, cfg, nil)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
+		return
 	}
+	for _, p := range exampleRelativeFiles(dir) {
+		fmt.Println(p)
+	}
+
+	// Output:
+	// meta-llama/Llama-2-7b/pytorch_model.bin
 }
 
 func ExampleSettings_performance() {
@@ -171,5 +233,13 @@ func ExampleSettings_performance() {
 		Verify:             "sha256", // Full verification
 	}
 
-	_ = cfg // Use in Download()
+	// Pass cfg to Download() or PlanRepo().
+	fmt.Printf("Concurrency: %d, MaxActiveDownloads: %d\n", cfg.Concurrency, cfg.MaxActiveDownloads)
+	fmt.Printf("MultipartThreshold: %s, Retries: %d\n", cfg.MultipartThreshold, cfg.Retries)
+	fmt.Printf("Verify: %s\n", cfg.Verify)
+
+	// Output:
+	// Concurrency: 16, MaxActiveDownloads: 4
+	// MultipartThreshold: 16MiB, Retries: 6
+	// Verify: sha256
 }
