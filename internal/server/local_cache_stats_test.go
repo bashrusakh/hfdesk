@@ -211,6 +211,58 @@ func TestLocalCacheDownloadedDatePublishedOnlyUnchanged(t *testing.T) {
 	}
 }
 
+// TestLocalCacheDownloadedDateUnCountedResidueIdentity pins the date on the
+// interrupted-publication residue of FinalizeBlob's hard-link tier:
+// blobs/<sha> and blobs/<sha>.incomplete sharing one inode. Lexical walk
+// order counts the published-named path first, then its staging sibling
+// un-counts the shared identity (registerExcluded), so the date must come
+// from the identities that STILL count after the whole walk — the backdated
+// published file, not the residue's fresh shared-inode mtime (today), even
+// though the residue's published-named path visited the forward count point.
+func TestLocalCacheDownloadedDateUnCountedResidueIdentity(t *testing.T) {
+	publishedWhen := time.Date(2021, 5, 4, 10, 0, 0, 0, time.UTC)
+	wantDate := publishedWhen.Format("2006-01-02")
+	today := time.Now().Format("2006-01-02")
+
+	scanBase := t.TempDir()
+	repoDir := filepath.Join(scanBase, "owner", "residue")
+	blobs := filepath.Join(repoDir, "blobs")
+	if err := os.MkdirAll(blobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	published := filepath.Join(repoDir, "model.gguf")
+	if err := os.WriteFile(published, []byte("real weights"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backdate(t, published, publishedWhen)
+	residue := filepath.Join(blobs, stagingTestSHA)
+	if err := os.WriteFile(residue, []byte("staged residue"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(residue, residue+".incomplete"); err != nil {
+		t.Fatalf("hard-link residue fixture: %v", err)
+	}
+
+	repos, err := scanLocalCachedRepos(t.TempDir(), "", []string{scanBase}, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := findRepoEntry(repos, "owner/residue")
+	if entry == nil {
+		t.Fatalf("residue repository was not listed: %+v", repos)
+	}
+	if entry.Downloaded != wantDate {
+		t.Errorf("residue downloaded date = %q, want %q (the un-counted residue identity's fresh shared-inode mtime must not move the date to %q)",
+			entry.Downloaded, wantDate, today)
+	}
+	// The residue identity counts nowhere: only the backdated published
+	// file remains in the count set (registerExcluded must stay intact).
+	if entry.Size != int64(len("real weights")) || entry.FileCount != 1 {
+		t.Errorf("residue stats size/count = %d/%d, want %d/1 (the un-counted residue identity counts nowhere)",
+			entry.Size, entry.FileCount, int64(len("real weights")))
+	}
+}
+
 // TestLocalCacheStatsExcludeStagingAndCountPhysicalFilesOnce pins the local
 // scan statistics rule (issue #146): size/fileCount count each distinct
 // published physical file exactly once — a snapshot or friendly-view symlink

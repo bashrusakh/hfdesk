@@ -1548,16 +1548,21 @@ func buildLocalCacheRepo(owner, name, repoDir, source string, includeFiles bool,
 		identities[bkey] = append(identities[bkey], &identity{fileInfo, true})
 		totalSize += fileInfo.Size()
 		fileCount++
-		// The downloaded date tracks published content only: it moves
-		// exactly where a file counts, so in-blobs staging artifacts and
-		// projections of a staging identity never move the date.
-		if fileInfo.ModTime().After(newest) {
-			newest = fileInfo.ModTime()
-		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// The downloaded date derives exactly from the identities that still
+	// count after the whole walk: registerExcluded may un-count one
+	// later, and an identity that counts nowhere never moves the date.
+	for _, bucket := range identities {
+		for _, e := range bucket {
+			if e.counted && e.info.ModTime().After(newest) {
+				newest = e.info.ModTime()
+			}
+		}
 	}
 
 	downloaded := ""
