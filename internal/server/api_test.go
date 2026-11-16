@@ -1947,15 +1947,22 @@ func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
 		{"strict colon-only owner segment", `{"repo": ":f", "strictFiles": true}`, "Invalid repo format"},
 		{"strict malformed repo with a non-canonical entry", `{"repo": "invalid", "strictFiles": true, "filters": ["a/../b"]}`, "Invalid repo format"},
 		{"non-strict expandable colon on an invalid expanded repo", `{"repo": "o:x/n"}`, "Invalid repo format"},
+		{"strict colon value with an explicit filters list", `{"repo": "x:y", "strictFiles": true, "filters": ["model.gguf"]}`, "Invalid repo format"},
 	} {
 		planCode, plan := post("/api/plan", tc.body)
 		if planCode != http.StatusBadRequest || plan.Error != tc.want {
 			t.Errorf("%s /api/plan: status=%d error=%q, want 400 %q", tc.name, planCode, plan.Error, tc.want)
 		}
+		if tc.want == "Invalid repo format" && plan.Details != "Expected owner/name" {
+			t.Errorf("%s /api/plan: details=%q, want %q", tc.name, plan.Details, "Expected owner/name")
+		}
 		dlCode, dl := post("/api/download", tc.body)
 		if dlCode != planCode || dl.Error != plan.Error {
 			t.Errorf("%s: plan=(%d,%q) download=(%d,%q), want the same verdict on both endpoints",
 				tc.name, planCode, plan.Error, dlCode, dl.Error)
+		}
+		if tc.want == "Invalid repo format" && dl.Details != "Expected owner/name" {
+			t.Errorf("%s /api/download: details=%q, want %q", tc.name, dl.Details, "Expected owner/name")
 		}
 	}
 	if got := hubRequests.Load(); got != 0 {

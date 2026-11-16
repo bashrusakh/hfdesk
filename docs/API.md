@@ -843,8 +843,10 @@ as `owner/name:sub/file.gguf`, or a traversal spelling like `../n:f` —
 instead reaches the `repo` boundary check below first and answers `400
 Invalid repo format`, as on `POST /api/download`.
 
-`repo` is validated at the request boundary exactly like `POST /api/download`,
-before any Hub contact: a missing `repo` answers `400`
+`repo` is validated at the request boundary exactly like `POST /api/download`
+(one ordering difference predates this change and is unchanged: plan
+validates `routeKey` first, so a request failing both reports
+`Invalid routeKey`), before any Hub contact: a missing `repo` answers `400`
 `Missing required field: repo`, and a value that is not a plain `owner/name`
 pair — per the check's actual rule stated below, exactly two slash-separated
 segments in `IsValidModelName`'s accepted spellings — answers `400 Invalid
@@ -862,10 +864,11 @@ first, where previously a colon value such as `x:y` or `a/b/c:d` answered
 an empty selection (for example `{"repo":"invalid","strictFiles":true}`)
 answered `400 invalid_file_selection`, a strict selection that carried its
 own shape error (a non-canonical entry, a case-colliding pair, or a
-combination with `excludes`, a branch variant, or `appendFilterSubdir`)
-answered `400 invalid_file_selection` naming that problem, and a non-colon
-malformed `repo` whose strict selection was otherwise valid fell through to
-the `500` scan error.
+combination with `excludes`, a branch variant, or `appendFilterSubdir`, or a
+malformed `shardRanges`) answered a named `400`: `invalid_file_selection`
+naming that problem, or `invalid_shard_ranges` naming the bad range
+expression. A non-colon malformed `repo` whose strict selection was
+otherwise valid fell through to the `500` scan error.
 `POST /api/download` has always answered `400 Invalid repo format` for these
 shapes, so this check brings plan to its longstanding verdict. The check's
 actual rule: it accepts a `repo` of exactly two slash-separated segments in
@@ -880,9 +883,12 @@ this check first — including a shorthand whose file part contains `/`
 spellings like `../n:f` (a traversal component) — for each of these colon
 spellings `/api/plan` previously answered `400 invalid_file_selection` with
 the strict-colon hint.
-The colon's `400 invalid_file_selection` is therefore unchanged only for
-check-passing spellings — the `owner/model:q4_0` class and the `o:x/n`
-class — in strict mode and whenever explicit `filters` are set.
+The colon's `400 invalid_file_selection` is therefore unchanged for
+check-passing spellings in strict mode and whenever explicit `filters` are
+set, and for any colon spelling in the non-strict explicit-`filters` form
+(the unexpandable-shorthand guard keeps precedence there); only failing
+spellings in strict mode and in the non-strict expandable form moved to
+`400 Invalid repo format`.
 
 Returns the files that would be downloaded without starting a job. Each HTTP
 response item exposes only `path`, `size`, and `lfs`; `path` is
