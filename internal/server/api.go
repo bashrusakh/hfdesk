@@ -97,6 +97,15 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+	} else if strings.Contains(req.Repo, ":") && !req.StrictFiles {
+		// Non-strict, colon kept, filters sent explicitly: the shorthand
+		// cannot be expanded, so reject it here with the same named pre-Hub
+		// 400 class strict mode gives — instead of letting the colon leak
+		// into the repo id and fail later at the Hub's repo lookup.
+		writeAPIError(w, http.StatusBadRequest, "invalid_file_selection",
+			"Invalid file selection",
+			"the owner/name:file shorthand cannot be combined with explicit filters — send one or the other")
+		return
 	}
 
 	if !hfdownloader.IsValidModelName(req.Repo) {
@@ -184,6 +193,15 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 				}
 			}
 		}
+	} else if strings.Contains(req.Repo, ":") && !req.StrictFiles {
+		// Non-strict, colon kept, filters sent explicitly: the shorthand
+		// cannot be expanded, so reject it here with the same named pre-Hub
+		// 400 class strict mode gives — instead of letting the colon leak
+		// into the repo id and fail later at the Hub's repo lookup.
+		writeAPIError(w, http.StatusBadRequest, "invalid_file_selection",
+			"Invalid file selection",
+			"the owner/name:file shorthand cannot be combined with explicit filters — send one or the other")
+		return
 	}
 
 	revision := req.Revision
@@ -327,11 +345,13 @@ func admitStrictSelection(w http.ResponseWriter, req *DownloadRequest) bool {
 	var err error
 	switch {
 	case strings.Contains(req.Repo, ":"):
-		// The owner/name:file shorthand expands into filters for non-strict
-		// requests only, so a strict request whose repo kept the colon came
-		// from that shorthand — a client-side shape error whether or not
-		// filters were also sent, rejected before any Hub contact instead of
-		// failing later on the Hub's repo lookup.
+		// The owner/name:file shorthand expands into filters only for a
+		// non-strict request with an empty filters list, so a strict request
+		// whose repo kept the colon came from that shorthand — a client-side
+		// shape error whether or not filters were also sent, rejected before
+		// any Hub contact instead of failing later on the Hub's repo lookup.
+		// (A non-strict colon request with explicit filters cannot expand
+		// either; each handler's shorthand guard rejects it the same way.)
 		err = fmt.Errorf("%w: the owner/name:file shorthand is not supported with strictFiles — send file paths in filters", hfdownloader.ErrInvalidFileSelection)
 	default:
 		var normalized []string
