@@ -1003,15 +1003,23 @@ Notes:
 
 - `repo` is required and must be `owner/name`.
 - `revision` defaults to `main`.
-- `shardRanges` participates in job identity like `filters`: requests that
-  are identical except for their shard ranges start independent jobs, and an
-  identical request (same repo, revision, destination, filters and ranges)
-  reuses the running one. The job snapshot returned by `POST /api/download`,
-  `GET /api/jobs` and `jobs_state.json` exposes the field as `shardRanges`,
-  and the bundled Downloads view labels it on the job's chip. Planning,
-  `dryRun: true` and the real download apply ranges identically; the syntax,
-  validation error code and the notices a doomed range selection produces are
-  documented under Plan above.
+- `shardRanges` participates in job identity: an identical request (same
+  repo, revision, destination, filters and ranges) reuses the running job,
+  and two requests whose range expressions differ only in the order of their
+  comma-separated segments or in whitespace around the expression or its
+  segments are one job too — the parser trims that whitespace and treats
+  segment order as inert. Requests differing only in span spelling (`1-3`
+  versus `1,2,3`), in the multiplicity of a repeated span (`1-3,1-3` versus
+  `1-3`), in their spans, or in empty versus non-empty ranges still start
+  independent jobs. `filters` compare order-insensitively, except when a
+  request sets `appendFilterSubdir: true`, where filter order is part of
+  identity: the winning filter names each file's destination subdirectory,
+  so re-ordered filters start independent jobs. The job snapshot returned by
+  `POST /api/download`, `GET /api/jobs` and `jobs_state.json` exposes the
+  field as `shardRanges`, and the bundled Downloads view labels it on the
+  job's chip. Planning, `dryRun: true` and the real download apply ranges
+  identically; the syntax, validation error code and the notices a doomed
+  range selection produces are documented under Plan above.
 - `branchVariant` (optional) selects one whole EXL2/EXL3 branch named by
   `revision`. It is model-only and must be unfiltered: `filters` and `excludes`
   must be empty, and `appendFilterSubdir`, `localRepo`, and `dataset: true` are
