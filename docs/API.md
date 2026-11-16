@@ -1614,9 +1614,14 @@ repository directory: they sum each distinct published physical file exactly
 once, no matter how many snapshot or friendly-view links resolve to it; a
 physical file whose identity carries a staging name inside the
 repository-root `blobs/` subtree counts nothing, however it is projected; and
-a link with no resolvable target adds neither size nor count. The optional
-`files` array is unaffected by these rules: it stays the full enumeration of
-every path present under the directory, staging artifacts included.
+a link with no resolvable target adds neither size nor count. The
+`downloaded` date follows that same counted set: only identities these
+rules count attribute or move it, so staging-only and
+interrupted-publication residue entries never do — the two-pass rule
+`GET /api/cache` applies to its own mtime-derived date the same way. The
+optional `files` array is unaffected by these rules: it stays the full
+enumeration of every path present under the directory, staging artifacts
+included.
 
 `GET /api/cache-selection` returns a read-only, fresh view of GGUF groups for
 the requested repository and explicit repository type. `type` is required and

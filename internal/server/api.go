@@ -148,18 +148,13 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fail closed before CreateJob: runJob now applies appendFilterSubdir to
-	// the downloader, whose validate() rejects a path-shaped filter + flag
-	// inside the run (after admission, after Hub work starts). Give the real
-	// download the same named 400 the plan and dry-run branch already answer
-	// with through PlanRepo — no job is admitted and no Hub contact happens.
-	// The dry-run branch above keeps reaching the identical verdict through
-	// PlanRepo untouched, and every earlier request-boundary gate (repo
-	// shape, shorthand, strict, branch variant, shard ranges) keeps its
-	// precedence over this one. routeKey is not one of them: it resolves at
-	// job creation (validatedRouteKey inside CreateJob), after this gate, so
-	// a request that is both routeKey-invalid and path-filter+flag invalid
-	// answers invalid_append_filter_subdir here, not invalid routeKey.
+	// Precedence: every earlier request-boundary gate (repo shape, shorthand,
+	// strict, branch variant, shard ranges) answers first; routeKey does not
+	// — it resolves inside CreateJob below, after this gate. A real download
+	// that is both routeKey-invalid and path-filter+flag-invalid answers
+	// invalid_append_filter_subdir here, while plan and dry-run answer
+	// "Invalid routeKey" first (the dry-run branch above exits into
+	// handlePlanInternal, where validatedRouteKey runs before PlanRepo).
 	if err := validateAppendFilterSubdirRequest(req); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_append_filter_subdir",
 			"AppendFilterSubdir cannot be combined with path-shaped filters", err.Error())
@@ -224,10 +219,7 @@ func (s *Server) handlePlanInternal(w http.ResponseWriter, req DownloadRequest) 
 			}
 		}
 	} else if strings.Contains(req.Repo, ":") && !req.StrictFiles {
-		// Non-strict, colon kept, filters sent explicitly: the shorthand
-		// cannot be expanded, so reject it here with the same named pre-Hub
-		// 400 class strict mode gives — instead of letting the colon leak
-		// into the repo id and fail later at the Hub's repo lookup.
+		// Same unexpandable-shorthand guard as handleStartDownload.
 		writeAPIError(w, http.StatusBadRequest, "invalid_file_selection",
 			"Invalid file selection",
 			"the owner/name:file shorthand cannot be combined with explicit filters — send one or the other")
@@ -1823,9 +1815,7 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		blobsDir := rd.BlobsDir()
 		var totalSize int64
 		var fileCount int
-		// The mtime-derived downloaded date comes from published files only:
-		// the blobs directory's own mtime also moves when an active or
-		// interrupted download creates a staging artifact inside it.
+		// The mtime-derived downloaded date comes from published files only.
 		var blobsNewest time.Time
 		// Interrupted-publication residue: blobs/<sha> hard-linked to its
 		// staging sibling shares one inode. Stage the staging-named entries'

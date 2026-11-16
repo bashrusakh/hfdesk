@@ -158,11 +158,11 @@ func TestCreateJobShardRangeSegmentOrderIdentity(t *testing.T) {
 	}
 }
 
-// TestCreateJobDedupAppendFilterSubdirOrderSemantic is the negative Step-0
-// pin: with appendFilterSubdir the planner attributes each file to its
-// winning filter (longest match, ties to the first listed filter), so filter
-// list order can name different destination subdirectories and stays part of
-// the request's identity: an identical order still dedups, a swap does not.
+// TestCreateJobDedupAppendFilterSubdirOrderSemantic pins that under
+// appendFilterSubdir the planner attributes each file to its winning filter
+// (longest match, ties to the first listed filter), so filter list order can
+// name different destination subdirectories and stays part of the request's
+// identity: an identical order still dedups, a swap does not.
 func TestCreateJobDedupAppendFilterSubdirOrderSemantic(t *testing.T) {
 	mgr, cleanup := newRouteTestManager(t, Config{CacheDir: t.TempDir()})
 	defer cleanup()
@@ -200,11 +200,9 @@ func TestCreateJobDedupAppendFilterSubdirOrderSemantic(t *testing.T) {
 // TestCreateJobDedupSplitsOnAppendFilterSubdir pins appendFilterSubdir as an
 // exact identity field: two requests differing only in the flag describe
 // different layouts (prefixed vs flat) and create two jobs, in either
-// creation order. This closes the previously disclosed cross-flag absorption
-// (an ordinary request could join an active appendFilterSubdir job and vice
-// versa because the flag was not persisted on Job). Same-flag behavior is
-// unchanged: identical requests still dedup, and under the flag filter order
-// stays part of identity (TestCreateJobDedupAppendFilterSubdirOrderSemantic).
+// creation order. Same-flag behavior: identical requests still dedup, and
+// under the flag filter order stays part of identity
+// (TestCreateJobDedupAppendFilterSubdirOrderSemantic).
 func TestCreateJobDedupSplitsOnAppendFilterSubdir(t *testing.T) {
 	mgr, cleanup := newRouteTestManager(t, Config{CacheDir: t.TempDir()})
 	defer cleanup()

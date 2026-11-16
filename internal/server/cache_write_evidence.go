@@ -17,9 +17,8 @@ import (
 // It carries every field that shapes where the job writes: the destination
 // root, the storage mode, the repository folder override, the branch
 // variant flag (the branch variant writes into the app-owned reserved space
-// instead of the ordinary repository tree) and appendFilterSubdir (it moves
-// flat/friendly destinations under each file's winning filter subdirectory
-// while the snapshot path stays repository-relative).
+// instead of the ordinary repository tree) and appendFilterSubdir (only
+// destination-subdir plan items take the prefix — see jobPlannedWriteEntries).
 type writeDecisionJob struct {
 	id, repo, revision, output, hub, local, localRepo string
 	status                                            JobStatus

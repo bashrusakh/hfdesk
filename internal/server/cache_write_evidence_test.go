@@ -1253,13 +1253,9 @@ func TestBroadMutationFindsEvidenceForNormalizedStartingDescriptor(t *testing.T)
 	}
 }
 
-// F1 pins: the pre-plan write-reachability projection must be flag-aware.
-// With appendFilterSubdir the real flat/friendly destinations are
-// <filter>/<repo-rel>, but the projection evaluates filters/excludes against
-// the destination spelling: the substring exclude "gguf/" matches the
-// prefixed spelling it can never match on the repository-relative path,
-// deriving an unsafe negative for the REAL write target and admitting its
-// deletion while the plan is unknown or incomplete.
+// Flag-aware pre-plan write-reachability: the "gguf/"-exclude counterexample
+// matches only the prefixed spelling, deriving an unsafe negative for the
+// real write target while the plan is unknown or incomplete.
 func TestAppendFilterSubdirPrePlanProjectionRefusesPrefixedDeletion(t *testing.T) {
 	probe := func(t *testing.T, excludes []string, flagged bool) (*JobManager, *Job) {
 		t.Helper()
@@ -1292,7 +1288,7 @@ func TestAppendFilterSubdirPrePlanProjectionRefusesPrefixedDeletion(t *testing.T
 		}
 	}
 
-	// (a)+(d): queued window (plan unknown), both exclude separator
+	// Queued window (plan unknown), both exclude separator
 	// spellings normalized identically by isExcludedPath.
 	for _, tc := range []struct{ name, exclude string }{
 		{name: "queued forward-slash exclude", exclude: "gguf/"},
@@ -1301,13 +1297,13 @@ func TestAppendFilterSubdirPrePlanProjectionRefusesPrefixedDeletion(t *testing.T
 		t.Run(tc.name, func(t *testing.T) {
 			m, job := probe(t, []string{tc.exclude}, true)
 			refuse(t, m, filepath.Join(jobDestinationBase(job), "gguf", "x.gguf"), "queued flagged job")
-			// (c) N5: the over-block envelope is preserved — the unprefixed
+			// The over-block envelope is preserved — the unprefixed
 			// phantom stays refused while the job is queued.
 			refuse(t, m, filepath.Join(jobDestinationBase(job), "x.gguf"), "queued flagged job phantom")
 		})
 	}
 
-	// (b): running flagged job with an incomplete plan.
+	// A running flagged job with an incomplete plan.
 	t.Run("running incomplete plan", func(t *testing.T) {
 		m, job := probe(t, []string{"gguf/"}, true)
 		m.mu.Lock()
@@ -1329,7 +1325,7 @@ func TestAppendFilterSubdirPrePlanProjectionRefusesPrefixedDeletion(t *testing.T
 		}
 	})
 
-	// (e): flag off is byte-identical — the exclude-derived negative stands
+	// Flag off is byte-identical — the exclude-derived negative stands
 	// for the destination the job never writes, and the live target stays
 	// guarded.
 	t.Run("flag off unchanged", func(t *testing.T) {

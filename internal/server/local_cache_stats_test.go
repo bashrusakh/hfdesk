@@ -26,7 +26,6 @@ func backdate(t *testing.T, path string, when time.Time) {
 	}
 }
 
-// findRepoEntry returns the listed entry for repoID, or nil.
 func findRepoEntry(repos []CachedRepoInfo, repoID string) *CachedRepoInfo {
 	for i := range repos {
 		if repos[i].Repo == repoID {
@@ -36,7 +35,6 @@ func findRepoEntry(repos []CachedRepoInfo, repoID string) *CachedRepoInfo {
 	return nil
 }
 
-// listedCacheRepos fetches GET /api/cache and returns its repository entries.
 func listedCacheRepos(t *testing.T, s *Server) []CachedRepoInfo {
 	t.Helper()
 	w := cacheRequest(t, s, "GET", "/api/cache", "")
@@ -314,6 +312,39 @@ func TestLocalCacheDownloadedDateUnCountedResidueIdentityHF(t *testing.T) {
 	}
 }
 
+// TestLocalCacheDownloadedDateDanglingSymlink pins the counted-set/date rule
+// for a dangling symlink in the scanned tree: it counts nowhere (the
+// size/count rule), so its fresh lstat mtime must not attribute a downloaded
+// date, and the scan lists the repository without crashing.
+func TestLocalCacheDownloadedDateDanglingSymlink(t *testing.T) {
+	publishedWhen := time.Date(2021, 5, 4, 10, 0, 0, 0, time.UTC)
+	wantDate := publishedWhen.In(time.Local).Format("2006-01-02")
+
+	scanBase := t.TempDir()
+	repoDir := filepath.Join(scanBase, "owner", "danglingdate")
+	published := filepath.Join(repoDir, "model.gguf")
+	assertNoError(t, os.MkdirAll(repoDir, 0o755), "repo dir")
+	assertNoError(t, os.WriteFile(published, []byte("real weights"), 0o644), "published file")
+	backdate(t, published, publishedWhen)
+	// Fresh dangling link: its lstat mtime is "now" if anything counts it.
+	assertNoError(t, os.Symlink(filepath.Join("blobs", "missing-blob"), filepath.Join(repoDir, "lost.gguf")), "dangling symlink")
+
+	repos, err := scanLocalCachedRepos(t.TempDir(), "", []string{scanBase}, nil, false)
+	assertNoError(t, err, "local scan")
+	entry := findRepoEntry(repos, "owner/danglingdate")
+	if entry == nil {
+		t.Fatalf("repository with a dangling symlink was not listed: %+v", repos)
+	}
+	if entry.Downloaded != wantDate {
+		t.Errorf("dangling-symlink downloaded date = %q, want %q (a dangling link counts nowhere, so its fresh mtime must not move the date to %q)",
+			entry.Downloaded, wantDate, time.Now().Format("2006-01-02"))
+	}
+	if entry.Size != int64(len("real weights")) || entry.FileCount != 1 {
+		t.Errorf("dangling-symlink stats size/count = %d/%d, want %d/1 (only the published file counts)",
+			entry.Size, entry.FileCount, int64(len("real weights")))
+	}
+}
+
 // TestLocalCacheStatsExcludeStagingAndCountPhysicalFilesOnce pins the local
 // scan statistics rule (issue #146): size/fileCount count each distinct
 // published physical file exactly once — a snapshot or friendly-view symlink
@@ -489,7 +520,7 @@ func TestLocalCacheScanDoesNotListStagingOnlyRepositories(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mixed, "model.gguf"), []byte("real weights"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// F2(a): an in-namespace staging name nested under blobs/sub/ must not
+	// An in-namespace staging name nested under blobs/sub/ must not
 	// make the staging-only directory listable either.
 	subStaging := filepath.Join(stagingOnly, "blobs", "sub", "tmp-model.gguf")
 	if err := os.MkdirAll(filepath.Dir(subStaging), 0o755); err != nil {
@@ -498,7 +529,7 @@ func TestLocalCacheScanDoesNotListStagingOnlyRepositories(t *testing.T) {
 	if err := os.WriteFile(subStaging, []byte("staging"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// F2(b): outside the repository-root blobs/ namespace, a staging-shaped
+	// Outside the repository-root blobs/ namespace, a staging-shaped
 	// name in a nested snapshots/<c>/blobs/ directory is content and keeps
 	// the directory's weight status.
 	if err := os.MkdirAll(filepath.Join(scanBase, "owner", "nested-weight", "snapshots", "commit1", "blobs"), 0o755); err != nil {
@@ -543,13 +574,12 @@ func TestLocalCacheScanDoesNotListStagingOnlyRepositories(t *testing.T) {
 }
 
 // TestLocalCacheStatsBlobsNamespaceAndStagingIdentity pins, on one scan:
-// F2 stats cells — staging shapes anywhere under the repository-root blobs/
-// subtree count nothing (even nested in blobs/sub/), while a nested
-// snapshots/<c>/blobs/ directory is OUTSIDE the namespace and counts as
-// content; F3 cells — a physical staging identity counts nowhere even
-// through a content-named symlink or hard link, while an independent copy
-// counts; and the grouped metadata cell — staging names never leak a
-// phantom Quantizations entry.
+// staging shapes anywhere under the repository-root blobs/ subtree count
+// nothing (even nested in blobs/sub/), while a nested snapshots/<c>/blobs/
+// directory is OUTSIDE the namespace and counts as content; a physical
+// staging identity counts nowhere even through a content-named symlink or
+// hard link, while an independent copy counts; and the grouped metadata cell
+// — staging names never leak a phantom Quantizations entry.
 func TestLocalCacheStatsBlobsNamespaceAndStagingIdentity(t *testing.T) {
 	scanBase := t.TempDir()
 	writeAll := func(files map[string]string) {
@@ -600,10 +630,10 @@ func TestLocalCacheStatsBlobsNamespaceAndStagingIdentity(t *testing.T) {
 			t.Errorf("%s size/count = %d/%d, want %d/%d", id, entry.Size, entry.FileCount, wantSize, wantCount)
 		}
 	}
-	checkStats("owner/proj-symlink", int64(len("weights")), 1)              // F3(i): symlink to staging counts nothing
-	checkStats("owner/proj-hardlink", int64(len("weights")+len(staged)), 2) // F3(ii): hard link to staging counts nothing, independent copy counts
-	checkStats("owner/nested-ns", int64(len("real weight")), 1)             // F2(a): in-namespace nested staging excluded
-	checkStats("owner/nested-out", int64(len(lock)+len("real weight")), 2)  // F2(b): outside the namespace counts
+	checkStats("owner/proj-symlink", int64(len("weights")), 1)              // symlink to staging counts nothing
+	checkStats("owner/proj-hardlink", int64(len("weights")+len(staged)), 2) // hard link to staging counts nothing, independent copy counts
+	checkStats("owner/nested-ns", int64(len("real weight")), 1)             // in-namespace nested staging excluded
+	checkStats("owner/nested-out", int64(len(lock)+len("real weight")), 2)  // outside the namespace counts
 
 	if want := []string{"Q4_K_M"}; !reflect.DeepEqual(byID["owner/nested-ns"].Quantizations, want) {
 		t.Errorf("nested-ns quantizations = %v, want %v (staging names must not leak metadata)", byID["owner/nested-ns"].Quantizations, want)

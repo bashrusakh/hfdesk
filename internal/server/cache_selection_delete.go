@@ -618,8 +618,9 @@ type selectedWriteEvidence struct {
 	exactMatch  bool
 	isDataset   bool
 	aliases     bool
-	// appendFilterSubdir marks evidence whose flat/friendly destinations the
-	// planner prefixes with a single-component filter directory.
+	// appendFilterSubdir marks evidence whose flat/friendly destinations may
+	// carry a single-component filter directory the planner prefixes (only
+	// destination-subdir plan items actually get one).
 	appendFilterSubdir bool
 }
 
@@ -701,9 +702,12 @@ func selectedWriteEvidenceMayWrite(evidence selectedWriteEvidence, targetIdentit
 						return true
 					}
 					// appendFilterSubdir prefixes flat/friendly spellings with a
-					// single-component filter the selection rules never saw; OR in
-					// the unprefixed spelling so no exclude derives a negative
-					// (snapshot spellings are already repository-relative).
+					// single-component filter the selection rules never saw; the
+					// strip runs on EVERY non-snapshot candidate, so a
+					// never-prefixed item ORs in a one-component-shorter (mangled)
+					// spelling — fail-safe, it can only over-block deletion — and
+					// so no exclude derives a negative from the prefix the planner
+					// adds (snapshot spellings are already repository-relative).
 					if evidence.appendFilterSubdir && !inv.snapshotNamespace {
 						if idx := strings.IndexByte(candidate, '/'); idx >= 0 &&
 							hfdownloader.GGUFPathMayBeEmitted(candidate[idx+1:], selection) {

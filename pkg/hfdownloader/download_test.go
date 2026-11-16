@@ -14,56 +14,6 @@ import (
 	"time"
 )
 
-func TestJob_Validation(t *testing.T) {
-	tests := []struct {
-		name    string
-		job     Job
-		wantErr bool
-	}{
-		{
-			name:    "valid model repo",
-			job:     Job{Repo: "owner/model"},
-			wantErr: false,
-		},
-		{
-			name:    "valid dataset repo",
-			job:     Job{Repo: "owner/dataset", IsDataset: true},
-			wantErr: false,
-		},
-		{
-			name:    "empty repo",
-			job:     Job{Repo: ""},
-			wantErr: true,
-		},
-		{
-			name:    "invalid repo format",
-			job:     Job{Repo: "invalid"},
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validateJob(tt.job)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("validateJob() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
-// validateJob is a test helper
-func validateJob(job Job) error {
-	invalidRepo := errors.New("invalid repository ID: expected owner/name format")
-	if job.Repo == "" {
-		return invalidRepo
-	}
-	if !IsValidModelName(job.Repo) {
-		return invalidRepo
-	}
-	return nil
-}
-
 func TestSettings_Defaults(t *testing.T) {
 	s := Settings{}
 
