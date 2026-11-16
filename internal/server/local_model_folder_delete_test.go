@@ -550,7 +550,7 @@ func TestLocalModelFolderDelete_SingleModelGate(t *testing.T) {
 		{"diffusers tree with one base", []string{
 			"unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors", "unet/config.json",
 		}, true, http.StatusOK, ""},
-		// F3 counterexamples: the interior-span reduction used to merge both
+		// Counterexamples: the interior-span reduction used to merge both
 		// pairs into one key and approved the pile for whole-folder deletion.
 		{"interior quant span pile (tiny…llama)", []string{
 			"tiny-Q4_K_M-llama.gguf", "tinyllama.gguf",
@@ -576,7 +576,7 @@ func TestLocalModelFolderDelete_SingleModelGate(t *testing.T) {
 			"unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors",
 			"x-Q4_K_M.gguf",
 		}, true, http.StatusConflict, "multiple models"},
-		// F8 at the API level: dropping a component-NAMED interior directory
+		// At the API level: dropping a component-NAMED interior directory
 		// merged these two folder-relative names and approved the folder.
 		{"component-named dir at non-first position", []string{
 			"a/unet/x.safetensors", "a/x.safetensors",
@@ -637,7 +637,7 @@ func TestLocalModelFolderDelete_SingleModelGate(t *testing.T) {
 	}
 }
 
-// F4: the nested-boundary factor on the wholeFolderDeletable flag is
+// The nested-boundary factor on the wholeFolderDeletable flag is
 // repo-scoped. A configured root nested under a SIBLING folder must not
 // invalidate this folder's flag or reason — mirroring what the DELETE
 // endpoint's selectedDeleteExclusions computes for this repo (which already

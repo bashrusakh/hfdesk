@@ -16,10 +16,9 @@ import (
 )
 
 // exampleStubCommit is the fixed commit the local Hub stub reports for every
-// revision lookup, pinning every plan to one immutable revision.
+// revision lookup.
 const exampleStubCommit = "deadbeef"
 
-// exampleStubFile is one file served by a stub repository.
 type exampleStubFile struct {
 	Path string
 	Size int64
@@ -58,12 +57,14 @@ var exampleStubRepos = map[string][]exampleStubFile{
 // It starts once per test binary and exits with the process.
 var exampleHub = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
+	_, _, revisionRoute := exampleAPIRoute(p, "revision")
+	treeRepo, _, treeRoute := exampleAPIRoute(p, "tree")
 	switch {
-	case strings.Contains(p, "/revision/"):
+	case revisionRoute:
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"sha": exampleStubCommit})
-	case strings.Contains(p, "/tree/"):
-		files := exampleStubRepos[exampleRepoID(p, "/tree/")]
+	case treeRoute:
+		files := exampleStubRepos[treeRepo]
 		nodes := make([]map[string]any, 0, len(files))
 		for _, f := range files {
 			node := map[string]any{"type": "file", "path": f.Path, "size": f.Size}
@@ -102,23 +103,27 @@ var exampleHub = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter,
 	}
 }))
 
-// exampleEndpoint returns the local Hub stub's URL for Settings.Endpoint.
+// exampleAPIRoute matches p exactly as the API route
+// /api/{models|datasets}/{owner}/{name}/{route}/… and returns the repo id
+// plus the remainder after the route segment. Matching is segment-exact, so
+// a fixture path that merely contains "/revision/" or "/tree/" never routes
+// as this metadata route.
+func exampleAPIRoute(p, route string) (repo, rest string, ok bool) {
+	trimmed := strings.TrimPrefix(strings.TrimPrefix(p, "/api/models/"), "/api/datasets/")
+	if trimmed == p { // not an /api/{models|datasets}/ path
+		return "", "", false
+	}
+	seg := strings.Split(trimmed, "/")
+	if len(seg) < 4 || seg[0] == "" || seg[1] == "" || seg[2] != route {
+		return "", "", false
+	}
+	return seg[0] + "/" + seg[1], strings.Join(seg[3:], "/"), true
+}
+
 func exampleEndpoint() string {
 	return exampleHub.URL
 }
 
-// exampleRepoID extracts the repository id from an API path such as
-// /api/models/owner/repo/tree/<rev> or /api/datasets/owner/repo/tree/<rev>.
-func exampleRepoID(p, marker string) string {
-	p = strings.TrimPrefix(p, "/api/models/")
-	p = strings.TrimPrefix(p, "/api/datasets/")
-	if i := strings.Index(p, marker); i >= 0 {
-		return p[:i]
-	}
-	return ""
-}
-
-// exampleStubBody returns size deterministic filler bytes for a fixture file.
 func exampleStubBody(size int64) []byte {
 	const pattern = "hfdesk-example-payload:"
 	n := (size + int64(len(pattern)) - 1) / int64(len(pattern))

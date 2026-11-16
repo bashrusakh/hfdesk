@@ -33,18 +33,18 @@ func TestWeightFileModelKey(t *testing.T) {
 		// Any other parent directory stays in the key.
 		{"a/pytorch_lora_weights.safetensors", "a/pytorch_lora_weights", true, true},
 		{"b/pytorch_lora_weights.safetensors", "b/pytorch_lora_weights", true, true},
-		// F8: a component-NAMED directory at a non-first position is NOT a
+		// A component-NAMED directory at a non-first position is NOT a
 		// pipeline component — every directory component stays verbatim in the
 		// general key, so these pairs must never merge.
 		{"a/unet/x.safetensors", "a/unet/x", true, true},
 		{"a/x.safetensors", "a/x", true, true},
 		{"a/b/unet/x.safetensors", "a/b/unet/x", true, true},
 		{"a/b/x.safetensors", "a/b/x", true, true},
-		// F3: an interior span never cuts — the full name is the key.
+		// An interior span never cuts — the full name is the key.
 		{"tiny-Q4_K_M-llama.gguf", "tiny-Q4_K_M-llama", true, true},
 		{"x-mmproj-y.gguf", "x-mmproj-y", true, true},
 		{"model.fp16.ema.safetensors", "model.fp16.ema", true, true},
-		// F6: the ".mmproj-" cut must be byte-aligned. Compensating Unicode
+		// The ".mmproj-" cut must be byte-aligned. Compensating Unicode
 		// ToLower length changes (Ⱥ grows 2→3, ẞ shrinks 3→2) must not shift
 		// the delimiter's byte offset — each name keeps its own exact key and
 		// the companion reduces only by its byte-exact ".mmproj-" prefix.

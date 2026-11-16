@@ -133,10 +133,11 @@ func TestPlanAppendFilterSubdirSingleComponentStillWorks(t *testing.T) {
 // Contract pin: with appendFilterSubdir applied, the write/deletion
 // interlock guards the paths the job really writes — the PREFIXED
 // flat/friendly destination and the UNPREFIXED HF snapshot path — and does
-// not guard the phantom unprefixed flat/friendly path. Before the flag was
-// wired through runJob, the plan enumerated unprefixed destinations: DELETE
-// of the real prefixed target would be admitted (the 409/DELETE mismatch)
-// while the phantom was refused instead.
+// not guard the phantom unprefixed flat/friendly path. Prevented
+// counterfactual only, never shipped behavior (the flag was inert
+// end-to-end at base): had the plan enumerated unprefixed destinations,
+// DELETE of the real prefixed target would be admitted while the phantom
+// was refused — the 409/DELETE mismatch.
 func TestAppendFilterSubdirInterlockGuardsPrefixedWrites(t *testing.T) {
 	root := t.TempDir()
 	m := newJobManagerWithStatePath(Config{CacheDir: root}, nil, filepath.Join(root, "state"))
@@ -218,14 +219,13 @@ func TestAppendFilterSubdirInterlockGuardsPrefixedWrites(t *testing.T) {
 	}
 }
 
-// Contract pin (FLIPPED): a real download combining a path-shaped filter
+// Contract pin: a real download combining a path-shaped filter
 // with appendFilterSubdir is rejected at the request boundary with the same
 // named 400 the plan and dry-run surfaces answer with — 400
 // invalid_append_filter_subdir, the documented message, details naming the
-// offending filter — before any Hub contact and before any job is admitted.
-// hfdownloader's validate rejects the same combination inside runJob, so a
-// stored path-filter+flag job could only die at run time; the boundary now
-// fails it closed instead.
+// offending filter — before any Hub contact and before any job is admitted;
+// hfdownloader's validate() inside runJob keeps the same rejection as the
+// run-time backstop.
 func TestRealDownloadPathFilterWithAppendFilterSubdirRejectedBeforeHub(t *testing.T) {
 	var requests atomic.Int64
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -277,12 +277,11 @@ func TestRealDownloadPathFilterWithAppendFilterSubdirRejectedBeforeHub(t *testin
 	}
 }
 
-// Contract pin (FLIPPED): a REAL download with a single-component filter and
+// Contract pin: a REAL download with a single-component filter and
 // appendFilterSubdir applies the library's filter-subdirectory layout over
 // HTTP. Planning gives such an item a non-empty DestinationSubdir (the
 // matched filter), so the file must land under <filter>/ and the flat
-// repository-relative path must NOT be written — the mirror image of the
-// old flat-landing lock, now that runJob passes the flag through.
+// repository-relative path must NOT be written.
 func TestRealDownloadSingleComponentFilterWithAppendFilterSubdirLandsUnderFilterSubdir(t *testing.T) {
 	const payload = "data"
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

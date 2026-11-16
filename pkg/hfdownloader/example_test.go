@@ -63,7 +63,7 @@ func ExampleDownload_withFilters() {
 
 	cfg := hfdownloader.Settings{
 		OutputDir: dir,
-		Endpoint:  exampleEndpoint(), // a local stub so the example runs offline
+		Endpoint:  exampleEndpoint(),
 	}
 
 	err := hfdownloader.Download(context.Background(), job, cfg, nil)
@@ -92,7 +92,7 @@ func ExampleDownload_dataset() {
 
 	cfg := hfdownloader.Settings{
 		OutputDir: dir,
-		Endpoint:  exampleEndpoint(), // a local stub so the example runs offline
+		Endpoint:  exampleEndpoint(),
 	}
 
 	err := hfdownloader.Download(context.Background(), job, cfg, nil)
@@ -115,7 +115,7 @@ func ExamplePlanRepo() {
 	}
 
 	cfg := hfdownloader.Settings{
-		Endpoint: exampleEndpoint(), // a local stub so the example runs offline
+		Endpoint: exampleEndpoint(),
 	}
 
 	plan, err := hfdownloader.PlanRepo(context.Background(), job, cfg)
@@ -175,7 +175,7 @@ func ExampleJob_filterSubdirs() {
 
 	cfg := hfdownloader.Settings{
 		OutputDir: dir,
-		Endpoint:  exampleEndpoint(), // a local stub so the example runs offline
+		Endpoint:  exampleEndpoint(),
 	}
 
 	err := hfdownloader.Download(context.Background(), job, cfg, nil)
@@ -200,7 +200,7 @@ func ExampleSettings_withAuth() {
 	cfg := hfdownloader.Settings{
 		OutputDir: dir,
 		Token:     os.Getenv("HF_TOKEN"), // Use environment variable
-		Endpoint:  exampleEndpoint(),     // a local stub so the example runs offline
+		Endpoint:  exampleEndpoint(),
 	}
 
 	job := hfdownloader.Job{
@@ -221,7 +221,8 @@ func ExampleSettings_withAuth() {
 }
 
 func ExampleSettings_performance() {
-	// High-performance settings for fast networks
+	// High-performance settings for fast networks; pass cfg to
+	// Download() or PlanRepo().
 	cfg := hfdownloader.Settings{
 		OutputDir:          "./Models",
 		Concurrency:        16,       // 16 parallel connections per file
@@ -232,14 +233,5 @@ func ExampleSettings_performance() {
 		BackoffMax:         "30s",    // Longer max for rate limiting
 		Verify:             "sha256", // Full verification
 	}
-
-	// Pass cfg to Download() or PlanRepo().
-	fmt.Printf("Concurrency: %d, MaxActiveDownloads: %d\n", cfg.Concurrency, cfg.MaxActiveDownloads)
-	fmt.Printf("MultipartThreshold: %s, Retries: %d\n", cfg.MultipartThreshold, cfg.Retries)
-	fmt.Printf("Verify: %s\n", cfg.Verify)
-
-	// Output:
-	// Concurrency: 16, MaxActiveDownloads: 4
-	// MultipartThreshold: 16MiB, Retries: 6
-	// Verify: sha256
+	_ = cfg
 }

@@ -75,13 +75,9 @@ type Job struct {
 	StrictFiles bool `json:"strictFiles,omitempty"`
 
 	// AppendFilterSubdir is the request's appendFilterSubdir flag, frozen on
-	// the job at creation: runJob passes it to the downloader, which lands
-	// flat/friendly files under each file's winning filter subdirectory
-	// (<filter>/) while the HF snapshot path stays repository-relative. It
-	// participates in job deduplication and the write-decision identity,
-	// persists through the snapshot/state machinery (an older
-	// jobs_state.json without the field loads as false), and appears on the
-	// API as appendFilterSubdir.
+	// the job at creation; the <filter>/ prefix applies only to plan items
+	// carrying a destination subdir — the layout invariant's canonical home
+	// is jobPlannedWriteEntries.
 	AppendFilterSubdir bool `json:"appendFilterSubdir,omitempty"`
 
 	// RouteKey is the download route key requested at creation (internal/audit
@@ -521,7 +517,7 @@ func stringSlicesEqual(a, b []string) bool {
 // selections. appendFilterSubdir compares exactly (it now shapes where the
 // job writes, so two requests differing in it are two layouts and two jobs),
 // which also makes the ordered-Filters rule below unambiguous: it is only
-// ever evaluated for a same-flag pair — with the flag set on both sides, the
+// ever decisive for a same-flag pair — with the flag set on both sides, the
 // planner attributes each file to its winning filter (longest match, ties to
 // the first listed filter) and list order can therefore name different
 // destination subdirectories; with it unset on both, Filters compare
@@ -553,13 +549,14 @@ func sameJobRequest(existing *Job, req DownloadRequest, revision, reqDestKey, hu
 
 // sameShardRanges reports whether two shardRanges expressions describe the
 // same request. An expression equals itself byte-identically; otherwise both
-// sides are non-empty valid expressions (validation rejects malformed
-// expressions at the request boundary, before identity ever runs) and
-// compare as sorted multisets of their per-span spelling: segment order is
-// inert per parseShardRanges' contract, each span keeps its own spelling
-// ("1-3" and "1,2,3" stay distinct), duplicate spans keep their multiplicity
-// ("1-3,1-3" differs from "1-3"), and an empty expression never equals a
-// non-empty one.
+// sides are non-empty and compare as sorted multisets of their per-span
+// spelling: segment order is inert per parseShardRanges' contract, each span
+// keeps its own spelling ("1-3" and "1,2,3" stay distinct), duplicate spans
+// keep their multiplicity ("1-3,1-3" differs from "1-3"), and an empty
+// expression never equals a non-empty one. A request-side value reached this
+// comparison only after validation at the request boundary; a stored value
+// may not have — loadJobsStateLocked decodes persisted jobs with zero
+// validation — and neither side is re-validated here.
 func sameShardRanges(a, b string) bool {
 	if a == b {
 		return true
@@ -633,16 +630,6 @@ resolveRequest:
 	reqDestKey := pathIdentityKey(outputDir)
 
 	// Check for existing active job with identical parameters.
-	// Deduplication is filter-aware: only match when filters and excludes
-	// are also identical, so the user can download a quantization and a
-	// vision encoder (mmproj) for the same repo at the same time — compared
-	// as order-insensitive selections, except that filter order stays part
-	// of identity under the request's appendFilterSubdir attribution. Shard
-	// ranges participate in the same identity: two requests that differ only
-	// in their shardRange selection describe different file sets, so they
-	// must not collapse into one job, while a mere re-ordering of the same
-	// segments (inert per the parser's contract) is the same request.
-	//
 	// Destination identity uses the frozen OutputDir (not LocalDir):
 	// LocalDir changes meaning whenever the settings/routes change between
 	// two creations — two cache-mode jobs created under different cache
@@ -669,24 +656,22 @@ resolveRequest:
 	}
 
 	job := &Job{
-		ID:            generateID(),
-		Repo:          req.Repo,
-		Revision:      revision,
-		IsDataset:     req.Dataset,
-		Filters:       req.Filters,
-		Excludes:      req.Excludes,
-		OutputDir:     outputDir,
-		HubDir:        hubDir,
-		LocalDir:      effectiveLocalDir,
-		LocalRepo:     req.LocalRepo,
-		BranchVariant: req.BranchVariant,
-		Flat:          flat,
-		ExactMatch:    req.ExactMatch,
-		ShardRanges:   req.ShardRanges,
-		StrictFiles:   req.StrictFiles,
-		RouteKey:      routeKey,
-		// Frozen like the rest of the request identity: runJob applies it,
-		// the write-decision snapshot carries it, and dedup splits on it.
+		ID:                 generateID(),
+		Repo:               req.Repo,
+		Revision:           revision,
+		IsDataset:          req.Dataset,
+		Filters:            req.Filters,
+		Excludes:           req.Excludes,
+		OutputDir:          outputDir,
+		HubDir:             hubDir,
+		LocalDir:           effectiveLocalDir,
+		LocalRepo:          req.LocalRepo,
+		BranchVariant:      req.BranchVariant,
+		Flat:               flat,
+		ExactMatch:         req.ExactMatch,
+		ShardRanges:        req.ShardRanges,
+		StrictFiles:        req.StrictFiles,
+		RouteKey:           routeKey,
 		AppendFilterSubdir: req.AppendFilterSubdir,
 		Status:             JobStatusQueued,
 		CreatedAt:          time.Now(),

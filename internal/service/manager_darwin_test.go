@@ -4936,7 +4936,7 @@ func TestLaunchdRefusesAnUnknownRunningFactOverALoadedJobWithoutAFile(t *testing
 			`Stop the instance with "hfdesk service stop"`,
 			`run "hfdesk service install" again`,
 		})
-		// N2: the refusal fires before any mutation, so no rollback ran
+		// The refusal fires before any mutation, so no rollback ran
 		// behind it — before the lift the report carried the restoration
 		// suffix of the post-write rollback.
 		if strings.Contains(err.Error(), "(the registration was restored)") {
@@ -4945,13 +4945,13 @@ func TestLaunchdRefusesAnUnknownRunningFactOverALoadedJobWithoutAFile(t *testing
 		assertNamesWithout(t, err.Error(), "Install()", nil, []string{
 			" or ",
 		})
-		// A3: the composite wrappers serve no second route beside the
+		// The composite wrappers serve no second route beside the
 		// refusal's own named action.
 		if strings.Contains(err.Error(), "to read the current state of the service") {
 			t.Errorf("Install() = %q, appends the state command beside the refusal's own action", err)
 		}
 	}
-	// N2: the supervisor was read and nothing else issued a command — the
+	// The supervisor was read and nothing else issued a command — the
 	// refusal precedes every mutation (before the lift the rollback read
 	// the state again).
 	if want := []string{"print " + launchd.target(), "print-disabled " + launchd.domain()}; !reflect.DeepEqual(fake.commands, want) {
@@ -5552,7 +5552,7 @@ func TestLaunchdRefusesAnUpdateThatCannotTellWhetherTheInstanceRuns(t *testing.T
 				`Stop the instance with "hfdesk service stop"`,
 				`run "hfdesk service install" again`,
 			})
-			// N2: before any mutation means before the rewrite of the
+			// Before any mutation means before the rewrite of the
 			// registration: no rollback ran, so the report carries no
 			// restoration suffix (it did before the lift).
 			if strings.Contains(err.Error(), "(the registration was restored)") {
@@ -5563,7 +5563,7 @@ func TestLaunchdRefusesAnUpdateThatCannotTellWhetherTheInstanceRuns(t *testing.T
 			})
 		}
 
-		// N2 + the refusal leaves the supervisor and the registration
+		// The refusal leaves the supervisor and the registration
 		// exactly as they were: the state read is the only command the
 		// attempt issued, the running instance is neither unloaded nor
 		// started, the property list was never rewritten, and the

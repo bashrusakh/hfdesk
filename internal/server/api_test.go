@@ -1698,7 +1698,7 @@ func TestAPI_ParseFiltersFromRepoPlanTwin(t *testing.T) {
 		}
 	}
 
-	// LOCK pin: an EMPTY file part (`owner/model:`) leaves the request
+	// An EMPTY file part (`owner/model:`) leaves the request
 	// unfiltered — both endpoints plan the whole tree (a filter derived
 	// from an empty segment would match nothing and fail no_filter_match).
 	for _, path := range []string{"/api/plan", "/api/download"} {
@@ -1717,7 +1717,7 @@ func TestAPI_ParseFiltersFromRepoPlanTwin(t *testing.T) {
 		}
 	}
 
-	// LOCK pins: the expansion's segment rules (trimmed; segments empty
+	// The expansion's segment rules (trimmed; segments empty
 	// after trimming dropped) are observable only on the admitted job
 	// snapshot — the planner trims independently, and a dry-run plan never
 	// echoes filters.
@@ -1774,6 +1774,32 @@ func TestAPI_ParseFiltersFromRepoPlanTwin(t *testing.T) {
 		t.Fatalf("error_detail=%+v, want no_filter_match quoting the derived filter \"q4_0\"; body=%s", emptyResp.ErrorDetail, explicitEmpty)
 	}
 
+	// The download endpoint's raw-JSON twin of the plan comparison above:
+	// the explicit empty filters list behaves byte-identically to the
+	// omitted form — both expand the shorthand into the admitted snapshot
+	// and reach the same terminal status (a nil-vs-empty guard rejecting
+	// only the explicit form with invalid_file_selection 400 fails here).
+	admit := func(body string) Job {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/download", bytes.NewBufferString(body)))
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("admission status=%d, want 202; body=%s", w.Code, w.Body.String())
+		}
+		var job Job
+		json.Unmarshal(w.Body.Bytes(), &job)
+		if job.Repo != "owner/model" || !reflect.DeepEqual(job.Filters, []string{"model-00001"}) {
+			t.Fatalf("expansion snapshot repo=%q filters=%v, want owner/model + exactly [model-00001]", job.Repo, job.Filters)
+		}
+		return job
+	}
+	omittedJob := admit(`{"repo":"owner/model:model-00001"}`)
+	omittedEnd := waitJobStatus(t, s.jobs, omittedJob.ID, JobStatusCompleted, 10*time.Second)
+	emptyJob := admit(`{"repo":"owner/model:model-00001","filters":[]}`)
+	emptyEnd := waitJobStatus(t, s.jobs, emptyJob.ID, JobStatusCompleted, 10*time.Second)
+	if omittedEnd.Status != emptyEnd.Status || omittedEnd.Status != JobStatusCompleted {
+		t.Fatalf("terminal statuses differ: omitted=%q explicit-empty=%q, want both completed", omittedEnd.Status, emptyEnd.Status)
+	}
+
 	// A multi-colon repo splits after the FIRST colon only: exactly one
 	// derived filter "a:b" (never "a" and "b") reaches the admitted snapshot
 	// beside the colon-stripped repo; the job then fails matching nothing.
@@ -1795,6 +1821,27 @@ func TestAPI_ParseFiltersFromRepoPlanTwin(t *testing.T) {
 	}
 	waitJobStatus(t, s.jobs, multi.ID, JobStatusFailed, 10*time.Second)
 
+	// The plan side of the multi-colon rule: a colon-heavy repo also splits
+	// after the FIRST colon only, so the no_filter_match details quote the
+	// single derived filter "a:b" — never "a" and "b" as two filters from
+	// splitting at every colon.
+	code, _, raw = postPlanResponse(t, mux, "/api/plan",
+		DownloadRequest{Repo: "owner/model:a:b"})
+	if code != http.StatusBadRequest {
+		t.Fatalf("multi-colon plan status=%d, want 400; body=%s", code, raw)
+	}
+	if err := json.Unmarshal([]byte(raw), &errResp); err != nil {
+		t.Fatal(err)
+	}
+	if errResp.ErrorDetail == nil || errResp.ErrorDetail.Code != "no_filter_match" {
+		t.Fatalf("error_detail=%+v, want code no_filter_match; body=%s", errResp.ErrorDetail, raw)
+	}
+	if !strings.Contains(errResp.ErrorDetail.Details, `"a:b"`) ||
+		strings.Contains(errResp.ErrorDetail.Details, `"a"`) ||
+		strings.Contains(errResp.ErrorDetail.Details, `"b"`) {
+		t.Fatalf("details=%q, want the single derived filter \"a:b\" and never \"a\"/\"b\" as separate filters; body=%s", errResp.ErrorDetail.Details, raw)
+	}
+
 	// Endpoint parity for the drop rule: on /api/plan the expansion drops
 	// the empty segment too — the no_filter_match details quote exactly the
 	// two derived filters, with no empty filter among them.
@@ -1813,7 +1860,7 @@ func TestAPI_ParseFiltersFromRepoPlanTwin(t *testing.T) {
 		t.Fatalf("details=%q, want exactly the derived filters q4_0 and q5_0 with no empty filter; body=%s", errResp.ErrorDetail.Details, raw)
 	}
 
-	// F1.3 plan-side trim half: the no_filter_match details quote the
+	// Plan-side trim: the no_filter_match details quote the
 	// DERIVED filters verbatim (PlanRepo never rewrites them), so a
 	// whitespace-padded segment must appear in its TRIMMED spelling — an
 	// expansion that failed to trim would put the padded spelling here.
@@ -1855,7 +1902,7 @@ func TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact(t *test
 	mux := http.NewServeMux()
 	s.registerAPIRoutes(mux)
 
-	// Row 1 pins the documented details string verbatim (F2); row 2 (F3)
+	// Row 1 pins the documented details string verbatim; row 2
 	// pins the strictFiles side of the expansion condition: strict + colon
 	// + EMPTY filters takes the same named 400 instead of expanding.
 	for _, tc := range []struct {
@@ -1892,21 +1939,9 @@ func TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact(t *test
 }
 
 // TestAPIPlanRepoBoundaryValidationMatchesDownload pins /api/plan's repo
-// boundary gate to /api/download's exact verdicts: a missing repo answers
-// 400 "Missing required field: repo" and a repo that is not an owner/name
-// pair answers 400 "Invalid repo format" on BOTH endpoints, byte-identical
-// to the reference handler, before any Hub contact and with no job admitted.
-// Previously /api/download already answered 400 while /api/plan let a
-// malformed repo that reached the scan fall through to PlanRepo and surface
-// as 500 "Failed to scan repository"; the strict rows below pin the
-// disclosed strict-corner before-states: strict selection answered 400
-// invalid_file_selection for the colon, empty-selection, and own-selection-
-// shape-error shapes, while a strict request whose malformed repo carried an
-// otherwise valid selection fell through to that 500. The colon-shorthand
-// guards keep precedence for the owner/name:file non-strict spelling: an
-// unexpandable shorthand shape still yields the named invalid_file_selection
-// (covered by
-// TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact).
+// boundary gate to /api/download's exact verdicts — byte-identical status,
+// error and details, before Hub contact with no job admitted — including
+// the disclosed strict-corner before-states.
 func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
 	var hubRequests atomic.Int64
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1969,6 +2004,9 @@ func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
 		if tc.want == "Invalid file selection" && plan.Details != unexpandableGuardDetails {
 			t.Errorf("%s /api/plan: details=%q, want the named unexpandable-guard details", tc.name, plan.Details)
 		}
+		if tc.want == "Invalid routeKey" && plan.Details != "routeKey must be one of the configured route keys" {
+			t.Errorf("%s /api/plan: details=%q, want the routeKey-only row's documented details bytes", tc.name, plan.Details)
+		}
 		dlCode, dl := post("/api/download", tc.body)
 		if dlCode != planCode || dl.Error != plan.Error {
 			t.Errorf("%s: plan=(%d,%q) download=(%d,%q), want the same verdict on both endpoints",
@@ -1979,6 +2017,9 @@ func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
 		}
 		if tc.want == "Invalid file selection" && dl.Details != unexpandableGuardDetails {
 			t.Errorf("%s /api/download: details=%q, want the named unexpandable-guard details", tc.name, dl.Details)
+		}
+		if tc.want == "Invalid routeKey" && dl.Details != "routeKey must be one of the configured route keys" {
+			t.Errorf("%s /api/download: details=%q, want the routeKey-only row's documented details bytes", tc.name, dl.Details)
 		}
 	}
 	if got := hubRequests.Load(); got != 0 {
