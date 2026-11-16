@@ -1948,13 +1948,20 @@ func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
 		{"strict malformed repo with a non-canonical entry", `{"repo": "invalid", "strictFiles": true, "filters": ["a/../b"]}`, "Invalid repo format"},
 		{"non-strict expandable colon on an invalid expanded repo", `{"repo": "o:x/n"}`, "Invalid repo format"},
 		{"strict colon value with an explicit filters list", `{"repo": "x:y", "strictFiles": true, "filters": ["model.gguf"]}`, "Invalid repo format"},
+		{"strict repo with a malformed shard range", `{"repo": "invalid", "strictFiles": true, "filters": ["model.gguf"], "shardRanges": "abc"}`, "Invalid repo format"},
+		{"non-strict repo with a malformed shard range", `{"repo": "invalid", "shardRanges": "abc"}`, "Invalid repo format"},
+		{"non-strict colon with explicit filters keeps the guard", `{"repo": "x:y", "filters": ["model.gguf"]}`, "Invalid file selection"},
 	} {
+		const unexpandableGuardDetails = "the owner/name:file shorthand cannot be combined with explicit filters — send one or the other"
 		planCode, plan := post("/api/plan", tc.body)
 		if planCode != http.StatusBadRequest || plan.Error != tc.want {
 			t.Errorf("%s /api/plan: status=%d error=%q, want 400 %q", tc.name, planCode, plan.Error, tc.want)
 		}
 		if tc.want == "Invalid repo format" && plan.Details != "Expected owner/name" {
 			t.Errorf("%s /api/plan: details=%q, want %q", tc.name, plan.Details, "Expected owner/name")
+		}
+		if tc.want == "Invalid file selection" && plan.Details != unexpandableGuardDetails {
+			t.Errorf("%s /api/plan: details=%q, want the named unexpandable-guard details", tc.name, plan.Details)
 		}
 		dlCode, dl := post("/api/download", tc.body)
 		if dlCode != planCode || dl.Error != plan.Error {
@@ -1963,6 +1970,9 @@ func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
 		}
 		if tc.want == "Invalid repo format" && dl.Details != "Expected owner/name" {
 			t.Errorf("%s /api/download: details=%q, want %q", tc.name, dl.Details, "Expected owner/name")
+		}
+		if tc.want == "Invalid file selection" && dl.Details != unexpandableGuardDetails {
+			t.Errorf("%s /api/download: details=%q, want the named unexpandable-guard details", tc.name, dl.Details)
 		}
 	}
 	if got := hubRequests.Load(); got != 0 {

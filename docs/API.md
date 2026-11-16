@@ -856,10 +856,11 @@ selection — a malformed `repo` previously fell through to the scan and failed
 with `500 Failed to scan repository`). The `owner/name:file` colon-shorthand
 rules above are unchanged for that spelling and keep precedence over this
 check in their non-strict shape: an unexpandable `owner/name:file` shorthand
-still fails with the named `400 invalid_file_selection`. One strict-corner
-verdict changed and is disclosed here: a strict request whose `repo` is not
-`owner/name`-shaped is now answered `400 Invalid repo format` at this check
-first, where previously a colon value such as `x:y` or `a/b/c:d` answered
+still fails with the named `400 invalid_file_selection`. Two verdict classes
+changed at this check; first, the strict corner: a strict request whose
+`repo` is not `owner/name`-shaped is now answered `400 Invalid repo format`
+at this check first, where previously a colon value such as `x:y` or
+`a/b/c:d` answered
 `400 invalid_file_selection` regardless of `filters`, a malformed `repo` with
 an empty selection (for example `{"repo":"invalid","strictFiles":true}`)
 answered `400 invalid_file_selection`, a strict selection that carried its
@@ -870,9 +871,15 @@ naming that problem, or `invalid_shard_ranges` naming the bad range
 expression. A non-colon malformed `repo` whose strict selection was
 otherwise valid fell through to the `500` scan error.
 `POST /api/download` has always answered `400 Invalid repo format` for these
-shapes, so this check brings plan to its longstanding verdict. The check's
-actual rule: it accepts a `repo` of exactly two slash-separated segments in
-`IsValidModelName`'s accepted spellings — an `owner/name` pair, where a
+shapes, so this check brings plan to its longstanding verdict. Second, where
+another boundary gate downstream of this check rejected the request first —
+a malformed `shardRanges` (it answered `400 invalid_shard_ranges` naming the
+bad expression) or a branch-variant request (it answered `400 Invalid branch
+variant request` in non-strict shape; strict shape answered `400
+invalid_file_selection` at strict selection first) — that named `400` now
+becomes `400 Invalid repo format` first, in strict AND non-strict shape.
+The check's actual rule: it accepts a `repo` of exactly two slash-separated
+segments in `IsValidModelName`'s accepted spellings — an `owner/name` pair, where a
 `:file`-style suffix inside the name segment still passes (`owner/model:q4_0`)
 and a colon in the owner segment passes too (`o:x/n`, though in the
 non-strict expandable form the check sees the expanded repo — `o:x/n`
@@ -888,7 +895,9 @@ check-passing spellings in strict mode and whenever explicit `filters` are
 set, and for any colon spelling in the non-strict explicit-`filters` form
 (the unexpandable-shorthand guard keeps precedence there); only failing
 spellings in strict mode and in the non-strict expandable form moved to
-`400 Invalid repo format`.
+`400 Invalid repo format` (a whole-value-failing spelling whose expanded
+repo passes — for example `owner/name:sub/file.gguf` with no explicit
+`filters` — keeps its old verdict).
 
 Returns the files that would be downloaded without starting a job. Each HTTP
 response item exposes only `path`, `size`, and `lfs`; `path` is
