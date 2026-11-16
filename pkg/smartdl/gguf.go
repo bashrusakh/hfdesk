@@ -330,6 +330,10 @@ func GGUFQuantType(name, relativePath string) string {
 // matching "mmproj" in the lowercased basename. Other packages that must
 // classify the same artifact (for example the server's cache-selection and
 // cache-metadata models) delegate here instead of keeping a divergent copy.
+// The whole-folder deletion classifier uses a narrower explicit-shape rule
+// (isModelCompanionFileName): an incidental interior "mmproj" substring must
+// never suppress a model key there, while this artifact role must never lose
+// a projector.
 func IsMMProjFile(name string) bool {
 	return strings.Contains(strings.ToLower(filepath.Base(name)), "mmproj")
 }

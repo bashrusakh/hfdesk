@@ -92,20 +92,46 @@ func splitModelKeyPath(relPath string) (dirs []string, base string) {
 	return segments[:len(segments)-1], segments[len(segments)-1]
 }
 
+// isModelCompanionFileName reports whether a GGUF basename is an mmproj
+// companion under whole-folder deletion's explicit-shape rule: a leading
+// "mmproj-", a ".mmproj-" or "-mmproj-" delimiter after a model part, or the
+// bare "mmproj" stem. Matching is case-insensitive ASCII and the token after
+// the delimiter is irrelevant, so every surveyed spelling is covered.
+//
+// This is deliberately narrower than IsMMProjFile, the artifact-role owner
+// for selection and the UI: that rule is a substring match that must never
+// lose a projector, while a deletion key must never silently absorb an
+// unrelated name such as "my-mmprojdata-model-Q4_K_M.gguf" (which could make
+// a two-model folder look like one). Both rules therefore agree on the
+// explicit companion shapes and differ only on incidental substrings.
+func isModelCompanionFileName(base string) bool {
+	stem := trimGGUFSuffix(base)
+	if asciiFoldEqualAt(stem, 0, "mmproj") {
+		rest := len(stem) - len("mmproj")
+		return rest == 0 || (rest > 1 && stem[len("mmproj")] == '-')
+	}
+	for _, delim := range []string{".mmproj-", "-mmproj-"} {
+		if i := asciiFoldIndex(stem, delim); i > 0 && i+len(delim) < len(stem) {
+			return true
+		}
+	}
+	return false
+}
+
 // reduceWeightFileKey is the per-file core of the classification: it
 // classifies the folder-relative path and strips the name down to its
 // reduced model base, returning the parent directory components unchanged so
-// the caller can scope them. The reduction is strictly right-anchored
-// (boundary-safe): a suffix segment is stripped only when it reaches the END
-// of the name — the "-<quant>" token at the end, the "-NNNNN-of-MMMMM" shard
-// suffix at the end (the $-anchored splitSuffixPattern), a precision marker
-// at the end, and only the canonical "<model>.mmproj-<quant>" companion
-// shape (the literal ".mmproj-" delimiter, found with the byte-aligned ASCII
-// search). Every slice operates on the ORIGINAL byte string: the companion
-// and precision cuts match ASCII byte-wise (asciiFoldEqualAt), and the quant
-// cut uses Go regexp byte offsets into the input as given ((?i) folds case
-// internally, the reported offsets are the original's) — so no case-rewritten
-// shadow string can shift a boundary. An interior occurrence never cuts.
+// the caller can scope them. Recognized mmproj companions are not weights for
+// this classification and contribute no key. For weights, the reduction is
+// strictly right-anchored (boundary-safe): a suffix segment is stripped only
+// when it reaches the END of the name — the "-<quant>" token at the end, the
+// "-NNNNN-of-MMMMM" shard suffix at the end (the $-anchored
+// splitSuffixPattern), or a precision marker at the end. Every slice operates
+// on the ORIGINAL byte string: precision markers match ASCII byte-wise
+// (asciiFoldEqualAt), and the quant cut uses Go regexp byte offsets into the
+// input as given ((?i) folds case internally, the reported offsets are the
+// original's) — so no case-rewritten shadow string can shift a boundary. An
+// interior occurrence never cuts.
 func reduceWeightFileKey(relPath string) (dirs []string, reduced string, weight, ok bool) {
 	dirs, base := splitModelKeyPath(relPath)
 	if base == "" {
@@ -115,6 +141,11 @@ func reduceWeightFileKey(relPath string) (dirs []string, reduced string, weight,
 	var stem string
 	switch {
 	case IsGGUFFileName(base):
+		// Companions are not model weights: they contribute no key, so a
+		// folder of only companions has zero keys and stays refused.
+		if isModelCompanionFileName(base) {
+			return nil, "", false, false
+		}
 		stem = trimGGUFSuffix(base)
 	case weightModelKeyExtensions[filepath.Ext(lower)]:
 		stem = base[:len(base)-len(filepath.Ext(base))]
@@ -124,18 +155,11 @@ func reduceWeightFileKey(relPath string) (dirs []string, reduced string, weight,
 	weight = true
 	fail := func() ([]string, string, bool, bool) { return nil, "", true, false }
 
-	// Canonical companion shape only: "<model>.mmproj-<quant>". A name that
-	// merely contains "mmproj" without the ".mmproj-" delimiter is NOT cut,
-	// and the prefix slice is taken at the delimiter's byte offset in the
-	// original stem.
-	if idx := asciiFoldIndex(stem, ".mmproj-"); idx >= 0 {
-		if idx == 0 {
-			return fail() // companion without a model part
-		}
-		stem = strings.TrimRight(stem[:idx], ".-_")
-		if stem == "" {
-			return fail()
-		}
+	// A dot-delimited projector without a model part (".mmproj-f16.gguf") is
+	// weight-shaped but ambiguous; fail closed. The "<model>.mmproj-" form is
+	// already a companion above.
+	if asciiFoldEqualAt(stem, 0, ".mmproj-") {
+		return fail()
 	}
 
 	// Right-anchored suffix loop: every strip removes only a segment that
@@ -203,18 +227,19 @@ func reduceWeightFileKey(relPath string) (dirs []string, reduced string, weight,
 //
 // The exact merge claim: two distinct file names are never merged by an
 // interior excision; the only designed merges are quant/shard/precision
-// variants of one name, the canonical "<model>.mmproj-<quant>" companion,
-// and — at the folder level, see SingleModelFolderKeys — one pipeline's
-// component roles (strictly first-component membership with the sub-path
-// below the role directory preserved).
+// variants of one name and — at the folder level, see
+// SingleModelFolderKeys — one pipeline's component roles (strictly
+// first-component membership with the sub-path below the role directory
+// preserved). Recognized mmproj companions contribute no key at all, so any
+// number of them beside one model's weights is still one model.
 //
 // Three outcomes: a non-weight file returns ("", false, false) and carries
-// no model identity (config/tokenizer/notes files never multiply keys); a
-// weight file reduced to a non-empty key returns it with (key, true, true);
-// a weight-shaped name the rules cannot confidently reduce — a key empty
-// after stripping (for example a bare "Q4_K_M.gguf" or "fp16.safetensors")
-// or a ".mmproj-" companion without a model part — returns ("", true, false)
-// so callers fail closed.
+// no model identity (config/tokenizer/notes files and recognized mmproj
+// companions never multiply keys); a weight file reduced to a non-empty key
+// returns it with (key, true, true); a weight-shaped name the rules cannot
+// confidently reduce — a key empty after stripping (for example a bare
+// "Q4_K_M.gguf" or "fp16.safetensors") or a ".mmproj-" companion without a
+// model part — returns ("", true, false) so callers fail closed.
 func WeightFileModelKey(relPath string) (key string, weight, ok bool) {
 	dirs, reduced, isWeight, good := reduceWeightFileKey(relPath)
 	if !isWeight || !good {
@@ -246,7 +271,9 @@ const pipelineModelKey = ":pipeline"
 // SingleModelFolderKeys classifies a whole folder's weight files to the set
 // of model keys for whole-folder "exactly one model?" eligibility. Non-weight
 // files are ignored; any weight-shaped name that cannot be classified makes
-// the second result true so callers fail closed.
+// the second result true so callers fail closed. Recognized mmproj companion
+// spellings (isModelCompanionFileName) are non-weights here: they add no key,
+// so a companion-only folder has zero keys and is refused.
 //
 // Pipeline-key rule (owner decision), layered on the per-file reduction:
 //
