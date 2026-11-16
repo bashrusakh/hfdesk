@@ -80,7 +80,7 @@ func validate(job Job, cfg Settings) error {
 		}
 	}
 	if job.AppendFilterSubdir {
-		if err := validateAppendFilterSubdirFilters(job.Filters); err != nil {
+		if err := ValidateAppendFilterSubdirFilters(job.Filters); err != nil {
 			return err
 		}
 	}
@@ -167,13 +167,15 @@ func ValidateShardRanges(expr string, filters []string) error {
 	return nil
 }
 
-// validateAppendFilterSubdirFilters rejects path-shaped filters when the
+// ValidateAppendFilterSubdirFilters rejects path-shaped filters when the
 // downloader would use each filter as a destination directory name. A filter
 // that names a repository path (or the "."/".." components) is not a
 // single-component group/token, so appending it as a directory would nest the
 // matched file under a misleading path. Path filters remain valid when
-// AppendFilterSubdir is disabled.
-func validateAppendFilterSubdirFilters(filters []string) error {
+// AppendFilterSubdir is disabled. The server calls it at the request boundary
+// so a path-shaped filter fails as a named client error before any Hub
+// contact; validate() re-runs the same check for direct library callers.
+func ValidateAppendFilterSubdirFilters(filters []string) error {
 	var pathFilters []string
 	for _, filter := range filters {
 		normalized := strings.ReplaceAll(filter, `\`, "/")

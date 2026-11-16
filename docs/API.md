@@ -953,7 +953,11 @@ report this combination the same way: `POST /api/plan`, a dry-run
 `POST /api/download`, and a real `POST /api/download` answer HTTP 400 with
 error code `invalid_append_filter_subdir` before any Hub contact, and a real
 download admits no job (the boundary rejects it instead of letting the job die
-inside the run).
+inside the run). A request that is both `routeKey`-invalid and a path-shaped
+filter combined with `appendFilterSubdir` answers `Invalid routeKey` on
+`POST /api/plan` and a dry-run `POST /api/download` (routeKey resolves first on
+those surfaces) but `invalid_append_filter_subdir` on a real `POST /api/download`
+(this gate precedes job creation).
 
 Over the HTTP API this option now behaves like the Go library: a real
 download with `appendFilterSubdir: true` creates filter subdirectories, so a

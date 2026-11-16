@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -74,6 +75,15 @@ func TestPlanAppendFilterSubdirPathFilterMapsToBadRequest(t *testing.T) {
 	}
 	if got := requests.Load(); got != 0 {
 		t.Errorf("rejected requests reached the hub %d time(s), want none", got)
+	}
+}
+
+func TestAppendFilterSubdirBoundaryConsumesLibraryRule(t *testing.T) {
+	req := DownloadRequest{AppendFilterSubdir: true, Filters: []string{"weights/model.gguf"}}
+	err := validateAppendFilterSubdirRequest(req)
+	want := hfdownloader.ValidateAppendFilterSubdirFilters(req.Filters)
+	if err == nil || err.Error() != want.Error() || !errors.Is(err, hfdownloader.ErrAppendFilterSubdirPathFilter) {
+		t.Fatalf("boundary error=%v, want the library owner's answer %v", err, want)
 	}
 }
 

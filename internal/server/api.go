@@ -74,10 +74,10 @@ func validateShardRangesRequest(req DownloadRequest) error {
 }
 
 // validateAppendFilterSubdirRequest is the real-download request-boundary
-// gate for appendFilterSubdir. It mirrors hfdownloader's
-// validateAppendFilterSubdirFilters (the two must move in lockstep: a filter
-// naming a repository path cannot become a destination directory), so a
-// path-shaped filter + flag request fails closed with the same
+// gate for appendFilterSubdir. The path-shape rule has one owner,
+// hfdownloader.ValidateAppendFilterSubdirFilters (the same check validate()
+// enforces inside the download), and this boundary calls it so a path-shaped
+// filter + flag request fails closed with the same
 // ErrAppendFilterSubdirPathFilter family the plan and dry-run surfaces
 // answer with through PlanRepo — before CreateJob admits a job and before
 // any Hub contact, instead of the job dying inside runJob's validate at run
@@ -86,17 +86,7 @@ func validateAppendFilterSubdirRequest(req DownloadRequest) error {
 	if !req.AppendFilterSubdir {
 		return nil
 	}
-	var pathFilters []string
-	for _, filter := range req.Filters {
-		normalized := strings.ReplaceAll(filter, `\`, "/")
-		if normalized == "." || normalized == ".." || strings.Contains(normalized, "/") {
-			pathFilters = append(pathFilters, filter)
-		}
-	}
-	if len(pathFilters) == 0 {
-		return nil
-	}
-	return fmt.Errorf("%w: %q", hfdownloader.ErrAppendFilterSubdirPathFilter, pathFilters)
+	return hfdownloader.ValidateAppendFilterSubdirFilters(req.Filters)
 }
 
 // handleStartDownload starts a new download job.
