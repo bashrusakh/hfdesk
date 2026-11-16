@@ -15,13 +15,16 @@ import (
 // It intentionally excludes progress, listeners and other presentation data.
 //
 // It carries every field that shapes where the job writes: the destination
-// root, the storage mode, the repository folder override and the branch
-// variant flag, because the branch variant writes into the app-owned reserved
-// space instead of the ordinary repository tree.
+// root, the storage mode, the repository folder override, the branch
+// variant flag (the branch variant writes into the app-owned reserved space
+// instead of the ordinary repository tree) and appendFilterSubdir (it moves
+// flat/friendly destinations under each file's winning filter subdirectory
+// while the snapshot path stays repository-relative).
 type writeDecisionJob struct {
 	id, repo, revision, output, hub, local, localRepo string
 	status                                            JobStatus
 	starting, flat, dataset, exact, branchVariant     bool
+	appendFilterSubdir                                bool
 	filters, excludes                                 []string
 	generation                                        int
 	createdAt                                         int64
@@ -63,8 +66,8 @@ func decisionJob(j *Job) writeDecisionJob {
 	return writeDecisionJob{id: j.ID, repo: j.Repo, revision: j.Revision, output: j.OutputDir,
 		hub: j.HubDir, local: j.LocalDir, localRepo: j.LocalRepo, status: j.Status,
 		starting: j.starting, flat: j.Flat, dataset: j.IsDataset, exact: j.ExactMatch,
-		branchVariant: j.BranchVariant,
-		filters:       append([]string(nil), j.Filters...), excludes: append([]string(nil), j.Excludes...),
+		branchVariant: j.BranchVariant, appendFilterSubdir: j.AppendFilterSubdir,
+		filters: append([]string(nil), j.Filters...), excludes: append([]string(nil), j.Excludes...),
 		generation: j.generation, createdAt: j.CreatedAt.UnixNano()}
 }
 
@@ -231,8 +234,9 @@ func decisionDescriptorKey(d writeDecisionJob) string {
 		Filters, Excludes                                 []string
 		Generation                                        int
 		Exact, Flat, Dataset, BranchVariant               bool
+		AppendFilterSubdir                                bool
 		ActivityID                                        uint64
-	}{d.id, d.repo, d.revision, d.output, d.hub, d.local, d.localRepo, d.filters, d.excludes, d.generation, d.exact, d.flat, d.dataset, d.branchVariant, d.activityID})
+	}{d.id, d.repo, d.revision, d.output, d.hub, d.local, d.localRepo, d.filters, d.excludes, d.generation, d.exact, d.flat, d.dataset, d.branchVariant, d.appendFilterSubdir, d.activityID})
 	return string(b)
 }
 
@@ -258,8 +262,9 @@ func jobFromDecision(d writeDecisionJob) *Job {
 	return &Job{ID: d.id, Repo: d.repo, Revision: d.revision, OutputDir: d.output, HubDir: d.hub,
 		LocalDir: d.local, LocalRepo: d.localRepo, Status: d.status, starting: d.starting,
 		Flat: d.flat, IsDataset: d.dataset, ExactMatch: d.exact, BranchVariant: d.branchVariant,
-		Filters:  append([]string(nil), d.filters...),
-		Excludes: append([]string(nil), d.excludes...), generation: d.generation}
+		AppendFilterSubdir: d.appendFilterSubdir,
+		Filters:            append([]string(nil), d.filters...),
+		Excludes:           append([]string(nil), d.excludes...), generation: d.generation}
 }
 
 // CollectSnapshot inventories all job and run-activity descriptors in the

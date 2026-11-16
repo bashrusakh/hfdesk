@@ -197,6 +197,66 @@ func TestCreateJobDedupAppendFilterSubdirOrderSemantic(t *testing.T) {
 	}
 }
 
+// TestCreateJobDedupSplitsOnAppendFilterSubdir pins appendFilterSubdir as an
+// exact identity field: two requests differing only in the flag describe
+// different layouts (prefixed vs flat) and create two jobs, in either
+// creation order. This closes the previously disclosed cross-flag absorption
+// (an ordinary request could join an active appendFilterSubdir job and vice
+// versa because the flag was not persisted on Job). Same-flag behavior is
+// unchanged: identical requests still dedup, and under the flag filter order
+// stays part of identity (TestCreateJobDedupAppendFilterSubdirOrderSemantic).
+func TestCreateJobDedupSplitsOnAppendFilterSubdir(t *testing.T) {
+	mgr, cleanup := newRouteTestManager(t, Config{CacheDir: t.TempDir()})
+	defer cleanup()
+
+	ordinary := DownloadRequest{Repo: "dedup/append-split", Filters: []string{"q4_k_m"}}
+	flagged := ordinary
+	flagged.AppendFilterSubdir = true
+
+	first, existing, err := mgr.CreateJob(ordinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing {
+		t.Fatal("first ordinary request should create a new job")
+	}
+	// The flagged variant must not absorb into the ordinary job.
+	flagJob, existing, err := mgr.CreateJob(flagged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing || flagJob.ID == first.ID {
+		t.Errorf("appendFilterSubdir request absorbed the ordinary job; existing=%v ids %s/%s", existing, flagJob.ID, first.ID)
+	}
+	// An identical same-flag request still dedups against its own twin.
+	again, existing, err := mgr.CreateJob(flagged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !existing || again.ID != flagJob.ID {
+		t.Errorf("identical flagged request should dedup; existing=%v ids %s/%s", existing, again.ID, flagJob.ID)
+	}
+
+	// Reverse order: the ordinary variant must not absorb into a flagged job.
+	flagFirst := DownloadRequest{Repo: "dedup/append-split-rev", Filters: []string{"q4_k_m"}, AppendFilterSubdir: true}
+	plainSecond := flagFirst
+	plainSecond.AppendFilterSubdir = false
+	lead, existing, err := mgr.CreateJob(flagFirst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing {
+		t.Fatal("first flagged request should create a new job")
+	}
+	ordinaryFollow, existing, err := mgr.CreateJob(plainSecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing || ordinaryFollow.ID == lead.ID {
+		t.Errorf("ordinary request absorbed the appendFilterSubdir job; existing=%v ids %s/%s", existing, ordinaryFollow.ID, lead.ID)
+	}
+}
+
 // TestCreateJobShardRangeWhitespaceInert pins whitespace around shardRanges
 // segments and at the expression's edges as inert for identity: the shard
 // parser trims outer and per-segment whitespace before parsing spans, so a
