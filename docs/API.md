@@ -832,10 +832,77 @@ non-empty cannot be expanded, so both endpoints reject it with `400`
 `the owner/name:file shorthand cannot be combined with explicit filters —
 send one or the other` (previously the colon leaked into the repo id and the
 request failed later at the Hub's repo lookup — a `500` scan error on plan,
-a doomed admitted job on download). With `strictFiles: true` the colon is
-rejected with the same code whether or not `filters` is set, with a hint to
-send the file paths in `filters` (documented under Strict file selection
-below).
+a doomed admitted job on download). With `strictFiles: true` a shorthand
+whose whole value passes the boundary check below — exactly two
+slash-separated segments in `IsValidModelName`'s accepted spellings, such as
+`owner/model:q4_0` or `o:x/n` — is rejected with the same code whether or
+not `filters` is set, with a hint to send the file paths in `filters`
+(documented under Strict file selection below); a colon value that fails
+that check — `x:y`, `a/b/c:d`, a shorthand whose file part contains `/` such
+as `owner/name:sub/file.gguf`, or a traversal spelling like `../n:f` —
+instead reaches the `repo` boundary check below first and answers `400
+Invalid repo format`, as on `POST /api/download`.
+
+`repo` is validated at the request boundary exactly like `POST /api/download`
+(one ordering difference predates this change and is unchanged: plan
+validates `routeKey` first, so a request failing both reports
+`Invalid routeKey`), before any Hub contact: a missing `repo` answers `400`
+`Missing required field: repo`, and a value that is not a plain `owner/name`
+pair — per the check's actual rule stated below, exactly two slash-separated
+segments in `IsValidModelName`'s accepted spellings — answers `400 Invalid
+repo format` with details `Expected owner/name`
+(when no earlier boundary gate rejected the request — for example a strict
+selection — a malformed `repo` previously fell through to the scan and failed
+with `500 Failed to scan repository`). The `owner/name:file` colon-shorthand
+rules above are unchanged for that spelling and keep precedence over this
+check in their non-strict shape: an unexpandable `owner/name:file` shorthand
+still fails with the named `400 invalid_file_selection`. Verdict changes at
+this check fall in three corners: the scan-reaching change (both modes —
+including the non-strict expanded-repo class), the strict corner, and the
+downstream named-gate corner. In the strict corner, a strict request whose
+`repo` is not `owner/name`-shaped is now answered `400 Invalid repo format`
+at this check first, where previously a colon value such as `x:y` or
+`a/b/c:d` answered
+`400 invalid_file_selection` regardless of `filters`, a malformed `repo` with
+an empty selection (for example `{"repo":"invalid","strictFiles":true}`)
+answered `400 invalid_file_selection`, a strict selection that carried its
+own shape error (a non-canonical entry, a case-colliding pair, or a
+combination with `excludes`, a branch variant, or `appendFilterSubdir`, or a
+malformed `shardRanges`) answered a named `400`: `invalid_file_selection`
+naming that problem, or `invalid_shard_ranges` naming the bad range
+expression. A non-colon malformed `repo` whose strict selection was
+otherwise valid fell through to the `500` scan error.
+`POST /api/download` has always answered `400 Invalid repo format` for these
+shapes, so this check brings plan to its longstanding verdict. In the
+downstream named-gate corner: where another boundary gate downstream of this
+check rejected the request first —
+a malformed `shardRanges` (it answered `400 invalid_shard_ranges` naming the
+bad expression) or a branch-variant request (it answered `400 Invalid branch
+variant request` in non-strict shape; strict shape answered `400
+invalid_file_selection` at strict selection first) — that named `400` now
+becomes `400 Invalid repo format` first, in strict AND non-strict shape.
+The check's actual rule: it accepts a `repo` of exactly two slash-separated
+segments in `IsValidModelName`'s accepted spellings — an `owner/name` pair, where a
+`:file`-style suffix inside the name segment still passes (`owner/model:q4_0`)
+and a colon in the owner segment passes too (`o:x/n`, though in the
+non-strict expandable form the check sees the expanded repo — `o:x/n`
+expands to `o` and is answered `Invalid repo format`). A strict request
+whose `repo` fails that rule is now answered `400 Invalid repo format` at
+this check first — including a shorthand whose file part contains `/`
+(`owner/name:sub/file.gguf` splits into three segments) and degenerate
+spellings like `../n:f` (a traversal component) — for each of these colon
+spellings `/api/plan` previously answered `400 invalid_file_selection` with
+the strict-colon hint.
+The colon's `400 invalid_file_selection` is therefore unchanged for
+check-passing spellings in strict mode and whenever explicit non-empty
+`filters` are set, and for any colon spelling in the non-strict form with
+explicit non-empty `filters` (the unexpandable-shorthand guard keeps
+precedence there); only failing spellings — failing the check as it runs
+there (whole value in strict, expanded repo in the expandable form) — in
+strict mode and in the non-strict expandable form moved to `400 Invalid
+repo format` (a whole-value-failing spelling whose expanded repo passes —
+for example `owner/name:sub/file.gguf` with no explicit `filters` — keeps
+its old verdict).
 
 Returns the files that would be downloaded without starting a job. Each HTTP
 response item exposes only `path`, `size`, and `lfs`; `path` is
@@ -989,12 +1056,22 @@ trailing-slash directory entry is rejected as non-canonical.
   one entry (`./a.bin` and `a.bin` are the same entry). Entries are otherwise
   used verbatim — no whitespace trimming and no case folding.
 - The selection is all-or-nothing, and request-shape problems fail with `400`
-  before any Hub contact on both endpoints:
+  before any Hub contact on both endpoints. The following shapes are answered
+  this way when the request passes the `repo` boundary check documented under
+  Plan: a request whose `repo` fails that check answers `400 Invalid repo
+  format` first on both endpoints (disclosed under Plan), before any
+  selection-shape verdict below:
   - empty `filters` → `400` `invalid_file_selection`
-  - an `owner/name:file` colon shorthand combined with `strictFiles` → `400`
+  - an `owner/name:file` colon shorthand combined with `strictFiles`, when
+    the value passes the `repo` boundary check (exactly two slash-separated
+    segments, such as `owner/model:q4_0` or `o:x/n`) → `400`
     `invalid_file_selection`, with a hint that the shorthand is not
     supported in strict mode — send the file paths in `filters`; the colon
-    in `repo` is rejected this way whether or not `filters` is set
+    is rejected this way whether or not `filters` is set. A colon spelling
+    that fails that check (for example `x:y`, `a/b/c:d`, or a shorthand
+    whose file part contains `/` such as `owner/name:sub/file.gguf`) →
+    `400 Invalid repo format` first on both endpoints, as disclosed in the
+    Plan section
   - a non-canonical entry (empty, absolute, trailing `/`, `.`, `..`, or a
     spelling that does not clean to itself such as `a/../b`) → `400`
     `invalid_file_selection`, naming the entry

@@ -1891,6 +1891,102 @@ func TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact(t *test
 	}
 }
 
+// TestAPIPlanRepoBoundaryValidationMatchesDownload pins /api/plan's repo
+// boundary gate to /api/download's exact verdicts: a missing repo answers
+// 400 "Missing required field: repo" and a repo that is not an owner/name
+// pair answers 400 "Invalid repo format" on BOTH endpoints, byte-identical
+// to the reference handler, before any Hub contact and with no job admitted.
+// Previously /api/download already answered 400 while /api/plan let a
+// malformed repo that reached the scan fall through to PlanRepo and surface
+// as 500 "Failed to scan repository"; the strict rows below pin the
+// disclosed strict-corner before-states: strict selection answered 400
+// invalid_file_selection for the colon, empty-selection, and own-selection-
+// shape-error shapes, while a strict request whose malformed repo carried an
+// otherwise valid selection fell through to that 500. The colon-shorthand
+// guards keep precedence for the owner/name:file non-strict spelling: an
+// unexpandable shorthand shape still yields the named invalid_file_selection
+// (covered by
+// TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact).
+func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
+	var hubRequests atomic.Int64
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hubRequests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer hub.Close()
+	s := newTestServerWithConfig(t, Config{
+		CacheDir: t.TempDir(), LocalDir: t.TempDir(), Endpoint: hub.URL,
+		MaxActive: 1, Proxy: &hfdownloader.ProxyConfig{NoEnvProxy: true},
+	})
+	mux := http.NewServeMux()
+	s.registerAPIRoutes(mux)
+
+	post := func(path, body string) (int, ErrorResponse) {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body)))
+		var resp ErrorResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode %s response: %v; body=%s", path, err, w.Body.String())
+		}
+		return w.Code, resp
+	}
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{"missing repo", `{}`, "Missing required field: repo"},
+		{"repo without an owner", `{"repo": "invalid"}`, "Invalid repo format"},
+		{"repo with a nested path", `{"repo": "a/b/c"}`, "Invalid repo format"},
+		{"strict repo with a non-owner/name colon", `{"repo": "x:y", "strictFiles": true}`, "Invalid repo format"},
+		{"strict repo without an owner", `{"repo": "invalid", "strictFiles": true}`, "Invalid repo format"},
+		{"strict shorthand whose file part contains a slash", `{"repo": "owner/name:sub/file.gguf", "strictFiles": true}`, "Invalid repo format"},
+		{"strict nested path with a valid selection", `{"repo": "a/b/c", "strictFiles": true, "filters": ["model.gguf"]}`, "Invalid repo format"},
+		{"strict traversal shorthand", `{"repo": "../n:f", "strictFiles": true}`, "Invalid repo format"},
+		{"strict nested path colon value", `{"repo": "a/b/c:d", "strictFiles": true}`, "Invalid repo format"},
+		{"strict colon-only owner segment", `{"repo": ":f", "strictFiles": true}`, "Invalid repo format"},
+		{"strict malformed repo with a non-canonical entry", `{"repo": "invalid", "strictFiles": true, "filters": ["a/../b"]}`, "Invalid repo format"},
+		{"non-strict expandable colon on an invalid expanded repo", `{"repo": "o:x/n"}`, "Invalid repo format"},
+		{"strict colon value with an explicit filters list", `{"repo": "x:y", "strictFiles": true, "filters": ["model.gguf"]}`, "Invalid repo format"},
+		{"strict repo with a malformed shard range", `{"repo": "invalid", "strictFiles": true, "filters": ["model.gguf"], "shardRanges": "abc"}`, "Invalid repo format"},
+		{"non-strict repo with a malformed shard range", `{"repo": "invalid", "shardRanges": "abc"}`, "Invalid repo format"},
+		{"non-strict colon with explicit filters keeps the guard", `{"repo": "x:y", "filters": ["model.gguf"]}`, "Invalid file selection"},
+		{"non-strict malformed repo with a branch variant", `{"repo": "invalid", "branchVariant": true}`, "Invalid repo format"},
+		{"non-strict expanded repo with a branch variant", `{"repo": "x:y", "branchVariant": true}`, "Invalid repo format"},
+		{"strict nested repo with a branch variant", `{"repo": "a/b/c", "branchVariant": true, "strictFiles": true, "filters": ["model.gguf"]}`, "Invalid repo format"},
+		{"control: check-passing repo keeps the branch-variant verdict", `{"repo": "owner/model", "branchVariant": true}`, "Invalid branch variant request"},
+	} {
+		const unexpandableGuardDetails = "the owner/name:file shorthand cannot be combined with explicit filters — send one or the other"
+		planCode, plan := post("/api/plan", tc.body)
+		if planCode != http.StatusBadRequest || plan.Error != tc.want {
+			t.Errorf("%s /api/plan: status=%d error=%q, want 400 %q", tc.name, planCode, plan.Error, tc.want)
+		}
+		if tc.want == "Invalid repo format" && plan.Details != "Expected owner/name" {
+			t.Errorf("%s /api/plan: details=%q, want %q", tc.name, plan.Details, "Expected owner/name")
+		}
+		if tc.want == "Invalid file selection" && plan.Details != unexpandableGuardDetails {
+			t.Errorf("%s /api/plan: details=%q, want the named unexpandable-guard details", tc.name, plan.Details)
+		}
+		dlCode, dl := post("/api/download", tc.body)
+		if dlCode != planCode || dl.Error != plan.Error {
+			t.Errorf("%s: plan=(%d,%q) download=(%d,%q), want the same verdict on both endpoints",
+				tc.name, planCode, plan.Error, dlCode, dl.Error)
+		}
+		if tc.want == "Invalid repo format" && dl.Details != "Expected owner/name" {
+			t.Errorf("%s /api/download: details=%q, want %q", tc.name, dl.Details, "Expected owner/name")
+		}
+		if tc.want == "Invalid file selection" && dl.Details != unexpandableGuardDetails {
+			t.Errorf("%s /api/download: details=%q, want the named unexpandable-guard details", tc.name, dl.Details)
+		}
+	}
+	if got := hubRequests.Load(); got != 0 {
+		t.Errorf("rejected requests reached the hub %d time(s), want none", got)
+	}
+	if jobs := s.jobs.ListJobs(); len(jobs) != 0 {
+		t.Errorf("rejected requests admitted %d job(s), want none", len(jobs))
+	}
+}
+
 // --- Delete Cache Security Tests ---
 
 func TestAPI_CacheDelete_PathTraversal(t *testing.T) {
