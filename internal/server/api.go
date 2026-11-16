@@ -1787,13 +1787,38 @@ func (s *Server) handleCacheList(w http.ResponseWriter, r *http.Request) {
 		// the blobs directory's own mtime also moves when an active or
 		// interrupted download creates a staging artifact inside it.
 		var blobsNewest time.Time
+		// Interrupted-publication residue: blobs/<sha> hard-linked to its
+		// staging sibling shares one inode. Stage the staging-named entries'
+		// identities first — bucketed by (size, mtime), confirmed with
+		// os.SameFile inside the bucket just like the local scan's identity
+		// rule — then count only content-named files whose identity is
+		// unclaimed, so the residue contributes nothing to count, size or
+		// date and sibling walk order cannot matter.
+		type blobKey struct {
+			size  int64
+			mtime int64
+		}
+		staged := make(map[blobKey][]os.FileInfo)
 		filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
-			if err == nil && !info.IsDir() && !isBlobStagingArtifactName(info.Name()) {
-				totalSize += info.Size()
-				fileCount++
-				if info.ModTime().After(blobsNewest) {
-					blobsNewest = info.ModTime()
+			if err == nil && !info.IsDir() && isBlobStagingArtifactName(info.Name()) {
+				k := blobKey{info.Size(), info.ModTime().UnixNano()}
+				staged[k] = append(staged[k], info)
+			}
+			return nil
+		})
+		filepath.Walk(blobsDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() || isBlobStagingArtifactName(info.Name()) {
+				return nil
+			}
+			for _, sibling := range staged[blobKey{info.Size(), info.ModTime().UnixNano()}] {
+				if os.SameFile(info, sibling) {
+					return nil // the residue identity counts nowhere, date included
 				}
+			}
+			totalSize += info.Size()
+			fileCount++
+			if info.ModTime().After(blobsNewest) {
+				blobsNewest = info.ModTime()
 			}
 			return nil
 		})
