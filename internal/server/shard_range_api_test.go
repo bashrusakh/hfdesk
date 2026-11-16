@@ -133,6 +133,7 @@ func TestShardRangeValidationFailsClosedBeforeHubContact(t *testing.T) {
 			"empty expression":  {Repo: "owner/model", Filters: []string{".safetensors"}, ExactMatch: true, ShardRanges: "  "},
 			"zero index":        {Repo: "owner/model", Filters: []string{".safetensors"}, ExactMatch: true, ShardRanges: "0-5"},
 			"without selection": {Repo: "owner/model", ShardRanges: "1-2"},
+			"empty shorthand":   {Repo: "owner/model:", ShardRanges: "1-2"},
 		} {
 			t.Run(route.name+"/"+name, func(t *testing.T) {
 				req.DryRun = route.dry
