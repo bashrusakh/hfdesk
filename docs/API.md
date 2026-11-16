@@ -866,6 +866,11 @@ error code `invalid_append_filter_subdir`; a normal non-dry-run download remains
 admitted and runs without filter subdirectories, matching the existing download
 pipeline.
 
+Over the HTTP API this option never creates filter subdirectories: it is a
+Go-library option, and on every HTTP surface plan responses stay
+repository-relative while downloads land flat at each file's
+repository-relative path, whatever `appendFilterSubdir` the request carries.
+
 When `filters` is non-empty and no non-excluded repository-relative path matches
 or recognized dataset-group membership selects data, the request fails with
 `400` and error code `no_filter_match`; retained companion/metadata files alone
@@ -1003,6 +1008,11 @@ Notes:
 
 - `repo` is required and must be `owner/name`.
 - `revision` defaults to `main`.
+- `appendFilterSubdir` is accepted but has no layout effect on any HTTP
+  surface: the HTTP API creates no filter subdirectories, so plan responses
+  stay repository-relative and a downloaded file lands flat at its
+  repository-relative path with no `<filter>/` prefix. It is a Go-library
+  option (documented under Plan above).
 - `shardRanges` participates in job identity like `filters`: requests that
   are identical except for their shard ranges start independent jobs, and an
   identical request (same repo, revision, destination, filters and ranges)
