@@ -4,6 +4,7 @@
 package smartdl
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -280,6 +281,177 @@ func TestRepoInfo_MultimodalRecommendedDownloadBundlesMMProj(t *testing.T) {
 	// The recommended mmproj must also be present and narrow (f16, not bf16/f32).
 	if !strings.Contains(filters, "mmproj-F16.gguf") {
 		t.Errorf("recommended download missing mmproj-f16 filter: %v", info.RecommendedDownload.Filters)
+	}
+}
+
+// ternaryBonsaiFiles mirrors prism-ml/Ternary-Bonsai-2-27B-gguf: an F16
+// artifact too large for the default rule, a low-quality Q2_0, two
+// unrecognized quant files, and two mmproj companions. No artifact satisfies
+// recommendedQuantIndex, so no LLM quant is recommended.
+func ternaryBonsaiFiles() []FileInfo {
+	const gib = int64(1024 * 1024 * 1024)
+	return []FileInfo{
+		ggufRecommendationTestFile("Ternary-Bonsai-2-27B-F16.gguf", 50*gib),
+		ggufRecommendationTestFile("Ternary-Bonsai-2-27B-Q2_0.gguf", 7_100_000_000),
+		ggufRecommendationTestFile("Ternary-Bonsai-2-27B-PTQ1_0.gguf", 6_000_000_000),
+		ggufRecommendationTestFile("Ternary-Bonsai-2-27B-PQ2_0.gguf", 5_900_000_000),
+		ggufRecommendationTestFile("mmproj-BF16.gguf", 100_000_000),
+		ggufRecommendationTestFile("mmproj-Q8_0.gguf", 80_000_000),
+	}
+}
+
+// TestRepoInfo_NoRecommendedQuantLeavesMMProjUnrecommended pins the reproduced
+// multimodal shape: without a recommended LLM quant the projector must not be
+// promoted into a lone recommendation, and the recommended download is absent.
+func TestRepoInfo_NoRecommendedQuantLeavesMMProjUnrecommended(t *testing.T) {
+	files := ternaryBonsaiFiles()
+	info := &RepoInfo{
+		Repo:   "prism-ml/Ternary-Bonsai-2-27B-gguf",
+		Type:   TypeGGUF,
+		Files:  files,
+		Branch: "main",
+	}
+	info.GGUF = analyzeGGUF(files)
+	populateSelectableItems(info)
+	info.PopulateDownloadSelection()
+
+	if got := len(info.SelectableItems); got != 6 {
+		t.Fatalf("got %d selectable items, want 6: %+v", got, info.SelectableItems)
+	}
+	for _, item := range info.SelectableItems {
+		if item.Recommended {
+			t.Errorf("item %q (%s) is recommended, want no recommendation", item.Label, item.Category)
+		}
+	}
+	if got := len(selectableItemsByCategory(info.SelectableItems, "vision_encoder")); got != 2 {
+		t.Fatalf("got %d vision_encoder items, want 2", got)
+	}
+	if info.RecommendedDownload != nil {
+		t.Fatalf("RecommendedDownload = %+v, want nil (no lone mmproj recommendation)", info.RecommendedDownload)
+	}
+	if len(info.RecommendedFilters) != 0 {
+		t.Fatalf("RecommendedFilters = %v, want none", info.RecommendedFilters)
+	}
+}
+
+// TestRepoInfo_MMProjOnlyRepoKeepsProjectorRecommended covers the projector-only
+// repository: there is no LLM quant to accompany, so the preferred projector
+// keeps its recommendation, including across a RAM-budget re-pick.
+func TestRepoInfo_MMProjOnlyRepoKeepsProjectorRecommended(t *testing.T) {
+	files := []FileInfo{
+		ggufRecommendationTestFile("mmproj-BF16.gguf", 100_000_000),
+		ggufRecommendationTestFile("mmproj-F16.gguf", 120_000_000),
+	}
+	info := &RepoInfo{
+		Repo:   "owner/mmproj-only",
+		Type:   TypeGGUF,
+		Files:  files,
+		Branch: "main",
+	}
+	info.GGUF = analyzeGGUF(files)
+	populateSelectableItems(info)
+	info.PopulateDownloadSelection()
+
+	assertOnlyProjectorRecommended := func() {
+		t.Helper()
+		vision := selectableItemsByCategory(info.SelectableItems, "vision_encoder")
+		if len(vision) != 2 {
+			t.Fatalf("got %d vision_encoder items, want 2", len(vision))
+		}
+		var recommended []SelectableItem
+		for _, item := range vision {
+			if item.Recommended {
+				recommended = append(recommended, item)
+			}
+		}
+		if len(recommended) != 1 {
+			t.Fatalf("got %d recommended projectors, want exactly 1: %+v", len(recommended), recommended)
+		}
+		if got, want := recommended[0].Files, []string{"mmproj-F16.gguf"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("recommended projector files = %v, want %v", got, want)
+		}
+		if info.RecommendedDownload == nil {
+			t.Fatal("expected a recommended download for an mmproj-only repository")
+		}
+		if got, want := info.RecommendedDownload.Filters, []string{"./mmproj-F16.gguf"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("recommended filters = %v, want %v", got, want)
+		}
+	}
+	assertOnlyProjectorRecommended()
+
+	ApplyGGUFRAMBudget(info, 8*1024*1024*1024)
+	assertOnlyProjectorRecommended()
+}
+
+// TestApplyGGUFRAMBudgetBundlesProjectorWithBudgetPickedQuant covers the
+// reproduced shape under a RAM budget: the budget fallback picks a quant, so
+// the preferred projector must become recommended again and the recommended
+// download must bundle both.
+func TestApplyGGUFRAMBudgetBundlesProjectorWithBudgetPickedQuant(t *testing.T) {
+	files := ternaryBonsaiFiles()
+	gguf := analyzeGGUF(files)
+	repo := &RepoInfo{
+		Repo:            "prism-ml/Ternary-Bonsai-2-27B-gguf",
+		Type:            TypeGGUF,
+		GGUF:            gguf,
+		SelectableItems: GGUFToSelectableItems(gguf),
+	}
+	ApplyGGUFRAMBudget(repo, 1)
+	repo.PopulateDownloadSelection()
+
+	quant := recommendedQuantFiles(t, repo.SelectableItems)
+	vision := selectableItemsByCategory(repo.SelectableItems, "vision_encoder")
+	var projectors []SelectableItem
+	for _, item := range vision {
+		if item.Recommended {
+			projectors = append(projectors, item)
+		}
+	}
+	if len(projectors) != 1 {
+		t.Fatalf("got %d recommended projectors, want exactly 1: %+v", len(projectors), projectors)
+	}
+	if got, want := projectors[0].Files, []string{"mmproj-BF16.gguf"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("recommended projector files = %v, want %v", got, want)
+	}
+	if repo.RecommendedDownload == nil {
+		t.Fatal("recommended_download missing")
+	}
+	if got, want := repo.RecommendedDownload.Filters, []string{exactArtifactFilter(quant[0]), "./mmproj-BF16.gguf"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("recommended filters = %v, want %v", got, want)
+	}
+}
+
+// TestApplyGGUFRAMBudgetClearsLoneMMProjRecommendation guards the budget re-pick
+// against preserving a vision-encoder recommendation when no quant is eligible
+// (all LLM artifacts here are MTP variants, which are never auto-recommended).
+func TestApplyGGUFRAMBudgetClearsLoneMMProjRecommendation(t *testing.T) {
+	files := []FileInfo{
+		ggufRecommendationTestFile("model-MTP-Q4_K_M.gguf", 3_000_000_000),
+		ggufRecommendationTestFile("mmproj-F16.gguf", 100_000_000),
+	}
+	gguf := analyzeGGUF(files)
+	repo := &RepoInfo{
+		Repo:            "owner/repo",
+		Type:            TypeGGUF,
+		GGUF:            gguf,
+		SelectableItems: GGUFToSelectableItems(gguf),
+	}
+	// Simulate stale pre-fix item state: a projector flagged recommended with
+	// no quant pick. The budget re-pick must not leave it there.
+	for i := range repo.SelectableItems {
+		if repo.SelectableItems[i].Category == "vision_encoder" {
+			repo.SelectableItems[i].Recommended = true
+		}
+	}
+	ApplyGGUFRAMBudget(repo, 1<<40)
+	for _, item := range repo.SelectableItems {
+		if item.Category == "vision_encoder" && item.Recommended {
+			t.Errorf("vision item %q stayed recommended without a recommended quant", item.Label)
+		}
+	}
+	repo.PopulateDownloadSelection()
+	if repo.RecommendedDownload != nil {
+		t.Fatalf("RecommendedDownload = %+v, want nil", repo.RecommendedDownload)
 	}
 }
 
