@@ -1946,6 +1946,7 @@ func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
 		{"strict nested path colon value", `{"repo": "a/b/c:d", "strictFiles": true}`, "Invalid repo format"},
 		{"strict colon-only owner segment", `{"repo": ":f", "strictFiles": true}`, "Invalid repo format"},
 		{"strict malformed repo with a non-canonical entry", `{"repo": "invalid", "strictFiles": true, "filters": ["a/../b"]}`, "Invalid repo format"},
+		{"non-strict expandable colon on an invalid expanded repo", `{"repo": "o:x/n"}`, "Invalid repo format"},
 	} {
 		planCode, plan := post("/api/plan", tc.body)
 		if planCode != http.StatusBadRequest || plan.Error != tc.want {

@@ -871,16 +871,18 @@ shapes, so this check brings plan to its longstanding verdict. The check's
 actual rule: it accepts a `repo` of exactly two slash-separated segments in
 `IsValidModelName`'s accepted spellings — an `owner/name` pair, where a
 `:file`-style suffix inside the name segment still passes (`owner/model:q4_0`)
-and a colon in the owner segment passes too (`o:x/n`). A strict request
+and a colon in the owner segment passes too (`o:x/n`, though in the
+non-strict expandable form the check sees the expanded repo — `o:x/n`
+expands to `o` and is answered `Invalid repo format`). A strict request
 whose `repo` fails that rule is now answered `400 Invalid repo format` at
 this check first — including a shorthand whose file part contains `/`
 (`owner/name:sub/file.gguf` splits into three segments) and degenerate
 spellings like `../n:f` (a traversal component) — for each of these colon
 spellings `/api/plan` previously answered `400 invalid_file_selection` with
 the strict-colon hint.
-Strict mode's `400 invalid_file_selection` for the colon is therefore
-unchanged only for check-passing spellings — the `owner/model:q4_0` class and
-the `o:x/n` class — with or without `filters`.
+The colon's `400 invalid_file_selection` is therefore unchanged only for
+check-passing spellings — the `owner/model:q4_0` class and the `o:x/n`
+class — in strict mode and whenever explicit `filters` are set.
 
 Returns the files that would be downloaded without starting a job. Each HTTP
 response item exposes only `path`, `size`, and `lfs`; `path` is
