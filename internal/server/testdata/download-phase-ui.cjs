@@ -138,7 +138,7 @@ eq(/data-role="phase"[^>]*style="display: none"/.test(statsMarkup), true,
 // invented while the server reports 0 B/s and no estimate.
 const preparing = job({ phase: 'preparing' });
 const prepCard = render(preparing);
-eq(role(prepCard, 'status').textContent, 'preparing');
+eq(role(prepCard, 'status').textContent, 'writing');
 eq(role(prepCard, 'status').className, 'job-status preparing');
 eq(role(prepCard, 'phase').textContent, 'writing 20 GB to disk');
 eq(role(prepCard, 'phase').title, 'writing 20 GB to disk');

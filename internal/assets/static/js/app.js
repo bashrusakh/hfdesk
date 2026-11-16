@@ -3561,7 +3561,7 @@ async function loadRepositoryDetails(entry) {
   // and the speed/ETA slot carries a size hint; unknown or absent values
   // (including newer phases) fall back to the plain running row.
   const JOB_LOCAL_PHASES = {
-    preparing: { label: 'preparing' },
+    preparing: { label: 'writing' },
     finalizing: { label: 'finalizing' }
   };
 

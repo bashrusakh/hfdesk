@@ -1429,6 +1429,20 @@ a {
   white-space: nowrap;
 }
 
+/* The live status badges share one reserved box so the phase switch cannot
+   reflow the header's action row. "finalizing" is the widest label shown
+   here; 64px fits it with 8px side padding. */
+.job-status.running,
+.job-status.preparing,
+.job-status.finalizing {
+  width: 64px;
+  min-width: 64px;
+  flex-shrink: 0;
+  justify-content: center;
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
 .job-status.downloading,
 .job-status.running {
   background: rgba(59, 130, 246, 0.2);
@@ -1530,6 +1544,19 @@ a {
   background: transparent;
   border: none;
   padding: 0 4px;
+  min-width: 58px;
+  min-height: 31.2px;
+  justify-content: center;
+}
+
+/* The percentage and byte pills change width between 0% (0 B / total) and
+   100% (total / total). Reserving their widest text keeps the wrapped stats
+   row's line breaks identical across phases. The percentage pill has no
+   padding or border, so its line height is pinned to a regular stats pill;
+   otherwise a wrapped line holding only the percentage is 8.8px shorter. */
+.job-stats > [data-role="bytes"] {
+  min-width: 120px;
+  justify-content: center;
 }
 
 /* The phase hint replaces the speed/ETA pills during local I/O. A block
