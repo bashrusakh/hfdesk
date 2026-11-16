@@ -837,6 +837,15 @@ rejected with the same code whether or not `filters` is set, with a hint to
 send the file paths in `filters` (documented under Strict file selection
 below).
 
+`repo` is validated at the request boundary exactly like `POST /api/download`,
+before any Hub contact: a missing `repo` answers `400`
+`Missing required field: repo`, and a value that is not a plain `owner/name`
+pair answers `400 Invalid repo format` with details `Expected owner/name`
+(previously a malformed `repo` fell through to the scan and failed with
+`500 Failed to scan repository`). The colon-shorthand rules above are
+unchanged and keep precedence over this check — an unexpandable shorthand
+shape still fails with the named `400 invalid_file_selection`.
+
 Returns the files that would be downloaded without starting a job. Each HTTP
 response item exposes only `path`, `size`, and `lfs`; `path` is
 repository-relative. The response does not include filter-attribution or

@@ -1891,6 +1891,66 @@ func TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact(t *test
 	}
 }
 
+// TestAPIPlanRepoBoundaryValidationMatchesDownload pins /api/plan's repo
+// boundary gate to /api/download's exact verdicts: a missing repo answers
+// 400 "Missing required field: repo" and a repo that is not an owner/name
+// pair answers 400 "Invalid repo format" on BOTH endpoints, byte-identical
+// to the reference handler, before any Hub contact and with no job admitted.
+// Previously /api/download already answered 400 while /api/plan let a
+// malformed repo fall through to PlanRepo and surface as 500 "Failed to scan
+// repository". The colon-shorthand guards keep precedence: an unexpandable
+// shorthand shape still yields the named invalid_file_selection (covered by
+// TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact).
+func TestAPIPlanRepoBoundaryValidationMatchesDownload(t *testing.T) {
+	var hubRequests atomic.Int64
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hubRequests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer hub.Close()
+	s := newTestServerWithConfig(t, Config{
+		CacheDir: t.TempDir(), LocalDir: t.TempDir(), Endpoint: hub.URL,
+		MaxActive: 1, Proxy: &hfdownloader.ProxyConfig{NoEnvProxy: true},
+	})
+	mux := http.NewServeMux()
+	s.registerAPIRoutes(mux)
+
+	post := func(path, body string) (int, ErrorResponse) {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body)))
+		var resp ErrorResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode %s response: %v; body=%s", path, err, w.Body.String())
+		}
+		return w.Code, resp
+	}
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{"missing repo", `{}`, "Missing required field: repo"},
+		{"repo without an owner", `{"repo": "invalid"}`, "Invalid repo format"},
+		{"repo with a nested path", `{"repo": "a/b/c"}`, "Invalid repo format"},
+	} {
+		planCode, plan := post("/api/plan", tc.body)
+		if planCode != http.StatusBadRequest || plan.Error != tc.want {
+			t.Errorf("%s /api/plan: status=%d error=%q, want 400 %q", tc.name, planCode, plan.Error, tc.want)
+		}
+		dlCode, dl := post("/api/download", tc.body)
+		if dlCode != planCode || dl.Error != plan.Error {
+			t.Errorf("%s: plan=(%d,%q) download=(%d,%q), want the same verdict on both endpoints",
+				tc.name, planCode, plan.Error, dlCode, dl.Error)
+		}
+	}
+	if got := hubRequests.Load(); got != 0 {
+		t.Errorf("rejected requests reached the hub %d time(s), want none", got)
+	}
+	if jobs := s.jobs.ListJobs(); len(jobs) != 0 {
+		t.Errorf("rejected requests admitted %d job(s), want none", len(jobs))
+	}
+}
+
 // --- Delete Cache Security Tests ---
 
 func TestAPI_CacheDelete_PathTraversal(t *testing.T) {
