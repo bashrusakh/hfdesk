@@ -547,6 +547,12 @@ func TestLocalModelFolderDelete_SingleModelGate(t *testing.T) {
 		{"gguf with mmproj companion", []string{
 			"model-Q4_K_M.gguf", "model.mmproj-f16.gguf",
 		}, true, http.StatusOK, ""},
+		{"reported Bonsai layout with two leading companions", []string{
+			"Omnicoder-9B-Opus-Distill.q8_0.gguf", "mmproj-F32.gguf", "mmproj-F16.gguf",
+		}, true, http.StatusOK, ""},
+		{"nested mmproj companion", []string{
+			"model-Q4_K_M.gguf", "sub/mmproj-F16.gguf",
+		}, true, http.StatusOK, ""},
 		{"diffusers tree with one base", []string{
 			"unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors", "unet/config.json",
 		}, true, http.StatusOK, ""},
@@ -555,8 +561,18 @@ func TestLocalModelFolderDelete_SingleModelGate(t *testing.T) {
 		{"interior quant span pile (tiny…llama)", []string{
 			"tiny-Q4_K_M-llama.gguf", "tinyllama.gguf",
 		}, true, http.StatusConflict, "multiple models"},
-		{"near-miss mmproj pile", []string{
+		{"hyphenated mmproj companion beside its base", []string{
 			"x-mmproj-y.gguf", "x.gguf",
+		}, true, http.StatusOK, ""},
+		{"companion-only folder", []string{
+			"mmproj-BF16.gguf", "mmproj-F16.gguf", "mmproj-F32.gguf",
+		}, true, http.StatusConflict, "No recognizable model weight"},
+		{"two models with their own companions", []string{
+			"modelA-Q4_K_M.gguf", "mmproj-F16.gguf",
+			"modelB-Q5_K_M.gguf", "mmproj-BF16.gguf",
+		}, true, http.StatusConflict, "multiple models"},
+		{"interior mmproj substring is not a companion", []string{
+			"mmprojector-f16.gguf", "my-mmprojdata-model-Q4_K_M.gguf",
 		}, true, http.StatusConflict, "multiple models"},
 		{"adapter pile in sibling dirs", []string{
 			"a/pytorch_lora_weights.safetensors", "b/pytorch_lora_weights.safetensors",

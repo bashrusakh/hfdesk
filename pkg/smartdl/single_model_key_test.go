@@ -21,11 +21,24 @@ func TestWeightFileModelKey(t *testing.T) {
 		{"model-Q4_K_M.gguf", "model", true, true},
 		{"model-Q4_K_M_00002-of-00002.gguf", "model", true, true},
 		{"model-00002-of-00002.safetensors", "model", true, true},
-		{"model.mmproj-f16.gguf", "model", true, true},
 		{"model.fp16.safetensors", "model", true, true},
 		{"model-BF16.gguf", "model", true, true},
 		{"modelA-v2.safetensors", "modelA-v2", true, true},
 		{"pytorch_model-00001-of-00002.bin", "pytorch_model", true, true},
+		// Recognized mmproj companion spellings are non-weights: every
+		// explicit shape contributes no model key.
+		{"model.mmproj-f16.gguf", "", false, false},
+		{"mmproj-F32.gguf", "", false, false},
+		{"mmproj.gguf", "", false, false},
+		{"x-mmproj-y.gguf", "", false, false},
+		{"Ternary-Bonsai-2-27B-mmproj-BF16.gguf", "", false, false},
+		{"mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf", "", false, false},
+		{"MMPROJ-F16.GGUF", "", false, false},
+		{"nested/mmproj-F32.gguf", "", false, false},
+		// The deletion rule is narrower than IsMMProjFile: an incidental
+		// interior "mmproj" substring is an ordinary weight name.
+		{"mmprojector-f16.gguf", "mmprojector", true, true},
+		{"my-mmprojdata-model-Q4_K_M.gguf", "my-mmprojdata-model", true, true},
 		// Diffusers component directories drop from the key (derived from
 		// requiredComponents, not a second list).
 		{"unet/diffusion_pytorch_model.safetensors", "diffusion_pytorch_model", true, true},
@@ -42,16 +55,13 @@ func TestWeightFileModelKey(t *testing.T) {
 		{"a/b/x.safetensors", "a/b/x", true, true},
 		// An interior span never cuts — the full name is the key.
 		{"tiny-Q4_K_M-llama.gguf", "tiny-Q4_K_M-llama", true, true},
-		{"x-mmproj-y.gguf", "x-mmproj-y", true, true},
 		{"model.fp16.ema.safetensors", "model.fp16.ema", true, true},
-		// The ".mmproj-" cut must be byte-aligned. Compensating Unicode
-		// ToLower length changes (Ⱥ grows 2→3, ẞ shrinks 3→2) must not shift
-		// the delimiter's byte offset — each name keeps its own exact key and
-		// the companion reduces only by its byte-exact ".mmproj-" prefix.
+		// Companion matching is ASCII-byte-aligned; Unicode case-mapping
+		// length changes in the model part do not affect the delimiter.
 		{"AȺȺ.m.gguf", "AȺȺ.m", true, true},
-		{"AȺȺ.mmproj-zẞẞ.gguf", "AȺȺ", true, true},
+		{"AȺȺ.mmproj-zẞẞ.gguf", "", false, false},
 		{"AȺȺȺ.mm.gguf", "AȺȺȺ.mm", true, true},
-		{"AȺȺȺ.mmproj-zẞẞẞ.gguf", "AȺȺȺ", true, true},
+		{"AȺȺȺ.mmproj-zẞẞẞ.gguf", "", false, false},
 		// Non-weights carry no identity.
 		{"config.json", "", false, false},
 		{"notes.txt", "", false, false},
@@ -75,12 +85,8 @@ func TestWeightFileModelKey(t *testing.T) {
 	// must stay equal.
 	distinct := [][2]string{
 		{"tiny-Q4_K_M-llama.gguf", "tinyllama.gguf"},                                 // interior quant excision merged these
-		{"x-mmproj-y.gguf", "x.gguf"},                                                // any-"mmproj" cut merged these
 		{"a/pytorch_lora_weights.safetensors", "b/pytorch_lora_weights.safetensors"}, // nested adapters
 		{"modelA.safetensors", "modelA-v2.safetensors"},
-		// F6 pairs: a shifted byte offset in the ".mmproj-" cut merged these.
-		{"AȺȺ.m.gguf", "AȺȺ.mmproj-zẞẞ.gguf"},
-		{"AȺȺȺ.mm.gguf", "AȺȺȺ.mmproj-zẞẞẞ.gguf"},
 		// F8 pairs: dropping a component-NAMED interior directory merged these.
 		{"a/unet/x.safetensors", "a/x.safetensors"},
 		{"a/b/unet/x.safetensors", "a/b/x.safetensors"},
@@ -95,7 +101,6 @@ func TestWeightFileModelKey(t *testing.T) {
 	same := [][2]string{
 		{"model-Q4_K_M.gguf", "model-Q5_K_S.gguf"},
 		{"model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"},
-		{"model.gguf", "model.mmproj-f16.gguf"},
 		{"unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors"},
 	}
 	for _, pair := range same {
@@ -188,5 +193,76 @@ func TestSingleModelFolderKeys(t *testing.T) {
 	}
 	if _, unclassified := SingleModelFolderKeys([]string{"unet/Q4_K_M.safetensors"}); !unclassified {
 		t.Error("unclassifiable weight name must fail closed")
+	}
+}
+
+// An mmproj companion is a non-weight in the whole-folder deletion
+// classification: every surveyed explicit shape adds no key, so one model's
+// weights plus any number of companions still classify as exactly one model.
+// A companion-only folder yields zero keys (the server refuses it through the
+// keyCount==0 rule), and two models that each carry companions keep two keys.
+func TestSingleModelFolderKeys_MMProjCompanions(t *testing.T) {
+	const model = "Omnicoder-9B-Opus-Distill.q8_0.gguf"
+	const modelKey = "Omnicoder-9B-Opus-Distill"
+	shapes := []struct {
+		name       string
+		companions []string
+	}{
+		{"leading mmproj-", []string{"mmproj-F32.gguf"}},
+		{"dot-separated .mmproj-", []string{"Omnicoder-9B-Opus-Distill.mmproj-Q8_0.gguf"}},
+		{"hyphenated -mmproj-", []string{"Ternary-Bonsai-2-27B-mmproj-BF16.gguf"}},
+		{"bare mmproj.gguf", []string{"mmproj.gguf"}},
+		{"model-name token after prefix", []string{
+			"mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf", "mmproj-model-f16.gguf",
+		}},
+		{"case-insensitive", []string{"MMPROJ-F16.GGUF"}},
+		{"nested companion", []string{"sub/mmproj-F16.gguf"}},
+		{"all companions together", []string{
+			"mmproj-BF16.gguf", "mmproj-F16.gguf", "mmproj-F32.gguf",
+		}},
+	}
+	for _, tc := range shapes {
+		t.Run(tc.name, func(t *testing.T) {
+			paths := append([]string{model}, tc.companions...)
+			keys, unclassified := SingleModelFolderKeys(paths)
+			if unclassified || len(keys) != 1 || keys[0] != modelKey {
+				t.Fatalf("keys=%v unclassified=%v, want exactly [%q]", keys, unclassified, modelKey)
+			}
+			for _, companion := range tc.companions {
+				if key, weight, ok := WeightFileModelKey(companion); key != "" || weight || ok {
+					t.Errorf("companion %q = (%q, %v, %v), want no key and not a weight", companion, key, weight, ok)
+				}
+			}
+		})
+	}
+
+	// A folder holding only companions has no model weight at all.
+	companionsOnly := []string{"mmproj-BF16.gguf", "mmproj-F16.gguf", "mmproj-F32.gguf", "mmproj.gguf"}
+	if keys, unclassified := SingleModelFolderKeys(companionsOnly); unclassified || len(keys) != 0 {
+		t.Fatalf("companion-only folder: keys=%v unclassified=%v, want zero keys", keys, unclassified)
+	}
+
+	// Two models keep their own keys even when each carries companions.
+	twoModels := []string{
+		"modelA-Q4_K_M.gguf", "mmproj-F16.gguf",
+		"modelB-Q5_K_M.gguf", "mmproj-BF16.gguf",
+	}
+	if keys, unclassified := SingleModelFolderKeys(twoModels); unclassified || len(keys) != 2 {
+		t.Fatalf("two models with companions: keys=%v unclassified=%v, want two keys", keys, unclassified)
+	}
+
+	// An unrelated interior "mmproj" substring is not a companion under the
+	// deletion rule; it keeps its own key so a second model cannot hide.
+	ambiguous := []string{"mmprojector-f16.gguf", "my-mmprojdata-model-Q4_K_M.gguf"}
+	if keys, unclassified := SingleModelFolderKeys(ambiguous); unclassified || len(keys) != 2 {
+		t.Fatalf("interior mmproj substrings: keys=%v unclassified=%v, want two keys", keys, unclassified)
+	}
+
+	// One base's quants still merge when companions are present.
+	quants := []string{
+		"model-Q4_K_M.gguf", "model-Q5_K_M.gguf", "mmproj-F32.gguf", "mmproj-F16.gguf",
+	}
+	if keys, unclassified := SingleModelFolderKeys(quants); unclassified || len(keys) != 1 || keys[0] != "model" {
+		t.Fatalf("quants plus companions: keys=%v unclassified=%v, want exactly [\"model\"]", keys, unclassified)
 	}
 }
