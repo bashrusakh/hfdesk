@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
@@ -1654,6 +1655,89 @@ func TestAPI_ParseFiltersFromRepo(t *testing.T) {
 	}
 	if len(resp.Filters) != 2 {
 		t.Errorf("Expected 2 filters, got %d", len(resp.Filters))
+	}
+}
+
+// TestAPI_ParseFiltersFromRepoPlanTwin pins expansion parity on the plan
+// endpoint: /api/plan parses owner/name:file,file exactly like
+// /api/download does — the colon is stripped from repo and each comma-split
+// segment of the file part reaches the planner as a filter. The negative row
+// proves application: with the colon leaked into repo instead, the same
+// request would fail at the Hub's repo lookup with 500, never with a named
+// no_filter_match that quotes both derived filters.
+func TestAPI_ParseFiltersFromRepoPlanTwin(t *testing.T) {
+	hub := shardRangeHub(shardRangeContent())
+	defer hub.Close()
+	_, mux := newShardRangeServer(t, hub, Config{})
+
+	code, plan, raw := postPlanResponse(t, mux, "/api/plan",
+		DownloadRequest{Repo: "owner/model:model-00001,model-00003"})
+	if code != http.StatusOK {
+		t.Fatalf("plan status=%d, want 200 after shorthand expansion; body=%s", code, raw)
+	}
+	if plan.Repo != "owner/model" {
+		t.Fatalf("plan repo=%q, want the colon-stripped owner/model", plan.Repo)
+	}
+
+	code, _, raw = postPlanResponse(t, mux, "/api/plan",
+		DownloadRequest{Repo: "owner/model:q4_0,q8_0"})
+	if code != http.StatusBadRequest {
+		t.Fatalf("unmatched shorthand plan status=%d, want 400; body=%s", code, raw)
+	}
+	var errResp ErrorResponse
+	if err := json.Unmarshal([]byte(raw), &errResp); err != nil {
+		t.Fatal(err)
+	}
+	if errResp.ErrorDetail == nil || errResp.ErrorDetail.Code != "no_filter_match" {
+		t.Fatalf("error_detail=%+v, want code no_filter_match; body=%s", errResp.ErrorDetail, raw)
+	}
+	for _, derived := range []string{`"q4_0"`, `"q8_0"`} {
+		if !strings.Contains(errResp.ErrorDetail.Details, derived) {
+			t.Fatalf("details=%q, want the comma-split shorthand segment %s applied as a filter", errResp.ErrorDetail.Details, derived)
+		}
+	}
+}
+
+// TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact pins
+// the reconciliation with strict mode: a non-strict request whose repo keeps
+// the colon cannot be expanded (filters were sent explicitly), so both
+// endpoints reject it with a named 400 invalid_file_selection before any Hub
+// contact and admit no job. Previously /api/plan failed late with a 500
+// scan error and /api/download admitted a job doomed at the Hub's repo
+// lookup.
+func TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact(t *testing.T) {
+	var hubRequests atomic.Int64
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hubRequests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer hub.Close()
+	s := newTestServerWithConfig(t, Config{
+		CacheDir: t.TempDir(), LocalDir: t.TempDir(), Endpoint: hub.URL,
+		MaxActive: 1, Proxy: &hfdownloader.ProxyConfig{NoEnvProxy: true},
+	})
+	mux := http.NewServeMux()
+	s.registerAPIRoutes(mux)
+
+	for _, path := range []string{"/api/plan", "/api/download"} {
+		code, resp, body := postStrict(mux, path, DownloadRequest{Repo: "owner/model:q4_0", Filters: []string{"q5_0"}})
+		if code != http.StatusBadRequest || resp.ID != "" {
+			t.Errorf("%s status=%d body=%s, want 400 with no admitted job", path, code, body)
+			continue
+		}
+		if resp.ErrorDetail == nil || resp.ErrorDetail.Code != "invalid_file_selection" {
+			t.Errorf("%s error_detail=%+v, want code invalid_file_selection; body=%s", path, resp.ErrorDetail, body)
+			continue
+		}
+		if !strings.Contains(resp.ErrorDetail.Details, "cannot be combined with explicit filters") {
+			t.Errorf("%s details=%q, want the shorthand+filters hint", path, resp.ErrorDetail.Details)
+		}
+	}
+	if got := hubRequests.Load(); got != 0 {
+		t.Errorf("rejected requests reached the hub %d time(s), want none", got)
+	}
+	if jobs := s.jobs.ListJobs(); len(jobs) != 0 {
+		t.Errorf("rejected requests admitted %d job(s), want none", len(jobs))
 	}
 }
 

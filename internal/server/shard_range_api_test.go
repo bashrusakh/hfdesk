@@ -367,3 +367,55 @@ func TestCreateJobShardRangeIdentity(t *testing.T) {
 		t.Errorf("missing shardRanges must not dedup against a ranged job; existing=%v ids %s/%s", existing, none.ID, first.ID)
 	}
 }
+
+// TestShardRangeAcceptsColonShorthandAsSelection pins the documented
+// exception: the owner/name:file shorthand derives the filters the ranges
+// gate requires, so shorthand + shardRanges with NO explicit filters is
+// accepted identically on plan, dry-run download and the real download, and
+// the ranges narrow the shorthand-derived selection.
+func TestShardRangeAcceptsColonShorthandAsSelection(t *testing.T) {
+	hub := shardRangeHub(shardRangeContent())
+	defer hub.Close()
+	root := t.TempDir()
+	s, mux := newShardRangeServer(t, hub, Config{LocalDir: root, MaxActive: 1})
+
+	for _, path := range []string{"/api/plan", "/api/download"} {
+		req := DownloadRequest{
+			Repo: "owner/model:safetensors", Revision: "main",
+			ShardRanges: "1,3",
+		}
+		req.DryRun = path == "/api/download"
+		code, plan, raw := postPlanResponse(t, mux, path, req)
+		if code != http.StatusOK {
+			t.Fatalf("%s status=%d, want 200 accepting the shorthand-derived selection; body=%s", path, code, raw)
+		}
+		if plan.Repo != "owner/model" {
+			t.Fatalf("%s plan repo=%q, want the colon-stripped owner/model", path, plan.Repo)
+		}
+		want := "model-00001-of-00003.safetensors,model-00003-of-00003.safetensors,config.json"
+		if got := strings.Join(planPathsOf(plan), ","); got != want {
+			t.Errorf("%s paths=%s, want the shorthand selection narrowed to %s", path, got, want)
+		}
+	}
+
+	// The real download admits the same request as a job whose snapshot
+	// carries the expanded repo, the derived filter, and the ranges.
+	body, err := json.Marshal(DownloadRequest{Repo: "owner/model:safetensors", Revision: "main", ShardRanges: "1,3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/download", bytes.NewReader(body)))
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("download status=%d, want 202 admitting the shorthand+ranges job; body=%s", w.Code, w.Body.String())
+	}
+	var admitted Job
+	if err := json.Unmarshal(w.Body.Bytes(), &admitted); err != nil {
+		t.Fatal(err)
+	}
+	if admitted.Repo != "owner/model" || len(admitted.Filters) != 1 || admitted.Filters[0] != "safetensors" || admitted.ShardRanges != "1,3" {
+		t.Fatalf("job snapshot repo=%q filters=%v ranges=%q, want owner/model with derived filter [safetensors] and ranges 1,3",
+			admitted.Repo, admitted.Filters, admitted.ShardRanges)
+	}
+	waitJobStatus(t, s.jobs, admitted.ID, JobStatusCompleted, 10*time.Second)
+}
