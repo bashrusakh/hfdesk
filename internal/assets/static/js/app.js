@@ -1306,6 +1306,100 @@ window.openCommunityThread = openCommunityThread;
 window.closeCommunityThread = closeCommunityThread;
 window.retryCommunityThread = retryCommunityThread;
 
+// Top-level Hub paths that are features, not repository owners. This mirrors
+// readmeReservedModelRoutes in internal/server/readme.go for the models
+// namespace: /papers/2401.04088 must stay an external page instead of becoming
+// an analysis request for "papers/2401.04088". Datasets keep the /datasets/
+// namespace even when the owner matches one of these names.
+const HUB_RESERVED_MODEL_ROUTES = new Set([
+  'about', 'api', 'assets', 'blog', 'brand', 'billing', 'careers',
+  'changelog', 'chat', 'collections', 'contact', 'course', 'courses', 'docs',
+  'duplicate', 'following', 'hardware', 'inference', 'join', 'learn', 'login',
+  'logout', 'models', 'new', 'notifications', 'oauth', 'organizations',
+  'papers', 'posts', 'pricing', 'privacy', 'search', 'security', 'settings',
+  'signup', 'solutions', 'spaces', 'static', 'support', 'tasks', 'terms'
+]);
+
+// decodeHubPathSegments splits an escaped URL path on literal slashes and
+// decodes each segment, so an encoded slash stays inside its segment instead of
+// creating a new path component. A malformed escape fails the whole link.
+function decodeHubPathSegments(pathname) {
+  const segments = [];
+  for (const part of String(pathname || '').split('/')) {
+    if (!part) continue;
+    try {
+      segments.push(decodeURIComponent(part));
+    } catch (_) {
+      return null;
+    }
+  }
+  return segments;
+}
+
+// classifyHubRepoHref maps an anchor href to the repository view it opens in
+// Model Details, or null when the link must stay external. Only repository
+// roots on the configured Hub endpoint are in-app:
+//   https://<endpoint>/<owner>/<repo>
+//   https://<endpoint>/datasets/<owner>/<repo>
+// File, tree, resolve and commit URLs address something the analysis view
+// cannot represent, so they remain external. A link on another host, a
+// reserved Hub page, or a non-http(s) scheme is external too. The endpoint is
+// server-owned configuration (settings, then /api/health); without it nothing
+// is in-app rather than guessing huggingface.co.
+function classifyHubRepoHref(href) {
+  const endpoint = configuredHfEndpointURL();
+  if (!endpoint) return null;
+
+  let base;
+  let url;
+  try {
+    base = new URL(endpoint);
+    url = new URL(String(href || '').trim(), base);
+  } catch (_) {
+    return null;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  if (url.host !== base.host) return null;
+
+  const prefix = decodeHubPathSegments(base.pathname);
+  const segments = decodeHubPathSegments(url.pathname);
+  if (!prefix || !segments || segments.length < prefix.length) return null;
+  for (let i = 0; i < prefix.length; i++) {
+    if (segments[i] !== prefix[i]) return null;
+  }
+
+  let rest = segments.slice(prefix.length);
+  let repoType = 'model';
+  if (rest[0] === 'datasets') {
+    repoType = 'dataset';
+    rest = rest.slice(1);
+  } else if (HUB_RESERVED_MODEL_ROUTES.has(rest[0])) {
+    return null;
+  }
+  // A root view is exactly owner/repo. Anything after it is a file, tree,
+  // resolve, commit or other Hub page the analysis view cannot represent.
+  if (rest.length !== 2) return null;
+  const repo = `${rest[0]}/${rest[1]}`;
+  if (!isValidReadmeRepo(repo)) return null;
+  return { repo, type: repoType };
+}
+
+// Community comment HTML is sanitized server-side and its repository-navigation
+// attributes are deliberately stripped, so the panel classifies a link from its
+// href when it is clicked. Delegation keeps working for every panel re-render
+// and never rewrites the sanitized HTML.
+function handleCommunityLinkClick(e) {
+  const target = e.target;
+  const link = target && target.closest ? target.closest('a[href]') : null;
+  if (!link) return;
+  if (e.defaultPrevented || (e.button && e.button !== 0) || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+
+  const destination = classifyHubRepoHref(link.getAttribute('href'));
+  if (!destination) return;
+  e.preventDefault();
+  openRepositoryInDetails(destination.repo, destination.type, null, 'push');
+}
+
 function normalizeRepoType(repoType) {
   return repoType === 'dataset' ? 'dataset' : repoType === 'model' ? 'model' : null;
 }
@@ -2082,6 +2176,16 @@ async function loadRepositoryDetails(entry) {
     return filters.map(normalizeArtifactPath);
   }
 
+  // defaultDetailTab is the tab a freshly rendered analysis starts on. A
+  // recognized repository keeps Overview as its default even when it offers no
+  // selectable items: formats such as a plain Transformers base model still
+  // have a description worth opening on. Only an unrecognized/generic
+  // repository has no smart selection, so its file tree is the download path
+  // and the default tab. The Files tab stays visible for every analysis.
+  function defaultDetailTab(analysis) {
+    return analysis && analysis.type === 'generic' ? 'files' : 'overview';
+  }
+
   function renderAnalysisResult(data) {
     const resultDiv = $('#modelsOverviewPanel') || $('#analyzeResult');
     if (!resultDiv) return;
@@ -2329,7 +2433,7 @@ async function loadRepositoryDetails(entry) {
     // Recognized formats open on Overview; an unrecognized/generic analysis
     // has no smart selection, so its file tree is the download path and the
     // default tab. The Files tab itself is always visible.
-    detailActiveTab = hasSelectableItems ? 'overview' : 'files';
+    detailActiveTab = defaultDetailTab(data);
     detailScrollPositions.overview = 0;
     detailScrollPositions.files = 0;
     const scroller = $('#analyzeResult');
@@ -6638,6 +6742,11 @@ async function loadRepositoryDetails(entry) {
     // README links are rendered/replaced inside the analysis pane. Delegate
     // here rather than binding to #readmePreview, which does not exist yet.
     $('#analyzeResult')?.addEventListener('click', handleReadmePreviewClick);
+
+    // Community comment bodies are server-sanitized, so their repository links
+    // are recognized from the href at click time. Delegate on the panel rather
+    // than rewriting the sanitized HTML on every render.
+    $('#modelsCommunityPanel')?.addEventListener('click', handleCommunityLinkClick);
 
     $('#modelsDetailBack')?.addEventListener('click', () => traverseRepoHistory(-1));
     $('#modelsDetailForward')?.addEventListener('click', () => traverseRepoHistory(1));

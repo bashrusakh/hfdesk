@@ -385,7 +385,9 @@ function setAnalysis(files, overrides = {}) {
   sequence++;
   const analysis = {
     repo: `${ROOT}/case${sequence}`,
-    type: 'unknown',
+    // Unrecognized repositories are the smartdl "generic" type. The default
+    // tab is decided by this discriminator, not by the selectable-item list.
+    type: 'generic',
     branch: 'main',
     is_dataset: false,
     file_count: files.length,
