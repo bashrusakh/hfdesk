@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/pkg/hfdownloader"
 )
@@ -1668,7 +1669,7 @@ func TestAPI_ParseFiltersFromRepo(t *testing.T) {
 func TestAPI_ParseFiltersFromRepoPlanTwin(t *testing.T) {
 	hub := shardRangeHub(shardRangeContent())
 	defer hub.Close()
-	_, mux := newShardRangeServer(t, hub, Config{})
+	s, mux := newShardRangeServer(t, hub, Config{})
 
 	code, plan, raw := postPlanResponse(t, mux, "/api/plan",
 		DownloadRequest{Repo: "owner/model:model-00001,model-00003"})
@@ -1696,6 +1697,56 @@ func TestAPI_ParseFiltersFromRepoPlanTwin(t *testing.T) {
 			t.Fatalf("details=%q, want the comma-split shorthand segment %s applied as a filter", errResp.ErrorDetail.Details, derived)
 		}
 	}
+
+	// LOCK pin: an EMPTY file part (`owner/model:`) leaves the request
+	// unfiltered — both endpoints plan the whole tree (a filter derived
+	// from an empty segment would match nothing and fail no_filter_match).
+	for _, path := range []string{"/api/plan", "/api/download"} {
+		req := DownloadRequest{Repo: "owner/model:"}
+		req.DryRun = path == "/api/download"
+		code, plan, raw := postPlanResponse(t, mux, path, req)
+		if code != http.StatusOK {
+			t.Fatalf("%s empty-file-part status=%d, want 200 unfiltered plan; body=%s", path, code, raw)
+		}
+		if plan.Repo != "owner/model" {
+			t.Fatalf("%s empty-file-part plan repo=%q, want the colon-stripped owner/model", path, plan.Repo)
+		}
+		want := "model-00001-of-00003.safetensors,model-00002-of-00003.safetensors,model-00003-of-00003.safetensors,config.json"
+		if got := strings.Join(planPathsOf(plan), ","); got != want {
+			t.Fatalf("%s empty-file-part paths=%s, want the unfiltered full tree %s", path, got, want)
+		}
+	}
+
+	// LOCK pins: the expansion's segment rules (trimmed; segments empty
+	// after trimming dropped) are observable only on the admitted job
+	// snapshot — the planner trims independently, and a dry-run plan never
+	// echoes filters.
+	for _, tc := range []struct {
+		repo string
+		want []string
+		end  JobStatus
+	}{
+		{"owner/model: model-00001 , model-00003 ", []string{"model-00001", "model-00003"}, JobStatusCompleted},
+		{"owner/model:q4_0,,q5_0", []string{"q4_0", "q5_0"}, JobStatusFailed},
+	} {
+		body, err := json.Marshal(DownloadRequest{Repo: tc.repo})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/download", bytes.NewReader(body)))
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("%q admission status=%d, want 202; body=%s", tc.repo, w.Code, w.Body.String())
+		}
+		var admitted Job
+		if err := json.Unmarshal(w.Body.Bytes(), &admitted); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(admitted.Filters, tc.want) {
+			t.Fatalf("%q derived filters=%v, want exactly %v", tc.repo, admitted.Filters, tc.want)
+		}
+		waitJobStatus(t, s.jobs, admitted.ID, tc.end, 10*time.Second)
+	}
 }
 
 // TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact pins
@@ -1719,18 +1770,32 @@ func TestAPIColonShorthandWithExplicitFiltersFailsClosedBeforeHubContact(t *test
 	mux := http.NewServeMux()
 	s.registerAPIRoutes(mux)
 
-	for _, path := range []string{"/api/plan", "/api/download"} {
-		code, resp, body := postStrict(mux, path, DownloadRequest{Repo: "owner/model:q4_0", Filters: []string{"q5_0"}})
-		if code != http.StatusBadRequest || resp.ID != "" {
-			t.Errorf("%s status=%d body=%s, want 400 with no admitted job", path, code, body)
-			continue
-		}
-		if resp.ErrorDetail == nil || resp.ErrorDetail.Code != "invalid_file_selection" {
-			t.Errorf("%s error_detail=%+v, want code invalid_file_selection; body=%s", path, resp.ErrorDetail, body)
-			continue
-		}
-		if !strings.Contains(resp.ErrorDetail.Details, "cannot be combined with explicit filters") {
-			t.Errorf("%s details=%q, want the shorthand+filters hint", path, resp.ErrorDetail.Details)
+	// Row 1 pins the documented details string verbatim (F2); row 2 (F3)
+	// pins the strictFiles side of the expansion condition: strict + colon
+	// + EMPTY filters takes the same named 400 instead of expanding.
+	for _, tc := range []struct {
+		name        string
+		req         DownloadRequest
+		wantDetails string
+	}{
+		{"non-strict with explicit filters", DownloadRequest{Repo: "owner/model:q4_0", Filters: []string{"q5_0"}},
+			"the owner/name:file shorthand cannot be combined with explicit filters — send one or the other"},
+		{"strict with an empty filters list", DownloadRequest{Repo: "owner/model:q4_0", StrictFiles: true},
+			"invalid strict file selection: the owner/name:file shorthand is not supported with strictFiles — send file paths in filters"},
+	} {
+		for _, path := range []string{"/api/plan", "/api/download"} {
+			code, resp, body := postStrict(mux, path, tc.req)
+			if code != http.StatusBadRequest || resp.ID != "" {
+				t.Errorf("%s %s: status=%d body=%s, want 400 with no admitted job", path, tc.name, code, body)
+				continue
+			}
+			if resp.ErrorDetail == nil || resp.ErrorDetail.Code != "invalid_file_selection" {
+				t.Errorf("%s %s: error_detail=%+v, want code invalid_file_selection; body=%s", path, tc.name, resp.ErrorDetail, body)
+				continue
+			}
+			if resp.ErrorDetail.Details != tc.wantDetails {
+				t.Errorf("%s %s: details=%q, want exactly %q", path, tc.name, resp.ErrorDetail.Details, tc.wantDetails)
+			}
 		}
 	}
 	if got := hubRequests.Load(); got != 0 {

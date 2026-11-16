@@ -820,7 +820,8 @@ Request:
 
 `repo` accepts the `owner/name:file` **colon shorthand**: when `strictFiles`
 is false and `filters` is empty (omitted or `[]`), the part after the first
-`:` is split on commas, each segment is trimmed, and the segments become the
+`:` is split on commas, each segment is trimmed, segments that are empty
+after trimming are dropped, and the remaining segments become the
 request's `filters` — `{"repo": "owner/name:q4_0,q5_0"}` plans `owner/name`
 with filters `["q4_0", "q5_0"]`, identically on `POST /api/plan` and
 `POST /api/download`. An empty file part (`owner/name:`) leaves the request
@@ -917,11 +918,11 @@ request alive.
 
 A malformed expression — an empty expression or segment, a non-numeric
 token, a zero or negative index, a reversed span such as `10-5`, or ranges
-without any selection (no explicit `filters` and no shorthand to derive them
-from) — is rejected with HTTP 400 and error code
-`invalid_shard_ranges` before any Hub contact, identically on `POST
-/api/plan` and `POST /api/download` (including `dryRun: true`), so a dry run
-never accepts a request the real download rejects.
+without any selection (no explicit `filters` and no shorthand with a
+non-empty file part to derive them from) — is rejected with HTTP 400 and
+error code `invalid_shard_ranges` before any Hub contact, identically on
+`POST /api/plan` and `POST /api/download` (including `dryRun: true`), so a
+dry run never accepts a request the real download rejects.
 
 Ranges never fail silently: their diagnostics ride the established `notices`
 array defined above (a download job then reports the same sentences in its
