@@ -285,9 +285,9 @@ func TestRepoInfo_MultimodalRecommendedDownloadBundlesMMProj(t *testing.T) {
 }
 
 // ternaryBonsaiFiles mirrors prism-ml/Ternary-Bonsai-2-27B-gguf: an F16
-// artifact too large for the default rule, a low-quality Q2_0, two
-// unrecognized quant files, and two mmproj companions. No artifact satisfies
-// recommendedQuantIndex, so no LLM quant is recommended.
+// artifact too large for the default rule, a low-quality Q2_0, two custom
+// ternary packings that are never auto-recommended, and two mmproj companions.
+// No artifact satisfies recommendedQuantIndex, so no LLM quant is recommended.
 func ternaryBonsaiFiles() []FileInfo {
 	const gib = int64(1024 * 1024 * 1024)
 	return []FileInfo{
@@ -400,6 +400,9 @@ func TestApplyGGUFRAMBudgetBundlesProjectorWithBudgetPickedQuant(t *testing.T) {
 	repo.PopulateDownloadSelection()
 
 	quant := recommendedQuantFiles(t, repo.SelectableItems)
+	if got, want := quant, []string{"Ternary-Bonsai-2-27B-Q2_0.gguf"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("budget fallback recommended %v, want %v (custom packings are never auto-recommended)", got, want)
+	}
 	vision := selectableItemsByCategory(repo.SelectableItems, "vision_encoder")
 	var projectors []SelectableItem
 	for _, item := range vision {

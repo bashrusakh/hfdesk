@@ -16,7 +16,7 @@ import (
 
 func TestGGUFQuantClassificationUsesWholeTokensAndPathSeparators(t *testing.T) {
 	for _, tc := range []struct{ path, want string }{
-		{"Ternary-Bonsai-PQ2_0.gguf", ""},
+		{"Ternary-Bonsai-PQ2_0.gguf", "PQ2_0"},
 		{"model-Q4_0CUSTOM.gguf", ""},
 		{"model-Q6_K_FUTURE.gguf", ""},
 		{"model-Q4_0_CUSTOM.gguf", ""},
@@ -206,8 +206,8 @@ func TestGGUFArtifactIdentityIsIndependentOfQuantLabel(t *testing.T) {
 		{Name: "model-Q5_K_M-00002-of-00002.gguf", Path: "model-Q5_K_M-00002-of-00002.gguf", Size: 7},
 		{Name: "future-layout.gguf", Path: "future-layout.gguf", Size: 8},
 	}
-	if got := ggufQuantType(files[0]); got != "" {
-		t.Fatalf("PQ2_0 was misclassified as %q", got)
+	if got := ggufQuantType(files[0]); got != "PQ2_0" {
+		t.Fatalf("PQ2_0 classified as %q, want PQ2_0", got)
 	}
 
 	// Exercise the exact recommended body against the public planner using the
@@ -255,8 +255,8 @@ func TestGGUFArtifactIdentityIsIndependentOfQuantLabel(t *testing.T) {
 		"Q4_0 · a/b-c-Q4_0.gguf":               {"a/b-c-Q4_0.gguf"},
 		"Q4_0 · a-b/c-Q4_0.gguf":               {"a-b/c-Q4_0.gguf"},
 		"Q5_K_M":                               {"model-Q5_K_M-00001-of-00002.gguf", "model-Q5_K_M-00002-of-00002.gguf"},
-		"Unknown · future-layout.gguf":         {"future-layout.gguf"},
-		"Unknown · Ternary-Bonsai-PQ2_0.gguf":  {"Ternary-Bonsai-PQ2_0.gguf"},
+		"Unknown":                              {"future-layout.gguf"},
+		"PQ2_0":                                {"Ternary-Bonsai-PQ2_0.gguf"},
 	} {
 		item, ok := byLabel[label]
 		if !ok || !reflect.DeepEqual(item.Files, want) {
