@@ -393,8 +393,9 @@ type Settings struct {
 //   - "plan_item": A file has been added to the download plan
 //   - "file_start": Download of a file has started
 //   - "file_preparing": Local preparation before transfer is running
-//   - "file_progress": Periodic progress update during download, including the
-//     last response-read and local-write activity timestamps
+//   - "file_progress": Periodic progress update during download, including
+//     the last response-read and local-write activity, the cumulative bytes
+//     read this run, and whether local work is in flight
 //   - "file_done": File download complete (check Message for "skip" info)
 //   - "retry": A retry attempt is being made
 //   - "error": An error occurred
@@ -436,9 +437,20 @@ type ProgressEvent struct {
 	// completed payload write. It is an activity timestamp, never a byte rate.
 	LastLocalWriteAt time.Time `json:"lastLocalWriteAt,omitempty"`
 
+	// ReadBytes is the cumulative bytes this run has read from the response
+	// body. Download speed and ETA derive from it; already-present resume
+	// bytes are never counted.
+	ReadBytes int64 `json:"readBytes,omitempty"`
+
+	// LocalWorkInFlight is true while a staging creation/preallocation call or
+	// a payload WriteAt is blocked in progress. The server keeps the file
+	// writing for as long as this is set, regardless of the last completed
+	// write's age.
+	LocalWorkInFlight bool `json:"localWorkInFlight,omitempty"`
+
 	// ActivityOnly marks a file_progress emitted during local preparation. It
 	// carries activity timestamps but no transfer-byte progress, so the server
-	// classifies the file without touching downloaded bytes or speed.
+	// classifies the file without touching downloaded bytes.
 	ActivityOnly bool `json:"activityOnly,omitempty"`
 
 	// Attempt is the retry attempt number (1-based).

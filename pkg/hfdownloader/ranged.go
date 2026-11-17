@@ -183,11 +183,12 @@ func claimStagingWithActivity(ctx context.Context, staging, publish, metaPath st
 		var retry bool
 		var cerr error
 		if activity != nil {
-			activity.noteLocalWrite()
+			activity.beginLocalWork()
 		}
 		state, retry, cerr = claimStagingLocked(staging, metaPath, it, job, commit, commitPinned, proofMode, currentFence)
 		if activity != nil {
 			activity.noteLocalWrite()
+			activity.finishLocalWork()
 		}
 		lock.release()
 		if cerr != nil {
@@ -736,6 +737,9 @@ func (w *boundedAtWriter) Write(p []byte) (int, error) {
 		n   int
 		err error
 	)
+	if w.activity != nil {
+		w.activity.beginLocalWork()
+	}
 	if w.writeAt != nil {
 		n, err = w.writeAt(p, w.base+w.written)
 	} else {
@@ -750,9 +754,12 @@ func (w *boundedAtWriter) Write(p []byte) (int, error) {
 		if w.measure != nil {
 			w.measure.writeBytes.Add(int64(n))
 		}
-		if w.onWrite != nil {
-			w.onWrite(p[:n])
-		}
+	}
+	if w.activity != nil {
+		w.activity.finishLocalWork()
+	}
+	if n > 0 && w.onWrite != nil {
+		w.onWrite(p[:n])
 	}
 	if err != nil {
 		return n, err
@@ -864,9 +871,10 @@ func (d *stagingDownload) flushMetaLocked() error {
 	// claim durable before the record is persisted. Checkpoint boundaries only,
 	// never per write chunk.
 	if d.out != nil {
-		d.activity.noteLocalWrite()
+		d.activity.beginLocalWork()
 		err := syncStagingPayload(d.out)
 		d.activity.noteLocalWrite()
+		d.activity.finishLocalWork()
 		if err != nil {
 			return fmt.Errorf("sync staging payload of %s before its checkpoint: %w", d.it.RelativePath, err)
 		}
@@ -890,9 +898,10 @@ func (d *stagingDownload) flushMetaLocked() error {
 	defer lock.release()
 	// Record I/O inside the gate is local work; the acquisition wait above is
 	// not, so the activity clock starts only after the gate is held.
-	d.activity.noteLocalWrite()
+	d.activity.beginLocalWork()
 	err := writeStagingMetaOwnedLocked(d.meta, &meta)
 	d.activity.noteLocalWrite()
+	d.activity.finishLocalWork()
 	return err
 }
 
@@ -1022,7 +1031,8 @@ func (d *stagingDownload) resetClaim(open *os.File) (*os.File, error) {
 	defer lock.release()
 	// The gate wait above is another writer's work; the record replacement and
 	// payload reset below are this file's local progress.
-	d.activity.noteLocalWrite()
+	d.activity.beginLocalWork()
+	defer d.activity.finishLocalWork()
 	defer d.activity.noteLocalWrite()
 	if !claimRecordOwnedLocked(d.meta) {
 		return nil, errStagingClaimLost
@@ -1200,10 +1210,11 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 			case <-tickerDone:
 				return
 			case <-t.C:
-				readAt, writeAt := d.activity.snapshot()
+				readAt, writeAt, readBytes, inFlight := d.activity.snapshot()
 				emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
 					Downloaded: d.baseCommitted.Load() + d.progress.Load(), Total: it.Size,
 					LastReadAt: readAt, LastLocalWriteAt: writeAt,
+					ReadBytes: readBytes, LocalWorkInFlight: inFlight,
 					ActivityOnly: !d.prepDone.Load()})
 			}
 		}
@@ -1230,9 +1241,10 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	if state.fresh {
 		openFlags |= os.O_CREATE
 	}
-	d.activity.noteLocalWrite()
+	d.activity.beginLocalWork()
 	out, err := os.OpenFile(stg, openFlags, 0o644)
 	d.activity.noteLocalWrite()
+	d.activity.finishLocalWork()
 	if err != nil && !state.fresh && errors.Is(err, os.ErrNotExist) {
 		out, err = d.resetClaim(nil)
 		if err == nil {
@@ -1265,9 +1277,10 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	d.out = out
 	defer d.closeOut()
 	if state.fresh {
-		d.activity.noteLocalWrite()
+		d.activity.beginLocalWork()
 		err := truncateStagingPayload(out, it.Size)
 		d.activity.noteLocalWrite()
+		d.activity.finishLocalWork()
 		if err != nil {
 			return false, err
 		}
@@ -1462,9 +1475,9 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 
 	// Report full transfer progress, then finalizing before optional content proof
 	// and publication so the UI does not sit silently at 100%.
-	readAt, writeAt := d.activity.snapshot()
+	readAt, writeAt, readBytes, inFlight := d.activity.snapshot()
 	emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size,
-		LastReadAt: readAt, LastLocalWriteAt: writeAt})
+		LastReadAt: readAt, LastLocalWriteAt: writeAt, ReadBytes: readBytes, LocalWorkInFlight: inFlight})
 	emit(ProgressEvent{Event: "file_finalizing", Path: it.RelativePath, Message: "finalizing"})
 
 	// Measure this call's proof/publication interval after the finalizing callback;

@@ -55,17 +55,23 @@ func TestActivityReaderNotesOnlyDeliveredBytes(t *testing.T) {
 	}()
 
 	<-reader.started
-	if readAt, writeAt := activity.snapshot(); !readAt.IsZero() || !writeAt.IsZero() {
-		t.Fatalf("activity recorded before bytes arrived: read=%v write=%v", readAt, writeAt)
+	if readAt, writeAt, readBytes, inFlight := activity.snapshot(); !readAt.IsZero() || !writeAt.IsZero() || readBytes != 0 || inFlight {
+		t.Fatalf("activity recorded before bytes arrived: read=%v write=%v bytes=%d inFlight=%v", readAt, writeAt, readBytes, inFlight)
 	}
 
 	close(reader.release)
 	if err := <-done; err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	readAt, writeAt := activity.snapshot()
+	readAt, writeAt, readBytes, inFlight := activity.snapshot()
 	if readAt.IsZero() {
 		t.Fatal("read activity was not recorded after bytes arrived")
+	}
+	if readBytes != 4 {
+		t.Fatalf("read bytes = %d, want 4", readBytes)
+	}
+	if inFlight {
+		t.Fatal("a read must not mark local work in flight")
 	}
 	if !writeAt.IsZero() {
 		t.Fatalf("write activity = %v, want none for a pure read", writeAt)
@@ -103,17 +109,23 @@ func TestBoundedAtWriterNotesWriteOnlyOnCompletion(t *testing.T) {
 	}()
 
 	<-started
-	if _, writeAt := activity.snapshot(); !writeAt.IsZero() {
-		t.Fatalf("write activity recorded while WriteAt is still blocked: %v", writeAt)
+	if _, writeAt, readBytes, inFlight := activity.snapshot(); !writeAt.IsZero() || readBytes != 0 || !inFlight {
+		t.Fatalf("blocked write state: write=%v bytes=%d inFlight=%v, want zero write, zero reads and in-flight", writeAt, readBytes, inFlight)
 	}
 
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	_, writeAt := activity.snapshot()
+	_, writeAt, readBytes, inFlight := activity.snapshot()
 	if writeAt.IsZero() {
 		t.Fatal("write activity was not recorded after completion")
+	}
+	if inFlight {
+		t.Fatal("local work is still marked in flight after completion")
+	}
+	if readBytes != 0 {
+		t.Fatalf("read bytes = %d after a pure write, want 0", readBytes)
 	}
 }
 
@@ -161,6 +173,7 @@ func TestMultipartPrepProgressReportsLocalActivity(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	prepSamples := 0
+	prepInFlight := 0
 	for _, s := range samples {
 		if !s.evt.ActivityOnly {
 			continue
@@ -168,6 +181,12 @@ func TestMultipartPrepProgressReportsLocalActivity(t *testing.T) {
 		prepSamples++
 		if s.evt.Downloaded != 0 {
 			t.Errorf("preparation sample reported %d transferred bytes, want 0", s.evt.Downloaded)
+		}
+		if s.evt.ReadBytes != 0 {
+			t.Errorf("preparation sample reported %d read bytes, want 0", s.evt.ReadBytes)
+		}
+		if s.evt.LocalWorkInFlight {
+			prepInFlight++
 		}
 		if !s.evt.LastReadAt.IsZero() {
 			t.Errorf("preparation sample reported a read at %v", s.evt.LastReadAt)
@@ -181,6 +200,9 @@ func TestMultipartPrepProgressReportsLocalActivity(t *testing.T) {
 	if prepSamples < 2 {
 		t.Fatalf("preparation activity samples = %d, want at least two during the 600 ms truncate", prepSamples)
 	}
+	if prepInFlight == 0 {
+		t.Fatal("no preparation sample reported the slow truncate as local work in flight")
+	}
 
 	last := samples[len(samples)-1]
 	if last.evt.ActivityOnly {
@@ -188,6 +210,9 @@ func TestMultipartPrepProgressReportsLocalActivity(t *testing.T) {
 	}
 	if last.evt.LastReadAt.IsZero() {
 		t.Error("the final progress sample has no read activity")
+	}
+	if last.evt.ReadBytes <= 0 {
+		t.Error("the final progress sample has no read bytes")
 	}
 	if last.evt.LastLocalWriteAt.IsZero() {
 		t.Error("the final progress sample has no local-write activity")
@@ -257,6 +282,12 @@ func TestMultipartClaimWaitIsNotLocalActivity(t *testing.T) {
 		if !s.evt.ActivityOnly {
 			t.Errorf("sample before the gate release is not activity-only")
 		}
+		if s.evt.LocalWorkInFlight {
+			t.Errorf("waiting on the metadata gate reported local work in flight")
+		}
+		if s.evt.ReadBytes != 0 {
+			t.Errorf("waiting on the metadata gate reported %d read bytes", s.evt.ReadBytes)
+		}
 		if !s.evt.LastLocalWriteAt.IsZero() {
 			t.Errorf("waiting on the metadata gate recorded local-write activity at %v", s.evt.LastLocalWriteAt)
 		}
@@ -309,5 +340,51 @@ func TestSingleProgressCarriesActivityTimestamps(t *testing.T) {
 	if last.LastReadAt.IsZero() || last.LastLocalWriteAt.IsZero() {
 		t.Fatalf("final activity = read %v, write %v; want both set",
 			last.LastReadAt, last.LastLocalWriteAt)
+	}
+}
+
+// TestSingleResumeReadCounterExcludesInheritedBytes checks that bytes already
+// on disk from a previous run never enter the read counter used for speed/ETA.
+func TestSingleResumeReadCounterExcludesInheritedBytes(t *testing.T) {
+	full := rangedTestPayload(200)
+	const partialN = 80
+	dst := filepath.Join(t.TempDir(), "resume-activity.bin")
+	job := Job{Repo: "o/r"}
+	it := PlanItem{RelativePath: "resume-activity.bin", Size: int64(len(full))}
+	seedSinglePartial(t, dst, full[:partialN], job, it, singleTestIdentity)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+	}))
+	t.Cleanup(srv.Close)
+	it.URL = srv.URL + "/resume-activity.bin"
+
+	var (
+		mu     sync.Mutex
+		events []ProgressEvent
+	)
+	emit := func(ev ProgressEvent) {
+		if ev.Event != "file_progress" {
+			return
+		}
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", job, Settings{Retries: 0}, it, dst, singleTestIdentity, emit); err != nil {
+		t.Fatalf("downloadSingle: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatal("no file_progress events were emitted")
+	}
+	last := events[len(events)-1]
+	if last.Downloaded != int64(len(full)) {
+		t.Fatalf("final downloaded = %d, want %d", last.Downloaded, len(full))
+	}
+	if last.ReadBytes != int64(len(full)-partialN) {
+		t.Fatalf("read bytes = %d, want %d remaining bytes only", last.ReadBytes, len(full)-partialN)
 	}
 }

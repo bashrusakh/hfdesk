@@ -1507,17 +1507,18 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	const unboundedBody = int64(^uint64(0) >> 1)
 
 	tmp := dst + ".part"
+	// activity carries the last response-read and local-write instants, the
+	// bytes read this run, and whether local work is in flight on every
+	// file_progress the single path emits from its write hook.
+	var activity fileActivity
+	activity.beginLocalWork()
 	out, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE, 0o644)
+	activity.noteLocalWrite()
+	activity.finishLocalWork()
 	if err != nil {
 		return false, err
 	}
 	defer out.Close()
-
-	// activity carries the last response-read and local-write instants on every
-	// file_progress the single path emits from its write hook. It is the only
-	// signal the server classifies.
-	var activity fileActivity
-	activity.noteLocalWrite()
 
 	// Bind the partial to the object; path-derived names can be shared across
 	// objects and revisions.
@@ -1611,10 +1612,13 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	if !sizeValid {
 		identity.Offset = 0
 	}
+	activity.beginLocalWork()
 	if err := persistSinglePartIdentity(out, sidecar, identity); err != nil {
+		activity.finishLocalWork()
 		return false, fmt.Errorf("write single-part identity %s: %w", sidecar, err)
 	}
 	activity.noteLocalWrite()
+	activity.finishLocalWork()
 
 	// Discard oversized partials and any partial with unknown expected size.
 	if !sizeValid {
@@ -1633,9 +1637,9 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	// An exact-size partial may finalize only with clean-framing proof.
 	if it.Size > 0 && pos == it.Size {
 		if identity.FramingComplete {
-			readAt, writeAt := activity.snapshot()
+			readAt, writeAt, readBytes, inFlight := activity.snapshot()
 			emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size,
-				LastReadAt: readAt, LastLocalWriteAt: writeAt})
+				LastReadAt: readAt, LastLocalWriteAt: writeAt, ReadBytes: readBytes, LocalWorkInFlight: inFlight})
 			return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)
 		}
 		// Written size does not prove clean EOF. Reserve and re-request the final
@@ -1653,9 +1657,9 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		forceLastByteRange = pos == 0
 	}
 	if pos > 0 {
-		readAt, writeAt := activity.snapshot()
+		readAt, writeAt, readBytes, inFlight := activity.snapshot()
 		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: pos, Total: it.Size,
-			LastReadAt: readAt, LastLocalWriteAt: writeAt})
+			LastReadAt: readAt, LastLocalWriteAt: writeAt, ReadBytes: readBytes, LocalWorkInFlight: inFlight})
 		downloadLog.Info("resuming download",
 			"repo", job.Repo,
 			"path", it.RelativePath,
@@ -1829,10 +1833,10 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						countedUpTo = end
 						if now := time.Now(); now.Sub(lastEmit) >= 200*time.Millisecond {
 							lastEmit = now
-							readAt, writeAt := activity.snapshot()
+							readAt, writeAt, readBytes, inFlight := activity.snapshot()
 							emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
 								Downloaded: end, Total: it.Size,
-								LastReadAt: readAt, LastLocalWriteAt: writeAt})
+								LastReadAt: readAt, LastLocalWriteAt: writeAt, ReadBytes: readBytes, LocalWorkInFlight: inFlight})
 						}
 					}
 					_, cerr := io.Copy(w, noted)
@@ -1862,10 +1866,10 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						if werr != nil {
 							return false, fmt.Errorf("persist single-part framing checkpoint %s: %w", sidecar, werr)
 						}
-						readAt, writeAt := activity.snapshot()
+						readAt, writeAt, readBytes, inFlight := activity.snapshot()
 						emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
 							Downloaded: countedUpTo, Total: it.Size,
-							LastReadAt: readAt, LastLocalWriteAt: writeAt})
+							LastReadAt: readAt, LastLocalWriteAt: writeAt, ReadBytes: readBytes, LocalWorkInFlight: inFlight})
 						return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)
 					}
 					attemptCancel()

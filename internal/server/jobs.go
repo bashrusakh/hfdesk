@@ -158,8 +158,10 @@ type JobFileProgress struct {
 	Downloaded int64  `json:"downloaded"`
 	Status     string `json:"status"` // pending, active, preparing, writing, finalizing, complete, skipped, error
 
-	progressed     bool  `json:"-"` // saw a real file_progress event for this file
-	baseDownloaded int64 `json:"-"` // bytes already on disk at first progress (resume position), excluded from speed
+	// readBytes is the last cumulative response-body read count reported for
+	// this file. Speed and ETA derive from it; it never includes resume bytes
+	// already on disk.
+	readBytes int64 `json:"-"`
 }
 
 const (
@@ -175,18 +177,32 @@ const (
 )
 
 // classifyActivity decides a file's transfer state from the downloader's last
-// read and last local-write instants. A recent read means the network is
-// delivering, so the file is active. With reads stalled, local progress newer
-// than the last read means the file is writing to disk. With both stale this
-// is a stalled transfer, not local work, so the current state is kept.
-func classifyActivity(status string, lastRead, lastWrite, now time.Time) string {
+// read and last local-write instants plus its in-flight local-work flag. A
+// recent read means the network is delivering, so the file is active. Local
+// work that is blocked in right now means the file is writing regardless of
+// how long it has run; otherwise newer completed local progress means writing.
+// With both stale this is a stalled transfer, so the current state is kept.
+func classifyActivity(status string, lastRead, lastWrite time.Time, inFlight bool, now time.Time) string {
 	if !lastRead.IsZero() && now.Sub(lastRead) <= activityReadHold {
 		return "active"
+	}
+	if inFlight {
+		return "writing"
 	}
 	if !lastWrite.IsZero() && lastWrite.After(lastRead) && now.Sub(lastWrite) <= activityWriteHold {
 		return "writing"
 	}
 	return status
+}
+
+// resetSpeedBaseline clears the transfer-rate history so a file's transition
+// from local creation/writes to network reads does not fold the local phase
+// into the ETA average.
+func resetSpeedBaseline(job *Job) {
+	job.speedSamples = nil
+	job.speedRunStart = time.Time{}
+	job.Progress.BytesPerSecond = 0
+	job.Progress.EtaSeconds = 0
 }
 
 // JobManager manages download jobs.
@@ -1541,14 +1557,15 @@ func (m *JobManager) snapshotConfig() Config {
 // network-adapter graph.
 const speedWindow = 10 * time.Second
 
-// updateJobSpeed recomputes BytesPerSecond from the cumulative bytes
-// transferred this run (skipped/already-present bytes excluded). The rate is
-// averaged over a sliding speedWindow, then blended into the previous reading
-// with a mild EMA — the windowed average alone still jitters as old samples
-// fall off the window, and that jitter makes the displayed speed (and any ETA
-// derived from it) jump around. Samples are throttled to a few per second so
-// the window stays small. now is passed in for deterministic testing.
-func updateJobSpeed(job *Job, transferred int64, now time.Time) {
+// updateJobSpeed recomputes BytesPerSecond from the cumulative bytes read from
+// the response bodies this run (already-present resume bytes never count and
+// local writes never contribute). The rate is averaged over a sliding
+// speedWindow, then blended into the previous reading with a mild EMA — the
+// windowed average alone still jitters as old samples fall off the window, and
+// that jitter makes the displayed speed (and any ETA derived from it) jump
+// around. Samples are throttled to a few per second so the window stays small.
+// now is passed in for deterministic testing.
+func updateJobSpeed(job *Job, readBytes int64, now time.Time) {
 	if n := len(job.speedSamples); n > 0 && now.Sub(job.speedSamples[n-1].t) < 400*time.Millisecond {
 		return
 	}
@@ -1563,13 +1580,13 @@ func updateJobSpeed(job *Job, transferred int64, now time.Time) {
 			kept = append(kept, s)
 		}
 	}
-	kept = append(kept, speedSample{t: now, bytes: transferred})
+	kept = append(kept, speedSample{t: now, bytes: readBytes})
 	job.speedSamples = kept
 
 	oldest := kept[0]
 	span := now.Sub(oldest.t).Seconds()
 	if span >= 1.0 {
-		rate := float64(transferred-oldest.bytes) / span
+		rate := float64(readBytes-oldest.bytes) / span
 		if rate < 0 {
 			rate = 0
 		}
@@ -1578,22 +1595,23 @@ func updateJobSpeed(job *Job, transferred int64, now time.Time) {
 		}
 		job.Progress.BytesPerSecond = int64(rate)
 	}
-	updateJobETA(job, transferred, now)
+	updateJobETA(job, readBytes, now)
 }
 
-// updateJobETA recomputes EtaSeconds. The predictor is mostly the whole-run
-// average rate (transferred / elapsed) — for remaining-time estimation the
-// long-run average is far steadier than the displayed speed, the way curl and
-// rsync compute their ETAs — blended with a little of the current smoothed
+// updateJobETA recomputes EtaSeconds from the read-based transfer rate while
+// remaining work stays the committed bytes left. The predictor is mostly the
+// whole-run average rate (readBytes / elapsed) — for remaining-time estimation
+// the long-run average is far steadier than the displayed speed, the way curl
+// and rsync compute their ETAs — blended with a little of the current smoothed
 // speed so a genuine, lasting throughput change still pulls the estimate over.
-func updateJobETA(job *Job, transferred int64, now time.Time) {
+func updateJobETA(job *Job, readBytes int64, now time.Time) {
 	remaining := job.Progress.TotalBytes - job.Progress.DownloadedBytes
 	elapsed := now.Sub(job.speedRunStart).Seconds()
-	if remaining <= 0 || elapsed < 1.0 || transferred <= 0 {
+	if remaining <= 0 || elapsed < 1.0 || readBytes <= 0 {
 		job.Progress.EtaSeconds = 0
 		return
 	}
-	runAvg := float64(transferred) / elapsed
+	runAvg := float64(readBytes) / elapsed
 	predictor := 0.7*runAvg + 0.3*float64(job.Progress.BytesPerSecond)
 	if predictor <= 0 {
 		job.Progress.EtaSeconds = 0
@@ -1691,47 +1709,40 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 	case "file_progress":
 		for i := range job.Files {
 			if job.Files[i].Path == evt.Path {
+				wasWriting := job.Files[i].Status == "writing"
 				switch job.Files[i].Status {
 				case "pending":
-					job.Files[i].Status = classifyActivity("active", evt.LastReadAt, evt.LastLocalWriteAt, now)
+					job.Files[i].Status = classifyActivity("active", evt.LastReadAt, evt.LastLocalWriteAt, evt.LocalWorkInFlight, now)
 				case "preparing", "active", "writing":
-					job.Files[i].Status = classifyActivity(job.Files[i].Status, evt.LastReadAt, evt.LastLocalWriteAt, now)
+					job.Files[i].Status = classifyActivity(job.Files[i].Status, evt.LastReadAt, evt.LastLocalWriteAt, evt.LocalWorkInFlight, now)
 				}
+				if wasWriting && job.Files[i].Status == "active" {
+					// The first read after local creation/writes starts the
+					// transfer clock; local time must not enter the ETA average.
+					resetSpeedBaseline(job)
+				}
+				job.Files[i].readBytes = evt.ReadBytes
 				if !evt.ActivityOnly {
-					if !job.Files[i].progressed {
-						// First real progress for this file: record the bytes
-						// already on disk (resume position) so they aren't
-						// counted toward the live transfer speed.
-						job.Files[i].progressed = true
-						job.Files[i].baseDownloaded = evt.Downloaded
-					}
 					job.Files[i].Downloaded = evt.Downloaded
 				}
 				break
 			}
 		}
 		refreshLocalPhase(job)
-		if evt.ActivityOnly {
-			// Preparation activity selects the file state but carries no
-			// transfer bytes; leave the progress and speed accounting alone.
-			break
-		}
 		// total drives the progress bar (includes skipped/already-present
-		// bytes); transferred drives the speed (only bytes moved this run).
-		// During the resume-recovery window (resumeFloor > 0) the running
-		// sum under-counts because plan_item has already added the full
-		// file list but only the one processed file has Downloaded > 0,
-		// which would clobber the value ResumeJob preserved. The
-		// monotonic guard keeps the preserved value on screen until the
-		// sum catches up, at which point the floor is released and a
-		// genuine rollback (e.g. downloadSingle's 200 fallback on a
-		// range request truncating the .part file) propagates immediately.
-		var total, transferred int64
+		// bytes); readTotal drives speed and ETA (only bytes actually read this
+		// run, so already-present resume bytes never count). During the
+		// resume-recovery window (resumeFloor > 0) the running sum under-counts
+		// because plan_item has already added the full file list but only the
+		// one processed file has Downloaded > 0, which would clobber the value
+		// ResumeJob preserved. The monotonic guard keeps the preserved value on
+		// screen until the sum catches up, at which point the floor is released
+		// and a genuine rollback (e.g. downloadSingle's 200 fallback on a range
+		// request truncating the .part file) propagates immediately.
+		var total, readTotal int64
 		for _, f := range job.Files {
 			total += f.Downloaded
-			if f.progressed {
-				transferred += f.Downloaded - f.baseDownloaded
-			}
+			readTotal += f.readBytes
 		}
 		if job.resumeFloor > 0 {
 			if total > job.Progress.DownloadedBytes {
@@ -1743,7 +1754,7 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 		} else {
 			job.Progress.DownloadedBytes = total
 		}
-		updateJobSpeed(job, transferred, now)
+		updateJobSpeed(job, readTotal, now)
 
 	case "file_finalizing":
 		// The file's bytes are all on disk; part assembly, hash verification

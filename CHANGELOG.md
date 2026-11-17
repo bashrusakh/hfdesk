@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- A disk-bound download reports the file as `writing` and shows the real local-write phase instead of a network speed and ETA. (#208)
+- A disk-bound or preallocating download shows the local `writing` phase for the whole creation/write window, and speed/ETA come from network reads so creation time is not mistaken for a transfer rate. (#208)
 
 ### Changed
 

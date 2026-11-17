@@ -233,3 +233,157 @@ func TestJobJSONExposesWritingFileStatus(t *testing.T) {
 		}
 	}
 }
+
+// TestApplyJobProgressCreationInFlightKeepsWriting covers the reported creation
+// window: 80 s of preallocation with no network reads must stay writing and
+// must not build a read-based rate or ETA.
+func TestApplyJobProgressCreationInFlightKeepsWriting(t *testing.T) {
+	h := newActivityHarness(t, "a.gguf")
+	h.apply(hfdownloader.ProgressEvent{Event: "file_preparing", Path: "a.gguf"})
+	lastWrite := h.now.Add(-time.Second)
+
+	for i := 0; i < 400; i++ { // 80 s at the 200 ms progress cadence
+		h.now = h.now.Add(200 * time.Millisecond)
+		h.apply(hfdownloader.ProgressEvent{
+			Event: "file_progress", Path: "a.gguf", Total: activityTestTotal,
+			LastLocalWriteAt: lastWrite, LocalWorkInFlight: true, ActivityOnly: true,
+		})
+		if i%40 != 0 && i != 399 {
+			continue
+		}
+		if got := h.status("a.gguf"); got != "writing" {
+			t.Fatalf("tick %d: file status = %q, want writing for the whole creation window", i, got)
+		}
+		if h.job.Phase != "writing" {
+			t.Fatalf("tick %d: phase = %q, want writing", i, h.job.Phase)
+		}
+		if h.job.Progress.BytesPerSecond != 0 {
+			t.Fatalf("tick %d: bytesPerSecond = %d, want 0 from the read counter", i, h.job.Progress.BytesPerSecond)
+		}
+		if h.job.Progress.EtaSeconds != 0 {
+			t.Fatalf("tick %d: etaSeconds = %d, want 0 while no reads arrive", i, h.job.Progress.EtaSeconds)
+		}
+	}
+}
+
+// TestApplyJobProgressFirstReadResetsSpeedBaseline checks that the transfer
+// clock starts at the first read, not at the start of file creation.
+func TestApplyJobProgressFirstReadResetsSpeedBaseline(t *testing.T) {
+	const total = int64(20 << 20)
+	job := &Job{ID: "first-read"}
+	now := time.Unix(1_700_000_000, 0)
+	apply := func(evt hfdownloader.ProgressEvent) { applyJobProgress(job, evt, now) }
+
+	apply(hfdownloader.ProgressEvent{Event: "plan_item", Path: "a.gguf", Total: total})
+	apply(hfdownloader.ProgressEvent{Event: "file_start", Path: "a.gguf"})
+	apply(hfdownloader.ProgressEvent{Event: "file_preparing", Path: "a.gguf"})
+	lastWrite := now.Add(-time.Second)
+
+	// 80 s of local creation with no reads.
+	for i := 0; i < 400; i++ {
+		now = now.Add(200 * time.Millisecond)
+		apply(hfdownloader.ProgressEvent{
+			Event: "file_progress", Path: "a.gguf", Total: total,
+			LastLocalWriteAt: lastWrite, LocalWorkInFlight: true, ActivityOnly: true,
+		})
+	}
+
+	// First read: active, and the speed history starts here.
+	now = now.Add(200 * time.Millisecond)
+	apply(hfdownloader.ProgressEvent{
+		Event: "file_progress", Path: "a.gguf", Total: total,
+		Downloaded: 1000, ReadBytes: 1000,
+		LastReadAt: now, LastLocalWriteAt: lastWrite,
+	})
+	if job.Files[0].Status != "active" {
+		t.Fatalf("file status after the first read = %q, want active", job.Files[0].Status)
+	}
+	if len(job.speedSamples) != 1 || !job.speedRunStart.Equal(now) {
+		t.Fatalf("speed baseline = %d samples starting %v, want one sample at %v",
+			len(job.speedSamples), job.speedRunStart, now)
+	}
+	if job.Progress.BytesPerSecond != 0 || job.Progress.EtaSeconds != 0 {
+		t.Fatalf("speed/ETA after the reset = %d B/s, %d s, want 0", job.Progress.BytesPerSecond, job.Progress.EtaSeconds)
+	}
+
+	// 5 s of reads at 2 MB/s; committed bytes advance ten times slower.
+	readBytes, downloaded := int64(1000), int64(1000)
+	for i := 0; i < 25; i++ {
+		now = now.Add(200 * time.Millisecond)
+		readBytes += 400_000
+		downloaded += 100_000
+		apply(hfdownloader.ProgressEvent{
+			Event: "file_progress", Path: "a.gguf", Total: total,
+			Downloaded: downloaded, ReadBytes: readBytes,
+			LastReadAt: now, LastLocalWriteAt: lastWrite,
+		})
+	}
+	if speed := job.Progress.BytesPerSecond; speed < 1_500_000 || speed > 2_500_000 {
+		t.Fatalf("bytesPerSecond = %d, want the ~2 MB/s read rate", speed)
+	}
+	// Remaining ~17.5 MB at 2 MB/s is about 9 s; folding in the 80 s creation
+	// window would put this in the hundreds of seconds.
+	if eta := job.Progress.EtaSeconds; eta <= 0 || eta > 30 {
+		t.Fatalf("etaSeconds = %d, want a transfer-only estimate (<= 30 s)", eta)
+	}
+}
+
+// TestApplyJobProgressBlockedWriteInFlightKeepsWriting checks that a write that
+// blocks for 10 s stays writing instead of ageing out of a 5 s window.
+func TestApplyJobProgressBlockedWriteInFlightKeepsWriting(t *testing.T) {
+	h := newActivityHarness(t, "a.gguf")
+	lastRead := h.ago(10 * time.Second)
+	lastWrite := h.ago(100 * time.Millisecond)
+
+	for i := 0; i < 50; i++ { // 10 s with no completed write and no read
+		h.now = h.now.Add(200 * time.Millisecond)
+		h.apply(hfdownloader.ProgressEvent{
+			Event: "file_progress", Path: "a.gguf", Total: activityTestTotal,
+			LastReadAt: lastRead, LastLocalWriteAt: lastWrite, LocalWorkInFlight: true,
+		})
+		if got := h.status("a.gguf"); got != "writing" {
+			t.Fatalf("tick %d: file status = %q, want writing while the write is in flight", i, got)
+		}
+		if h.job.Phase != "writing" {
+			t.Fatalf("tick %d: phase = %q, want writing", i, h.job.Phase)
+		}
+	}
+}
+
+// TestApplyJobProgressSpeedUsesReadBytes checks that committed writes do not
+// drive the transfer rate: only response reads do.
+func TestApplyJobProgressSpeedUsesReadBytes(t *testing.T) {
+	h := newActivityHarness(t, "a.gguf")
+	lastWrite := h.ago(100 * time.Millisecond)
+	readBytes, downloaded := int64(0), int64(0)
+
+	for i := 0; i < 12; i++ {
+		h.now = h.now.Add(400 * time.Millisecond)
+		readBytes += 800_000 // 2 MB/s
+		downloaded += 20_000 // 50 KB/s committed
+		h.apply(hfdownloader.ProgressEvent{
+			Event: "file_progress", Path: "a.gguf", Total: activityTestTotal,
+			Downloaded: downloaded, ReadBytes: readBytes,
+			LastReadAt: h.now, LastLocalWriteAt: lastWrite,
+		})
+	}
+	if speed := h.job.Progress.BytesPerSecond; speed < 1_500_000 || speed > 2_500_000 {
+		t.Fatalf("bytesPerSecond = %d, want the ~2 MB/s read rate, not 50 KB/s committed", speed)
+	}
+
+	// Reads stop; committed bytes keep advancing. The displayed rate must fall
+	// away from the committed rate rather than follow it. The 10 s speed
+	// window needs to age out the last read samples first.
+	for i := 0; i < 30; i++ {
+		h.now = h.now.Add(400 * time.Millisecond)
+		downloaded += 80_000
+		h.apply(hfdownloader.ProgressEvent{
+			Event: "file_progress", Path: "a.gguf", Total: activityTestTotal,
+			Downloaded: downloaded, ReadBytes: readBytes,
+			LastReadAt: h.now.Add(-10 * time.Second), LastLocalWriteAt: lastWrite,
+		})
+	}
+	if speed := h.job.Progress.BytesPerSecond; speed > 200_000 {
+		t.Fatalf("bytesPerSecond = %d, want the rate to fall when reads stop", speed)
+	}
+}
