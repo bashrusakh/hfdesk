@@ -2285,8 +2285,35 @@ a {
 
 .cache-detail-repo {
   min-width: 0;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  font-family: inherit;
   font-size: 16px;
+  font-weight: inherit;
+  line-height: inherit;
+  text-align: left;
   overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.cache-detail-repo:hover {
+  color: var(--color-primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.cache-detail-repo:hover .cache-detail-owner,
+.cache-detail-repo:hover .cache-detail-name {
+  color: var(--color-primary);
+}
+
+.cache-detail-repo:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
 }
 
 .cache-detail-owner {
@@ -2299,17 +2326,13 @@ a {
   color: var(--color-text);
 }
 
-.cache-detail-facts,
-.cache-detail-secondary {
+.cache-detail-facts {
   display: block;
   min-width: 0;
   max-width: 100%;
   margin: 0;
   color: var(--color-text-secondary);
   font-size: 12px;
-}
-
-.cache-detail-facts {
   overflow-wrap: anywhere;
 }
 
@@ -2322,18 +2345,6 @@ a {
 }
 
 .cache-detail-commit {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--color-text-secondary);
-}
-
-.cache-detail-secondary {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.cache-detail-secondary code {
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--color-text-secondary);

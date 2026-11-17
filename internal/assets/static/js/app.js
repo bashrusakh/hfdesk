@@ -4292,32 +4292,8 @@ async function loadRepositoryDetails(entry) {
       : { owner: '', name: value };
   }
 
-  function cacheDetailPathKey(value) {
-    return String(value || '').replace(/[\\/]+$/, '');
-  }
-
-  // The download line is the only surviving part of the old metadata grid:
-  // without a manifest the date, status, and command carry no provenance.
-  function cacheDetailDownloadHTML(data) {
-    const manifest = data.manifest;
-    if (!manifest) return '';
-    const facts = [];
-    if (manifest.downloaded) facts.push(`Downloaded ${escapeHtml(manifest.downloaded)}`);
-    if (data.downloadStatus === 'complete') {
-      facts.push('Complete download');
-    } else if (data.downloadStatus === 'filtered') {
-      facts.push(`Filtered download${manifest.filters ? ` (${escapeHtml(manifest.filters)})` : ''}`);
-    }
-    if (manifest.command) {
-      facts.push(`<code class="cache-detail-command" title="${escapeCacheDetailAttribute(manifest.command)}">${escapeHtml(manifest.command)}</code>`);
-    }
-    return facts.length
-      ? `<p class="cache-detail-secondary cache-detail-download">${facts.join(' <span class="cache-detail-sep" aria-hidden="true">·</span> ')}</p>`
-      : '';
-  }
-
-  // Identity, one line for the opened copy, and the two optional values that
-  // still add information: the friendly path and manifest provenance.
+  // Identity plus one line for the opened copy. Paths live in the location
+  // select and download provenance stays in the manifest, not the header.
   function cacheDetailHeaderHTML(data) {
     const parts = cacheDetailsRepoParts(data.repo);
     const owner = data.owner || parts.owner;
@@ -4337,21 +4313,16 @@ async function loadRepositoryDetails(entry) {
     const factsLine = facts.length
       ? `<p class="cache-detail-facts"><span class="cache-detail-facts-prefix">This copy</span>${facts.map(fact => ` <span class="cache-detail-sep" aria-hidden="true">·</span> ${fact}`).join('')}</p>`
       : '';
-    const friendlyPath = typeof data.friendlyPath === 'string' ? data.friendlyPath : '';
-    const friendlyLine = friendlyPath && cacheDetailPathKey(friendlyPath) !== cacheDetailPathKey(data.path)
-      ? `<p class="cache-detail-secondary cache-detail-friendly"><span>Friendly view</span> <span class="cache-detail-sep" aria-hidden="true">·</span> <code title="${escapeCacheDetailAttribute(friendlyPath)}">${escapeHtml(friendlyPath)}</code></p>`
-      : '';
+    const repoLabel = owner ? `${owner}/${name}` : name;
     const hubLink = data.repo && source !== 'Local'
       ? `<a class="cache-detail-hub-link" href="https://huggingface.co/${data.type === 'dataset' ? 'datasets/' : ''}${encodeURI(data.repo)}" target="_blank" rel="noopener">HF Hub ↗</a>`
       : '';
     return `<div class="cache-detail-header">
         <div class="cache-detail-title-row">
-          <div class="cache-detail-repo">${owner ? `<span class="cache-detail-owner">${escapeHtml(owner)}/</span>` : ''}<span class="cache-detail-name">${escapeHtml(name)}</span></div>
+          <button class="cache-detail-repo" type="button" onclick="openCacheDetailsRepository()" aria-label="Open ${escapeCacheDetailAttribute(repoLabel)}">${owner ? `<span class="cache-detail-owner">${escapeHtml(owner)}/</span>` : ''}<span class="cache-detail-name">${escapeHtml(name)}</span></button>
           ${hubLink}
         </div>
         ${factsLine}
-        ${friendlyLine}
-        ${cacheDetailDownloadHTML(data)}
       </div>`;
   }
 
@@ -4442,10 +4413,11 @@ async function loadRepositoryDetails(entry) {
 
   function cacheDetailsLoadingHTML(repo, type) {
     const parts = cacheDetailsRepoParts(repo);
+    const repoLabel = parts.owner ? `${parts.owner}/${parts.name}` : parts.name;
     return `<div class="cache-detail-modal">
         <div class="cache-detail-header">
           <div class="cache-detail-title-row">
-            <div class="cache-detail-repo">${parts.owner ? `<span class="cache-detail-owner">${escapeHtml(parts.owner)}/</span>` : ''}<span class="cache-detail-name">${escapeHtml(parts.name)}</span></div>
+            <button class="cache-detail-repo" type="button" onclick="openCacheDetailsRepository()" aria-label="Open ${escapeCacheDetailAttribute(repoLabel)}">${parts.owner ? `<span class="cache-detail-owner">${escapeHtml(parts.owner)}/</span>` : ''}<span class="cache-detail-name">${escapeHtml(parts.name)}</span></button>
           </div>
         </div>
         <section id="cacheSelectionSection" class="cache-detail-section" role="status" aria-live="polite" aria-busy="true">
@@ -4461,6 +4433,14 @@ async function loadRepositoryDetails(entry) {
         ${cacheDetailResizeGripHTML()}
       </div>`;
   }
+
+  window.openCacheDetailsRepository = function() {
+    const context = activeCacheDetailsContext;
+    if (!context) return;
+    const { repo, type } = context;
+    hideModal();
+    navigateToAnalyze(repo, type, null);
+  };
 
   window.refreshCacheDetails = function() {
     const context = activeCacheDetailsContext;

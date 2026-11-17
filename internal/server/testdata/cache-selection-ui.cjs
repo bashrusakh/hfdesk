@@ -221,7 +221,12 @@ const context = {
   }
 };
 let source = fs.readFileSync(path.join(__dirname, '..', '..', 'assets', 'static', 'js', 'app.js'), 'utf8');
+source = source.replace(
+  '  function navigateToAnalyze(repoId, repoType = null, revision = null) {',
+  '  function navigateToAnalyze(repoId, repoType = null, revision = null) {\n    window.__navCalls.push([repoId, repoType, revision]);\n    return;'
+);
 source = source.replace('  // Start\n', `window.test = { showCacheDetails: window.showCacheDetails };\n  // Start\n`);
+window.__navCalls = [];
 vm.runInNewContext(source, context);
 
 const paths = Array.from({ length: 25 }, (_, i) => `family/file-${i}.gguf`);
@@ -273,6 +278,13 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   const factsHTML = headerHTML.match(/<p class="cache-detail-facts">([\s\S]*?)<\/p>/)?.[1] || '';
   assert.equal(textContent(factsHTML), 'This copy · 1 GB · 30 files · abcdef1', 'the facts line describes the opened copy compactly');
   assert(factsHTML.includes('<code class="cache-detail-commit" title="abcdef1234567890">abcdef1</code>'), 'the short commit keeps the full value in title');
+  assert(!factsHTML.includes('<button') && !factsHTML.includes('onclick='), 'the facts line stays non-interactive');
+  const repoButtonTag = headerHTML.match(/<button class="cache-detail-repo"[^>]*>/)?.[0] || '';
+  assert(repoButtonTag.includes('type="button"'), 'the repository title is a real button');
+  assert(repoButtonTag.includes('onclick="openCacheDetailsRepository()"'), 'the button delegates to the live-context handler');
+  assert(repoButtonTag.includes('aria-label="Open org/model"'), 'the button names the repository it opens');
+  assert(headerHTML.includes('<span class="cache-detail-owner">org/</span><span class="cache-detail-name">model</span></button>'), 'the repo line still reads owner/name');
+  assert(!headerHTML.includes('cache-detail-hub-link'), 'a local copy keeps no external Hub link');
   assert(!modalHTML.includes('id="cacheDetailPanelTitle"') && !modalHTML.includes('cache-detail-def'), 'the old This copy panel and definition rows are gone');
   assert(!modalHTML.includes('id="cacheLocationChange"') && !modalHTML.includes('id="cacheLocationPicker"'), 'the Change button and hidden picker are gone');
   assert(!modalHTML.includes('Not reported'), 'unreported facts are omitted rather than labelled');
@@ -288,8 +300,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert.equal(textContent(modalHTML.match(/<h4 id="cacheContentsHeading"[^>]*>([\s\S]*?)<\/h4>/)?.[1] || ''), 'GGUF groups', 'the contents heading is just GGUF groups');
   assert(!modalHTML.includes('cache-contents-location"><code'), 'the duplicate path line is gone');
   assert(!headerHTML.includes('/friendly/model') && !headerHTML.includes('/scan/one'), 'the header carries no location path');
-  assert(!modalHTML.includes('cache-detail-download'), 'without a manifest there is no download provenance line');
-  assert(!modalHTML.includes('cache-detail-friendly'), 'without a friendly path there is no friendly line');
+  assert(!modalHTML.includes('cache-detail-secondary'), 'the header carries no friendly or download secondary line');
   assert.equal(nodes.get('#cacheSelectionSection').querySelectorAll('.cache-selection-delete').filter(button => button.disabled).length, 1, 'only the unverifiable local group is disabled');
   assert(!modalHTML.includes('Only this group will be removed.'), 'enabled rows no longer repeat a redundant help line');
   // The danger zone legitimately renders the whole-folder button for local
@@ -399,6 +410,10 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(calls.some(call => call.path === '/api/cache/org%2Fdata?type=dataset'));
   assert(!calls.some(call => call.path.startsWith('/api/cache-selection')));
   assert(modalHTML.includes('Delete entire dataset cache'));
+  const datasetHeaderHTML = modalHTML.match(/<div class="cache-detail-header">[\s\S]*?<\/div>\s*<section id="cacheSelectionSection"/)?.[0] || '';
+  assert(datasetHeaderHTML.includes('aria-label="Open org/data"'), 'the dataset title opens the dataset repository');
+  assert(datasetHeaderHTML.includes('<a class="cache-detail-hub-link" href="https://huggingface.co/datasets/org/data" target="_blank" rel="noopener">HF Hub ↗</a>'), 'the external Hub link stays a separate anchor');
+  assert(datasetHeaderHTML.indexOf('</button>') < datasetHeaderHTML.indexOf('cache-detail-hub-link'), 'the Hub link stays a separate sibling after the repository button');
   assert.equal((modalHTML.match(/<h4 id="cacheContentsHeading"/g) || []).length, 1, 'the dataset uses one contents heading');
   assert(modalHTML.includes('>Files <span class="cache-selection-counts">· 3</span></h4>'), 'the single Files heading carries the count once');
   assert(!modalHTML.includes('>Files <span class="cache-selection-counts">3 files</span></h4>'), 'the heading does not repeat the files noun');
@@ -409,13 +424,6 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(modalHTML.includes('Delete entire dataset cache'), 'the dataset keeps its delete block');
   assert(!modalHTML.includes('Repository metadata') && !modalHTML.includes('cache-detail-metadata'), 'datasets lose the metadata block too');
   assert(!calls.some(call => call.method === 'DELETE'));
-  detailsManifest = { downloaded: '2026-11-14 10:00', commit: 'abcdef1234567890', command: 'hf download org/data --repo-type dataset', filters: '' };
-  detailsDownloadStatus = 'complete';
-  await window.test.showCacheDetails('org/data', 'dataset');
-  assert(textContent(modalHTML.match(/<p class="cache-detail-secondary cache-detail-download">([\s\S]*?)<\/p>/)?.[1] || '').includes('Downloaded 2026-11-14 10:00 · Complete download'), 'datasets keep the provenance line without the metadata block');
-  assert(!modalHTML.includes('Download Info') && !modalHTML.includes('Repository metadata'), 'the dataset provenance has no heading or grid');
-  detailsManifest = null;
-  detailsDownloadStatus = 'unknown';
   detailsFiles = [];
   detailsFileCount = 30;
 
@@ -886,28 +894,46 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   }
   await reopenWith({});
   assert(!modalHTML.includes('class="cache-detail-facts"'), 'a copy with no reported facts renders no facts line');
-  assert(!modalHTML.includes('cache-detail-friendly'), 'a missing friendly path renders no friendly line');
-  assert(!modalHTML.includes('cache-detail-download'), 'no manifest and unknown status render no provenance');
-  assert(!modalHTML.includes('Downloaded by external tool'), 'the old no-manifest note is gone');
+  assert(!modalHTML.includes('cache-detail-secondary'), 'a copy with no extras renders only the identity line');
   await reopenWith({ sizeHuman: '2 GB', fileCount: 2, commit: 'abcdef1234567890', friendlyPath: '/friendly/view' });
-  assert.equal(textContent(modalHTML.match(/<p class="cache-detail-facts">([\s\S]*?)<\/p>/)?.[1] || ''), 'This copy · 2 GB · 2 files · abcdef1', 'the facts line joins the reported values with middle dots');
-  assert.equal(textContent(modalHTML.match(/<p class="cache-detail-secondary cache-detail-friendly">([\s\S]*?)<\/p>/)?.[1] || ''), 'Friendly view · /friendly/view', 'a distinct friendly path stays available as one muted line');
-  assert(modalHTML.includes('title="/friendly/view"'), 'the friendly path keeps its full value in title');
-  await reopenWith({ sizeHuman: '2 GB', fileCount: 2, commit: 'abcdef1234567890', friendlyPath: '/opened/copy' });
-  assert(!modalHTML.includes('cache-detail-friendly'), 'a friendly path equal to the location path is not repeated');
+  assert.equal(textContent(modalHTML.match(/<p class="cache-detail-facts">([\s\S]*?)<\/p>/)?.[1] || ''), 'This copy · 2 GB · 2 files · abcdef1', 'the facts line stays when a friendly path is present');
+  assert(!modalHTML.includes('cache-detail-friendly') && !modalHTML.includes('cache-detail-secondary'), 'a friendly path adds no secondary line');
+  assert(!modalHTML.includes('Friendly view') && !modalHTML.includes('/friendly/view'), 'the friendly path is not rendered in the header or a tooltip');
   await reopenWith({
     sizeHuman: '2 GB', fileCount: 2, commit: 'abcdef1234567890', downloadStatus: 'complete',
     manifest: { downloaded: '2026-11-16 18:42', commit: 'abcdef1234567890', command: 'hf download org/model --include "*.gguf" --local-dir /opened/copy', filters: '' }
   });
-  const provenance = modalHTML.match(/<p class="cache-detail-secondary cache-detail-download">([\s\S]*?)<\/p>/)?.[1] || '';
-  assert.equal(textContent(provenance), 'Downloaded 2026-11-16 18:42 · Complete download · hf download org/model --include "*.gguf" --local-dir /opened/copy', 'manifest provenance is one line without headings');
-  assert(provenance.includes('title="hf download org/model --include &quot;*.gguf&quot; --local-dir /opened/copy"'), 'the command keeps its full value in title');
-  assert(!modalHTML.includes('Repository metadata') && !modalHTML.includes('Vision Encoder') && !modalHTML.includes('Download Info'), 'the metadata details block and its headings are gone');
+  assert.equal(textContent(modalHTML.match(/<p class="cache-detail-facts">([\s\S]*?)<\/p>/)?.[1] || ''), 'This copy · 2 GB · 2 files · abcdef1', 'the facts line stays when a manifest is present');
+  assert(!modalHTML.includes('cache-detail-download') && !modalHTML.includes('cache-detail-secondary'), 'a manifest adds no provenance line');
+  assert(!modalHTML.includes('Downloaded 2026-11-16') && !modalHTML.includes('Complete download'), 'the manifest date and status stay out of the header');
+  assert(!modalHTML.includes('hf download org/model') && !modalHTML.includes('title="hf download org/model'), 'the manifest command stays out of the header and its tooltips');
   await reopenWith({
     sizeHuman: '2 GB', fileCount: 2, commit: 'abcdef1234567890', downloadStatus: 'filtered',
     manifest: { downloaded: '2026-11-15 09:10', commit: 'abcdef1234567890', command: '', filters: 'Q4_K_M' }
   });
-  assert.equal(textContent(modalHTML.match(/<p class="cache-detail-secondary cache-detail-download">([\s\S]*?)<\/p>/)?.[1] || ''), 'Downloaded 2026-11-15 09:10 · Filtered download (Q4_K_M)', 'filtered manifests name their filters');
+  assert(!modalHTML.includes('Filtered download') && !modalHTML.includes('(Q4_K_M)'), 'a filtered manifest adds no provenance or filter text');
+  assert(!modalHTML.includes('cache-detail-download') && !modalHTML.includes('cache-detail-secondary'), 'a filtered manifest adds no secondary line');
+  assert.equal(textContent(modalHTML.match(/<p class="cache-detail-facts">([\s\S]*?)<\/p>/)?.[1] || ''), 'This copy · 2 GB · 2 files · abcdef1', 'the facts line stays for a filtered manifest');
+
+  // The repository title uses the live context for the in-app overview and
+  // closes Details first; the revision is deliberately null.
+  await reopenWith({ sizeHuman: '2 GB', fileCount: 2, commit: 'abcdef1234567890' });
+  window.__navCalls = [];
+  assert(nodes.get('#modalBackdrop').classList.contains('active'), 'model Details is open before navigation');
+  window.openCacheDetailsRepository();
+  assert(!nodes.get('#modalBackdrop').classList.contains('active'), 'the model title button closes Details');
+  assert.deepEqual(JSON.parse(JSON.stringify(window.__navCalls)), [['org/model', 'model', null]], 'the model title opens the default model revision');
+
+  window.__navCalls = [];
+  detailsSource = 'HF cache';
+  detailsFiles = [{ name: 'data/train-00000.parquet', sizeHuman: '10 MB' }];
+  detailsFileCount = 1;
+  currentSelection = { repo: 'org/data', type: 'dataset', locations: [] };
+  await window.test.showCacheDetails('org/data', 'dataset');
+  assert(nodes.get('#modalBackdrop').classList.contains('active'), 'dataset Details is open before navigation');
+  window.openCacheDetailsRepository();
+  assert(!nodes.get('#modalBackdrop').classList.contains('active'), 'the dataset title button closes Details');
+  assert.deepEqual(JSON.parse(JSON.stringify(window.__navCalls)), [['org/data', 'dataset', null]], 'the dataset title opens the default dataset revision');
 
   detailsSizeHuman = '1 GB';
   detailsFileCount = 30;
@@ -917,7 +943,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   detailsDownloadStatus = 'unknown';
 
   if (process.env.CACHE_UI_FIXTURE_URL) await checkBrowserLayout();
-  console.log('PASS: compact Repository Details header with one facts line, optional friendly/provenance lines, one native location select in the sticky heading, GGUF rows without inventory disclosures, danger zone and ghost footer; location focusing; delete focus/scroll restoration; quant-titled, left-aligned group confirmations with definition rows, one-sentence consequences, right-aligned size rows, inline link-only notes, versioned and vision-encoder variants, pending disabled state, untouched whole-copy dialog; exact local/HF request composition; all saved versions; shared-payload/207/conflict results; cancel; exact refresh/context; dataset single Files heading and file list; full member inventories with sizes; metadata removal; escaping');
+  console.log('PASS: two-line Repository Details header with a live-context repository title button, one facts line, no friendly/download secondary lines, one native location select in the sticky heading, GGUF rows without inventory disclosures, danger zone and ghost footer; location focusing; delete focus/scroll restoration; quant-titled, left-aligned group confirmations with definition rows, one-sentence consequences, right-aligned size rows, inline link-only notes, versioned and vision-encoder variants, pending disabled state, untouched whole-copy dialog; exact local/HF request composition; all saved versions; shared-payload/207/conflict results; cancel; exact refresh/context; dataset single Files heading and file list; full member inventories with sizes; metadata removal; model/dataset title navigation at the default revision; escaping');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 
 // Optional real-DOM/layout layer against an isolated read-only fixture serving
@@ -977,6 +1003,34 @@ async function checkBrowserLayout() {
       if (width === 1000) assert.equal(structure.modalWidth, 600);
       if (width === 1000) assert(structure.scrollHeight >= 300, '760px keeps a usable contents viewport');
       else assert(structure.scrollHeight >= 150, '360px keeps usable contents rows');
+      const repoTitle = page.locator('button.cache-detail-repo');
+      assert.equal(await repoTitle.count(), 1, 'the repository title is the only title button');
+      assert.equal(await repoTitle.getAttribute('aria-label'), 'Open org/model');
+      const titleLayout = () => page.evaluate(() => {
+        const button = document.querySelector('button.cache-detail-repo').getBoundingClientRect();
+        const row = document.querySelector('.cache-detail-title-row').getBoundingClientRect();
+        const facts = document.querySelector('.cache-detail-facts').getBoundingClientRect();
+        const round = value => Math.round(value * 10) / 10;
+        return { x: round(button.x), y: round(button.y), width: round(button.width), height: round(button.height), rowHeight: round(row.height), factsTop: round(facts.top) };
+      });
+      const titleBefore = await titleLayout();
+      await repoTitle.hover();
+      const hoverStyle = await repoTitle.evaluate(node => ({ decoration: getComputedStyle(node).textDecorationLine, cursor: getComputedStyle(node).cursor }));
+      assert(hoverStyle.decoration.includes('underline'), 'the repository title underlines on hover');
+      assert.equal(hoverStyle.cursor, 'pointer');
+      assert.deepEqual(await titleLayout(), titleBefore, 'hover styling does not shift the header');
+      await page.locator('#modalClose').focus();
+      await page.keyboard.press('Tab');
+      assert.equal(await page.evaluate(() => document.activeElement?.className), 'cache-detail-repo', 'Tab reaches the repository title');
+      const focusStyle = await repoTitle.evaluate(node => ({
+        visible: node.matches(':focus-visible'),
+        outlineWidth: getComputedStyle(node).outlineWidth,
+        outlineStyle: getComputedStyle(node).outlineStyle
+      }));
+      assert(focusStyle.visible && focusStyle.outlineStyle !== 'none' && focusStyle.outlineWidth === '2px', 'the repository title has a visible focus ring');
+      assert.deepEqual(await titleLayout(), titleBefore, 'focus styling does not shift the header');
+      await page.evaluate(() => document.activeElement?.blur());
+      await page.mouse.move(1, 1);
       const compactRow = page.locator('.cache-selection-group').filter({ hasText: 'mmproj-F16.gguf' }).first();
       const compactBox = await compactRow.boundingBox();
       assert(compactBox.height <= 70, 'a row with one file and one version stays compact');
@@ -1139,6 +1193,6 @@ async function checkBrowserLayout() {
       assert.deepEqual(errors, [], 'no page runtime errors');
       await page.close();
     }
-    console.log('PASS: real DOM region order/ancestry; 760px contents viewport; 360px two-line rows and no horizontal scroll; compact facts header; one native location select in the sticky heading; HF shards/versions facts; left-aligned confirmation with definition rows, open long inventory, right-aligned sizes, versioned/vision screenshots, centred whole-copy dialog; dataset single Files heading and file list; no metadata block; loading/error states inside contents; no writes');
+    console.log('PASS: real DOM region order/ancestry; 760px contents viewport; 360px two-line rows and no horizontal scroll; compact facts header; title button hover/focus stability; one native location select in the sticky heading; HF shards/versions facts; left-aligned confirmation with definition rows, open long inventory, right-aligned sizes, versioned/vision screenshots, centred whole-copy dialog; dataset single Files heading and file list; no metadata block; loading/error states inside contents; no writes');
   } finally { await browser.close(); }
 }
