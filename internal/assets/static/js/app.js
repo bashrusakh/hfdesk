@@ -3550,7 +3550,8 @@ async function loadRepositoryDetails(entry) {
 
   function activeJobFile(job) {
     const files = Array.isArray(job.files) ? job.files : [];
-    return files.find(f => f.status === 'active')
+    return files.find(f => f.status === 'writing')
+        || files.find(f => f.status === 'active')
         || files.find(f => f.status === 'finalizing')
         || files.find(f => f.status === 'pending')
         || files[files.length - 1]
@@ -3562,8 +3563,20 @@ async function loadRepositoryDetails(entry) {
   // (including newer phases) fall back to the plain running row.
   const JOB_LOCAL_PHASES = {
     preparing: { label: 'writing' },
+    writing: { label: 'writing' },
     finalizing: { label: 'finalizing' }
   };
+
+  // The writing hint names the file(s) currently blocking on the disk, not the
+  // whole job: a multi-file job can write one file while another waits.
+  function writingFilesBytes(job) {
+    const files = Array.isArray(job.files) ? job.files : [];
+    let bytes = 0;
+    for (const file of files) {
+      if (file && file.status === 'writing') bytes += Number(file.totalBytes) || 0;
+    }
+    return bytes;
+  }
 
   function jobLocalPhase(job, status) {
     if (status !== 'running' || typeof job.phase !== 'string') return '';
@@ -3572,11 +3585,12 @@ async function loadRepositoryDetails(entry) {
 
   // One hint pill replaces the speed and ETA pills at a comparable width, so a
   // phase does not add a stats line of its own.
-  function jobPhaseHint(phaseKey, totalBytes) {
+  function jobPhaseHint(job, phaseKey, totalBytes) {
     const label = JOB_LOCAL_PHASES[phaseKey].label;
-    if (!(totalBytes > 0)) return label;
-    const size = formatBytes(totalBytes);
-    return phaseKey === 'preparing' ? `writing ${size} to disk` : `finalizing ${size}`;
+    const hintedBytes = phaseKey === 'writing' ? writingFilesBytes(job) : totalBytes;
+    if (!(hintedBytes > 0)) return label;
+    const size = formatBytes(hintedBytes);
+    return phaseKey === 'finalizing' ? `finalizing ${size}` : `writing ${size} to disk`;
   }
 
   function createJobCard(job) {
@@ -3691,7 +3705,7 @@ async function loadRepositoryDetails(entry) {
     // The progress bar and percentage keep their real values.
     const phaseEl = el.querySelector('[data-role="phase"]');
     if (phaseKey) {
-      const phaseText = jobPhaseHint(phaseKey, totalBytes);
+      const phaseText = jobPhaseHint(job, phaseKey, totalBytes);
       if (phaseEl.textContent !== phaseText) phaseEl.textContent = phaseText;
       if (phaseEl.title !== phaseText) phaseEl.title = phaseText;
       if (phaseEl.style.display === 'none') phaseEl.style.display = '';

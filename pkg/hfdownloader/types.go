@@ -393,7 +393,8 @@ type Settings struct {
 //   - "plan_item": A file has been added to the download plan
 //   - "file_start": Download of a file has started
 //   - "file_preparing": Local preparation before transfer is running
-//   - "file_progress": Periodic progress update during download
+//   - "file_progress": Periodic progress update during download, including
+//     the cumulative local write-wait measurement
 //   - "file_done": File download complete (check Message for "skip" info)
 //   - "retry": A retry attempt is being made
 //   - "error": An error occurred
@@ -424,6 +425,13 @@ type ProgressEvent struct {
 
 	// Downloaded is the cumulative bytes downloaded so far.
 	Downloaded int64 `json:"downloaded,omitempty"`
+
+	// WriteWaitNanos is the cumulative time this file's transfer has spent
+	// blocked inside local payload writes (boundedAtWriter.WriteAt, including
+	// staging creation/preallocation) as of this event. The server compares
+	// its growth with the interval's wall time to classify the file's local
+	// write phase; it is a duration, never a byte rate.
+	WriteWaitNanos int64 `json:"writeWaitNanos,omitempty"`
 
 	// Attempt is the retry attempt number (1-based).
 	// Only set in "retry" events.

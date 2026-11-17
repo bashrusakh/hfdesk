@@ -1513,6 +1513,11 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	}
 	defer out.Close()
 
+	// writeWait accumulates the blocking time of every payload write for this
+	// file. The single path emits file_progress from the write hook instead of
+	// a ticker, so the same measurement rides its existing emissions.
+	var writeWait atomic.Int64
+
 	// Bind the partial to the object; path-derived names can be shared across
 	// objects and revisions.
 	identity := singleIdentityFor(job, it, opts)
@@ -1626,7 +1631,8 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	// An exact-size partial may finalize only with clean-framing proof.
 	if it.Size > 0 && pos == it.Size {
 		if identity.FramingComplete {
-			emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size})
+			emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size,
+				WriteWaitNanos: writeWait.Load()})
 			return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)
 		}
 		// Written size does not prove clean EOF. Reserve and re-request the final
@@ -1644,7 +1650,8 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		forceLastByteRange = pos == 0
 	}
 	if pos > 0 {
-		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: pos, Total: it.Size})
+		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: pos, Total: it.Size,
+			WriteWaitNanos: writeWait.Load()})
 		downloadLog.Info("resuming download",
 			"repo", job.Repo,
 			"path", it.RelativePath,
@@ -1808,6 +1815,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 					paced := cfg.SpeedLimiter.Reader(attemptCtx, body)
 					w := newBoundedAtWriter(out, base, limit)
 					w.measure = payloadIOMeasurementFromContext(ctx)
+					w.writeWait = &writeWait
 					w.onWrite = func([]byte) {
 						end := base + w.written
 						if end <= countedUpTo {
@@ -1817,7 +1825,8 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						if now := time.Now(); now.Sub(lastEmit) >= 200*time.Millisecond {
 							lastEmit = now
 							emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
-								Downloaded: end, Total: it.Size})
+								Downloaded: end, Total: it.Size,
+								WriteWaitNanos: writeWait.Load()})
 						}
 					}
 					_, cerr := io.Copy(w, paced)
@@ -1848,7 +1857,8 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 							return false, fmt.Errorf("persist single-part framing checkpoint %s: %w", sidecar, werr)
 						}
 						emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
-							Downloaded: countedUpTo, Total: it.Size})
+							Downloaded: countedUpTo, Total: it.Size,
+							WriteWaitNanos: writeWait.Load()})
 						return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)
 					}
 					attemptCancel()

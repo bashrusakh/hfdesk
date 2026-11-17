@@ -1434,6 +1434,7 @@ a {
    here; 64px fits it with 8px side padding. */
 .job-status.running,
 .job-status.preparing,
+.job-status.writing,
 .job-status.finalizing {
   width: 64px;
   min-width: 64px;
@@ -1455,7 +1456,8 @@ a {
 }
 
 .job-status.finalizing,
-.job-status.preparing {
+.job-status.preparing,
+.job-status.writing {
   background: rgba(139, 92, 246, 0.2);
   color: #a78bfa;
 }
