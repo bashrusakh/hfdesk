@@ -1305,12 +1305,13 @@ so other files proceed even with a low limit. Progress reports distinguish
 preparation, transfer, finalizing, completion, skipped, error, and cancellation
 states. `file_preparing` marks local staging creation/preallocation before the
 first transfer byte, and `file_finalizing` is emitted before the
-pre-publication proof. A file whose response reads have stalled while local
-work is in flight (or recently completed) reports `status` `writing`; when no
-file is still transferring from the network, the job's `phase` is `writing`
-too. `bytesPerSecond` and `etaSeconds` derive from response-body bytes read
-this run, not from committed payload bytes, so file creation and resume bytes
-do not distort them; a client hides speed and ETA while the writing phase is
+pre-publication proof. A file with local work in flight (claim/preallocation
+or a payload write currently blocked) reports `status` `writing`; a completed
+write alone and a pure network stall do not. When no file is still
+transferring from the network, the job's `phase` is `writing` too.
+`bytesPerSecond` and `etaSeconds` derive from response-body bytes read this
+run, not from committed payload bytes, so file creation and resume bytes do
+not distort them; a client hides speed and ETA while the writing phase is
 shown. The detailed ownership and resume contract is in
 `pkg/hfdownloader/doc.go`.
 

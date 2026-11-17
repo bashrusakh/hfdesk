@@ -106,13 +106,13 @@ progress (staging creation/claim, preallocation, checkpoint fsync, or a
 completed payload write). `ReadBytes` is the cumulative bytes read this run,
 and `LocalWorkInFlight` is true while a staging operation or payload write is
 blocked in progress. The server reports the file as `active` while reads are
-recent; in-flight local work or newer completed local progress reports
-`writing`; when both are stale the transfer is stalled and the state is held.
-Download speed and ETA derive from `ReadBytes` (already-present resume bytes
-never count), while committed bytes drive the progress bar. A writing file
-with no sibling still transferring from the network also raises the job-level
-`writing` phase; speed and ETA keep their byte-rate meaning and are hidden by
-the UI while the phase is shown.
+recent; in-flight local work reports `writing`; a completed write alone and a
+pure network stall are not `writing`, and a preparing file stays `preparing`
+for its claim window. Download speed and ETA derive from `ReadBytes`
+(already-present resume bytes never count), while committed bytes drive the
+progress bar. A writing file with no sibling still transferring from the
+network also raises the job-level `writing` phase; speed and ETA keep their
+byte-rate meaning and are hidden by the UI while the phase is shown.
 
 # Filter Matching
 

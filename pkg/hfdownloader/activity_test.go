@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -386,5 +387,81 @@ func TestSingleResumeReadCounterExcludesInheritedBytes(t *testing.T) {
 	}
 	if last.ReadBytes != int64(len(full)-partialN) {
 		t.Fatalf("read bytes = %d, want %d remaining bytes only", last.ReadBytes, len(full)-partialN)
+	}
+}
+
+// TestSingleProgressTickerReportsActivityBeforeCompletion covers the single
+// path's periodic activity-only samples: they carry read/in-flight state while
+// the transfer runs, so a blocked write can be reported before it completes.
+func TestSingleProgressTickerReportsActivityBeforeCompletion(t *testing.T) {
+	full := rangedTestPayload(64 * 1024)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(full)))
+		flusher, _ := w.(http.Flusher)
+		for off := 0; off < len(full); off += 4096 {
+			end := off + 4096
+			if end > len(full) {
+				end = len(full)
+			}
+			if _, err := w.Write(full[off:end]); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(120 * time.Millisecond)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	const relPath = "ticker-single.bin"
+	dst := filepath.Join(t.TempDir(), relPath)
+	var (
+		mu      sync.Mutex
+		samples []ProgressEvent
+	)
+	emit := func(ev ProgressEvent) {
+		if ev.Event != "file_progress" {
+			return
+		}
+		mu.Lock()
+		samples = append(samples, ev)
+		mu.Unlock()
+	}
+
+	it := PlanItem{RelativePath: relPath, URL: srv.URL + "/" + relPath, Size: int64(len(full))}
+	cfg := Settings{Concurrency: 1, Retries: 0, StallTimeout: "0"}
+	if _, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r", Revision: "main"},
+		cfg, it, dst, singleOpts{Commit: rangedSeedCommit, CommitPinned: true, Domain: acquireTestDomain(t, dst)}, emit); err != nil {
+		t.Fatalf("downloadSingle: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	activitySamples := 0
+	for _, ev := range samples {
+		if !ev.ActivityOnly {
+			continue
+		}
+		activitySamples++
+		if ev.ReadBytes <= 0 {
+			t.Errorf("activity-only sample has no read bytes")
+		}
+		if ev.LastReadAt.IsZero() {
+			t.Errorf("activity-only sample has no read activity")
+		}
+	}
+	if activitySamples < 2 {
+		t.Fatalf("activity-only samples = %d, want at least two during the slow transfer", activitySamples)
+	}
+	last := samples[len(samples)-1]
+	if last.ActivityOnly {
+		t.Error("the final progress sample is still marked activity-only")
+	}
+	if last.ReadBytes != int64(len(full)) {
+		t.Fatalf("final read bytes = %d, want %d", last.ReadBytes, len(full))
+	}
+	if last.Downloaded != int64(len(full)) {
+		t.Fatalf("final downloaded = %d, want %d", last.Downloaded, len(full))
 	}
 }

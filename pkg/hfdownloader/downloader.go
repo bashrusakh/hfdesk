@@ -1685,6 +1685,40 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	countedUpTo := pos
 	var lastEmit time.Time
 
+	// A periodic activity-only sample keeps the server informed while a
+	// single-path WriteAt is blocked; the write hook alone reports only after a
+	// write completes. Stop it before finalization and on every return path.
+	tickerDone := make(chan struct{})
+	var tickerWG sync.WaitGroup
+	var tickerStopOnce sync.Once
+	stopTicker := func() {
+		tickerStopOnce.Do(func() {
+			close(tickerDone)
+			tickerWG.Wait()
+		})
+	}
+	defer stopTicker()
+	tickerWG.Add(1)
+	go func() {
+		defer tickerWG.Done()
+		t := time.NewTicker(200 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tickerDone:
+				return
+			case <-t.C:
+				readAt, writeAt, readBytes, inFlight := activity.snapshot()
+				emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Total: it.Size,
+					LastReadAt: readAt, LastLocalWriteAt: writeAt,
+					ReadBytes: readBytes, LocalWorkInFlight: inFlight,
+					ActivityOnly: true})
+			}
+		}
+	}()
+
 	for {
 		unpinnedRestart := !opts.CommitPinned && attempt > 0
 		if unpinnedRestart {
@@ -1870,6 +1904,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
 							Downloaded: countedUpTo, Total: it.Size,
 							LastReadAt: readAt, LastLocalWriteAt: writeAt, ReadBytes: readBytes, LocalWorkInFlight: inFlight})
+						stopTicker()
 						return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)
 					}
 					attemptCancel()

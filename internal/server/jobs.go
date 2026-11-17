@@ -170,39 +170,30 @@ const (
 	// fresher than this is pulling data, so any disk write behind it is not the
 	// current bottleneck.
 	activityReadHold = 1500 * time.Millisecond
-	// activityWriteHold bounds how old the last local progress may be for it to
-	// explain a stalled read. Once both signals are stale the transfer is
-	// stalled, and the state is held: silence alone never invents a phase.
-	activityWriteHold = 5 * time.Second
 )
 
 // classifyActivity decides a file's transfer state from the downloader's last
-// read and last local-write instants plus its in-flight local-work flag. A
-// recent read means the network is delivering, so the file is active. Local
-// work that is blocked in right now means the file is writing regardless of
-// how long it has run; otherwise newer completed local progress means writing.
-// With both stale this is a stalled transfer, so the current state is kept.
-func classifyActivity(status string, lastRead, lastWrite time.Time, inFlight bool, now time.Time) string {
+// read instant and its in-flight local-work flag. A recent read means the
+// network is delivering, so the file is active. Local work that is blocked in
+// right now means the file is writing. A completed write alone is not writing:
+// silence with nothing in flight is a stalled transfer and holds active (a
+// preparing file stays preparing for its claim window).
+func classifyActivity(status string, lastRead time.Time, inFlight bool, now time.Time) string {
 	if !lastRead.IsZero() && now.Sub(lastRead) <= activityReadHold {
 		return "active"
 	}
 	if inFlight {
 		return "writing"
 	}
-	if !lastWrite.IsZero() && lastWrite.After(lastRead) && now.Sub(lastWrite) <= activityWriteHold {
-		return "writing"
+	if status == "preparing" {
+		return "preparing"
+	}
+	if status == "writing" {
+		// The in-flight local work ended and no read has arrived: the write is
+		// no longer happening, so this is a stalled transfer, not local work.
+		return "active"
 	}
 	return status
-}
-
-// resetSpeedBaseline clears the transfer-rate history so a file's transition
-// from local creation/writes to network reads does not fold the local phase
-// into the ETA average.
-func resetSpeedBaseline(job *Job) {
-	job.speedSamples = nil
-	job.speedRunStart = time.Time{}
-	job.Progress.BytesPerSecond = 0
-	job.Progress.EtaSeconds = 0
 }
 
 // JobManager manages download jobs.
@@ -1559,10 +1550,12 @@ const speedWindow = 10 * time.Second
 
 // updateJobSpeed recomputes BytesPerSecond from the cumulative bytes read from
 // the response bodies this run (already-present resume bytes never count and
-// local writes never contribute). The rate is averaged over a sliding
-// speedWindow, then blended into the previous reading with a mild EMA — the
-// windowed average alone still jitters as old samples fall off the window, and
-// that jitter makes the displayed speed (and any ETA derived from it) jump
+// local writes never contribute). The first sample is taken only once a read
+// has delivered bytes — the caller skips this before then — so creation and
+// preparation time never start the transfer clock. The rate is averaged over a
+// sliding speedWindow, then blended into the previous reading with a mild EMA —
+// the windowed average alone still jitters as old samples fall off the window,
+// and that jitter makes the displayed speed (and any ETA derived from it) jump
 // around. Samples are throttled to a few per second so the window stays small.
 // now is passed in for deterministic testing.
 func updateJobSpeed(job *Job, readBytes int64, now time.Time) {
@@ -1709,17 +1702,11 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 	case "file_progress":
 		for i := range job.Files {
 			if job.Files[i].Path == evt.Path {
-				wasWriting := job.Files[i].Status == "writing"
 				switch job.Files[i].Status {
 				case "pending":
-					job.Files[i].Status = classifyActivity("active", evt.LastReadAt, evt.LastLocalWriteAt, evt.LocalWorkInFlight, now)
+					job.Files[i].Status = classifyActivity("active", evt.LastReadAt, evt.LocalWorkInFlight, now)
 				case "preparing", "active", "writing":
-					job.Files[i].Status = classifyActivity(job.Files[i].Status, evt.LastReadAt, evt.LastLocalWriteAt, evt.LocalWorkInFlight, now)
-				}
-				if wasWriting && job.Files[i].Status == "active" {
-					// The first read after local creation/writes starts the
-					// transfer clock; local time must not enter the ETA average.
-					resetSpeedBaseline(job)
+					job.Files[i].Status = classifyActivity(job.Files[i].Status, evt.LastReadAt, evt.LocalWorkInFlight, now)
 				}
 				job.Files[i].readBytes = evt.ReadBytes
 				if !evt.ActivityOnly {
@@ -1754,7 +1741,14 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 		} else {
 			job.Progress.DownloadedBytes = total
 		}
-		updateJobSpeed(job, readTotal, now)
+		if readTotal <= 0 {
+			// No response byte has been read yet this run. Creation/prep time
+			// must not start the transfer clock or seed the ETA average.
+			job.Progress.BytesPerSecond = 0
+			job.Progress.EtaSeconds = 0
+		} else {
+			updateJobSpeed(job, readTotal, now)
+		}
 
 	case "file_finalizing":
 		// The file's bytes are all on disk; part assembly, hash verification

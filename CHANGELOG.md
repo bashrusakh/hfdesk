@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- A disk-bound or preallocating download shows the local `writing` phase for the whole creation/write window, and speed/ETA come from network reads so creation time is not mistaken for a transfer rate. (#208)
+- A download reports `writing` only while file creation/preallocation or a payload write is in flight, and its speed/ETA come from network reads; a completed write or a pure network stall does not hold that phase. (#208)
 
 ### Changed
 

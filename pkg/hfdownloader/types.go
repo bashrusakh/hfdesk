@@ -434,7 +434,8 @@ type ProgressEvent struct {
 
 	// LastLocalWriteAt is when the file last made local progress: staging
 	// creation, claim record I/O, preallocation, a checkpoint fsync, or a
-	// completed payload write. It is an activity timestamp, never a byte rate.
+	// completed payload write. It is reported for activity context; a
+	// completed write alone does not select the writing phase.
 	LastLocalWriteAt time.Time `json:"lastLocalWriteAt,omitempty"`
 
 	// ReadBytes is the cumulative bytes this run has read from the response
