@@ -11,17 +11,43 @@ let delayNextDetails = null;
 let detailsSource = 'Local';
 let detailsPath = '/friendly/model';
 let detailsWholeFolder = null;
+let detailsWholeFolderReason = '';
 let datasetSource = 'HF cache';
 let detailsFiles = [];
+let detailsCommit = 'abcdef1234567890';
 let deleteMode = 'success';
 let deletedBodies = [];
 let pendingDelete = null;
 function fakeButton(dataset = {}) {
-  return { dataset, disabled: false, listeners: {}, addEventListener(name, callback) { this.listeners[name] = callback; }, click() { return this.disabled ? undefined : this.listeners.click?.(); } };
+  return { dataset, disabled: false, focused: false, listeners: {}, addEventListener(name, callback) { this.listeners[name] = callback; }, focus() { this.focused = true; }, click() { return this.disabled ? undefined : this.listeners.click?.(); } };
+}
+function decodeAttributeValue(value) {
+  return String(value).replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+function registerSelectionLocation(html) {
+  const selectTag = html.match(/<select id="cacheSelectionLocation"[^>]*>/)?.[0];
+  if (!selectTag) { nodes.delete('#cacheSelectionLocation'); return; }
+  const optionValues = Array.from(html.matchAll(/<option value="(-?\d+)"([^>]*)>/g));
+  const chosen = optionValues.find(match => match[2].includes('selected'));
+  const select = {
+    value: chosen ? chosen[1] : (optionValues[0]?.[1] ?? '0'),
+    disabled: false,
+    focused: false,
+    title: (selectTag.match(/title="([^"]*)"/) || [])[1] || '',
+    listeners: {},
+    addEventListener(name, callback) { this.listeners[name] = callback; },
+    focus() { this.focused = true; }
+  };
+  nodes.set('#cacheSelectionLocation', select);
+}
+function setOptionsHTML(value) {
+  modalHTML = modalHTML.replace(/<div id="cacheLocationOptions">[\s\S]*?<\/div>/, `<div id="cacheLocationOptions">${value}</div>`);
+  registerSelectionLocation(value);
 }
 function setSectionHTML(section, value) {
   section.html = value;
-  modalHTML = modalHTML.replace(/<section id="cacheSelectionSection"[^>]*>[\s\S]*?<\/section>/, `<section id="cacheSelectionSection" class="cache-detail-section">${value}</section>`);
+  const opening = modalHTML.match(/<section id="cacheSelectionSection"[^>]*>/)?.[0];
+  modalHTML = modalHTML.replace(/<section id="cacheSelectionSection"[^>]*>[\s\S]*?<\/section>/, `${opening || '<section id="cacheSelectionSection" class="cache-detail-section" role="status" aria-live="polite" aria-busy="false">'}${value}</section>`);
   const buttons = selector => {
     const attribute = selector === '.cache-selection-pick' ? 'data-group-index' : 'data-delete-group-index';
     return Array.from(value.matchAll(new RegExp(`<button[^>]*${attribute}="(\\d+)"[^>]*>`, 'g')), match => {
@@ -30,34 +56,100 @@ function setSectionHTML(section, value) {
       return button;
     });
   };
-  const buttonLists = new Map(['.cache-selection-pick', '.cache-selection-delete'].map(selector => [selector, buttons(selector)]));
-  section.querySelectorAll = selector => buttonLists.get(selector) || [];
-  if (value.includes('id="cacheSelectionLocation"')) {
-    const select = { value: value.includes('Choose a currently available location') ? '-1' : '0', disabled: false, listeners: {}, addEventListener(name, callback) { this.listeners[name] = callback; } };
-    nodes.set('#cacheSelectionLocation', select);
-  } else nodes.delete('#cacheSelectionLocation');
+  const deleteButtons = buttons('.cache-selection-delete');
+  const pickButtons = buttons('.cache-selection-pick');
+  const rows = Array.from(value.matchAll(/<article class="cache-selection-group"[^>]*data-group-id="([^"]*)"[\s\S]*?<\/article>/g), (match, index) => ({
+    dataset: { groupId: decodeAttributeValue(match[1]) },
+    querySelector(selector) { return selector === '.cache-selection-delete' ? deleteButtons[index] : null; }
+  }));
+  section.querySelectorAll = selector => {
+    if (selector === '.cache-selection-delete') return deleteButtons;
+    if (selector === '.cache-selection-pick') return pickButtons;
+    if (selector === '.cache-selection-group') return rows;
+    return [];
+  };
+  section.querySelector = () => null;
+  section.setAttribute = (name, attributeValue) => {
+    section.attributes = { ...(section.attributes || {}), [name]: attributeValue };
+    modalHTML = modalHTML.replace(/<section id="cacheSelectionSection"[^>]*>/, tag => {
+      const without = tag.replace(/\saria-busy="[^"]*"/, '');
+      return without.replace(/>$/, ` aria-busy="${attributeValue}">`);
+    });
+  };
+  if (value.includes('id="cacheContentsHeading"')) {
+    const heading = { focused: false, focus() { this.focused = true; } };
+    nodes.set('#cacheContentsHeading', heading);
+  } else nodes.delete('#cacheContentsHeading');
+  if (value.includes('id="cacheContentsScroll"')) {
+    const scroll = {
+      scrollTop: 0,
+      insertAdjacentHTML(_position, html) {
+        modalHTML = modalHTML.replace(/(<div id="cacheContentsScroll"[^>]*>)/, `$1${html}`);
+      }
+    };
+    nodes.set('#cacheContentsScroll', scroll);
+  } else nodes.delete('#cacheContentsScroll');
+}
+function registerPanelNodes(value) {
+  nodes.delete('#cacheSelectionLocation');
+  if (value.includes('id="cacheLocationOptions"')) {
+    const optionsNode = { set innerHTML(content) { setOptionsHTML(content); } };
+    nodes.set('#cacheLocationOptions', optionsNode);
+    const inner = value.match(/<div id="cacheLocationOptions">([\s\S]*?)<\/div>/)?.[1] ?? '';
+    registerSelectionLocation(inner);
+  } else {
+    nodes.delete('#cacheLocationOptions');
+  }
+  if (value.includes('id="cacheLocationChange"')) {
+    const button = fakeButton();
+    button.attributes = { 'aria-expanded': 'false' };
+    button.setAttribute = (name, attributeValue) => { button.attributes[name] = attributeValue; };
+    button.getAttribute = name => button.attributes[name];
+    nodes.set('#cacheLocationChange', button);
+  } else nodes.delete('#cacheLocationChange');
+  if (value.includes('id="cacheLocationPicker"')) {
+    let hidden = /<div id="cacheLocationPicker"[^>]*\shidden(?:\s|>)/.test(value);
+    nodes.set('#cacheLocationPicker', {
+      hasAttribute(name) { return name === 'hidden' ? hidden : false; },
+      removeAttribute(name) { if (name === 'hidden') hidden = false; },
+      setAttribute(name) { if (name === 'hidden') hidden = true; },
+      isHidden() { return hidden; }
+    });
+  } else nodes.delete('#cacheLocationPicker');
 }
 const modalBody = {
   insertAdjacentHTML(position, html) {
     modalHTML = position === 'afterbegin' ? html + modalHTML : modalHTML + html;
+    registerPanelNodes(modalHTML);
     if (html.includes('id="cacheSelectionSection"') && !nodes.has('#cacheSelectionSection')) {
-      const section = { set innerHTML(value) { setSectionHTML(this, value); }, insertAdjacentHTML(_p, value) { modalHTML += value; } };
+      const section = {
+        attributes: {},
+        set innerHTML(value) { setSectionHTML(this, value); },
+        insertAdjacentHTML(_p, value) { modalHTML += value; }
+      };
       nodes.set('#cacheSelectionSection', section);
     }
     if (html.includes('id="cacheSelectionSection"')) {
-      const inner = html.match(/<section id="cacheSelectionSection">([\s\S]*?)<\/section>/)?.[1];
+      const inner = html.match(/<section id="cacheSelectionSection"[^>]*>([\s\S]*?)<\/section>/)?.[1];
       if (inner !== undefined) setSectionHTML(nodes.get('#cacheSelectionSection'), inner);
     }
-    if (html.includes('id="cacheSelectionLocation"') && !nodes.has('#cacheSelectionSection')) setSectionHTML({ querySelectorAll() {} }, html);
     syncConfirmButtons();
   },
   set innerHTML(value) {
     modalHTML = value;
     nodes.delete('#cacheSelectionSection');
-    nodes.delete('#cacheSelectionLocation');
+    nodes.delete('#cacheContentsHeading');
+    nodes.delete('#cacheContentsScroll');
+    registerPanelNodes(value);
     const sectionMatch = value.match(/<section id="cacheSelectionSection"[^>]*>([\s\S]*?)<\/section>/);
     if (sectionMatch) {
-      const section = { set innerHTML(content) { setSectionHTML(this, content); }, insertAdjacentHTML(_p, content) { modalHTML += content; } };
+      const section = {
+        attributes: {},
+        set innerHTML(content) { setSectionHTML(this, content); },
+        insertAdjacentHTML(_p, content) { modalHTML += content; }
+      };
+      const busy = value.match(/<section id="cacheSelectionSection"[^>]*aria-busy="([^"]*)"/);
+      if (busy) section.attributes['aria-busy'] = busy[1];
       nodes.set('#cacheSelectionSection', section);
       setSectionHTML(section, sectionMatch[1]);
     }
@@ -141,7 +233,7 @@ const context = {
         await delay.promise;
       }
       const dataset = path.includes('type=dataset');
-      result = { repo: dataset ? 'org/data' : 'org/model', type: dataset ? 'dataset' : 'model', owner: 'org', name: dataset ? 'data' : 'model', files: dataset ? [] : detailsFiles, path: dataset ? '/datasets/data' : detailsPath, sizeHuman: '1 GB', fileCount: 30, source: dataset ? datasetSource : detailsSource, wholeFolderDeletable: detailsWholeFolder };
+      result = { repo: dataset ? 'org/data' : 'org/model', type: dataset ? 'dataset' : 'model', owner: 'org', name: dataset ? 'data' : 'model', files: dataset ? [] : detailsFiles, path: dataset ? '/datasets/data' : detailsPath, sizeHuman: '1 GB', fileCount: 30, source: dataset ? datasetSource : detailsSource, commit: detailsCommit, wholeFolderDeletable: detailsWholeFolder, wholeFolderDeleteReason: detailsWholeFolderReason };
     } else if (path === '/api/cache') {
       result = { repos: [], stats: {} };
     } else {
@@ -192,18 +284,41 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert.equal((modalHTML.match(/class="cache-selection-group"/g) || []).length, 10);
   assert(modalHTML.includes('/scan/one') && modalHTML.includes('Could not verify this exact group'));
   assert(modalHTML.includes('title="/scan/one/&quot;archive&quot;"'), 'quoted path is safe in the selector title');
-  assert(modalHTML.includes('model.gguf') && modalHTML.includes('Only this link; weights remain'));
-  assert(modalHTML.includes('file-24.gguf'), 'all group files beyond 20 remain selectable/visible');
-  assert(modalHTML.includes('&lt;img src=x onerror=alert(1)&gt;') && !modalHTML.includes('<img src=x'), 'server-provided filenames are escaped');
+  assert(modalHTML.includes('title="same-q-family-a"'), 'the row names its group and keeps the full value in title');
+  assert(modalHTML.includes('Only this link; weights remain') === false, 'member messages stay in the confirmation inventory');
+  assert(modalHTML.includes('link only'), 'a link-only member adds a facts line');
+  assert(modalHTML.includes('2 shards'), 'the split group names its shard count');
+  assert(modalHTML.includes('aria-label="Delete Q4_K_M same-q-family-a"'), 'each row action names its variant for assistive technology');
+  assert(!/Show \d+ file record/.test(modalHTML), 'the old per-row inventory disclosure is gone');
+  assert(!modalHTML.includes('<img src=x'), 'server-provided text is escaped in the card');
+  assert(modalHTML.includes('This copy') && modalHTML.includes('id="cacheLocationChange"'), 'the copy panel carries the Change control');
+  const panelHTML = modalHTML.match(/<section class="cache-detail-panel"[\s\S]*?<\/section>/)?.[0] || '';
+  assert(panelHTML.includes('<dt>Source</dt>') && panelHTML.includes('Local'), 'the panel names the opened source');
+  assert(panelHTML.includes('<dt>Location</dt>') && panelHTML.includes('/scan/one/&quot;archive&quot;'), 'the panel names the opened location');
+  assert(panelHTML.includes('<dt>Size</dt>') && panelHTML.includes('1 GB'));
+  assert(panelHTML.includes('<dt>Files</dt>') && panelHTML.includes('30'));
+  assert(panelHTML.includes('<dt>Commit</dt>') && panelHTML.includes('abcdef1') && panelHTML.includes('title="abcdef1234567890"'), 'the panel shows the short commit with the full value in title');
+  assert(panelHTML.includes('aria-expanded="false"') && panelHTML.includes('aria-controls="cacheLocationPicker"'));
+  assert(/id="cacheLocationPicker"[^>]*hidden/.test(modalHTML), 'the location picker starts collapsed');
+  const changeControl = nodes.get('#cacheLocationChange');
+  window.toggleCacheLocationPicker(changeControl);
+  assert.equal(nodes.get('#cacheLocationPicker').isHidden(), false, 'Change opens the existing location selection');
+  assert.equal(changeControl.getAttribute('aria-expanded'), 'true');
+  assert(nodes.get('#cacheSelectionLocation').focused, 'opening the picker focuses the select');
   assert.equal(nodes.get('#cacheSelectionSection').querySelectorAll('.cache-selection-delete').filter(button => button.disabled).length, 1, 'only the unverifiable local group is disabled');
-  assert(modalHTML.includes('Only this group will be removed.'));
-  // The action bar legitimately renders the whole-folder button for local
-  // sources now, so the group-section scope carries the original claim that
-  // GGUF group rows never call whole-repository delete.
+  assert(!modalHTML.includes('Only this group will be removed.'), 'enabled rows no longer repeat a redundant help line');
+  // The danger zone legitimately renders the whole-folder button for local
+  // sources, so the group rows carry the original claim that they never call
+  // whole-repository delete.
   const groupSectionHTML = nodes.get('#cacheSelectionSection').html || '';
-  assert(!groupSectionHTML.includes('onclick="confirmDeleteCache'), 'model groups must not call whole-repository delete');
+  const groupArticles = groupSectionHTML.match(/<article class="cache-selection-group"[\s\S]*?<\/article>/g) || [];
+  assert.equal(groupArticles.length, 10);
+  assert(groupArticles.every(article => !article.includes('confirmDeleteCache')), 'model groups must not call whole-repository delete');
   assert(!calls.some(call => call.method === 'DELETE'));
   assert(!modalHTML.includes('cache-selection-pick'), 'Delete is direct; no redundant Select action');
+  const footerHTML = modalHTML.match(/<div class="cache-detail-actions">([\s\S]*?)<\/div>/)?.[1] || '';
+  assert(footerHTML.includes('refreshCacheDetails()') && footerHTML.includes('hideModal()'), 'the footer offers Refresh and Close');
+  assert(!footerHTML.includes('btn-danger') && !footerHTML.includes('Delete entire'), 'the footer has no destructive action');
 
   // Explicitly switch to the HF location and ensure it loads the opaque ID.
   currentSelection = { ...currentSelection, locations: [{ ...currentSelection.locations[1] }] };
@@ -212,21 +327,35 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   await select.listeners.change();
   assert(calls.some(call => call.path.includes('locationId=loc-2')));
   assert(modalHTML.includes('/scan/one'), 'location choices remain available after selecting one');
-  assert(modalHTML.includes('commit-a') && modalHTML.includes('commit-b'));
-  assert(modalHTML.includes('model-00002-of-00002.gguf'));
+  assert(modalHTML.includes('GGUF groups in HF cache'), 'the contents heading names the selected location');
+  assert(modalHTML.includes('/cache/hub/org--model'));
+  assert(modalHTML.includes('2 shards') && modalHTML.includes('2 saved versions'), 'the HF group shows shards and saved versions as facts');
+  assert(modalHTML.includes('title="/cache/hub/org--model"'), 'the selected location keeps its full path in title');
+  assert(nodes.get('#cacheContentsHeading').focused, 'a location change returns focus to the contents heading');
+  const hfRowArticles = modalHTML.match(/<article class="cache-selection-group"[^>]*>[\s\S]*?<\/article>/g) || [];
+  const hfCompanionRow = hfRowArticles.find(article => article.includes('title="mmproj-F32.gguf"'));
+  assert(hfCompanionRow && !hfCompanionRow.includes('cache-selection-facts'), 'a single file with one version and no link gets no facts line');
+  assert.equal(nodes.get('#cacheSelectionSection').attributes['aria-busy'], 'false', 'the contents region is not busy after the render');
   assert.equal(nodes.get('#cacheSelectionSection').querySelectorAll('.cache-selection-delete').filter(button => button.disabled).length, 0, 'backend-advertised HF group action is enabled');
   assert.equal((modalHTML.match(/cache-badge-vision-encoder/g) || []).length, 1, 'the HF companion group renders its own badge');
   assert.equal((modalHTML.match(/class="cache-badge">Q4_K_M<\/span>/g) || []).length, 1, 'the HF llm group keeps its model-quant badge');
+
+  // Refresh reloads the details snapshot but keeps the selected location.
+  const refreshCalls = calls.length;
+  await window.refreshCacheDetails();
+  assert(calls.slice(refreshCalls).some(call => call.path === '/api/cache/org%2Fmodel?type=model'), 'Refresh reloads the opened copy');
+  assert(modalHTML.includes('GGUF groups in HF cache'), 'Refresh keeps the selected contents location');
 
   // HF confirmation groups four stored entries into two distinct paths and
   // names both saved versions without turning versions into extra shards.
   let hfSequence = await startGroupConfirmation(0);
   assert(modalHTML.includes('all saved versions in this selected location'));
-  assert(modalHTML.includes('Files included (2 distinct paths · 2 saved versions)'), modalHTML.slice(0, 2200));
+  assert(modalHTML.includes('Files included (2 files · 2 saved versions)'), modalHTML.slice(0, 2200));
   const hfConfirmation = modalHTML.slice(modalHTML.indexOf('<div id="cache-delete-confirm-'));
   assert.equal((hfConfirmation.match(/model-00001-of-00002\.gguf/g) || []).length, 1);
   assert.equal((hfConfirmation.match(/model-00002-of-00002\.gguf/g) || []).length, 1);
   assert(hfConfirmation.includes('Saved versions (2): commit-a, commit-b'));
+  assert(hfConfirmation.includes('5 B'), 'the inventory names each file size');
   assert(!/<input[^>]*commit|<select[^>]*commit/i.test(hfConfirmation), 'HF confirmation does not offer revision input');
   assert(hfConfirmation.includes('GGUF group:'), 'an llm group is still confirmed as a GGUF group');
   assert(!hfConfirmation.includes('Vision encoder'), 'an llm versioned confirmation does not claim a vision-encoder role');
@@ -262,6 +391,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(versionedCompanionConfirmation.includes('This removes the selected vision encoder companion from all saved versions in this selected location. Other groups and other locations remain.'), 'the versioned companion scope statement names the role');
   assert(!versionedCompanionConfirmation.includes('This removes this GGUF group from all saved versions'), 'the versioned companion scope statement does not use the generic group wording');
   assert(versionedCompanionConfirmation.includes('Saved versions (1): commit-a'), 'the versioned companion still lists its saved versions');
+  assert(versionedCompanionConfirmation.includes('Files included (1 file · 1 saved version)'), 'the companion inventory uses one consistent count');
   const beforeVersionedCompanion = deletedBodies.length;
   await cancelButton(versionedCompanionSequence).click();
   assert.equal(deletedBodies.length, beforeVersionedCompanion, 'cancelling the versioned companion confirmation sends no mutation');
@@ -272,6 +402,9 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(calls.some(call => call.path === '/api/cache/org%2Fdata?type=dataset'));
   assert(!calls.some(call => call.path.startsWith('/api/cache-selection')));
   assert(modalHTML.includes('Delete entire dataset cache'));
+  assert.equal((modalHTML.match(/<h4 id="cacheContentsHeading"/g) || []).length, 1, 'the dataset uses one contents heading');
+  assert(modalHTML.includes('>Files <span class="cache-selection-counts">0 files</span></h4>'), 'the single Files heading carries the count');
+  assert(!modalHTML.includes('Files (0)'), 'the duplicate inner Files heading is gone');
   assert(!calls.some(call => call.method === 'DELETE'));
 
   // Existing whole-repository deletion remains available for an HF model
@@ -377,6 +510,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   await window.test.showCacheDetails('org/data', 'dataset');
   assert(!modalHTML.includes('Delete entire'), 'local datasets get no whole-repository button');
   assert(!modalHTML.includes('confirmDeleteCache'), 'local datasets never offer whole-repository delete');
+  assert(modalHTML.includes('Local datasets are view-only here'), 'the danger zone says local datasets are view-only');
   assert(!calls.some(call => call.method === 'DELETE'), 'no local-dataset delete is sent');
   datasetSource = 'HF cache';
   detailsPath = '/friendly/model';
@@ -389,16 +523,22 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   detailsPath = '/piles/org/shared';
   detailsFiles = ['modelA-Q4_K_M', 'modelB-Q5_K_M', 'modelC-Q6_K', 'modelD-Q8_0', 'modelE-Q4_K_S'].map(n => ({ name: `${n}.gguf`, sizeHuman: '4 GB' }));
   detailsWholeFolder = false;
+  detailsWholeFolderReason = 'This folder contains 5 separate model families.';
   currentSelection = JSON.parse(JSON.stringify(selectionFixture));
   await window.test.showCacheDetails('org/model', 'model');
   assert(!modalHTML.includes('Delete entire model folder'), 'a shared pile folder never renders the whole-folder button');
   assert(!modalHTML.includes('onclick="confirmDeleteCache'), 'a pile listing offers no whole-repository delete at all');
+  assert(modalHTML.includes('Whole-folder deletion is not available for this location.'), 'the danger zone explains the withheld action');
+  assert(modalHTML.includes('This folder contains 5 separate model families.'), 'the server reason is shown when the action is withheld');
   assert.equal((modalHTML.match(/class="cache-selection-group"/g) || []).length, 10, 'the pile keeps its per-group rows for targeted deletion');
   detailsWholeFolder = null;
+  detailsWholeFolderReason = '';
 
   async function openLocalDetails() {
     detailsSource = 'Local';
     detailsFiles = [];
+    detailsWholeFolder = true;
+    detailsWholeFolderReason = '';
     currentSelection = JSON.parse(JSON.stringify(selectionFixture));
     await window.test.showCacheDetails('org/model', 'model');
   }
@@ -408,7 +548,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   // The rendered group kind decides the dialog title: a companion group is a
   // vision encoder, every other group is a GGUF group.
   function renderedGroupKind(index = 0) {
-    const articles = modalHTML.match(/<article class="cache-selection-group">[\s\S]*?<\/article>/g) || [];
+    const articles = modalHTML.match(/<article class="cache-selection-group"[^>]*>[\s\S]*?<\/article>/g) || [];
     const article = articles[index];
     assert(article, `rendered group ${index} is present in the current location`);
     return article.includes('cache-badge-vision-encoder') ? 'vision_encoder' : 'llm';
@@ -433,7 +573,8 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   await openLocalDetails();
   let sequence = await startGroupConfirmation(0);
   assert(modalHTML.includes('Repository:') && modalHTML.includes('/scan/one') && modalHTML.includes('same-q-family-a'));
-  assert(modalHTML.includes('family/file-24.gguf') && modalHTML.includes('Files included (25 distinct paths)'));
+  assert(modalHTML.includes('family/file-24.gguf') && modalHTML.includes('Files included (25 files)'));
+  assert(modalHTML.includes('4 B'), 'the inventory names each file size');
   assert(modalHTML.includes('Other variants, companion files, metadata, directories, and other locations remain'));
   assert.equal(deletedBodies.length, 0);
   await cancelButton(sequence).click();
@@ -451,7 +592,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   sequence = await startGroupConfirmation(6);
   assert(modalHTML.includes('parts/model-00001-of-00002.gguf'));
   assert(modalHTML.includes('parts/model-00002-of-00002.gguf'));
-  assert(modalHTML.includes('Files included (2 distinct paths)'));
+  assert(modalHTML.includes('Files included (2 files)'));
   await cancelButton(sequence).click();
   assert.equal(deletedBodies.length, 0);
 
@@ -464,11 +605,12 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert.equal((modalHTML.match(/cache-badge-vision-encoder/g) || []).length, 3, 'every companion group renders its own badge');
   assert.equal((modalHTML.match(/class="cache-badge">Q4_K_M<\/span>/g) || []).length, 5, 'every llm quantization group keeps its own model-quant badge');
   assert.equal((modalHTML.match(/class="cache-badge">Q5_K_M<\/span>/g) || []).length, 1, 'the llm split group keeps its own model-quant badge');
-  assert(modalHTML.includes('Vision encoder'), 'the companion badge names the artifact role');
+  assert(modalHTML.includes('>VISION<'), 'the companion badge names the artifact role');
+  assert(modalHTML.includes('aria-label="Delete vision encoder mmproj-F32.gguf"'), 'the companion action carries its variant in the accessible name');
   assert(!modalHTML.includes('>F32<'), 'a companion never renders a model-quant badge');
   assert(modalHTML.includes('mmproj-F32.gguf'), 'the companion keeps its own group label');
   const companionSequence = await startGroupConfirmation(companionIndex);
-  assert(modalHTML.includes('Files included (1 distinct paths)'), 'only the companion member is confirmed');
+  assert(modalHTML.includes('Files included (1 file)'), 'only the companion member is confirmed');
   const companionConfirmation = modalHTML.slice(modalHTML.indexOf('<div id="cache-delete-confirm-'));
   assert(companionConfirmation.includes('Vision encoder (mmproj companion):'), 'the companion confirmation names the vision-encoder role');
   assert(companionConfirmation.includes('mmproj-F32.gguf'), 'the companion confirmation names the selected companion');
@@ -537,6 +679,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   // Successful DELETE sends only the fresh group selection, then refreshes both
   // cache list and exact location while retaining other groups/locations.
   await openLocalDetails();
+  nodes.get('#cacheContentsScroll').scrollTop = 240;
   const beforeLocalSuccess = deletedBodies.length;
   sequence = await startGroupConfirmation(0);
   await confirmButton(sequence).click();
@@ -553,8 +696,10 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(!calls.some(call => call.method === 'DELETE' && call.path !== '/api/cache-selection'), 'group action never falls back to whole-repository DELETE');
   assert(calls.some(call => call.path === '/api/cache'), 'Cache cards refresh after operation');
   assert(modalHTML.includes('Selected GGUF group removed'));
-  assert(!modalHTML.includes('<strong>same-q-family-a</strong>'), 'successful group is not left presented as present');
+  assert(!modalHTML.includes('title="same-q-family-a"'), 'successful group is not left presented as present');
   assert(modalHTML.includes('same Q4 family family-b') && modalHTML.includes('/cache/hub/org--model'), 'other groups and locations remain visible');
+  assert.equal(nodes.get('#cacheContentsScroll').scrollTop, 240, 'variant deletion restores the contents scroll position');
+  assert(nodes.get('#cacheContentsHeading').focused, 'a removed row returns focus to the contents heading');
 
   // HTTP 207 is successful at the transport level but must render a partial
   // result from the JSON ok:false payload without hiding remaining members.
@@ -577,6 +722,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert.equal(deletedBodies.length, beforeConflict + 1, 'conflict is not automatically retried');
   assert(modalHTML.includes('was not confirmed as removed') && modalHTML.includes('Selected GGUF is busy'));
   assert(modalHTML.includes('/scan/one'), 'conflict keeps the selected location in context');
+  assert(deleteControl(0).focused, 'a kept row receives focus after a refused delete');
   deleteMode = 'success';
 
   // A refusal includes the actionable backend reason, rendered as escaped text,
@@ -622,7 +768,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   await confirmButton(sequence).click();
   assert(modalHTML.includes('Selected GGUF group removed'));
   assert(modalHTML.includes('/scan/one'), 'result retains the location from which the link was removed');
-  assert(modalHTML.includes('No other location was selected automatically'));
+  assert(modalHTML.includes('no other location was selected automatically'));
   assert.equal(nodes.get('#cacheSelectionLocation').value, '-1');
   assert(modalHTML.includes('/cache/hub/org--model'), 'the other location remains available but unselected');
 
@@ -660,7 +806,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   resolveLocationRead();
   await Promise.all([oldContextDelete, locationChange]);
   assert(modalHTML.includes('/cache/hub/org--model'), modalHTML.slice(0, 1800));
-  assert(modalHTML.includes('model-00001-of-00002.gguf'), 'the newer chosen location remains current after the old mutation finishes');
+  assert(modalHTML.includes('2 shards'), 'the newer chosen location remains current after the old mutation finishes');
 
   // A late response from a replaced modal cannot overwrite its content.
   detailsSource = 'Local';
@@ -670,9 +816,10 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   nodes.get('#modalTitle').textContent = 'Another modal';
   finishDetails();
   await pendingDetails;
-  assert.equal(modalHTML, '<div class="loading-state"><div class="spinner"></div></div>');
+  assert(modalHTML.includes('Loading repository details…'), 'a stale response cannot overwrite the loading shell');
+  assert(modalHTML.includes('cache-detail-modal') && modalHTML.includes('cache-detail-owner">org/') && modalHTML.includes('cache-detail-name">model<'), 'the loading shell keeps the repository identity visible');
   if (process.env.CACHE_UI_FIXTURE_URL) await checkBrowserLayout();
-  console.log('PASS: typed details, exact local/HF group confirmations and request composition, all saved versions, shared-payload/207/conflict results, cancel, exact refresh/context, legacy actions, full member lists, escaping');
+  console.log('PASS: sectioned Repository Details with identity header, This copy panel, GGUF rows without inventory disclosures, danger zone and ghost footer; location focusing; delete focus/scroll restoration; exact local/HF group confirmations and request composition; all saved versions; shared-payload/207/conflict results; cancel; exact refresh/context; dataset single Files heading; full member inventories with sizes; escaping');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 
 // Optional real-DOM/layout layer against an isolated read-only fixture serving
@@ -683,12 +830,12 @@ async function checkBrowserLayout() {
   const base = process.env.CACHE_UI_FIXTURE_URL;
   try {
     for (const width of [1000, 360]) {
-      const page = await browser.newPage({ viewport: { width, height: 900 } });
+      const page = await browser.newPage({ viewport: { width, height: 720 } });
       const errors = [];
       page.on('pageerror', error => errors.push(error.message));
       page.on('request', request => assert.equal(request.method(), 'GET', 'visual checks never send destructive requests'));
       await page.goto(base);
-      await page.getByText('Show 25 file records', { exact: true }).waitFor();
+      await page.getByText('GGUF groups in Local', { exact: true }).waitFor();
       await page.evaluate(() => Promise.all(document.getAnimations().filter(animation => animation.effect?.target?.closest?.('#modal')).map(animation => animation.finished)));
       const structure = await page.evaluate(() => {
         const modal = document.querySelector('.cache-detail-modal');
@@ -700,60 +847,78 @@ async function checkBrowserLayout() {
           groupsInside: scroll.contains(modal.querySelector('.cache-selection-groups')),
           othersInside: scroll.contains(modal.querySelector('.cache-selection-other')),
           metadataInside: scroll.contains(modal.querySelector('.cache-detail-metadata')),
+          dangerInside: scroll.contains(modal.querySelector('.cache-detail-danger')),
           headingOutside: !scroll.contains(section.querySelector('h4')),
           collapsed: Array.from(modal.querySelectorAll('details')).every(node => !node.open),
-          stats: modal.querySelector('.cache-detail-stats').children.length,
-          pathTitle: document.querySelector('#cacheSelectionLocation').title,
+          defs: modal.querySelectorAll('.cache-detail-def').length,
+          pathTitle: document.querySelector('.cache-detail-location-path').title,
           documentOverflow: document.documentElement.scrollWidth > innerWidth,
-          modalWidth: document.querySelector('#modal').getBoundingClientRect().width
+          modalWidth: document.querySelector('#modal').getBoundingClientRect().width,
+          actions: Array.from(modal.querySelectorAll('.cache-detail-actions .btn'), node => node.textContent.trim()),
+          scrollHeight: scroll.clientHeight,
+          rowHeight: modal.querySelector('.cache-selection-group').getBoundingClientRect().height,
+          panelTop: modal.querySelector('.cache-detail-panel').getBoundingClientRect().top,
+          dangerTop: modal.querySelector('.cache-detail-danger').getBoundingClientRect().top
         };
       });
-      assert.deepEqual(structure.children, ['cache-detail-header', 'cache-detail-stats', 'cache-detail-section', 'cache-detail-actions']);
+      assert.deepEqual(structure.children, ['cache-detail-header', 'cache-detail-panel', 'cache-detail-section', 'cache-detail-actions']);
       assert.equal(structure.scrollCount, 1);
-      for (const key of ['groupsInside', 'othersInside', 'metadataInside', 'headingOutside', 'collapsed']) assert(structure[key], key);
-      assert.equal(structure.stats, 3);
+      for (const key of ['groupsInside', 'othersInside', 'metadataInside', 'dangerInside', 'headingOutside', 'collapsed']) assert(structure[key], key);
+      assert.equal(structure.defs, 5);
       assert(structure.pathTitle.includes('very-long-library-location'));
+      assert.deepEqual(structure.actions, ['Refresh', 'Close']);
       assert(!structure.documentOverflow);
       assert(structure.modalWidth <= (width === 360 ? 360 : 600));
       if (width === 1000) assert.equal(structure.modalWidth, 600);
+      if (width === 1000) assert(structure.scrollHeight >= 300, '720p keeps a usable contents viewport');
+      else assert(structure.scrollHeight >= 150, '360px keeps usable contents rows');
+      const compactRow = page.locator('.cache-selection-group').filter({ hasText: 'mmproj-F16.gguf' }).first();
+      const compactBox = await compactRow.boundingBox();
+      assert(compactBox.height <= 70, 'a row with one file and one version stays compact');
+      assert(await page.locator('.cache-selection-group').filter({ hasText: '25 shards' }).count(), 'a multi-shard row keeps its facts line');
       const first = page.locator('.cache-selection-group').first();
-      const title = await first.locator('strong').boundingBox();
-      const button = await first.getByRole('button', { name: 'Delete', exact: true }).boundingBox();
-      assert(title.x + title.width <= button.x, 'long name stays in its reserved left column');
-      const stationary = () => page.evaluate(() => ['.modal-header', '.cache-detail-header', '.cache-detail-stats', '.cache-selection-sticky', '.cache-detail-actions'].map(selector => document.querySelector(selector).getBoundingClientRect().y));
+      const file = await first.locator('.cache-selection-file-path').boundingBox();
+      const del = await first.getByRole('button', { name: /^Delete Q4_K_M / }).boundingBox();
+      assert(file.x + file.width <= del.x + 0.5, 'long path stays left of its action');
+      const stationary = () => page.evaluate(() => ['.modal-header', '.cache-detail-header', '.cache-detail-panel', '.cache-selection-sticky', '.cache-detail-actions'].map(selector => document.querySelector(selector).getBoundingClientRect().y));
       const before = await stationary();
-      await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-collapsed.png` });
-      const summary = first.locator('summary');
-      await summary.focus();
-      await page.keyboard.press('Enter');
-      assert.equal(await first.locator('details[open] li').count(), 25);
+      await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-local.png` });
       await page.locator('.cache-detail-scroll').evaluate(node => { node.scrollTop = 450; });
-      assert.deepEqual(await stationary(), before, 'chrome, identity, stats, location, and footer stay still');
+      assert.deepEqual(await stationary(), before, 'chrome, identity, panel, heading, and footer stay still');
       const scrolling = await page.evaluate(() => Array.from(document.querySelectorAll('#modal *')).filter(node => ['auto', 'scroll'].includes(getComputedStyle(node).overflowY) && node.scrollHeight > node.clientHeight).map(node => node.className));
       assert.deepEqual(scrolling, ['cache-detail-scroll'], 'no nested/outer scroll owners');
-      await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-expanded.png` });
       await page.getByText('Other files (2)', { exact: true }).click();
       assert.equal(await page.locator('.cache-selection-other[open] li').count(), 2);
-      assert.deepEqual(await stationary(), before, 'expanding Other files does not move the fixed summary or footer');
-      await page.getByLabel('Storage location', { exact: true }).selectOption('1');
-      await page.getByText('2 files · 2 saved versions', { exact: true }).waitFor();
-      assert((await page.getByLabel('Storage location', { exact: true }).getAttribute('title')).includes('/cache/hub/'));
-      // The confirmation title names the artifact role, so read the rendered
-      // group's badge and wait for the matching title.
-      const firstIsVisionEncoder = await first.locator('.cache-badge-vision-encoder').count() > 0;
-      await first.getByRole('button', { name: 'Delete', exact: true }).click();
-      await page.getByRole('heading', { name: firstIsVisionEncoder ? 'Confirm vision encoder deletion' : 'Confirm GGUF group deletion', exact: true }).waitFor();
+      assert.deepEqual(await stationary(), before, 'expanding Other files does not move the fixed chrome');
+      await page.getByRole('button', { name: 'Change', exact: true }).click();
+      await page.getByLabel('Show contents from', { exact: true }).selectOption('1');
+      await page.getByText('GGUF groups in HF cache', { exact: true }).waitFor();
+      await page.getByText('2 shards · 2 saved versions', { exact: true }).waitFor();
+      assert((await page.getByLabel('Show contents from', { exact: true }).getAttribute('title')).includes('/cache/hub/'));
+      assert.equal(await page.evaluate(() => document.activeElement?.id), 'cacheContentsHeading', 'location change focuses the heading');
+      assert.deepEqual(await stationary(), before, 'switching location keeps the chrome still');
+      await page.getByRole('button', { name: 'Delete Q4_K_M same-q-family-b', exact: true }).click();
+      await page.getByRole('heading', { name: 'Confirm GGUF group deletion', exact: true }).waitFor();
       assert.equal(await page.locator('.cache-detail-modal').count(), 0, 'confirmation does not inherit Details layout');
-      assert.equal(await page.locator('#modalBody').evaluate(node => getComputedStyle(node).overflowY), 'auto');
+      const inventory = await page.locator('.cache-selection-confirmation details').textContent();
+      assert(inventory.includes('Files included (2 files · 2 saved versions)'));
+      assert(inventory.includes('5 B'), 'the confirmation inventory names file sizes');
       await page.getByRole('button', { name: 'Cancel', exact: true }).click();
       await page.getByRole('heading', { name: 'Repository Details', exact: true }).waitFor();
+      await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-hf.png` });
       for (const variant of ['non-gguf', 'dataset']) {
         await page.goto(`${base}?case=${variant}`);
-        await page.getByText('weights.safetensors', { exact: true }).waitFor();
+        await page.getByText('weights.safetensors', { exact: true }).first().waitFor();
         await page.getByRole('button', { name: `Delete entire ${variant === 'dataset' ? 'dataset' : 'model'} cache`, exact: true }).waitFor();
         assert.equal(await page.locator('.cache-selection-group').count(), 0);
         assert.equal(await page.locator('.cache-detail-scroll').count(), 1);
+        assert.equal(await page.locator('.cache-detail-scroll .cache-detail-danger').count(), 1);
         assert(await page.locator('.cache-detail-scroll .cache-detail-metadata').count());
+        if (variant === 'dataset') {
+          assert.equal(await page.locator('#cacheContentsHeading').count(), 1);
+          assert((await page.locator('#cacheContentsHeading').textContent()).startsWith('Files'));
+          assert.equal(await page.getByText('Files (1)', { exact: true }).count(), 0, 'no duplicate inner Files heading');
+        }
         await page.getByText('Repository metadata', { exact: true }).click();
         assert(await page.getByText('mmproj-F16.gguf', { exact: true }).isVisible(), 'vision metadata remains reachable');
         assert(await page.getByText('d1a7b9c'.repeat(5), { exact: true }).isVisible(), 'commit is retained in supplementary metadata');
@@ -762,10 +927,12 @@ async function checkBrowserLayout() {
       }
       await page.route('**/api/cache-selection*', route => route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Fixture unavailable' }) }));
       await page.goto(base);
-      await page.getByText('Unable to load GGUF selection:', { exact: false }).waitFor();
-      assert.equal(await page.locator('.cache-detail-scroll .cache-detail-files').count(), 1, 'failed selection preserves the snapshot file fallback');
+      await page.getByText('Unable to load repository details:', { exact: false }).waitFor();
+      assert.equal(await page.locator('.cache-detail-scroll .cache-files-list').count(), 1, 'failed selection preserves the snapshot file fallback');
       assert.equal(await page.locator('.cache-detail-scroll .cache-detail-metadata').count(), 1);
-      await page.getByRole('button', { name: 'Delete entire model cache', exact: true }).waitFor();
+      assert.equal(await page.locator('.cache-detail-scroll .cache-detail-danger').count(), 1);
+      assert(await page.locator('.cache-detail-header .cache-detail-name').isVisible(), 'the failed selection keeps identity visible');
+      await page.getByRole('button', { name: 'Delete entire model folder', exact: true }).waitFor();
       await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-selection-error.png` });
       await page.unroute('**/api/cache-selection*');
       let releaseSelection;
@@ -774,15 +941,17 @@ async function checkBrowserLayout() {
       await page.goto(base);
       await page.getByText('Loading GGUF groups…', { exact: true }).waitFor();
       assert.equal(await page.locator('.cache-detail-scroll').count(), 1);
+      assert(await page.locator('.cache-detail-header .cache-detail-name').isVisible(), 'loading keeps identity visible');
+      assert.equal(await page.getByRole('button', { name: 'Refresh', exact: true }).count(), 1);
       await page.getByRole('button', { name: 'Close', exact: true }).waitFor();
       await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-loading.png` });
       releaseSelection();
-      await page.getByText('Show 25 file records', { exact: true }).waitFor();
+      await page.getByText('GGUF groups in Local', { exact: true }).waitFor();
       await page.keyboard.press('Escape');
       assert.equal(await page.locator('#modalBackdrop.active').count(), 0, 'Escape still closes Details');
       assert.deepEqual(errors, [], 'no page runtime errors');
       await page.close();
     }
-    console.log('PASS: real DOM ancestry/order; 600px modal and 360px viewport; long-name reserved action column; 25 native-details members; sole central scroller with stationary chrome/footer; location switch; dataset/no-GGUF fallback; no writes');
+    console.log('PASS: real DOM region order/ancestry; 720p contents viewport; 360px two-line rows and no horizontal scroll; This copy panel; Change/location switch with focus; HF shards/versions facts; confirmation inventory with sizes; dataset single Files heading; loading/error states inside contents; no writes');
   } finally { await browser.close(); }
 }
