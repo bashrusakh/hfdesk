@@ -4270,58 +4270,195 @@ async function loadRepositoryDetails(entry) {
   let activeCacheDetailsContext = null;
   let cacheDeleteConfirmationSequence = 0;
   const pendingSelectedCacheDeletes = new Set();
+  function cacheDetailsRepoParts(repo) {
+    const value = String(repo || '');
+    const slash = value.indexOf('/');
+    return slash > 0
+      ? { owner: value.slice(0, slash), name: value.slice(slash + 1) }
+      : { owner: '', name: value };
+  }
+
+  function cacheDetailSourceChip(source) {
+    return source
+      ? `<span class="cache-badge cache-source-badge">${escapeHtml(source)}</span>`
+      : '<span class="cache-detail-unknown">Not reported</span>';
+  }
+
+  // The header carries identity only: owner/name, one provenance line, and a
+  // Hub link when the copy came from the Hub. Type, status, and "external"
+  // badges were presentation noise (the type is the modal's content).
+  function cacheDetailHeaderHTML(data) {
+    const parts = cacheDetailsRepoParts(data.repo);
+    const owner = data.owner || parts.owner;
+    const name = data.name || parts.name;
+    const source = data.source || '';
+    const path = data.path || '';
+    const hubLink = data.repo && source !== 'Local'
+      ? `<a class="cache-detail-hub-link" href="https://huggingface.co/${data.type === 'dataset' ? 'datasets/' : ''}${encodeURI(data.repo)}" target="_blank" rel="noopener">HF Hub ↗</a>`
+      : '';
+    const provenance = source || path
+      ? `<p class="cache-detail-provenance">${cacheDetailSourceChip(source)}${path ? `<code class="cache-detail-provenance-path" title="${escapeCacheDetailAttribute(path)}">${escapeHtml(path)}</code>` : ''}${hubLink}</p>`
+      : '';
+    return `<div class="cache-detail-header">
+        <div class="cache-detail-repo">${owner ? `<span class="cache-detail-owner">${escapeHtml(owner)}/</span>` : ''}<span class="cache-detail-name">${escapeHtml(name)}</span></div>
+        ${provenance}
+      </div>`;
+  }
+
+  // "This copy" always describes the copy Details was opened for, even after
+  // the contents switcher shows another location.
+  function cacheDetailPanelHTML(data, model) {
+    const commit = typeof data.commit === 'string' ? data.commit : '';
+    const shortCommit = commit.length > 7 ? commit.slice(0, 7) : commit;
+    return `<section class="cache-detail-panel" aria-labelledby="cacheDetailPanelTitle">
+        <div class="cache-detail-panel-head">
+          <h4 id="cacheDetailPanelTitle">This copy</h4>
+          <span class="cache-detail-panel-note">The values describe the copy this view was opened for.</span>
+        </div>
+        <dl class="cache-detail-defs">
+          <div class="cache-detail-def cache-detail-def-source"><dt>Source</dt><dd>${cacheDetailSourceChip(data.source)}</dd></div>
+          <div class="cache-detail-def cache-detail-def-location"><dt>Location</dt><dd>
+            <code class="cache-detail-location-path" title="${escapeCacheDetailAttribute(data.path || '')}">${escapeHtml(data.path || 'Not reported')}</code>
+            ${model ? `<button id="cacheLocationChange" class="btn btn-ghost btn-sm cache-detail-location-change" type="button" aria-expanded="false" aria-controls="cacheLocationPicker" onclick="toggleCacheLocationPicker(this)">Change</button>` : ''}
+          </dd></div>
+          <div class="cache-detail-def cache-detail-def-size"><dt>Size</dt><dd>${escapeHtml(data.sizeHuman || 'Not reported')}</dd></div>
+          <div class="cache-detail-def cache-detail-def-files"><dt>Files</dt><dd>${Number.isFinite(data.fileCount) ? data.fileCount : 'Not reported'}</dd></div>
+          <div class="cache-detail-def cache-detail-def-commit"><dt>Commit</dt><dd>${commit ? `<code title="${escapeCacheDetailAttribute(commit)}">${escapeHtml(shortCommit)}</code>` : 'Not reported'}</dd></div>
+        </dl>
+        ${model ? `<div id="cacheLocationPicker" class="cache-detail-location-picker" hidden>
+          <label for="cacheSelectionLocation">Show contents from</label>
+          <div id="cacheLocationOptions"><p class="cache-selection-readonly">Loading available locations…</p></div>
+        </div>` : ''}
+      </section>`;
+  }
+
+  // The danger zone keeps the established whole-copy gating byte-for-byte:
+  // HF cache and Friendly view always; Local only when the server proved the
+  // folder is one model; datasets keep the HF-only rule and are otherwise
+  // view-only.
+  function cacheDetailDangerHTML(data) {
+    const source = data.source || '';
+    let action = null;
+    let scope = '';
+    let withheldReason = '';
+    if (data.type === 'dataset') {
+      if (source === 'HF cache' || !source) {
+        action = { label: 'Delete entire dataset cache', args: [data.repo, data.type] };
+        scope = 'Deletes every cached file for this dataset. This cannot be undone.';      } else if (source === 'Local') {
+        scope = 'Local datasets are view-only here; remove the folder outside HFDesk.';
+      } else {
+        scope = 'This dataset copy cannot be deleted from Details.';
+      }
+    } else if (source === 'HF cache' || !source) {
+      action = { label: 'Delete entire model cache', args: [data.repo, data.type] };
+      scope = 'Removes all cached files for this model. This cannot be undone.';
+    } else if (source === 'Local') {
+      if (data.wholeFolderDeletable === true) {
+        action = { label: 'Delete entire model folder', args: [data.repo, data.type, 'Local', data.path] };
+        scope = 'Deletes the whole folder, including any files you added there. This cannot be undone.';
+      } else {
+        scope = 'Whole-folder deletion is not available for this location.';
+        withheldReason = data.wholeFolderDeleteReason || '';
+      }
+    } else if (source === 'Friendly view') {
+      action = { label: 'Delete entire model cache', args: [data.repo, data.type, 'Friendly view', data.path] };
+      scope = "Deletes this friendly view folder and the rest of the model's HF cache when present. This cannot be undone.";
+    } else {
+      scope = 'This copy cannot be deleted from Details.';
+    }
+    const actionHtml = action
+      ? `<button class="btn btn-danger" type="button" onclick="confirmDeleteCache(${action.args.map(arg => escapeCacheDetailAttribute(JSON.stringify(arg))).join(', ')})">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+            <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
+          </svg>
+          ${escapeHtml(action.label)}
+        </button>`
+      : '';
+    return `<div class="cache-detail-danger" role="group" aria-labelledby="cacheDetailDangerTitle">
+        <h4 id="cacheDetailDangerTitle">Delete this copy</h4>
+        <p class="cache-detail-danger-scope">${escapeHtml(scope)}</p>
+        ${withheldReason ? `<p class="cache-detail-danger-reason">${escapeHtml(withheldReason)}</p>` : ''}
+        ${actionHtml}
+      </div>`;
+  }
+
+  function cacheDetailFilesHTML(files) {
+    const list = Array.isArray(files) ? files : [];
+    if (!list.length) return '<p class="cache-selection-readonly">No files were reported in this snapshot.</p>';
+    return `<div class="cache-files-list">${list.map(f => `
+      <div class="cache-file-row">
+        <span class="cache-file-name" title="${escapeCacheDetailAttribute(f.name)}">${f.isLfs ? '<span class="lfs-badge">LFS</span>' : ''}${escapeHtml(f.name)}</span>
+        <span class="cache-file-size">${escapeHtml(f.sizeHuman || '')}</span>
+      </div>`).join('')}</div>`;
+  }
+
+  function cacheAllFilesHeadingHTML(context) {
+    const count = Array.isArray(context.snapshotFiles) ? context.snapshotFiles.length : 0;
+    return context.type === 'model' && count
+      ? `<h5 class="cache-detail-subheading">All files (${count})</h5>`
+      : '';
+  }
+
+  function cacheContentsHeadingHTML(context, location) {
+    if (context.type === 'dataset') {
+      const count = Array.isArray(context.snapshotFiles) ? context.snapshotFiles.length : 0;
+      return `<h4 id="cacheContentsHeading" class="cache-contents-heading" tabindex="-1">Files <span class="cache-selection-counts">${count} file${count === 1 ? '' : 's'}</span></h4>`;
+    }
+    const source = location ? ` in ${escapeHtml(location.source)}` : '';
+    return `<h4 id="cacheContentsHeading" class="cache-contents-heading" tabindex="-1">GGUF groups${source}</h4>
+      ${location ? `<p class="cache-contents-location"><code title="${escapeCacheDetailAttribute(location.path)}">${escapeHtml(location.path)}</code></p>` : ''}`;
+  }
+
+  function cacheContentsSectionHTML(context, location, bodyHTML, busy = false) {
+    return `<div class="cache-selection-sticky">${cacheContentsHeadingHTML(context, location)}</div>
+      <div id="cacheContentsScroll" class="cache-detail-scroll" tabindex="0" aria-label="Repository files and metadata" aria-busy="${busy ? 'true' : 'false'}">${bodyHTML}</div>`;
+  }
+
+  function cacheDetailsLoadingHTML(repo, type) {
+    const parts = cacheDetailsRepoParts(repo);
+    return `<div class="cache-detail-modal">
+        <div class="cache-detail-header">
+          <div class="cache-detail-repo">${parts.owner ? `<span class="cache-detail-owner">${escapeHtml(parts.owner)}/</span>` : ''}<span class="cache-detail-name">${escapeHtml(parts.name)}</span></div>
+        </div>
+        <section id="cacheSelectionSection" class="cache-detail-section" role="status" aria-live="polite" aria-busy="true">
+          <div class="cache-selection-sticky">${cacheContentsHeadingHTML({ type }, null)}</div>
+          <div id="cacheContentsScroll" class="cache-detail-scroll" tabindex="0" aria-label="Repository files and metadata">
+            <div class="loading-state"><div class="spinner"></div></div>
+            <p class="cache-selection-readonly">Loading repository details…</p>
+          </div>
+        </section>
+        <div class="cache-detail-actions">
+          <button class="btn btn-ghost" type="button" onclick="hideModal()">Close</button>
+        </div>
+      </div>`;
+  }
+
+  window.toggleCacheLocationPicker = function(button) {
+    const picker = $('#cacheLocationPicker');
+    if (!picker) return;
+    const isOpen = picker.hasAttribute('hidden');
+    if (isOpen) picker.removeAttribute('hidden');
+    else picker.setAttribute('hidden', '');
+    if (button) button.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+    if (isOpen) $('#cacheSelectionLocation')?.focus();
+  };
+
+  window.refreshCacheDetails = function() {
+    const context = activeCacheDetailsContext;
+    if (!context) return undefined;
+    return window.showCacheDetails(context.repo, context.type, context.selectedLocationID || '');
+  };
+
   window.showCacheDetails = async function(repo, type, preferredLocationID = '') {
     const requestID = ++cacheDetailsRequest;
     const context = { requestID, repo, type: type === 'dataset' ? 'dataset' : 'model', selectedLocationID: preferredLocationID };
     activeCacheDetailsContext = context;
+    const requestedType = context.type;
     try {
-      showModal('Repository Details', '<div class="loading-state"><div class="spinner"></div></div>');
-      const requestedType = context.type;
+      showModal('Repository Details', cacheDetailsLoadingHTML(repo, requestedType));
       const data = await api('GET', `/cache/${encodeURIComponent(repo)}?type=${encodeURIComponent(requestedType)}`);
       if (!cacheDetailsContextIsCurrent(context)) return;
-
-      const typeIcon = data.type === 'model'
-        ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
-             <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
-           </svg>`
-        : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
-             <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
-             <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
-           </svg>`;
-
-      // Build files table
-      const filesHtml = data.files?.length > 0
-        ? `<div class="cache-detail-files">
-             <h4>Files (${data.files.length})</h4>
-             <div class="cache-files-list">
-               ${data.files.map(f => `
-                 <div class="cache-file-row">
-                   <span class="cache-file-name" title="${escapeCacheDetailAttribute(f.name)}">
-                     ${f.isLfs ? '<span class="lfs-badge">LFS</span>' : ''}
-                     ${escapeHtml(f.name)}
-                   </span>
-                   <span class="cache-file-size">${escapeHtml(f.sizeHuman)}</span>
-                 </div>
-               `).join('')}
-             </div>
-           </div>`
-        : '';
-
-      // Build download status badge for detail view
-      let statusBadgeHtml = '';
-      if (data.downloadStatus === 'complete') {
-        statusBadgeHtml = '<span class="cache-badge cache-badge-complete">Complete</span>';
-      } else if (data.downloadStatus === 'filtered') {
-        statusBadgeHtml = '<span class="cache-badge cache-badge-filtered">Filtered</span>';
-      } else if (data.downloadStatus === 'unknown') {
-        statusBadgeHtml = '<span class="cache-badge cache-badge-unknown">External</span>';
-      }
-      const detailSourceBadge = data.source
-        ? `<span class="cache-badge cache-source-badge">${escapeHtml(data.source)}</span>`
-        : '';
-      const detailCapabilities = renderCapabilityIcons(data.capabilities, {
-        vision: data.hasMMProj ? 'Vision: mmproj encoder found' : 'Vision'
-      });
 
       // Build manifest info
       const manifestHtml = data.manifest
@@ -4372,7 +4509,7 @@ async function loadRepositoryDetails(entry) {
         : '';
 
       context.snapshotFiles = Array.isArray(data.files) ? data.files : [];
-      context.filesHTML = filesHtml || '<p class="cache-selection-readonly">No files were reported in this snapshot.</p>';
+      context.filesHTML = cacheDetailFilesHTML(context.snapshotFiles);
       context.metadataHTML = `<details class="cache-detail-metadata"><summary>Repository metadata</summary>
         ${data.commit ? `<div class="cache-detail-section"><h4>Commit</h4><code class="cache-path-value">${escapeHtml(data.commit)}</code></div>` : ''}
         ${manifestHtml}${mmprojHtml}
@@ -4380,75 +4517,21 @@ async function loadRepositoryDetails(entry) {
           <div class="cache-path-item"><span class="cache-path-label">${data.source === 'HF cache' || !data.source ? 'Cache (HF format)' : 'Local path'}</span><code class="cache-path-value">${escapeHtml(data.path)}</code></div>
           ${data.friendlyPath ? `<div class="cache-path-item"><span class="cache-path-label">Friendly view</span><code class="cache-path-value">${escapeHtml(data.friendlyPath)}</code></div>` : ''}
         </div></div></details>`;
+      context.dangerHTML = cacheDetailDangerHTML(data);
+      const dataset = data.type === 'dataset';
+      const initialBody = dataset
+        ? `${context.filesHTML}${context.metadataHTML}${context.dangerHTML}`
+        : '<div class="loading-state"><div class="spinner"></div></div><p class="cache-selection-readonly">Loading GGUF groups…</p>';
       setModalContent(`
         <div class="cache-detail-modal">
-          <div class="cache-detail-header">
-            <span class="cache-detail-type cache-type-${requestedType}">
-              ${typeIcon}
-              ${escapeHtml(data.type)}
-            </span>
-            ${statusBadgeHtml}
-            ${detailSourceBadge}
-            ${detailCapabilities}
-            <div class="cache-detail-repo">
-              <span class="cache-detail-owner">${escapeHtml(data.owner)}/</span>
-              <span class="cache-detail-name">${escapeHtml(data.name)}</span>
-            </div>
-            <a href="https://huggingface.co/${data.type === 'dataset' ? 'datasets/' : ''}${encodeURI(data.repo)}" target="_blank" rel="noopener" class="btn btn-ghost btn-sm cache-detail-hf" aria-label="View on HuggingFace" title="View on HuggingFace">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
-                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-                <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
-              </svg>
-            </a>
-          </div>
-
-          <div class="cache-detail-stats">
-            <div class="cache-detail-stat">
-              <div class="cache-detail-stat-value">${escapeHtml(data.sizeHuman)}</div>
-              <div class="cache-detail-stat-label">Total Size</div>
-            </div>
-            <div class="cache-detail-stat">
-              <div class="cache-detail-stat-value">${data.fileCount}</div>
-              <div class="cache-detail-stat-label">Files</div>
-            </div>
-            <div class="cache-detail-stat">
-              <div class="cache-detail-stat-value">${escapeHtml(data.branch || 'main')}</div>
-              <div class="cache-detail-stat-label">Branch</div>
-            </div>
-          </div>
-
-          <section id="cacheSelectionSection" class="cache-detail-section">
-            <div class="cache-selection-sticky"><h4>${requestedType === 'model' ? 'GGUF groups' : 'Files'}</h4></div>
-            <div class="cache-detail-scroll" tabindex="0" aria-label="Repository files and metadata">${requestedType === 'model' ? '<p>Loading GGUF groups…</p>' : context.filesHTML}${context.metadataHTML}</div>
+          ${cacheDetailHeaderHTML(data)}
+          ${cacheDetailPanelHTML(data, !dataset)}
+          <section id="cacheSelectionSection" class="cache-detail-section" role="status" aria-live="polite" aria-busy="${dataset ? 'false' : 'true'}">
+            ${cacheContentsSectionHTML(context, null, initialBody, !dataset)}
           </section>
-
           <div class="cache-detail-actions">
-          ${data.type === 'dataset' && (data.source === 'HF cache' || !data.source) ? `<button class="btn btn-danger" onclick="confirmDeleteCache(${escapeCacheDetailAttribute(JSON.stringify(data.repo))}, ${escapeCacheDetailAttribute(JSON.stringify(data.type))})">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
-                <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
-              </svg>
-              Delete entire dataset cache
-            </button>` : data.type === 'model' && (data.source === 'HF cache' || !data.source) ? `<button class="btn btn-danger" onclick="confirmDeleteCache(${escapeCacheDetailAttribute(JSON.stringify(data.repo))}, ${escapeCacheDetailAttribute(JSON.stringify(data.type))})">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
-                <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
-              </svg>
-              Delete entire model cache
-            </button>` : data.type === 'model' && data.source === 'Local' && data.wholeFolderDeletable === true ? `<button class="btn btn-danger" onclick="confirmDeleteCache(${escapeCacheDetailAttribute(JSON.stringify(data.repo))}, ${escapeCacheDetailAttribute(JSON.stringify(data.type))}, ${escapeCacheDetailAttribute(JSON.stringify('Local'))}, ${escapeCacheDetailAttribute(JSON.stringify(data.path))})">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
-                <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
-              </svg>
-              Delete entire model folder
-            </button>` : data.type === 'model' && data.source === 'Friendly view' ? `<button class="btn btn-danger" onclick="confirmDeleteCache(${escapeCacheDetailAttribute(JSON.stringify(data.repo))}, ${escapeCacheDetailAttribute(JSON.stringify(data.type))}, ${escapeCacheDetailAttribute(JSON.stringify('Friendly view'))}, ${escapeCacheDetailAttribute(JSON.stringify(data.path))})">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
-                <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                <line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
-              </svg>
-              Delete entire model cache
-            </button>` : ''}
-            <button class="btn btn-ghost" onclick="hideModal()">Close</button>
+            <button class="btn btn-ghost" type="button" onclick="refreshCacheDetails()">Refresh</button>
+            <button class="btn btn-ghost" type="button" onclick="hideModal()">Close</button>
           </div>
         </div>
       `);
@@ -4462,11 +4545,12 @@ async function loadRepositoryDetails(entry) {
         renderCacheSelection(selection, defaultLocation?.id || preferredLocationID || '', context, '');
       }
     } catch (e) {
-      if (cacheDetailsContextIsCurrent(context)) {
-        const section = $('#cacheSelectionSection');
-        if (section) section.innerHTML = `<div class="cache-selection-sticky"><h4>GGUF groups</h4></div><div class="cache-detail-scroll" tabindex="0" aria-label="Repository files and metadata"><p class="cache-selection-warning">Unable to load GGUF selection: ${escapeHtml(e.message)}</p>${context.filesHTML || ''}${context.metadataHTML || ''}</div>`;
-        else setModalContent(`<p style="color: var(--color-error);">${escapeHtml(e.message)}</p>`);
-      }
+      if (!cacheDetailsContextIsCurrent(context)) return;
+      const section = $('#cacheSelectionSection');
+      if (!section) return;
+      const body = `<p class="cache-selection-warning">Unable to load repository details: ${escapeHtml(e.message)}</p>${cacheAllFilesHeadingHTML(context)}${context.filesHTML || ''}${context.metadataHTML || ''}${context.dangerHTML || ''}`;
+      section.innerHTML = cacheContentsSectionHTML(context, null, body);
+      section.setAttribute('aria-busy', 'false');
     }
   };
 
@@ -4490,72 +4574,108 @@ async function loadRepositoryDetails(entry) {
     return escapeHtml(String(value ?? '')).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
-  function renderCacheSelection(selection, selectedLocationID, context, outcomeHTML = '') {
-    const { requestID, repo } = context;
+  function cacheSelectionGroupRowHTML(group, index, repo, location) {
+    const deleteKey = selectedCacheDeleteKey(repo, location.id, group.id);
+    const canDelete = location.canDelete === true && group.canDelete === true;
+    const disabledReason = location.canDelete !== true
+      ? location.deleteReason || location.warning || 'This location is not eligible for selected-file deletion.'
+      : group.canDelete !== true
+        ? group.warning || 'This GGUF group is not eligible for selected-file deletion.'
+        : '';
+    const pending = pendingSelectedCacheDeletes.has(deleteKey);
+    const members = Array.isArray(group.members) ? group.members : [];
+    const distinctPaths = new Set(members.map(member => member.path)).size;
+    const savedVersions = new Set(members.flatMap(member => member.versions || [])).size;
+    let groupSize = 0;
+    const countedPaths = new Set();
+    for (const member of members) {
+      if (countedPaths.has(member.path)) continue;
+      countedPaths.add(member.path);
+      groupSize += Number(member.size) || 0;
+    }
+    const quantSuffix = group.quant ? ` · ${group.quant}` : '';
+    const displayLabel = quantSuffix && typeof group.label === 'string' && group.label.endsWith(quantSuffix) ? group.label.slice(0, -quantSuffix.length) : (group.label || '');
+    const isVision = group.kind === 'vision_encoder';
+    // A vision encoder is a companion artifact, not a model quantization, so
+    // it gets its own badge instead of a quant label.
+    const kindBadge = isVision
+      ? '<span class="cache-badge cache-badge-vision-encoder" title="Multimodal vision encoder companion">VISION</span>'
+      : (group.quant ? `<span class="cache-badge">${escapeHtml(group.quant)}</span>` : '');
+    const size = groupSize > 0 ? `<span class="cache-selection-size">${escapeHtml(formatBytes(groupSize))}</span>` : '';
+    const countLabel = `${distinctPaths} file${distinctPaths === 1 ? '' : 's'}`;
+    // Facts replace the old per-row inventory disclosure and appear only when
+    // they add information beyond the line-1 counts.
+    const facts = [];
+    if (distinctPaths > 1) facts.push(`${distinctPaths} shards`);
+    if (savedVersions > 1) facts.push(`${savedVersions} saved versions`);
+    if (members.some(member => member.linkOnly)) facts.push('link only');
+    const accessibleName = (isVision
+      ? `Delete vision encoder ${displayLabel}`
+      : group.quant ? `Delete ${group.quant} ${displayLabel}` : `Delete ${displayLabel}`).trim();
+    return `
+      <article class="cache-selection-group" data-group-id="${escapeCacheDetailAttribute(group.id)}">
+        <div class="cache-selection-group-info">${kindBadge}${size}<span class="cache-selection-counts">${size ? '· ' : ''}${countLabel}</span></div>
+        <code class="cache-selection-file-path" title="${escapeCacheDetailAttribute(displayLabel)}">${escapeHtml(displayLabel)}</code>
+        ${facts.length ? `<p class="cache-selection-facts">${escapeHtml(facts.join(' · '))}</p>` : ''}
+        <button class="btn btn-ghost btn-sm cache-selection-delete" type="button" data-delete-group-index="${index}"${!canDelete || pending ? ' disabled' : ''}${disabledReason ? ` aria-describedby="cache-selection-help-${index}" title="${escapeCacheDetailAttribute(disabledReason)}"` : ''} aria-label="${escapeCacheDetailAttribute(accessibleName)}">Delete</button>
+        ${group.warning && group.warning !== disabledReason ? `<p class="cache-selection-warning">${escapeHtml(group.warning)}</p>` : ''}
+        ${disabledReason || pending ? `<p id="cache-selection-help-${index}" class="cache-selection-readonly">${escapeHtml(pending ? 'Deletion is in progress for this group.' : disabledReason)}</p>` : ''}
+      </article>`;
+  }
+
+  function cacheSelectionLocationOptionsHTML(locations, selectedLocationID, location) {
+    if (!locations.length) return '<p class="cache-selection-readonly">No selectable model locations are available.</p>';
+    return `<select id="cacheSelectionLocation"${location ? ` title="${escapeCacheDetailAttribute(location.path)}"` : ''}>${selectedLocationID && !location ? '<option value="-1" selected>Choose a currently available location</option>' : ''}${locations.map((item, index) => `<option value="${index}"${item.id === selectedLocationID ? ' selected' : ''}>${escapeHtml(item.source)} — ${escapeHtml(item.path)}</option>`).join('')}</select>`;
+  }
+
+  function focusCacheContents(section, groupID = '') {
+    if (!section || typeof section.querySelectorAll !== 'function') return;
+    if (groupID) {
+      const owner = Array.from(section.querySelectorAll('.cache-selection-group')).find(row => row.dataset?.groupId === groupID);
+      const control = owner?.querySelector?.('.cache-selection-delete');
+      if (control) { control.focus(); return; }
+    }
+    $('#cacheContentsHeading')?.focus?.();
+  }
+
+  function renderCacheSelection(selection, selectedLocationID, context, outcomeHTML = '', options = {}) {
+    const { repo } = context;
     const locations = selection.locations || [];
     const location = locations.find(item => item.id === selectedLocationID);
-    const options = locations.map((item, index) =>
-      `<option value="${index}"${item.id === selectedLocationID ? ' selected' : ''}>${escapeHtml(item.source)} — ${escapeHtml(item.path)}</option>`
-    ).join('');
+    const optionsHost = $('#cacheLocationOptions');
+    if (optionsHost) optionsHost.innerHTML = cacheSelectionLocationOptionsHTML(locations, selectedLocationID, location);
+    const change = $('#cacheLocationChange');
+    if (change) change.disabled = locations.length === 0;
     const groups = location?.groups || [];
     const hasGroups = Boolean(location && groups.length);
-    const groupRows = groups.length ? groups.map((group, index) => {
-      const deleteKey = selectedCacheDeleteKey(repo, location.id, group.id);
-      const canDelete = location.canDelete === true && group.canDelete === true;
-      const disabledReason = location.canDelete !== true
-        ? location.deleteReason || location.warning || 'This location is not eligible for selected-file deletion.'
-        : group.canDelete !== true
-          ? group.warning || 'This GGUF group is not eligible for selected-file deletion.'
-          : '';
-      const pending = pendingSelectedCacheDeletes.has(deleteKey);
-      const distinctPaths = new Set((group.members || []).map(member => member.path)).size;
-      const savedVersions = new Set((group.members || []).flatMap(member => member.versions || [])).size;
-      const quantSuffix = group.quant ? ` · ${group.quant}` : '';
-      const displayLabel = quantSuffix && typeof group.label === 'string' && group.label.endsWith(quantSuffix) ? group.label.slice(0, -quantSuffix.length) : group.label;
-      // A vision encoder is a companion artifact, not a model quantization, so
-      // it gets its own badge instead of a quant label.
-      const kindBadge = group.kind === 'vision_encoder'
-        ? ' <span class="cache-badge cache-badge-vision-encoder" title="Multimodal vision encoder companion">Vision encoder</span>'
-        : (group.quant ? ` <span class="cache-badge">${escapeHtml(group.quant)}</span>` : '');
-      return `
-      <article class="cache-selection-group">
-        <div class="cache-selection-group-row">
-          <div class="cache-selection-group-info"><strong>${escapeHtml(displayLabel)}</strong>${kindBadge}<span class="cache-selection-counts">${distinctPaths} file${distinctPaths === 1 ? '' : 's'}${savedVersions ? ` · ${savedVersions} saved versions` : ''}</span></div>
-          <button class="btn btn-danger btn-sm cache-selection-delete" type="button" data-delete-group-index="${index}"${!canDelete || pending ? ' disabled' : ''} aria-describedby="cache-selection-help-${index}"${disabledReason ? ` title="${escapeCacheDetailAttribute(disabledReason)}"` : ''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg> Delete</button>
-        </div>
-        <details><summary>Show ${group.members?.length || 0} file record${group.members?.length === 1 ? '' : 's'}</summary>
-          <ul>${(group.members || []).map(member => `<li><code>${escapeHtml(member.path)}</code>${member.versions?.length ? ` <span>(${member.versions.map(escapeHtml).join(', ')})</span>` : ''}${member.linkOnly ? ` <span class="cache-selection-warning">Link only — ${escapeHtml(member.message || 'the weight file remains')}</span>` : ''}</li>`).join('')}</ul>
-        </details>
-        ${group.warning && group.warning !== disabledReason ? `<p class="cache-selection-warning">${escapeHtml(group.warning)}</p>` : ''}
-        <span id="cache-selection-help-${index}" class="cache-selection-readonly">${pending ? 'Deletion is in progress for this group.' : disabledReason ? escapeHtml(disabledReason) : 'Only this group will be removed.'}</span>
-      </article>`;
-    }).join('') : '<p>No GGUF groups were found in this location.</p>';
+    const groupRows = groups.length
+      ? groups.map((group, index) => cacheSelectionGroupRowHTML(group, index, repo, location)).join('')
+      : '';
     const snapshotFiles = Array.isArray(context.snapshotFiles) ? context.snapshotFiles : [];
     const otherFiles = snapshotFiles.filter(file => !/\.gguf$/i.test(file?.name || ''));
     const otherFilesHtml = !hasGroups || !otherFiles.length ? '' : `<details class="cache-selection-other"><summary>Other files (${otherFiles.length})</summary><p class="cache-selection-readonly">Config, tokenizer, and other non-GGUF files from the opening snapshot.</p><ul>${otherFiles.map(file => `<li>${file.isLfs ? '<span class="lfs-badge">LFS</span> ' : ''}<code>${escapeHtml(file.name)}</code>${file.sizeHuman ? ` <span>${escapeHtml(file.sizeHuman)}</span>` : ''}</li>`).join('')}</ul></details>`;
+    const bodyHTML = `${outcomeHTML}
+      ${location?.warning ? `<p class="cache-selection-warning">${escapeHtml(location.warning)}</p>` : ''}
+      ${selectedLocationID && !location ? '<p class="cache-selection-warning">The previously selected location is no longer available. Showing the copy this view was opened for; no other location was selected automatically.</p>' : ''}
+      ${!locations.length ? '<p class="cache-selection-readonly">No selectable model locations are available.</p>' : ''}
+      ${location ? `<div class="cache-selection-groups">${groupRows || '<p class="cache-selection-readonly">No GGUF groups were found in this location.</p>'}</div>` : ''}
+      ${hasGroups ? otherFilesHtml : ''}
+      ${location ? '' : `${cacheAllFilesHeadingHTML(context)}${context.filesHTML || ''}`}
+      ${context.metadataHTML || ''}
+      ${context.dangerHTML || ''}`;
     const host = $('#modalBody');
     if (!host || !cacheDetailsContextIsCurrent(context)) return;
     let section = $('#cacheSelectionSection');
     if (!section) {
       const cacheDetailHost = host.querySelector('.cache-detail-modal') || host;
-      const cacheDetailAnchor = cacheDetailHost.querySelector?.('.cache-detail-stats') || cacheDetailHost.querySelector?.('.cache-detail-header');
-      if (cacheDetailAnchor) cacheDetailAnchor.insertAdjacentHTML('afterend', '<section id="cacheSelectionSection" class="cache-detail-section"></section>');
-      else cacheDetailHost.insertAdjacentHTML('afterbegin', '<section id="cacheSelectionSection" class="cache-detail-section"></section>');
+      const cacheDetailAnchor = cacheDetailHost.querySelector?.('.cache-detail-panel') || cacheDetailHost.querySelector?.('.cache-detail-header');
+      if (cacheDetailAnchor) cacheDetailAnchor.insertAdjacentHTML('afterend', '<section id="cacheSelectionSection" class="cache-detail-section" role="status" aria-live="polite" aria-busy="false"></section>');
+      else cacheDetailHost.insertAdjacentHTML('afterbegin', '<section id="cacheSelectionSection" class="cache-detail-section" role="status" aria-live="polite" aria-busy="false"></section>');
       section = $('#cacheSelectionSection');
+      if (!section) return;
     }
-    section.innerHTML = `
-      <div class="cache-selection-sticky">
-        <h4>GGUF groups</h4>
-        ${locations.length ? `<label for="cacheSelectionLocation">Storage location</label><select id="cacheSelectionLocation"${location ? ` title="${escapeCacheDetailAttribute(location.path)}"` : ''}>${selectedLocationID && !location ? '<option value="-1" selected>Choose a currently available location</option>' : ''}${options}</select>` : '<p>No selectable model locations are available.</p>'}
-        ${location?.warning ? `<p class="cache-selection-warning">${escapeHtml(location.warning)}</p>` : ''}
-      </div>
-      <div class="cache-detail-scroll" tabindex="0" aria-label="Repository files and metadata">
-      ${outcomeHTML}
-      ${selectedLocationID && !location ? '<p class="cache-selection-warning">The previously selected location is no longer available. No other location was selected automatically.</p>' : ''}
-      ${location ? `<div class="cache-selection-groups">${groupRows}</div>` : ''}
-      ${hasGroups ? otherFilesHtml : context.filesHTML || ''}
-      ${context.metadataHTML || ''}
-      </div>`;
+    section.setAttribute('aria-busy', 'false');
+    section.innerHTML = cacheContentsSectionHTML(context, location, bodyHTML);
     context.selection = selection;
     context.selectedLocationID = selectedLocationID;
     section.querySelectorAll('.cache-selection-delete').forEach(button => button.addEventListener('click', () => {
@@ -4566,6 +4686,7 @@ async function loadRepositoryDetails(entry) {
       openSelectedCacheDeleteConfirmation({
         context,
         detailsHTML: $('#modalBody').innerHTML,
+        restoreScrollTop: Number($('#cacheContentsScroll')?.scrollTop) || 0,
         repo,
         location: { id: location.id, source: location.source, path: location.path },
         group: {
@@ -4590,26 +4711,44 @@ async function loadRepositoryDetails(entry) {
       if (!Number.isInteger(selectedIndex) || !nextLocation || !cacheDetailsContextIsCurrent(context)) return;
       context.selectedLocationID = nextLocation.id;
       select.disabled = true;
-      section.innerHTML = `<div class="cache-selection-sticky"><h4>GGUF groups</h4><p>Loading groups from ${escapeHtml(nextLocation.source)} location: <code>${escapeHtml(nextLocation.path)}</code></p></div><div class="cache-detail-scroll" aria-busy="true"></div>`;
+      const liveSection = $('#cacheSelectionSection');
+      if (liveSection) {
+        liveSection.setAttribute('aria-busy', 'true');
+        liveSection.innerHTML = cacheContentsSectionHTML(context, nextLocation, `<p class="cache-selection-readonly">Loading GGUF groups from ${escapeHtml(nextLocation.source)}…</p>`, true);
+      }
       const query = `/cache-selection?repo=${encodeURIComponent(repo)}&type=model&locationId=${encodeURIComponent(nextLocation.id)}`;
       try {
         const updated = await api('GET', query);
         if (!cacheDetailsContextIsCurrent(context)) return;
+        const picker = $('#cacheLocationPicker');
+        if (picker) picker.setAttribute('hidden', '');
+        const changeButton = $('#cacheLocationChange');
+        if (changeButton) changeButton.setAttribute('aria-expanded', 'false');
         const freshLocation = updated.locations?.find(item => item.id === nextLocation.id);
         const refreshed = { ...selection, locations: locations.map(item => item.id === nextLocation.id && freshLocation ? freshLocation : item) };
-        renderCacheSelection(refreshed, nextLocation.id, context, outcomeHTML);
+        renderCacheSelection(refreshed, nextLocation.id, context, outcomeHTML, { focusHeading: true });
       } catch (error) {
-        if (cacheDetailsContextIsCurrent(context)) {
-          const warning = $('#cacheSelectionSection');
-          if (warning) warning.innerHTML = `<div class="cache-selection-sticky"><h4>GGUF groups</h4></div><div class="cache-detail-scroll" tabindex="0" aria-label="Repository files and metadata"><p class="cache-selection-warning">Unable to load groups from ${escapeHtml(nextLocation.source)} location <code>${escapeHtml(nextLocation.path)}</code>: ${escapeHtml(error.message)}</p>${context.filesHTML || ''}${context.metadataHTML || ''}</div>`;
+        if (!cacheDetailsContextIsCurrent(context)) return;
+        const warning = $('#cacheSelectionSection');
+        if (warning) {
+          warning.setAttribute('aria-busy', 'false');
+          warning.innerHTML = cacheContentsSectionHTML(context, nextLocation, `<p class="cache-selection-warning">Unable to load groups from ${escapeHtml(nextLocation.source)} location <code>${escapeHtml(nextLocation.path)}</code>: ${escapeHtml(error.message)}</p>${context.metadataHTML || ''}${context.dangerHTML || ''}`);
+          const failedSelect = $('#cacheSelectionLocation');
+          if (failedSelect) failedSelect.disabled = false;
+          $('#cacheContentsHeading')?.focus?.();
         }
       }
     });
+    if (Number.isFinite(options.restoreScrollTop)) {
+      const scroll = $('#cacheContentsScroll');
+      if (scroll) scroll.scrollTop = options.restoreScrollTop;
+    }
+    if (options.focusGroupId || options.focusHeading) focusCacheContents(section, options.focusGroupId || '');
   }
 
   function openSelectedCacheDeleteConfirmation(context) {
     if (!cacheDetailsContextIsCurrent(context.context)) return;
-    const { context: detailsContext, repo, location, group } = context;
+    const { context: detailsContext, repo, location, group, restoreScrollTop = 0 } = context;
     const sequence = ++cacheDeleteConfirmationSequence;
     const confirmationID = `cache-delete-confirm-${sequence}`;
     const members = group.members.map(member => Object.freeze({
@@ -4624,16 +4763,17 @@ async function loadRepositoryDetails(entry) {
     for (const member of members) {
       let entry = filesByPath.get(member.path);
       if (!entry) {
-        entry = { path: member.path, versions: new Set(), linkOnly: false };
+        entry = { path: member.path, versions: new Set(), linkOnly: false, size: 0 };
         filesByPath.set(member.path, entry);
       }
       member.versions.forEach(version => entry.versions.add(version));
       entry.linkOnly = entry.linkOnly || member.linkOnly;
+      if (!entry.size && Number(member.size) > 0) entry.size = Number(member.size);
     }
     const fileEntries = Array.from(filesByPath.values());
     const savedVersionCount = new Set(members.flatMap(member => member.versions)).size;
     const linkOnly = members.some(member => member.linkOnly);
-    const files = fileEntries.map(entry => `<li><code>${escapeHtml(entry.path)}</code>${entry.versions.size ? `<span> — Saved versions (${entry.versions.size}): ${Array.from(entry.versions).map(escapeHtml).join(', ')}</span>` : ''}${entry.linkOnly ? '<strong> — Link only: this removes the link; the weight file remains.</strong>' : ''}</li>`).join('');
+    const files = fileEntries.map(entry => `<li><code>${escapeHtml(entry.path)}</code>${entry.size > 0 ? `<span> — ${escapeHtml(formatBytes(entry.size))}</span>` : ''}${entry.versions.size ? `<span> — Saved versions (${entry.versions.size}): ${Array.from(entry.versions).map(escapeHtml).join(', ')}</span>` : ''}${entry.linkOnly ? '<strong> — Link only: this removes the link; the weight file remains.</strong>' : ''}</li>`).join('');
     // A vision encoder is a companion artifact, not a model quantization, so
     // the confirmation names its role and never claims the selected artifact
     // class remains.
@@ -4660,7 +4800,7 @@ async function loadRepositoryDetails(entry) {
         <p>${groupLine}</p>
         <p>${scopeStatement}</p>
         ${linkOnly ? '<p class="cache-selection-warning">This group includes link-only entries. Removing a link does not remove its weight target.</p>' : ''}
-        <details open><summary>Files included (${fileEntries.length} distinct paths${versioned ? ` · ${savedVersionCount} saved versions` : ''})</summary><ul>${files}</ul></details>
+        <details open><summary>Files included (${fileEntries.length} file${fileEntries.length === 1 ? '' : 's'}${savedVersionCount ? ` · ${savedVersionCount} saved version${savedVersionCount === 1 ? '' : 's'}` : ''})</summary><ul>${files}</ul></details>
         <p id="cache-delete-progress" role="status"></p>
         <div class="form-actions">
           <button id="cache-delete-cancel-${sequence}" class="btn btn-ghost" type="button">Cancel</button>
@@ -4699,6 +4839,7 @@ async function loadRepositoryDetails(entry) {
       await submitSelectedCacheDelete({
         detailsContext,
         detailsHTML: context.detailsHTML,
+        restoreScrollTop,
         repo,
         location,
         group,
@@ -4749,7 +4890,7 @@ async function loadRepositoryDetails(entry) {
   }
 
   function insertCacheDetailsFreshnessNotice() {
-    ($('#modalBody .cache-detail-scroll') || $('#cacheSelectionSection'))?.insertAdjacentHTML('afterbegin', '<p class="cache-selection-readonly">The repository totals and general file list are the snapshot from when Details opened; GGUF groups were refreshed for the selected locations.</p>');
+    $('#cacheContentsScroll')?.insertAdjacentHTML('afterbegin', '<p class="cache-selection-readonly">This copy and the general file list are the snapshot from when Details opened; GGUF groups were refreshed for the selected location.</p>');
   }
 
   async function submitSelectedCacheDelete(context) {
@@ -4796,15 +4937,24 @@ async function loadRepositoryDetails(entry) {
       if (!context.isCurrent()) return;
       $('#modalTitle').textContent = 'Repository Details';
       setModalContent(context.detailsHTML);
-      renderCacheSelection(freshSelection, context.location.id, context.detailsContext, notice);
+      renderCacheSelection(freshSelection, context.location.id, context.detailsContext, notice, {
+        restoreScrollTop: context.restoreScrollTop,
+        focusGroupId: context.group.id
+      });
       insertCacheDetailsFreshnessNotice();
     } catch (error) {
       if (!context.isCurrent()) return;
       $('#modalTitle').textContent = 'Repository Details';
       setModalContent(context.detailsHTML);
       const section = $('#cacheSelectionSection');
-      if (section) section.innerHTML = `<div class="cache-selection-sticky"><h4>GGUF groups</h4></div><div class="cache-detail-scroll" tabindex="0" aria-label="Repository files and metadata">${notice}<p class="cache-selection-warning">Unable to refresh GGUF locations: ${escapeHtml(error.message)}. Close and reopen Details before another delete.</p>${context.detailsContext.filesHTML || ''}${context.detailsContext.metadataHTML || ''}</div>`;
+      if (section) {
+        section.setAttribute('aria-busy', 'false');
+        section.innerHTML = cacheContentsSectionHTML(context.detailsContext, null, `${notice}<p class="cache-selection-warning">Unable to refresh GGUF locations: ${escapeHtml(error.message)}. Close and reopen Details before another delete.</p>${context.detailsContext.metadataHTML || ''}${context.detailsContext.dangerHTML || ''}`);
+        const scroll = $('#cacheContentsScroll');
+        if (scroll) scroll.scrollTop = Number(context.restoreScrollTop) || 0;
+      }
       insertCacheDetailsFreshnessNotice();
+      $('#cacheContentsHeading')?.focus?.();
     }
   }
 
