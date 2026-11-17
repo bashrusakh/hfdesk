@@ -98,7 +98,11 @@ func TestCacheManyItemConcurrentDownloadCompletes(t *testing.T) {
 			srv := newCacheConcurrencyHub(t, cacheConcurrencyFileCount)
 			cacheDir := t.TempDir()
 
-			ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+			// The contract is that every requested file completes under
+			// concurrency, not a runner-speed target. Observed Windows runs of
+			// this tree ranged from 78s to 93s, so keep the budget well above
+			// that spread while still failing a hang or deadlock.
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
 			defer cancel()
 			start := time.Now()
 			var doneCount atomic.Int64
