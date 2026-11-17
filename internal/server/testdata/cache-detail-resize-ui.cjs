@@ -218,7 +218,7 @@ async function openDetails() {
 
   // Live bounds: the 40px backdrop gutter on each side, the 520px minimum
   // width, and the 500px minimum height that keeps a usable contents viewport
-  // below the fixed header, This copy panel, and footer.
+  // below the fixed header, facts lines, and footer.
   const live = ui.cacheDetailResizeBounds();
   eq(live.minWidth, 520);
   eq(live.minHeight, 500);

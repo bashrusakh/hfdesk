@@ -15,6 +15,7 @@ Long-form notes: [docs/releases/1.3.0-beta.6.md](docs/releases/1.3.0-beta.6.md).
 ### Changed
 
 - The selected GGUF group deletion confirmation names the quantization in its title and shows left-aligned facts, a one-sentence scope, and file rows with right-aligned sizes; the whole-copy confirmation is unchanged. (#207)
+- Repository Details uses one compact identity and **This copy** facts header, a single native location selector in the contents heading, and single-line friendly-view/download provenance instead of the duplicated **This copy** panel and **Repository metadata** block. (#213)
 
 ## [1.3.0-beta.5] - 2026-11-17
 

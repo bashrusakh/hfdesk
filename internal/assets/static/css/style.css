@@ -2274,7 +2274,17 @@ a {
   max-width: 100%;
 }
 
+.cache-detail-title-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+}
+
 .cache-detail-repo {
+  min-width: 0;
   font-size: 16px;
   overflow-wrap: anywhere;
 }
@@ -2289,25 +2299,41 @@ a {
   color: var(--color-text);
 }
 
-.cache-detail-provenance {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+.cache-detail-facts,
+.cache-detail-secondary {
+  display: block;
   min-width: 0;
   max-width: 100%;
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.cache-detail-facts {
+  overflow-wrap: anywhere;
+}
+
+.cache-detail-facts-prefix {
+  font-weight: 500;
+}
+
+.cache-detail-sep {
+  color: var(--color-text-muted);
+}
+
+.cache-detail-commit {
+  font-family: var(--font-mono);
   font-size: 12px;
   color: var(--color-text-secondary);
 }
 
-.cache-detail-provenance .cache-badge {
-  flex-shrink: 0;
-}
-
-.cache-detail-provenance-path {
-  min-width: 0;
+.cache-detail-secondary {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.cache-detail-secondary code {
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--color-text-secondary);
@@ -2331,143 +2357,6 @@ a {
 .cache-detail-hub-link:focus-visible {
   outline: 2px solid var(--color-primary);
   outline-offset: 2px;
-}
-
-.cache-detail-panel {
-  flex-shrink: 0;
-  min-width: 0;
-  margin: 0 20px 10px;
-  padding: 8px 12px;
-  background: var(--color-bg-secondary);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  container-type: inline-size;
-  container-name: cache-detail-copy;
-}
-
-.cache-detail-panel-head {
-  display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 4px 10px;
-  margin-bottom: 6px;
-}
-
-.cache-detail-panel-head h4 {
-  margin: 0;
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.cache-detail-panel-note {
-  font-size: 12px;
-  color: var(--color-text-secondary);
-}
-
-.cache-detail-defs {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto auto;
-  gap: 8px 16px;
-  margin: 0;
-}
-
-/* The dialog width changes independently of the viewport when the user
-   resizes it, so "This copy" collapses from its panel width, not the window. */
-@container cache-detail-copy (max-width: 520px) {
-  .cache-detail-defs {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    grid-template-areas:
-      "source size"
-      "location location"
-      "files commit";
-    gap: 8px 12px;
-  }
-  .cache-detail-def-source { grid-area: source; }
-  .cache-detail-def-location { grid-area: location; }
-  .cache-detail-def-size { grid-area: size; }
-  .cache-detail-def-files { grid-area: files; }
-  .cache-detail-def-commit { grid-area: commit; }
-}
-
-.cache-detail-def {
-  min-width: 0;
-}
-
-.cache-detail-def dt {
-  margin: 0 0 2px;
-  color: var(--color-text-secondary);
-  font-size: 11px;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.cache-detail-def dd {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  min-width: 0;
-  margin: 0;
-  color: var(--color-text);
-  font-size: 13px;
-}
-
-.cache-detail-def dd code {
-  min-width: 0;
-  overflow: hidden;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.cache-detail-def-location dd {
-  flex-wrap: nowrap;
-}
-
-.cache-detail-location-path {
-  flex: 1 1 auto;
-}
-
-.cache-detail-location-change {
-  flex-shrink: 0;
-}
-
-.cache-detail-unknown {
-  color: var(--color-text-secondary);
-  font-size: 12px;
-}
-
-.cache-detail-location-picker {
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px dashed var(--color-border);
-}
-
-.cache-detail-location-picker label {
-  display: block;
-  margin-bottom: 6px;
-  color: var(--color-text-secondary);
-  font-size: 12px;
-}
-
-.cache-detail-location-picker select {
-  display: block;
-  width: 100%;
-  max-width: 100%;
-  box-sizing: border-box;
-  padding: 7px 10px;
-  background: var(--color-bg-tertiary);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  color: var(--color-text);
-  font-size: 13px;
-}
-
-.cache-detail-location-picker select:focus {
-  outline: none;
-  border-color: var(--color-primary);
-  box-shadow: 0 0 0 3px var(--color-primary-glow);
 }
 
 .cache-detail-danger {
@@ -2503,13 +2392,6 @@ a {
 
 .cache-detail-section {
   margin-bottom: 24px;
-}
-
-.cache-detail-section h4 {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--color-text);
-  margin-bottom: 12px;
 }
 
 .cache-selection-group {
@@ -2560,20 +2442,27 @@ a {
   border-bottom: 1px solid var(--color-border);
 }
 
-/* A short window leaves the fixed chrome plus "This copy" with little room.
-   The duplicate location line goes first, then the heading itself, so the
-   contents scroll never paints over the footer. */
+/* A short window leaves the fixed chrome with little room, so the sticky
+   heading tightens before it disappears entirely. */
 @media (max-height: 600px) {
   .cache-selection-sticky { padding-bottom: 4px; }
-  .cache-selection-sticky .cache-contents-location { display: none; }
 }
 
 @media (max-height: 500px) {
   .cache-selection-sticky { display: none; }
 }
 
+.cache-contents-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
 .cache-selection-sticky h4 {
   margin: 0;
+  flex-shrink: 0;
   font-size: 14px;
   font-weight: 600;
 }
@@ -2595,24 +2484,39 @@ a {
 }
 
 .cache-contents-location {
-  margin: 2px 0 0;
-  color: var(--color-text-secondary);
-  font-size: 12px;
-  overflow-wrap: anywhere;
+  display: flex;
+  justify-content: flex-end;
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
 }
 
-.cache-contents-location code {
+.cache-contents-location select {
   display: block;
-  max-width: 100%;
+  width: 100%;
+  max-width: 360px;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 4px 8px;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  padding: 2px 8px;
   background: var(--color-bg-tertiary);
-  border-radius: 6px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
   color: var(--color-text-secondary);
   font-family: var(--font-mono);
   font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cache-contents-location select:focus {
+  outline: none;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-glow);
+}
+
+.cache-contents-location select:disabled {
+  cursor: progress;
 }
 
 .cache-detail-scroll {
@@ -2724,8 +2628,7 @@ a {
   outline-offset: 2px;
 }
 
-.cache-detail-modal .cache-selection-other summary,
-.cache-detail-metadata > summary {
+.cache-detail-modal .cache-selection-other summary {
   cursor: pointer;
   padding: 4px 0;
   border-radius: 4px;
@@ -2744,8 +2647,7 @@ a {
   text-underline-offset: 2px;
 }
 
-.cache-detail-modal .cache-selection-other summary:focus-visible,
-.cache-detail-metadata > summary:focus-visible {
+.cache-detail-modal .cache-selection-other summary:focus-visible {
   outline: 2px solid var(--color-primary);
   outline-offset: 2px;
 }
@@ -2843,20 +2745,6 @@ a {
     max-height: 92dvh;
   }
   .cache-detail-header { padding: 12px 14px 8px; }
-  .cache-detail-panel { margin: 0 14px 10px; padding: 8px 10px; }
-  .cache-detail-defs {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    grid-template-areas:
-      "source size"
-      "location location"
-      "files commit";
-    gap: 8px 12px;
-  }
-  .cache-detail-def-source { grid-area: source; }
-  .cache-detail-def-location { grid-area: location; }
-  .cache-detail-def-size { grid-area: size; }
-  .cache-detail-def-files { grid-area: files; }
-  .cache-detail-def-commit { grid-area: commit; }
   .cache-selection-sticky { padding: 0 14px 8px; }
   .cache-detail-scroll { padding: 10px 14px; }
   .cache-detail-modal .cache-detail-actions {
@@ -2878,83 +2766,6 @@ a {
   .cache-detail-resize-grip {
     transition: none;
   }
-}
-
-.cache-detail-grid {
-  display: grid;
-  gap: 12px;
-}
-
-.cache-detail-item {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.cache-detail-full {
-  grid-column: 1 / -1;
-}
-
-.cache-detail-label {
-  font-size: 12px;
-  color: var(--color-text-secondary);
-}
-
-.cache-detail-value {
-  font-size: 14px;
-  color: var(--color-text);
-}
-
-.cache-detail-code {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  background: var(--color-bg-tertiary);
-  padding: 8px 12px;
-  border-radius: var(--radius-sm);
-  word-break: break-all;
-}
-
-.cache-detail-paths {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.cache-path-item {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.cache-path-label {
-  font-size: 12px;
-  color: var(--color-text-secondary);
-}
-
-.cache-path-value {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  background: var(--color-bg-tertiary);
-  padding: 10px 12px;
-  border-radius: var(--radius-sm);
-  word-break: break-all;
-  display: block;
-}
-
-.cache-detail-note {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 12px 16px;
-  background: var(--color-bg-tertiary);
-  border-radius: var(--radius-md);
-  font-size: 13px;
-  color: var(--color-text-secondary);
-}
-
-.cache-detail-note svg {
-  flex-shrink: 0;
-  color: var(--color-text-muted);
 }
 
 .cache-detail-subheading {
@@ -3022,8 +2833,6 @@ a {
   background: var(--color-surface);
 }
 
-.cache-detail-metadata { margin-top: 12px; }
-.cache-detail-metadata[open] > summary { margin-bottom: 12px; }
 .cache-detail-modal .cache-file-name { white-space: normal; overflow-wrap: anywhere; }
 
 /* Selected-group deletion dialog. Scoped here so the shared whole-copy
