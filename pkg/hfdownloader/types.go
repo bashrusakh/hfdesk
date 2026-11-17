@@ -393,8 +393,8 @@ type Settings struct {
 //   - "plan_item": A file has been added to the download plan
 //   - "file_start": Download of a file has started
 //   - "file_preparing": Local preparation before transfer is running
-//   - "file_progress": Periodic progress update during download, including
-//     the cumulative local write-wait measurement
+//   - "file_progress": Periodic progress update during download, including the
+//     last response-read and local-write activity timestamps
 //   - "file_done": File download complete (check Message for "skip" info)
 //   - "retry": A retry attempt is being made
 //   - "error": An error occurred
@@ -426,12 +426,20 @@ type ProgressEvent struct {
 	// Downloaded is the cumulative bytes downloaded so far.
 	Downloaded int64 `json:"downloaded,omitempty"`
 
-	// WriteWaitNanos is the cumulative time this file's transfer has spent
-	// blocked inside local payload writes (boundedAtWriter.WriteAt, including
-	// staging creation/preallocation) as of this event. The server compares
-	// its growth with the interval's wall time to classify the file's local
-	// write phase; it is a duration, never a byte rate.
-	WriteWaitNanos int64 `json:"writeWaitNanos,omitempty"`
+	// LastReadAt is when a successful response-body read last delivered bytes
+	// for this file. The server compares it with the current time to tell a
+	// transfer that is waiting on the network from one blocked on local writes.
+	LastReadAt time.Time `json:"lastReadAt,omitempty"`
+
+	// LastLocalWriteAt is when the file last made local progress: staging
+	// creation, claim record I/O, preallocation, a checkpoint fsync, or a
+	// completed payload write. It is an activity timestamp, never a byte rate.
+	LastLocalWriteAt time.Time `json:"lastLocalWriteAt,omitempty"`
+
+	// ActivityOnly marks a file_progress emitted during local preparation. It
+	// carries activity timestamps but no transfer-byte progress, so the server
+	// classifies the file without touching downloaded bytes or speed.
+	ActivityOnly bool `json:"activityOnly,omitempty"`
 
 	// Attempt is the retry attempt number (1-based).
 	// Only set in "retry" events.

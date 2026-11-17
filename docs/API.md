@@ -1305,8 +1305,8 @@ so other files proceed even with a low limit. Progress reports distinguish
 preparation, transfer, finalizing, completion, skipped, error, and cancellation
 states. `file_preparing` marks local staging creation/preallocation before the
 first transfer byte, and `file_finalizing` is emitted before the
-pre-publication proof. A file whose measured local write wait dominates its
-progress interval reports `status` `writing`; when no file is still
+pre-publication proof. A file whose response reads have stalled while local
+progress continues reports `status` `writing`; when no file is still
 transferring from the network, the job's `phase` is `writing` too. Speed and
 ETA keep their byte-rate meaning, and a client hides them while the writing
 phase is shown. The detailed ownership and resume contract is in

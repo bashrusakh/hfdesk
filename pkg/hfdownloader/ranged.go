@@ -141,6 +141,13 @@ type stagingClaimState struct {
 // destination domain. It fails closed if that domain does not cover staging;
 // only normalized state for the matching pinned identity can be resumed.
 func claimStaging(ctx context.Context, staging, publish, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, cfg Settings, contentAddressed bool, domain *blobDomain) (state *stagingClaimState, err error) {
+	return claimStagingWithActivity(ctx, staging, publish, metaPath, it, job, commit, commitPinned, cfg, contentAddressed, domain, nil)
+}
+
+// claimStagingWithActivity is claimStaging plus activity notes around the local
+// record work inside the metadata gate. The gate acquisition wait is excluded:
+// another writer holding it is not this file's local progress.
+func claimStagingWithActivity(ctx context.Context, staging, publish, metaPath string, it PlanItem, job Job, commit string, commitPinned bool, cfg Settings, contentAddressed bool, domain *blobDomain, activity *fileActivity) (state *stagingClaimState, err error) {
 	if !domain.coversStaging(staging) {
 		return nil, fmt.Errorf("refuse to claim staging %s: the held destination ownership domain does not cover it", staging)
 	}
@@ -175,7 +182,13 @@ func claimStaging(ctx context.Context, staging, publish, metaPath string, it Pla
 		}
 		var retry bool
 		var cerr error
+		if activity != nil {
+			activity.noteLocalWrite()
+		}
 		state, retry, cerr = claimStagingLocked(staging, metaPath, it, job, commit, commitPinned, proofMode, currentFence)
+		if activity != nil {
+			activity.noteLocalWrite()
+		}
 		lock.release()
 		if cerr != nil {
 			return nil, cerr
@@ -701,11 +714,12 @@ type boundedAtWriter struct {
 	limit   int64
 	written int64
 	measure *payloadIOMeasurement
-	// writeWait, when non-nil, accumulates every WriteAt's blocking time across
-	// the file's range workers. It is the measurement behind the server's
-	// local-write phase; nil leaves the writer uninstrumented.
-	writeWait *atomic.Int64
-	onWrite   func(p []byte) // optional per-write hook (progress/hash feed)
+	// activity, when non-nil, records when each completed payload write landed
+	// so the server can tell a disk-bound transfer from a network-bound one.
+	activity *fileActivity
+	// writeAt is a test hook; nil means f.WriteAt.
+	writeAt func(p []byte, off int64) (int, error)
+	onWrite func(p []byte) // optional per-write hook (progress/hash feed)
 }
 
 func newBoundedAtWriter(f *os.File, base, limit int64) *boundedAtWriter {
@@ -718,12 +732,19 @@ func (w *boundedAtWriter) Write(p []byte) (int, error) {
 	if int64(len(p)) > w.limit-w.written {
 		return 0, fmt.Errorf("%w: wrote %d of %d bytes, got %d more", errRangedBodyOverflow, w.written, w.limit, len(p))
 	}
-	writeStart := time.Now()
-	n, err := w.f.WriteAt(p, w.base+w.written)
-	if w.writeWait != nil {
-		w.writeWait.Add(int64(time.Since(writeStart)))
+	var (
+		n   int
+		err error
+	)
+	if w.writeAt != nil {
+		n, err = w.writeAt(p, w.base+w.written)
+	} else {
+		n, err = w.f.WriteAt(p, w.base+w.written)
 	}
 	if n > 0 {
+		if w.activity != nil {
+			w.activity.noteLocalWrite()
+		}
 		w.written += int64(n)
 		stagingWriteBytes.Add(int64(n))
 		if w.measure != nil {
@@ -787,14 +808,18 @@ type stagingDownload struct {
 	// progress counts unique bytes written this run; emitted progress is
 	// baseCommitted + progress and never decreases within a run.
 	progress atomic.Int64
-	// writeWaitNanos accumulates the time every range writer spent inside
-	// WriteAt, plus the claim/preallocation window. It is reported with each
-	// file_progress so the server can classify the local-write phase.
-	writeWaitNanos atomic.Int64
+	// activity carries the last response-read and local-write instants on every
+	// file_progress event. It is the only signal the server classifies.
+	activity fileActivity
+	// prepDone is false until the claim, preallocation and initial checkpoint
+	// finish. Activity-only progress events keep the server from treating the
+	// prep window's zero bytes as transfer progress.
+	prepDone atomic.Bool
 	// baseCommitted is the committed total at claim time (excluded from
 	// this-run speed accounting, consistent with the resumed/skipped-bytes
-	// rule the single path already follows).
-	baseCommitted int64
+	// rule the single path already follows). It is read by the prep/progress
+	// ticker, so it is updated atomically.
+	baseCommitted atomic.Int64
 
 	// seqHash hashes writes only for a fresh whole-file sequential task. Untrusted
 	// framing invalidates it, requiring a final full-file pass. Access requires seqMu.
@@ -827,6 +852,10 @@ func (d *stagingDownload) flushMeta() error {
 // the real staging file; tests may replace it to observe the ordering.
 var syncStagingPayload = func(f *os.File) error { return f.Sync() }
 
+// truncateStagingPayload is a test hook for observing preallocation activity;
+// production always truncates the real staging payload.
+var truncateStagingPayload = func(f *os.File, size int64) error { return f.Truncate(size) }
+
 // flushMetaLocked requires metaMu, then takes the metadata gate and rechecks
 // the process-instance token before replacement. A nil layout claims no bytes.
 func (d *stagingDownload) flushMetaLocked() error {
@@ -835,7 +864,10 @@ func (d *stagingDownload) flushMetaLocked() error {
 	// claim durable before the record is persisted. Checkpoint boundaries only,
 	// never per write chunk.
 	if d.out != nil {
-		if err := syncStagingPayload(d.out); err != nil {
+		d.activity.noteLocalWrite()
+		err := syncStagingPayload(d.out)
+		d.activity.noteLocalWrite()
+		if err != nil {
 			return fmt.Errorf("sync staging payload of %s before its checkpoint: %w", d.it.RelativePath, err)
 		}
 	}
@@ -856,7 +888,12 @@ func (d *stagingDownload) flushMetaLocked() error {
 		return err
 	}
 	defer lock.release()
-	return writeStagingMetaOwnedLocked(d.meta, &meta)
+	// Record I/O inside the gate is local work; the acquisition wait above is
+	// not, so the activity clock starts only after the gate is held.
+	d.activity.noteLocalWrite()
+	err := writeStagingMetaOwnedLocked(d.meta, &meta)
+	d.activity.noteLocalWrite()
+	return err
 }
 
 // seqHashDigest reads digest and usability together under seqMu. False requires
@@ -983,6 +1020,10 @@ func (d *stagingDownload) resetClaim(open *os.File) (*os.File, error) {
 		return nil, err
 	}
 	defer lock.release()
+	// The gate wait above is another writer's work; the record replacement and
+	// payload reset below are this file's local progress.
+	d.activity.noteLocalWrite()
+	defer d.activity.noteLocalWrite()
 	if !claimRecordOwnedLocked(d.meta) {
 		return nil, errStagingClaimLost
 	}
@@ -1001,15 +1042,19 @@ func (d *stagingDownload) resetClaim(open *os.File) (*os.File, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := f.Truncate(d.it.Size); err != nil {
+		d.activity.noteLocalWrite()
+		if err := truncateStagingPayload(f, d.it.Size); err != nil {
 			_ = f.Close()
 			return nil, err
 		}
+		d.activity.noteLocalWrite()
 		return f, nil
 	}
-	if err := open.Truncate(d.it.Size); err != nil {
+	d.activity.noteLocalWrite()
+	if err := truncateStagingPayload(open, d.it.Size); err != nil {
 		return nil, err
 	}
+	d.activity.noteLocalWrite()
 	return open, nil
 }
 
@@ -1106,18 +1151,10 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	metaPath := stg + ".meta"
 
 	// Staging creation/preallocation can run for minutes on a non-sparse or
-	// network filesystem; announce the window before the first byte. Its
-	// duration is part of the file's local write wait: truncation and the
-	// initial checkpoint are disk work even though the phase stays preparing.
+	// network filesystem; announce the window before the first byte. The
+	// periodic progress ticker starts here so the server can observe local
+	// creation work even before the first transfer byte.
 	emit(ProgressEvent{Event: "file_preparing", Path: it.RelativePath, Message: "preparing staging file"})
-	prepStart := time.Now()
-
-	// Claim under the item's held domain and local metadata gate; only a known
-	// content-addressed publication target is completion proof.
-	state, err := claimStaging(ctx, stg, pub, metaPath, it, job, opts.Commit, opts.CommitPinned, cfg, opts.ContentAddressed, opts.Domain)
-	if err != nil {
-		return false, err
-	}
 
 	d := &stagingDownload{
 		ctx:              ctx,
@@ -1134,10 +1171,51 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		commit:           opts.Commit,
 		commitPinned:     opts.CommitPinned,
 		startedAt:        time.Now().UTC(),
-		proofPending:     state.proofPending,
 		contentAddressed: opts.ContentAddressed,
 		domain:           opts.Domain,
 	}
+
+	// The preparation window reports activity while the claim, preallocation
+	// and initial checkpoint run, then continues through the transfer. Stop it
+	// before finalization so it cannot observe publication.
+	tickerDone := make(chan struct{})
+	var tickerWG sync.WaitGroup
+	var tickerStopOnce sync.Once
+	stopTicker := func() {
+		tickerStopOnce.Do(func() {
+			close(tickerDone)
+			tickerWG.Wait()
+		})
+	}
+	defer stopTicker()
+	tickerWG.Add(1)
+	go func() {
+		defer tickerWG.Done()
+		t := time.NewTicker(200 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tickerDone:
+				return
+			case <-t.C:
+				readAt, writeAt := d.activity.snapshot()
+				emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
+					Downloaded: d.baseCommitted.Load() + d.progress.Load(), Total: it.Size,
+					LastReadAt: readAt, LastLocalWriteAt: writeAt,
+					ActivityOnly: !d.prepDone.Load()})
+			}
+		}
+	}()
+
+	// Claim under the item's held domain and local metadata gate; only a known
+	// content-addressed publication target is completion proof.
+	state, err := claimStagingWithActivity(ctx, stg, pub, metaPath, it, job, opts.Commit, opts.CommitPinned, cfg, opts.ContentAddressed, opts.Domain, &d.activity)
+	if err != nil {
+		return false, err
+	}
+	d.proofPending = state.proofPending
 
 	// A permanent range error cancels siblings with an abortCause, preserving the
 	// original error and distinguishing internal abort from user cancel/pause.
@@ -1152,7 +1230,9 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	if state.fresh {
 		openFlags |= os.O_CREATE
 	}
+	d.activity.noteLocalWrite()
 	out, err := os.OpenFile(stg, openFlags, 0o644)
+	d.activity.noteLocalWrite()
 	if err != nil && !state.fresh && errors.Is(err, os.ErrNotExist) {
 		out, err = d.resetClaim(nil)
 		if err == nil {
@@ -1185,7 +1265,10 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	d.out = out
 	defer d.closeOut()
 	if state.fresh {
-		if err := out.Truncate(it.Size); err != nil {
+		d.activity.noteLocalWrite()
+		err := truncateStagingPayload(out, it.Size)
+		d.activity.noteLocalWrite()
+		if err != nil {
 			return false, err
 		}
 	} else {
@@ -1230,7 +1313,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		d.proofPending = true
 	}
 	proofPendingForFlush := d.proofPending
-	d.baseCommitted = committedTotal(d.ranges)
+	d.baseCommitted.Store(committedTotal(d.ranges))
 	d.metaMu.Unlock()
 
 	if err := d.flushMeta(); err != nil {
@@ -1247,10 +1330,10 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	}
 
 	// The claim, preallocation and initial checkpoint are local disk work that
-	// preceded the first transfer byte; fold their duration into the file's
-	// cumulative write wait. The phase stays preparing (unchanged) until the
-	// first real progress event.
-	d.writeWaitNanos.Store(int64(time.Since(prepStart)))
+	// preceded the first transfer byte; their activity timestamps are already
+	// on the prep ticker events. The phase stays preparing (unchanged) until a
+	// recent read or local write selects the next state.
+	d.prepDone.Store(true)
 
 	// Derive missing suffixes under metaMu: checkpoint normalization mutates the
 	// same layout. Persisted partitions survive Concurrency changes; full prefixes
@@ -1268,7 +1351,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		tasks = append(tasks, rangeTask{idx: i, from: r.Start + r.Committed})
 	}
 	seqHashEligible := cfg.Verify == "sha256" && it.LFS && it.SHA256 != "" &&
-		len(tasks) == 1 && d.baseCommitted == 0 &&
+		len(tasks) == 1 && d.baseCommitted.Load() == 0 &&
 		d.ranges[tasks[0].idx].Start == 0 && d.ranges[tasks[0].idx].End == it.Size-1
 	d.metaMu.Unlock()
 
@@ -1331,29 +1414,8 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		}()
 	}
 
-	// Report the atomic in-memory count; join the ticker before finalization so
-	// it cannot observe publication in progress.
-	tickerDone := make(chan struct{})
-	var tickerWG sync.WaitGroup
-	tickerWG.Add(1)
-	go func() {
-		defer tickerWG.Done()
-		t := time.NewTicker(200 * time.Millisecond)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-tickerDone:
-				return
-			case <-t.C:
-				emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
-					Downloaded: d.baseCommitted + d.progress.Load(), Total: it.Size,
-					WriteWaitNanos: d.writeWaitNanos.Load()})
-			}
-		}
-	}()
-
+	// The prep/transfer ticker is joined before finalization so it cannot
+	// observe publication in progress.
 	go func() {
 		for _, t := range tasks {
 			select {
@@ -1367,8 +1429,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	}()
 
 	wg.Wait()
-	close(tickerDone)
-	tickerWG.Wait()
+	stopTicker()
 
 	// Return the original permanent error, not a sibling's cancellation. Internal
 	// abort preserves committed staging ranges rather than running user cleanup.
@@ -1401,8 +1462,9 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 
 	// Report full transfer progress, then finalizing before optional content proof
 	// and publication so the UI does not sit silently at 100%.
+	readAt, writeAt := d.activity.snapshot()
 	emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size,
-		WriteWaitNanos: d.writeWaitNanos.Load()})
+		LastReadAt: readAt, LastLocalWriteAt: writeAt})
 	emit(ProgressEvent{Event: "file_finalizing", Path: it.RelativePath, Message: "finalizing"})
 
 	// Measure this call's proof/publication interval after the finalizing callback;
@@ -1662,9 +1724,10 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 				// mistaken for a stalled peer.
 				body := newStallReader(rs.Body, stall, attemptCancel)
 				paced := d.cfg.SpeedLimiter.Reader(attemptCtx, body)
+				noted := activityReader{r: paced, a: &d.activity}
 				w := newBoundedAtWriter(d.out, wantStart, wantLen)
 				w.measure = payloadIOMeasurementFromContext(d.ctx)
-				w.writeWait = &d.writeWaitNanos
+				w.activity = &d.activity
 				w.onWrite = func(p []byte) {
 					end := wantStart + w.written
 					if end > countedUpTo {
@@ -1678,7 +1741,7 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 					}
 					d.seqMu.Unlock()
 				}
-				_, cerr := io.Copy(w, paced)
+				_, cerr := io.Copy(w, noted)
 				rs.Body.Close()
 				if cerr == nil && w.written != wantLen {
 					cerr = fmt.Errorf("ranged body short: got %d of %d bytes for bytes %d-%d",

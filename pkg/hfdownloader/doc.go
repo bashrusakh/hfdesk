@@ -100,13 +100,15 @@ resume state. A job-level `preparing` phase is shown only while no file is
 transferring and at least one is preparing; like `finalizing`, it suppresses
 network speed and ETA.
 
-`file_progress` also carries `WriteWaitNanos`, the cumulative time the file's
-transfer has spent blocked inside local payload writes (`WriteAt`, including
-staging creation/preallocation). The server compares its growth with the
-interval's wall time, smooths that share and reports the file as `writing`
-while local writes dominate. A writing file with no sibling still transferring
-from the network also raises the job-level `writing` phase; speed and ETA keep
-their byte-rate meaning and are hidden by the UI while the phase is shown.
+`file_progress` also carries `LastReadAt` and `LastLocalWriteAt`: when a
+response-body read last delivered bytes and when the file last made local
+progress (staging creation/claim, preallocation, checkpoint fsync, or a
+completed payload write). The server reports the file as `active` while reads
+are recent; with reads stalled, newer local progress reports `writing`; when
+both are stale the transfer is stalled and the state is held. A writing file
+with no sibling still transferring from the network also raises the job-level
+`writing` phase; speed and ETA keep their byte-rate meaning and are hidden by
+the UI while the phase is shown.
 
 # Filter Matching
 

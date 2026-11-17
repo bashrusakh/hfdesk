@@ -1513,10 +1513,11 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	}
 	defer out.Close()
 
-	// writeWait accumulates the blocking time of every payload write for this
-	// file. The single path emits file_progress from the write hook instead of
-	// a ticker, so the same measurement rides its existing emissions.
-	var writeWait atomic.Int64
+	// activity carries the last response-read and local-write instants on every
+	// file_progress the single path emits from its write hook. It is the only
+	// signal the server classifies.
+	var activity fileActivity
+	activity.noteLocalWrite()
 
 	// Bind the partial to the object; path-derived names can be shared across
 	// objects and revisions.
@@ -1613,6 +1614,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	if err := persistSinglePartIdentity(out, sidecar, identity); err != nil {
 		return false, fmt.Errorf("write single-part identity %s: %w", sidecar, err)
 	}
+	activity.noteLocalWrite()
 
 	// Discard oversized partials and any partial with unknown expected size.
 	if !sizeValid {
@@ -1631,8 +1633,9 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	// An exact-size partial may finalize only with clean-framing proof.
 	if it.Size > 0 && pos == it.Size {
 		if identity.FramingComplete {
+			readAt, writeAt := activity.snapshot()
 			emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size,
-				WriteWaitNanos: writeWait.Load()})
+				LastReadAt: readAt, LastLocalWriteAt: writeAt})
 			return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)
 		}
 		// Written size does not prove clean EOF. Reserve and re-request the final
@@ -1650,8 +1653,9 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		forceLastByteRange = pos == 0
 	}
 	if pos > 0 {
+		readAt, writeAt := activity.snapshot()
 		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: pos, Total: it.Size,
-			WriteWaitNanos: writeWait.Load()})
+			LastReadAt: readAt, LastLocalWriteAt: writeAt})
 		downloadLog.Info("resuming download",
 			"repo", job.Repo,
 			"path", it.RelativePath,
@@ -1813,9 +1817,10 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 					// mistaken for a stalled peer.
 					body := newStallReader(resp.Body, stall, attemptCancel)
 					paced := cfg.SpeedLimiter.Reader(attemptCtx, body)
+					noted := activityReader{r: paced, a: &activity}
 					w := newBoundedAtWriter(out, base, limit)
 					w.measure = payloadIOMeasurementFromContext(ctx)
-					w.writeWait = &writeWait
+					w.activity = &activity
 					w.onWrite = func([]byte) {
 						end := base + w.written
 						if end <= countedUpTo {
@@ -1824,12 +1829,13 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						countedUpTo = end
 						if now := time.Now(); now.Sub(lastEmit) >= 200*time.Millisecond {
 							lastEmit = now
+							readAt, writeAt := activity.snapshot()
 							emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
 								Downloaded: end, Total: it.Size,
-								WriteWaitNanos: writeWait.Load()})
+								LastReadAt: readAt, LastLocalWriteAt: writeAt})
 						}
 					}
-					_, cerr := io.Copy(w, paced)
+					_, cerr := io.Copy(w, noted)
 					resp.Body.Close()
 					if cerr == nil {
 						// Exact body length: the bounded writer refuses an
@@ -1856,9 +1862,10 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						if werr != nil {
 							return false, fmt.Errorf("persist single-part framing checkpoint %s: %w", sidecar, werr)
 						}
+						readAt, writeAt := activity.snapshot()
 						emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
 							Downloaded: countedUpTo, Total: it.Size,
-							WriteWaitNanos: writeWait.Load()})
+							LastReadAt: readAt, LastLocalWriteAt: writeAt})
 						return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)
 					}
 					attemptCancel()

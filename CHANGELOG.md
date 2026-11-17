@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- A disk-bound download reports the file as `writing` and shows the real local-write phase instead of a network speed and ETA.
+- A disk-bound download reports the file as `writing` and shows the real local-write phase instead of a network speed and ETA. (#208)
 
 ### Changed
 
