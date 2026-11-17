@@ -2,13 +2,19 @@
 
 ## [Unreleased]
 
+## [1.3.0-beta.6] - 2026-11-18
+
+Beta build of the upcoming `v1.3.0`; the artifacts are pre-release builds for testing and are not marked as the latest stable release.
+
+Long-form notes: [docs/releases/1.3.0-beta.6.md](docs/releases/1.3.0-beta.6.md).
+
 ### Fixed
 
-- A download reports `writing` only while file creation/preallocation or a payload write is in flight, and its speed/ETA come from network reads; a completed write or a pure network stall does not hold that phase. (#208)
+- A download reports `writing` only while file creation/preallocation or a payload write is in flight, and its speed/ETA come from network reads; a completed write or a pure network stall does not hold that phase. (#209)
 
 ### Changed
 
-- The selected GGUF group deletion confirmation names the quantization in its title and shows left-aligned facts, a one-sentence scope, and file rows with right-aligned sizes; the whole-copy confirmation is unchanged.
+- The selected GGUF group deletion confirmation names the quantization in its title and shows left-aligned facts, a one-sentence scope, and file rows with right-aligned sizes; the whole-copy confirmation is unchanged. (#207)
 
 ## [1.3.0-beta.5] - 2026-11-17
 
