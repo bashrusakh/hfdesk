@@ -158,107 +158,42 @@ type JobFileProgress struct {
 	Downloaded int64  `json:"downloaded"`
 	Status     string `json:"status"` // pending, active, preparing, writing, finalizing, complete, skipped, error
 
-	progressed     bool  `json:"-"` // saw a real file_progress event for this file
-	baseDownloaded int64 `json:"-"` // bytes already on disk at first progress (resume position), excluded from speed
-
-	// Local-write phase classification state. The downloader reports its
-	// cumulative WriteAt wait with every file_progress; these fields turn the
-	// per-interval growth into a smoothed share and apply enter/exit hysteresis.
-	writeSampleAt  time.Time `json:"-"` // when the last interval was sampled
-	writeWaitTotal int64     `json:"-"` // cumulative write wait at that sample
-	writeShare     float64   `json:"-"` // smoothed share of wall time blocked in local writes
-	writeShareSeen bool      `json:"-"` // writeShare holds at least one interval
-	writeLowSince  time.Time `json:"-"` // when the share first fell to writePhaseExitShare or below
+	// readBytes is the last cumulative response-body read count reported for
+	// this file. Speed and ETA derive from it; it never includes resume bytes
+	// already on disk.
+	readBytes int64 `json:"-"`
 }
 
 const (
-	// writePhaseEnterShare is the smoothed share of a sampling interval that
-	// must be spent blocked in local writes before a file reports "writing".
-	writePhaseEnterShare = 0.5
-	// writePhaseExitShare is the lower bound for leaving "writing". The gap to
-	// writePhaseEnterShare is the hysteresis that keeps a transfer oscillating
-	// around the disk limit from flapping every progress tick.
-	writePhaseExitShare = 0.2
-	// writeShareSmoothing weights the newest interval in the per-file
-	// exponential moving average. At the transfer's 200 ms file_progress
-	// cadence that is a smoothing window of about 2.5 samples (500 ms).
-	writeShareSmoothing = 0.4
-	// writePhaseExitDwell is how long the smoothed share must stay at or below
-	// writePhaseExitShare before a writing file returns to active. The clock
-	// starts at the first low sample and resets as soon as the share rises
-	// above the bound, so a brief dip at the disk limit cannot drop the phase.
-	writePhaseExitDwell = 3 * time.Second
-	// writeShareMinInterval drops samples too short for a meaningful ratio
-	// (ticker jitter, the terminal progress event).
-	writeShareMinInterval = 100 * time.Millisecond
+	// activityReadHold is how recently a response-body read must have delivered
+	// bytes for the file to count as network-active. A transfer whose reads are
+	// fresher than this is pulling data, so any disk write behind it is not the
+	// current bottleneck.
+	activityReadHold = 1500 * time.Millisecond
 )
 
-// resetWriteSampling starts a measurement window at file_start/file_preparing.
-// The first file_progress then folds the whole preparation interval into its
-// share, so a slow staging preallocation registers as local write wait.
-func (f *JobFileProgress) resetWriteSampling(now time.Time) {
-	f.writeSampleAt = now
-	f.writeWaitTotal = 0
-	f.writeShare = 0
-	f.writeShareSeen = false
-	f.writeLowSince = time.Time{}
-}
-
-// observeLocalWriteWait folds one file_progress interval into the file's
-// smoothed local-write share. cumulativeNanos is the downloader's cumulative
-// WriteAt wait for the file; its growth is compared with the interval's wall
-// time. Concurrent range workers add their waits together, so a saturated
-// disk makes the sum approach the interval while a network-bound transfer
-// spends almost no time in WriteAt.
-func (f *JobFileProgress) observeLocalWriteWait(cumulativeNanos int64, now time.Time) {
-	prevAt, prevTotal := f.writeSampleAt, f.writeWaitTotal
-	f.writeSampleAt = now
-	f.writeWaitTotal = cumulativeNanos
-	if prevAt.IsZero() || cumulativeNanos < prevTotal {
-		return
+// classifyActivity decides a file's transfer state from the downloader's last
+// read instant and its in-flight local-work flag. A recent read means the
+// network is delivering, so the file is active. Local work that is blocked in
+// right now means the file is writing. A completed write alone is not writing:
+// silence with nothing in flight is a stalled transfer and holds active (a
+// preparing file stays preparing for its claim window).
+func classifyActivity(status string, lastRead time.Time, inFlight bool, now time.Time) string {
+	if !lastRead.IsZero() && now.Sub(lastRead) <= activityReadHold {
+		return "active"
 	}
-	elapsed := now.Sub(prevAt)
-	if elapsed < writeShareMinInterval {
-		return
+	if inFlight {
+		return "writing"
 	}
-	share := float64(cumulativeNanos-prevTotal) / float64(elapsed)
-	if share > 1 {
-		share = 1
+	if status == "preparing" {
+		return "preparing"
 	}
-	if f.writeShareSeen {
-		f.writeShare = writeShareSmoothing*share + (1-writeShareSmoothing)*f.writeShare
-		return
+	if status == "writing" {
+		// The in-flight local work ended and no read has arrived: the write is
+		// no longer happening, so this is a stalled transfer, not local work.
+		return "active"
 	}
-	f.writeShare = share
-	f.writeShareSeen = true
-}
-
-// updateWriteStatus applies the enter/exit hysteresis. Entry is immediate at
-// writePhaseEnterShare. Exit requires the smoothed share to stay at or below
-// writePhaseExitShare for writePhaseExitDwell: a dip that recovers resets the
-// low-share clock, so a disk-bound transfer cannot flash back to "active".
-// It only moves between active and writing; preparing, finalizing, complete
-// and error are owned by their own events.
-func (f *JobFileProgress) updateWriteStatus(now time.Time) {
-	switch f.Status {
-	case "writing":
-		if f.writeShare > writePhaseExitShare {
-			f.writeLowSince = time.Time{}
-			return
-		}
-		if f.writeLowSince.IsZero() {
-			f.writeLowSince = now
-		}
-		if now.Sub(f.writeLowSince) >= writePhaseExitDwell {
-			f.Status = "active"
-			f.writeLowSince = time.Time{}
-		}
-	case "active":
-		if f.writeShare >= writePhaseEnterShare {
-			f.Status = "writing"
-			f.writeLowSince = time.Time{}
-		}
-	}
+	return status
 }
 
 // JobManager manages download jobs.
@@ -1613,14 +1548,17 @@ func (m *JobManager) snapshotConfig() Config {
 // network-adapter graph.
 const speedWindow = 10 * time.Second
 
-// updateJobSpeed recomputes BytesPerSecond from the cumulative bytes
-// transferred this run (skipped/already-present bytes excluded). The rate is
-// averaged over a sliding speedWindow, then blended into the previous reading
-// with a mild EMA — the windowed average alone still jitters as old samples
-// fall off the window, and that jitter makes the displayed speed (and any ETA
-// derived from it) jump around. Samples are throttled to a few per second so
-// the window stays small. now is passed in for deterministic testing.
-func updateJobSpeed(job *Job, transferred int64, now time.Time) {
+// updateJobSpeed recomputes BytesPerSecond from the cumulative bytes read from
+// the response bodies this run (already-present resume bytes never count and
+// local writes never contribute). The first sample is taken only once a read
+// has delivered bytes — the caller skips this before then — so creation and
+// preparation time never start the transfer clock. The rate is averaged over a
+// sliding speedWindow, then blended into the previous reading with a mild EMA —
+// the windowed average alone still jitters as old samples fall off the window,
+// and that jitter makes the displayed speed (and any ETA derived from it) jump
+// around. Samples are throttled to a few per second so the window stays small.
+// now is passed in for deterministic testing.
+func updateJobSpeed(job *Job, readBytes int64, now time.Time) {
 	if n := len(job.speedSamples); n > 0 && now.Sub(job.speedSamples[n-1].t) < 400*time.Millisecond {
 		return
 	}
@@ -1635,13 +1573,13 @@ func updateJobSpeed(job *Job, transferred int64, now time.Time) {
 			kept = append(kept, s)
 		}
 	}
-	kept = append(kept, speedSample{t: now, bytes: transferred})
+	kept = append(kept, speedSample{t: now, bytes: readBytes})
 	job.speedSamples = kept
 
 	oldest := kept[0]
 	span := now.Sub(oldest.t).Seconds()
 	if span >= 1.0 {
-		rate := float64(transferred-oldest.bytes) / span
+		rate := float64(readBytes-oldest.bytes) / span
 		if rate < 0 {
 			rate = 0
 		}
@@ -1650,22 +1588,23 @@ func updateJobSpeed(job *Job, transferred int64, now time.Time) {
 		}
 		job.Progress.BytesPerSecond = int64(rate)
 	}
-	updateJobETA(job, transferred, now)
+	updateJobETA(job, readBytes, now)
 }
 
-// updateJobETA recomputes EtaSeconds. The predictor is mostly the whole-run
-// average rate (transferred / elapsed) — for remaining-time estimation the
-// long-run average is far steadier than the displayed speed, the way curl and
-// rsync compute their ETAs — blended with a little of the current smoothed
+// updateJobETA recomputes EtaSeconds from the read-based transfer rate while
+// remaining work stays the committed bytes left. The predictor is mostly the
+// whole-run average rate (readBytes / elapsed) — for remaining-time estimation
+// the long-run average is far steadier than the displayed speed, the way curl
+// and rsync compute their ETAs — blended with a little of the current smoothed
 // speed so a genuine, lasting throughput change still pulls the estimate over.
-func updateJobETA(job *Job, transferred int64, now time.Time) {
+func updateJobETA(job *Job, readBytes int64, now time.Time) {
 	remaining := job.Progress.TotalBytes - job.Progress.DownloadedBytes
 	elapsed := now.Sub(job.speedRunStart).Seconds()
-	if remaining <= 0 || elapsed < 1.0 || transferred <= 0 {
+	if remaining <= 0 || elapsed < 1.0 || readBytes <= 0 {
 		job.Progress.EtaSeconds = 0
 		return
 	}
-	runAvg := float64(transferred) / elapsed
+	runAvg := float64(readBytes) / elapsed
 	predictor := 0.7*runAvg + 0.3*float64(job.Progress.BytesPerSecond)
 	if predictor <= 0 {
 		job.Progress.EtaSeconds = 0
@@ -1739,7 +1678,6 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 		for i := range job.Files {
 			if job.Files[i].Path == evt.Path {
 				job.Files[i].Status = "active"
-				job.Files[i].resetWriteSampling(now)
 				break
 			}
 		}
@@ -1753,9 +1691,6 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 		for i := range job.Files {
 			if job.Files[i].Path == evt.Path {
 				job.Files[i].Status = "preparing"
-				// The preparation window is local write work: start its clock so
-				// the first file_progress folds preallocation into the share.
-				job.Files[i].resetWriteSampling(now)
 				matched = true
 				break
 			}
@@ -1767,41 +1702,34 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 	case "file_progress":
 		for i := range job.Files {
 			if job.Files[i].Path == evt.Path {
-				if job.Files[i].Status == "preparing" || job.Files[i].Status == "pending" {
-					job.Files[i].Status = "active"
+				switch job.Files[i].Status {
+				case "pending":
+					job.Files[i].Status = classifyActivity("active", evt.LastReadAt, evt.LocalWorkInFlight, now)
+				case "preparing", "active", "writing":
+					job.Files[i].Status = classifyActivity(job.Files[i].Status, evt.LastReadAt, evt.LocalWorkInFlight, now)
 				}
-				if job.Files[i].Status == "active" || job.Files[i].Status == "writing" {
-					job.Files[i].observeLocalWriteWait(evt.WriteWaitNanos, now)
-					job.Files[i].updateWriteStatus(now)
+				job.Files[i].readBytes = evt.ReadBytes
+				if !evt.ActivityOnly {
+					job.Files[i].Downloaded = evt.Downloaded
 				}
-				if !job.Files[i].progressed {
-					// First real progress for this file: record the bytes
-					// already on disk (resume position) so they aren't
-					// counted toward the live transfer speed.
-					job.Files[i].progressed = true
-					job.Files[i].baseDownloaded = evt.Downloaded
-				}
-				job.Files[i].Downloaded = evt.Downloaded
 				break
 			}
 		}
 		refreshLocalPhase(job)
 		// total drives the progress bar (includes skipped/already-present
-		// bytes); transferred drives the speed (only bytes moved this run).
-		// During the resume-recovery window (resumeFloor > 0) the running
-		// sum under-counts because plan_item has already added the full
-		// file list but only the one processed file has Downloaded > 0,
-		// which would clobber the value ResumeJob preserved. The
-		// monotonic guard keeps the preserved value on screen until the
-		// sum catches up, at which point the floor is released and a
-		// genuine rollback (e.g. downloadSingle's 200 fallback on a
-		// range request truncating the .part file) propagates immediately.
-		var total, transferred int64
+		// bytes); readTotal drives speed and ETA (only bytes actually read this
+		// run, so already-present resume bytes never count). During the
+		// resume-recovery window (resumeFloor > 0) the running sum under-counts
+		// because plan_item has already added the full file list but only the
+		// one processed file has Downloaded > 0, which would clobber the value
+		// ResumeJob preserved. The monotonic guard keeps the preserved value on
+		// screen until the sum catches up, at which point the floor is released
+		// and a genuine rollback (e.g. downloadSingle's 200 fallback on a range
+		// request truncating the .part file) propagates immediately.
+		var total, readTotal int64
 		for _, f := range job.Files {
 			total += f.Downloaded
-			if f.progressed {
-				transferred += f.Downloaded - f.baseDownloaded
-			}
+			readTotal += f.readBytes
 		}
 		if job.resumeFloor > 0 {
 			if total > job.Progress.DownloadedBytes {
@@ -1813,7 +1741,14 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 		} else {
 			job.Progress.DownloadedBytes = total
 		}
-		updateJobSpeed(job, transferred, now)
+		if readTotal <= 0 {
+			// No response byte has been read yet this run. Creation/prep time
+			// must not start the transfer clock or seed the ETA average.
+			job.Progress.BytesPerSecond = 0
+			job.Progress.EtaSeconds = 0
+		} else {
+			updateJobSpeed(job, readTotal, now)
+		}
 
 	case "file_finalizing":
 		// The file's bytes are all on disk; part assembly, hash verification

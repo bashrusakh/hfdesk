@@ -1507,16 +1507,18 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	const unboundedBody = int64(^uint64(0) >> 1)
 
 	tmp := dst + ".part"
+	// activity carries the last response-read and local-write instants, the
+	// bytes read this run, and whether local work is in flight on every
+	// file_progress the single path emits from its write hook.
+	var activity fileActivity
+	activity.beginLocalWork()
 	out, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE, 0o644)
+	activity.noteLocalWrite()
+	activity.finishLocalWork()
 	if err != nil {
 		return false, err
 	}
 	defer out.Close()
-
-	// writeWait accumulates the blocking time of every payload write for this
-	// file. The single path emits file_progress from the write hook instead of
-	// a ticker, so the same measurement rides its existing emissions.
-	var writeWait atomic.Int64
 
 	// Bind the partial to the object; path-derived names can be shared across
 	// objects and revisions.
@@ -1610,9 +1612,13 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	if !sizeValid {
 		identity.Offset = 0
 	}
+	activity.beginLocalWork()
 	if err := persistSinglePartIdentity(out, sidecar, identity); err != nil {
+		activity.finishLocalWork()
 		return false, fmt.Errorf("write single-part identity %s: %w", sidecar, err)
 	}
+	activity.noteLocalWrite()
+	activity.finishLocalWork()
 
 	// Discard oversized partials and any partial with unknown expected size.
 	if !sizeValid {
@@ -1631,8 +1637,9 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	// An exact-size partial may finalize only with clean-framing proof.
 	if it.Size > 0 && pos == it.Size {
 		if identity.FramingComplete {
+			readAt, writeAt, readBytes, inFlight := activity.snapshot()
 			emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size,
-				WriteWaitNanos: writeWait.Load()})
+				LastReadAt: readAt, LastLocalWriteAt: writeAt, ReadBytes: readBytes, LocalWorkInFlight: inFlight})
 			return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)
 		}
 		// Written size does not prove clean EOF. Reserve and re-request the final
@@ -1650,8 +1657,9 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 		forceLastByteRange = pos == 0
 	}
 	if pos > 0 {
+		readAt, writeAt, readBytes, inFlight := activity.snapshot()
 		emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: pos, Total: it.Size,
-			WriteWaitNanos: writeWait.Load()})
+			LastReadAt: readAt, LastLocalWriteAt: writeAt, ReadBytes: readBytes, LocalWorkInFlight: inFlight})
 		downloadLog.Info("resuming download",
 			"repo", job.Repo,
 			"path", it.RelativePath,
@@ -1676,6 +1684,40 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 	// Count unique durable bytes, including the inherited prefix, only once.
 	countedUpTo := pos
 	var lastEmit time.Time
+
+	// A periodic activity-only sample keeps the server informed while a
+	// single-path WriteAt is blocked; the write hook alone reports only after a
+	// write completes. Stop it before finalization and on every return path.
+	tickerDone := make(chan struct{})
+	var tickerWG sync.WaitGroup
+	var tickerStopOnce sync.Once
+	stopTicker := func() {
+		tickerStopOnce.Do(func() {
+			close(tickerDone)
+			tickerWG.Wait()
+		})
+	}
+	defer stopTicker()
+	tickerWG.Add(1)
+	go func() {
+		defer tickerWG.Done()
+		t := time.NewTicker(200 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tickerDone:
+				return
+			case <-t.C:
+				readAt, writeAt, readBytes, inFlight := activity.snapshot()
+				emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Total: it.Size,
+					LastReadAt: readAt, LastLocalWriteAt: writeAt,
+					ReadBytes: readBytes, LocalWorkInFlight: inFlight,
+					ActivityOnly: true})
+			}
+		}
+	}()
 
 	for {
 		unpinnedRestart := !opts.CommitPinned && attempt > 0
@@ -1813,9 +1855,16 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 					// mistaken for a stalled peer.
 					body := newStallReader(resp.Body, stall, attemptCancel)
 					paced := cfg.SpeedLimiter.Reader(attemptCtx, body)
+					noted := activityReader{r: paced, a: &activity}
 					w := newBoundedAtWriter(out, base, limit)
 					w.measure = payloadIOMeasurementFromContext(ctx)
-					w.writeWait = &writeWait
+					w.activity = &activity
+					if singleWriteAtHook != nil {
+						hook := singleWriteAtHook
+						w.writeAt = func(p []byte, off int64) (int, error) {
+							return hook(out, p, off)
+						}
+					}
 					w.onWrite = func([]byte) {
 						end := base + w.written
 						if end <= countedUpTo {
@@ -1824,12 +1873,13 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						countedUpTo = end
 						if now := time.Now(); now.Sub(lastEmit) >= 200*time.Millisecond {
 							lastEmit = now
+							readAt, writeAt, readBytes, inFlight := activity.snapshot()
 							emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
 								Downloaded: end, Total: it.Size,
-								WriteWaitNanos: writeWait.Load()})
+								LastReadAt: readAt, LastLocalWriteAt: writeAt, ReadBytes: readBytes, LocalWorkInFlight: inFlight})
 						}
 					}
-					_, cerr := io.Copy(w, paced)
+					_, cerr := io.Copy(w, noted)
 					resp.Body.Close()
 					if cerr == nil {
 						// Exact body length: the bounded writer refuses an
@@ -1856,9 +1906,11 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 						if werr != nil {
 							return false, fmt.Errorf("persist single-part framing checkpoint %s: %w", sidecar, werr)
 						}
+						readAt, writeAt, readBytes, inFlight := activity.snapshot()
 						emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
 							Downloaded: countedUpTo, Total: it.Size,
-							WriteWaitNanos: writeWait.Load()})
+							LastReadAt: readAt, LastLocalWriteAt: writeAt, ReadBytes: readBytes, LocalWorkInFlight: inFlight})
+						stopTicker()
 						return finalizeSinglePartial(ctx, out, tmp, dst, it, cfg, inherited, opts, emit)
 					}
 					attemptCancel()
@@ -1960,6 +2012,11 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 // singleProofStartHook lets tests cancel before hashing while the writable
 // partial is still open, exercising Windows close-before-cleanup ordering.
 var singleProofStartHook func(out *os.File)
+
+// singleWriteAtHook lets tests block a single-path payload write while the
+// activity ticker runs. Production leaves it nil; the hook receives the open
+// payload file and must perform or reject the write.
+var singleWriteAtHook func(f *os.File, p []byte, off int64) (int, error)
 
 // finalizeSinglePartial requires clean response framing (from this run or a
 // matching exact-size sidecar), checks any known size, and publishes the partial.

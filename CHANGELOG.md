@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- A disk-bound download reports the file as `writing` and shows the real local-write phase instead of a network speed and ETA.
+- A download reports `writing` only while file creation/preallocation or a payload write is in flight, and its speed/ETA come from network reads; a completed write or a pure network stall does not hold that phase. (#208)
 
 ### Changed
 

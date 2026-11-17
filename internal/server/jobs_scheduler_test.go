@@ -233,7 +233,8 @@ func TestApplyJobProgress_FilePreparingPhase(t *testing.T) {
 			job.Progress.BytesPerSecond, job.Progress.EtaSeconds)
 	}
 
-	apply(hfdownloader.ProgressEvent{Event: "file_progress", Path: "a.gguf", Downloaded: 1, Total: 100})
+	apply(hfdownloader.ProgressEvent{Event: "file_progress", Path: "a.gguf", Downloaded: 1, Total: 100,
+		LastReadAt: now})
 	if job.Phase != "" {
 		t.Fatalf("phase = %q after transfer resumed, want empty", job.Phase)
 	}
