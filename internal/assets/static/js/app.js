@@ -4431,6 +4431,7 @@ async function loadRepositoryDetails(entry) {
         <div class="cache-detail-actions">
           <button class="btn btn-ghost" type="button" onclick="hideModal()">Close</button>
         </div>
+        ${cacheDetailResizeGripHTML()}
       </div>`;
   }
 
@@ -4533,6 +4534,7 @@ async function loadRepositoryDetails(entry) {
             <button class="btn btn-ghost" type="button" onclick="refreshCacheDetails()">Refresh</button>
             <button class="btn btn-ghost" type="button" onclick="hideModal()">Close</button>
           </div>
+          ${cacheDetailResizeGripHTML()}
         </div>
       `);
       if (requestedType === 'model') {
@@ -6262,6 +6264,327 @@ async function loadRepositoryDetails(entry) {
   // Modal
   // =========================================
 
+  // Repository Details is the only dialog with a resize owner. Its size is
+  // persisted apart from the shared modal markup so every other dialog keeps
+  // the established default chrome.
+  const CACHE_DETAIL_SIZE_STORAGE_KEY = 'hfdesk.repositoryDetailsSize.v1';
+  const CACHE_DETAIL_SIZE_VERSION = 1;
+  const CACHE_DETAIL_RESIZE_MIN_VIEWPORT = 720;
+  const CACHE_DETAIL_MIN_WIDTH = 520;
+  // At 520px wide the two-column This copy panel plus the fixed header and
+  // footer need 500px before the contents scroll loses its usable viewport.
+  const CACHE_DETAIL_MIN_HEIGHT = 500;
+  const CACHE_DETAIL_KEYBOARD_STEP = 16;
+  const CACHE_DETAIL_KEYBOARD_STEP_LARGE = 64;
+  const cacheDetailResize = {
+    applied: false,
+    framed: false,
+    drag: null
+  };
+
+  function cacheDetailResizeEnabled() {
+    const width = Number(window.innerWidth) || 0;
+    if (width <= CACHE_DETAIL_RESIZE_MIN_VIEWPORT) return false;
+    try {
+      if (typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches) return false;
+    } catch (_) { /* an unknown pointer is treated as fine */ }
+    return true;
+  }
+
+  function cacheDetailResizeGripHTML() {
+    if (!cacheDetailResizeEnabled()) return '';
+    return `<button class="cache-detail-resize-grip" type="button" aria-label="Resize dialog" title="Drag to resize. Double-click to reset.">
+      <svg viewBox="0 0 18 18" aria-hidden="true" focusable="false"><path d="M15 6 6 15M15 11l-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+    </button>`;
+  }
+
+  function cacheDetailModalHost() {
+    const body = $('#modalBody');
+    return body?.querySelector ? body.querySelector('.cache-detail-modal') : null;
+  }
+
+  function cacheDetailBackdropPadding() {
+    // The backdrop's own padding is the resize gutter. 40px is the wide
+    // default; the narrow override is also read from the live CSS rule.
+    const fallback = { horizontal: 80, vertical: 80 };
+    try {
+      if (typeof getComputedStyle !== 'function') return fallback;
+      const style = getComputedStyle($('#modalBackdrop'));
+      return {
+        horizontal: (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0),
+        vertical: (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0)
+      };
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  function cacheDetailResizeBounds() {
+    const padding = cacheDetailBackdropPadding();
+    return {
+      minWidth: CACHE_DETAIL_MIN_WIDTH,
+      maxWidth: Math.max(0, (Number(window.innerWidth) || 0) - padding.horizontal),
+      minHeight: CACHE_DETAIL_MIN_HEIGHT,
+      maxHeight: Math.max(0, (Number(window.innerHeight) || 0) - padding.vertical)
+    };
+  }
+
+  function cacheDetailClampDimension(value, min, max) {
+    // When the viewport gutter leaves less than the nominal minimum, the
+    // viewport ceiling wins: a dialog never exceeds its bounds.
+    const ceiling = Math.max(0, max);
+    const floor = Math.min(min, ceiling);
+    const numeric = Number.isFinite(value) ? value : floor;
+    return Math.min(Math.max(numeric, floor), ceiling);
+  }
+
+  function cacheDetailClampSize(width, height, bounds = cacheDetailResizeBounds()) {
+    return {
+      width: cacheDetailClampDimension(width, bounds.minWidth, bounds.maxWidth),
+      height: cacheDetailClampDimension(height, bounds.minHeight, bounds.maxHeight)
+    };
+  }
+
+  function cacheDetailSizeFits(size, bounds) {
+    return size.width >= Math.min(bounds.minWidth, bounds.maxWidth)
+      && size.width <= bounds.maxWidth
+      && size.height >= Math.min(bounds.minHeight, bounds.maxHeight)
+      && size.height <= bounds.maxHeight;
+  }
+
+  function readCacheDetailSize() {
+    try {
+      const raw = window.localStorage?.getItem(CACHE_DETAIL_SIZE_STORAGE_KEY);
+      if (!raw) return null;
+      const stored = JSON.parse(raw);
+      if (!stored || stored.version !== CACHE_DETAIL_SIZE_VERSION) return null;
+      if (!Number.isFinite(stored.width) || !Number.isFinite(stored.height)) return null;
+      return { width: stored.width, height: stored.height };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function writeCacheDetailSize(width, height) {
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+    try {
+      window.localStorage?.setItem(CACHE_DETAIL_SIZE_STORAGE_KEY, JSON.stringify({
+        version: CACHE_DETAIL_SIZE_VERSION,
+        width: Math.round(width),
+        height: Math.round(height)
+      }));
+    } catch (_) { /* storage may be unavailable */ }
+  }
+
+  function clearCacheDetailSize() {
+    try {
+      window.localStorage?.removeItem(CACHE_DETAIL_SIZE_STORAGE_KEY);
+    } catch (_) { /* storage may be unavailable */ }
+  }
+
+  function frameCacheDetailModal() {
+    const modal = $('#modal');
+    if (!modal || cacheDetailResize.framed) return false;
+    const rect = modal.getBoundingClientRect ? modal.getBoundingClientRect() : {};
+    const width = rect.width || 0;
+    const height = rect.height || 0;
+    if (!(width > 0 && height > 0)) return false;
+    const viewportWidth = Number(window.innerWidth) || 0;
+    const viewportHeight = Number(window.innerHeight) || 0;
+    const size = cacheDetailClampSize(width, height);
+    modal.style.maxWidth = 'none';
+    modal.style.maxHeight = 'none';
+    modal.style.width = `${Math.round(size.width)}px`;
+    modal.style.height = `${Math.round(size.height)}px`;
+    modal.style.position = 'fixed';
+    modal.style.margin = '0';
+    modal.style.left = `${Math.round(cacheDetailClampDimension(rect.left || 0, 0, Math.max(0, viewportWidth - size.width)))}px`;
+    modal.style.top = `${Math.round(cacheDetailClampDimension(rect.top || 0, 0, Math.max(0, viewportHeight - size.height)))}px`;
+    cacheDetailResize.applied = true;
+    cacheDetailResize.framed = true;
+    return true;
+  }
+
+  function applyCacheDetailModalSize(width, height, { frame = true } = {}) {
+    const modal = $('#modal');
+    if (!modal) return null;
+    if (frame) frameCacheDetailModal();
+    const size = cacheDetailClampSize(width, height);
+    modal.style.maxWidth = 'none';
+    modal.style.maxHeight = 'none';
+    modal.style.width = `${Math.round(size.width)}px`;
+    modal.style.height = `${Math.round(size.height)}px`;
+    if (cacheDetailResize.framed) {
+      const left = parseFloat(modal.style.left);
+      const top = parseFloat(modal.style.top);
+      if (Number.isFinite(left)) modal.style.left = `${Math.round(cacheDetailClampDimension(left, 0, Math.max(0, (Number(window.innerWidth) || 0) - size.width)))}px`;
+      if (Number.isFinite(top)) modal.style.top = `${Math.round(cacheDetailClampDimension(top, 0, Math.max(0, (Number(window.innerHeight) || 0) - size.height)))}px`;
+    }
+    cacheDetailResize.applied = true;
+    return size;
+  }
+
+  function resetCacheDetailModalSize() {
+    endCacheDetailPointerDrag();
+    const modal = $('#modal');
+    if (modal) {
+      modal.style.position = '';
+      modal.style.left = '';
+      modal.style.top = '';
+      modal.style.width = '';
+      modal.style.height = '';
+      modal.style.margin = '';
+      modal.style.maxWidth = '';
+      modal.style.maxHeight = '';
+    }
+    cacheDetailResize.applied = false;
+    cacheDetailResize.framed = false;
+  }
+
+  function restoreCacheDetailModalSize() {
+    if (!cacheDetailResizeEnabled()) return false;
+    const stored = readCacheDetailSize();
+    if (!stored) return false;
+    if (!cacheDetailSizeFits(stored, cacheDetailResizeBounds())) return false;
+    applyCacheDetailModalSize(stored.width, stored.height, { frame: false });
+    return true;
+  }
+
+  function syncCacheDetailResizeGrip(host = cacheDetailModalHost()) {
+    if (!host || !host.querySelector) return null;
+    let grip = host.querySelector('.cache-detail-resize-grip');
+    if (!cacheDetailResizeEnabled()) {
+      grip?.remove?.();
+      return null;
+    }
+    if (!grip && host.insertAdjacentHTML) {
+      host.insertAdjacentHTML('beforeend', cacheDetailResizeGripHTML());
+      grip = host.querySelector('.cache-detail-resize-grip');
+    }
+    return grip;
+  }
+
+  function syncCacheDetailResize() {
+    if (!cacheDetailModalHost()) {
+      resetCacheDetailModalSize();
+      return;
+    }
+    const grip = syncCacheDetailResizeGrip();
+    // A content re-render replaces the grip node, so an in-flight drag would
+    // otherwise keep its listeners on a detached element.
+    if (cacheDetailResize.drag && cacheDetailResize.drag.grip !== grip) endCacheDetailPointerDrag();
+    if (!cacheDetailResize.applied) restoreCacheDetailModalSize();
+  }
+
+  function endCacheDetailPointerDrag() {
+    const drag = cacheDetailResize.drag;
+    if (!drag) return;
+    cacheDetailResize.drag = null;
+    drag.grip.removeEventListener?.('pointermove', drag.onMove);
+    drag.grip.removeEventListener?.('pointerup', drag.onEnd);
+    drag.grip.removeEventListener?.('pointercancel', drag.onEnd);
+    try {
+      if (drag.grip.hasPointerCapture?.(drag.pointerId)) drag.grip.releasePointerCapture(drag.pointerId);
+    } catch (_) { /* the pointer may already be gone */ }
+    drag.grip.classList?.remove('dragging');
+    if (document.body?.style) {
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    }
+  }
+
+  function startCacheDetailPointerResize(event, grip) {
+    if (!cacheDetailResizeEnabled() || event.button !== 0 || cacheDetailResize.drag) return;
+    const modal = $('#modal');
+    if (!modal || !cacheDetailModalHost()) return;
+    frameCacheDetailModal();
+    const startWidth = parseFloat(modal.style.width);
+    const startHeight = parseFloat(modal.style.height);
+    if (!Number.isFinite(startWidth) || !Number.isFinite(startHeight)) return;
+    const drag = {
+      grip,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      startWidth,
+      startHeight,
+      onMove: null,
+      onEnd: null
+    };
+    drag.onMove = (move) => {
+      if (cacheDetailResize.drag !== drag || move.pointerId !== drag.pointerId) return;
+      applyCacheDetailModalSize(
+        drag.startWidth + (move.clientX - drag.startX),
+        drag.startHeight + (move.clientY - drag.startY)
+      );
+    };
+    drag.onEnd = (end) => {
+      if (cacheDetailResize.drag !== drag || end.pointerId !== drag.pointerId) return;
+      const width = parseFloat(modal.style.width);
+      const height = parseFloat(modal.style.height);
+      endCacheDetailPointerDrag();
+      writeCacheDetailSize(width, height);
+    };
+    cacheDetailResize.drag = drag;
+    try {
+      grip.setPointerCapture?.(event.pointerId);
+    } catch (_) { /* capture is an enhancement, not a requirement */ }
+    grip.addEventListener('pointermove', drag.onMove);
+    grip.addEventListener('pointerup', drag.onEnd);
+    grip.addEventListener('pointercancel', drag.onEnd);
+    grip.classList?.add('dragging');
+    if (document.body?.style) {
+      document.body.style.cursor = 'nwse-resize';
+      document.body.style.userSelect = 'none';
+    }
+  }
+
+  function handleCacheDetailResizeKeydown(event) {
+    if (!cacheDetailResizeEnabled()) return;
+    const step = event.shiftKey ? CACHE_DETAIL_KEYBOARD_STEP_LARGE : CACHE_DETAIL_KEYBOARD_STEP;
+    let deltaX = 0;
+    let deltaY = 0;
+    if (event.key === 'ArrowLeft') deltaX = -step;
+    else if (event.key === 'ArrowRight') deltaX = step;
+    else if (event.key === 'ArrowUp') deltaY = -step;
+    else if (event.key === 'ArrowDown') deltaY = step;
+    else return;
+    event.preventDefault();
+    const modal = $('#modal');
+    if (!modal) return;
+    frameCacheDetailModal();
+    const width = parseFloat(modal.style.width);
+    const height = parseFloat(modal.style.height);
+    if (!Number.isFinite(width) || !Number.isFinite(height)) return;
+    const size = applyCacheDetailModalSize(width + deltaX, height + deltaY);
+    if (size) writeCacheDetailSize(size.width, size.height);
+  }
+
+  function resetCacheDetailSizeToDefault() {
+    if (!cacheDetailResizeEnabled()) return;
+    resetCacheDetailModalSize();
+    clearCacheDetailSize();
+  }
+
+  function handleCacheDetailViewportResize() {
+    if (!cacheDetailModalHost()) return;
+    syncCacheDetailResizeGrip();
+    if (!cacheDetailResizeEnabled()) {
+      resetCacheDetailModalSize();
+      return;
+    }
+    if (!cacheDetailResize.applied) {
+      restoreCacheDetailModalSize();
+      return;
+    }
+    const modal = $('#modal');
+    if (!modal) return;
+    const rect = modal.getBoundingClientRect ? modal.getBoundingClientRect() : {};
+    if (rect.width > 0 && rect.height > 0) {
+      applyCacheDetailModalSize(rect.width, rect.height, { frame: cacheDetailResize.framed });
+    }
+  }
+
   function showModal(title, content) {
     // Opening any modal supersedes a revision picker. If an initial (pending)
     // picker is open, settle its pending navigation first with the same explicit
@@ -6278,10 +6601,12 @@ async function loadRepositoryDetails(entry) {
     $('#modalTitle').textContent = title;
     $('#modalBody').innerHTML = content;
     $('#modalBackdrop').classList.add('active');
+    syncCacheDetailResize();
   }
 
   function setModalContent(content) {
     $('#modalBody').innerHTML = content;
+    syncCacheDetailResize();
   }
 
   function hideModal() {
@@ -6291,6 +6616,7 @@ async function loadRepositoryDetails(entry) {
     revisionPickerRequestId = null;
     revisionPickerRepo = null;
     $('#modalBackdrop').classList.remove('active');
+    resetCacheDetailModalSize();
     if (cancel) cancel();
   }
 
@@ -6302,6 +6628,23 @@ async function loadRepositoryDetails(entry) {
     $('#modalBackdrop')?.addEventListener('click', (e) => {
       if (e.target === $('#modalBackdrop')) hideModal();
     });
+
+    // The grip travels with the details markup, so the dialog body delegates
+    // pointer, double-click, and keyboard handling across every re-render.
+    const body = $('#modalBody');
+    body?.addEventListener('pointerdown', (event) => {
+      const grip = event.target?.closest?.('.cache-detail-resize-grip');
+      if (grip) startCacheDetailPointerResize(event, grip);
+    });
+    body?.addEventListener('dblclick', (event) => {
+      if (!event.target?.closest?.('.cache-detail-resize-grip')) return;
+      event.preventDefault();
+      resetCacheDetailSizeToDefault();
+    });
+    body?.addEventListener('keydown', (event) => {
+      if (event.target?.closest?.('.cache-detail-resize-grip')) handleCacheDetailResizeKeydown(event);
+    });
+    window.addEventListener?.('resize', handleCacheDetailViewportResize);
 
     // ESC key to close modals
     document.addEventListener('keydown', (e) => {
