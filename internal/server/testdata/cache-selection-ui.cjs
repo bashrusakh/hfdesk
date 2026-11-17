@@ -350,17 +350,20 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   // HF confirmation groups four stored entries into two distinct paths and
   // names both saved versions without turning versions into extra shards.
   let hfSequence = await startGroupConfirmation(0);
-  assert(modalHTML.includes('all saved versions in this selected location'));
-  assert(modalHTML.includes('Files included (2 files · 2 saved versions)'), modalHTML.slice(0, 2200));
-  const hfConfirmation = modalHTML.slice(modalHTML.indexOf('<div id="cache-delete-confirm-'));
-  assert.equal((hfConfirmation.match(/model-00001-of-00002\.gguf/g) || []).length, 1);
-  assert.equal((hfConfirmation.match(/model-00002-of-00002\.gguf/g) || []).length, 1);
-  assert(hfConfirmation.includes('Saved versions (2): commit-a, commit-b'));
-  assert(hfConfirmation.includes('5 B'), 'the inventory names each file size');
+  const hfConfirmation = confirmationHTML();
+  assert.equal(nodes.get('#modalTitle').textContent, 'Delete Q4_K_M?', 'the versioned title names the quantization');
+  assert(hfConfirmation.includes('This removes this group from all saved versions in this location; other groups and locations stay.'), 'the versioned consequence is one short sentence');
+  assert(hfConfirmation.includes('<dt>Size</dt><dd class="cache-delete-size">10 B</dd>'), 'the versioned size counts each distinct path once');
+  assert(hfConfirmation.includes('<dt>Files</dt>') && hfConfirmation.includes('2 files') && hfConfirmation.includes('2 saved versions'), 'the files row splits distinct paths from saved versions');
+  assert.equal((hfConfirmation.match(/class="cache-delete-file"/g) || []).length, 2, 'four stored entries render as two distinct paths');
+  assert(!hfConfirmation.includes('<details'), 'two distinct paths stay inline without a disclosure');
+  assert.equal((hfConfirmation.match(/>model-00001-of-00002\.gguf</g) || []).length, 1, 'the first shard is one visible row');
+  assert.equal((hfConfirmation.match(/>model-00002-of-00002\.gguf</g) || []).length, 1, 'the second shard is one visible row');
+  assert.equal((hfConfirmation.match(/2 saved versions · commit-a, commit-b/g) || []).length, 2, 'each row suffixes its saved versions');
+  assert(hfConfirmation.includes('<span class="cache-delete-file-size">5 B</span>'), 'the inventory names each file size');
   assert(!/<input[^>]*commit|<select[^>]*commit/i.test(hfConfirmation), 'HF confirmation does not offer revision input');
-  assert(hfConfirmation.includes('GGUF group:'), 'an llm group is still confirmed as a GGUF group');
-  assert(!hfConfirmation.includes('Vision encoder'), 'an llm versioned confirmation does not claim a vision-encoder role');
-  assert(hfConfirmation.includes('This removes this GGUF group from all saved versions in this selected location. Other groups and other locations remain.'), 'the llm versioned scope statement is unchanged');
+  assert(hfConfirmation.includes('<dt>Group</dt>') && hfConfirmation.includes('class="cache-badge">Q4_K_M</span>'), 'an llm group is still confirmed by its quant badge');
+  assert(!hfConfirmation.includes('cache-badge-vision-encoder'), 'an llm versioned confirmation does not claim a vision-encoder role');
   const hfDeleteCount = deletedBodies.length;
   await cancelButton(hfSequence).click();
   assert.equal(deletedBodies.length, hfDeleteCount, 'HF confirmation Cancel sends no mutation');
@@ -387,12 +390,13 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   // A companion in the HF cache names its role for the versioned case too.
   await window.test.showCacheDetails('org/model', 'model', 'loc-2');
   const versionedCompanionSequence = await startGroupConfirmation(0);
-  const versionedCompanionConfirmation = modalHTML.slice(modalHTML.indexOf('<div id="cache-delete-confirm-'));
-  assert(versionedCompanionConfirmation.includes('Vision encoder (mmproj companion):'), 'the versioned companion confirmation names the vision-encoder role');
-  assert(versionedCompanionConfirmation.includes('This removes the selected vision encoder companion from all saved versions in this selected location. Other groups and other locations remain.'), 'the versioned companion scope statement names the role');
-  assert(!versionedCompanionConfirmation.includes('This removes this GGUF group from all saved versions'), 'the versioned companion scope statement does not use the generic group wording');
-  assert(versionedCompanionConfirmation.includes('Saved versions (1): commit-a'), 'the versioned companion still lists its saved versions');
-  assert(versionedCompanionConfirmation.includes('Files included (1 file · 1 saved version)'), 'the companion inventory uses one consistent count');
+  const versionedCompanionConfirmation = confirmationHTML();
+  assert.equal(nodes.get('#modalTitle').textContent, 'Delete this group?', 'the versioned companion keeps the generic title');
+  assert(versionedCompanionConfirmation.includes('cache-badge-vision-encoder'), 'the versioned companion group row keeps the vision-encoder badge');
+  assert(versionedCompanionConfirmation.includes('This removes this vision encoder companion from all saved versions in this location; other groups and locations stay.'), 'the versioned companion consequence names the role');
+  assert(!versionedCompanionConfirmation.includes('This removes this group from all saved versions'), 'the versioned companion consequence does not use the generic group wording');
+  assert(versionedCompanionConfirmation.includes('1 saved version · commit-a'), 'the versioned companion row lists its saved version');
+  assert(versionedCompanionConfirmation.includes('<dt>Files</dt>') && versionedCompanionConfirmation.includes('1 file') && versionedCompanionConfirmation.includes('1 saved version'), 'the companion files row uses one consistent count');
   const beforeVersionedCompanion = deletedBodies.length;
   await cancelButton(versionedCompanionSequence).click();
   assert.equal(deletedBodies.length, beforeVersionedCompanion, 'cancelling the versioned companion confirmation sends no mutation');
@@ -467,6 +471,8 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert.equal(hfButton[1], 'confirmDeleteCache(&quot;org/model&quot;, &quot;model&quot;)', 'HF whole-repo button stays byte-identical');
   const hfDrive = await driveWholeRepoDelete();
   assert.equal(hfDrive.confirmArgs.length, 2, 'HF confirmation takes only repo and type');
+  assert(hfDrive.confirmHTML.includes('<div class="delete-confirm">'), 'the whole-copy dialog keeps the shared centred container');
+  assert(!hfDrive.confirmHTML.includes('cache-selection-confirmation'), 'group confirmation styling never reaches the whole-copy dialog');
   assert(hfDrive.confirmHTML.includes('Are you sure you want to delete <strong>org/model</strong> from the cache?'), 'HF confirmation copy unchanged');
   assert(hfDrive.confirmHTML.includes('This will permanently remove all cached files for this model. This action cannot be undone.'), 'HF confirmation note unchanged');
   const hfDelete = calls.find(call => call.method === 'DELETE');
@@ -546,23 +552,30 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   function deleteControl(index = 0) {
     return nodes.get('#cacheSelectionSection').querySelectorAll('.cache-selection-delete')[index];
   }
-  // The rendered group kind decides the dialog title: a companion group is a
-  // vision encoder, every other group is a GGUF group.
-  function renderedGroupKind(index = 0) {
+  // The rendered group decides the dialog title: a quantization names itself,
+  // while a group without one uses the generic title.
+  function renderedGroup(index = 0) {
     const articles = modalHTML.match(/<article class="cache-selection-group"[^>]*>[\s\S]*?<\/article>/g) || [];
     const article = articles[index];
     assert(article, `rendered group ${index} is present in the current location`);
-    return article.includes('cache-badge-vision-encoder') ? 'vision_encoder' : 'llm';
+    return {
+      quant: (article.match(/class="cache-badge">([^<]+)<\/span>/) || [])[1] || ''
+    };
   }
-  function expectedConfirmationTitle(kind) {
-    return kind === 'vision_encoder' ? 'Confirm vision encoder deletion' : 'Confirm GGUF group deletion';
+  function expectedConfirmationTitle({ quant }) {
+    return quant ? `Delete ${quant}?` : 'Delete this group?';
+  }
+  function confirmationHTML() {
+    const start = modalHTML.indexOf('<div id="cache-delete-confirm-');
+    assert(start >= 0, 'the group confirmation is rendered');
+    return modalHTML.slice(start);
   }
   async function startGroupConfirmation(index = 0) {
     const control = deleteControl(index);
     assert(control && !control.disabled, 'eligible local group has an enabled delete action');
-    const kind = renderedGroupKind(index);
+    const group = renderedGroup(index);
     await control.click();
-    assert.equal(nodes.get('#modalTitle').textContent, expectedConfirmationTitle(kind));
+    assert.equal(nodes.get('#modalTitle').textContent, expectedConfirmationTitle(group));
     return Number(modalHTML.match(/id="cache-delete-confirm-(\d+)"/)[1]);
   }
   function confirmButton(sequence) { return nodes.get(`#cache-delete-confirm-button-${sequence}`); }
@@ -573,10 +586,19 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   deletedBodies = [];
   await openLocalDetails();
   let sequence = await startGroupConfirmation(0);
-  assert(modalHTML.includes('Repository:') && modalHTML.includes('/scan/one') && modalHTML.includes('same-q-family-a'));
-  assert(modalHTML.includes('family/file-24.gguf') && modalHTML.includes('Files included (25 files)'));
-  assert(modalHTML.includes('4 B'), 'the inventory names each file size');
-  assert(modalHTML.includes('Other variants, companion files, metadata, directories, and other locations remain'));
+  let confirmation = confirmationHTML();
+  assert.equal(nodes.get('#modalTitle').textContent, 'Delete Q4_K_M?', 'the title names the quantization');
+  assert(confirmation.includes('<dt>Repository</dt><dd>org/model</dd>'), 'the repository row shows owner/name');
+  assert(confirmation.includes('<dt>Location</dt>') && confirmation.includes('title="/scan/one/&quot;archive&quot;"'), 'the location row names the source and keeps the full path in title');
+  assert(confirmation.includes('<dt>Group</dt>') && confirmation.includes('class="cache-badge">Q4_K_M</span>') && confirmation.includes('same-q-family-a'), 'the group row pairs the quant badge with the label');
+  assert(confirmation.includes('<dt>Size</dt><dd class="cache-delete-size">100 B</dd>'), 'the size sums the distinct files once');
+  assert(confirmation.includes('<dt>Files</dt>') && confirmation.includes('25 files'), 'the files row counts distinct paths');
+  assert(confirmation.includes('This removes only this group; other variants, companions and locations stay.'), 'the unversioned consequence is a short sentence');
+  assert(confirmation.includes('<details class="cache-delete-inventory" open><summary>Files (25)</summary>'), 'a long inventory keeps its open disclosure');
+  assert.equal((confirmation.match(/class="cache-delete-file"/g) || []).length, 25, 'every distinct file gets one row');
+  assert(confirmation.includes('family/file-24.gguf') && confirmation.includes('<span class="cache-delete-file-size">4 B</span>'), 'the inventory names each file size');
+  const firstFileRow = confirmation.match(/<li class="cache-delete-file">[\s\S]*?<\/li>/)?.[0] || '';
+  assert(firstFileRow.indexOf('cache-delete-file-path') < firstFileRow.indexOf('cache-delete-file-size'), 'the path leads and the size follows it');
   assert.equal(deletedBodies.length, 0);
   await cancelButton(sequence).click();
   assert.equal(deletedBodies.length, 0, 'Cancel does not send DELETE');
@@ -585,15 +607,22 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
 
   // Link-only warning is explicit in confirmation and cancel remains read-only.
   sequence = await startGroupConfirmation(1);
-  assert(modalHTML.includes('this removes the link; the weight file remains'));
+  confirmation = confirmationHTML();
+  assert.equal(nodes.get('#modalTitle').textContent, 'Delete this group?', 'a group without a quant label uses the generic title');
+  assert(confirmation.includes('class="cache-delete-file-linkonly">link only — the weight file remains</span>'), 'the link-only row carries its inline note');
+  assert(!confirmation.includes('This group includes link-only entries'), 'the old link-only paragraph is gone');
+  assert(!confirmation.includes('<dt>Size</dt>'), 'an unreported size is omitted instead of understated');
   await cancelButton(sequence).click();
   assert.equal(deletedBodies.length, 0);
 
   // A recognized split confirms every shard together, not a matching quant label.
   sequence = await startGroupConfirmation(6);
-  assert(modalHTML.includes('parts/model-00001-of-00002.gguf'));
-  assert(modalHTML.includes('parts/model-00002-of-00002.gguf'));
-  assert(modalHTML.includes('Files included (2 files)'));
+  confirmation = confirmationHTML();
+  assert(confirmation.includes('parts/model-00001-of-00002.gguf'));
+  assert(confirmation.includes('parts/model-00002-of-00002.gguf'));
+  assert.equal((confirmation.match(/class="cache-delete-file"/g) || []).length, 2, 'each shard is its own row');
+  assert(!confirmation.includes('<details'), 'a short inventory renders inline without a disclosure');
+  assert(confirmation.includes('<dt>Files</dt>') && confirmation.includes('2 files'), 'the files row counts the two shards');
   await cancelButton(sequence).click();
   assert.equal(deletedBodies.length, 0);
 
@@ -611,15 +640,16 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(!modalHTML.includes('>F32<'), 'a companion never renders a model-quant badge');
   assert(modalHTML.includes('mmproj-F32.gguf'), 'the companion keeps its own group label');
   const companionSequence = await startGroupConfirmation(companionIndex);
-  assert(modalHTML.includes('Files included (1 file)'), 'only the companion member is confirmed');
-  const companionConfirmation = modalHTML.slice(modalHTML.indexOf('<div id="cache-delete-confirm-'));
-  assert(companionConfirmation.includes('Vision encoder (mmproj companion):'), 'the companion confirmation names the vision-encoder role');
-  assert(companionConfirmation.includes('mmproj-F32.gguf'), 'the companion confirmation names the selected companion');
-  assert(companionConfirmation.includes('Delete selected vision encoder files'), 'the companion confirm button names the vision encoder');
-  assert(!companionConfirmation.includes('Delete selected GGUF files'), 'the generic gguf confirm label is not used for a companion');
-  assert(!companionConfirmation.includes('Other variants, companion files, metadata, directories, and other locations remain.'), 'the companion confirmation does not claim companion files remain');
-  assert(companionConfirmation.includes('This removes only the selected vision encoder companion files.'), 'the companion scope statement is limited to the selected companion');
-  assert(companionConfirmation.includes('Other quantization groups, other companion files, metadata, directories, and other locations remain.'), 'the companion scope statement keeps the remaining scope explicit');
+  const companionConfirmation = confirmationHTML();
+  assert.equal(nodes.get('#modalTitle').textContent, 'Delete this group?', 'a vision encoder has no quant title');
+  assert.equal((companionConfirmation.match(/class="cache-delete-file"/g) || []).length, 1, 'only the companion member is confirmed');
+  assert(!companionConfirmation.includes('<details'), 'the single companion file needs no disclosure');
+  assert(companionConfirmation.includes('cache-badge-vision-encoder') && companionConfirmation.includes('>VISION</span>'), 'the group row badges the vision-encoder role');
+  assert(companionConfirmation.includes('mmproj-F32.gguf'), 'the group row names the selected companion');
+  assert(companionConfirmation.includes('>Delete vision encoder</button>'), 'the companion confirm button names the vision encoder');
+  assert(!companionConfirmation.includes('>Delete group</button>'), 'the generic group confirm label is not used for a companion');
+  assert(companionConfirmation.includes('This removes only this vision encoder companion; other variants, companions and locations stay.'), 'the companion consequence keeps the role wording and stays short');
+  assert(!companionConfirmation.includes('metadata, directories'), 'the companion consequence does not reintroduce the old paragraph');
   const beforeCompanion = deletedBodies.length;
   let resolveCompanionDelete;
   pendingDelete = { promise: new Promise(resolve => { resolveCompanionDelete = resolve; }) };
@@ -649,12 +679,12 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   // An LLM group keeps its current confirmation wording.
   await openLocalDetails();
   const llmSequence = await startGroupConfirmation(0);
-  const llmConfirmation = modalHTML.slice(modalHTML.indexOf('<div id="cache-delete-confirm-'));
-  assert(llmConfirmation.includes('GGUF group:'), 'an llm group is still confirmed as a GGUF group');
-  assert(!llmConfirmation.includes('Vision encoder'), 'an llm confirmation does not claim a vision-encoder role');
-  assert(llmConfirmation.includes('Delete selected GGUF files'), 'an llm group keeps its confirm button label');
-  assert(!llmConfirmation.includes('Delete selected vision encoder files'), 'the companion confirm label is not used for an llm group');
-  assert(llmConfirmation.includes('This removes only the selected GGUF group members. Other variants, companion files, metadata, directories, and other locations remain.'), 'the llm scope statement is unchanged');
+  const llmConfirmation = confirmationHTML();
+  assert(llmConfirmation.includes('<dt>Group</dt>') && llmConfirmation.includes('class="cache-badge">Q4_K_M</span>'), 'an llm group is confirmed by its quant badge');
+  assert(!llmConfirmation.includes('cache-badge-vision-encoder'), 'an llm confirmation does not claim a vision-encoder role');
+  assert(llmConfirmation.includes('>Delete group</button>'), 'an llm group uses the short group confirm label');
+  assert(!llmConfirmation.includes('>Delete vision encoder</button>'), 'the companion confirm label is not used for an llm group');
+  assert(llmConfirmation.includes('This removes only this group; other variants, companions and locations stay.'), 'the llm consequence is the short unversioned sentence');
   const beforeLLM = deletedBodies.length;
   let resolveLLMDelete;
   pendingDelete = { promise: new Promise(resolve => { resolveLLMDelete = resolve; }) };
@@ -780,7 +810,8 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   let resolveDelete;
   pendingDelete = { promise: new Promise(resolve => { resolveDelete = resolve; }) };
   const pending = confirmButton(sequence).click();
-  assert(confirmButton(sequence).disabled && cancelButton(sequence).disabled);
+  assert(confirmButton(sequence).disabled && cancelButton(sequence).disabled, 'the pending delete disables both dialog actions');
+  assert.equal(nodes.get('#cache-delete-progress').textContent, 'Deleting the selected GGUF group…', 'the pending status line stays in place');
   await window.test.showCacheDetails('org/other', 'model');
   const replacementModal = modalHTML;
   resolveDelete();
@@ -820,7 +851,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(modalHTML.includes('Loading repository details…'), 'a stale response cannot overwrite the loading shell');
   assert(modalHTML.includes('cache-detail-modal') && modalHTML.includes('cache-detail-owner">org/') && modalHTML.includes('cache-detail-name">model<'), 'the loading shell keeps the repository identity visible');
   if (process.env.CACHE_UI_FIXTURE_URL) await checkBrowserLayout();
-  console.log('PASS: sectioned Repository Details with identity header, This copy panel, GGUF rows without inventory disclosures, danger zone and ghost footer; location focusing; delete focus/scroll restoration; exact local/HF group confirmations and request composition; all saved versions; shared-payload/207/conflict results; cancel; exact refresh/context; dataset single Files heading; full member inventories with sizes; escaping');
+  console.log('PASS: sectioned Repository Details with identity header, This copy panel, GGUF rows without inventory disclosures, danger zone and ghost footer; location focusing; delete focus/scroll restoration; quant-titled, left-aligned group confirmations with definition rows, one-sentence consequences, right-aligned size rows, inline link-only notes, versioned and vision-encoder variants, pending disabled state, untouched whole-copy dialog; exact local/HF request composition; all saved versions; shared-payload/207/conflict results; cancel; exact refresh/context; dataset single Files heading; full member inventories with sizes; escaping');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 
 // Optional real-DOM/layout layer against an isolated read-only fixture serving
@@ -831,7 +862,7 @@ async function checkBrowserLayout() {
   const base = process.env.CACHE_UI_FIXTURE_URL;
   try {
     for (const width of [1000, 360]) {
-      const page = await browser.newPage({ viewport: { width, height: 720 } });
+      const page = await browser.newPage({ viewport: { width, height: 760 } });
       const errors = [];
       page.on('pageerror', error => errors.push(error.message));
       page.on('request', request => assert.equal(request.method(), 'GET', 'visual checks never send destructive requests'));
@@ -873,7 +904,7 @@ async function checkBrowserLayout() {
       assert(!structure.documentOverflow);
       assert(structure.modalWidth <= (width === 360 ? 360 : 600));
       if (width === 1000) assert.equal(structure.modalWidth, 600);
-      if (width === 1000) assert(structure.scrollHeight >= 300, '720p keeps a usable contents viewport');
+      if (width === 1000) assert(structure.scrollHeight >= 300, '760px keeps a usable contents viewport');
       else assert(structure.scrollHeight >= 150, '360px keeps usable contents rows');
       const compactRow = page.locator('.cache-selection-group').filter({ hasText: 'mmproj-F16.gguf' }).first();
       const compactBox = await compactRow.boundingBox();
@@ -893,6 +924,63 @@ async function checkBrowserLayout() {
       await page.getByText('Other files (2)', { exact: true }).click();
       assert.equal(await page.locator('.cache-selection-other[open] li').count(), 2);
       assert.deepEqual(await stationary(), before, 'expanding Other files does not move the fixed chrome');
+
+      // The LLM confirmation is left-aligned, structured as definition rows,
+      // and keeps a long inventory in one open disclosure.
+      await page.getByRole('button', { name: 'Delete Q4_K_M same-q-family-a', exact: true }).click();
+      await page.getByRole('heading', { name: 'Delete Q4_K_M?', exact: true }).waitFor();
+      const llmDialog = await page.locator('.cache-selection-confirmation').evaluate(node => ({
+        textAlign: getComputedStyle(node).textAlign,
+        facts: Array.from(node.querySelectorAll('dt'), dt => dt.textContent),
+        summary: node.querySelector('details > summary')?.textContent,
+        files: node.querySelectorAll('.cache-delete-file').length
+      }));
+      assert.equal(llmDialog.textAlign, 'left', 'the group confirmation is left-aligned');
+      assert.equal(await page.locator('.delete-confirm').count(), 0, 'the group confirmation does not opt into the centred shared layout');
+      assert.deepEqual(llmDialog.facts, ['Repository', 'Location', 'Group', 'Size', 'Files']);
+      assert.equal(llmDialog.summary, 'Files (25)');
+      assert.equal(llmDialog.files, 25);
+      assert.equal(await page.locator('.cache-delete-location-path').getAttribute('title'), '/scan/one/"archive"');
+      assert(!await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), 'the dialog never widens the document');
+      const llmRow = page.locator('.cache-delete-file').first();
+      const llmRowBox = await llmRow.boundingBox();
+      const llmPathBox = await llmRow.locator('.cache-delete-file-path').boundingBox();
+      const llmSizeBox = await llmRow.locator('.cache-delete-file-size').boundingBox();
+      assert(Math.abs((llmSizeBox.x + llmSizeBox.width) - (llmRowBox.x + llmRowBox.width)) <= 1, 'the size is right-aligned in its row');
+      assert(Math.abs(llmPathBox.x - llmRowBox.x) <= 1, 'the path is left-aligned in its row');
+      await page.screenshot({ path: `/tmp/opencode/gguf-delete-confirmation-llm-long-${width}x760.png` });
+      await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await page.getByRole('heading', { name: 'Repository Details', exact: true }).waitFor();
+
+      // A link-only member carries its warning inline in the error colour.
+      await page.getByRole('button', { name: 'Delete model.gguf', exact: true }).click();
+      await page.getByRole('heading', { name: 'Delete this group?', exact: true }).waitFor();
+      const linkNote = page.locator('.cache-delete-file-linkonly');
+      assert.equal((await linkNote.textContent()).trim(), 'link only — the weight file remains');
+      assert.equal(await linkNote.evaluate(node => getComputedStyle(node).color), 'rgb(239, 68, 68)');
+      await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await page.getByRole('heading', { name: 'Repository Details', exact: true }).waitFor();
+
+      // A short LLM group shows the whole dialog including its actions.
+      await page.getByRole('button', { name: 'Delete Q4_K_M same Q4 family family-c', exact: true }).click();
+      await page.getByRole('heading', { name: 'Delete Q4_K_M?', exact: true }).waitFor();
+      assert.equal(await page.locator('.cache-selection-confirmation details').count(), 0, 'one file stays inline');
+      assert.equal(await page.getByRole('button', { name: 'Delete group', exact: true }).count(), 1);
+      await page.screenshot({ path: `/tmp/opencode/gguf-delete-confirmation-llm-${width}x760.png` });
+      await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await page.getByRole('heading', { name: 'Repository Details', exact: true }).waitFor();
+
+      // A vision encoder is badged by role and uses the same short structure.
+      await page.getByRole('button', { name: 'Delete vision encoder mmproj-F32.gguf', exact: true }).click();
+      await page.getByRole('heading', { name: 'Delete this group?', exact: true }).waitFor();
+      assert.equal(await page.locator('.cache-selection-confirmation .cache-badge-vision-encoder').textContent(), 'VISION');
+      assert.equal(await page.getByRole('button', { name: 'Delete vision encoder', exact: true }).count(), 1);
+      assert((await page.locator('.cache-delete-consequence').textContent()).includes('vision encoder companion'));
+      assert.equal(await page.locator('.cache-selection-confirmation details').count(), 0, 'one companion file needs no disclosure');
+      await page.screenshot({ path: `/tmp/opencode/gguf-delete-confirmation-vision-${width}x760.png` });
+      await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await page.getByRole('heading', { name: 'Repository Details', exact: true }).waitFor();
+
       await page.getByRole('button', { name: 'Change', exact: true }).click();
       await page.getByLabel('Show contents from', { exact: true }).selectOption('1');
       await page.getByText('GGUF groups in HF cache', { exact: true }).waitFor();
@@ -900,15 +988,37 @@ async function checkBrowserLayout() {
       assert((await page.getByLabel('Show contents from', { exact: true }).getAttribute('title')).includes('/cache/hub/'));
       assert.equal(await page.evaluate(() => document.activeElement?.id), 'cacheContentsHeading', 'location change focuses the heading');
       assert.deepEqual(await stationary(), before, 'switching location keeps the chrome still');
+
+      // Four stored entries stay two distinct file rows with one right-aligned
+      // size each and the saved versions as a muted suffix.
       await page.getByRole('button', { name: 'Delete Q4_K_M same-q-family-b', exact: true }).click();
-      await page.getByRole('heading', { name: 'Confirm GGUF group deletion', exact: true }).waitFor();
+      await page.getByRole('heading', { name: 'Delete Q4_K_M?', exact: true }).waitFor();
       assert.equal(await page.locator('.cache-detail-modal').count(), 0, 'confirmation does not inherit Details layout');
-      const inventory = await page.locator('.cache-selection-confirmation details').textContent();
-      assert(inventory.includes('Files included (2 files · 2 saved versions)'));
-      assert(inventory.includes('5 B'), 'the confirmation inventory names file sizes');
+      assert.equal(await page.locator('.cache-selection-confirmation details').count(), 0, 'a two-file inventory stays inline');
+      assert.equal(await page.locator('.cache-delete-file').count(), 2, 'the four stored entries stay two distinct files');
+      assert((await page.locator('.cache-delete-consequence').textContent()).includes('all saved versions in this location'));
+      assert.equal((await page.locator('.cache-delete-saved-versions').textContent()).trim(), '· 2 saved versions');
+      assert.equal((await page.locator('.cache-delete-size').textContent()).trim(), '10 B', 'the size counts each distinct path once');
+      assert.equal((await page.locator('.cache-delete-file-size').first().textContent()).trim(), '5 B');
+      assert.equal(await page.locator('.cache-delete-file-versions').first().textContent(), '2 saved versions · commit-a, commit-b');
+      await page.screenshot({ path: `/tmp/opencode/gguf-delete-confirmation-versioned-${width}x760.png` });
       await page.getByRole('button', { name: 'Cancel', exact: true }).click();
       await page.getByRole('heading', { name: 'Repository Details', exact: true }).waitFor();
       await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-hf.png` });
+
+      // The whole-copy confirmation keeps the shared centred layout and style.
+      const wholeCopyButton = page.locator('.cache-detail-danger .btn-danger');
+      assert.equal(await wholeCopyButton.count(), 1, 'the danger zone keeps its whole-copy action');
+      await wholeCopyButton.click();
+      await page.getByRole('heading', { name: 'Delete from Cache', exact: true }).waitFor();
+      const wholeCopy = await page.locator('.delete-confirm').evaluate(node => ({
+        textAlign: getComputedStyle(node).textAlign,
+        groupScoped: node.classList.contains('cache-selection-confirmation')
+      }));
+      assert.equal(wholeCopy.textAlign, 'center', 'the whole-copy confirmation stays centred');
+      assert.equal(wholeCopy.groupScoped, false, 'the group confirmation styling never reaches the whole-copy dialog');
+      assert(await page.getByText('Are you sure you want to delete', { exact: false }).isVisible());
+      await page.getByRole('button', { name: 'Cancel', exact: true }).click();
       for (const variant of ['non-gguf', 'dataset']) {
         await page.goto(`${base}?case=${variant}`);
         await page.getByText('weights.safetensors', { exact: true }).first().waitFor();
@@ -955,6 +1065,6 @@ async function checkBrowserLayout() {
       assert.deepEqual(errors, [], 'no page runtime errors');
       await page.close();
     }
-    console.log('PASS: real DOM region order/ancestry; 720p contents viewport; 360px two-line rows and no horizontal scroll; This copy panel; Change/location switch with focus; HF shards/versions facts; confirmation inventory with sizes; dataset single Files heading; loading/error states inside contents; no writes');
+    console.log('PASS: real DOM region order/ancestry; 760px contents viewport; 360px two-line rows and no horizontal scroll; This copy panel; Change/location switch with focus; HF shards/versions facts; left-aligned confirmation with definition rows, open long inventory, right-aligned sizes, versioned/vision screenshots, centred whole-copy dialog; dataset single Files heading; loading/error states inside contents; no writes');
   } finally { await browser.close(); }
 }

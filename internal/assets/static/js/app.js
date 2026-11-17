@@ -4576,6 +4576,16 @@ async function loadRepositoryDetails(entry) {
     return escapeHtml(String(value ?? '')).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
+  // The group label carries the quantization suffix from the server; a badge
+  // already names it, so the visible label drops the repeated suffix once and
+  // both the row and its confirmation use the same value.
+  function cacheSelectionGroupDisplayLabel(group) {
+    const quantSuffix = group.quant ? ` · ${group.quant}` : '';
+    return quantSuffix && typeof group.label === 'string' && group.label.endsWith(quantSuffix)
+      ? group.label.slice(0, -quantSuffix.length)
+      : (group.label || '');
+  }
+
   function cacheSelectionGroupRowHTML(group, index, repo, location) {
     const deleteKey = selectedCacheDeleteKey(repo, location.id, group.id);
     const canDelete = location.canDelete === true && group.canDelete === true;
@@ -4595,8 +4605,7 @@ async function loadRepositoryDetails(entry) {
       countedPaths.add(member.path);
       groupSize += Number(member.size) || 0;
     }
-    const quantSuffix = group.quant ? ` · ${group.quant}` : '';
-    const displayLabel = quantSuffix && typeof group.label === 'string' && group.label.endsWith(quantSuffix) ? group.label.slice(0, -quantSuffix.length) : (group.label || '');
+    const displayLabel = cacheSelectionGroupDisplayLabel(group);
     const isVision = group.kind === 'vision_encoder';
     // A vision encoder is a companion artifact, not a model quantization, so
     // it gets its own badge instead of a quant label.
@@ -4694,7 +4703,9 @@ async function loadRepositoryDetails(entry) {
         group: {
           id: group.id,
           label: group.label,
+          displayLabel: cacheSelectionGroupDisplayLabel(group),
           kind: group.kind,
+          quant: group.quant,
           hasSavedVersions: (group.members || []).some(member => member.versions?.length > 0),
           members: (group.members || []).map(member => ({
             path: member.path,
@@ -4774,36 +4785,57 @@ async function loadRepositoryDetails(entry) {
     }
     const fileEntries = Array.from(filesByPath.values());
     const savedVersionCount = new Set(members.flatMap(member => member.versions)).size;
-    const linkOnly = members.some(member => member.linkOnly);
-    const files = fileEntries.map(entry => `<li><code>${escapeHtml(entry.path)}</code>${entry.size > 0 ? `<span> — ${escapeHtml(formatBytes(entry.size))}</span>` : ''}${entry.versions.size ? `<span> — Saved versions (${entry.versions.size}): ${Array.from(entry.versions).map(escapeHtml).join(', ')}</span>` : ''}${entry.linkOnly ? '<strong> — Link only: this removes the link; the weight file remains.</strong>' : ''}</li>`).join('');
+    // The size row appears only when every distinct file reports its own size,
+    // so multiple saved versions of one path can never inflate the total.
+    let totalSize = 0;
+    let completeSize = fileEntries.length > 0;
+    for (const entry of fileEntries) {
+      if (!(entry.size > 0)) { completeSize = false; break; }
+      totalSize += entry.size;
+    }
     // A vision encoder is a companion artifact, not a model quantization, so
     // the confirmation names its role and never claims the selected artifact
     // class remains.
     const isVisionEncoder = group.kind === 'vision_encoder';
-    // The dialog strings name the artifact role. The LLM wording is unchanged.
-    const confirmationTitle = isVisionEncoder ? 'Confirm vision encoder deletion' : 'Confirm GGUF group deletion';
-    const confirmButtonLabel = isVisionEncoder ? 'Delete selected vision encoder files' : 'Delete selected GGUF files';
+    const groupLabel = typeof group.displayLabel === 'string' && group.displayLabel ? group.displayLabel : group.label;
+    const groupBadge = isVisionEncoder
+      ? '<span class="cache-badge cache-badge-vision-encoder" title="Multimodal vision encoder companion">VISION</span>'
+      : group.quant ? `<span class="cache-badge">${escapeHtml(group.quant)}</span>` : '';
+    const confirmationTitle = group.quant ? `Delete ${group.quant}?` : 'Delete this group?';
+    const confirmButtonLabel = isVisionEncoder ? 'Delete vision encoder' : 'Delete group';
     const progressLabel = isVisionEncoder ? 'Deleting the selected vision encoder…' : 'Deleting the selected GGUF group…';
-    const groupLine = isVisionEncoder
-      ? `Vision encoder (mmproj companion): <strong>${escapeHtml(group.label)}</strong>`
-      : `GGUF group: <strong>${escapeHtml(group.label)}</strong>`;
-    const llmScopeStatement = versioned
-      ? 'This removes this GGUF group from all saved versions in this selected location. Other groups and other locations remain.'
-      : 'This removes only the selected GGUF group members. Other variants, companion files, metadata, directories, and other locations remain.';
-    const visionEncoderScopeStatement = versioned
-      ? 'This removes the selected vision encoder companion from all saved versions in this selected location. Other groups and other locations remain.'
-      : 'This removes only the selected vision encoder companion files. Other quantization groups, other companion files, metadata, directories, and other locations remain.';
-    const scopeStatement = isVisionEncoder ? visionEncoderScopeStatement : llmScopeStatement;
+    const consequence = isVisionEncoder
+      ? versioned
+        ? 'This removes this vision encoder companion from all saved versions in this location; other groups and locations stay.'
+        : 'This removes only this vision encoder companion; other variants, companions and locations stay.'
+      : versioned
+        ? 'This removes this group from all saved versions in this location; other groups and locations stay.'
+        : 'This removes only this group; other variants, companions and locations stay.';
+    const fileCountLabel = `${fileEntries.length} file${fileEntries.length === 1 ? '' : 's'}`;
+    const savedVersionsLabel = savedVersionCount
+      ? `${savedVersionCount} saved version${savedVersionCount === 1 ? '' : 's'}`
+      : '';
+    const inventoryRows = fileEntries.map(entry => `<li class="cache-delete-file">
+          <code class="cache-delete-file-path" title="${escapeCacheDetailAttribute(entry.path)}">${escapeHtml(entry.path)}</code>
+          ${entry.size > 0 ? `<span class="cache-delete-file-size">${escapeHtml(formatBytes(entry.size))}</span>` : ''}
+          ${entry.versions.size ? `<span class="cache-delete-file-versions">${entry.versions.size} saved version${entry.versions.size === 1 ? '' : 's'} · ${Array.from(entry.versions).map(escapeHtml).join(', ')}</span>` : ''}
+          ${entry.linkOnly ? '<span class="cache-delete-file-linkonly">link only — the weight file remains</span>' : ''}
+        </li>`).join('');
+    const inventory = fileEntries.length > 3
+      ? `<details class="cache-delete-inventory" open><summary>Files (${fileEntries.length})</summary><ul class="cache-delete-file-list">${inventoryRows}</ul></details>`
+      : `<ul class="cache-delete-file-list">${inventoryRows}</ul>`;
     showModal(confirmationTitle, `
-      <div id="${confirmationID}" class="delete-confirm cache-selection-confirmation">
-        <p>Repository: <strong>${escapeHtml(repo)}</strong></p>
-        <p>Type: <strong>Model</strong></p>
-        <p>Storage location: <strong>${escapeHtml(location.source)}</strong><br><code>${escapeHtml(location.path)}</code></p>
-        <p>${groupLine}</p>
-        <p>${scopeStatement}</p>
-        ${linkOnly ? '<p class="cache-selection-warning">This group includes link-only entries. Removing a link does not remove its weight target.</p>' : ''}
-        <details open><summary>Files included (${fileEntries.length} file${fileEntries.length === 1 ? '' : 's'}${savedVersionCount ? ` · ${savedVersionCount} saved version${savedVersionCount === 1 ? '' : 's'}` : ''})</summary><ul>${files}</ul></details>
-        <p id="cache-delete-progress" role="status"></p>
+      <div id="${confirmationID}" class="cache-selection-confirmation">
+        <dl class="cache-delete-facts">
+          <dt>Repository</dt><dd>${escapeHtml(repo)}</dd>
+          <dt>Location</dt><dd class="cache-delete-location"><span>${escapeHtml(location.source)}</span><code class="cache-delete-location-path" title="${escapeCacheDetailAttribute(location.path)}">${escapeHtml(location.path)}</code></dd>
+          <dt>Group</dt><dd class="cache-delete-group">${groupBadge}<span class="cache-delete-group-label" title="${escapeCacheDetailAttribute(groupLabel)}">${escapeHtml(groupLabel)}</span></dd>
+          ${completeSize ? `<dt>Size</dt><dd class="cache-delete-size">${escapeHtml(formatBytes(totalSize))}</dd>` : ''}
+          <dt>Files</dt><dd>${escapeHtml(fileCountLabel)}${savedVersionsLabel ? `<span class="cache-delete-saved-versions">· ${escapeHtml(savedVersionsLabel)}</span>` : ''}</dd>
+        </dl>
+        <p class="cache-delete-consequence">${escapeHtml(consequence)}</p>
+        ${inventory}
+        <p id="cache-delete-progress" class="cache-delete-progress" role="status"></p>
         <div class="form-actions">
           <button id="cache-delete-cancel-${sequence}" class="btn btn-ghost" type="button">Cancel</button>
           <button id="cache-delete-confirm-button-${sequence}" class="btn btn-danger" type="button">${confirmButtonLabel}</button>

@@ -3024,8 +3024,188 @@ a {
 .cache-detail-metadata[open] > summary { margin-bottom: 12px; }
 .cache-detail-modal .cache-file-name { white-space: normal; overflow-wrap: anywhere; }
 
-/* Keep both confirmation actions reachable on narrow phones. */
-.cache-selection-confirmation .form-actions { flex-wrap: wrap; }
+/* Selected-group deletion dialog. Scoped here so the shared whole-copy
+   .delete-confirm dialog keeps its centred layout. */
+.cache-selection-confirmation {
+  min-width: 0;
+  text-align: left;
+}
+
+.cache-selection-confirmation .cache-delete-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 8px 16px;
+  min-width: 0;
+  margin: 0;
+}
+
+.cache-selection-confirmation .cache-delete-facts dt {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  line-height: 1.9;
+  text-transform: uppercase;
+}
+
+.cache-selection-confirmation .cache-delete-facts dd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  color: var(--color-text);
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.cache-selection-confirmation .cache-delete-location {
+  gap: 2px 8px;
+}
+
+.cache-selection-confirmation .cache-delete-location-path {
+  flex: 1 1 160px;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 1px 6px;
+  background: var(--color-bg-tertiary);
+  border-radius: 6px;
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cache-selection-confirmation .cache-delete-group {
+  align-items: center;
+}
+
+.cache-selection-confirmation .cache-delete-group .cache-badge {
+  flex-shrink: 0;
+  background: var(--color-primary);
+  color: var(--color-text-inverse, #fff);
+}
+
+.cache-selection-confirmation .cache-delete-group .cache-badge.cache-badge-vision-encoder {
+  background: rgba(139, 92, 246, 0.14);
+  color: #c4b5fd;
+}
+
+.cache-selection-confirmation .cache-delete-group-label {
+  min-width: 0;
+}
+
+.cache-selection-confirmation .cache-delete-size {
+  font-variant-numeric: tabular-nums;
+}
+
+.cache-selection-confirmation .cache-delete-saved-versions,
+.cache-selection-confirmation .cache-delete-file-versions {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.cache-selection-confirmation .cache-delete-consequence {
+  margin: 12px 0 0;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.cache-selection-confirmation .cache-delete-inventory {
+  min-width: 0;
+  margin-top: 10px;
+}
+
+.cache-selection-confirmation .cache-delete-inventory > summary {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.cache-selection-confirmation .cache-delete-inventory > summary:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.cache-selection-confirmation .cache-delete-file-list {
+  list-style: none;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+}
+
+.cache-selection-confirmation .cache-delete-inventory .cache-delete-file-list {
+  margin-top: 4px;
+}
+
+.cache-selection-confirmation .cache-delete-file {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  column-gap: 12px;
+  row-gap: 2px;
+  min-width: 0;
+  padding: 8px 0;
+  border-top: 1px solid var(--color-border);
+}
+
+.cache-selection-confirmation .cache-delete-file:first-child {
+  border-top: none;
+}
+
+.cache-selection-confirmation .cache-delete-file-path {
+  grid-column: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cache-selection-confirmation .cache-delete-file-size {
+  grid-column: 2;
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.cache-selection-confirmation .cache-delete-file-versions,
+.cache-selection-confirmation .cache-delete-file-linkonly {
+  grid-column: 1 / -1;
+}
+
+.cache-selection-confirmation .cache-delete-file-linkonly {
+  color: var(--color-error);
+}
+
+.cache-selection-confirmation .cache-delete-progress {
+  min-height: 1.4em;
+  margin: 8px 0 0;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.cache-selection-confirmation .form-actions {
+  flex-wrap: wrap;
+  margin-top: 18px;
+  padding-top: 14px;
+}
+
+@media (max-width: 480px) {
+  .modal-backdrop:has(.cache-selection-confirmation) {
+    padding: 12px;
+  }
+}
 
 /* ============================================
    Settings Page
