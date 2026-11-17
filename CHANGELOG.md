@@ -2,10 +2,17 @@
 
 ## [Unreleased]
 
+## [1.3.0-beta.5] - 2026-11-17
+
+Beta release of the upcoming `v1.3.0`; the artifacts are pre-release builds for testing and are not marked as the latest stable release.
+
+Long-form notes: [docs/releases/1.3.0-beta.5.md](docs/releases/1.3.0-beta.5.md).
+
 ### Changed
 
 - Repository Details is a sectioned card: identity and provenance, a **This copy** panel, compact GGUF rows with facts, and a dedicated delete block replace the old stats row, per-row inventory disclosures, and footer delete.
 - Repository Details can be resized from its bottom-right grip (the size is remembered per browser), while the delete confirmations keep their default dialog layout.
+- CHANGELOG.md is now a one-line-per-change summary; long-form notes live in docs/releases/<version>.md (#203).
 
 ## [1.3.0-beta.4] - 2026-11-17
 
