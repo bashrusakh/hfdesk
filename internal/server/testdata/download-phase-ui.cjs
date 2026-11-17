@@ -188,18 +188,70 @@ eq(role(runCard, 'eta').style.display, '');
 eq(role(runCard, 'eta').textContent, 'ETA 5m');
 eq(role(runCard, 'pct').textContent, '50.0%');
 
+// 3. writing: the disk is the bottleneck for one file. The badge names the
+// phase, the hint sizes only the file(s) currently writing (not the whole
+// job), speed/ETA stay hidden, and the file line names that same file even
+// though a later file is still pending.
+const writingJob = job({
+  phase: 'writing',
+  files: [
+    { path: 'writing.gguf', totalBytes: 4 * 1024 ** 3, downloaded: 1024 ** 3, status: 'writing' },
+    { path: 'waiting.gguf', totalBytes: 6 * 1024 ** 3, downloaded: 0, status: 'pending' }
+  ],
+  progress: {
+    ...preparing.progress,
+    downloadedBytes: 1024 ** 3,
+    bytesPerSecond: 2 * 1024 * 1024,
+    etaSeconds: 900
+  }
+});
+const writeCard = render(writingJob);
+eq(role(writeCard, 'status').textContent, 'writing');
+eq(role(writeCard, 'status').className, 'job-status writing');
+eq(role(writeCard, 'phase').textContent, 'writing 4 GB to disk',
+  'the writing hint sizes the writing file, not the job total');
+eq(role(writeCard, 'phase').title, 'writing 4 GB to disk');
+eq(role(writeCard, 'phase').style.display, '');
+eq(role(writeCard, 'speed').style.display, 'none');
+eq(role(writeCard, 'eta').style.display, 'none');
+eq(role(writeCard, 'pct').textContent, '5.0%', 'the percentage stays truthful while writing');
+eq(role(writeCard, 'bytes').textContent, '1 GB / 20 GB');
+eq(role(writeCard, 'active-file').textContent, 'writing: writing.gguf');
+eq(role(writeCard, 'active-file').style.display, '');
+
+// 4. A mixed job (one file writing, another still pulling from the network)
+// keeps the normal running row and aggregate speed; only the file line names
+// the writing file.
+const mixedCard = render(job({
+  files: [
+    { path: 'writing.gguf', totalBytes: 3 * 1024 ** 3, downloaded: 1024 ** 3, status: 'writing' },
+    { path: 'active.gguf', totalBytes: 8 * 1024 ** 3, downloaded: 2 * 1024 ** 3, status: 'active' }
+  ],
+  progress: running.progress
+}));
+eq(role(mixedCard, 'status').textContent, 'running');
+eq(role(mixedCard, 'status').className, 'job-status running');
+eq(role(mixedCard, 'phase').style.display, 'none');
+eq(role(mixedCard, 'speed').style.display, '');
+eq(role(mixedCard, 'speed').textContent, '12.5 MB/s');
+eq(role(mixedCard, 'active-file').textContent, 'writing: writing.gguf');
+
 // A local phase must never need more visible pills than the transferring row
 // it replaces; the stats row keeps the same single-line flex layout.
 ok(visiblePills(prepCard) <= visiblePills(runCard),
   'preparing must not add a visible stats pill over a transferring job');
 ok(visiblePills(finCard) <= visiblePills(runCard),
   'finalizing must not add a visible stats pill over a transferring job');
+ok(visiblePills(writeCard) <= visiblePills(runCard),
+  'writing must not add a visible stats pill over a transferring job');
+ok(!/[\r\n]/.test(role(writeCard, 'phase').textContent),
+  'the writing hint must stay on one line');
 ok(!/[\r\n]/.test(role(prepCard, 'phase').textContent),
   'the phase hint must stay on one line');
 ok(!/[\r\n]/.test(role(finCard, 'phase').textContent),
   'the finalizing hint must stay on one line');
 
-// 4. Completed jobs never show a phase, even if a stale phase value survived
+// 5. Completed jobs never show a phase, even if a stale phase value survived
 // in the snapshot. Terminal state owns the row.
 const completed = job({
   status: 'completed',
@@ -213,13 +265,13 @@ eq(role(doneCard, 'phase').style.display, 'none');
 eq(role(doneCard, 'speed').style.display, 'none');
 eq(role(doneCard, 'eta').style.display, 'none');
 
-// 5. Unknown or absent phases degrade to the plain running row.
+// 6. Unknown or absent phases degrade to the plain running row.
 const unknownCard = render(job({ phase: 'verifying', progress: running.progress }));
 eq(role(unknownCard, 'status').textContent, 'running');
 eq(role(unknownCard, 'phase').style.display, 'none');
 eq(role(unknownCard, 'speed').textContent, '12.5 MB/s');
 
-// 6. Progress updates mutate the existing nodes; they never rebuild the card
+// 7. Progress updates mutate the existing nodes; they never rebuild the card
 // or the hint. updateJobCard must not assign the card innerHTML per tick.
 const phaseRef = role(prepCard, 'phase');
 const statusRef = role(prepCard, 'status');
@@ -241,4 +293,4 @@ eq(role(prepCard, 'phase').textContent, '');
 eq(role(prepCard, 'speed').style.display, '');
 eq(role(prepCard, 'speed').textContent, '12.5 MB/s');
 
-console.log(`PASS: ${assertions} download phase row assertions (preparing, finalizing, running, completed, unknown, DOM stability)`);
+console.log(`PASS: ${assertions} download phase row assertions (preparing, writing, running, mixed, finalizing, completed, unknown, DOM stability)`);

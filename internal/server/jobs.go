@@ -57,7 +57,7 @@ type Job struct {
 	Flat               bool              `json:"flat,omitempty"`          // Save real files (flat mode) instead of HF cache layout
 	ExactMatch         bool              `json:"exactMatch,omitempty"`    // Match filters by whole name segment, not substring
 	Status             JobStatus         `json:"status"`
-	Phase              string            `json:"phase,omitempty"` // sub-state while running, e.g. "preparing" or "finalizing"
+	Phase              string            `json:"phase,omitempty"` // sub-state while running: "preparing", "writing" or "finalizing"
 	Progress           JobProgress       `json:"progress"`
 	Error              string            `json:"error,omitempty"`
 	CreatedAt          time.Time         `json:"createdAt"`
@@ -156,10 +156,97 @@ type JobFileProgress struct {
 	Path       string `json:"path"`
 	TotalBytes int64  `json:"totalBytes"`
 	Downloaded int64  `json:"downloaded"`
-	Status     string `json:"status"` // pending, active, complete, skipped, error
+	Status     string `json:"status"` // pending, active, preparing, writing, finalizing, complete, skipped, error
 
 	progressed     bool  `json:"-"` // saw a real file_progress event for this file
 	baseDownloaded int64 `json:"-"` // bytes already on disk at first progress (resume position), excluded from speed
+
+	// Local-write phase classification state. The downloader reports its
+	// cumulative WriteAt wait with every file_progress; these fields turn the
+	// per-interval growth into a smoothed share and apply enter/exit hysteresis.
+	writeSampleAt  time.Time `json:"-"` // when the last interval was sampled
+	writeWaitTotal int64     `json:"-"` // cumulative write wait at that sample
+	writeShare     float64   `json:"-"` // smoothed share of wall time blocked in local writes
+	writeShareSeen bool      `json:"-"` // writeShare holds at least one interval
+	writingSince   time.Time `json:"-"` // when Status last became "writing"
+}
+
+const (
+	// writePhaseEnterShare is the smoothed share of a sampling interval that
+	// must be spent blocked in local writes before a file reports "writing".
+	writePhaseEnterShare = 0.5
+	// writePhaseExitShare is the lower bound for leaving "writing". The gap to
+	// writePhaseEnterShare is the hysteresis that keeps a transfer oscillating
+	// around the disk limit from flapping every progress tick.
+	writePhaseExitShare = 0.2
+	// writeShareSmoothing weights the newest interval in the per-file
+	// exponential moving average. At the transfer's 200 ms file_progress
+	// cadence that is a smoothing window of about 2.5 samples (500 ms).
+	writeShareSmoothing = 0.4
+	// writePhaseMinDwell keeps a file in "writing" for at least this long
+	// before a low share may return it to "active".
+	writePhaseMinDwell = time.Second
+	// writeShareMinInterval drops samples too short for a meaningful ratio
+	// (ticker jitter, the terminal progress event).
+	writeShareMinInterval = 100 * time.Millisecond
+)
+
+// resetWriteSampling starts a measurement window at file_start/file_preparing.
+// The first file_progress then folds the whole preparation interval into its
+// share, so a slow staging preallocation registers as local write wait.
+func (f *JobFileProgress) resetWriteSampling(now time.Time) {
+	f.writeSampleAt = now
+	f.writeWaitTotal = 0
+	f.writeShare = 0
+	f.writeShareSeen = false
+	f.writingSince = time.Time{}
+}
+
+// observeLocalWriteWait folds one file_progress interval into the file's
+// smoothed local-write share. cumulativeNanos is the downloader's cumulative
+// WriteAt wait for the file; its growth is compared with the interval's wall
+// time. Concurrent range workers add their waits together, so a saturated
+// disk makes the sum approach the interval while a network-bound transfer
+// spends almost no time in WriteAt.
+func (f *JobFileProgress) observeLocalWriteWait(cumulativeNanos int64, now time.Time) {
+	prevAt, prevTotal := f.writeSampleAt, f.writeWaitTotal
+	f.writeSampleAt = now
+	f.writeWaitTotal = cumulativeNanos
+	if prevAt.IsZero() || cumulativeNanos < prevTotal {
+		return
+	}
+	elapsed := now.Sub(prevAt)
+	if elapsed < writeShareMinInterval {
+		return
+	}
+	share := float64(cumulativeNanos-prevTotal) / float64(elapsed)
+	if share > 1 {
+		share = 1
+	}
+	if f.writeShareSeen {
+		f.writeShare = writeShareSmoothing*share + (1-writeShareSmoothing)*f.writeShare
+		return
+	}
+	f.writeShare = share
+	f.writeShareSeen = true
+}
+
+// updateWriteStatus applies the enter/exit hysteresis. It only moves between
+// active and writing; preparing, finalizing, complete and error are owned by
+// their own events.
+func (f *JobFileProgress) updateWriteStatus(now time.Time) {
+	switch f.Status {
+	case "writing":
+		if f.writeShare <= writePhaseExitShare && now.Sub(f.writingSince) >= writePhaseMinDwell {
+			f.Status = "active"
+			f.writingSince = time.Time{}
+		}
+	case "active":
+		if f.writeShare >= writePhaseEnterShare {
+			f.Status = "writing"
+			f.writingSince = now
+		}
+	}
 }
 
 // JobManager manages download jobs.
@@ -1581,29 +1668,44 @@ func updateJobETA(job *Job, transferred int64, now time.Time) {
 // pkg/smartdl's analysis_warnings.
 const maxJobWarnings = 20
 
-// refreshPreparingPhase projects per-file local preparation onto the job-wide
-// phase. It is shown only while at least one file is preparing and no file is
-// in transfer; the preparing file itself is excluded from the transfer check
-// because file_start marks it active before its local preparation starts.
-func refreshPreparingPhase(job *Job) {
+// refreshLocalPhase projects per-file local I/O onto the job-wide phase. A
+// writing file (at least one is blocking on the disk) wins over a preparing
+// one; a file still transferring from the network keeps the job in its plain
+// running state so the aggregate speed stays visible and only the file line
+// names the writing file.
+func refreshLocalPhase(job *Job) {
 	preparing := false
+	writing := false
 	transferring := false
 	for i := range job.Files {
 		switch job.Files[i].Status {
 		case "preparing":
 			preparing = true
+		case "writing":
+			writing = true
 		case "active":
 			transferring = true
 		}
 	}
-	if preparing && !transferring {
+	if transferring {
+		if job.Phase == "preparing" || job.Phase == "writing" {
+			job.Phase = ""
+		}
+		return
+	}
+	switch {
+	case writing:
+		// bytesPerSecond/etaSeconds stay truthful: bytes are still advancing,
+		// and the UI hides both pills while the writing phase is shown.
+		job.Phase = "writing"
+	case preparing:
 		job.Phase = "preparing"
 		job.Progress.BytesPerSecond = 0
 		job.Progress.EtaSeconds = 0
-		return
-	}
-	if job.Phase == "preparing" {
-		job.Phase = ""
+	default:
+		if job.Phase == "preparing" || job.Phase == "writing" {
+			job.Phase = ""
+		}
 	}
 }
 
@@ -1625,10 +1727,11 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 		for i := range job.Files {
 			if job.Files[i].Path == evt.Path {
 				job.Files[i].Status = "active"
+				job.Files[i].resetWriteSampling(now)
 				break
 			}
 		}
-		refreshPreparingPhase(job)
+		refreshLocalPhase(job)
 
 	case "file_preparing":
 		// Local preparation (staging creation/preallocation or resume
@@ -1638,12 +1741,15 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 		for i := range job.Files {
 			if job.Files[i].Path == evt.Path {
 				job.Files[i].Status = "preparing"
+				// The preparation window is local write work: start its clock so
+				// the first file_progress folds preallocation into the share.
+				job.Files[i].resetWriteSampling(now)
 				matched = true
 				break
 			}
 		}
 		if matched {
-			refreshPreparingPhase(job)
+			refreshLocalPhase(job)
 		}
 
 	case "file_progress":
@@ -1651,6 +1757,10 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 			if job.Files[i].Path == evt.Path {
 				if job.Files[i].Status == "preparing" || job.Files[i].Status == "pending" {
 					job.Files[i].Status = "active"
+				}
+				if job.Files[i].Status == "active" || job.Files[i].Status == "writing" {
+					job.Files[i].observeLocalWriteWait(evt.WriteWaitNanos, now)
+					job.Files[i].updateWriteStatus(now)
 				}
 				if !job.Files[i].progressed {
 					// First real progress for this file: record the bytes
@@ -1663,7 +1773,7 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 				break
 			}
 		}
-		refreshPreparingPhase(job)
+		refreshLocalPhase(job)
 		// total drives the progress bar (includes skipped/already-present
 		// bytes); transferred drives the speed (only bytes moved this run).
 		// During the resume-recovery window (resumeFloor > 0) the running
@@ -1705,16 +1815,17 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 		}
 		// A file still preparing keeps the preparing phase while no transfer
 		// is running; only once preparation ends can the job be finalizing.
-		refreshPreparingPhase(job)
+		refreshLocalPhase(job)
 		if job.Phase == "preparing" {
 			break
 		}
 		// Once no file is left downloading, the whole job is in local
 		// post-processing: surface the phase and stop showing the stale
-		// speed/ETA from the last transfer window.
+		// speed/ETA from the last transfer window. A writing file is still
+		// transferring, just disk-bound, so it counts as downloading here.
 		downloading := false
 		for _, f := range job.Files {
-			if f.Status == "active" || f.Status == "pending" {
+			if f.Status == "active" || f.Status == "pending" || f.Status == "writing" {
 				downloading = true
 				break
 			}
@@ -1733,7 +1844,7 @@ func applyJobProgress(job *Job, evt hfdownloader.ProgressEvent, now time.Time) {
 				break
 			}
 		}
-		refreshPreparingPhase(job)
+		refreshLocalPhase(job)
 		job.Progress.CompletedFiles++
 		// Recalculate total downloaded (skipped/completed files included).
 		// Speed is intentionally not updated here: a skipped file emits only

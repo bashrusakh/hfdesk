@@ -701,7 +701,11 @@ type boundedAtWriter struct {
 	limit   int64
 	written int64
 	measure *payloadIOMeasurement
-	onWrite func(p []byte) // optional per-write hook (progress/hash feed)
+	// writeWait, when non-nil, accumulates every WriteAt's blocking time across
+	// the file's range workers. It is the measurement behind the server's
+	// local-write phase; nil leaves the writer uninstrumented.
+	writeWait *atomic.Int64
+	onWrite   func(p []byte) // optional per-write hook (progress/hash feed)
 }
 
 func newBoundedAtWriter(f *os.File, base, limit int64) *boundedAtWriter {
@@ -714,7 +718,11 @@ func (w *boundedAtWriter) Write(p []byte) (int, error) {
 	if int64(len(p)) > w.limit-w.written {
 		return 0, fmt.Errorf("%w: wrote %d of %d bytes, got %d more", errRangedBodyOverflow, w.written, w.limit, len(p))
 	}
+	writeStart := time.Now()
 	n, err := w.f.WriteAt(p, w.base+w.written)
+	if w.writeWait != nil {
+		w.writeWait.Add(int64(time.Since(writeStart)))
+	}
 	if n > 0 {
 		w.written += int64(n)
 		stagingWriteBytes.Add(int64(n))
@@ -779,6 +787,10 @@ type stagingDownload struct {
 	// progress counts unique bytes written this run; emitted progress is
 	// baseCommitted + progress and never decreases within a run.
 	progress atomic.Int64
+	// writeWaitNanos accumulates the time every range writer spent inside
+	// WriteAt, plus the claim/preallocation window. It is reported with each
+	// file_progress so the server can classify the local-write phase.
+	writeWaitNanos atomic.Int64
 	// baseCommitted is the committed total at claim time (excluded from
 	// this-run speed accounting, consistent with the resumed/skipped-bytes
 	// rule the single path already follows).
@@ -1094,8 +1106,11 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	metaPath := stg + ".meta"
 
 	// Staging creation/preallocation can run for minutes on a non-sparse or
-	// network filesystem; announce the window before the first byte.
+	// network filesystem; announce the window before the first byte. Its
+	// duration is part of the file's local write wait: truncation and the
+	// initial checkpoint are disk work even though the phase stays preparing.
 	emit(ProgressEvent{Event: "file_preparing", Path: it.RelativePath, Message: "preparing staging file"})
+	prepStart := time.Now()
 
 	// Claim under the item's held domain and local metadata gate; only a known
 	// content-addressed publication target is completion proof.
@@ -1231,6 +1246,12 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		return false, err
 	}
 
+	// The claim, preallocation and initial checkpoint are local disk work that
+	// preceded the first transfer byte; fold their duration into the file's
+	// cumulative write wait. The phase stays preparing (unchanged) until the
+	// first real progress event.
+	d.writeWaitNanos.Store(int64(time.Since(prepStart)))
+
 	// Derive missing suffixes under metaMu: checkpoint normalization mutates the
 	// same layout. Persisted partitions survive Concurrency changes; full prefixes
 	// without framing proof reserve the last byte. Release the gate before network I/O.
@@ -1327,7 +1348,8 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 				return
 			case <-t.C:
 				emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath,
-					Downloaded: d.baseCommitted + d.progress.Load(), Total: it.Size})
+					Downloaded: d.baseCommitted + d.progress.Load(), Total: it.Size,
+					WriteWaitNanos: d.writeWaitNanos.Load()})
 			}
 		}
 	}()
@@ -1379,7 +1401,8 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 
 	// Report full transfer progress, then finalizing before optional content proof
 	// and publication so the UI does not sit silently at 100%.
-	emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size})
+	emit(ProgressEvent{Event: "file_progress", Path: it.RelativePath, Downloaded: it.Size, Total: it.Size,
+		WriteWaitNanos: d.writeWaitNanos.Load()})
 	emit(ProgressEvent{Event: "file_finalizing", Path: it.RelativePath, Message: "finalizing"})
 
 	// Measure this call's proof/publication interval after the finalizing callback;
@@ -1641,6 +1664,7 @@ func (d *stagingDownload) runRange(partCtx context.Context, task rangeTask, setP
 				paced := d.cfg.SpeedLimiter.Reader(attemptCtx, body)
 				w := newBoundedAtWriter(d.out, wantStart, wantLen)
 				w.measure = payloadIOMeasurementFromContext(d.ctx)
+				w.writeWait = &d.writeWaitNanos
 				w.onWrite = func(p []byte) {
 					end := wantStart + w.written
 					if end > countedUpTo {
