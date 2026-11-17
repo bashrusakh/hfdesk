@@ -173,6 +173,8 @@ Project structure changes over time. AGENTS.md and CONTRIBUTING.md are guidance,
 ## Releases
 Every release must include meaningful release notes. Before publishing, check previous notes, review changes since the previous tag, and use actual commits, merged PRs, linked issues, and final code changes. Do not invent features, fixes, impact, or breaking changes. Call out user-visible, breaking, migration, compatibility, security, benchmark/default, and data-format changes when relevant. If a release is created automatically by GitHub Actions, its body must still be reviewed and updated before completion. A GitHub Release with an empty, placeholder, too thin, or unreviewed auto-generated-only body is considered unfinished, even if the tag and assets were created successfully. Before marking release work as done, verify the GitHub Release page contains the correct tag, title, body, and assets.
 
+Keep `CHANGELOG.md` scannable: each entry is one or two sentences with its PR reference, while long-form detail belongs in `docs/releases/<version>.md`. Release notes are built from the changelog, so the changelog must stay readable at a glance.
+
 ## Project Structure
 Components and important paths observed in the repository:
 - **hfdesk binary** — Compiled Go binary built in Dockerfile (paths: `Dockerfile`; evidence: `Dockerfile`)
