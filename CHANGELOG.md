@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The selected GGUF group deletion confirmation names the quantization in its title and shows left-aligned facts, a one-sentence scope, and file rows with right-aligned sizes; the whole-copy confirmation is unchanged.
+
 ## [1.3.0-beta.5] - 2026-11-17
 
 Beta release of the upcoming `v1.3.0`; the artifacts are pre-release builds for testing and are not marked as the latest stable release.
