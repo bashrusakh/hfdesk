@@ -2339,6 +2339,8 @@ a {
   background: var(--color-bg-secondary);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
+  container-type: inline-size;
+  container-name: cache-detail-copy;
 }
 
 .cache-detail-panel-head {
@@ -2365,6 +2367,24 @@ a {
   grid-template-columns: auto minmax(0, 1fr) auto auto auto;
   gap: 8px 16px;
   margin: 0;
+}
+
+/* The dialog width changes independently of the viewport when the user
+   resizes it, so "This copy" collapses from its panel width, not the window. */
+@container cache-detail-copy (max-width: 520px) {
+  .cache-detail-defs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-areas:
+      "source size"
+      "location location"
+      "files commit";
+    gap: 8px 12px;
+  }
+  .cache-detail-def-source { grid-area: source; }
+  .cache-detail-def-location { grid-area: location; }
+  .cache-detail-def-size { grid-area: size; }
+  .cache-detail-def-files { grid-area: files; }
+  .cache-detail-def-commit { grid-area: commit; }
 }
 
 .cache-detail-def {
@@ -2515,6 +2535,7 @@ a {
   flex: 1;
   min-height: 0;
   margin: 0;
+  overflow: hidden;
 }
 
 #cacheSelectionSection[aria-busy="true"] {
@@ -2535,6 +2556,18 @@ a {
   flex-shrink: 0;
   padding: 0 20px 8px;
   border-bottom: 1px solid var(--color-border);
+}
+
+/* A short window leaves the fixed chrome plus "This copy" with little room.
+   The duplicate location line goes first, then the heading itself, so the
+   contents scroll never paints over the footer. */
+@media (max-height: 600px) {
+  .cache-selection-sticky { padding-bottom: 4px; }
+  .cache-selection-sticky .cache-contents-location { display: none; }
+}
+
+@media (max-height: 500px) {
+  .cache-selection-sticky { display: none; }
 }
 
 .cache-selection-sticky h4 {
@@ -2749,6 +2782,51 @@ a {
   flex-shrink: 0;
 }
 
+/* The 18px grip ends at the footer's 20px content padding, so it never
+   covers the Refresh/Close buttons. It is only a hint until hover or focus. */
+.cache-detail-resize-grip {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: nwse-resize;
+  opacity: 0;
+  touch-action: none;
+  transition: opacity var(--transition-fast), color var(--transition-fast);
+}
+
+.modal:hover .cache-detail-resize-grip,
+.cache-detail-resize-grip:focus-visible,
+.cache-detail-resize-grip.dragging {
+  opacity: 1;
+}
+
+.cache-detail-resize-grip:hover,
+.cache-detail-resize-grip.dragging {
+  color: var(--color-text-secondary);
+}
+
+.cache-detail-resize-grip:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.cache-detail-resize-grip svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+@media (max-width: 720px), (pointer: coarse) {
+  .cache-detail-resize-grip { display: none; }
+}
+
 @media (max-height: 780px) {
   .modal:has(.cache-detail-modal) {
     height: 94dvh;
@@ -2794,7 +2872,8 @@ a {
 @media (prefers-reduced-motion: reduce) {
   .cache-detail-modal .cache-selection-delete,
   .cache-detail-modal .cache-selection-other summary,
-  .cache-detail-modal .cache-detail-hub-link {
+  .cache-detail-modal .cache-detail-hub-link,
+  .cache-detail-resize-grip {
     transition: none;
   }
 }

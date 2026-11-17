@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const path = require('node:path');
 const vm = require('node:vm');
 
 const calls = [];
@@ -242,7 +243,7 @@ const context = {
     return { ok: true, json: async () => result };
   }
 };
-let source = fs.readFileSync('../assets/static/js/app.js', 'utf8');
+let source = fs.readFileSync(path.join(__dirname, '..', '..', 'assets', 'static', 'js', 'app.js'), 'utf8');
 source = source.replace('  // Start\n', `window.test = { showCacheDetails: window.showCacheDetails };\n  // Start\n`);
 vm.runInNewContext(source, context);
 
@@ -861,7 +862,9 @@ async function checkBrowserLayout() {
           dangerTop: modal.querySelector('.cache-detail-danger').getBoundingClientRect().top
         };
       });
-      assert.deepEqual(structure.children, ['cache-detail-header', 'cache-detail-panel', 'cache-detail-section', 'cache-detail-actions']);
+      assert.deepEqual(structure.children, width === 360
+        ? ['cache-detail-header', 'cache-detail-panel', 'cache-detail-section', 'cache-detail-actions']
+        : ['cache-detail-header', 'cache-detail-panel', 'cache-detail-section', 'cache-detail-actions', 'cache-detail-resize-grip']);
       assert.equal(structure.scrollCount, 1);
       for (const key of ['groupsInside', 'othersInside', 'metadataInside', 'dangerInside', 'headingOutside', 'collapsed']) assert(structure[key], key);
       assert.equal(structure.defs, 5);

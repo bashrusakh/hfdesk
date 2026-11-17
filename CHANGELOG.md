@@ -5,6 +5,7 @@
 ### Changed
 
 - Repository Details is a sectioned card: identity and provenance, a **This copy** panel, compact GGUF rows with facts, and a dedicated delete block replace the old stats row, per-row inventory disclosures, and footer delete.
+- Repository Details can be resized from its bottom-right grip (the size is remembered per browser), while the delete confirmations keep their default dialog layout.
 
 ## [1.3.0-beta.4] - 2026-11-17
 
