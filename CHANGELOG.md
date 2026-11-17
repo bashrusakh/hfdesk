@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Repository Details is a sectioned card: identity and provenance, a **This copy** panel, compact GGUF rows with facts, and a dedicated delete block replace the old stats row, per-row inventory disclosures, and footer delete.
+
 ## [1.3.0-beta.4] - 2026-11-17
 
 Beta release of the upcoming `v1.3.0`; the artifacts are pre-release builds for testing and are not marked as the latest stable release.
