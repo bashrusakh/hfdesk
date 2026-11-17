@@ -400,7 +400,8 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(!calls.some(call => call.path.startsWith('/api/cache-selection')));
   assert(modalHTML.includes('Delete entire dataset cache'));
   assert.equal((modalHTML.match(/<h4 id="cacheContentsHeading"/g) || []).length, 1, 'the dataset uses one contents heading');
-  assert(modalHTML.includes('>Files <span class="cache-selection-counts">3 files</span></h4>'), 'the single Files heading carries the count');
+  assert(modalHTML.includes('>Files <span class="cache-selection-counts">· 3</span></h4>'), 'the single Files heading carries the count once');
+  assert(!modalHTML.includes('>Files <span class="cache-selection-counts">3 files</span></h4>'), 'the heading does not repeat the files noun');
   assert(!modalHTML.includes('Files (0)'), 'the duplicate inner Files heading is gone');
   assert.equal((modalHTML.match(/id="cacheSelectionLocation"/g) || []).length, 0, 'datasets keep no location switch');
   assert.equal((modalHTML.match(/class="cache-files-list"/g) || []).length, 1, 'the dataset keeps its file list');
@@ -1097,7 +1098,7 @@ async function checkBrowserLayout() {
           assert.equal(await page.locator('.cache-selection-group').count(), 0);
           assert.equal(await page.locator('select#cacheSelectionLocation').count(), 0, 'datasets keep no location switch');
           assert.equal(await page.locator('#cacheContentsHeading').count(), 1);
-          assert((await page.locator('#cacheContentsHeading').textContent()).startsWith('Files'));
+          assert.match((await page.locator('#cacheContentsHeading').textContent()).trim(), /^Files · \d+$/u, 'the dataset heading renders the count once without repeating the noun');
           assert.equal(await page.getByText('Files (1)', { exact: true }).count(), 0, 'no duplicate inner Files heading');
         } else {
           await page.getByText('weights.safetensors', { exact: true }).first().waitFor();

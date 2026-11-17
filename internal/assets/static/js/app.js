@@ -4426,7 +4426,7 @@ async function loadRepositoryDetails(entry) {
   function cacheContentsHeadingHTML(context, location, locationOptions = null) {
     if (context.type === 'dataset') {
       const count = Array.isArray(context.snapshotFiles) ? context.snapshotFiles.length : 0;
-      return `<h4 id="cacheContentsHeading" class="cache-contents-heading" tabindex="-1">Files <span class="cache-selection-counts">${count} file${count === 1 ? '' : 's'}</span></h4>`;
+      return `<h4 id="cacheContentsHeading" class="cache-contents-heading" tabindex="-1">Files <span class="cache-selection-counts">· ${count}</span></h4>`;
     }
     const select = cacheLocationSelectHTML(locationOptions?.locations || [], locationOptions?.selectedLocationID || '', location, locationOptions?.busy === true);
     return `<div class="cache-contents-head">
