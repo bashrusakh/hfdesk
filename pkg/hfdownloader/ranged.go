@@ -860,8 +860,9 @@ func (d *stagingDownload) flushMeta() error {
 var syncStagingPayload = func(f *os.File) error { return f.Sync() }
 
 // truncateStagingPayload is a test hook for observing preallocation activity;
-// production always truncates the real staging payload.
-var truncateStagingPayload = func(f *os.File, size int64) error { return f.Truncate(size) }
+// production sizes the real staging payload through the platform helper, which
+// makes it sparse before extending it where the filesystem supports that.
+var truncateStagingPayload = func(f *os.File, size int64) error { return prepareStagingPayload(f, size) }
 
 // flushMetaLocked requires metaMu, then takes the metadata gate and rechecks
 // the process-instance token before replacement. A nil layout claims no bytes.
