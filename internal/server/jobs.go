@@ -168,7 +168,7 @@ type JobFileProgress struct {
 	writeWaitTotal int64     `json:"-"` // cumulative write wait at that sample
 	writeShare     float64   `json:"-"` // smoothed share of wall time blocked in local writes
 	writeShareSeen bool      `json:"-"` // writeShare holds at least one interval
-	writingSince   time.Time `json:"-"` // when Status last became "writing"
+	writeLowSince  time.Time `json:"-"` // when the share first fell to writePhaseExitShare or below
 }
 
 const (
@@ -183,9 +183,11 @@ const (
 	// exponential moving average. At the transfer's 200 ms file_progress
 	// cadence that is a smoothing window of about 2.5 samples (500 ms).
 	writeShareSmoothing = 0.4
-	// writePhaseMinDwell keeps a file in "writing" for at least this long
-	// before a low share may return it to "active".
-	writePhaseMinDwell = time.Second
+	// writePhaseExitDwell is how long the smoothed share must stay at or below
+	// writePhaseExitShare before a writing file returns to active. The clock
+	// starts at the first low sample and resets as soon as the share rises
+	// above the bound, so a brief dip at the disk limit cannot drop the phase.
+	writePhaseExitDwell = 3 * time.Second
 	// writeShareMinInterval drops samples too short for a meaningful ratio
 	// (ticker jitter, the terminal progress event).
 	writeShareMinInterval = 100 * time.Millisecond
@@ -199,7 +201,7 @@ func (f *JobFileProgress) resetWriteSampling(now time.Time) {
 	f.writeWaitTotal = 0
 	f.writeShare = 0
 	f.writeShareSeen = false
-	f.writingSince = time.Time{}
+	f.writeLowSince = time.Time{}
 }
 
 // observeLocalWriteWait folds one file_progress interval into the file's
@@ -231,20 +233,30 @@ func (f *JobFileProgress) observeLocalWriteWait(cumulativeNanos int64, now time.
 	f.writeShareSeen = true
 }
 
-// updateWriteStatus applies the enter/exit hysteresis. It only moves between
-// active and writing; preparing, finalizing, complete and error are owned by
-// their own events.
+// updateWriteStatus applies the enter/exit hysteresis. Entry is immediate at
+// writePhaseEnterShare. Exit requires the smoothed share to stay at or below
+// writePhaseExitShare for writePhaseExitDwell: a dip that recovers resets the
+// low-share clock, so a disk-bound transfer cannot flash back to "active".
+// It only moves between active and writing; preparing, finalizing, complete
+// and error are owned by their own events.
 func (f *JobFileProgress) updateWriteStatus(now time.Time) {
 	switch f.Status {
 	case "writing":
-		if f.writeShare <= writePhaseExitShare && now.Sub(f.writingSince) >= writePhaseMinDwell {
+		if f.writeShare > writePhaseExitShare {
+			f.writeLowSince = time.Time{}
+			return
+		}
+		if f.writeLowSince.IsZero() {
+			f.writeLowSince = now
+		}
+		if now.Sub(f.writeLowSince) >= writePhaseExitDwell {
 			f.Status = "active"
-			f.writingSince = time.Time{}
+			f.writeLowSince = time.Time{}
 		}
 	case "active":
 		if f.writeShare >= writePhaseEnterShare {
 			f.Status = "writing"
-			f.writingSince = now
+			f.writeLowSince = time.Time{}
 		}
 	}
 }

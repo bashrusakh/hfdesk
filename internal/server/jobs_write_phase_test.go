@@ -145,26 +145,55 @@ func TestApplyJobProgressClassifiesLocalWritePhase(t *testing.T) {
 		}
 	})
 
-	t.Run("minimum dwell holds writing through a short lull", func(t *testing.T) {
+	t.Run("short dip below the exit bound does not drop the phase", func(t *testing.T) {
 		h := newWritePhaseHarness(t, "a.gguf")
-		h.tick("a.gguf", 200*time.Millisecond)
-		h.ticks("a.gguf", 4, 0)
+		h.ticks("a.gguf", 5, 200*time.Millisecond)
 		if got := h.status("a.gguf"); got != "writing" {
-			t.Fatalf("file status after 0.8s of lull = %q, want writing inside the dwell", got)
+			t.Fatalf("file status before the dip = %q, want writing", got)
 		}
-		h.tick("a.gguf", 0)
+
+		// A 2.0 s dip below the 0.2 exit bound, as measured on the throttled
+		// stand (t=64..66). The smoothed share crosses the bound after about
+		// 0.8 s, but it is not sustained for the 3 s exit dwell.
+		for i := 0; i < 10; i++ {
+			h.tick("a.gguf", 0)
+			if got := h.status("a.gguf"); got != "writing" {
+				t.Fatalf("dip interval %d: file status = %q, want writing", i, got)
+			}
+			if h.job.Phase != "writing" {
+				t.Fatalf("dip interval %d: phase = %q, want writing", i, h.job.Phase)
+			}
+		}
+
+		// The disk is the bottleneck again: the low-share clock resets, and the
+		// status never left writing.
+		h.ticks("a.gguf", 4, 200*time.Millisecond)
+		if got := h.status("a.gguf"); got != "writing" {
+			t.Fatalf("file status after the dip = %q, want writing", got)
+		}
+		if h.job.Phase != "writing" {
+			t.Fatalf("phase = %q after the dip, want writing", h.job.Phase)
+		}
+
+		// A genuine recovery still ends the phase, but only after the low share
+		// persists for the full dwell.
+		h.ticks("a.gguf", 8, 0)
+		if got := h.status("a.gguf"); got != "writing" {
+			t.Fatalf("file status 1.6s into recovery = %q, want writing inside the dwell", got)
+		}
+		h.ticks("a.gguf", 10, 0)
 		if got := h.status("a.gguf"); got != "active" {
-			t.Fatalf("file status after the dwell = %q, want active", got)
+			t.Fatalf("file status after sustained recovery = %q, want active", got)
 		}
 		if h.job.Phase != "" {
-			t.Fatalf("phase = %q, want empty once writes stop blocking", h.job.Phase)
+			t.Fatalf("phase = %q after sustained recovery, want empty", h.job.Phase)
 		}
 	})
 
 	t.Run("stalled then resumed returns to active without flapping", func(t *testing.T) {
 		h := newWritePhaseHarness(t, "a.gguf")
 		h.tick("a.gguf", 200*time.Millisecond)
-		h.ticks("a.gguf", 5, 0)
+		h.ticks("a.gguf", 20, 0)
 		if got := h.status("a.gguf"); got != "active" {
 			t.Fatalf("file status after the stall = %q, want active", got)
 		}
@@ -242,7 +271,7 @@ func TestJobJSONExposesLocalWritePhaseWithoutTimingState(t *testing.T) {
 	if len(decoded.Files) != 1 || decoded.Files[0].Status != "writing" {
 		t.Errorf("response files = %+v, want one writing file", decoded.Files)
 	}
-	for _, private := range []string{"writeShare", "writeWaitTotal", "writeSampleAt", "writingSince"} {
+	for _, private := range []string{"writeShare", "writeWaitTotal", "writeSampleAt", "writeLowSince"} {
 		if strings.Contains(string(data), `"`+private+`"`) {
 			t.Errorf("job JSON leaked private timing state %q: %s", private, data)
 		}
