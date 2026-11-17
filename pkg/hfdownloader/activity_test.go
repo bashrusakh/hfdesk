@@ -6,6 +6,8 @@ package hfdownloader
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -463,5 +465,172 @@ func TestSingleProgressTickerReportsActivityBeforeCompletion(t *testing.T) {
 	}
 	if last.Downloaded != int64(len(full)) {
 		t.Fatalf("final downloaded = %d, want %d", last.Downloaded, len(full))
+	}
+}
+
+// TestSingleTickerReportsInFlightWrite blocks the single-path payload write and
+// requires a ticker sample with LocalWorkInFlight and a stale read while it is
+// blocked. Removing the writer's activity wiring or forcing the ticker flag to
+// false makes this test fail.
+func TestSingleTickerReportsInFlightWrite(t *testing.T) {
+	oldHook := singleWriteAtHook
+	t.Cleanup(func() { singleWriteAtHook = oldHook })
+
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	singleWriteAtHook = func(f *os.File, p []byte, off int64) (int, error) {
+		once.Do(func() { close(blocked) })
+		<-release
+		return f.WriteAt(p, off)
+	}
+
+	full := rangedTestPayload(64 * 1024)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+	}))
+	t.Cleanup(srv.Close)
+
+	const relPath = "inflight-single.bin"
+	dst := filepath.Join(t.TempDir(), relPath)
+	var (
+		mu      sync.Mutex
+		samples []ProgressEvent
+	)
+	emit := func(ev ProgressEvent) {
+		if ev.Event != "file_progress" {
+			return
+		}
+		mu.Lock()
+		samples = append(samples, ev)
+		mu.Unlock()
+	}
+
+	it := PlanItem{RelativePath: relPath, URL: srv.URL + "/" + relPath, Size: int64(len(full))}
+	cfg := Settings{Concurrency: 1, Retries: 0, StallTimeout: "0"}
+	done := make(chan error, 1)
+	go func() {
+		_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r", Revision: "main"},
+			cfg, it, dst, singleOpts{Commit: rangedSeedCommit, CommitPinned: true, Domain: acquireTestDomain(t, dst)}, emit)
+		done <- err
+	}()
+
+	select {
+	case <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the single-path write was never entered")
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	var inFlight *ProgressEvent
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		for i := range samples {
+			ev := samples[i]
+			if ev.ActivityOnly && ev.LocalWorkInFlight && !ev.LastReadAt.IsZero() && time.Since(ev.LastReadAt) > 1500*time.Millisecond {
+				inFlight = &ev
+				break
+			}
+		}
+		mu.Unlock()
+		if inFlight != nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if inFlight == nil {
+		close(release)
+		<-done
+		t.Fatal("no activity-only sample reported LocalWorkInFlight with a stale read while the write was blocked")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("downloadSingle: %v", err)
+	}
+}
+
+// TestSingleTickerStopsBeforeFinalizing requires that no activity-only sample
+// follows file_finalizing. Removing the explicit stopTicker() before
+// finalizeSinglePartial lets the ticker race the blocked proof and fails this.
+func TestSingleTickerStopsBeforeFinalizing(t *testing.T) {
+	oldHook := singleProofStartHook
+	t.Cleanup(func() { singleProofStartHook = oldHook })
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	singleProofStartHook = func(out *os.File) {
+		once.Do(func() { close(entered) })
+		<-release
+	}
+
+	full := rangedTestPayload(32 * 1024)
+	sum := sha256.Sum256(full)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(full))
+	}))
+	t.Cleanup(srv.Close)
+
+	const relPath = "finalizing-order.bin"
+	dst := filepath.Join(t.TempDir(), relPath)
+	var (
+		mu      sync.Mutex
+		samples []ProgressEvent
+	)
+	emit := func(ev ProgressEvent) {
+		mu.Lock()
+		samples = append(samples, ev)
+		mu.Unlock()
+	}
+
+	it := PlanItem{
+		RelativePath: relPath,
+		URL:          srv.URL + "/" + relPath,
+		Size:         int64(len(full)),
+		SHA256:       hex.EncodeToString(sum[:]),
+	}
+	cfg := Settings{Concurrency: 1, Retries: 0, StallTimeout: "0", Verify: "sha256"}
+	done := make(chan error, 1)
+	go func() {
+		_, err := downloadSingle(context.Background(), srv.Client(), "", Job{Repo: "o/r", Revision: "main"},
+			cfg, it, dst, singleOpts{Commit: rangedSeedCommit, CommitPinned: true, Domain: acquireTestDomain(t, dst)}, emit)
+		done <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("finalization proof was never entered")
+	}
+
+	// Give a still-running ticker several intervals to emit after finalizing.
+	time.Sleep(500 * time.Millisecond)
+	mu.Lock()
+	finalizingAt := -1
+	for i, ev := range samples {
+		if ev.Event == "file_finalizing" {
+			finalizingAt = i
+			break
+		}
+	}
+	if finalizingAt < 0 {
+		mu.Unlock()
+		close(release)
+		<-done
+		t.Fatal("file_finalizing was not emitted before the proof hook")
+	}
+	for i := finalizingAt + 1; i < len(samples); i++ {
+		if samples[i].Event == "file_progress" && samples[i].ActivityOnly {
+			mu.Unlock()
+			close(release)
+			<-done
+			t.Fatalf("activity-only sample emitted after file_finalizing: %+v", samples[i])
+		}
+	}
+	mu.Unlock()
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("downloadSingle: %v", err)
 	}
 }

@@ -1859,6 +1859,12 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 					w := newBoundedAtWriter(out, base, limit)
 					w.measure = payloadIOMeasurementFromContext(ctx)
 					w.activity = &activity
+					if singleWriteAtHook != nil {
+						hook := singleWriteAtHook
+						w.writeAt = func(p []byte, off int64) (int, error) {
+							return hook(out, p, off)
+						}
+					}
 					w.onWrite = func([]byte) {
 						end := base + w.written
 						if end <= countedUpTo {
@@ -2006,6 +2012,11 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 // singleProofStartHook lets tests cancel before hashing while the writable
 // partial is still open, exercising Windows close-before-cleanup ordering.
 var singleProofStartHook func(out *os.File)
+
+// singleWriteAtHook lets tests block a single-path payload write while the
+// activity ticker runs. Production leaves it nil; the hook receives the open
+// payload file and must perform or reject the write.
+var singleWriteAtHook func(f *os.File, p []byte, off int64) (int, error)
 
 // finalizeSinglePartial requires clean response framing (from this run or a
 // matching exact-size sidecar), checks any known size, and publishes the partial.
