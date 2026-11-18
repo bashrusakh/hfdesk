@@ -1,6 +1,6 @@
 module github.com/bashrusakh/hfdesk
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/energye/systray v1.0.3
@@ -8,9 +8,9 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808
 	github.com/microcosm-cc/bluemonday v1.0.27
-	github.com/yuin/goldmark v1.8.2
-	golang.org/x/net v0.55.0
-	golang.org/x/sys v0.47.0
+	github.com/yuin/goldmark v1.8.7
+	golang.org/x/net v0.63.0
+	golang.org/x/sys v0.50.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
