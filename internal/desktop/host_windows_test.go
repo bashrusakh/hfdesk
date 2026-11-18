@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bashrusakh/hfdesk/internal/service"
 	"github.com/energye/systray"
 	"golang.org/x/sys/windows"
 )
@@ -89,12 +90,24 @@ func TestDesktopTrayHostBecomesReady(t *testing.T) {
 		defer runtime.UnlockOSThread()
 		defer close(stopped)
 		threadIDs <- windows.GetCurrentThreadId()
+
+		// The service section reads a machine without a registration,
+		// so the test never queries the real service control manager
+		// of the machine and the menu starts from the state whose
+		// items are visible.
+		serviceView := trayServiceView{
+			read: func() (service.Status, error) {
+				return service.Status{State: service.StateNotInstalled}, nil
+			},
+			refresh: make(chan struct{}),
+		}
 		runTray(iconBytes, "HFDesk - test", trayActions{
 			open:    func() {},
 			runtime: func() {},
 			install: func() {},
+			service: func() {},
 			quit:    func() {},
-		}, ready)
+		}, serviceView, ready)
 	}()
 
 	threadID := <-threadIDs

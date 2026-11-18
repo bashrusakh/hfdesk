@@ -6,6 +6,7 @@ package desktop
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -28,11 +29,20 @@ func TestInstallServiceTextStatesWhatTheRegistrationChanges(t *testing.T) {
 		"keeps running after this window closes",
 		"administrator rights",
 		"Windows prompt",
-		"nothing is downloaded or copied",
+		"The one file HFDesk can download",
+		"only after its SHA-256 is verified",
+		"nothing else is downloaded or copied",
 		"settings, jobs and models",
 		dataDir,
 		"do not appear in the service",
 	})
+	// The narrowed rule must not read as the old blanket claim: the
+	// desktop app CAN download one file now, so "nothing is downloaded or
+	// copied" without the qualifier is the wording that must be gone.
+	if strings.Contains(text, ": nothing is downloaded or copied") ||
+		strings.Contains(text, "HFDesk stays portable: nothing is downloaded or copied") {
+		t.Errorf("the confirmation %q still carries the old blanket claim", text)
+	}
 }
 
 // TestInstallServiceTextWithoutADataDirectoryStaysTrue proves that the
@@ -764,14 +774,342 @@ func TestServiceNotInstalledTextNamesTheWayToInstall(t *testing.T) {
 	}
 }
 
-// TestServiceSiblingMissingTextNamesTheFolder proves that a missing console
-// program is reported with the folder the installation looked at and with the
-// layout of the release, so the user can put the two programs back together.
-func TestServiceSiblingMissingTextNamesTheFolder(t *testing.T) {
+// TestNewSiblingMissingNoticeNamesFileFolderAndOneAction proves the copy of
+// the redesigned notice of a missing console program: the bold instruction
+// names the file, the first-glance content names what the program is for and
+// the folder it is not in, the offer is attached with the facts of the
+// command link, and the long pairing explanation stays out of the first
+// glance — it belongs to the manual expander.
+//
+// The notice is built without a dialog, so this pins the wording every
+// renderer shows.
+func TestNewSiblingMissingNoticeNamesFileFolderAndOneAction(t *testing.T) {
 	const folder = `C:\portable`
-	text := serviceSiblingMissingText(folder, errors.New("there is no hfdesk.exe in "+folder))
+	// The path is joined platform-natively: the derivation reads the file
+	// name with filepath.Base, so the separator has to be the local one.
+	desktop := filepath.Join(folder, testReleaseDesktop)
+	asset := "hfdesk_windows_amd64_v1.3.0-beta.7.exe"
+	offer := &consoleDownloadOffer{
+		Release: consoleRelease{Tag: "v1.3.0-beta.7", Asset: asset},
+		Size:    12772352,
+	}
 
-	assertNames(t, text, "the report", []string{folder, "hfdesk.exe", "hfdesk-desktop.exe", "same folder"})
+	// The lookup's own failure for this fixture: an empty folder next
+	// to a version-stamped desktop program fails the pairing rule, and
+	// that failure's explanation stays out of the first glance below.
+	lookup := t.TempDir()
+	_, findErr := findConsoleExecutable(lookup, filepath.Join(lookup, testReleaseDesktop))
+	if !errors.Is(findErr, errConsolePairMissing) {
+		t.Fatalf("the empty folder of a version-stamped program failed with %v, want the pairing failure", findErr)
+	}
+
+	notice := newSiblingMissingNotice(serviceActionInstall, folder, desktop, findErr, offer)
+
+	assertNames(t, notice.Instruction, "the instruction", []string{asset, "is missing"})
+	assertNames(t, notice.Content, "the content", []string{
+		"The Windows service runs this program",
+		folder,
+	})
+	if strings.Contains(notice.Content, "only runs the console program") {
+		t.Errorf("the content %q carries the pairing explanation", notice.Content)
+	}
+	if notice.Title != "HFDesk" {
+		t.Errorf("the title is %q, want %q", notice.Title, "HFDesk")
+	}
+	if notice.Download != offer {
+		t.Errorf("the notice carries %v, want the resolved offer", notice.Download)
+	}
+	if notice.Folder != folder {
+		t.Errorf("the notice carries folder %q, want %q", notice.Folder, folder)
+	}
+
+	// The pairing explanation is long and belongs to the expander, not
+	// to the first glance; the manual text carries the get-put-retry steps.
+	if strings.Contains(notice.Content, "release") {
+		t.Errorf("the content %q carries the pairing explanation", notice.Content)
+	}
+	assertNames(t, notice.Manual, "the manual text", []string{
+		"Get release v1.3.0-beta.7",
+		"releases/tag/v1.3.0-beta.7",
+		"put " + asset + " next to hfdesk-desktop.exe",
+		folder,
+		"run the action again",
+		"only runs the console program of that same release",
+	})
+
+	// The labels of the two buttons and the note of the command link are
+	// the approved copy; the note states size, release, the check and
+	// what follows it.
+	assertNames(t, siblingMissingDownloadLabel, "the primary label", []string{"Download it and continue"})
+	assertNames(t, siblingMissingDismissLabel, "the dismiss label", []string{"Not now"})
+	assertNames(t, siblingMissingManualLabel, "the expander label", []string{"Install it manually instead"})
+	assertNames(t, siblingMissingDownloadNote(notice), "the note line", []string{
+		"12.2 MB",
+		"from the official release v1.3.0-beta.7",
+		"SHA-256 checked",
+		"then the usual install steps",
+	})
+
+	// The claim the feature falsified must be gone from every surface of
+	// the notice.
+	for name, text := range map[string]string{
+		"instruction": notice.Instruction,
+		"content":     notice.Content,
+		"manual":      notice.Manual,
+	} {
+		if strings.Contains(text, "never downloads") || strings.Contains(text, "nothing is downloaded or copied") {
+			t.Errorf("the %s %q carries the falsified download claim", name, text)
+		}
+	}
+}
+
+// TestNewSiblingMissingNoticeWithoutAReleaseKeepsManualInstructionsOnly
+// proves that a local build — a desktop program whose name carries no
+// release version — gets no download offer: the notice names hfdesk.exe,
+// keeps the cause of the failed lookup beside the first sentence and offers
+// the manual steps alone.
+func TestNewSiblingMissingNoticeWithoutAReleaseKeepsManualInstructionsOnly(t *testing.T) {
+	const folder = `C:\portable`
+	notice := newSiblingMissingNotice(serviceActionInstall, folder, filepath.Join(folder, "hfdesk-desktop.exe"),
+		errors.New("there is no hfdesk.exe in "+folder), nil)
+
+	if notice.Download != nil {
+		t.Errorf("the notice offers the download %v for a local build, want no offer", notice.Download)
+	}
+	assertNames(t, notice.Instruction, "the instruction", []string{"hfdesk.exe", "is missing"})
+	assertNames(t, notice.Content, "the content", []string{
+		"The Windows service runs this program",
+		folder,
+		"there is no hfdesk.exe",
+	})
+	assertNames(t, notice.Manual, "the manual text", []string{
+		"Put hfdesk.exe next to hfdesk-desktop.exe",
+		folder,
+		"run the action again",
+	})
+	if strings.Contains(notice.Manual, "Get release") {
+		t.Errorf("the manual text %q names a release for a local build", notice.Manual)
+	}
+}
+
+// TestNewSiblingMissingNoticeKeepsTheCauseOfANonPairingLookupFailure proves
+// the cause rule of the notice for a version-stamped desktop program: a
+// folder that cannot be read is not the pairing rule, so its cause sits
+// beside the first sentence of the content — the version stamp alone never
+// silences it.
+func TestNewSiblingMissingNoticeKeepsTheCauseOfANonPairingLookupFailure(t *testing.T) {
+	// A folder that does not exist: the lookup fails at the read, long
+	// before it could apply the pairing rule.
+	folder := filepath.Join(t.TempDir(), "gone")
+	desktop := filepath.Join(folder, testReleaseDesktop)
+	_, findErr := findConsoleExecutable(folder, desktop)
+	if findErr == nil {
+		t.Fatal("the lookup of a missing folder succeeded")
+	}
+	if errors.Is(findErr, errConsolePairMissing) {
+		t.Fatalf("the failed read %v is marked as the pairing failure", findErr)
+	}
+
+	notice := newSiblingMissingNotice(serviceActionInstall, folder, desktop, findErr, nil)
+	assertNames(t, notice.Content, "the content", []string{
+		"The Windows service runs this program",
+		folder,
+		"cannot be read",
+	})
+}
+
+// TestSiblingMissingChooseTextMapsYesNo proves the Yes/No text of an
+// offer-bearing notice maps its two answers: Yes takes the verified
+// download and continues, No changes nothing and carries the manual path.
+// The notice flow's own fallback reaches the box only manual-only, so this
+// is the rule of the box itself, which an offer-bearing notice still gets
+// when it reaches the box.
+func TestSiblingMissingChooseTextMapsYesNo(t *testing.T) {
+	const folder = `C:\portable`
+	notice := newSiblingMissingNotice(serviceActionInstall, folder, filepath.Join(folder, testReleaseDesktop),
+		errors.New("pairing"), &consoleDownloadOffer{
+			Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
+			Size:    1024,
+		})
+
+	text := siblingMissingChooseText(notice)
+	assertNames(t, text, "the fallback", []string{
+		testReleaseAsset + " is missing",
+		"The Windows service runs this program, and it is not in " + folder,
+		"Choose Yes to download " + testReleaseAsset,
+		"official release " + testReleaseTag,
+		"SHA-256",
+		"continue with the installation",
+		"Choose No to change nothing",
+		notice.Manual,
+	})
+}
+
+// TestSiblingMissingNoticeForFallbackSuppressesAnOfferThatCannotRun proves
+// the message box fallback never offers what the transfer behind it would
+// refuse: the offer survives only an attempt that did not fail, while the
+// failure the fallback exists for drops it — whatever made the task dialog
+// fail, and independently of the machine's progress-dialog gate — and the
+// box keeps the file, the folder and the manual path.
+func TestSiblingMissingNoticeForFallbackSuppressesAnOfferThatCannotRun(t *testing.T) {
+	const folder = `C:\portable`
+	offered := newSiblingMissingNotice(serviceActionInstall, folder, filepath.Join(folder, testReleaseDesktop),
+		errors.New("pairing"), &consoleDownloadOffer{
+			Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
+			Size:    1024,
+		})
+
+	kept := siblingMissingNoticeForFallback(offered, nil)
+	if kept != offered {
+		t.Errorf("an attempt that did not fail changed the notice: %+v, want the offer kept", kept)
+	}
+
+	// The failure of the task dialog attempt itself is the case a gate
+	// read alone did not close: the progress-dialog gate of the machine
+	// can stand while the notice's own dialog call failed, and the
+	// transfer behind this offer shows its progress and its Cancel in
+	// exactly that task dialog machinery a moment later. The offer is
+	// dropped, so the box never asks a Yes whose transfer could only end
+	// in the "nothing was downloaded" report.
+	manual := siblingMissingNoticeForFallback(offered,
+		errors.New("the dialog could not be shown (HRESULT 0x80070057)"))
+	if manual.Download != nil {
+		t.Errorf("the fallback keeps the offer %v although the transfer cannot run, want no offer", manual.Download)
+	}
+	if manual.Instruction != offered.Instruction || manual.Content != offered.Content ||
+		manual.Folder != offered.Folder || manual.Manual != offered.Manual {
+		t.Errorf("dropping the offer changed the rest of the notice:\ngot  %+v\nwant %+v", manual, offered)
+	}
+
+	text := siblingMissingManualNoticeText(manual)
+	assertNames(t, text, "the manual-only box", []string{
+		offered.Instruction,
+		folder,
+		offered.Manual,
+	})
+	assertNamesWithout(t, text, "the manual-only box", nil, []string{"Choose Yes"})
+}
+
+// TestConsoleDownloadFailedTextReportsTheReasonAndTheManualPath proves the
+// report of a failed download states the result, the cause and the one next
+// action — and claims only what the mechanism guarantees: that this download
+// left no file of its own behind when no file of it remains, and the path of
+// a file whose removal failed instead.
+func TestConsoleDownloadFailedTextReportsTheReasonAndTheManualPath(t *testing.T) {
+	const folder = `C:\portable`
+	notice := newSiblingMissingNotice(serviceActionInstall, folder, filepath.Join(folder, testReleaseDesktop),
+		errors.New("pairing"), &consoleDownloadOffer{
+			Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
+			Size:    1024,
+		})
+
+	cause := errors.New("the SHA-256 of the downloaded file is abcd, but release " + testReleaseTag + " publishes efgh for it")
+	text := consoleDownloadFailedText(notice, cause)
+	assertNames(t, text, "the report", []string{
+		"HFDesk could not download " + testReleaseAsset,
+		cause.Error(),
+		"This download left no file behind in " + folder,
+		notice.Manual,
+	})
+	if strings.Contains(text, "A file remains at") {
+		t.Errorf("the report %q claims a leftover for a clean cleanup", text)
+	}
+
+	// A staging file that could not be removed is named with its path
+	// instead of being covered by the "no file" claim — and it is only
+	// called what it is: a file that remains, not a partial one, because
+	// the leftover of the cancel path is the complete placed program.
+	leftover := folder + `\.hfdesk-console-42.tmp`
+	text = consoleDownloadFailedText(notice, &consoleDownloadError{
+		cause:    errors.Join(cause, errors.New("the staging file could not be removed: access is denied")),
+		leftover: leftover,
+	})
+	assertNames(t, text, "the report with a leftover", []string{
+		cause.Error(),
+		"A file remains at " + leftover,
+		"could not be removed",
+		notice.Manual,
+	})
+	if strings.Contains(text, "left no file behind") {
+		t.Errorf("the report %q claims a clean download although a file remains", text)
+	}
+
+	// The cancelled transfer reports its own cause beside the manual
+	// path: this is the report the flow shows when the user cancels the
+	// progress dialog, so the cause names the cancellation, the download
+	// left nothing of its own behind and the manual path stays reachable.
+	text = consoleDownloadFailedText(notice, errConsoleDownloadCanceled)
+	assertNames(t, text, "the cancellation report", []string{
+		"HFDesk could not download " + testReleaseAsset,
+		errConsoleDownloadCanceled.Error(),
+		"This download left no file behind in " + folder,
+		notice.Manual,
+	})
+}
+
+// TestConsoleDownloadProgressTextNamesTheTransfer proves the progress dialog
+// names what is fetched, where from and the check that runs before the file
+// is used.
+func TestConsoleDownloadProgressTextNamesTheTransfer(t *testing.T) {
+	instruction, content := consoleDownloadProgressText(&consoleDownloadOffer{
+		Release: consoleRelease{Tag: "v1.3.0-beta.7", Asset: "hfdesk_windows_amd64_v1.3.0-beta.7.exe"},
+		Size:    12772352,
+	})
+	assertNames(t, instruction, "the instruction", []string{"Downloading hfdesk_windows_amd64_v1.3.0-beta.7.exe"})
+	assertNames(t, content, "the content", []string{
+		"12.2 MB",
+		"official release v1.3.0-beta.7",
+		"SHA-256 is checked before the file is used",
+	})
+}
+
+// TestSiblingMissingNoticeCopyNamesTheActionItContinues proves the copy that
+// runs after a verified download names the service action the user actually
+// invoked: the note line of an update promises the update steps and its
+// fallback continues with the update, while the install notice keeps its
+// approved wording exactly. The manual path stays the approved,
+// action-neutral sentence, which is true for both actions.
+func TestSiblingMissingNoticeCopyNamesTheActionItContinues(t *testing.T) {
+	const folder = `C:\portable`
+	noticeFor := func(action serviceAction) siblingMissingNotice {
+		return newSiblingMissingNotice(action, folder, filepath.Join(folder, testReleaseDesktop),
+			errors.New("pairing"), &consoleDownloadOffer{
+				Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
+				Size:    12772352,
+			})
+	}
+
+	install := noticeFor(serviceActionInstall)
+	installNote := siblingMissingDownloadNote(install)
+	installFallback := siblingMissingChooseText(install)
+	assertNames(t, installNote, "the install note line", []string{
+		"from the official release " + testReleaseTag,
+		"SHA-256 checked",
+		"then the usual install steps",
+	})
+	assertNames(t, installFallback, "the install fallback", []string{"continue with the installation"})
+	assertNamesWithout(t, installNote+"\n"+installFallback, "the install copy", nil, []string{"update"})
+
+	update := noticeFor(serviceActionUpdate)
+	updateNote := siblingMissingDownloadNote(update)
+	updateFallback := siblingMissingChooseText(update)
+	assertNames(t, updateNote, "the update note line", []string{
+		"from the official release " + testReleaseTag,
+		"SHA-256 checked",
+		"then the usual update steps",
+	})
+	assertNames(t, updateFallback, "the update fallback", []string{"continue with the update"})
+	assertNamesWithout(t, updateNote+"\n"+updateFallback, "the update copy", nil,
+		[]string{"install steps", "the installation"})
+
+	if update.Action != serviceActionUpdate {
+		t.Errorf("the notice carries the action %q, want %q", update.Action, serviceActionUpdate)
+	}
+	if update.Manual != install.Manual {
+		t.Errorf("the manual text differs per action:\ninstall: %q\nupdate: %q",
+			install.Manual, update.Manual)
+	}
+	assertNames(t, update.Manual, "the manual text", []string{"run the action again"})
 }
 
 // TestServiceSingletonHoldRefusedTextStatesNoActionAndOneCommand proves the

@@ -49,6 +49,28 @@ var errServiceGatePending = errors.New("the service is still starting or stoppin
 // without an elevated shell.
 var serviceStatus = lookupServiceStatus
 
+// serviceDisplayStatusTimeout bounds the read behind a service status line.
+//
+// The line is shown on a cadence — the tray re-reads it every few seconds
+// and the Runtime window with its own status refresh — so the read ends
+// before the next one is due instead of stacking reads behind a service
+// control manager that does not answer. A read that runs out of budget is
+// not a machine without a service: the caller reports the unknown state.
+var serviceDisplayStatusTimeout = 2 * time.Second
+
+// readServiceDisplayStatus reads the registration for a status line.
+//
+// Unlike the service gate it does not wait for a pending state to settle:
+// the line only reports what the machine has right now ("starting" and
+// "stopping" are truthful words for it), and every action reads the
+// registration again — through the settle wait of the gate — before it
+// decides anything on the state.
+func readServiceDisplayStatus() (service.Status, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), serviceDisplayStatusTimeout)
+	defer cancel()
+	return serviceStatus(ctx)
+}
+
 // lookupServiceStatus reads the registration of the Windows service with the
 // factory of the service layer. The desktop host drives no supervisor of its
 // own: it only asks the shared layer for the state of the registration.
@@ -259,8 +281,10 @@ var serviceInstallRunning atomic.Bool
 //
 // The action asks the user to confirm the installation before anything is
 // changed, because the registration is a machine-wide change that survives the
-// desktop app. The console program is verified before the user is asked, so a
-// folder without it is reported instead of after the elevation prompt.
+// desktop app. The console program is settled before the user is asked — a
+// folder without it gets the notice with this release's own pair on offer, or
+// the manual path — so the folder is never first discovered after the
+// elevation prompt.
 //
 // The helper is launched elevated and must open the ready/success events, the
 // original process handle, and this instance's singleton before it becomes
@@ -286,13 +310,8 @@ func installServiceFromTray(instanceMutex string) *desktopHandover {
 		return nil
 	}
 
-	console, err := findSiblingExecutable(filepath.Dir(executable), executable)
-	if err != nil {
-		desktopLog.Warn("the console program of the service is missing",
-			"folder", filepath.Dir(executable), "error", err)
-		showMessage(serviceSiblingMissingCaption,
-			serviceSiblingMissingText(filepath.Dir(executable), err),
-			windows.MB_ICONERROR)
+	console, ok := offerMissingConsoleProgram(serviceActionInstall, executable)
+	if !ok {
 		return nil
 	}
 
@@ -420,6 +439,45 @@ func offerRegisteredServiceFromTray(status service.Status, instanceMutex string)
 	}
 }
 
+// openRegisteredServiceFromTray offers the choice of an existing
+// registration to the Service... item of the tray.
+//
+// The item exists only for a registration the menu read, but the machine
+// can change between that read and the click, so the state is read again
+// before the dialog is built — with the settle wait of the gate, because
+// the dialog decides on the state just like the gate's dialog does. The
+// dialog itself is reached through offerRegisteredServiceFromTray, the very
+// function the install item reaches when its own recheck finds a
+// registration, so the two items can never ask different questions or act
+// on different readings. A state that reads as no registration changes
+// nothing: the menu line catches up with its next refresh instead of
+// offering an installation the user did not ask for with this click.
+func openRegisteredServiceFromTray(instanceMutex string) {
+	ctx, cancel := context.WithTimeout(context.Background(), serviceStatusTimeout)
+	defer cancel()
+	status, err := serviceGateStatus(ctx)
+	if err != nil {
+		if errors.Is(err, errServiceGatePending) {
+			desktopLog.Info("the tray offers no service choice for a state that is still a transition",
+				"state", string(status.State))
+			showMessage(serviceGatePendingCaption,
+				serviceGatePendingText(status.State), windows.MB_ICONINFORMATION)
+			return
+		}
+		desktopLog.Error("the tray could not read the Windows service registration for the service choice",
+			"error", err)
+		showMessage(serviceGateUnreadableCaption,
+			serviceGateUnreadableText(err), windows.MB_ICONERROR)
+		return
+	}
+	if status.State == service.StateNotInstalled {
+		desktopLog.Info("the tray found no registration for the service choice: the menu line catches up",
+			"state", string(status.State))
+		return
+	}
+	offerRegisteredServiceFromTray(status, instanceMutex)
+}
+
 // servingDesktopRefusesMutation reports whether the guard of the elevated
 // helper would refuse a mutation beside the desktop that runs this tray:
 // the same two facts the helper decides from — another process of this
@@ -492,6 +550,14 @@ func desktopExecutable() (string, error) {
 // same actions the user would run from a console. The process id of the helper
 // is returned, so the caller can record which helper performs the action.
 //
+// An update registers from the console program of this folder, so the
+// missing program is settled here — the one place every update entry passes
+// and always before the elevation prompt — through offerMissingConsoleProgram.
+// A declined notice, or a failed download whose report that flow already
+// showed, returns (0, nil): no helper was started, and there is no launch
+// failure left for the caller to report. A start runs the executable the
+// registration already names and never looks for a console program.
+//
 // instanceMutex is handed to an update or a start, which hold that desktop
 // singleton through their mutation; every other action carries no wait state.
 // The claim path of this desktop travels with it, so the guard of the action
@@ -500,6 +566,11 @@ func launchServiceHelper(action serviceAction, waitPID int, instanceMutex string
 	executable, err := desktopExecutable()
 	if err != nil {
 		return 0, err
+	}
+	if action == serviceActionUpdate {
+		if _, ok := offerMissingConsoleProgram(action, executable); !ok {
+			return 0, nil
+		}
 	}
 	pid, err := launchElevated(elevatedLaunch{
 		Executable:    executable,
@@ -514,6 +585,55 @@ func launchServiceHelper(action serviceAction, waitPID int, instanceMutex string
 	desktopLog.Info("the elevated service helper started",
 		"action", string(action), "pid", pid)
 	return pid, nil
+}
+
+// offerMissingConsoleProgram settles the console program the service action
+// will run, before that action asks for anything else: it looks the program
+// up in the folder of the desktop program and, when it is missing, shows the
+// notice — the verified download of this release's own pair on the user's
+// explicit request, or the manual path.
+//
+// It reports the program the action continues with and whether it may
+// continue at all. false means the program is still missing and the action
+// must change nothing: a declined notice ends without any further report, and
+// a failed download was reported by this flow itself — the caller adds no
+// second report beside it. The install precheck and both update entries run
+// through here, so the notice, the fail-closed download and the rule that
+// keeps a decline quiet are one implementation instead of three.
+func offerMissingConsoleProgram(action serviceAction, executable string) (string, bool) {
+	console, err := findSiblingExecutable(filepath.Dir(executable), executable)
+	if err == nil {
+		return console, true
+	}
+	desktopLog.Warn("the console program of the service is missing",
+		"action", string(action),
+		"folder", filepath.Dir(executable), "error", err)
+	// The notice is built from the lookup's folder and error, and the
+	// offer is resolved before it: the download button only exists when
+	// this release publishes the exact paired asset with an authoritative
+	// checksum — otherwise the notice keeps its manual instructions alone.
+	offer, offerErr := consoleDownloadOfferFor(executable)
+	if offerErr != nil {
+		desktopLog.Warn("no verified download is offered for the missing console program", "error", offerErr)
+	}
+	notice := newSiblingMissingNotice(action, filepath.Dir(executable), executable, err, offer)
+	if showSiblingMissingNotice(notice) != siblingMissingDownload {
+		desktopLog.Info("the console program stays missing: the service action changes nothing",
+			"action", string(action))
+		return "", false
+	}
+	console, err = runConsoleDownload(notice)
+	if err != nil {
+		desktopLog.Error("the console program could not be downloaded: this download left no file of its own in the folder",
+			"action", string(action),
+			"folder", filepath.Dir(executable), "error", err)
+		showMessage(consoleDownloadFailedCaption, consoleDownloadFailedText(notice, err),
+			windows.MB_ICONERROR)
+		return "", false
+	}
+	desktopLog.Info("the console program was downloaded and verified",
+		"action", string(action), "console", console)
+	return console, true
 }
 
 func reportServiceHandoverFailure(err error) {

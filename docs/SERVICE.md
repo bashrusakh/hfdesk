@@ -803,25 +803,63 @@ is the only part of HFDesk that offers the service from a user interface. It is
 a program of its own: a release ships it next to the console host, and neither
 replaces the other.
 
-- **Tray menu.** The menu has four actions: **Open HFDesk** (the web UI of the
-  instance in the default browser), **Runtime / Logs** (the runtime window),
-  **Install service…** (registers the Windows service) and **Quit HFDesk** (a
-  graceful shutdown).
+- **Tray menu.** The menu starts with a status line that reports the state of
+  the Windows service registration — `Service: installed (running)`,
+  `Service: not installed`, or `Service: unknown` when the state could not be
+  read, which never claims a machine without a service — followed by its
+  actions: **Open HFDesk** (the web UI of the instance in the default
+  browser), **Runtime / Logs** (the runtime window), **Install service…**
+  (registers the Windows service) and **Quit HFDesk** (a graceful shutdown).
+  **Install service…** is greyed out while a service is installed and sits
+  beside **Service…**, which opens the registered-service dialog — the same
+  question the install item opens when its own recheck finds a registration:
+  open it, start it or update it — so no capability leaves the tray; without a
+  registration, **Install service…** is the active item and **Service…** is
+  hidden. The status line is re-read after the service actions of the host and
+  every 30 seconds, so it stays truthful as the machine changes.
+- **Runtime / Logs window.** The header of the window shows the same service
+  status as the tray menu, from the same read, and an **Install service…**
+  button that is enabled only while no service is installed — the status
+  refresh flips it once one exists. The button runs the exact installation
+  flow of the tray item (the notice, the confirmation, the administrator
+  prompt, the handover and the existing reports), and the host's
+  single-action guard refuses a second installation while one is in flight,
+  whichever surface started it.
 - **Install service…** asks for confirmation first, because the registration is
   a machine-wide change that outlives the app: the service starts at boot, keeps
-  running without the desktop app, needs administrator rights, downloads and
-  copies nothing, and keeps its own data. It then requires the console program
-  in the folder of the desktop program — the program paired with this desktop
-  program, the same name with the `hfdesk-desktop` prefix replaced by
-  `hfdesk` — and installs the service from that folder: the desktop host never
-  downloads and never copies a binary. A desktop program whose name carries a
-  version has no other candidate: a missing pair is an error that names the
-  console file it expected and the folder it looked in, so a new desktop
-  program never registers the console program of another release and the
-  version the report names is the version the registration runs. A desktop
+  running without the desktop app, needs administrator rights, and keeps its own
+  data. The confirmation also states the one file the desktop host can download:
+  the missing console program of its own release, only on request and only after
+  its SHA-256 is verified — nothing else is downloaded or copied. The action
+  requires the console program in the folder of the desktop program — the
+  program paired with this desktop program, the same name with the
+  `hfdesk-desktop` prefix replaced by `hfdesk` — and installs the service from
+  that folder. A desktop program whose name carries a version has no other
+  candidate: a missing pair is reported in a notice that names the missing file
+  and the folder and offers to download exactly that console program from the
+  official release of this name. The offer exists only for that versioned name;
+  the transfer runs behind a progress dialog with **Cancel**, the file is
+  verified against an authoritative checksum of that same release (the asset
+  digest of the release API or its `checksums.txt`) before it is placed, a
+  cancelled or failed transfer leaves no file of its own, never touches a file
+  it did not place, and reports the reason beside the manual steps, and after a
+  verified download the very same service action continues through the usual
+  confirmation and administrator prompt; the manual instructions stay available
+  in the collapsed expander of the notice, and a release without an
+  authoritative checksum is never offered at all. The same precheck runs for an
+  update before it is handed to the helper — both from the choice dialog of a
+  launch that finds a registration and from the registered-service dialog of the
+  tray — where the notice names the action it continues (its note line says
+  update, not install) and a declined notice or a failed download ends the
+  choice without elevation. A start needs no console program of its own: it runs
+  the executable the registration already names, so it never opens the notice;
+  the elevated helper keeps its own late check as the last resort. So a new
+  desktop program never registers the console program of another release and
+  the version the report names is the version the registration runs. A desktop
   program without a version — a local build such as `hfdesk-desktop.exe` —
   keeps the fallbacks: `hfdesk.exe` next, then exactly one `hfdesk*.exe` of a
-  release in the folder. Install the service from a folder that only
+  release in the folder, with the notice offering manual instructions only.
+  Install the service from a folder that only
   administrators can modify: the service runs that program as `LocalService`,
   and HFDesk never changes the permissions of a user folder. Windows shows its
   standard administrator prompt, the elevated helper installs the service,
@@ -1025,15 +1063,16 @@ The **command line** never elevates: `hfdesk service …` invokes no `sudo`, `su
 fails with a permission error instead of escalating on its own.
 
 The **Windows desktop host** is the exception, and only on an explicit choice of
-the user: **Install service…** in its tray, and **Update service** or
-**Start service** in its startup dialog, ask Windows for administrator rights
-through the standard prompt before an elevated helper performs the action (see
+the user: **Install service…** in its tray or in the Runtime / Logs window, and
+**Update service** or **Start service** in its startup dialog, ask Windows for
+administrator rights through the standard prompt before an elevated helper
+performs the action (see
 [The Windows desktop host](#the-windows-desktop-host)). A declined prompt
-changes nothing: the tray installation leaves the running desktop app untouched,
-while a declined **Start service** or **Update service** from the startup dialog
-simply ends that launch, because it never started a server. Every
-`hfdesk service` command keeps its guarantee: a machine-wide operation refuses
-without an elevated shell and never prompts.
+changes nothing: the tray and window installation leaves the running desktop
+app untouched, while a declined **Start service** or **Update service** from
+the startup dialog simply ends that launch, because it never started a server.
+Every `hfdesk service` command keeps its guarantee: a machine-wide operation
+refuses without an elevated shell and never prompts.
 
 The **machine-wide scope** needs an **elevated shell** (root on Linux) for
 `install`, `uninstall`, `start`, `stop` and `restart`: the registration lives

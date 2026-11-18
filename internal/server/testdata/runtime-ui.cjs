@@ -105,7 +105,8 @@ function makeNode(extra = {}) {
 
 const nodes = new Map();
 for (const id of [
-  'statusDot', 'statusLabel', 'versionLabel', 'serverUrl', 'activeJobs',
+  'statusDot', 'statusLabel', 'versionLabel', 'serviceBadge', 'installServiceButton',
+  'serverUrl', 'activeJobs',
   'queuedJobs', 'logFile', 'errorBanner', 'errorTitle', 'errorText',
   'openUiButton', 'openUiNote', 'openLogsButton', 'copyButton', 'clearButton',
   'levelFilter', 'searchInput', 'followToggle', 'streamDot', 'streamLabel',
@@ -172,7 +173,21 @@ const server = {
   // runId is the run of the server. The status reports it, the way the
   // server does. A null value means that the server does not report a run
   // id at all, the way an older build answers.
-  runId: 'run-1'
+  runId: 'run-1',
+  // serviceState is the state word of the platform service registration.
+  // A null value means that the server reports no state at all, the way an
+  // older build answers.
+  serviceState: 'not-installed'
+};
+
+// installs is the install-service action of the host behind the endpoint:
+// the harness counts the dispatches and picks how the endpoint answers.
+const installs = {
+  posts: 0,
+  // mode is "ok" (dispatched), "missing" (no host action, 404) or
+  // "pending" (the answer waits until the harness releases it).
+  mode: 'ok',
+  release: null
 };
 
 const calls = [];
@@ -282,7 +297,33 @@ const context = {
       if (server.runId !== null && server.runId !== undefined) {
         status.runId = server.runId;
       }
+      // A server that does not report the service state leaves the field
+      // out, the way an older build answers.
+      if (server.serviceState !== null && server.serviceState !== undefined) {
+        status.serviceState = server.serviceState;
+      }
       return jsonResponse(status);
+    }
+    if (rawPath === '/api/runtime/install-service') {
+      installs.posts += 1;
+      if (installs.mode === 'missing') {
+        // The body of a 404 of the server, shape for shape.
+        return {
+          ok: false,
+          status: 404,
+          text: async () => JSON.stringify({
+            ok: false,
+            error: 'No service action',
+            error_detail: { code: 'not_found', message: 'No service action' }
+          })
+        };
+      }
+      if (installs.mode === 'pending') {
+        return new Promise((resolve) => {
+          installs.release = () => resolve(jsonResponse({ ok: true }));
+        });
+      }
+      return jsonResponse({ ok: true });
     }
     if (rawPath.startsWith('/api/runtime/logs?')) {
       // The server answers with the cursor of the last record it
@@ -474,6 +515,7 @@ function resetView() {
   ui.state.logError = '';
   ui.state.statusError = '';
   ui.state.loggedErrors = new Set();
+  ui.state.serviceInstall = false;
 
   // The live source of the previous scenario is closed, so the scenarios do
   // not share a stream.
@@ -504,6 +546,23 @@ function resetView() {
   server.statusFails = false;
   server.version = 'test';
   server.runId = 'run-1';
+  server.serviceState = 'not-installed';
+
+  // The install-service action of the previous scenario is reset, so the
+  // scenarios do not share its dispatches, and a pending answer of the
+  // previous scenario can never resolve into the next one.
+  installs.posts = 0;
+  installs.mode = 'ok';
+  installs.release = null;
+
+  // The service badge and the install button start from the state the
+  // shipped markup carries, so a scenario reads them from a known place.
+  const serviceBadge = nodes.get('#serviceBadge');
+  serviceBadge.textContent = 'Service —';
+  serviceBadge.classList.remove('badge-success', 'badge-warning');
+  serviceBadge.classList.add('badge-secondary');
+  nodes.get('#installServiceButton').disabled = false;
+  nodes.get('#installServiceButton').title = 'Register HFDesk as a Windows service that starts at boot';
 
   nodes.get('#toastContainer').replaceChildren();
   nodes.get('#liveRegion').textContent = '';
@@ -1022,6 +1081,186 @@ async function scenarioHiddenPagePoll() {
   eq(reads, 1, 'the view reads the log once per tick after the page was shown again');
 }
 
+// fireClick clicks a button the way the page does: it runs the handlers
+// the view registered for the click event.
+function fireClick(node) {
+  for (const handler of node.handlers.click || []) handler({});
+}
+
+// The status of the platform service in the header: the badge says what the
+// machine has — in the words the tray menu shows for the same state — and
+// the install button is enabled only while the status positively reports
+// that no service is installed. A state that could not be settled is never
+// read as "not installed".
+async function scenarioServiceStatus() {
+  resetView();
+
+  for (const tc of [
+    {
+      name: 'a machine without a registration',
+      state: 'not-installed',
+      label: 'Service: not installed',
+      tone: 'badge-secondary',
+      enabled: true
+    },
+    {
+      name: 'a running service',
+      state: 'running',
+      label: 'Service: installed (running)',
+      tone: 'badge-success',
+      enabled: false
+    },
+    {
+      name: 'a stopped service',
+      state: 'stopped',
+      label: 'Service: installed (stopped)',
+      tone: 'badge-success',
+      enabled: false
+    },
+    {
+      name: 'a state the supervisor could not report',
+      state: 'unknown',
+      label: 'Service: unknown',
+      tone: 'badge-warning',
+      enabled: false
+    },
+    {
+      // An older build reports no state at all: the window must not
+      // read the absence of the field as a machine without a service.
+      name: 'a build that reports no state',
+      state: null,
+      label: 'Service: unknown',
+      tone: 'badge-warning',
+      enabled: false
+    }
+  ]) {
+    server.serviceState = tc.state;
+    await ui.refreshStatus();
+    await settle();
+
+    const badge = nodes.get('#serviceBadge');
+    eq(badge.textContent, tc.label, `the badge of ${tc.name} reads "${tc.label}"`);
+    ok(badge.classList.contains(tc.tone),
+      `the badge of ${tc.name} carries the ${tc.tone} chip`);
+    eq(nodes.get('#installServiceButton').disabled, !tc.enabled,
+      `the install button of ${tc.name} is ${tc.enabled ? 'enabled' : 'disabled'}`);
+  }
+}
+
+// One click on the install button reaches the host exactly once: a second
+// click while the request is in flight never reaches it, the button comes
+// back only with the next status refresh, and only while the service is
+// still not installed. A build without the endpoint says so instead of
+// failing on every click.
+async function scenarioInstallServiceAction() {
+  resetView();
+  server.serviceState = 'not-installed';
+  await ui.refreshStatus();
+  await settle();
+
+  const button = nodes.get('#installServiceButton');
+  eq(installs.posts, 0, 'the view starts without a dispatch');
+  eq(button.disabled, false, 'the install button is enabled for a machine without a service');
+
+  installs.mode = 'pending';
+  fireClick(button);
+  eq(button.disabled, true,
+    'the button disables itself while the action is in flight');
+  fireClick(button);
+  fireClick(button);
+  eq(installs.posts, 1,
+    'one click reaches the host exactly once: the clicks beside the first are ignored');
+
+  installs.mode = 'ok';
+  installs.release();
+  await settle();
+  eq(button.disabled, true,
+    'the button does not come back before the status refresh decides again');
+
+  await ui.refreshStatus();
+  await settle();
+  eq(button.disabled, false,
+    'the status refresh enables the button while no service is installed');
+
+  // The service is installed under the window: the refresh flips the
+  // button, exactly like the badge.
+  server.serviceState = 'running';
+  await ui.refreshStatus();
+  await settle();
+  eq(button.disabled, true,
+    'the status refresh disables the button once the service is installed');
+  eq(nodes.get('#serviceBadge').textContent, 'Service: installed (running)',
+    'the badge reports the installed service with the same words');
+
+  // A build without the endpoint reports it once instead of failing on
+  // every click. What the click leaves behind is the tooltip that names
+  // the missing endpoint; the disabled state is only the one the click
+  // set, because the next status refresh decides the button again — and
+  // only the service state keeps it disabled then.
+  server.serviceState = 'not-installed';
+  await ui.refreshStatus();
+  await settle();
+  installs.mode = 'missing';
+  fireClick(button);
+  await settle();
+  eq(installs.posts, 2, 'the click on the missing endpoint still reached the host once');
+  ok(toastMessages().some(message => /not available in this build/.test(message)),
+    `the view reports that the endpoint is missing (${JSON.stringify(toastMessages())})`);
+  ok(button.title.includes('install-service'),
+    'the button names the missing endpoint in its tooltip');
+  eq(button.disabled, true,
+    'the button is still the one the click disabled, because no status refresh decided it again');
+
+  await ui.refreshStatus();
+  await settle();
+  eq(button.disabled, false,
+    'the next status refresh decides the button again while no service is installed');
+  ok(button.title.includes('install-service'),
+    'the tooltip of the missing endpoint outlives the refresh');
+  installs.mode = 'ok';
+}
+
+// A status request that fails leaves the window offline, and the service
+// badge must not keep the claim its last successful render wrote: a badge
+// that still read "Service: not installed" beside the Offline dot would
+// assert an absence no read proved — a restart or a shutdown after a
+// committed handover is enough to stop the answers. The window shows the
+// unknown state instead, in the wording and tone the badge already uses for
+// a state that could not be settled, and the install button is disabled
+// with it: that action is enabled only while the state proves absence, the
+// rule the tray menu follows for the same unsettled read.
+async function scenarioServiceStatusOffline() {
+  resetView();
+
+  // The last status the window read proves there is no service.
+  server.serviceState = 'not-installed';
+  await ui.refreshStatus();
+  await settle();
+
+  const badge = nodes.get('#serviceBadge');
+  const button = nodes.get('#installServiceButton');
+  eq(badge.textContent, 'Service: not installed',
+    'the badge reports the machine without a service');
+  eq(button.disabled, false,
+    'the install button is enabled for a machine without a service');
+
+  // The server stops answering: the read of the state fails with it.
+  server.statusFails = true;
+  await ui.refreshStatus();
+  await settle();
+
+  eq(nodes.get('#statusLabel').textContent, 'Offline',
+    'the connection dot reports the server that did not answer');
+  eq(badge.textContent, 'Service: unknown',
+    'the badge drops the claim of absence: the state cannot be read');
+  ok(badge.classList.contains('badge-warning'),
+    'the badge carries the unknown chip, the tone the badge uses for unknown');
+  eq(button.disabled, true,
+    'the install action is disabled while the state cannot prove absence');
+
+  server.statusFails = false;
+}
+
 // The groups of the scenarios of the harness.
 //
 // The group is picked with the HFDESK_RUNTIME_SCENARIO environment
@@ -1049,6 +1288,11 @@ const scenarioGroups = {
   restore: [
     scenarioHiddenPageStream,
     scenarioHiddenPagePoll
+  ],
+  service: [
+    scenarioServiceStatus,
+    scenarioInstallServiceAction,
+    scenarioServiceStatusOffline
   ]
 };
 

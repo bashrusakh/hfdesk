@@ -855,12 +855,19 @@ func TestServiceGateEndsAPendingLaunchWithoutAChoice(t *testing.T) {
 
 // TestServiceGateUpdatesTheServiceWithTheElevatedHelper proves that the update
 // of an installed service is handed to the elevated helper.
+//
+// The update registers from the console program of this folder, so the gate's
+// update passes the precheck inside the helper launch first; the stubbed
+// lookup finds the program and no notice is shown before the elevation.
 func TestServiceGateUpdatesTheServiceWithTheElevatedHelper(t *testing.T) {
 	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
 		return runningServiceStatus(service.StateStopped, "127.0.0.1:18080"), nil
 	})
 	replaceSeam(t, &showServiceChoice, func(serviceChoicePrompt) serviceChoice {
 		return serviceChoiceUpdate
+	})
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return `C:\portable\hfdesk.exe`, nil
 	})
 
 	var launches []elevatedLaunch
@@ -886,6 +893,200 @@ func TestServiceGateUpdatesTheServiceWithTheElevatedHelper(t *testing.T) {
 	if len(*messages) != 0 {
 		t.Errorf("the gate showed %v, want the helper to report the outcome", *messages)
 	}
+}
+
+// TestLaunchServiceHelperResolvesTheConsoleLookupOnlyWhenUpdating proves
+// which service actions consult the console lookup inside the helper launch:
+// an update resolves the console program it registers from, while a start
+// resolves no console program — the lookup runs zero times and the helper is
+// launched all the same, so a start works without the file present. A later,
+// non-aborting lookup added to the start path would be caught here.
+//
+// The update row is the control that keeps the zero assertion honest: it
+// proves the counted seam is the lookup production really consults, so the
+// start row cannot pass because the stub watches a seam nothing calls.
+// Neither row may read release metadata or show a notice: the start lookup
+// stub reports the program missing, so a consultation of it would enter
+// exactly that flow, and the two seams fail the row instead of reading the
+// network or blocking on a dialog.
+func TestLaunchServiceHelperResolvesTheConsoleLookupOnlyWhenUpdating(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		action      serviceAction
+		console     string // what the lookup resolves; empty means the program is missing
+		wantLookups int
+	}{
+		{name: "start", action: serviceActionStart, wantLookups: 0},
+		{name: "update", action: serviceActionUpdate, console: `C:\portable\hfdesk.exe`, wantLookups: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lookups := 0
+			replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+				lookups++
+				if tc.console == "" {
+					return "", errors.New("no console program in the folder")
+				}
+				return tc.console, nil
+			})
+			replaceSeam(t, &consoleDownloadOfferFor, func(string) (*consoleDownloadOffer, error) {
+				t.Error("the launch resolved download metadata although the console lookup of this row must decide alone")
+				return nil, nil
+			})
+			replaceSeam(t, &showSiblingMissingNotice, func(siblingMissingNotice) siblingMissingAnswer {
+				t.Error("the launch showed the notice of a missing console program although this row settles the program without it")
+				return siblingMissingDismiss
+			})
+			var launches []elevatedLaunch
+			replaceSeam(t, &launchElevated, func(l elevatedLaunch) (uint32, error) {
+				launches = append(launches, l)
+				return 4242, nil
+			})
+			messages := recordMessages(t)
+
+			pid, err := launchServiceHelper(tc.action, 0, testGateSingleton)
+			assertNoError(t, err, "launch the %s helper: %v", tc.action, err)
+			if pid != 4242 {
+				t.Errorf("the %s helper reports the process %d, want 4242", tc.action, pid)
+			}
+			if lookups != tc.wantLookups {
+				t.Errorf("the %s consulted the console lookup %d times, want %d", tc.action, lookups, tc.wantLookups)
+			}
+			if len(launches) != 1 || launches[0].Action != tc.action {
+				t.Fatalf("the %s launched %v, want exactly this action once", tc.action, launches)
+			}
+			if len(*messages) != 0 {
+				t.Errorf("the %s showed %v, want no message box beside the helper", tc.action, *messages)
+			}
+		})
+	}
+}
+
+// TestServiceGateUpdateSettlesTheMissingConsoleProgram proves the update of
+// both update entries is settled before the elevation: the update choice of
+// the gate reaches the same notice inside the helper launch, and only a
+// console program that is now in place — found, or downloaded and verified —
+// reaches the administrator prompt.
+//
+// A declined notice changes nothing and adds no report of its own; a failed
+// download is reported exactly once, with the reason and the manual path, and
+// launches no helper.
+func TestServiceGateUpdateSettlesTheMissingConsoleProgram(t *testing.T) {
+	fixture := func(t *testing.T) (*[]shownMessage, *[]elevatedLaunch) {
+		t.Helper()
+		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+			return runningServiceStatus(service.StateStopped, "127.0.0.1:18080"), nil
+		})
+		replaceSeam(t, &showServiceChoice, func(serviceChoicePrompt) serviceChoice {
+			return serviceChoiceUpdate
+		})
+		replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+			return "", errors.New("the pair of this release is missing")
+		})
+		var launches []elevatedLaunch
+		replaceSeam(t, &launchElevated, func(l elevatedLaunch) (uint32, error) {
+			launches = append(launches, l)
+			return 4343, nil
+		})
+		return recordMessages(t), &launches
+	}
+	versionedOffer := func(string) (*consoleDownloadOffer, error) {
+		return &consoleDownloadOffer{
+			Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
+			Size:    testReleaseAssetSize,
+		}, nil
+	}
+
+	t.Run("a verified download continues into the same update", func(t *testing.T) {
+		messages, launches := fixture(t)
+		replaceSeam(t, &consoleDownloadOfferFor, versionedOffer)
+		var shown *siblingMissingNotice
+		replaceSeam(t, &showSiblingMissingNotice, func(notice siblingMissingNotice) siblingMissingAnswer {
+			shown = &notice
+			return siblingMissingDownload
+		})
+		downloads := 0
+		replaceSeam(t, &runConsoleDownload, func(notice siblingMissingNotice) (string, error) {
+			downloads++
+			return filepath.Join(notice.Folder, testReleaseAsset), nil
+		})
+
+		if serviceGate(testGateSingleton) {
+			t.Fatal("the service gate let a launch with an installed service start its own server")
+		}
+		if shown == nil || shown.Action != serviceActionUpdate {
+			t.Fatalf("the notice shown = %+v, want the notice of the update", shown)
+		}
+		if downloads != 1 {
+			t.Errorf("the transfer ran %d times, want exactly one", downloads)
+		}
+		if len(*launches) != 1 || (*launches)[0].Action != serviceActionUpdate {
+			t.Fatalf("the gate launched %+v, want the one update handover", *launches)
+		}
+		if (*launches)[0].InstanceMutex != testGateSingleton {
+			t.Errorf("the update helper holds the singleton %q, want this launch's singleton %q",
+				(*launches)[0].InstanceMutex, testGateSingleton)
+		}
+		if len(*messages) != 0 {
+			t.Errorf("the gate showed %v, want the helper to report the outcome", *messages)
+		}
+	})
+
+	t.Run("a declined notice changes nothing", func(t *testing.T) {
+		messages, launches := fixture(t)
+		var shown *siblingMissingNotice
+		replaceSeam(t, &showSiblingMissingNotice, func(notice siblingMissingNotice) siblingMissingAnswer {
+			shown = &notice
+			return siblingMissingDismiss
+		})
+		replaceSeam(t, &runConsoleDownload, func(siblingMissingNotice) (string, error) {
+			t.Error("the update transferred a program although the notice was declined")
+			return "", nil
+		})
+
+		if serviceGate(testGateSingleton) {
+			t.Fatal("the service gate let a launch with an installed service start its own server")
+		}
+		if shown == nil || shown.Action != serviceActionUpdate {
+			t.Fatalf("the notice shown = %+v, want the notice of the update", shown)
+		}
+		if len(*launches) != 0 {
+			t.Errorf("the gate launched %+v, want no helper after a declined notice", *launches)
+		}
+		if len(*messages) != 0 {
+			t.Errorf("the gate showed %v, want the decline to stay quiet", *messages)
+		}
+	})
+
+	t.Run("a failed download is reported once and launches nothing", func(t *testing.T) {
+		messages, launches := fixture(t)
+		replaceSeam(t, &consoleDownloadOfferFor, versionedOffer)
+		replaceSeam(t, &showSiblingMissingNotice, func(siblingMissingNotice) siblingMissingAnswer {
+			return siblingMissingDownload
+		})
+		cause := errors.New("the SHA-256 of the downloaded file is abcd, but release " + testReleaseTag + " publishes efgh for it")
+		replaceSeam(t, &runConsoleDownload, func(siblingMissingNotice) (string, error) {
+			return "", cause
+		})
+
+		if serviceGate(testGateSingleton) {
+			t.Fatal("the service gate let a launch with an installed service start its own server")
+		}
+		if len(*launches) != 0 {
+			t.Errorf("the gate launched %+v, want no helper after a failed download", *launches)
+		}
+		if len(*messages) != 1 {
+			t.Fatalf("the gate showed %d message boxes, want the one download report: %v", len(*messages), *messages)
+		}
+		if caption := consoleDownloadFailedCaption; (*messages)[0].caption != caption {
+			t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
+		}
+		assertNames(t, (*messages)[0].text, "the report", []string{
+			"could not download " + testReleaseAsset,
+			cause.Error(),
+			"This download left no file behind in ",
+			"run the action again",
+		})
+	})
 }
 
 // TestServiceGateCancelChangesNothing proves that the cancel answer ends the
@@ -1078,12 +1279,12 @@ func TestTrayServiceInstallDoesNothingWhenTheConfirmationIsDeclined(t *testing.T
 }
 
 // TestTrayServiceInstallReportsAMissingConsoleProgram proves that a missing
-// console program is reported before the user is asked to confirm anything, and
-// that it leaves the desktop host running.
+// console program reaches the redesigned notice before the user is asked to
+// confirm anything, and that dismissing it leaves the desktop host running
+// without any other message.
 //
-// An installation whose program is not there cannot work, so the action reports
-// the missing program instead of asking for a confirmation it would have to
-// withdraw after the elevation prompt.
+// The test binary's own name carries no release version, so the notice keeps
+// its manual instructions only: a local build is never offered a download.
 func TestTrayServiceInstallReportsAMissingConsoleProgram(t *testing.T) {
 	stubNoServiceRegistration(t)
 	freshServiceInstallGuard(t)
@@ -1098,20 +1299,145 @@ func TestTrayServiceInstallReportsAMissingConsoleProgram(t *testing.T) {
 		t.Fatal("the tray action launched the helper without the console program")
 		return nil, nil
 	})
+	var notice *siblingMissingNotice
+	replaceSeam(t, &showSiblingMissingNotice, func(shown siblingMissingNotice) siblingMissingAnswer {
+		notice = &shown
+		return siblingMissingDismiss
+	})
 	messages := recordMessages(t)
 
 	if installServiceFromTray(`Local\HFDesk.Test.4`) != nil {
 		t.Fatal("the tray action quit the host without the console program")
 	}
-	if len(*messages) != 1 {
-		t.Fatalf("the tray action showed %d message boxes, want one", len(*messages))
+	if notice == nil {
+		t.Fatal("the tray action never showed the notice of the missing console program")
 	}
-	if caption := serviceSiblingMissingCaption; (*messages)[0].caption != caption {
+	if !strings.Contains(notice.Instruction, "hfdesk.exe") || !strings.Contains(notice.Instruction, "is missing") {
+		t.Errorf("the instruction %q does not name the missing program", notice.Instruction)
+	}
+	if notice.Folder == "" {
+		t.Error("the notice does not name the folder the installation looked in")
+	}
+	if notice.Download != nil {
+		t.Errorf("the notice offers a download %v for a local build", notice.Download)
+	}
+	if len(*messages) != 0 {
+		t.Errorf("the tray action showed %v beside the notice", *messages)
+	}
+}
+
+// TestTrayServiceInstallContinuesAfterTheRequestedDownload proves the flow
+// behind the primary action of the notice: the transfer runs once with the
+// offer the notice carries, and the very same service action then continues
+// through the ordinary confirmation and the elevated helper — no new
+// install mechanics anywhere in the path.
+func TestTrayServiceInstallContinuesAfterTheRequestedDownload(t *testing.T) {
+	stubNoServiceRegistration(t)
+	freshServiceInstallGuard(t)
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return "", errors.New("the pair is missing")
+	})
+	replaceSeam(t, &consoleDownloadOfferFor, func(string) (*consoleDownloadOffer, error) {
+		return &consoleDownloadOffer{
+			Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
+			Size:    testReleaseAssetSize,
+		}, nil
+	})
+	var shown *siblingMissingNotice
+	replaceSeam(t, &showSiblingMissingNotice, func(notice siblingMissingNotice) siblingMissingAnswer {
+		shown = &notice
+		return siblingMissingDownload
+	})
+	downloads := 0
+	replaceSeam(t, &runConsoleDownload, func(notice siblingMissingNotice) (string, error) {
+		downloads++
+		if notice.Download == nil {
+			t.Error("the transfer ran without the offer of the notice")
+		}
+		return filepath.Join(notice.Folder, testReleaseAsset), nil
+	})
+	confirmations := 0
+	replaceSeam(t, &confirmServiceInstall, func(string) bool {
+		confirmations++
+		return true
+	})
+	var launches []elevatedLaunch
+	replaceSeam(t, &launchElevatedProcess, func(l elevatedLaunch) (*elevatedProcess, error) {
+		launches = append(launches, l)
+		return readyTestProcess(t, l), nil
+	})
+	messages := recordMessages(t)
+
+	handover := installServiceFromTray(`Local\HFDesk.Test.6`)
+	if handover == nil {
+		t.Fatal("the tray action did not hand the installation over after the download")
+	}
+	t.Cleanup(handover.close)
+	if shown == nil || shown.Download == nil {
+		t.Fatalf("the notice shown was %+v, want it to carry the download offer", shown)
+	}
+	if downloads != 1 {
+		t.Errorf("the transfer ran %d times, want exactly one", downloads)
+	}
+	if confirmations != 1 {
+		t.Errorf("the confirmation was asked %d times, want the ordinary question once", confirmations)
+	}
+	if len(launches) != 1 || launches[0].Action != serviceActionInstall {
+		t.Errorf("the tray action launched %v, want one installation helper", launches)
+	}
+	if len(*messages) != 0 {
+		t.Errorf("the tray action showed %v, want the helper to report the outcome", *messages)
+	}
+}
+
+// TestTrayServiceInstallReportsAFailedDownload proves a transfer that did not
+// finish or did not verify is reported with its reason and the manual path —
+// before the confirmation, before the elevation, and with nothing placed in
+// the folder claimed by the report.
+func TestTrayServiceInstallReportsAFailedDownload(t *testing.T) {
+	stubNoServiceRegistration(t)
+	freshServiceInstallGuard(t)
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return "", errors.New("the pair is missing")
+	})
+	replaceSeam(t, &consoleDownloadOfferFor, func(string) (*consoleDownloadOffer, error) {
+		return &consoleDownloadOffer{
+			Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
+			Size:    testReleaseAssetSize,
+		}, nil
+	})
+	replaceSeam(t, &showSiblingMissingNotice, func(siblingMissingNotice) siblingMissingAnswer {
+		return siblingMissingDownload
+	})
+	cause := errors.New("the SHA-256 of the downloaded file is abcd, but release " + testReleaseTag + " publishes efgh for it")
+	replaceSeam(t, &runConsoleDownload, func(siblingMissingNotice) (string, error) {
+		return "", cause
+	})
+	replaceSeam(t, &confirmServiceInstall, func(string) bool {
+		t.Error("the tray action asked for a confirmation although the download failed")
+		return true
+	})
+	replaceSeam(t, &launchElevatedProcess, func(elevatedLaunch) (*elevatedProcess, error) {
+		t.Fatal("the tray action launched the helper although the download failed")
+		return nil, nil
+	})
+	messages := recordMessages(t)
+
+	if installServiceFromTray(`Local\HFDesk.Test.7`) != nil {
+		t.Fatal("the tray action quit the host although the download failed")
+	}
+	if len(*messages) != 1 {
+		t.Fatalf("the tray action showed %d message boxes, want one report", len(*messages))
+	}
+	if caption := consoleDownloadFailedCaption; (*messages)[0].caption != caption {
 		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 	}
-	if !strings.Contains((*messages)[0].text, "hfdesk.exe") {
-		t.Errorf("the message %q does not name the missing program", (*messages)[0].text)
-	}
+	assertNames(t, (*messages)[0].text, "the report", []string{
+		"could not download " + testReleaseAsset,
+		cause.Error(),
+		"This download left no file behind in ",
+		"run the action again",
+	})
 }
 
 // TestTrayServiceInstallReportsARefusedElevation proves that a refused request
@@ -2231,9 +2557,9 @@ func TestServiceHelperArgumentsNameTheActionAndHandover(t *testing.T) {
 // refuses an installation without the console program of the service, before it
 // touches the registration.
 //
-// The desktop host downloads and copies nothing, so the program has to be in the
-// folder of the helper already. The helper reports the folder and leaves the
-// machine as it was.
+// The helper never fetches a program itself — it acts only on the file that is
+// already in its folder — so the program has to be there already. The helper
+// reports the folder and leaves the machine as it was.
 func TestServiceHelperInstallReportsAMissingConsoleProgram(t *testing.T) {
 	replaceSeam(t, &findSiblingExecutable, func(dir, _ string) (string, error) {
 		return "", errors.New("there is no hfdesk.exe in " + dir)

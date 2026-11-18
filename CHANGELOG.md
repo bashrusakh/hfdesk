@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The Windows desktop host's missing console program notice — at the install precheck and before either update entry reaches the administrator prompt — is a task dialog: the missing file as its bold line, the folder under it, a **Download it and continue** command link that fetches exactly that program of this release behind a progress dialog with **Cancel** and verifies its SHA-256 before placing it, with the note line naming the action it continues — then the same service action continues through its usual confirmation and administrator prompt — a **Not now** answer, and the manual steps in a collapsed **Install it manually instead** expander; a start runs the registered program and never sees the notice, a local build without a version and a release without an authoritative checksum are never offered a download, and a failed or cancelled transfer leaves no file of its own, never touching a file it did not place.
+- The Windows desktop host shows whether the Windows service is installed on both of its surfaces. The tray menu starts with a status line — `Service: installed (running)`, `Service: not installed`, or `Service: unknown` when the state could not be read, which never claims a machine without a service — re-read after the host's service actions and every 30 seconds; with a service installed, **Install service…** stays visible but greyed beside a new **Service…** item that opens the same registered-service dialog (open, start or update), and without one **Install service…** is the active item with no dead second item beside it. The Runtime / Logs window shows the same status as a header chip and adds an **Install service…** button that is enabled only while no service is installed and runs the exact tray installation flow; the host's single-action guard refuses a second installation while one is in flight, whichever surface started it.
+
 ## [1.3.0-beta.8] - 2026-11-18
 
 Beta build of the upcoming `v1.3.0`; the artifacts are pre-release builds for testing and are not marked as the latest stable release.

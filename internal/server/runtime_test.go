@@ -98,7 +98,7 @@ var runtimeLogPaths = []string{
 }
 
 // runtimeSurfaceRequests are the requests of the whole runtime surface: the
-// status, the log page, the log stream and the two actions of the window.
+// status, the log page, the log stream and the actions of the window.
 //
 // The surface shares one guard, so every request of it is covered by the
 // same rules.
@@ -111,6 +111,7 @@ var runtimeSurfaceRequests = []struct {
 	{method: http.MethodGet, path: "/api/runtime/logs/stream"},
 	{method: http.MethodPost, path: "/api/runtime/open-logs"},
 	{method: http.MethodPost, path: "/api/runtime/open-ui"},
+	{method: http.MethodPost, path: "/api/runtime/install-service"},
 }
 
 // TestRuntimeEndpointsRejectNonLoopbackPeer proves that the runtime data of
@@ -359,11 +360,11 @@ func TestRuntimeEndpointsAllowLocalHost(t *testing.T) {
 				}
 			}
 
-			// The two actions of the surface are served as well: the
+			// The actions of the surface are served as well: the
 			// guard does not reject them. They answer with 404 here,
-			// because the test server has no log file and no bound
-			// address.
-			for _, path := range []string{"/api/runtime/open-logs", "/api/runtime/open-ui"} {
+			// because the test server has no log file, no bound
+			// address and no host service surface.
+			for _, path := range []string{"/api/runtime/open-logs", "/api/runtime/open-ui", "/api/runtime/install-service"} {
 				recorder := httptest.NewRecorder()
 				handler.ServeHTTP(recorder,
 					runtimeRequestWithHost(http.MethodPost, path, "127.0.0.1:5555", c.host))
