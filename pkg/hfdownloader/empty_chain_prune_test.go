@@ -56,12 +56,31 @@ func mustOwnershipLocks(t *testing.T) {
 	}
 }
 
+// ownershipGapPathKey normalizes a path to the canonical on-disk spelling the
+// resolver's own EvalSymlinks walk produces (Windows 8.3 short names, case,
+// separators, symlinked prefixes), so a fixture can compare against an
+// observed gap path independently of the spelling its caller holds.
+func ownershipGapPathKey(path string) string {
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(abs); resolveErr == nil {
+		return resolved
+	}
+	return abs
+}
+
 // vanishOnceAt installs an ownership gap hook that removes path exactly once
-// when the named gap observes it, and fails the test if the gap never fired.
+// when the named gap observes it — compared in canonical on-disk spelling
+// (ownershipGapPathKey), because the resolver's walk passes EvalSymlinks-
+// canonical paths while the fixture holds the spelling it created — and fails
+// the test if the gap never fired.
 func vanishOnceAt(t *testing.T, site, path string) {
+	want := ownershipGapPathKey(path)
 	fired := false
 	ownershipPathGapHook = func(gotSite, got string) {
-		if !fired && gotSite == site && got == path {
+		if !fired && gotSite == site && ownershipGapPathKey(got) == want {
 			fired = os.Remove(path) == nil
 		}
 	}
@@ -276,6 +295,35 @@ func TestWriterResolutionVanishHealsWriter(t *testing.T) {
 	}
 }
 
+// The identity-gap seam must fire regardless of path spelling: a fixture path
+// spelled through a symlinked alias canonicalizes to a different spelling
+// inside the resolver's walk — the same divergence the Windows runner's 8.3
+// short-name temp path (RUNNER~1 vs runneradmin) produces — so matching the
+// observed gap path by exact spelling never hits. The forced vanish still
+// heals the writer through create-parents.
+func TestWriterResolutionVanishHealsWriterAliasedSpelling(t *testing.T) {
+	mustOwnershipLocks(t)
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	mustMkdirAll(t, real)
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	realm := newFlatTestRealm(t)
+	dirs := filepath.Join(alias, "vendor", "model")
+	mustMkdirAll(t, dirs)
+	dst := filepath.Join(dirs, "file.bin")
+	vanishOnceAt(t, "identity", dirs)
+	dom, err := acquireBlobDomainScoped(context.Background(), flatDomainKey(dst), dst+".incomplete", realm, appendPartialOwnershipPaths(nil, dst), dst)
+	if err != nil {
+		t.Fatalf("writer surfaced the pruning race: %T: %v", err, err)
+	}
+	mustWriteFile(t, dst, "payload")
+	assertRealDir(t, filepath.Join(real, "vendor", "model"))
+	dom.release()
+}
+
 // A directory that vanishes between the pruning's emptiness check and its tree
 // admission is already gone: the chain keeps walking upward instead of
 // stopping at a "live writer" that does not exist.
@@ -313,7 +361,11 @@ func TestFlatTreeRemovalGapVanishMatchesPreResolutionVanish(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s must take the documented re-verified-vanish flow: %T: %v", c.name, err, err)
 			}
-			if _, err := admission.AdmitFileWrites(context.Background(), []string{tree}); !errors.Is(err, ErrOwnershipBusy) {
+			releaseWrites, err := admission.AdmitFileWrites(context.Background(), []string{tree})
+			if !errors.Is(err, ErrOwnershipBusy) {
+				if releaseWrites != nil {
+					releaseWrites()
+				}
 				t.Errorf("%s: a creator of the vanished target must stay excluded until release: %v", c.name, err)
 			}
 			release()
