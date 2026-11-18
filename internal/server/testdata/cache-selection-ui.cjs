@@ -10,7 +10,7 @@ let currentSelection = null;
 let delayNextSelection = null;
 let delayNextDetails = null;
 let detailsSource = 'Local';
-let detailsPath = '/friendly/model';
+let detailsPath = '/scan/one/"archive"';
 let detailsFriendlyPath = '';
 let detailsManifest = null;
 let detailsDownloadStatus = 'unknown';
@@ -97,6 +97,18 @@ function setSectionHTML(section, value) {
     nodes.set('#cacheContentsScroll', scroll);
   } else nodes.delete('#cacheContentsScroll');
 }
+function registerDangerHost(value) {
+  const hostTag = value.match(/<div id="cacheDangerHost"[^>]*>/)?.[0];
+  if (!hostTag) { nodes.delete('#cacheDangerHost'); return; }
+  nodes.set('#cacheDangerHost', {
+    set innerHTML(content) {
+      modalHTML = modalHTML.replace(
+        /(<div id="cacheDangerHost"[^>]*>)[\s\S]*?(<\/div>\s*<div class="cache-detail-actions">)/,
+        `$1${content}$2`
+      );
+    }
+  });
+}
 const modalBody = {
   insertAdjacentHTML(position, html) {
     modalHTML = position === 'afterbegin' ? html + modalHTML : modalHTML + html;
@@ -119,6 +131,7 @@ const modalBody = {
     nodes.delete('#cacheSelectionSection');
     nodes.delete('#cacheContentsHeading');
     nodes.delete('#cacheContentsScroll');
+    registerDangerHost(value);
     const sectionMatch = value.match(/<section id="cacheSelectionSection"[^>]*>([\s\S]*?)<\/section>/);
     if (sectionMatch) {
       const section = {
@@ -317,7 +330,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(!groupSectionHTML.includes('cache-detail-danger'), 'the model danger block stays out of the scrolled contents');
   assert.equal((modalHTML.match(/class="cache-detail-danger"/g) || []).length, 1, 'the model has one danger entry point');
   assert(modalHTML.indexOf('id="cacheDangerHost"') < modalHTML.indexOf('class="cache-detail-actions"'), 'the model danger block sits directly above the footer');
-  assert(modalHTML.includes('cache-detail-danger-target') && modalHTML.includes('title="/friendly/model"'), 'the model danger block names the opened copy');
+  assert(!modalHTML.includes('cache-detail-danger-target'), 'the default matching location omits the target line');
   assert(!calls.some(call => call.method === 'DELETE'));
   assert(!modalHTML.includes('cache-selection-pick'), 'Delete is direct; no redundant Select action');
   const footerHTML = modalHTML.match(/<div class="cache-detail-actions">([\s\S]*?)<\/div>/)?.[1] || '';
@@ -339,7 +352,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(nodes.get('#cacheContentsHeading').focused, 'a location change returns focus to the contents heading');
   assert(!nodes.get('#cacheSelectionSection').html.includes('cache-detail-danger'), 'switching locations does not move the danger block into the scroll');
   assert.equal((modalHTML.match(/class="cache-detail-danger"/g) || []).length, 1, 'switching locations keeps one danger entry point');
-  assert(modalHTML.includes('title="/friendly/model"'), 'the danger target stays the opened copy after switching locations');
+  assert(modalHTML.includes('cache-detail-danger-target') && modalHTML.includes('title="/scan/one/&quot;archive&quot;"'), 'the danger target appears when the listed location diverges');
   const hfRowArticles = modalHTML.match(/<article class="cache-selection-group"[^>]*>[\s\S]*?<\/article>/g) || [];
   const hfGroupRow = hfRowArticles.find(article => article.includes('data-group-id="grp-hf"'));
   assert(hfGroupRow && hfGroupRow.includes('· 2 shards') && hfGroupRow.includes('2 saved versions') && !hfGroupRow.includes('· 2 files'), 'the HF group does not repeat the shard count as files');
@@ -880,6 +893,26 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(modalHTML.includes('/cache/hub/org--model'), modalHTML.slice(0, 1800));
   assert(modalHTML.includes('2 shards'), 'the newer chosen location remains current after the old mutation finishes');
 
+  // The danger target appears only while the listed location differs from the
+  // opened copy, and disappears when the user switches back.
+  detailsSource = 'Local';
+  detailsPath = '/scan/one/"archive"';
+  detailsFiles = [];
+  detailsWholeFolder = null;
+  currentSelection = JSON.parse(JSON.stringify(selectionFixture));
+  await window.test.showCacheDetails('org/model', 'model');
+  assert(!modalHTML.includes('cache-detail-danger-target'), 'the matching default location has no target line');
+  let targetSelect = nodes.get('#cacheSelectionLocation');
+  targetSelect.value = '1';
+  await targetSelect.listeners.change();
+  assert(modalHTML.includes('cache-detail-danger-target'), 'switching to another location adds the target line');
+  assert(modalHTML.includes('title="/scan/one/&quot;archive&quot;"'), 'the target line names the opened path');
+  targetSelect = nodes.get('#cacheSelectionLocation');
+  targetSelect.value = '0';
+  await targetSelect.listeners.change();
+  assert(!modalHTML.includes('cache-detail-danger-target'), 'switching back removes the target line');
+  assert.equal(nodes.get('#cacheSelectionLocation').title, '/scan/one/"archive"', 'switching back restores the opened location');
+
   // A late response from a replaced modal cannot overwrite its content.
   detailsSource = 'Local';
   let finishDetails;
@@ -1018,6 +1051,7 @@ async function checkBrowserLayout() {
           headerTop: modal.querySelector('.cache-detail-header').getBoundingClientRect().top,
           dangerTop: modal.querySelector('.cache-detail-danger').getBoundingClientRect().top,
           dangerBottom: modal.querySelector('.cache-detail-danger').getBoundingClientRect().bottom,
+          dangerTarget: modal.querySelectorAll('.cache-detail-danger-target').length,
           actionsTop: modal.querySelector('.cache-detail-actions').getBoundingClientRect().top,
           scrollBottom: scroll.getBoundingClientRect().bottom
         };
@@ -1030,6 +1064,7 @@ async function checkBrowserLayout() {
       assert(structure.dangerTop >= structure.scrollBottom - 0.5, 'the danger block starts below the contents scroll');
       assert(structure.dangerBottom <= structure.actionsTop + 0.5, 'the danger block sits directly above the footer');
       assert.equal(structure.selectCount, 1);
+      assert.equal(structure.dangerTarget, 0, 'the default matching location has no danger target line');
       assert.equal(structure.locationLabel, 'Files from');
       assert.equal(structure.metadata, 0, 'no panel, metadata block, or definition rows');
       assert(structure.facts[0].startsWith('This copy · '), 'the facts line survives the compact header');
@@ -1076,7 +1111,7 @@ async function checkBrowserLayout() {
       const file = await first.locator('.cache-selection-file-path').boundingBox();
       const del = await first.getByRole('button', { name: /^Delete Q4_K_M / }).boundingBox();
       assert(file.x + file.width <= del.x + 0.5, 'long path stays left of its action');
-      const stationary = () => page.evaluate(() => ['.modal-header', '.cache-detail-header', '.cache-selection-sticky', '.cache-detail-danger', '.cache-detail-actions'].map(selector => document.querySelector(selector).getBoundingClientRect().y));
+      const stationary = () => page.evaluate(() => ['.modal-header', '.cache-detail-header', '.cache-selection-sticky', '.cache-detail-actions'].map(selector => document.querySelector(selector).getBoundingClientRect().y));
       const before = await stationary();
       await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-local.png` });
       await page.locator('.cache-detail-scroll').evaluate(node => { node.scrollTop = 450; });
@@ -1151,6 +1186,15 @@ async function checkBrowserLayout() {
       assert((await locationSelect.getAttribute('title')).includes('/cache/hub/'));
       assert.equal(await page.evaluate(() => document.activeElement?.id), 'cacheContentsHeading', 'location change focuses the heading');
       assert.deepEqual(await stationary(), before, 'switching location keeps the chrome still');
+      assert.equal(await page.locator('.cache-detail-danger-target').count(), 1, 'the diverged location adds the danger target line');
+      assert((await page.locator('.cache-detail-danger-target code').getAttribute('title')).includes('very-long-library-location'));
+      await locationSelect.selectOption('0');
+      await page.locator('.cache-selection-group').filter({ hasText: '25 shards' }).first().waitFor();
+      assert.equal(await page.locator('.cache-detail-danger-target').count(), 0, 'switching back removes the danger target line');
+      await locationSelect.selectOption('1');
+      await page.getByText('2 saved versions', { exact: true }).waitFor();
+      assert.equal(await page.locator('.cache-detail-danger-target').count(), 1, 'the danger target returns when the location diverges again');
+      assert.deepEqual(await stationary(), before, 'switching back and forth keeps the fixed chrome still');
 
       // Four stored entries stay two distinct file rows with one right-aligned
       // size each and the saved versions as a muted suffix.
@@ -1194,7 +1238,8 @@ async function checkBrowserLayout() {
           assert.equal(await page.getByText('Files (1)', { exact: true }).count(), 0, 'no duplicate inner Files heading');
           const datasetFactsText = (await page.locator('.cache-detail-header .cache-detail-facts').textContent()).trim();
           assert(!/\d+ files?/u.test(datasetFactsText), 'the dataset facts line leaves the file count to the sticky heading');
-          assert(await page.locator('.cache-detail-danger-target').count(), 'the dataset danger block names its target');
+          assert.equal(await page.locator('.cache-detail-danger-target').count(), 1, 'the dataset danger block always names its target');
+          assert((await page.locator('.cache-detail-danger-target code').getAttribute('title')).includes('datasets--'));
         } else {
           await page.getByText('weights.safetensors', { exact: true }).first().waitFor();
           await page.getByRole('button', { name: 'Delete entire model cache', exact: true }).waitFor();

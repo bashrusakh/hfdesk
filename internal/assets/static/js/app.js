@@ -4330,7 +4330,7 @@ async function loadRepositoryDetails(entry) {
   // HF cache and Friendly view always; Local only when the server proved the
   // folder is one model; datasets keep the HF-only rule and are otherwise
   // view-only.
-  function cacheDetailDangerHTML(data) {
+  function cacheDetailDangerHTML(data, includeTarget = true) {
     const source = data.source || '';
     let action = null;
     let scope = '';
@@ -4372,11 +4372,32 @@ async function loadRepositoryDetails(entry) {
     const targetPath = typeof data.path === 'string' ? data.path : '';
     return `<div class="cache-detail-danger" role="group" aria-labelledby="cacheDetailDangerTitle">
         <h4 id="cacheDetailDangerTitle">Delete this copy</h4>
-        ${targetPath ? `<p class="cache-detail-danger-target"><span>Target copy</span> <span class="cache-detail-sep" aria-hidden="true">·</span> <code title="${escapeCacheDetailAttribute(targetPath)}">${escapeHtml(targetPath)}</code></p>` : ''}
+        ${includeTarget && targetPath ? `<p class="cache-detail-danger-target"><span>Target copy</span> <span class="cache-detail-sep" aria-hidden="true">·</span> <code title="${escapeCacheDetailAttribute(targetPath)}">${escapeHtml(targetPath)}</code></p>` : ''}
         <p class="cache-detail-danger-scope">${escapeHtml(scope)}</p>
         ${withheldReason ? `<p class="cache-detail-danger-reason">${escapeHtml(withheldReason)}</p>` : ''}
         ${actionHtml}
       </div>`;
+  }
+
+  function cacheDetailPathsMatch(left, right) {
+    const normalize = value => String(value || '').replace(/[\\/]+$/, '');
+    return normalize(left) === normalize(right);
+  }
+
+  // The target line is only needed when the listed copy has moved away from
+  // the copy Details was opened for. Datasets have no location select, so
+  // their opener remains their only copy identity.
+  function cacheDetailDangerFor(context, location) {
+    const data = context.detailData;
+    if (!data) return '';
+    const includeTarget = data.type === 'dataset'
+      || Boolean(location && !cacheDetailPathsMatch(location.path, data.path));
+    return cacheDetailDangerHTML(data, includeTarget);
+  }
+
+  function updateCacheDangerHost(context, location) {
+    const host = $('#cacheDangerHost');
+    if (host) host.innerHTML = cacheDetailDangerFor(context, location);
   }
 
   function cacheDetailFilesHTML(files) {
@@ -4462,7 +4483,7 @@ async function loadRepositoryDetails(entry) {
 
       context.snapshotFiles = Array.isArray(data.files) ? data.files : [];
       context.filesHTML = cacheDetailFilesHTML(context.snapshotFiles);
-      context.dangerHTML = cacheDetailDangerHTML(data);
+      context.detailData = data;
       const dataset = data.type === 'dataset';
       const initialBody = dataset
         ? context.filesHTML
@@ -4473,7 +4494,7 @@ async function loadRepositoryDetails(entry) {
           <section id="cacheSelectionSection" class="cache-detail-section" role="status" aria-live="polite" aria-busy="${dataset ? 'false' : 'true'}">
             ${cacheContentsSectionHTML(context, null, initialBody, !dataset)}
           </section>
-          <div id="cacheDangerHost" class="cache-detail-danger-host">${context.dangerHTML}</div>
+          <div id="cacheDangerHost" class="cache-detail-danger-host">${cacheDetailDangerFor(context, null)}</div>
           <div class="cache-detail-actions">
             <button class="btn btn-ghost" type="button" onclick="refreshCacheDetails()">Refresh</button>
             <button class="btn btn-ghost" type="button" onclick="hideModal()">Close</button>
@@ -4629,6 +4650,7 @@ async function loadRepositoryDetails(entry) {
     }
     section.setAttribute('aria-busy', 'false');
     section.innerHTML = cacheContentsSectionHTML(context, location, bodyHTML, false, { locations, selectedLocationID });
+    updateCacheDangerHost(context, location);
     context.selection = selection;
     context.selectedLocationID = selectedLocationID;
     section.querySelectorAll('.cache-selection-delete').forEach(button => button.addEventListener('click', () => {
@@ -4666,6 +4688,7 @@ async function loadRepositoryDetails(entry) {
       if (!Number.isInteger(selectedIndex) || !nextLocation || !cacheDetailsContextIsCurrent(context)) return;
       context.selectedLocationID = nextLocation.id;
       select.disabled = true;
+      updateCacheDangerHost(context, nextLocation);
       const liveSection = $('#cacheSelectionSection');
       if (liveSection) {
         liveSection.setAttribute('aria-busy', 'true');
@@ -4920,6 +4943,7 @@ async function loadRepositoryDetails(entry) {
       if (section) {
         section.setAttribute('aria-busy', 'false');
         section.innerHTML = cacheContentsSectionHTML(context.detailsContext, null, `${notice}<p class="cache-selection-warning">Unable to refresh GGUF locations: ${escapeHtml(error.message)}. Close and reopen Details before another delete.</p>`);
+        updateCacheDangerHost(context.detailsContext, context.location);
         const scroll = $('#cacheContentsScroll');
         if (scroll) scroll.scrollTop = Number(context.restoreScrollTop) || 0;
       }
