@@ -516,6 +516,17 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
     return { confirmHTML, confirmArgs };
   }
 
+  // Whole-copy Cancel returns to the same Details dialog and scroll position,
+  // rather than closing the dialog.
+  await openWholeFolderDetails('Local', '/models-local/org/model', [{ name: 'weights.safetensors', sizeHuman: '4 GB' }]);
+  nodes.get('#cacheContentsScroll').scrollTop = 240;
+  window.confirmDeleteCache('org/model', 'model', 'Local', '/models-local/org/model');
+  assert.equal(nodes.get('#modalTitle').textContent, 'Delete from Cache');
+  window.cancelCacheDelete();
+  assert.equal(nodes.get('#modalTitle').textContent, 'Repository Details', 'whole-copy cancel returns to Details');
+  assert(modalHTML.includes('cache-detail-modal') && modalHTML.includes('Delete this copy'), 'whole-copy cancel restores the danger block');
+  assert.equal(nodes.get('#cacheContentsScroll').scrollTop, 240, 'whole-copy cancel restores the contents scroll position');
+
   // (a) HF cache: byte-identical button markup, unchanged confirmation copy,
   // unchanged request — query only, body stays null.
   await openWholeFolderDetails('HF cache', '/cache/hub/org--model', [{ name: 'weights.safetensors', sizeHuman: '1 GB' }]);
@@ -1214,6 +1225,9 @@ async function checkBrowserLayout() {
       await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-hf.png` });
 
       // The whole-copy confirmation keeps the shared centred layout and style.
+      const detailsScroll = page.locator('.cache-detail-scroll');
+      await detailsScroll.evaluate(node => { node.scrollTop = Math.min(140, Math.max(0, node.scrollHeight - node.clientHeight)); });
+      const cancelScrollTop = await detailsScroll.evaluate(node => node.scrollTop);
       const wholeCopyButton = page.locator('.cache-detail-danger .btn-danger');
       assert.equal(await wholeCopyButton.count(), 1, 'the danger zone keeps its whole-copy action');
       await wholeCopyButton.click();
@@ -1226,6 +1240,8 @@ async function checkBrowserLayout() {
       assert.equal(wholeCopy.groupScoped, false, 'the group confirmation styling never reaches the whole-copy dialog');
       assert(await page.getByText('Are you sure you want to delete', { exact: false }).isVisible());
       await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await page.getByRole('heading', { name: 'Repository Details', exact: true }).waitFor();
+      assert.equal(await detailsScroll.evaluate(node => node.scrollTop), cancelScrollTop, 'whole-copy cancel restores the contents scroll position');
       for (const variant of ['non-gguf', 'dataset']) {
         await page.goto(`${base}?case=${variant}`);
         if (variant === 'dataset') {

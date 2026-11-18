@@ -4282,6 +4282,7 @@ async function loadRepositoryDetails(entry) {
 
   let cacheDetailsRequest = 0;
   let activeCacheDetailsContext = null;
+  let cacheDeleteReturnToDetails = null;
   let cacheDeleteConfirmationSequence = 0;
   const pendingSelectedCacheDeletes = new Set();
   function cacheDetailsRepoParts(repo) {
@@ -5029,6 +5030,18 @@ async function loadRepositoryDetails(entry) {
   // request can only ever delete that folder; HF-cache calls keep the original
   // two-argument form and byte-identical request.
   window.confirmDeleteCache = function(repo, type, source = '', path = '') {
+    const detailsBody = $('#modalBody');
+    const detailsHTML = detailsBody && detailsBody.innerHTML.includes('cache-detail-modal')
+      ? detailsBody.innerHTML
+      : '';
+    const restoreScrollTop = Number($('#cacheContentsScroll')?.scrollTop) || 0;
+    cacheDeleteReturnToDetails = detailsHTML
+      ? () => {
+        showModal('Repository Details', detailsHTML);
+        const scroll = $('#cacheContentsScroll');
+        if (scroll) scroll.scrollTop = restoreScrollTop;
+      }
+      : null;
     const wholeFolder = source === 'Local' || source === 'Friendly view';
     const message = wholeFolder
       ? `Are you sure you want to delete the whole model folder <strong>${escapeHtml(path)}</strong>?`
@@ -5052,7 +5065,7 @@ async function loadRepositoryDetails(entry) {
         <p class="delete-message">${message}</p>
         <p class="delete-note">${note}</p>
         <div class="form-actions" style="margin-top: 20px;">
-          <button class="btn btn-ghost" onclick="hideModal()">Cancel</button>
+          <button class="btn btn-ghost" onclick="cancelCacheDelete()">Cancel</button>
           <button class="btn btn-danger" onclick="${confirmTarget}">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
               <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
@@ -5062,6 +5075,13 @@ async function loadRepositoryDetails(entry) {
         </div>
       </div>
     `);
+  };
+
+  window.cancelCacheDelete = function() {
+    const restore = cacheDeleteReturnToDetails;
+    cacheDeleteReturnToDetails = null;
+    if (restore) restore();
+    else hideModal();
   };
 
   // Actually delete the cache. Local/friendly calls carry the source
@@ -6607,6 +6627,7 @@ async function loadRepositoryDetails(entry) {
     revisionPickerCancelHandler = null;
     revisionPickerRequestId = null;
     revisionPickerRepo = null;
+    cacheDeleteReturnToDetails = null;
     $('#modalBackdrop').classList.remove('active');
     resetCacheDetailModalSize();
     if (cancel) cancel();
