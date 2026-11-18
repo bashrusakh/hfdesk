@@ -764,6 +764,12 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	// state of the desktop, so it is a POST, and it is guarded by the same
 	// local-only rule as the other runtime endpoints.
 	mux.HandleFunc("POST /api/runtime/open-ui", s.localOnly(s.handleRuntimeOpenUI))
+	// The install-service action is handed to the host, which owns the
+	// dialogs, the elevation and the handover of an installation and runs
+	// the same function its tray menu runs. It changes the state of the
+	// machine, so it is a POST, and it is guarded by the same local-only
+	// rule as the other runtime endpoints.
+	mux.HandleFunc("POST /api/runtime/install-service", s.localOnly(s.handleRuntimeInstallService))
 }
 
 // Middleware

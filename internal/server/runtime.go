@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -73,6 +74,14 @@ type RuntimeStatusResponse struct {
 	// LogFile is the path of the rotating log file. It is empty when the
 	// application does not write a log file.
 	LogFile string `json:"logFile"`
+	// ServiceState is the lifecycle state of the platform service
+	// registration: the state word of the service layer ("not-installed",
+	// "running", "stopped", …), or runtimeServiceStateUnknown when no host
+	// of this process provides the service surface or the state could not
+	// be read. It never reads "not-installed" for a state that could not be
+	// settled, so a client can enable an installation only on a proven
+	// absence.
+	ServiceState string `json:"serviceState"`
 }
 
 // RuntimeOpenLogsResponse is the body of POST /api/runtime/open-logs.
@@ -89,12 +98,73 @@ type RuntimeOpenUIResponse struct {
 	OK bool `json:"ok"`
 }
 
+// RuntimeInstallServiceResponse is the body of POST
+// /api/runtime/install-service.
+type RuntimeInstallServiceResponse struct {
+	// OK reports that the host received the action. The installation
+	// itself runs on the host afterwards and reports its own outcome
+	// there: this response returns as soon as the action was dispatched,
+	// so no request waits out the dialogs of the flow.
+	OK bool `json:"ok"`
+}
+
 // RuntimeJobCounts counts the active jobs of the server.
 type RuntimeJobCounts struct {
 	// Running is the number of jobs that occupy an active slot.
 	Running int `json:"running"`
 	// Queued is the number of jobs that wait for a free slot.
 	Queued int `json:"queued"`
+}
+
+// runtimeServiceStateUnknown is the state word the status reports when the
+// registration could not be settled: no host of this process provides the
+// service surface, or the read failed.
+//
+// The word is shared with the state vocabulary of the service layer, which
+// the runtime surface transports as plain words instead of importing that
+// package: only the host knows the registration, so only the host can read
+// it, and the surface must never guess "not-installed" in its place.
+const runtimeServiceStateUnknown = "unknown"
+
+// The service surface of the host: the registration read behind
+// GET /api/runtime and the install action behind
+// POST /api/runtime/install-service.
+//
+// The desktop host registers both through SetRuntimeService. Both stay nil
+// for a host without the surface (the console and service hosts), and the
+// status then reports the unknown state while the action answers 404.
+var (
+	// runtimeServiceMu guards the registered surface: the host registers
+	// while the server may already answer, so the handlers read the two
+	// values under the lock.
+	runtimeServiceMu sync.RWMutex
+	// runtimeServiceStateRead reads the state word of the registration,
+	// or its failure.
+	runtimeServiceStateRead func() (string, error)
+	// runtimeServiceInstall dispatches the host's install-service action.
+	runtimeServiceInstall func()
+)
+
+// SetRuntimeService registers the service surface of the host.
+//
+// read returns the state word of the platform service registration (the
+// vocabulary of the service layer) or the failure of that read; install
+// runs the host's install-service action and must return promptly, because
+// the action shows the dialogs of the flow on a goroutine of its own. Both
+// may be nil, and nil clears the surface again — the tests restore it that
+// way.
+func SetRuntimeService(read func() (string, error), install func()) {
+	runtimeServiceMu.Lock()
+	defer runtimeServiceMu.Unlock()
+	runtimeServiceStateRead = read
+	runtimeServiceInstall = install
+}
+
+// currentRuntimeService returns the registered service surface of the host.
+func currentRuntimeService() (func() (string, error), func()) {
+	runtimeServiceMu.RLock()
+	defer runtimeServiceMu.RUnlock()
+	return runtimeServiceStateRead, runtimeServiceInstall
 }
 
 // RuntimeLogRecord is a log record on the wire.
@@ -191,15 +261,38 @@ func (s *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, RuntimeStatusResponse{
-		Version:    Version,
-		Status:     "ok",
-		URL:        s.BrowserURL(),
-		Address:    address,
-		ActiveJobs: RuntimeJobCounts{Running: running, Queued: queued},
-		RunID:      s.RunID(),
-		LogCursor:  cursor,
-		LogFile:    logFile,
+		Version:      Version,
+		Status:       "ok",
+		URL:          s.BrowserURL(),
+		Address:      address,
+		ActiveJobs:   RuntimeJobCounts{Running: running, Queued: queued},
+		RunID:        s.RunID(),
+		LogCursor:    cursor,
+		LogFile:      logFile,
+		ServiceState: runtimeServiceState(),
 	})
+}
+
+// runtimeServiceState answers the state word of the status endpoint.
+//
+// A surface that is not registered, a failing read and a read without a
+// state all answer the unknown state: the status line of a client then
+// reports what this process could not settle instead of claiming a machine
+// without a registration.
+func runtimeServiceState() string {
+	read, _ := currentRuntimeService()
+	if read == nil {
+		return runtimeServiceStateUnknown
+	}
+	state, err := read()
+	if err != nil {
+		return runtimeServiceStateUnknown
+	}
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return runtimeServiceStateUnknown
+	}
+	return state
 }
 
 // openLogDirectory opens a directory with the default file manager of the
@@ -242,6 +335,29 @@ func (s *Server) handleRuntimeOpenUI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, RuntimeOpenUIResponse{OK: true})
+}
+
+// handleRuntimeInstallService hands the installation of the platform
+// service to the host.
+//
+// The endpoint performs no installation itself: the desktop host owns that
+// flow — the missing-console notice, the confirmation, the administrator
+// prompt and the graceful handover — and runs the very function its tray
+// menu runs, so the two surfaces cannot drift apart. The call therefore
+// only dispatches the action and answers right away, while the host's own
+// single-action guard refuses a second action that is still in flight,
+// exactly like a second tray click. A host without the action answers 404,
+// so a window of an older or console build disables its button instead of
+// failing on every click.
+func (s *Server) handleRuntimeInstallService(w http.ResponseWriter, r *http.Request) {
+	_, install := currentRuntimeService()
+	if install == nil {
+		writeError(w, http.StatusNotFound, "No service action",
+			"this build of HFDesk has no install-service action")
+		return
+	}
+	install()
+	writeJSON(w, http.StatusOK, RuntimeInstallServiceResponse{OK: true})
 }
 
 // handleRuntimeOpenLogs opens the folder of the active log file with the

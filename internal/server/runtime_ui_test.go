@@ -176,6 +176,21 @@ func TestRuntimeUIRunID(t *testing.T) {
 	runRuntimeUIHarness(t, "run")
 }
 
+// TestRuntimeUIServiceStatusAndInstallAction proves that the Runtime /
+// Logs view shows the status of the platform service with the words the
+// tray menu shows for the same state, and that its install button follows
+// the one rule the surface promises: enabled only while the status
+// positively reports that no service is installed, flipped by the status
+// refresh once one exists, and never dispatching a second installation
+// while one is in flight.
+//
+// Node's built-in VM drives the shipped runtime.js with DOM and fetch
+// stubs, so the harness exercises the view itself and not a copy of its
+// rules.
+func TestRuntimeUIServiceStatusAndInstallAction(t *testing.T) {
+	runRuntimeUIHarness(t, "service")
+}
+
 // TestRuntimeUIAllScenarioGroups proves that the Runtime / Logs view works
 // when every scenario of the harness runs in one process.
 //
