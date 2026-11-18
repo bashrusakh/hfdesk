@@ -587,6 +587,21 @@ func TestDownloadConsoleReleaseLeavesNoFileOnEveryFailure(t *testing.T) {
 			t.Fatalf("the folder cannot be made read-only: %v", err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(folder, 0o755) })
+		// The mode bits above only refuse a new file where the platform
+		// honours them on a directory, so the folder is refused in the
+		// platform's own terms as well. The premise is then probed with a
+		// real create: the assertions below must only run against a folder
+		// that genuinely refused a file, never against one whose refusal
+		// the platform silently ignored.
+		if err := denyNewFiles(folder); err != nil {
+			t.Skipf("this platform cannot refuse a new file in the folder: %v", err)
+		}
+		probe, probeErr := os.Create(filepath.Join(folder, ".write-probe"))
+		if probeErr == nil {
+			_ = probe.Close()
+			_ = os.Remove(probe.Name())
+			t.Skip("the folder still accepted a new file after the read-only setup, so an unwritable folder is not expressible here")
+		}
 
 		if _, err := downloadConsoleRelease(context.Background(), offer, folder, nil); err == nil ||
 			!strings.Contains(err.Error(), "cannot be written") {
