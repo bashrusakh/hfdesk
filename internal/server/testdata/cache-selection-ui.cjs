@@ -30,8 +30,18 @@ function fakeButton(dataset = {}) {
 function decodeAttributeValue(value) {
   return String(value).replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
 }
+function stripTags(html) {
+  let text = '';
+  let inTag = false;
+  for (const char of String(html)) {
+    if (char === '<') { inTag = true; continue; }
+    if (char === '>') { inTag = false; continue; }
+    if (!inTag) text += char;
+  }
+  return text;
+}
 function textContent(html) {
-  return decodeAttributeValue(String(html).replace(/<[^>]*>/g, '')).replace(/\s+/g, ' ').trim();
+  return decodeAttributeValue(stripTags(html)).replace(/\s+/g, ' ').trim();
 }
 function registerSelectionLocation(html) {
   const selectTag = html.match(/<select id="cacheSelectionLocation"[^>]*>/)?.[0];
