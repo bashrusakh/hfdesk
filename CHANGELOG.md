@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The systemd D-Bus client no longer crashes when a socket deadline or close lands mid-message (godbus v5.2.4).
+
 ## [1.3.0-beta.7] - 2026-11-18
 
 Beta build of the upcoming `v1.3.0`; the artifacts are pre-release builds for testing and are not marked as the latest stable release.
