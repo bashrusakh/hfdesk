@@ -2,9 +2,19 @@
 
 ## [Unreleased]
 
+## [1.3.0-beta.7] - 2026-11-18
+
+Beta build of the upcoming `v1.3.0`; the artifacts are pre-release builds for testing and are not marked as the latest stable release.
+
+Long-form notes: [docs/releases/1.3.0-beta.7.md](docs/releases/1.3.0-beta.7.md).
+
 ### Fixed
 
-- Ranged downloads mark their staging payload sparse before sizing it, removing the disk-speed zero-fill window on Windows; filesystems without sparse support keep the previous behaviour.
+- Ranged downloads mark their staging payload sparse before sizing it, removing the disk-speed zero-fill window on Windows; filesystems without sparse support keep the previous behaviour. (#212)
+
+### Changed
+
+- Repository Details uses a two-line identity and **This copy** facts header, opens the repository from its title, keeps whole-copy deletion fixed above the footer with a target path, and moves location choice into the contents heading; dataset and shard counts appear once. (#213)
 
 ## [1.3.0-beta.6] - 2026-11-18
 
@@ -19,7 +29,6 @@ Long-form notes: [docs/releases/1.3.0-beta.6.md](docs/releases/1.3.0-beta.6.md).
 ### Changed
 
 - The selected GGUF group deletion confirmation names the quantization in its title and shows left-aligned facts, a one-sentence scope, and file rows with right-aligned sizes; the whole-copy confirmation is unchanged. (#207)
-- Repository Details uses a two-line identity and **This copy** facts header, opens the repository from its title, keeps whole-copy deletion fixed above the footer with a target path, and moves location choice into the contents heading; dataset and shard counts appear once. (#213)
 
 ## [1.3.0-beta.5] - 2026-11-17
 
