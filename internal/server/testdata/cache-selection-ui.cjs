@@ -28,7 +28,7 @@ function fakeButton(dataset = {}) {
   return { dataset, disabled: false, focused: false, listeners: {}, addEventListener(name, callback) { this.listeners[name] = callback; }, focus() { this.focused = true; }, click() { return this.disabled ? undefined : this.listeners.click?.(); } };
 }
 function decodeAttributeValue(value) {
-  return String(value).replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  return String(value).replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
 }
 function textContent(html) {
   return decodeAttributeValue(String(html).replace(/<[^>]*>/g, '')).replace(/\s+/g, ' ').trim();
@@ -486,7 +486,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   // folder; (c) Friendly view routes its tree with the folder pin; (d) local
   // datasets get no button (the decided scope).
   function decodeAttrValue(value) {
-    return value.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+    return value.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
   }
   function onclickArgs(fnName) {
     const match = modalHTML.match(new RegExp(`onclick="${fnName}\\(([^"]*)\\)"`));
