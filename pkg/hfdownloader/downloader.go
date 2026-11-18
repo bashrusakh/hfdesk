@@ -1197,6 +1197,97 @@ func cleanupPartialsOnCancel(cfg Settings, dst string, domain *blobDomain) {
 	}
 	// dst was confined to its destination root by SafeJoin in Download.
 	cleanupLegacyPartials(dst, domain)
+	// The removed partial may leave its directory chain completely empty;
+	// the chain is pruned when the destination scope is released.
+	domain.scheduleEmptyChainPrune(dst, cfg)
+}
+
+// emptyChainPrune names one cleanup-scheduled empty-directory chain pruning:
+// the chain that contained the removed partial at dst, bounded by the output
+// root. Only explicit-cancel cleanup and CleanupJobPartFiles create one.
+type emptyChainPrune struct{ dst, root string }
+
+// pruneEmptyAncestors removes the directory chain that contained a removed
+// partial, walking upward from the partial's directory while directories stay
+// completely empty, and stopping at the first directory that holds any
+// content, is not a real directory (a symlink or a file), lies outside the
+// output root, or refuses the tree admission. The output root is the boundary
+// and is never removed. A user-created empty directory that held only the
+// removed partial is removed too: this is deliberately the "remove any
+// now-empty directory" rule, not created-directory tracking.
+//
+// Every removal runs under the realm's tree-removal admission — the same
+// exclusive directory admission the sync path's empty-directory pruning takes
+// — so a live writer in the chain is never disrupted: a writer scope holds the
+// directory keys shared and refuses the removal, while a creator whose
+// directory vanished recreates it in the writer preparation's create-parent
+// step. os.Remove's refusal to unlink a non-empty directory is the content
+// backstop for the race between the emptiness check and the removal. The
+// caller has released the destination scope: that scope's shared directory
+// keys conflict with the exclusive tree admission. Pruning is best-effort: a
+// refusal keeps the directory, a failure logs a warning, and neither fails the
+// job nor blocks artifact removal.
+func pruneEmptyAncestors(dst, root string, realm *ownershipRealm) {
+	if realm == nil || root == "" || dst == "" {
+		return
+	}
+	for dir := filepath.Dir(dst); pathWithinRoot(root, dir); dir = filepath.Dir(dir) {
+		if !pruneEmptyDir(dir, realm) {
+			return
+		}
+	}
+}
+
+// pruneEmptyDir removes one completely empty directory under its tree-removal
+// admission and reports whether the chain walk may continue upward. A missing
+// directory is already gone, so the walk continues toward its parents.
+func pruneEmptyDir(dir string, realm *ownershipRealm) bool {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true
+		}
+		downloadLog.Warn("skip empty-directory pruning", "path", dir, "error", err)
+		return false
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		// A symlink or non-directory in the chain stops it: following or
+		// removing one could reach outside the output root's real tree.
+		return false
+	}
+	if entries, readErr := os.ReadDir(dir); readErr != nil || len(entries) > 0 {
+		if readErr != nil && !os.IsNotExist(readErr) {
+			downloadLog.Warn("skip empty-directory pruning", "path", dir, "error", readErr)
+		}
+		// Any content at all stops the chain: the directory survives, and so
+		// do its parents.
+		return false
+	}
+	if ownershipPathGapHook != nil {
+		ownershipPathGapHook("admit", dir)
+	}
+	lease, leaseErr := realm.acquireTreeRemoval(context.Background(), dir, 0)
+	if leaseErr != nil {
+		if _, statErr := os.Lstat(dir); os.IsNotExist(statErr) {
+			// Vanished with the admission in flight: already gone, so keep
+			// walking up like a missing directory.
+			return true
+		}
+		// A live writer at, under or above the tree owns it; keep the
+		// directory like a failed os.Remove.
+		downloadLog.Warn("keep empty directory owned by another live writer", "path", dir, "error", leaseErr)
+		return false
+	}
+	// lgtm[go/path-injection]
+	err = os.Remove(dir)
+	lease.Release()
+	if err != nil && !os.IsNotExist(err) {
+		// Includes the content backstop: the directory stopped being empty
+		// between the check and the removal.
+		downloadLog.Warn("cleanup empty directory failed", "path", dir, "error", err)
+		return false
+	}
+	return true
 }
 
 // cleanupLegacyPartials removes single-request and legacy multipart artifacts
@@ -1292,6 +1383,9 @@ func CleanupJobPartFiles(settings Settings, dsts []string) error {
 			removeHFCacheTemp(dst)
 			removeBlobStagingForTemp(dst, domain)
 		}
+		// Flat mode: the removed partial's now-empty directory chain is
+		// pruned when the destination scope drops below.
+		domain.scheduleEmptyChainPrune(dst, settings)
 		domain.release()
 	}
 	return nil

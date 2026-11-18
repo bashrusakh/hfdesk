@@ -351,7 +351,11 @@ remain unsupported. A tree-removal admission whose target is missing must
 re-verify the vanish while holding the missing target's creator-side keys — a
 bare or wrapped ENOENT from resolution is not proof that the target is gone —
 and an admission that can establish neither a live-writer conflict nor a
-re-verified vanish fails closed instead of admitting.
+re-verified vanish fails closed instead of admitting. Vanish placement is not
+observable to this rule: a target that vanished before resolution began and one
+that vanished inside resolution's own stat/identity observation gap both
+resolve as missing and reach the admission with the same not-exist identity,
+so both take this same re-verified-vanish flow.
 
 Whole-tree admission keeps open lock files for every directory in the tree
 from the first exclusive acquisition until the caller's removal finishes: two
@@ -945,6 +949,34 @@ cannot distinguish a job's earlier bytes from another current owner of that
 destination, so it leaves the destination alone even if the cancelling job once
 wrote there.
 
+After flat-mode artifact removal, both explicit-cancel cleanup and
+`CleanupJobPartFiles` prune the removed partial's directory chain: each
+directory is removed only while it is completely empty, walking upward until
+the first directory that holds any content, is a symlink or non-directory,
+lies outside the output root, or refuses admission — the output root is the
+boundary and is never removed. This is deliberately the "remove any now-empty
+directory" rule: a user-created empty directory that held only the removed
+partial is removed too, and no created-directory tracking exists. Each removal
+takes the directory's tree-removal admission in the same realm as the
+destination scope and happens only after that scope is released — the scope
+holds the chain's directory keys shared, which refuses the exclusive tree
+admission while it is held — so a live writer in the chain is excluded and a
+creator whose directory vanished recreates it in the writer preparation's
+create-parent step; `os.Remove`'s refusal to unlink a non-empty directory is
+the content backstop. A writer whose OWNERSHIP PATH RESOLUTION — which runs
+before any scope exists — races the removal is not disrupted either: a
+component that vanishes inside resolution's own stat/identity observation gap
+resolves exactly like a component that vanished before resolution began
+(missing, with virtual creation keys), so the writer recreates the chain in
+create-parents and no raw stat ENOENT escapes to the job. On the pruning side,
+a directory that vanishes between the emptiness check and the tree admission
+counts as already gone and the chain continues upward, while a refused or busy
+admission — a real live owner — stops the chain with a warning. The pruning is scheduled only by those two cleanup paths:
+a pause or internal abort keeps resumable partials and never schedules it. It
+runs only for flat output directories, never touches the HF cache layout, and
+is best-effort: a refused admission keeps the directory, a failure logs a
+warning, and neither fails the job nor blocks artifact removal.
+
 Under the item scope, `removeStagingArtifactsLocked` removes while the metadata
 gate is held; `removeStagingArtifactsIfUnowned` takes that gate and removes only
 a pair whose current scope/key proof or independent self/death evidence proves
@@ -996,7 +1028,9 @@ partial data on a transient network failure unless it is known to be stale or
 incompatible. Use context-aware sleeps and requests so pause, cancel, shutdown
 and requeue stop promptly. Cancellation is checked after `file_finalizing` and
 again immediately before the single-path rename; an explicit cancel applies the
-claim-checked cleanup, while a pause or internal abort preserves resumable
+claim-checked cleanup — which also prunes the removed partial's now-empty
+directory chain up to the output root in flat mode (see the cleanup section
+above) — while a pause or internal abort preserves resumable
 partials. A cancel inside the ranged pre-placement window is the exception:
 it leaves the already-proven, complete staging pair on disk for a resume,
 because the explicit-cancel cleanup is not run there by design. Keep progress

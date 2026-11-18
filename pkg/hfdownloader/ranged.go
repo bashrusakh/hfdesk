@@ -1019,6 +1019,9 @@ func (d *stagingDownload) applyCancelCleanup() {
 		downloadLog.Warn("cleanup obsolete multipart artifacts failed", "path", d.dst, "error", err)
 	}
 	removeStagingArtifactsLocked(d.stg, d.meta)
+	// The removed staging may leave its directory chain completely empty;
+	// the chain is pruned when the destination scope is released.
+	d.domain.scheduleEmptyChainPrune(d.dst, d.cfg)
 }
 
 // resetClaim replaces metadata before resetting a payload that changed between

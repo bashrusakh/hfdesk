@@ -136,12 +136,16 @@ type blobDomain struct {
 	// covers: blobs/tmp-<name> for a cache destination (which covers
 	// blobs/tmp-<name>.incomplete and blobs/<name>.incomplete), or the
 	// <destination>.incomplete staging name for a flat one.
-	dest     string
-	entry    *blobDomainEntry
-	realm    *ownershipRealm
-	scope    *ownershipLease
-	proof    string
-	released bool
+	dest  string
+	entry *blobDomainEntry
+	realm *ownershipRealm
+	scope *ownershipLease
+	proof string
+	// pruneAfterRelease is the empty-directory chain pruning scheduled by
+	// explicit-cancel cleanup (see scheduleEmptyChainPrune). nil when nothing
+	// was scheduled.
+	pruneAfterRelease *emptyChainPrune
+	released          bool
 }
 
 type blobDomainFence struct {
@@ -385,6 +389,24 @@ func (d *blobDomain) ownershipFenceProof() string {
 	return d.proof
 }
 
+// scheduleEmptyChainPrune schedules removal of the destination's now-empty
+// parent directory chain for when this domain's scope is released. Only the
+// flat output-directory case is eligible: the HF cache layout must never be
+// pruned by this feature. The pruning runs at release because the held scope's
+// shared directory keys conflict with the exclusive tree admission the pruning
+// needs (see pruneEmptyAncestors).
+func (d *blobDomain) scheduleEmptyChainPrune(dst string, cfg Settings) {
+	if d == nil || d.released || dst == "" {
+		return
+	}
+	// Flat mode is exactly "OutputDir set and CacheDir unset"; anything else
+	// is the HF cache layout or no output root at all.
+	if cfg.CacheDir != "" || cfg.OutputDir == "" {
+		return
+	}
+	d.pruneAfterRelease = &emptyChainPrune{dst: dst, root: cfg.OutputDir}
+}
+
 func (d *blobDomain) release() {
 	if d == nil || d.released {
 		return
@@ -392,6 +414,13 @@ func (d *blobDomain) release() {
 	d.released = true
 	if d.scope != nil {
 		d.scope.Release()
+	}
+	// Scheduled empty-directory pruning runs only after the scope has been
+	// released: the scope holds the chain's directory keys shared, which
+	// refuses the pruning's exclusive tree admission.
+	if prune := d.pruneAfterRelease; prune != nil {
+		d.pruneAfterRelease = nil
+		pruneEmptyAncestors(prune.dst, prune.root, d.realm)
 	}
 	if d.entry == nil {
 		return
