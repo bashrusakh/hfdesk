@@ -28,7 +28,16 @@ func acquireDefaultScopedBlobDomain(ctx context.Context, key, dst string) (*blob
 		return nil, err
 	}
 	proofPath := key
-	paths := appendUniqueOwnershipPaths([]string{key, dst}, appendPartialOwnershipPaths(nil, dst)...)
+	seed := []string{key}
+	if strings.HasPrefix(key, flatDomainKeyPrefix) {
+		// The flat key is an in-process namespace, not a filesystem path:
+		// keep it out of the realm path set, whose create-parent step would
+		// materialize "flat:..." relative to the test working directory (the
+		// package source tree under go test). Production never scopes it
+		// either (see downloadOwnershipPaths).
+		seed = nil
+	}
+	paths := appendUniqueOwnershipPaths(append(seed, dst), appendPartialOwnershipPaths(nil, dst)...)
 	if strings.HasPrefix(key, flatDomainKeyPrefix) {
 		proofPath = strings.TrimPrefix(key, flatDomainKeyPrefix)
 		paths = appendPartialOwnershipPaths(paths, proofPath)
