@@ -241,12 +241,38 @@ const (
 // has no console program.
 var findSiblingExecutable = findConsoleExecutable
 
+// errConsolePairMissing marks the lookup failure that states the pairing rule
+// itself: a version-stamped desktop program whose console pair is not in the
+// folder. The notice of the missing program keeps that explanation out of its
+// first glance — the collapsed expander already carries the pairing sentence —
+// and shows the cause of every other lookup failure (an unreadable folder, no
+// candidate, several candidates) beside its first sentence, so errors.Is
+// tells the two classes of failure apart.
+var errConsolePairMissing = errors.New("the console program paired with this desktop program is missing")
+
+// consolePairingFailure is that pairing failure with its full sentence: it
+// keeps the message the user can act on and marks itself for
+// errors.Is(err, errConsolePairMissing).
+type consolePairingFailure struct {
+	message string
+}
+
+func (e *consolePairingFailure) Error() string {
+	return e.message
+}
+
+func (e *consolePairingFailure) Unwrap() error {
+	return errConsolePairMissing
+}
+
 // findConsoleExecutable returns the path of the console program of HFDesk in
 // dir.
 //
-// HFDesk stays portable: the desktop never downloads, copies or replaces a
-// binary, so the installation registers the program of the folder the desktop
-// runs from.
+// The installation registers the program of the folder the desktop runs from.
+// The one exception to "the desktop replaces nothing by itself" is the
+// missing-program notice, which may fetch the missing pair of this very
+// release on the user's explicit request (see consoleReleaseFor); this
+// function only ever selects a file that is already there.
 //
 // A version-stamped desktop program requires its pair: a release ships
 // hfdesk_windows_amd64_1.3.0.exe next to hfdesk-desktop_windows_amd64_1.3.0.exe,
@@ -299,8 +325,9 @@ func findConsoleExecutable(dir, desktop string) (string, error) {
 	// program of its own release: another program in the folder belongs to
 	// another release, so it is not a fallback but a different version.
 	if versioned && paired != "" {
-		return "", fmt.Errorf("there is no %s in %s: %s is the desktop program of the release %s, and the service only runs the console program of that release. Copy %s of the release next to the desktop app",
-			paired, dir, filepath.Base(desktop), stamp, paired)
+		return "", &consolePairingFailure{message: fmt.Sprintf(
+			"there is no %s in %s: %s is the desktop program of the release %s, and the service only runs the console program of that release. Copy %s of the release next to the desktop app",
+			paired, dir, filepath.Base(desktop), stamp, paired)}
 	}
 	if preferred != "" {
 		return preferred, nil

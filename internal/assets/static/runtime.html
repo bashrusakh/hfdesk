@@ -333,11 +333,16 @@
           <span id="statusLabel">Starting&hellip;</span>
         </span>
         <span class="runtime-version" id="versionLabel">Version &mdash;</span>
+        <span class="badge badge-secondary" id="serviceBadge"
+              title="The Windows service registration of this machine">Service &mdash;</span>
       </div>
 
       <div class="runtime-header-actions">
         <span class="runtime-note" id="openUiNote" hidden></span>
         <button class="btn btn-primary btn-sm" id="openUiButton" type="button">Open HFDesk</button>
+        <button class="btn btn-outline btn-sm" id="installServiceButton" type="button"
+                title="Register HFDesk as a Windows service that starts at boot"
+                disabled>Install service...</button>
       </div>
     </header>
 

@@ -364,6 +364,79 @@ func run(o Options, logPath string) (err error) {
 		}
 	}
 
+	// The service section of this host is wired once, for both of its
+	// surfaces:
+	//
+	//   - serviceRefresh is the tray menu's catch-up channel. An action
+	//     that changed (or may have changed) the registration posts to it
+	//     and the menu re-reads instead of waiting for its cadence.
+	//   - installService is the install-service flow itself — the
+	//     missing-console notice, the confirmation, the administrator
+	//     prompt, the handover and the existing reports — factored out of
+	//     the tray click so the tray item and the Runtime window run the
+	//     very same function and cannot drift apart. It runs on a
+	//     goroutine of its own (dispatched by its callers), because its
+	//     dialogs and the shutdown must never block a caller: the message
+	//     loop of the tray, or the HTTP request of the window.
+	//   - The runtime surface of the server receives the registration read
+	//     the tray menu line is built from — so the window shows the same
+	//     status from the same reader — and the dispatch of the very same
+	//     install function. The registration happens before the window
+	//     exists, so the surface answers from the first moment the window
+	//     can ask; without it (the console host) the status reports the
+	//     unknown state and the action answers 404.
+	serviceRefresh := make(chan struct{}, 1)
+	requestServiceMenuRefresh := func() {
+		select {
+		case serviceRefresh <- struct{}{}:
+		default:
+		}
+	}
+
+	installService := func() {
+		handover := installServiceFromTray(lock.name)
+		if handover == nil {
+			// Nothing was handed over: the state may have changed
+			// under a stale menu line — the flow re-read the
+			// registration and may have offered the dialog of an
+			// existing service — so the line catches up now instead
+			// of with the next tick.
+			requestServiceMenuRefresh()
+			return
+		}
+		if !shutdownCoordinator.commit(handover) {
+			handover.close()
+			serviceInstallRunning.Store(false)
+			desktopLog.Info("service handover was not committed because desktop shutdown already started")
+			requestServiceMenuRefresh()
+			return
+		}
+		requestQuit()
+	}
+	dispatchInstallService := func() {
+		// The confirmation, the prompt of the user account control and
+		// the graceful shutdown all take a moment, and the shutdown has
+		// to run outside the message loop of the tray. The action
+		// therefore runs on a goroutine of its own.
+		//
+		// The host commits shutdown only after the elevated helper has
+		// opened its wait handles and acknowledged readiness. Earlier
+		// failures leave the running desktop untouched; after commit,
+		// every quit path joins persistence and the helper still requires
+		// both successful completion and this process's exit.
+		go guard.runBackground(installService)
+	}
+	application.SetRuntimeService(
+		func() (string, error) {
+			status, err := readServiceDisplayStatus()
+			if err != nil {
+				return "", err
+			}
+			return string(status.State), nil
+		},
+		dispatchInstallService,
+	)
+
 	iconBytes, err := productIconBytes()
 	if err != nil {
 		desktopLog.Warn("could not build the product icon", "error", err)
@@ -443,32 +516,21 @@ func run(o Options, logPath string) (err error) {
 				showRuntimeWindow(window, url, webview2Ready)
 			})
 		},
-		install: func() {
-			// The confirmation, the prompt of the user account control and
-			// the graceful shutdown all take a moment, and the shutdown has
-			// to run outside the message loop of the tray. The action
-			// therefore runs on a goroutine of its own.
-			//
-			// The host commits shutdown only after the elevated helper has
-			// opened its wait handles and acknowledged readiness. Earlier
-			// failures leave the running desktop untouched; after commit,
-			// every quit path joins persistence and the helper still requires
-			// both successful completion and this process's exit.
+		install: dispatchInstallService,
+		service: func() {
+			// The dialog waits for a settled state and stays open for
+			// an answer, so it runs on a goroutine of its own exactly
+			// like the installation does; the menu catches up when the
+			// choice was performed.
 			go guard.runBackground(func() {
-				handover := installServiceFromTray(lock.name)
-				if handover == nil {
-					return
-				}
-				if !shutdownCoordinator.commit(handover) {
-					handover.close()
-					serviceInstallRunning.Store(false)
-					desktopLog.Info("service handover was not committed because desktop shutdown already started")
-					return
-				}
-				requestQuit()
+				openRegisteredServiceFromTray(lock.name)
+				requestServiceMenuRefresh()
 			})
 		},
 		quit: requestQuit,
+	}, trayServiceView{
+		read:    readServiceDisplayStatus,
+		refresh: serviceRefresh,
 	}, ready)
 
 	// The tray loop ended. The server is stopped before the process

@@ -48,6 +48,7 @@ GET /api/runtime/logs?after=<cursor>&level=<level>&limit=<n>
 GET /api/runtime/logs/stream?after=<cursor>&level=<level>
 POST /api/runtime/open-logs
 POST /api/runtime/open-ui
+POST /api/runtime/install-service
 ```
 
 These endpoints report the status and the log of the running server. They
@@ -100,7 +101,8 @@ requests of the runtime endpoints.
   "activeJobs": { "running": 1, "queued": 2 },
   "runId": "3f8a1c06b27d4e59a0c1d8b47e2f6095",
   "logCursor": 42,
-  "logFile": "/home/user/.cache/HFDesk/logs/hfdesk.log"
+  "logFile": "/home/user/.cache/HFDesk/logs/hfdesk.log",
+  "serviceState": "unknown"
 }
 ```
 
@@ -110,6 +112,17 @@ and `logCursor` is the sequence number of the most recent log record, the
 cursor a client sends to read the records emitted after it. `logFile` is the
 path of the rotating log file; it is an empty string when the application does
 not write a log file.
+
+`serviceState` is the lifecycle state of the platform service registration,
+in the state vocabulary of the service layer: `not-installed`, `running`,
+`stopped`, `starting`, `stopping`, `failed`, `broken`, `masked`,
+`masked-runtime` or `unknown`. It is `unknown` whenever this process could
+not settle the state — no host of the process provides the service surface
+(the console and service hosts), the read failed, or the supervisor reported
+no usable state — and it is never `not-installed` for a state that could not
+be read, so a client can enable an installation only on a proven absence. The
+desktop host fills it from the same read its tray menu status line shows, so
+the Runtime window and the tray report the same status.
 
 `runId` identifies the run of the server: it is generated once per server
 and it never changes afterwards, so it is stable for the whole life of the
@@ -236,6 +249,29 @@ the operating system did not open the browser.
 The URL is handed to the default handler of the operating system, the very
 mechanism the console host and the desktop host use to open the web UI, so
 every caller reaches the browser the same way.
+
+`POST /api/runtime/install-service` hands the installation of the platform
+service to the host. The endpoint performs no installation itself: the
+desktop host owns that flow — the missing-console notice, the confirmation,
+the administrator prompt and the graceful handover — and runs the very
+function its tray menu runs, so the window and the tray cannot drift apart.
+It takes no parameters: the endpoint dispatches the host's action and
+nothing else. It is a POST, because it changes the state of the machine, and
+it is guarded by the same local-only rule as the other runtime endpoints. It
+answers `404` when the host of this build provides no install action (the
+console and service hosts).
+
+```json
+{
+  "ok": true
+}
+```
+
+The response returns as soon as the action was dispatched, so no request
+waits out the dialogs of the flow: the host reports the outcome itself, and
+its single-action guard refuses a second installation while one is already
+in flight — a second request in that window starts nothing and is answered
+the same way, exactly like a second click on the tray item.
 
 ```json
 {

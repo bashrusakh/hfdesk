@@ -221,6 +221,18 @@ func (a *App) URL() string {
 	return a.server.BrowserURL()
 }
 
+// SetRuntimeService registers the service surface of the host with the
+// server: the registration read that answers GET /api/runtime and the
+// install action behind POST /api/runtime/install-service.
+//
+// The surface belongs to the host — only the desktop host owns the dialogs
+// and the elevated helper of an installation — so it is handed in instead
+// of being built into the shared server. A host that never calls this
+// reports the state as unknown and answers the action with 404.
+func (a *App) SetRuntimeService(read func() (string, error), install func()) {
+	server.SetRuntimeService(read, install)
+}
+
 // Wait blocks until the server stops. When ctx is cancelled the server
 // performs its graceful shutdown (quiesce jobs, drain HTTP, close the job
 // manager) and Wait returns the server's error.

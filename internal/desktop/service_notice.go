@@ -38,9 +38,17 @@ const (
 	// state that is no longer positively stopped.
 	serviceGateChangedCaption = "HFDesk - the service state changed"
 
-	// serviceSiblingMissingCaption is the caption of the notice that the
-	// console program of the service is missing.
-	serviceSiblingMissingCaption = "HFDesk - the hfdesk program is missing"
+	// serviceSiblingMissingCaption is the window title of the notice that
+	// the console program of the service is missing. The redesigned notice
+	// titles its task dialog and its message box fallback alike with the
+	// product name, so the two never show different titles for the same
+	// question.
+	serviceSiblingMissingCaption = "HFDesk"
+
+	// consoleDownloadFailedCaption is the caption of the report of a
+	// download of the console program that did not finish or did not
+	// verify.
+	consoleDownloadFailedCaption = "HFDesk - the console program could not be downloaded"
 
 	// serviceInstalledCaption is the caption of the report of a finished
 	// installation.
@@ -88,14 +96,16 @@ func serviceFailureCaption(action serviceAction) string {
 //
 // The confirmation states the four facts the user has to know: the service
 // starts at boot and keeps running after the window closes, the registration
-// needs administrator rights, nothing is downloaded or copied, and the desktop
-// and the service keep separate data (the surprising one). dataDir is the state
-// directory of the service, so the text names the directory it will really own.
+// needs administrator rights, the narrowed download rule — only the missing
+// console program of this release's own name, only on request, only after its
+// SHA-256 was verified — and that the desktop and the service keep separate
+// data (the surprising one). dataDir is the state directory of the service, so
+// the text names the directory it will really own.
 func installServiceText(dataDir string) string {
 	text := "This registers HFDesk as a Windows service.\n\n" +
 		"The service starts at boot and keeps running after this window closes.\n" +
 		"Installing it needs administrator rights, so a Windows prompt follows.\n\n" +
-		"HFDesk stays portable: nothing is downloaded or copied. The service runs the hfdesk program that sits next to this desktop app.\n\n" +
+		"HFDesk stays portable: the service runs the hfdesk program that sits next to this desktop app. The one file HFDesk can download is that missing program from its own release — only when you ask for it, and only after its SHA-256 is verified; nothing else is downloaded or copied.\n\n" +
 		"This desktop app and the service keep separate data:\n" +
 		"- the settings, jobs and models of this app stay where they are, and\n" +
 		"- the service starts with its own data"
@@ -719,23 +729,236 @@ func serviceLaunchFailedText(action serviceAction, err error) string {
 		" Repeat the action and approve the administrator prompt when Windows shows it; a prompt Windows never shows — for example when a policy blocks the elevation — cannot be approved, and that cause stays."
 }
 
-// serviceSiblingMissingText returns the report of a missing console program.
+// The labels of the missing-program notice.
+const (
+	// siblingMissingDownloadLabel is the primary action: the command
+	// link that fetches the paired console program and continues the
+	// service action the user invoked.
+	siblingMissingDownloadLabel = "Download it and continue"
+	// siblingMissingDismissLabel dismisses the notice and changes
+	// nothing.
+	siblingMissingDismissLabel = "Not now"
+	// siblingMissingManualLabel is the collapsed expander that carries
+	// the instructions for putting the file in place by hand.
+	siblingMissingManualLabel = "Install it manually instead"
+)
+
+// siblingMissingNotice is the copy of the notice a service action shows when
+// its console program is missing.
 //
-// The desktop host does not download, copy or replace a binary, so the program
-// has to be in the folder of the desktop host already. The text names the
-// folder it looked at and how the release is laid out, so the user can put the
-// two programs back together.
-func serviceSiblingMissingText(lookedIn string, err error) string {
-	detail := ""
-	if err != nil {
-		detail = err.Error()
+// The fields are the parts of the redesigned TaskDialog layout: the bold
+// instruction names the file, the first-glance content states what the
+// program is for and the folder it is not in, the download offer — nil when
+// no verified download can be offered — carries the release facts the command
+// link shows, and the manual text is what the collapsed expander and the
+// message box fallback carry as the way without a download. Action is the
+// service action the user invoked, so the copy that continues after a
+// verified download names that action and never another one. The copy is
+// built without any dialog or network in it, so a test can pin the wording.
+type siblingMissingNotice struct {
+	// Action is the service action that continues after a verified
+	// download: install or update.
+	Action serviceAction
+	// Title is the window title of the notice.
+	Title string
+	// Instruction is the bold main line: the missing file, named.
+	Instruction string
+	// Content is the first-glance sentence under it.
+	Content string
+	// Folder is the folder the lookup looked in and the manual steps
+	// point at.
+	Folder string
+	// Download is the resolved offer of the paired release asset, or nil
+	// when only the manual instructions are shown.
+	Download *consoleDownloadOffer
+	// Manual is the text of the manual path.
+	Manual string
+}
+
+// serviceActionNoticePhrases returns how the notice names the action that
+// continues after a verified download: the modifier before "steps" in the
+// note line of the command link, and the noun after "continue with" in the
+// message box fallback.
+//
+// Only the two actions that register from the folder — install and update —
+// reach this notice, and each names the action the user actually invoked, in
+// the words the reports of that same action already use (the
+// serviceActionFailureHeadline family): the note line of an update must not
+// promise the install steps. A start resolves no console program and never
+// gets here; the default keeps the install spelling instead of inventing a
+// phrase for an action that cannot occur.
+func serviceActionNoticePhrases(action serviceAction) (steps, continueWith string) {
+	switch action {
+	case serviceActionUpdate:
+		return "update", "the update"
+	default:
+		return "install", "the installation"
 	}
-	text := "HFDesk could not find the hfdesk program that the service runs.\n\n" + detail + "\n\n" +
-		"The desktop app never downloads or copies a binary. The release ships hfdesk.exe next to hfdesk-desktop.exe"
-	if lookedIn != "" {
-		text += ", and this desktop app was started from " + lookedIn
+}
+
+// newSiblingMissingNotice builds the notice of a failed lookup of the
+// console program for the service action that asked for it.
+//
+// The instruction always names the file the action expected — the pair of a
+// version-stamped program, or hfdesk.exe for a local build — and the content
+// states the folder it is not in. The one failure whose cause stays out of
+// the first glance is the pairing failure of a version-stamped program
+// (marked with errConsolePairMissing): its explanation is the pairing rule
+// the collapsed expander already states. Every other failure of the lookup —
+// an unreadable folder, no candidate, several candidates — keeps its cause
+// beside the first sentence, because that cause is what the manual steps
+// have to deal with.
+func newSiblingMissingNotice(action serviceAction, folder, desktop string, findErr error, offer *consoleDownloadOffer) siblingMissingNotice {
+	missing := pairedConsoleExecutableName(desktop)
+	if missing == "" {
+		missing = consoleExecutableName + executableSuffix
 	}
-	return text + ". Put both programs in the same folder and try again."
+	notice := siblingMissingNotice{
+		Action:      action,
+		Title:       serviceSiblingMissingCaption,
+		Instruction: missing + " is missing",
+		Content:     missingProgramContent(folder),
+		Folder:      folder,
+		Download:    offer,
+		Manual:      siblingMissingManualText(folder, desktop, missing),
+	}
+	if findErr != nil && !errors.Is(findErr, errConsolePairMissing) {
+		notice.Content += "\n\n" + findErr.Error()
+	}
+	return notice
+}
+
+// missingProgramContent returns the first-glance sentence of the notice: what
+// the program is for and the folder it is not in.
+func missingProgramContent(folder string) string {
+	where := folder
+	if where == "" {
+		where = "the folder of this desktop app"
+	}
+	return "The Windows service runs this program, and it is not in " + where + "."
+}
+
+// siblingMissingManualText returns the text of the manual path: how to get
+// the file without a download and where to put it.
+//
+// A desktop program that names its release gets the release to fetch and the
+// pairing rule that makes the two programs belong in one folder; a local
+// build names no release, so its text only states where the file goes. Both
+// end with the one action that follows: run the action again.
+func siblingMissingManualText(folder, desktop, missing string) string {
+	where := folder
+	if where == "" {
+		where = "the folder of this desktop app"
+	}
+	release, namesRelease := consoleReleaseFor(desktop)
+	if namesRelease {
+		return "Get release " + release.Tag + " from " + releaseTagPagePrefix + release.Tag +
+			", put " + missing + " next to hfdesk-desktop.exe in " + where +
+			", and run the action again.\n\n" +
+			"A desktop program of a release only runs the console program of that same release, " +
+			"so the release ships " + missing + " beside hfdesk-desktop.exe and both belong in one folder."
+	}
+	return "Put " + missing + " next to hfdesk-desktop.exe in " + where +
+		" — a release of HFDesk ships both programs in one folder — and run the action again."
+}
+
+// siblingMissingDownloadNote returns the note line under the download command
+// link: the size the release publishes, the release, and what the click leads
+// to — the checksum check and then the ordinary steps of the action that
+// asked for the program, named per action.
+func siblingMissingDownloadNote(notice siblingMissingNotice) string {
+	offer := notice.Download
+	steps, _ := serviceActionNoticePhrases(notice.Action)
+	return consoleSizeText(offer.Size) + " from the official release " + offer.Release.Tag +
+		" · SHA-256 checked · then the usual " + steps + " steps"
+}
+
+// siblingMissingNoticeForFallback returns the notice the message box
+// fallback shows when the task dialog of the notice could not be shown.
+//
+// dialogErr is the failure of that attempt. The offer is only kept when the
+// transfer behind it can actually run, and the transfer shows its progress
+// bar and its Cancel in a task dialog of this same machine moments later: no
+// failure of the attempt proves that the next task dialog can be shown —
+// whatever made it fail counts exactly like a machine without a progress
+// dialog — so every failure drops the offer and the box degrades to
+// manual-only instead of asking a Yes that could only end in the "nothing
+// was downloaded" report. An action that cannot proceed is never offered,
+// the same way a release without an authoritative checksum never offers one.
+// Only an attempt that did not fail keeps the notice as it is; the notice
+// flow reaches this fallback only when one did fail. The instruction, the
+// content and the manual path stay exactly as they are, so the manual-only
+// box still names the file, the folder and the way without a download.
+func siblingMissingNoticeForFallback(notice siblingMissingNotice, dialogErr error) siblingMissingNotice {
+	if dialogErr == nil {
+		return notice
+	}
+	notice.Download = nil
+	return notice
+}
+
+// siblingMissingManualNoticeText returns the whole text of the manual-only
+// notice for the message box fallback: instruction, content and the manual
+// path, in one box.
+func siblingMissingManualNoticeText(notice siblingMissingNotice) string {
+	return notice.Instruction + "\n\n" + notice.Content + "\n\n" + notice.Manual
+}
+
+// siblingMissingChooseText returns the Yes/No text of the message box of a
+// notice that offers the download. The fallback of the notice flow itself is
+// manual-only — siblingMissingNoticeForFallback drops the offer after the
+// failed task dialog attempt — so this text belongs to an offer-bearing
+// notice reaching the box, which the box and its tests keep.
+//
+// A message box has no named buttons, so the text maps Yes and No onto the
+// two choices: the verified download that continues, and the manual path that
+// changes nothing. The continuation is named per action, so the box of an
+// update says update and never installation. No is the default button, so a
+// stray Enter never starts a download — the same rule the confirmation of
+// the installation follows.
+func siblingMissingChooseText(notice siblingMissingNotice) string {
+	offer := notice.Download
+	_, continueWith := serviceActionNoticePhrases(notice.Action)
+	return notice.Instruction + "\n\n" + notice.Content + "\n\n" +
+		"Choose Yes to download " + offer.Release.Asset + " from the official release " + offer.Release.Tag +
+		", check its SHA-256, and continue with " + continueWith + ".\n" +
+		"Choose No to change nothing and put the file there yourself:\n\n" +
+		notice.Manual
+}
+
+// consoleDownloadProgressText returns the instruction and the content of the
+// progress dialog of the transfer: what is being fetched, and where from —
+// with the check that runs before the file is used.
+func consoleDownloadProgressText(offer *consoleDownloadOffer) (instruction, content string) {
+	return "Downloading " + offer.Release.Asset + "…",
+		consoleSizeText(offer.Size) + " from the official release " + offer.Release.Tag +
+			" · SHA-256 is checked before the file is used"
+}
+
+// consoleDownloadFailedText returns the report of a download that did not
+// finish or did not verify: the result, the cause and the one next action —
+// the manual path.
+//
+// The report states only what the mechanism guarantees: the clean line says
+// that this download left no file of its own behind — true whether nothing
+// was ever created or cleanup removed what was — and claims nothing about
+// files the folder already held or the user placed beside it; a file whose
+// removal failed is named with its path instead of being covered by that
+// line, because a report that hides a leftover sends the user looking for a
+// file the report said was not there. Neither leftover is called "partial":
+// the leftover of a cancelled transfer is the complete program the transfer
+// placed, so only the guaranteed facts — a file remains there, and it has to
+// be deleted — are reported.
+func consoleDownloadFailedText(notice siblingMissingNotice, downloadErr error) string {
+	offer := notice.Download
+	text := "HFDesk could not download " + offer.Release.Asset + ".\n\n" + downloadErr.Error() + "\n\n"
+	var failure *consoleDownloadError
+	if errors.As(downloadErr, &failure) && failure.leftover != "" {
+		text += "A file remains at " + failure.leftover + " and could not be removed: delete it yourself.\n\n"
+	} else {
+		text += "This download left no file behind in " + notice.Folder + ".\n\n"
+	}
+	return text + notice.Manual
 }
 
 // unknownServiceActionText returns the report of an action the helper does not

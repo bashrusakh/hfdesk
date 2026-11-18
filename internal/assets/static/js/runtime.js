@@ -143,6 +143,11 @@
     renderTimer: null,
     // statusTimer is the status refresh interval.
     statusTimer: null,
+    // serviceInstall marks the install-service action while its request is
+    // in flight, so a second click never reaches the host beside the first
+    // one. The host's own single-action guard refuses the clicks that get
+    // through anyway, exactly like a second tray click.
+    serviceInstall: false,
     // statusError and logError hold the current failures. They are shown in
     // the error banner, which never blocks the view.
     statusError: '',
@@ -162,6 +167,8 @@
     statusDot: $('statusDot'),
     statusLabel: $('statusLabel'),
     versionLabel: $('versionLabel'),
+    serviceBadge: $('serviceBadge'),
+    installServiceButton: $('installServiceButton'),
     serverUrl: $('serverUrl'),
     activeJobs: $('activeJobs'),
     queuedJobs: $('queuedJobs'),
@@ -467,12 +474,58 @@
     el.openLogsButton.title = logFile
       ? `Open the folder of ${logFile}`
       : 'The application does not write a log file';
+
+    applyServiceView(status.serviceState);
+  }
+
+  // applyServiceView writes the service badge of the header and the enable
+  // rule of the install button from one service state, so the success path
+  // and the failure path share exactly one rule.
+  function applyServiceView(serviceState) {
+    const service = serviceStatusView(serviceState);
+    el.serviceBadge.textContent = service.label;
+    el.serviceBadge.classList.remove('badge-success', 'badge-warning', 'badge-secondary');
+    el.serviceBadge.classList.add(service.tone);
+    // The button is enabled only while the state positively reports that
+    // no service is installed; a click that is already in flight keeps it
+    // disabled as well.
+    el.installServiceButton.disabled = state.serviceInstall || service.install !== false;
+  }
+
+  // serviceStatusView maps the service state the server reports onto the
+  // badge of the header and the enable rule of the install button.
+  //
+  // The wording is the one the tray menu shows for the same state, and it
+  // never claims "not installed" for a state that could not be settled: an
+  // unknown state — no host surface, a failed read, or a state the
+  // supervisor did not report — keeps the badge on "unknown" and the
+  // button disabled, so a click can never start an installation beside a
+  // registration the read did not rule out. A build that reports no state
+  // at all is read the same way.
+  function serviceStatusView(state) {
+    if (state === 'not-installed') {
+      return { label: 'Service: not installed', tone: 'badge-secondary', install: false };
+    }
+    if (typeof state !== 'string' || state === '' || state === 'unknown') {
+      return { label: 'Service: unknown', tone: 'badge-warning', install: null };
+    }
+    return { label: `Service: installed (${state})`, tone: 'badge-success', install: true };
   }
 
   // applyStatusFailure renders the state of a server that did not answer.
+  //
+  // The service state could not be read either, so the badge must not keep
+  // the claim its last successful render wrote: beside an Offline dot a
+  // "Service: not installed" badge would assert an absence no read proved.
+  // The window shows the unknown state instead — the wording and tone the
+  // badge already uses for a state that could not be settled — and the
+  // install button is disabled with it, because that action is enabled only
+  // while the state proves absence: the rule the tray menu follows for the
+  // same unsettled read.
   function applyStatusFailure() {
     setIndicator(el.statusDot, 'error');
     el.statusLabel.textContent = 'Offline';
+    applyServiceView('unknown');
   }
 
   // setIndicator colors a status dot of the design system.
@@ -1269,6 +1322,53 @@
     }
   }
 
+  // installService hands the installation of the Windows service to the
+  // host.
+  //
+  // The window performs no step of the flow itself: the host runs the very
+  // function its tray menu runs — the missing-console notice, the
+  // confirmation, the administrator prompt, the handover — and reports its
+  // own outcome there, so the window adds no second report beside those
+  // dialogs. While the request is in flight the button stays disabled, so a
+  // second click never reaches the host; a click that still gets through
+  // while the flow runs (one started from the tray, or one after the
+  // request returned) is refused by the host's single-action guard, exactly
+  // like a second tray click.
+  async function installService() {
+    if (state.serviceInstall) return;
+    state.serviceInstall = true;
+    el.installServiceButton.disabled = true;
+
+    try {
+      await fetchJSON('/api/runtime/install-service', { method: 'POST' });
+    } catch (err) {
+      if (err.status === 404) {
+        // The endpoint is not part of this build: what this click
+        // leaves behind is the tooltip that names the missing endpoint,
+        // and the window says so, instead of failing on every click.
+        // The disabled state is only the one the click itself set —
+        // the next status refresh decides the button again, and only
+        // the service state keeps it disabled then.
+        el.installServiceButton.title = 'This build of HFDesk does not provide the install-service endpoint.';
+        showToast('Installing the service is not available in this build', 'error');
+        announce('Installing the service is not available in this build');
+      } else if (err.status) {
+        showToast(`The service installation could not be started: ${err.message}`, 'error');
+      } else {
+        // The server stopped answering: a committed handover shuts the
+        // host down right after this response, and the native flow has
+        // already reported its outcome there — the window stays quiet
+        // instead of reporting a failure beside that report.
+        logErrorOnce(`The install-service request ended without an answer: ${err.message}`);
+      }
+    } finally {
+      state.serviceInstall = false;
+      // The button does not come back here: the next status refresh is
+      // what decides it, and only while the service is still not
+      // installed.
+    }
+  }
+
   // =========================================
   // Feedback
   // =========================================
@@ -1350,6 +1450,7 @@
     el.clearButton.addEventListener('click', clearView);
     el.openUiButton.addEventListener('click', openUi);
     el.openLogsButton.addEventListener('click', openLogs);
+    el.installServiceButton.addEventListener('click', installService);
 
     window.addEventListener('pagehide', () => {
       // The view remembers the live source it used, so it can resume the

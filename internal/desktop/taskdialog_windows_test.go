@@ -7,6 +7,8 @@ package desktop
 
 import (
 	"encoding/binary"
+	"errors"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -470,4 +472,215 @@ func TestServiceGateMessageBoxFallbackMapsYesNoCancel(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSiblingMissingMessageBoxFallbackMapsYesNo proves how the message box
+// maps the two answers of an offer-bearing notice: Yes takes the verified
+// download, No and every other answer change nothing — and the manual-only
+// notice shows its whole text in one box instead of asking at all. The
+// notice flow's own fallback reaches the box only with the manual-only
+// notice (a failed task dialog attempt drops the offer), so the mapping
+// here is the rule of the box itself.
+func TestSiblingMissingMessageBoxFallbackMapsYesNo(t *testing.T) {
+	const folder = `C:\portable`
+	notice := newSiblingMissingNotice(serviceActionInstall, folder, filepath.Join(folder, testReleaseDesktop),
+		errors.New("pairing"), &consoleDownloadOffer{
+			Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
+			Size:    1024,
+		})
+
+	for _, tc := range []struct {
+		name   string
+		answer int32
+		want   siblingMissingAnswer
+	}{
+		{name: "yes downloads", answer: messageBoxYes, want: siblingMissingDownload},
+		{name: "no keeps the manual path", answer: messageBoxNo, want: siblingMissingDismiss},
+		{name: "cancel changes nothing", answer: messageBoxCancel, want: siblingMissingDismiss},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var asked []string
+			replaceSeam(t, &showSiblingMissingMessageBox, func(text string) int32 {
+				asked = append(asked, text)
+				return tc.answer
+			})
+
+			if got := messageBoxSiblingMissing(notice); got != tc.want {
+				t.Errorf("the fallback answer %d performs %v, want %v", tc.answer, got, tc.want)
+			}
+			if len(asked) != 1 {
+				t.Fatalf("the fallback asked %d boxes, want one", len(asked))
+			}
+			assertNames(t, asked[0], "the fallback text", []string{
+				"Choose Yes to download " + testReleaseAsset,
+				"Choose No to change nothing",
+				notice.Manual,
+			})
+		})
+	}
+
+	t.Run("the manual-only notice asks no question", func(t *testing.T) {
+		replaceSeam(t, &showSiblingMissingMessageBox, func(string) int32 {
+			t.Error("the manual-only notice asked the Yes/No question of an offer it does not make")
+			return messageBoxNo
+		})
+		messages := recordMessages(t)
+
+		manual := newSiblingMissingNotice(serviceActionInstall, folder, filepath.Join(folder, "hfdesk-desktop.exe"),
+			errors.New("there is no hfdesk.exe in "+folder), nil)
+		if got := messageBoxSiblingMissing(manual); got != siblingMissingDismiss {
+			t.Errorf("the manual-only notice performs %v, want no action", got)
+		}
+		if len(*messages) != 1 {
+			t.Fatalf("the fallback showed %d boxes, want the one notice", len(*messages))
+		}
+		if (*messages)[0].caption != serviceSiblingMissingCaption {
+			t.Errorf("the caption is %q, want %q", (*messages)[0].caption, serviceSiblingMissingCaption)
+		}
+		assertNames(t, (*messages)[0].text, "the notice text", []string{
+			manual.Instruction,
+			manual.Content,
+			manual.Manual,
+		})
+	})
+}
+
+// TestSiblingMissingDialogLayoutPinsButtonsOrderAndDefault proves the task
+// dialog composition of the missing-console notice without a dialog: the
+// button set with their ids, the display order, the label and the answer of
+// every button, which answer Enter selects, and the standard-button set of
+// each composition.
+//
+// The offered download is the first command link — the primary answer, its
+// label carrying the download note as the line under it — and "Not now" is
+// the default button of both compositions, so Enter never starts a download.
+// The manual-only notice has no custom button at all: it closes with the
+// single standard OK button, which is its default and changes nothing. A
+// silently changed button layout would pass every wording test, so this pins
+// the pure layout function the dialog itself is built from, the way the
+// service gate's layout is pinned.
+func TestSiblingMissingDialogLayoutPinsButtonsOrderAndDefault(t *testing.T) {
+	const folder = `C:\portable`
+	offered := newSiblingMissingNotice(serviceActionInstall, folder, filepath.Join(folder, testReleaseDesktop),
+		errors.New("pairing"), &consoleDownloadOffer{
+			Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
+			Size:    1024,
+		})
+	manual := newSiblingMissingNotice(serviceActionInstall, folder, filepath.Join(folder, "hfdesk-desktop.exe"),
+		errors.New("there is no hfdesk.exe in "+folder), nil)
+
+	for _, tc := range []struct {
+		name             string
+		notice           siblingMissingNotice
+		wantLabels       []string
+		wantIDs          []int32
+		wantAnswers      []siblingMissingAnswer
+		wantDefault      int32
+		wantStandard     uint32
+		wantCommandLinks bool
+	}{
+		{
+			name:             "the offered download",
+			notice:           offered,
+			wantLabels:       []string{"Download it and continue", "Not now"},
+			wantIDs:          []int32{siblingMissingDownloadButtonID, siblingMissingDismissButtonID},
+			wantAnswers:      []siblingMissingAnswer{siblingMissingDownload, siblingMissingDismiss},
+			wantDefault:      siblingMissingDismissButtonID,
+			wantCommandLinks: true,
+		},
+		{
+			name:         "the manual-only notice",
+			notice:       manual,
+			wantDefault:  standardButtonOKID,
+			wantStandard: tdcOKButton,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dialog := siblingMissingDialogLayout(tc.notice)
+
+			if dialog.defaultButton != tc.wantDefault {
+				t.Errorf("the default button is %d, want %d", dialog.defaultButton, tc.wantDefault)
+			}
+			if answer, err := dialog.answer(dialog.defaultButton); err != nil || answer != siblingMissingDismiss {
+				t.Errorf("the default button answers (%v, %v), want the dismiss answer without an error: Enter must never start a download",
+					answer, err)
+			}
+			if dialog.standardButtons != tc.wantStandard {
+				t.Errorf("the standard buttons are %#x, want %#x", dialog.standardButtons, tc.wantStandard)
+			}
+			if dialog.commandLinks != tc.wantCommandLinks {
+				t.Errorf("the command links are %t, want %t", dialog.commandLinks, tc.wantCommandLinks)
+			}
+			if len(dialog.buttons) != len(tc.wantIDs) {
+				t.Fatalf("the dialog has %d buttons with the ids %v, want %d with %v",
+					len(dialog.buttons), siblingMissingButtonIDs(dialog.buttons), len(tc.wantIDs), tc.wantIDs)
+			}
+			for i, button := range dialog.buttons {
+				if button.id != tc.wantIDs[i] {
+					t.Errorf("button %d has the id %d, want %d", i, button.id, tc.wantIDs[i])
+				}
+				if button.answer != tc.wantAnswers[i] {
+					t.Errorf("button %d performs %v, want %v", i, button.answer, tc.wantAnswers[i])
+				}
+				// What the dialog presses is what the composition
+				// answers: the id and the action are checked on
+				// the same button.
+				if answer, err := dialog.answer(button.id); err != nil || answer != tc.wantAnswers[i] {
+					t.Errorf("pressing button %d answered (%v, %v), want %v without an error",
+						i, answer, err, tc.wantAnswers[i])
+				}
+				label := button.label
+				if i == 0 && tc.wantCommandLinks {
+					// The command link carries its label as the
+					// first line and the note as the lines under
+					// it — the note is why the link is worth
+					// reading before the press.
+					first, note, found := strings.Cut(button.label, "\n")
+					if !found {
+						t.Errorf("the command link %q carries no note line", button.label)
+					} else if note != siblingMissingDownloadNote(tc.notice) {
+						t.Errorf("the note of the command link is %q, want %q", note, siblingMissingDownloadNote(tc.notice))
+					}
+					label = first
+				}
+				if label != tc.wantLabels[i] {
+					t.Errorf("button %d is labelled %q, want %q", i, label, tc.wantLabels[i])
+				}
+			}
+		})
+	}
+
+	// Every way of leaving either dialog changes nothing, and an id the
+	// dialog never sends is reported instead of guessed: a button the host
+	// does not know must never start a download.
+	for name, dialog := range map[string]siblingMissingDialog{
+		"the offered download":   siblingMissingDialogLayout(offered),
+		"the manual-only notice": siblingMissingDialogLayout(manual),
+	} {
+		for _, pressed := range []int32{standardButtonOKID, messageBoxCancel, 0} {
+			if answer, err := dialog.answer(pressed); err != nil || answer != siblingMissingDismiss {
+				t.Errorf("pressing %d of %s answered (%v, %v), want the dismiss answer without an error",
+					pressed, name, answer, err)
+			}
+		}
+		answer, err := dialog.answer(999)
+		if err == nil {
+			t.Errorf("the unknown button of %s returned no error", name)
+		} else if !strings.Contains(err.Error(), "999") {
+			t.Errorf("the error of the unknown button is %q, want it to name the id", err)
+		}
+		if answer != siblingMissingDismiss {
+			t.Errorf("the unknown button of %s performs %v, want no action", name, answer)
+		}
+	}
+}
+
+// siblingMissingButtonIDs returns the ids of the buttons, for a failure
+// message.
+func siblingMissingButtonIDs(buttons []siblingMissingButton) []int32 {
+	ids := make([]int32, 0, len(buttons))
+	for _, button := range buttons {
+		ids = append(ids, button.id)
+	}
+	return ids
 }
