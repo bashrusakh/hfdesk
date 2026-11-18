@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Ranged downloads mark their staging payload sparse before sizing it, removing the disk-speed zero-fill window on Windows; filesystems without sparse support keep the previous behaviour.
+
 ## [1.3.0-beta.6] - 2026-11-18
 
 Beta build of the upcoming `v1.3.0`; the artifacts are pre-release builds for testing and are not marked as the latest stable release.
