@@ -250,6 +250,9 @@ func (m *systemdManager) systemdDBusConnection(ctx context.Context) (*dbus.Conn,
 	}
 }
 
+// A deadline or close can end a read mid-message; godbus v5.2.4 or newer is
+// required because earlier releases panicked in DecodeMessageWithFDs on that
+// read error.
 func connectSystemdPrivate(ctx context.Context, socketPath string) (*dbus.Conn, error) {
 	stream, err := (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 	if err != nil {
