@@ -310,6 +310,14 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   const groupArticles = groupSectionHTML.match(/<article class="cache-selection-group"[\s\S]*?<\/article>/g) || [];
   assert.equal(groupArticles.length, 10);
   assert(groupArticles.every(article => !article.includes('confirmDeleteCache')), 'model groups must not call whole-repository delete');
+  const splitRow = groupArticles.find(article => article.includes('title="split Q5 family"'));
+  assert(splitRow && splitRow.includes('· 2 shards') && !splitRow.includes('cache-selection-facts'), 'a multi-file group counts shards once in the info line');
+  const wideRow = groupArticles.find(article => article.includes('title="same-q-family-a"'));
+  assert(wideRow && wideRow.includes('· 25 shards') && !wideRow.includes('cache-selection-facts'), 'a 25-file group counts shards once');
+  assert(!groupSectionHTML.includes('cache-detail-danger'), 'the model danger block stays out of the scrolled contents');
+  assert.equal((modalHTML.match(/class="cache-detail-danger"/g) || []).length, 1, 'the model has one danger entry point');
+  assert(modalHTML.indexOf('id="cacheDangerHost"') < modalHTML.indexOf('class="cache-detail-actions"'), 'the model danger block sits directly above the footer');
+  assert(modalHTML.includes('cache-detail-danger-target') && modalHTML.includes('title="/friendly/model"'), 'the model danger block names the opened copy');
   assert(!calls.some(call => call.method === 'DELETE'));
   assert(!modalHTML.includes('cache-selection-pick'), 'Delete is direct; no redundant Select action');
   const footerHTML = modalHTML.match(/<div class="cache-detail-actions">([\s\S]*?)<\/div>/)?.[1] || '';
@@ -325,13 +333,19 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(modalHTML.includes('/scan/one'), 'location choices remain available after selecting one');
   assert.equal(textContent(modalHTML.match(/<h4 id="cacheContentsHeading"[^>]*>([\s\S]*?)<\/h4>/)?.[1] || ''), 'GGUF groups', 'the contents heading stays one short label after switching');
   assert(modalHTML.includes('/cache/hub/org--model'));
-  assert(modalHTML.includes('2 shards') && modalHTML.includes('2 saved versions'), 'the HF group shows shards and saved versions as facts');
+  assert(modalHTML.includes('2 shards') && modalHTML.includes('2 saved versions'), 'the HF group splits shard and version counts across its two lines');
   assert(modalHTML.includes('title="/cache/hub/org--model"'), 'the selected location keeps its full path in title');
   assert.equal((modalHTML.match(/id="cacheSelectionLocation"/g) || []).length, 1, 'switching keeps one location select');
   assert(nodes.get('#cacheContentsHeading').focused, 'a location change returns focus to the contents heading');
+  assert(!nodes.get('#cacheSelectionSection').html.includes('cache-detail-danger'), 'switching locations does not move the danger block into the scroll');
+  assert.equal((modalHTML.match(/class="cache-detail-danger"/g) || []).length, 1, 'switching locations keeps one danger entry point');
+  assert(modalHTML.includes('title="/friendly/model"'), 'the danger target stays the opened copy after switching locations');
   const hfRowArticles = modalHTML.match(/<article class="cache-selection-group"[^>]*>[\s\S]*?<\/article>/g) || [];
+  const hfGroupRow = hfRowArticles.find(article => article.includes('data-group-id="grp-hf"'));
+  assert(hfGroupRow && hfGroupRow.includes('· 2 shards') && hfGroupRow.includes('2 saved versions') && !hfGroupRow.includes('· 2 files'), 'the HF group does not repeat the shard count as files');
   const hfCompanionRow = hfRowArticles.find(article => article.includes('title="mmproj-F32.gguf"'));
   assert(hfCompanionRow && !hfCompanionRow.includes('cache-selection-facts'), 'a single file with one version and no link gets no facts line');
+  assert(hfCompanionRow.includes('· 1 file'), 'a single-file group keeps its file label');
   assert.equal(nodes.get('#cacheSelectionSection').attributes['aria-busy'], 'false', 'the contents region is not busy after the render');
   assert.equal(nodes.get('#cacheSelectionSection').querySelectorAll('.cache-selection-delete').filter(button => button.disabled).length, 0, 'backend-advertised HF group action is enabled');
   assert.equal((modalHTML.match(/cache-badge-vision-encoder/g) || []).length, 1, 'the HF companion group renders its own badge');
@@ -412,8 +426,12 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(modalHTML.includes('Delete entire dataset cache'));
   const datasetHeaderHTML = modalHTML.match(/<div class="cache-detail-header">[\s\S]*?<\/div>\s*<section id="cacheSelectionSection"/)?.[0] || '';
   assert(datasetHeaderHTML.includes('aria-label="Open org/data"'), 'the dataset title opens the dataset repository');
-  assert(datasetHeaderHTML.includes('<a class="cache-detail-hub-link" href="https://huggingface.co/datasets/org/data" target="_blank" rel="noopener">HF Hub ↗</a>'), 'the external Hub link stays a separate anchor');
+  assert(datasetHeaderHTML.includes('<a class="cache-detail-hub-link" href="https://huggingface.co/datasets/org/data" target="_blank" rel="noopener">HF Hub<svg class="cache-detail-hub-icon"'), 'the external Hub link keeps its own mark');
+  assert(!modalHTML.includes('↗'), 'the Hub link does not depend on a font glyph');
   assert(datasetHeaderHTML.indexOf('</button>') < datasetHeaderHTML.indexOf('cache-detail-hub-link'), 'the Hub link stays a separate sibling after the repository button');
+  const datasetFacts = textContent(datasetHeaderHTML.match(/<p class="cache-detail-facts">([\s\S]*?)<\/p>/)?.[1] || '');
+  assert.equal(datasetFacts, 'This copy · 1 GB · abcdef1', 'dataset facts leave the file count to the sticky heading');
+  assert(!datasetFacts.includes('files'), 'the dataset facts line does not repeat the file count');
   assert.equal((modalHTML.match(/<h4 id="cacheContentsHeading"/g) || []).length, 1, 'the dataset uses one contents heading');
   assert(modalHTML.includes('>Files <span class="cache-selection-counts">· 3</span></h4>'), 'the single Files heading carries the count once');
   assert(!modalHTML.includes('>Files <span class="cache-selection-counts">3 files</span></h4>'), 'the heading does not repeat the files noun');
@@ -422,6 +440,11 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert.equal((modalHTML.match(/class="cache-files-list"/g) || []).length, 1, 'the dataset keeps its file list');
   assert(modalHTML.includes('data/train-00001.parquet'), 'the dataset file list keeps its entries');
   assert(modalHTML.includes('Delete entire dataset cache'), 'the dataset keeps its delete block');
+  const datasetSectionHTML = nodes.get('#cacheSelectionSection').html || '';
+  assert(!datasetSectionHTML.includes('cache-detail-danger'), 'the dataset danger block stays out of the scrolled contents');
+  assert.equal((modalHTML.match(/class="cache-detail-danger"/g) || []).length, 1, 'the dataset has one danger entry point');
+  assert(modalHTML.indexOf('id="cacheDangerHost"') < modalHTML.indexOf('class="cache-detail-actions"'), 'the dataset danger block sits directly above the footer');
+  assert(modalHTML.includes('cache-detail-danger-target') && modalHTML.includes('title="/datasets/data"'), 'the dataset danger block names the opened copy');
   assert(!modalHTML.includes('Repository metadata') && !modalHTML.includes('cache-detail-metadata'), 'datasets lose the metadata block too');
   assert(!calls.some(call => call.method === 'DELETE'));
   detailsFiles = [];
@@ -868,8 +891,17 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   assert(modalHTML.includes('Loading repository details…'), 'a stale response cannot overwrite the loading shell');
   assert(modalHTML.includes('cache-detail-modal') && modalHTML.includes('cache-detail-owner">org/') && modalHTML.includes('cache-detail-name">model<'), 'the loading shell keeps the repository identity visible');
 
+  // A dataset loading shell has no files yet, so it must not print a zero count.
+  let finishDatasetDetails;
+  delayNextDetails = { promise: new Promise(resolve => { finishDatasetDetails = resolve; }) };
+  const pendingDatasetDetails = window.test.showCacheDetails('org/data', 'dataset');
+  assert.equal(textContent(modalHTML.match(/<h4 id="cacheContentsHeading"[^>]*>([\s\S]*?)<\/h4>/)?.[1] || ''), 'Files', 'the dataset loading heading omits the unknown count');
+  assert(!modalHTML.includes('cache-selection-counts'), 'the dataset loading heading has no count span');
+  finishDatasetDetails();
+  await pendingDatasetDetails;
+
   // Facts drop unreported values instead of inventing "Not reported"; the
-  // friendly path and download provenance are optional single lines.
+  // friendly path and download provenance are rejected even when supplied.
   async function reopenWith(overrides) {
     detailsSource = 'Local';
     detailsPath = '/opened/copy';
@@ -943,7 +975,7 @@ const selectionFixture = JSON.parse(JSON.stringify(currentSelection));
   detailsDownloadStatus = 'unknown';
 
   if (process.env.CACHE_UI_FIXTURE_URL) await checkBrowserLayout();
-  console.log('PASS: two-line Repository Details header with a live-context repository title button, one facts line, no friendly/download secondary lines, one native location select in the sticky heading, GGUF rows without inventory disclosures, danger zone and ghost footer; location focusing; delete focus/scroll restoration; quant-titled, left-aligned group confirmations with definition rows, one-sentence consequences, right-aligned size rows, inline link-only notes, versioned and vision-encoder variants, pending disabled state, untouched whole-copy dialog; exact local/HF request composition; all saved versions; shared-payload/207/conflict results; cancel; exact refresh/context; dataset single Files heading and file list; full member inventories with sizes; metadata removal; model/dataset title navigation at the default revision; escaping');
+  console.log('PASS: two-line Repository Details header with a live-context repository title button, one facts line, no friendly/download secondary lines, one native location select in the sticky heading, GGUF rows with shard/file counts rendered once, a fixed danger block above the footer, and a font-independent hub icon; location focusing; delete focus/scroll restoration; quant-titled, left-aligned group confirmations with definition rows, one-sentence consequences, right-aligned size rows, inline link-only notes, versioned and vision-encoder variants, pending disabled state, untouched whole-copy dialog; exact local/HF request composition; all saved versions; shared-payload/207/conflict results; cancel; exact refresh/context; dataset single Files heading and file list; full member inventories with sizes; metadata removal; model/dataset title navigation at the default revision; escaping');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 
 // Optional real-DOM/layout layer against an isolated read-only fixture serving
@@ -970,7 +1002,7 @@ async function checkBrowserLayout() {
           scrollCount: modal.querySelectorAll('.cache-detail-scroll').length,
           groupsInside: scroll.contains(modal.querySelector('.cache-selection-groups')),
           othersInside: scroll.contains(modal.querySelector('.cache-selection-other')),
-          dangerInside: scroll.contains(modal.querySelector('.cache-detail-danger')),
+          dangerOutside: !scroll.contains(modal.querySelector('.cache-detail-danger')) && modal.contains(modal.querySelector('.cache-detail-danger')),
           headingOutside: !scroll.contains(section.querySelector('h4')),
           collapsed: Array.from(modal.querySelectorAll('details')).every(node => !node.open),
           facts: Array.from(modal.querySelectorAll('.cache-detail-header .cache-detail-facts'), node => node.textContent.trim()),
@@ -984,14 +1016,19 @@ async function checkBrowserLayout() {
           scrollHeight: scroll.clientHeight,
           rowHeight: modal.querySelector('.cache-selection-group').getBoundingClientRect().height,
           headerTop: modal.querySelector('.cache-detail-header').getBoundingClientRect().top,
-          dangerTop: modal.querySelector('.cache-detail-danger').getBoundingClientRect().top
+          dangerTop: modal.querySelector('.cache-detail-danger').getBoundingClientRect().top,
+          dangerBottom: modal.querySelector('.cache-detail-danger').getBoundingClientRect().bottom,
+          actionsTop: modal.querySelector('.cache-detail-actions').getBoundingClientRect().top,
+          scrollBottom: scroll.getBoundingClientRect().bottom
         };
       });
       assert.deepEqual(structure.children, width === 360
-        ? ['cache-detail-header', 'cache-detail-section', 'cache-detail-actions']
-        : ['cache-detail-header', 'cache-detail-section', 'cache-detail-actions', 'cache-detail-resize-grip']);
+        ? ['cache-detail-header', 'cache-detail-section', 'cache-detail-danger-host', 'cache-detail-actions']
+        : ['cache-detail-header', 'cache-detail-section', 'cache-detail-danger-host', 'cache-detail-actions', 'cache-detail-resize-grip']);
       assert.equal(structure.scrollCount, 1);
-      for (const key of ['groupsInside', 'othersInside', 'dangerInside', 'headingOutside', 'collapsed']) assert(structure[key], key);
+      for (const key of ['groupsInside', 'othersInside', 'dangerOutside', 'headingOutside', 'collapsed']) assert(structure[key], key);
+      assert(structure.dangerTop >= structure.scrollBottom - 0.5, 'the danger block starts below the contents scroll');
+      assert(structure.dangerBottom <= structure.actionsTop + 0.5, 'the danger block sits directly above the footer');
       assert.equal(structure.selectCount, 1);
       assert.equal(structure.locationLabel, 'Files from');
       assert.equal(structure.metadata, 0, 'no panel, metadata block, or definition rows');
@@ -1039,7 +1076,7 @@ async function checkBrowserLayout() {
       const file = await first.locator('.cache-selection-file-path').boundingBox();
       const del = await first.getByRole('button', { name: /^Delete Q4_K_M / }).boundingBox();
       assert(file.x + file.width <= del.x + 0.5, 'long path stays left of its action');
-      const stationary = () => page.evaluate(() => ['.modal-header', '.cache-detail-header', '.cache-selection-sticky', '.cache-detail-actions'].map(selector => document.querySelector(selector).getBoundingClientRect().y));
+      const stationary = () => page.evaluate(() => ['.modal-header', '.cache-detail-header', '.cache-selection-sticky', '.cache-detail-danger', '.cache-detail-actions'].map(selector => document.querySelector(selector).getBoundingClientRect().y));
       const before = await stationary();
       await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-local.png` });
       await page.locator('.cache-detail-scroll').evaluate(node => { node.scrollTop = 450; });
@@ -1109,7 +1146,8 @@ async function checkBrowserLayout() {
       const locationSelect = page.getByLabel('Files from', { exact: true });
       await locationSelect.selectOption('1');
       await page.getByRole('heading', { name: 'GGUF groups', exact: true }).waitFor();
-      await page.getByText('2 shards · 2 saved versions', { exact: true }).waitFor();
+      await page.getByText('2 saved versions', { exact: true }).waitFor();
+      assert(await page.locator('.cache-selection-group').filter({ hasText: '2 shards' }).count(), 'the HF group counts its shards once');
       assert((await locationSelect.getAttribute('title')).includes('/cache/hub/'));
       assert.equal(await page.evaluate(() => document.activeElement?.id), 'cacheContentsHeading', 'location change focuses the heading');
       assert.deepEqual(await stationary(), before, 'switching location keeps the chrome still');
@@ -1154,13 +1192,17 @@ async function checkBrowserLayout() {
           assert.equal(await page.locator('#cacheContentsHeading').count(), 1);
           assert.match((await page.locator('#cacheContentsHeading').textContent()).trim(), /^Files · \d+$/u, 'the dataset heading renders the count once without repeating the noun');
           assert.equal(await page.getByText('Files (1)', { exact: true }).count(), 0, 'no duplicate inner Files heading');
+          const datasetFactsText = (await page.locator('.cache-detail-header .cache-detail-facts').textContent()).trim();
+          assert(!/\d+ files?/u.test(datasetFactsText), 'the dataset facts line leaves the file count to the sticky heading');
+          assert(await page.locator('.cache-detail-danger-target').count(), 'the dataset danger block names its target');
         } else {
           await page.getByText('weights.safetensors', { exact: true }).first().waitFor();
           await page.getByRole('button', { name: 'Delete entire model cache', exact: true }).waitFor();
           assert.equal(await page.locator('select#cacheSelectionLocation').count(), 0, 'no locations means no empty switch');
         }
         assert.equal(await page.locator('.cache-detail-scroll').count(), 1);
-        assert.equal(await page.locator('.cache-detail-scroll .cache-detail-danger').count(), 1);
+        assert.equal(await page.locator('.cache-detail-scroll .cache-detail-danger').count(), 0, 'no danger block inside the scroll');
+        assert.equal(await page.locator('.cache-detail-danger').count(), 1, 'one fixed danger block remains');
         assert.equal(await page.locator('.cache-detail-scroll .cache-detail-metadata').count(), 0);
         assert.equal(await page.locator('.cache-detail-scroll .cache-detail-section h4').count(), 0, 'no metadata headings remain');
         assert(await page.locator('.cache-detail-header .cache-detail-facts').isVisible(), 'the opened-copy facts stay visible');
@@ -1171,7 +1213,8 @@ async function checkBrowserLayout() {
       await page.getByText('Unable to load repository details:', { exact: false }).waitFor();
       assert.equal(await page.locator('.cache-detail-scroll .cache-files-list').count(), 1, 'failed selection preserves the snapshot file fallback');
       assert.equal(await page.locator('.cache-detail-scroll .cache-detail-metadata').count(), 0);
-      assert.equal(await page.locator('.cache-detail-scroll .cache-detail-danger').count(), 1);
+      assert.equal(await page.locator('.cache-detail-scroll .cache-detail-danger').count(), 0, 'error state keeps danger outside the scroll');
+      assert.equal(await page.locator('.cache-detail-danger').count(), 1, 'error state keeps one fixed danger block');
       assert(await page.locator('.cache-detail-header .cache-detail-name').isVisible(), 'the failed selection keeps identity visible');
       await page.getByRole('button', { name: 'Delete entire model folder', exact: true }).waitFor();
       await page.screenshot({ path: `/tmp/opencode/repository-details-${width}-selection-error.png` });
@@ -1193,6 +1236,6 @@ async function checkBrowserLayout() {
       assert.deepEqual(errors, [], 'no page runtime errors');
       await page.close();
     }
-    console.log('PASS: real DOM region order/ancestry; 760px contents viewport; 360px two-line rows and no horizontal scroll; compact facts header; title button hover/focus stability; one native location select in the sticky heading; HF shards/versions facts; left-aligned confirmation with definition rows, open long inventory, right-aligned sizes, versioned/vision screenshots, centred whole-copy dialog; dataset single Files heading and file list; no metadata block; loading/error states inside contents; no writes');
+    console.log('PASS: real DOM region order/ancestry; 760px contents viewport; 360px two-line rows and no horizontal scroll; compact facts header; title button hover/focus stability; one native location select in the sticky heading; fixed danger block; merged shard/version facts; left-aligned confirmation with definition rows, open long inventory, right-aligned sizes, versioned/vision screenshots, centred whole-copy dialog; dataset single Files heading and file list; no metadata block; loading/error states inside contents; no writes');
   } finally { await browser.close(); }
 }

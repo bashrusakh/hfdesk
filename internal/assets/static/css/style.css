@@ -2351,12 +2351,19 @@ a {
 }
 
 .cache-detail-hub-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   flex-shrink: 0;
   border-radius: 4px;
   color: var(--color-primary);
   font-size: 12px;
   font-weight: 500;
   text-decoration: none;
+}
+
+.cache-detail-hub-icon {
+  flex-shrink: 0;
 }
 
 .cache-detail-hub-link:hover {
@@ -2368,6 +2375,16 @@ a {
 .cache-detail-hub-link:focus-visible {
   outline: 2px solid var(--color-primary);
   outline-offset: 2px;
+}
+
+.cache-detail-danger-host {
+  flex-shrink: 0;
+  min-width: 0;
+  padding: 10px 20px;
+}
+
+.cache-detail-danger-host .cache-detail-danger {
+  margin: 0;
 }
 
 .cache-detail-danger {
@@ -2382,6 +2399,31 @@ a {
   margin: 0 0 4px;
   color: var(--color-text);
   font-size: 13px;
+}
+
+.cache-detail-danger-target {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+  margin: 0 0 6px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.cache-detail-danger-target > span:first-child {
+  flex-shrink: 0;
+}
+
+.cache-detail-danger-target code {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-text-secondary);
 }
 
 .cache-detail-danger-scope {
@@ -2756,6 +2798,7 @@ a {
     max-height: 92dvh;
   }
   .cache-detail-header { padding: 12px 14px 8px; }
+  .cache-detail-danger-host { padding: 10px 14px; }
   .cache-selection-sticky { padding: 0 14px 8px; }
   .cache-detail-scroll { padding: 10px 14px; }
   .cache-detail-modal .cache-detail-actions {

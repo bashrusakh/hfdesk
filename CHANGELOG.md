@@ -15,7 +15,7 @@ Long-form notes: [docs/releases/1.3.0-beta.6.md](docs/releases/1.3.0-beta.6.md).
 ### Changed
 
 - The selected GGUF group deletion confirmation names the quantization in its title and shows left-aligned facts, a one-sentence scope, and file rows with right-aligned sizes; the whole-copy confirmation is unchanged. (#207)
-- Repository Details uses a two-line identity and **This copy** facts header, opens the repository from its title, and moves location choice into the contents heading instead of the duplicated **This copy** panel, paths, and **Repository metadata** block. (#213)
+- Repository Details uses a two-line identity and **This copy** facts header, opens the repository from its title, keeps whole-copy deletion fixed above the footer with a target path, and moves location choice into the contents heading; dataset and shard counts appear once. (#213)
 
 ## [1.3.0-beta.5] - 2026-11-17
 

@@ -4305,7 +4305,7 @@ async function loadRepositoryDetails(entry) {
     const shortCommit = commit.length > 7 ? commit.slice(0, 7) : commit;
     const facts = [];
     if (data.sizeHuman) facts.push(escapeHtml(data.sizeHuman));
-    if (Number.isFinite(data.fileCount)) facts.push(`${data.fileCount} file${data.fileCount === 1 ? '' : 's'}`);
+    if (data.type !== 'dataset' && Number.isFinite(data.fileCount)) facts.push(`${data.fileCount} file${data.fileCount === 1 ? '' : 's'}`);
     if (shortCommit) {
       const fullCommit = data.manifest?.commit || commit;
       facts.push(`<code class="cache-detail-commit" title="${escapeCacheDetailAttribute(fullCommit)}">${escapeHtml(shortCommit)}</code>`);
@@ -4315,7 +4315,7 @@ async function loadRepositoryDetails(entry) {
       : '';
     const repoLabel = owner ? `${owner}/${name}` : name;
     const hubLink = data.repo && source !== 'Local'
-      ? `<a class="cache-detail-hub-link" href="https://huggingface.co/${data.type === 'dataset' ? 'datasets/' : ''}${encodeURI(data.repo)}" target="_blank" rel="noopener">HF Hub ↗</a>`
+      ? `<a class="cache-detail-hub-link" href="https://huggingface.co/${data.type === 'dataset' ? 'datasets/' : ''}${encodeURI(data.repo)}" target="_blank" rel="noopener">HF Hub<svg class="cache-detail-hub-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="12" height="12" aria-hidden="true" focusable="false"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></a>`
       : '';
     return `<div class="cache-detail-header">
         <div class="cache-detail-title-row">
@@ -4369,8 +4369,10 @@ async function loadRepositoryDetails(entry) {
           ${escapeHtml(action.label)}
         </button>`
       : '';
+    const targetPath = typeof data.path === 'string' ? data.path : '';
     return `<div class="cache-detail-danger" role="group" aria-labelledby="cacheDetailDangerTitle">
         <h4 id="cacheDetailDangerTitle">Delete this copy</h4>
+        ${targetPath ? `<p class="cache-detail-danger-target"><span>Target copy</span> <span class="cache-detail-sep" aria-hidden="true">·</span> <code title="${escapeCacheDetailAttribute(targetPath)}">${escapeHtml(targetPath)}</code></p>` : ''}
         <p class="cache-detail-danger-scope">${escapeHtml(scope)}</p>
         ${withheldReason ? `<p class="cache-detail-danger-reason">${escapeHtml(withheldReason)}</p>` : ''}
         ${actionHtml}
@@ -4396,8 +4398,8 @@ async function loadRepositoryDetails(entry) {
 
   function cacheContentsHeadingHTML(context, location, locationOptions = null) {
     if (context.type === 'dataset') {
-      const count = Array.isArray(context.snapshotFiles) ? context.snapshotFiles.length : 0;
-      return `<h4 id="cacheContentsHeading" class="cache-contents-heading" tabindex="-1">Files <span class="cache-selection-counts">· ${count}</span></h4>`;
+      const count = Array.isArray(context.snapshotFiles) ? context.snapshotFiles.length : null;
+      return `<h4 id="cacheContentsHeading" class="cache-contents-heading" tabindex="-1">Files${count === null ? '' : ` <span class="cache-selection-counts">· ${count}</span>`}</h4>`;
     }
     const select = cacheLocationSelectHTML(locationOptions?.locations || [], locationOptions?.selectedLocationID || '', location, locationOptions?.busy === true);
     return `<div class="cache-contents-head">
@@ -4463,7 +4465,7 @@ async function loadRepositoryDetails(entry) {
       context.dangerHTML = cacheDetailDangerHTML(data);
       const dataset = data.type === 'dataset';
       const initialBody = dataset
-        ? `${context.filesHTML}${context.dangerHTML}`
+        ? context.filesHTML
         : '<div class="loading-state"><div class="spinner"></div></div><p class="cache-selection-readonly">Loading GGUF groups…</p>';
       setModalContent(`
         <div class="cache-detail-modal">
@@ -4471,6 +4473,7 @@ async function loadRepositoryDetails(entry) {
           <section id="cacheSelectionSection" class="cache-detail-section" role="status" aria-live="polite" aria-busy="${dataset ? 'false' : 'true'}">
             ${cacheContentsSectionHTML(context, null, initialBody, !dataset)}
           </section>
+          <div id="cacheDangerHost" class="cache-detail-danger-host">${context.dangerHTML}</div>
           <div class="cache-detail-actions">
             <button class="btn btn-ghost" type="button" onclick="refreshCacheDetails()">Refresh</button>
             <button class="btn btn-ghost" type="button" onclick="hideModal()">Close</button>
@@ -4491,7 +4494,7 @@ async function loadRepositoryDetails(entry) {
       if (!cacheDetailsContextIsCurrent(context)) return;
       const section = $('#cacheSelectionSection');
       if (!section) return;
-      const body = `<p class="cache-selection-warning">Unable to load repository details: ${escapeHtml(e.message)}</p>${cacheAllFilesHeadingHTML(context)}${context.filesHTML || ''}${context.dangerHTML || ''}`;
+      const body = `<p class="cache-selection-warning">Unable to load repository details: ${escapeHtml(e.message)}</p>${cacheAllFilesHeadingHTML(context)}${context.filesHTML || ''}`;
       section.innerHTML = cacheContentsSectionHTML(context, null, body);
       section.setAttribute('aria-busy', 'false');
     }
@@ -4554,11 +4557,9 @@ async function loadRepositoryDetails(entry) {
       ? '<span class="cache-badge cache-badge-vision-encoder" title="Multimodal vision encoder companion">VISION</span>'
       : (group.quant ? `<span class="cache-badge">${escapeHtml(group.quant)}</span>` : '');
     const size = groupSize > 0 ? `<span class="cache-selection-size">${escapeHtml(formatBytes(groupSize))}</span>` : '';
-    const countLabel = `${distinctPaths} file${distinctPaths === 1 ? '' : 's'}`;
-    // Facts replace the old per-row inventory disclosure and appear only when
-    // they add information beyond the line-1 counts.
+    const countLabel = distinctPaths === 1 ? '1 file' : `${distinctPaths} shards`;
+    // Facts carry only the values not already expressed by the info line.
     const facts = [];
-    if (distinctPaths > 1) facts.push(`${distinctPaths} shards`);
     if (savedVersions > 1) facts.push(`${savedVersions} saved versions`);
     if (members.some(member => member.linkOnly)) facts.push('link only');
     const accessibleName = (isVision
@@ -4614,8 +4615,7 @@ async function loadRepositoryDetails(entry) {
       ${!locations.length ? '<p class="cache-selection-readonly">No selectable model locations are available.</p>' : ''}
       ${location ? `<div class="cache-selection-groups">${groupRows || '<p class="cache-selection-readonly">No GGUF groups were found in this location.</p>'}</div>` : ''}
       ${hasGroups ? otherFilesHtml : ''}
-      ${location ? '' : `${cacheAllFilesHeadingHTML(context)}${context.filesHTML || ''}`}
-      ${context.dangerHTML || ''}`;
+      ${location ? '' : `${cacheAllFilesHeadingHTML(context)}${context.filesHTML || ''}`}`;
     const host = $('#modalBody');
     if (!host || !cacheDetailsContextIsCurrent(context)) return;
     let section = $('#cacheSelectionSection');
@@ -4683,7 +4683,7 @@ async function loadRepositoryDetails(entry) {
         const warning = $('#cacheSelectionSection');
         if (warning) {
           warning.setAttribute('aria-busy', 'false');
-          warning.innerHTML = cacheContentsSectionHTML(context, nextLocation, `<p class="cache-selection-warning">Unable to load groups from ${escapeHtml(nextLocation.source)} location <code>${escapeHtml(nextLocation.path)}</code>: ${escapeHtml(error.message)}</p>${context.dangerHTML || ''}`, false, { locations, selectedLocationID: nextLocation.id });
+          warning.innerHTML = cacheContentsSectionHTML(context, nextLocation, `<p class="cache-selection-warning">Unable to load groups from ${escapeHtml(nextLocation.source)} location <code>${escapeHtml(nextLocation.path)}</code>: ${escapeHtml(error.message)}</p>`, false, { locations, selectedLocationID: nextLocation.id });
           $('#cacheContentsHeading')?.focus?.();
         }
       }
@@ -4919,7 +4919,7 @@ async function loadRepositoryDetails(entry) {
       const section = $('#cacheSelectionSection');
       if (section) {
         section.setAttribute('aria-busy', 'false');
-        section.innerHTML = cacheContentsSectionHTML(context.detailsContext, null, `${notice}<p class="cache-selection-warning">Unable to refresh GGUF locations: ${escapeHtml(error.message)}. Close and reopen Details before another delete.</p>${context.detailsContext.dangerHTML || ''}`);
+        section.innerHTML = cacheContentsSectionHTML(context.detailsContext, null, `${notice}<p class="cache-selection-warning">Unable to refresh GGUF locations: ${escapeHtml(error.message)}. Close and reopen Details before another delete.</p>`);
         const scroll = $('#cacheContentsScroll');
         if (scroll) scroll.scrollTop = Number(context.restoreScrollTop) || 0;
       }
