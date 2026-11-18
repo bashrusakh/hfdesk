@@ -150,8 +150,10 @@ or job ownership behavior. This section is the agent-level summary; when it and
   ancestor and the same descending component spellings (documented residual).
   Tree removals admit the tree first and
   treat a missing target as gone only after re-verifying the vanish while
-  holding its creator-side keys; an admission that establishes neither fails
-  closed. Shared H clients converge without per-user `OwnershipDir` setup.
+  holding its creator-side keys — a target that vanished inside resolution's
+  observation gap is classified missing and takes this same flow as one that
+  vanished before resolution began — while an admission that establishes
+  neither fails closed. Shared H clients converge without per-user `OwnershipDir` setup.
   `Settings.OwnershipDir` is for flat `OutputDir` mode only; a non-empty value
   in cache mode is rejected instead of selecting another cache namespace.
   Cache-owned node metadata is separated from payload components, IDs/profiles
@@ -255,7 +257,22 @@ or job ownership behavior. This section is the agent-level summary; when it and
   admission a live holder refuses survives without failing the operation, and
   with no held domain the family is left alone. A route removes only the
   artifacts it creates (B1): for example, a multipart HEAD failure leaves a
-  single-route `.part`/sidecar alone.
+  single-route `.part`/sidecar alone. In flat output mode only, explicit-cancel
+  cleanup and `CleanupJobPartFiles` then prune the removed partial's directory
+  chain while each directory is completely empty, up to — but never including —
+  the output root ("remove any now-empty directory" semantics, no
+  created-directory tracking); any content, a symlink or non-directory, a path
+  outside the root, or a live writer's admission stops the chain and survives.
+  Each removal takes the directory's tree-removal admission right after the
+  destination scope is released (the scope's shared directory keys refuse that
+  exclusive admission while held), so a concurrent writer is never disrupted:
+  a component that vanishes inside the writer's path-resolution observation gap
+  resolves as missing and is recreated by the writer preparation's create-parent
+  step (no raw stat ENOENT reaches the per-file fatal path), and a directory
+  that vanishes between the pruning's emptiness check and its admission counts
+  as already gone — the chain continues upward, while a refused/busy admission
+  (a live owner) stops it. Pause and internal abort preserve resumable
+  partials and never prune, and the HF cache layout is never pruned.
 - `Settings.Verify` controls LFS verification too: `none`, `size` (default, no
   normal-path full-file reread), `sha256` (at most one pre-publication pass),
   and `etag` (the same pre-publication pass for a known digest; historical

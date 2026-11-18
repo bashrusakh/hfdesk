@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Cancelling a download (or cleaning a paused job's leftover part files) in local-folder mode now removes the directories its removed partials leave completely empty, up to the output root; any directory that still holds content, the output root itself, and the HF cache layout are untouched.
+
 ## [1.3.0-beta.8] - 2026-11-18
 
 Beta build of the upcoming `v1.3.0`; the artifacts are pre-release builds for testing and are not marked as the latest stable release.
