@@ -73,6 +73,11 @@ func appendUniqueOwnershipPaths(paths []string, more ...string) []string {
 	return result
 }
 
+// ownershipPathGapHook, when non-nil, runs inside the observation gaps of the
+// ownership/pruning path machinery ("canonical", "identity", "admit") so a
+// test can vanish the directory there. Production leaves it nil.
+var ownershipPathGapHook func(site, path string)
+
 func canonicalOwnershipPath(name string, directory bool) (string, error) {
 	abs, err := filepath.Abs(filepath.Clean(name))
 	if err != nil {
@@ -99,17 +104,25 @@ func canonicalOwnershipPath(name string, directory bool) (string, error) {
 	for current := parent; ; current = filepath.Dir(current) {
 		resolved, resolveErr := filepath.EvalSymlinks(current)
 		if resolveErr == nil {
-			info, statErr := os.Stat(current)
-			if statErr != nil {
-				return "", statErr
+			if ownershipPathGapHook != nil {
+				ownershipPathGapHook("canonical", current)
 			}
-			if !info.IsDir() {
+			info, statErr := os.Stat(current)
+			switch {
+			case statErr == nil && info.IsDir():
+				for i := len(missing) - 1; i >= 0; i-- {
+					resolved = filepath.Join(resolved, missing[i])
+				}
+				return filepath.Clean(filepath.Join(resolved, base)), nil
+			case errors.Is(statErr, os.ErrNotExist):
+				// Vanished in the gap: the same missing component EvalSymlinks
+				// reports one syscall earlier; walk up like that case.
+				resolveErr = statErr
+			case statErr != nil:
+				return "", statErr
+			default:
 				return "", fmt.Errorf("ownership path parent %q is not a directory", current)
 			}
-			for i := len(missing) - 1; i >= 0; i-- {
-				resolved = filepath.Join(resolved, missing[i])
-			}
-			return filepath.Clean(filepath.Join(resolved, base)), nil
 		}
 		if !errors.Is(resolveErr, os.ErrNotExist) {
 			return "", resolveErr
@@ -303,13 +316,23 @@ func (r *ownershipRealm) resolveOwnershipPath(name string, directory bool) (owne
 				if !info.IsDir() {
 					return ownershipResolvedPath{}, fmt.Errorf("ownership component %q is not a directory", current)
 				}
+				if ownershipPathGapHook != nil {
+					ownershipPathGapHook("identity", current)
+				}
 				objectID, idErr := statDirectoryIdentity(current)
-				if idErr != nil {
+				if idErr != nil && !errors.Is(idErr, os.ErrNotExist) {
 					return ownershipResolvedPath{}, fmt.Errorf("identify ownership directory %q: %w", current, idErr)
 				}
-				keys.objectID = objectID
-				keys.objectKey = r.resourceKey("directory-object", objectID)
-				parentToken = "object:" + objectID
+				if idErr == nil {
+					keys.objectID = objectID
+					keys.objectKey = r.resourceKey("directory-object", objectID)
+					parentToken = "object:" + objectID
+				} else {
+					// Vanished in the gap: the same missing component the stat
+					// reported one syscall earlier.
+					missing = true
+					parentToken = "virtual:" + entryID
+				}
 			case errors.Is(statErr, os.ErrNotExist):
 				missing = true
 				parentToken = "virtual:" + entryID
@@ -342,7 +365,12 @@ func (r *ownershipRealm) resolveOwnershipPath(name string, directory bool) (owne
 			return resolved, nil
 		}
 		if len(resolved.directories) == 0 || resolved.directories[len(resolved.directories)-1].objectKey == "" {
-			return ownershipResolvedPath{}, fmt.Errorf("ownership tree target %q is missing", canonical)
+			// The target (or its chain) is absent — vanished before observation
+			// or inside an observation gap — so the error keeps the absent
+			// identity: tree-removal admission triggers its documented
+			// re-verified-vanish flow on it (it is a trigger, never proof).
+			// Writers never reach this directory-mode check.
+			return ownershipResolvedPath{}, fmt.Errorf("ownership tree target %q is missing: %w", canonical, os.ErrNotExist)
 		}
 		return resolved, nil
 	}
