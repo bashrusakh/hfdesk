@@ -2,10 +2,16 @@
 
 ## [Unreleased]
 
+## [1.3.0-beta.8] - 2026-11-18
+
+Beta build of the upcoming `v1.3.0`; the artifacts are pre-release builds for testing and are not marked as the latest stable release.
+
+Long-form notes: [docs/releases/1.3.0-beta.8.md](docs/releases/1.3.0-beta.8.md).
+
 ### Fixed
 
-- The systemd D-Bus client no longer crashes when a socket deadline or close lands mid-message (godbus v5.2.4).
-- README rendering uses a patched `golang.org/x/net` (GO-2026-6866, GO-2026-6860), and the build toolchain moves to Go 1.26.11.
+- The systemd D-Bus client no longer crashes when a socket deadline or close lands mid-message (godbus v5.2.4). (#215)
+- README rendering uses a patched `golang.org/x/net` (GO-2026-6866, GO-2026-6860), and the build toolchain moves to Go 1.26.11. (#216)
 
 ## [1.3.0-beta.7] - 2026-11-18
 
