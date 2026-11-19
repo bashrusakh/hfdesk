@@ -1106,14 +1106,14 @@ async function scenarioServiceStatus() {
     {
       name: 'a running service',
       state: 'running',
-      label: 'Service: installed (running)',
+      label: 'Service: installed',
       tone: 'badge-success',
       enabled: false
     },
     {
       name: 'a stopped service',
       state: 'stopped',
-      label: 'Service: installed (stopped)',
+      label: 'Service: installed',
       tone: 'badge-success',
       enabled: false
     },
@@ -1189,7 +1189,7 @@ async function scenarioInstallServiceAction() {
   await settle();
   eq(button.disabled, true,
     'the status refresh disables the button once the service is installed');
-  eq(nodes.get('#serviceBadge').textContent, 'Service: installed (running)',
+  eq(nodes.get('#serviceBadge').textContent, 'Service: installed',
     'the badge reports the installed service with the same words');
 
   // A build without the endpoint reports it once instead of failing on

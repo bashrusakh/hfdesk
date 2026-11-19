@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The Windows desktop host's service status line and Runtime / Logs badge only say whether the service is installed — `Service: installed`, `Service: not installed`, `Service: unknown` — dropping the state word that used to follow "installed".
+
 ## [1.3.0-beta.9] - 2026-11-19
 
 Beta build of the upcoming `v1.3.0`; the artifacts are pre-release builds for testing and are not marked as the latest stable release.
