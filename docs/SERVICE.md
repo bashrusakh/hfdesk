@@ -804,7 +804,7 @@ a program of its own: a release ships it next to the console host, and neither
 replaces the other.
 
 - **Tray menu.** The menu starts with a status line that reports the state of
-  the Windows service registration — `Service: installed (running)`,
+  the Windows service registration — `Service: installed`,
   `Service: not installed`, or `Service: unknown` when the state could not be
   read, which never claims a machine without a service — followed by its
   actions: **Open HFDesk** (the web UI of the instance in the default

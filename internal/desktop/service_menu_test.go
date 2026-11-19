@@ -40,39 +40,39 @@ func TestServiceMenuForOneRead(t *testing.T) {
 		{
 			name:           "running service",
 			status:         service.Status{State: service.StateRunning, Running: true},
-			line:           "Service: installed (running)",
+			line:           "Service: installed",
 			installEnabled: false,
 			serviceVisible: true,
 		},
 		{
 			name:           "stopped service",
 			status:         service.Status{State: service.StateStopped},
-			line:           "Service: installed (stopped)",
+			line:           "Service: installed",
 			installEnabled: false,
 			serviceVisible: true,
 		},
 		{
 			name:           "service on its way up",
 			status:         service.Status{State: service.StateStarting},
-			line:           "Service: installed (starting)",
+			line:           "Service: installed",
 			installEnabled: false,
 			serviceVisible: true,
 		},
 		{
 			name:           "failed service",
 			status:         service.Status{State: service.StateFailed},
-			line:           "Service: installed (failed)",
+			line:           "Service: installed",
 			installEnabled: false,
 			serviceVisible: true,
 		},
 		{
 			// A registration whose program is gone is still a
-			// registration: the diagnosis is the state word of the
-			// line, and the items stay the ones of an installed
-			// service.
+			// registration: the line still says installed — it never
+			// carried a state word — and the items stay the ones of an
+			// installed service.
 			name:           "broken registration",
 			status:         service.Status{State: service.StateBroken},
-			line:           "Service: installed (broken)",
+			line:           "Service: installed",
 			installEnabled: false,
 			serviceVisible: true,
 		},

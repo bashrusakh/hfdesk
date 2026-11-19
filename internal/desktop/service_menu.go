@@ -57,16 +57,16 @@ type serviceMenuState struct {
 //
 // The wording never claims "not installed" for a state that could not be
 // read: an unsettled read is "Service: unknown", the one honest word for
-// that machine. A registration is named with its state word — the
-// vocabulary the service gate and `hfdesk service status` already use —
-// so the line reads "Service: installed (running)", "(stopped)" or
-// "(starting)".
+// that machine. A proven registration is named by the one word the
+// decision rests on — the line reads "Service: installed" and nothing
+// else, because the line answers only whether a registration exists, not
+// how it is doing.
 func serviceStatusLine(status service.Status, readErr error) string {
 	switch classifyRegistration(status, readErr) {
 	case registrationAbsent:
 		return "Service: not installed"
 	case registrationPresent:
-		return "Service: installed (" + string(status.State) + ")"
+		return "Service: installed"
 	default:
 		return "Service: unknown"
 	}
