@@ -23,8 +23,11 @@
 
 ### Fixed
 
-- A service action started while the app runs in desktop mode switches the app to the tray and performs instead of asking the user to quit HFDesk; deleting the service returns it to desktop mode, and updating a stopped service keeps the window open.
-- The missing console program is found under either spelling of its version, and a download that cannot be offered states the reason and offers **Try again** instead of a button that disappears.
+- A start, a delete or an update of a service that is not stopped switches the app from desktop mode to the tray and performs instead of asking the user to quit HFDesk.
+- Deleting the service in that switch returns the app to desktop mode.
+- Updating a stopped service keeps the window open.
+- The missing console program is found under either spelling of its version.
+- A download of it that cannot be offered states the reason and offers **Try again** instead of a button that disappears.
 - The log no longer records a state reading while nothing changes; it records state changes and actions.
 - A failed service installation now says what actually went wrong — the start did not run, the program ended too early, the service did not come up in time, or the started service could not be verified — instead of a vague "could not confirm".
 - A registration removed after a failed installation attempt no longer reads as if the service had never been registered.

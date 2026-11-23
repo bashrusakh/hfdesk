@@ -807,8 +807,9 @@ replaces the other.
   instance in the default browser), **Logs** (the log window) and the
   **Service** submenu; a separator and **Quit HFDesk** (a graceful
   shutdown) close it. The whole service section lives inside that submenu:
-  a status line that reports the state of the Windows service
-  registration — `Service: installed`, `Service: not installed`, or
+  a status line that names the state of the Windows service
+  registration — `Service: not installed`, `Service: installed`,
+  `Service: running`, `Service: starting`, `Service: stopping`, or
   `Service: unknown` when the state could not be read, which never claims
   a machine without a service — followed by exactly one group of
   actions. A read that proves no registration shows **Install
@@ -827,12 +828,20 @@ replaces the other.
   machine.
 - **Service actions.** **Install service…** (in the tray and as the window
   button) and the four lifecycle items run one flow. The lifecycle items
-  appear beside a proven registration and each is enabled for the state it
-  can act on: **Start service** only for a settled state that does not run,
-  **Stop service** while the service runs, **Update service** and
-  **Delete service** beside any proven registration. Installing, stopping and
+  appear beside a proven registration and each is enabled only for a
+  settled read it can act on: **Start service** for a settled state that
+  does not run, **Stop service** for a settled state that runs, **Update
+  service** and **Delete service** for any settled registration — while
+  the service is starting or stopping, all four go grey, because a
+  transition is not a state to decide on, and they light up again as soon
+  as the reading settles. Installing, stopping and
   deleting ask for confirmation before Windows shows its administrator
-  prompt; a start or an update goes straight to that prompt. One service
+  prompt; a start or an update from the tray companion goes straight to
+  that prompt, while one from a desktop app that serves its own address
+  asks for confirmation first, and that confirmation names the window
+  closing and the switch to the tray (see below) — except an update of a
+  positively stopped service, which goes straight and keeps the window
+  open. One service
   action runs at a time: a second request while one is in flight is refused
   with its own report instead of raising a second prompt beside the first.
   **Delete service** removes only the registration — the data, the cache,
@@ -857,10 +866,11 @@ replaces the other.
 - **Logs window.** One window — titled `HFDesk - Logs` — covers the desktop
   app and the tray companion alike. It loads the live log page of the
   address it knows: the desktop app's own server, or the registered address
-  of the service. That page shows the same service status as the tray menu,
-  from the same read, and an **Install service…** button that is enabled
-  only while no service is installed — the status refresh flips it once one
-  exists. The button runs the exact installation flow of the tray item (the
+  of the service. That page takes the service state from the server it is
+  loaded from and shows it as a badge that answers only whether a service
+  is installed, and an
+  **Install service…** button that is enabled only while no service is
+  installed — the status refresh flips it once one exists. The button runs the exact installation flow of the tray item (the
   notice, the confirmation, the administrator prompt, the handover and the
   existing reports), and the host's
   single service-action guard refuses a second service action while one is
