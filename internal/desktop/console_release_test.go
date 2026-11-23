@@ -393,6 +393,221 @@ func TestResolveConsoleDownloadOfferNeedsAnExactAssetAndAChecksum(t *testing.T) 
 	})
 }
 
+// TestResolveConsoleDownloadOfferMatchesTheVersionSpellingOfTheName proves
+// the offer survives the one spelling difference between a program name and
+// the asset the release publishes: the release tags v1.3.0-beta.7 and names
+// its assets after that tag, while a build whose name carries the version
+// without the "v" derives the pair in its own spelling. Both spellings name
+// the same file, so the offer resolves in every combination of them, in any
+// case — and another version or another platform still never matches, which
+// is the rule the exact match used to enforce.
+func TestResolveConsoleDownloadOfferMatchesTheVersionSpellingOfTheName(t *testing.T) {
+	payload := "console-program-payload"
+	digest := "sha256:" + sha256Hex(payload)
+
+	for _, tc := range []struct {
+		name    string
+		desktop string // the name of the running desktop program
+		asset   string // the name the release publishes
+		wantOK  bool
+	}{
+		{
+			name:    "the program without the v, the asset with it",
+			desktop: "hfdesk-desktop_windows_amd64_1.3.0-beta.7.exe",
+			asset:   "hfdesk_windows_amd64_v1.3.0-beta.7.exe",
+			wantOK:  true,
+		},
+		{
+			name:    "the program with the v, the asset without it",
+			desktop: "hfdesk-desktop_windows_amd64_v1.3.0-beta.7.exe",
+			asset:   "hfdesk_windows_amd64_1.3.0-beta.7.exe",
+			wantOK:  true,
+		},
+		{
+			name:    "neither side carries the v",
+			desktop: "hfdesk-desktop_windows_amd64_1.3.0-beta.7.exe",
+			asset:   "hfdesk_windows_amd64_1.3.0-beta.7.exe",
+			wantOK:  true,
+		},
+		{
+			name:    "both sides carry the v",
+			desktop: "hfdesk-desktop_windows_amd64_v1.3.0-beta.7.exe",
+			asset:   "hfdesk_windows_amd64_v1.3.0-beta.7.exe",
+			wantOK:  true,
+		},
+		{
+			name:    "another case on both sides",
+			desktop: "HFDESK-DESKTOP_Windows_AMD64_1.3.0-BETA.7.EXE",
+			asset:   "hfdesk_windows_amd64_v1.3.0-beta.7.exe",
+			wantOK:  true,
+		},
+		{
+			name:    "another version never matches",
+			desktop: "hfdesk-desktop_windows_amd64_1.3.0-beta.7.exe",
+			asset:   "hfdesk_windows_amd64_v1.3.0-beta.8.exe",
+		},
+		{
+			name:    "another platform never matches",
+			desktop: "hfdesk-desktop_windows_amd64_1.3.0-beta.7.exe",
+			asset:   "hfdesk_linux_amd64_v1.3.0-beta.7.exe",
+		},
+		{
+			name:    "another program never matches",
+			desktop: "hfdesk-desktop_windows_amd64_1.3.0-beta.7.exe",
+			asset:   "hfdesk-desktop_windows_amd64_v1.3.0-beta.7.exe",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var server *httptest.Server
+			server = serveRelease(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				body, _ := json.Marshal(githubReleaseResponse{Assets: []consoleReleaseAsset{{
+					Name:               tc.asset,
+					Size:               int64(len(payload)),
+					Digest:             digest,
+					BrowserDownloadURL: server.URL + "/download/" + tc.asset,
+				}}})
+				_, _ = w.Write(body)
+			}))
+
+			offer, err := resolveConsoleDownloadOffer(tc.desktop)
+			if !tc.wantOK {
+				if offer != nil {
+					t.Fatalf("the offer points at %v although the release publishes %q", offer, tc.asset)
+				}
+				if err == nil {
+					t.Fatal("the offer failed with no error although the release publishes no pair")
+				}
+				if reason, classified := consoleOfferReasonOf(err); !classified || reason != consoleOfferUnpublished {
+					t.Errorf("the failure %v is classified %q, want %q", err, reason, consoleOfferUnpublished)
+				}
+				return
+			}
+			if err != nil || offer == nil {
+				t.Fatalf("the offer is (%v, %v), want the pair of %q beside the published %q",
+					offer, err, tc.desktop, tc.asset)
+			}
+			// The offer keeps the pair in the spelling of the
+			// program that asked for it — that is the name the file
+			// has to land under for the local lookup to find it —
+			// while the transfer reads it from the published asset.
+			if want := pairedConsoleExecutableName(tc.desktop); offer.Release.Asset != want {
+				t.Errorf("the offer names asset %q, want the pair of the program %q", offer.Release.Asset, want)
+			}
+			if offer.URL == "" || !allowedReleaseDownloadURL(offer.URL) {
+				t.Errorf("the URL %q is not inside the official release downloads", offer.URL)
+			}
+		})
+	}
+}
+
+// TestResolveConsoleDownloadOfferClassifiesWhyItIsUnavailable proves the
+// failure of an offer resolve carries the class the notice reads its one
+// reason line from — an unreadable release, a release that publishes nothing
+// verifiable — and that the message itself is exactly the message it was
+// before, so the report and the log still read the raw cause.
+func TestResolveConsoleDownloadOfferClassifiesWhyItIsUnavailable(t *testing.T) {
+	t.Run("a release that cannot be read is unreachable", func(t *testing.T) {
+		serveRelease(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "gone", http.StatusNotFound)
+		}))
+
+		offer, err := resolveConsoleDownloadOffer(testReleaseDesktop)
+		if offer != nil || err == nil {
+			t.Fatalf("the offer is (%v, %v), want no offer and the failure", offer, err)
+		}
+		if reason, classified := consoleOfferReasonOf(err); !classified || reason != consoleOfferUnreachable {
+			t.Errorf("the failure %v is classified %q, want %q", err, reason, consoleOfferUnreachable)
+		}
+		if !strings.Contains(err.Error(), "cannot be read") {
+			t.Errorf("the error is %q, want the message of the failed read it wraps", err)
+		}
+	})
+
+	t.Run("a release without a checksum is unpublished", func(t *testing.T) {
+		payload := "console-program-payload"
+		var server *httptest.Server
+		server = serveRelease(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(releaseFixtureJSON(server, payload, "", false)))
+		}))
+
+		offer, err := resolveConsoleDownloadOffer(testReleaseDesktop)
+		if offer != nil || err == nil {
+			t.Fatalf("the offer is (%v, %v), want no offer and the failure", offer, err)
+		}
+		if reason, classified := consoleOfferReasonOf(err); !classified || reason != consoleOfferUnpublished {
+			t.Errorf("the failure %v is classified %q, want %q", err, reason, consoleOfferUnpublished)
+		}
+		if !strings.Contains(err.Error(), "no SHA-256 checksum") {
+			t.Errorf("the error is %q, want the message of the missing checksum it wraps", err)
+		}
+	})
+
+	t.Run("a build without a release version fails no class", func(t *testing.T) {
+		serveRelease(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Error("a build without a release version read the release")
+			http.Error(w, "must not be asked", http.StatusInternalServerError)
+		}))
+
+		offer, err := resolveConsoleDownloadOffer(testLocalBuildDesktop)
+		if offer != nil || err != nil {
+			t.Errorf("the local build got (%v, %v), want no offer and no failure", offer, err)
+		}
+	})
+}
+
+// TestDownloadConsoleReleaseTakesTheVersionSpellingOfTheRelease proves the
+// whole path of that spelling difference: the release publishes its asset and
+// its checksum line under the tag — the "v" spelling — while the desktop
+// program of this build names its version without it, and the transfer still
+// resolves the offer, finds the checksum line of that very file and places the
+// verified program under the pair's own name, which is the name the local
+// lookup expects beside the desktop app.
+func TestDownloadConsoleReleaseTakesTheVersionSpellingOfTheRelease(t *testing.T) {
+	payload := "console-program-payload"
+	// The published names carry the tag's "v"; the program does not.
+	const (
+		desktopWithoutVersionPrefix = "hfdesk-desktop_windows_amd64_1.3.0-beta.7.exe"
+		pairWithoutVersionPrefix    = "hfdesk_windows_amd64_1.3.0-beta.7.exe"
+	)
+	var server *httptest.Server
+	// No API digest, so the checksum list is the source of the SHA-256 —
+	// the line of the published name has to answer the pair's spelling.
+	server = serveRelease(t, releaseMux(t, &server, payload, "", true, nil))
+
+	offer, err := resolveConsoleDownloadOffer(desktopWithoutVersionPrefix)
+	if err != nil || offer == nil {
+		t.Fatalf("the offer is (%v, %v), want the pair of the published asset", offer, err)
+	}
+	if offer.Digest != "" {
+		t.Errorf("the digest is %q, want none: this fixture verifies through the checksum list", offer.Digest)
+	}
+	if offer.Release.Asset != pairWithoutVersionPrefix {
+		t.Errorf("the offer names asset %q, want %q", offer.Release.Asset, pairWithoutVersionPrefix)
+	}
+
+	folder := t.TempDir()
+	outcome, err := downloadConsoleRelease(context.Background(), offer, folder, nil)
+	if err != nil {
+		t.Fatalf("the download failed: %v", err)
+	}
+	want := filepath.Join(folder, pairWithoutVersionPrefix)
+	if outcome.Path != want || !outcome.Placed {
+		t.Errorf("the outcome is %+v, want the placed file %q", outcome, want)
+	}
+	content, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("the downloaded program cannot be read: %v", err)
+	}
+	if string(content) != payload {
+		t.Errorf("the file holds %q, want the payload %q", content, payload)
+	}
+	if entries := folderEntries(t, folder); len(entries) != 1 || entries[0] != pairWithoutVersionPrefix {
+		t.Errorf("the folder holds %v, want only %s", entries, pairWithoutVersionPrefix)
+	}
+}
+
 // TestDownloadConsoleReleaseVerifiesBeforeItPublishes proves the happy path:
 // the exact asset lands under its release name in the folder of the desktop
 // app, and nothing else does — the staging file of the transfer is gone
@@ -840,6 +1055,9 @@ func TestSHA256FromChecksums(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		list string
+		// ask is the name the caller looks up; empty means the asset
+		// of the fixture, whose spelling carries the tag's "v".
+		ask  string
 		want string
 		ok   bool
 	}{
@@ -847,12 +1065,43 @@ func TestSHA256FromChecksums(t *testing.T) {
 		{name: "with the binary marker", list: hash + " *" + asset + "\r\n", want: hash, ok: true},
 		{name: "among other lines", list: "deadbeef  other.exe\n" + hash + "  " + asset, want: hash, ok: true},
 		{name: "the same name in another case", list: hash + "  HFDESK_Windows_AMD64_V1.3.0-BETA.7.EXE\n", want: hash, ok: true},
+		{
+			// The published line carries the tag's "v" and the pair
+			// of a build that names its version without it does not:
+			// the same file, so the line is still this file's line.
+			name: "the list carries the v the asked name does not",
+			list: hash + "  " + asset + "\n",
+			ask:  "hfdesk_windows_amd64_1.3.0-beta.7.exe",
+			want: hash, ok: true,
+		},
+		{
+			name: "the asked name carries the v the list does not",
+			list: hash + "  hfdesk_windows_amd64_1.3.0-beta.7.exe\n",
+			want: hash, ok: true,
+		},
+		{
+			// The normalized spelling folds only the "v" and the
+			// case away: another version, another platform or
+			// another program is another file, and its line is
+			// never taken — a sum that cannot be found is a sum the
+			// download refuses to run without.
+			name: "another version is never taken",
+			list: hash + "  " + asset + "\n",
+			ask:  "hfdesk_windows_amd64_1.3.0-beta.8.exe",
+			ok:   false,
+		},
+		{name: "another platform is never taken", list: hash + "  " + asset + "\n",
+			ask: "hfdesk_linux_amd64_v1.3.0-beta.7.exe", ok: false},
 		{name: "another file's line", list: hash + "  other.exe\n", ok: false},
 		{name: "a malformed hash", list: "not-a-hash  " + asset + "\n", ok: false},
 		{name: "an empty list", list: "", ok: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := sha256FromChecksums(tc.list, asset)
+			asked := tc.ask
+			if asked == "" {
+				asked = asset
+			}
+			got, ok := sha256FromChecksums(tc.list, asked)
 			if ok != tc.ok {
 				t.Fatalf("sha256FromChecksums reported %t, want %t", ok, tc.ok)
 			}

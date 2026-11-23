@@ -1216,7 +1216,8 @@ func launchServiceHelper(action serviceAction, waitPID int, instanceMutex string
 // will run, before that action asks for anything else: it looks the program
 // up in the folder of the desktop program and, when it is missing, shows the
 // notice — the verified download of this release's own pair on the user's
-// explicit request, or the manual path.
+// explicit request, the manual route, or, when no download can be offered,
+// the reason for that and a way to ask the release again.
 //
 // It reports the program the action continues with and whether it may
 // continue at all. false means the program is still missing and the action
@@ -1234,15 +1235,32 @@ func offerMissingConsoleProgram(action serviceAction, executable string) (string
 		"action", string(action),
 		"folder", filepath.Dir(executable), "error", err)
 	// The notice is built from the lookup's folder and error, and the
-	// offer is resolved before it: the download button only exists when
+	// offer is resolved before it: the download link only exists when
 	// this release publishes the exact paired asset with an authoritative
-	// checksum — otherwise the notice keeps its manual instructions alone.
+	// checksum. A resolve that fails is not dropped — it becomes the
+	// reason line of the notice, so a button never disappears in silence.
 	offer, offerErr := consoleDownloadOfferFor(executable)
 	if offerErr != nil {
 		desktopLog.Warn("no verified download is offered for the missing console program", "error", offerErr)
 	}
-	notice := newSiblingMissingNotice(action, filepath.Dir(executable), executable, err, offer)
-	if showSiblingMissingNotice(notice) != siblingMissingDownload {
+	notice := newSiblingMissingNotice(action, filepath.Dir(executable), executable, err, offer, offerErr)
+
+	answer := showSiblingMissingNotice(notice)
+	for answer == siblingMissingRetry {
+		// "Try again" reads the release once more: the connection may
+		// be back, or the release may publish the file by now. The
+		// notice is rebuilt from what was just read, so its reason line
+		// and its links always describe the release as it stands, and
+		// the loop only ever runs while the user asks for another read.
+		desktopLog.Info("the release is read again for the missing console program", "action", string(action))
+		offer, offerErr = consoleDownloadOfferFor(executable)
+		if offerErr != nil {
+			desktopLog.Warn("no verified download is offered for the missing console program", "error", offerErr)
+		}
+		notice = newSiblingMissingNotice(action, filepath.Dir(executable), executable, err, offer, offerErr)
+		answer = showSiblingMissingNotice(notice)
+	}
+	if answer != siblingMissingDownload {
 		desktopLog.Info("the console program stays missing: the service action changes nothing",
 			"action", string(action))
 		return "", false

@@ -1279,6 +1279,101 @@ func TestTrayServiceInstallDoesNothingWhenTheConfirmationIsDeclined(t *testing.T
 	}
 }
 
+// TestOfferMissingConsoleProgramReadsTheReleaseAgainOnRetry proves the way
+// back the notice offers whenever no download can be offered: "Try again"
+// reads the release once more and shows the notice anew from what that read
+// produced — the reason line of the first notice is the failure of the first
+// read, the second notice carries the fresh offer — while a decline after the
+// retry still changes nothing and adds no report of its own.
+func TestOfferMissingConsoleProgramReadsTheReleaseAgainOnRetry(t *testing.T) {
+	fixture := func(t *testing.T, answers ...siblingMissingAnswer) (
+		*[]siblingMissingNotice, *[]shownMessage, *int, *int) {
+		t.Helper()
+		replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+			return "", errors.New("the pair of this release is missing")
+		})
+		resolutions := 0
+		replaceSeam(t, &consoleDownloadOfferFor, func(string) (*consoleDownloadOffer, error) {
+			resolutions++
+			if resolutions == 1 {
+				return nil, offerUnreachable(errors.New("dial tcp: no route to host"))
+			}
+			return &consoleDownloadOffer{
+				Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
+				Size:    testReleaseAssetSize,
+			}, nil
+		})
+		var shown []siblingMissingNotice
+		replaceSeam(t, &showSiblingMissingNotice, func(notice siblingMissingNotice) siblingMissingAnswer {
+			shown = append(shown, notice)
+			if len(shown) > len(answers) {
+				t.Errorf("the notice was shown %d times, only %d answers scripted", len(shown), len(answers))
+				return siblingMissingDismiss
+			}
+			return answers[len(shown)-1]
+		})
+		downloads := 0
+		replaceSeam(t, &runConsoleDownload, func(notice siblingMissingNotice) (string, error) {
+			downloads++
+			if notice.Download == nil {
+				t.Error("the transfer ran without the offer of the notice it was given")
+			}
+			return filepath.Join(notice.Folder, testReleaseAsset), nil
+		})
+		messages := recordMessages(t)
+		return &shown, messages, &resolutions, &downloads
+	}
+
+	t.Run("a retry reads the release again and the download follows that read", func(t *testing.T) {
+		shown, messages, resolutions, downloads := fixture(t, siblingMissingRetry, siblingMissingDownload)
+
+		console, ok := offerMissingConsoleProgram(serviceActionUpdate, filepath.Join(`C:\portable`, testReleaseDesktop))
+		if !ok || console == "" {
+			t.Fatalf("the notice reports (%q, %t), want the downloaded program", console, ok)
+		}
+		if *resolutions != 2 {
+			t.Errorf("the release was read %d times, want the first read and the retry", *resolutions)
+		}
+		if len(*shown) != 2 {
+			t.Fatalf("the notice was shown %d times, want the first one and the one after the retry", len(*shown))
+		}
+		// The first notice states why no download is offered — the
+		// read that failed — and the second is rebuilt from the read
+		// the retry performed, so its offer and its empty reason line
+		// describe the release as it stands after that read.
+		if (*shown)[0].Download != nil || !strings.Contains((*shown)[0].Reason, "could not be reached") {
+			t.Errorf("the first notice carries %+v, want no offer and the reason of the failed read", (*shown)[0])
+		}
+		if (*shown)[1].Download == nil || (*shown)[1].Reason != "" {
+			t.Errorf("the notice after the retry carries %+v, want the fresh offer and no reason line", (*shown)[1])
+		}
+		if *downloads != 1 {
+			t.Errorf("the transfer ran %d times, want exactly one", *downloads)
+		}
+		if len(*messages) != 0 {
+			t.Errorf("the flow showed %v, want the decline-free download to stay quiet", *messages)
+		}
+	})
+
+	t.Run("a decline after a retry changes nothing", func(t *testing.T) {
+		shown, messages, resolutions, downloads := fixture(t, siblingMissingRetry, siblingMissingDismiss)
+
+		if console, ok := offerMissingConsoleProgram(serviceActionUpdate, filepath.Join(`C:\portable`, testReleaseDesktop)); ok || console != "" {
+			t.Errorf("the declined notice reports (%q, %t), want no program and no continuation", console, ok)
+		}
+		if *resolutions != 2 || len(*shown) != 2 {
+			t.Errorf("the release was read %d times and the notice shown %d times, want one of each per answer",
+				*resolutions, len(*shown))
+		}
+		if *downloads != 0 {
+			t.Errorf("the transfer ran %d times after a decline, want none", *downloads)
+		}
+		if len(*messages) != 0 {
+			t.Errorf("the declined notice showed %v, want the decline to stay quiet", *messages)
+		}
+	})
+}
+
 // TestTrayServiceInstallReportsAMissingConsoleProgram proves that a missing
 // console program reaches the redesigned notice before the user is asked to
 // confirm anything, and that dismissing it leaves the desktop host running
