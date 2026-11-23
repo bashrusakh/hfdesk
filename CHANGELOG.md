@@ -5,18 +5,27 @@
 ### Added
 
 - The Windows desktop can work as a tray companion beside an installed service — without running its own server — and after an installation it restarts as exactly that.
+- The service update report names the old program file left behind when the registration moved to another file and offers to delete it with one press, warning it may still belong with its old folder; nothing is removed automatically.
 
 ### Changed
 
-- The Windows desktop host's service status line and Runtime / Logs badge only say whether the service is installed — `Service: installed`, `Service: not installed`, `Service: unknown` — dropping the state word that used to follow "installed".
+- The tray menu's state line names the state of the Windows service in words — `Service: not installed`, `Service: installed`, `Service: running`, `Service: starting`, `Service: stopping`, `Service: unknown`.
+- The Logs window badge only says whether the service is installed — `Service: installed`, `Service: not installed`, `Service: unknown`.
 - The service status in the tray and in the window follows every reading of the service, keeping both surfaces on the real state.
-- The tray menu adds Start service, Stop service, Update service and Delete service next to Install service…, and deleting removes only the registration, keeping all data.
+- The tray menu adds Start service, Stop service, Update service and Delete service, and deleting removes only the registration, keeping all data.
+- Everything about the service now lives in one **Service** submenu with its status line at the top: the duplicate **Service…** item is gone, and **Install service…** shows only where there is nothing to install.
+- One **Logs** window replaces the separate Runtime / Logs window in both desktop and tray-companion mode: the live log while the address answers, and an honest state with actions when it does not.
+- The Logs window and the error windows open their log file with one action instead of showing its path as text.
+- The notice about the missing service program says in one short line which file is needed and where, and keeps its actions — the download and the manual route — visible side by side.
 - Error reports now name the log file of the launch they belong to.
 - Window and report texts are now short and plain: the state and what to do next.
 - Installing from a removable or network drive now warns that Windows may start the service before the drive is ready.
 
 ### Fixed
 
+- A service action started while the app runs in desktop mode switches the app to the tray and performs instead of asking the user to quit HFDesk; deleting the service returns it to desktop mode, and updating a stopped service keeps the window open.
+- The missing console program is found under either spelling of its version, and a download that cannot be offered states the reason and offers **Try again** instead of a button that disappears.
+- The log no longer records a state reading while nothing changes; it records state changes and actions.
 - A failed service installation now says what actually went wrong — the start did not run, the program ended too early, the service did not come up in time, or the started service could not be verified — instead of a vague "could not confirm".
 - A registration removed after a failed installation attempt no longer reads as if the service had never been registered.
 

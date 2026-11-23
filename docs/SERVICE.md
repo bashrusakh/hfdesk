@@ -804,26 +804,27 @@ a program of its own: a release ships it next to the console host, and neither
 replaces the other.
 
 - **Tray menu.** The menu opens with **Open HFDesk** (the web UI of the
-  instance in the default browser) and **Runtime / Logs** (the runtime
-  window), then the service group: a status line that reports the state of
-  the Windows service registration — `Service: installed`,
-  `Service: not installed`, or `Service: unknown` when the state could not be
-  read, which never claims a machine without a service — followed by
-  **Install service…** (registers the Windows service) and, beside a proven
-  registration, **Start service**, **Stop service**, **Update service**,
-  **Delete service** and **Service…**, which opens the registered-service
-  dialog — the same question the install item opens when its own recheck
-  finds a registration: open it, start it or update it — so no capability
-  leaves the tray. A read that proves no registration enables the install
-  item and shows none of the registration-bound items; a proven registration
-  keeps the install item visible but grey, held inactive by the registration
-  the read proved; a read that could settle neither greys the install item and
-  offers no lifecycle items, so a
-  destructive action is never offered without a state that was read. The
-  status line is re-read after every service action, after every reading the
-  tray and the window make, and every 30 seconds, so both surfaces keep the
-  real state of the machine. A separator and **Quit HFDesk** (a graceful
-  shutdown) close the menu.
+  instance in the default browser), **Logs** (the log window) and the
+  **Service** submenu; a separator and **Quit HFDesk** (a graceful
+  shutdown) close it. The whole service section lives inside that submenu:
+  a status line that reports the state of the Windows service
+  registration — `Service: installed`, `Service: not installed`, or
+  `Service: unknown` when the state could not be read, which never claims
+  a machine without a service — followed by exactly one group of
+  actions. A read that proves no registration shows **Install
+  service…** (registers the Windows service) and nothing else that acts;
+  a proven registration shows **Start service**, **Stop service**,
+  **Update service** and **Delete service** instead, so the install item
+  is on screen only where there is nothing to install and no grey
+  install item remains; a read that could settle neither shows the status
+  line alone with no action, so a destructive action is never offered
+  without a state that was read. The duplicate **Service…** item that
+  opened the registered-service dialog is gone; that dialog still belongs
+  to the install recheck. Each lifecycle item is enabled for the state it
+  can act on (see **Service actions** below). The status line is re-read
+  after every service action, after every reading the tray and the window
+  make, and every 30 seconds, so both surfaces keep the real state of the
+  machine.
 - **Service actions.** **Install service…** (in the tray and as the window
   button) and the four lifecycle items run one flow. The lifecycle items
   appear beside a proven registration and each is enabled for the state it
@@ -837,14 +838,37 @@ replaces the other.
   **Delete service** removes only the registration — the data, the cache,
   the config file, the history and the logs stay, the same invariant as
   `hfdesk service uninstall`.
-- **Runtime / Logs window.** The header of the window shows the same service
-  status as the tray menu, from the same read, and an **Install service…**
-  button that is enabled only while no service is installed — the status
-  refresh flips it once one exists. The button runs the exact installation
-  flow of the tray item (the notice, the confirmation, the administrator
-  prompt, the handover and the existing reports), and the host's
+
+  Starting, updating or deleting the service from a desktop app that serves
+  its own address performs the action after the app leaves desktop mode: the
+  window closes, the elevated helper acts beside a
+  host that is already gone, and the app comes back as the tray companion —
+  the confirmation states that fact before the prompt, instead of a refusal
+  that asked the user to quit HFDesk. **Delete service** is the answer that
+  returns: once the registration is gone, the app starts again in desktop
+  mode. An **Update service** of a positively confirmed stopped service
+  rewrites the registration in place and keeps the window open. Only a
+  handover that cannot be established refuses, with a report that says so.
+
+  An update that moved the registration to another program file names the
+  old file in its report when that file is still on the disk, warns that it
+  may belong with the pair of its old folder, and offers its deletion as one
+  press — nothing is deleted automatically.
+- **Logs window.** One window — titled `HFDesk - Logs` — covers the desktop
+  app and the tray companion alike. It loads the live log page of the
+  address it knows: the desktop app's own server, or the registered address
+  of the service. That page shows the same service status as the tray menu,
+  from the same read, and an **Install service…** button that is enabled
+  only while no service is installed — the status refresh flips it once one
+  exists. The button runs the exact installation flow of the tray item (the
+  notice, the confirmation, the administrator prompt, the handover and the
+  existing reports), and the host's
   single service-action guard refuses a second service action while one is
-  in flight, whichever surface or item started it.
+  in flight, whichever surface or item started it. When that address does
+  not answer (or names none), the window shows an honest local page
+  instead: the state of the service, the address that did not answer stated
+  as plain text, the path of the service log file with the action **Open
+  the log file** that opens it, and **Try again** to re-read the live page.
 - **Install service…** asks for confirmation first, because the registration is
   a machine-wide change that outlives the app: the service starts at boot, keeps
   running without the desktop app, needs administrator rights, and keeps its own
@@ -857,18 +881,30 @@ replaces the other.
   program paired with this desktop program, the same name with the
   `hfdesk-desktop` prefix replaced by `hfdesk` — and installs the service from
   that folder. A desktop program whose name carries a version has no other
-  candidate: a missing pair is reported in a notice that names the missing file
-  and the folder and offers to download exactly that console program from the
-  official release of this name. The offer exists only for that versioned name;
+  candidate: a missing pair is reported in a notice that leads with one short
+  line — the missing file and that the service needs it — then what the
+  program is for and the folder it is expected in, and offers to download
+  exactly that console program from the official release of this name. The
+  offer exists only for that versioned name; the release lookup accepts
+  either spelling of that version (with or without its `v`, in any case),
+  while another version or another program never matches;
   the transfer runs behind a progress dialog with **Cancel**, the file is
   verified against an authoritative checksum of that same release (the asset
   digest of the release API or its `checksums.txt`) before it is placed, a
   cancelled or failed transfer leaves no file of its own, never touches a file
   it did not place, and reports the reason beside the manual steps, and after a
   verified download the very same service action continues through the usual
-  confirmation and administrator prompt; the manual instructions stay available
-  in the collapsed expander of the notice, and a release without an
-  authoritative checksum is never offered at all. The same precheck runs for an
+  confirmation and administrator prompt. The manual route is one of the
+  visible actions of the notice — **Install it manually instead**, beside the
+  download — while the pairing rule and the raw cause of a failed lookup stay
+  in the folded **Details**; and when no download can be offered (a build
+  whose name carries no release version, a release page that could not be
+  reached, a release that publishes no verified file), the notice states that
+  reason in one line and offers **Try again** where the download button would
+  be, so the button never disappears without a way back. The log file of this
+  launch is opened from the notice with one action instead of being named as
+  text, and a release without
+  an authoritative checksum is never offered at all. The same precheck runs for an
   update before it is handed to the helper — both from the choice dialog of a
   launch that finds a registration and from the registered-service dialog of the
   tray — where the notice names the action it continues (its note line says
@@ -998,19 +1034,20 @@ replaces the other.
   its own — it binds no address, so the companion and the service can never
   serve one address — and because it serves nothing it can run the service
   actions itself, including starting the service. Its tray menu is the
-  service group above: the status line, **Open HFDesk** (the web UI of the
-  registered address, enabled while the service serves it), the install item
-  beside a proven absence or the lifecycle items beside a proven
-  registration, **Runtime / Logs**, and — after a separator — **Exit**, which
+  root described above: **Open HFDesk** (the web UI of the
+  registered address, enabled while the service serves it), **Logs**, the
+  **Service** submenu with the status line and exactly one group of
+  actions — the install item beside a proven absence, the lifecycle items
+  beside a proven registration — and, after a separator, **Exit**, which
   closes only the companion and leaves the service running. The **Open
   HFDesk** item appears only beside a proven registration and hides beside a
-  proven absence and an unsettled or unreadable read. Its Runtime /
-  Logs window renders fresh on every show: the state of the service, a link
-  to the web UI the registration names, the tail of the service's own log
-  file (from the registered log directory, see
-  [Where the state lives](#where-the-state-lives)) with the one action that
-  opens the whole file with the default handler of Windows, and the log file
-  of this launch.
+  proven absence and an unsettled or unreadable read. Its **Logs** window is
+  the same window the desktop app opens: on every show it probes the
+  registered address and loads the live log page while the service answers
+  it, and otherwise shows the honest state, the address that did not answer,
+  and the path of the service log file (from the registered log directory,
+  see [Where the state lives](#where-the-state-lives)) with the action that
+  opens it and **Try again** to retry.
 - **The dialog** is a Windows task dialog, which needs the common controls
   version 6 that the embedded application manifest declares. A locally built
   binary without that resource still works: it falls back to message boxes that
@@ -1116,7 +1153,7 @@ The **command line** never elevates: `hfdesk service …` invokes no `sudo`, `su
 fails with a permission error instead of escalating on its own.
 
 The **Windows desktop host** is the exception, and only on an explicit choice of
-the user: **Install service…** in its tray or in the Runtime / Logs window, the
+the user: **Install service…** in its tray or in the Logs window, the
 **Start service**, **Stop service**, **Update service** and **Delete service**
 items of the tray (of the desktop host and of the tray companion alike), and
 **Update service** or **Start service** in its startup dialog, ask Windows for
