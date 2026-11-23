@@ -119,7 +119,8 @@ type ServiceActionOptions struct {
 	// writes. The windows this helper shows name that path, so the log is
 	// reachable from outside the window: the host records the action it
 	// launched and the exit of this helper there. Empty (a hand-typed
-	// command line) names the default per-user log of this session.
+	// command line) means this run writes no log file of its own, and its
+	// windows name no file at all.
 	LogFile string
 }
 

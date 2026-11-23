@@ -410,8 +410,11 @@ func (serviceStateReader) readForAction(ctx context.Context) (service.Status, er
 // elevation, an early failure or an answer of the dialog that changes
 // nothing leaves the items working again. A launched helper keeps the guard
 // until THAT HELPER ENDS (keepServiceActionGuardUntilHelperEnds), so the
-// guard spans the mutation and not only the click that asked for it. An
-// installation handover keeps it until the host exits.
+// guard spans the mutation and not only the click that asked for it; a
+// helper the shell started but named no process for cannot be waited for
+// and keeps the guard for the bounded hold of its action budget instead
+// (keepServiceActionGuardForUntrackedHelper). An installation handover keeps
+// it until the host exits.
 var serviceActionRunning atomic.Bool
 
 // beginServiceAction takes the single service-action guard for one request
@@ -732,11 +735,13 @@ func serviceActionSurface(action serviceAction) string {
 // reports the outcome of the action itself, in a native message box.
 //
 // The guard covers the whole action: a launched helper inherits it through
-// the waiter and releases it when it ends, together with the menu refresh;
-// every other end path — a declined confirmation, a refused mutation, a
-// failed launch, an unknown state — releases it here and asks for the menu
-// catch-up, so the status is re-read after every request that acted, and
-// after the helper ends for the ones that launched it.
+// the waiter and releases it when it ends, together with the menu refresh —
+// a helper without a process record through the bounded hold that stands in
+// for its exit (see launchTrayServiceAction) — and every other end path — a
+// declined confirmation, a refused mutation, a failed launch, an unknown
+// state — releases it here and asks for the menu catch-up, so the status is
+// re-read after every request that acted, and after the helper ends for the
+// ones that launched it.
 func performServiceActionFromTray(action serviceAction, instanceMutex string) {
 	if !beginServiceAction(serviceActionSurface(action)) {
 		return
@@ -793,7 +798,10 @@ func performServiceActionFromTray(action serviceAction, instanceMutex string) {
 
 // launchTrayServiceAction starts the elevated helper for a lifecycle action
 // of the tray and hands the single service-action guard to a goroutine that
-// keeps it until that helper ends.
+// keeps it until that helper ends — or, for a helper the shell named no
+// process for, until the bounded hold of its action budget ends
+// (untrackedHelperHoldBudget), because nothing can wait for the exit of such
+// a helper while it may still perform its mutation.
 //
 // A start and an update carry the desktop singleton of this host — they hold
 // it through their mutation, exactly like the launches of the service gate.
@@ -803,31 +811,42 @@ func performServiceActionFromTray(action serviceAction, instanceMutex string) {
 //
 // The result reports whether a helper was launched: true means the waiter
 // owns the guard now and releases it, with the menu catch-up, when the
-// helper ends. false means nothing runs and the caller keeps the guard —
-// either the console-program notice of the update was declined (no report is
-// due: the notice flow already showed its own) or the launch failed, which
-// this function reports like every other launch of these actions.
+// helper ends or when the bounded hold of an untracked helper ends. false
+// means nothing runs and the caller keeps the guard — either the
+// console-program notice of the update was declined (no report is due: the
+// notice flow already showed its own) or the launch failed, which this
+// function reports like every other launch of these actions.
 func launchTrayServiceAction(action serviceAction, instanceMutex string) bool {
 	mutex := instanceMutex
 	if !serviceActionHoldsSingleton(action) {
 		mutex = ""
 	}
-	pid, err := launchServiceHelper(action, 0, mutex)
+	launch, err := launchServiceHelper(action, 0, mutex)
 	if err != nil {
 		reportServiceLaunchFailure(action, err)
 		return false
 	}
-	if pid == 0 {
+	if !launch.started {
 		return false
 	}
-	// Both end-path functions are read HERE, on the goroutine that launched
-	// the helper: the waiter outlives this call, and values it read itself
-	// could be replaced by a later caller while the waiter is still
-	// unscheduled. The captured refresh is the host's own signal — assigned
-	// before any tray item exists — or the stub of a test that launched
-	// this helper; the captured wait is the same seam the test replaced
-	// before this launch.
-	go keepServiceActionGuardUntilHelperEnds(pid, waitForServiceActionHelper, serviceMenuRefresh)
+	// Both end-path functions and the hold budget are read HERE, on the
+	// goroutine that launched the helper: the waiter outlives this call,
+	// and values it read itself could be replaced by a later caller while
+	// the waiter is still unscheduled. The captured refresh is the host's
+	// own signal — assigned before any tray item exists — or the stub of a
+	// test that launched this helper; the captured wait is the same seam
+	// the test replaced before this launch.
+	if launch.pid == 0 {
+		// The shell started the helper but named no process for it, so
+		// no one can observe its exit: the guard is held for the
+		// bounded hold instead of being released at the launch — the
+		// helper may still move the registration, and a second action
+		// beside it is refused with the busy report until the hold
+		// ends like the run of a waited-for helper.
+		go keepServiceActionGuardForUntrackedHelper(untrackedHelperHoldBudget, serviceMenuRefresh)
+		return true
+	}
+	go keepServiceActionGuardUntilHelperEnds(launch.pid, waitForServiceActionHelper, serviceMenuRefresh)
 	return true
 }
 
@@ -847,8 +866,10 @@ var waitForServiceActionHelper = waitForServiceActionProcess
 // so the wait opens the process again with the only right it needs — the
 // synchronization right, which a caller may hold on a higher-integrity
 // process. A process that cannot be opened is already gone (it ended before
-// this open, or its id was never readable): its action is over, and the wait
-// ends without blocking.
+// this open): its action is over, and the wait ends without blocking. A zero
+// id never reaches this wait: a helper without a process record keeps the
+// guard through the bounded hold instead
+// (keepServiceActionGuardForUntrackedHelper).
 func waitForServiceActionProcess(pid uint32) {
 	if pid == 0 {
 		return
@@ -899,6 +920,47 @@ func waitForServiceActionProcess(pid uint32) {
 // seam another caller could replace while it is unscheduled.
 func keepServiceActionGuardUntilHelperEnds(pid uint32, wait func(uint32), refresh func()) {
 	wait(pid)
+	endServiceActionGuard(refresh)
+}
+
+// untrackedHelperHoldBudget bounds the guard hold of a helper that runs
+// without a process record.
+//
+// The shell started such a helper, so it may perform its mutation while no
+// caller can wait for its exit: releasing the single service-action guard at
+// the launch would admit a second action beside a possibly live helper, and
+// two helpers would move the same registration next to each other. The hold
+// is bounded on purpose, and its budget is the action budget of the helper
+// itself: serviceActionBudget bounds the context of every action the helper
+// runs — the installation, the update, the start, the stop and the removal
+// alike — so holding the guard for exactly that budget covers the whole
+// mutation window of a helper nobody can wait for. What can outlive that
+// budget is only the final report window of the helper, which performs no
+// further change; the hold then ends like the run of a waited-for helper:
+// the guard is released and the menu catches up.
+//
+// It is a variable so the tests can shorten the hold.
+var untrackedHelperHoldBudget = serviceActionBudget
+
+// keepServiceActionGuardForUntrackedHelper keeps the single service-action
+// guard for the bounded hold of a helper that runs without a process record
+// and asks the menu to catch up right after the hold ended.
+//
+// It is the end path of a launch nothing can wait for (see
+// untrackedHelperHoldBudget): the budget stands in for the exit of the
+// helper, and the release and the catch-up are the very ones the waited-for
+// path takes. hold and refresh are the values the launching goroutine
+// captured, so this waiter never reads a seam another caller could replace
+// while it is unscheduled.
+func keepServiceActionGuardForUntrackedHelper(hold time.Duration, refresh func()) {
+	time.Sleep(hold)
+	endServiceActionGuard(refresh)
+}
+
+// endServiceActionGuard releases the single service-action guard and asks
+// the menu to catch up: the end every service action shares, after the exit
+// of a waited-for helper and after the bounded hold of an untracked one.
+func endServiceActionGuard(refresh func()) {
 	serviceActionRunning.Store(false)
 	if refresh != nil {
 		refresh()
@@ -1053,33 +1115,57 @@ func desktopExecutable() (string, error) {
 	return path, nil
 }
 
+// serviceHelperLaunch is the outcome of one launch of the elevated helper.
+//
+// It keeps the two outcomes apart that the guard policy of every caller
+// decides on differently — a launch that started NO helper, and a helper
+// that runs — instead of hiding both behind a zero process id. A started
+// helper carries its process id when the shell named one, so a caller can
+// wait for its exit; a started helper the shell named no process for carries
+// pid 0: it performs the same mutation, but no caller can observe its exit
+// (see untrackedHelperHoldBudget).
+type serviceHelperLaunch struct {
+	// started reports whether the shell started a helper process. false
+	// means nothing runs: the console-program notice of an update was
+	// declined or its download failed, or the launch failed with its own
+	// error.
+	started bool
+	// pid is the process id of the started helper. Zero while started is
+	// true means the launch carries no process record to wait for.
+	pid uint32
+}
+
 // launchServiceHelper starts the elevated helper of the desktop host.
 //
 // The helper is this very program, started with administrator rights: the
 // desktop never implements a second service client, and the helper runs the
-// same actions the user would run from a console. The process id of the helper
-// is returned, so the caller can record which helper performs the action.
+// same actions the user would run from a console. The outcome names both the
+// fact that a helper runs and its process id (serviceHelperLaunch), so the
+// caller can record which helper performs the action and how to end its
+// guard.
 //
 // An update registers from the console program of this folder, so the
 // missing program is settled here — the one place every update entry passes
 // and always before the elevation prompt — through offerMissingConsoleProgram.
 // A declined notice, or a failed download whose report that flow already
-// showed, returns (0, nil): no helper was started, and there is no launch
-// failure left for the caller to report. A start runs the executable the
-// registration already names and never looks for a console program.
+// showed, returns the empty result: no helper was started, and there is no
+// launch failure left for the caller to report. Every launch the shell
+// performed returns started — with the process id when the shell named one,
+// and zero when it did not. A start runs the executable the registration
+// already names and never looks for a console program.
 //
 // instanceMutex is handed to an update or a start, which hold that desktop
 // singleton through their mutation; every other action carries no wait state.
 // The claim path of this desktop travels with it, so the guard of the action
 // reads this desktop's claim under any approving account.
-func launchServiceHelper(action serviceAction, waitPID int, instanceMutex string) (uint32, error) {
+func launchServiceHelper(action serviceAction, waitPID int, instanceMutex string) (serviceHelperLaunch, error) {
 	executable, err := desktopExecutable()
 	if err != nil {
-		return 0, err
+		return serviceHelperLaunch{}, err
 	}
 	if action == serviceActionUpdate {
 		if _, ok := offerMissingConsoleProgram(action, executable); !ok {
-			return 0, nil
+			return serviceHelperLaunch{}, nil
 		}
 	}
 	pid, err := launchElevated(elevatedLaunch{
@@ -1091,11 +1177,11 @@ func launchServiceHelper(action serviceAction, waitPID int, instanceMutex string
 		LogFile:       runLogPath,
 	})
 	if err != nil {
-		return 0, err
+		return serviceHelperLaunch{}, err
 	}
 	desktopLog.Info("the elevated service helper started",
 		"action", string(action), "pid", pid)
-	return pid, nil
+	return serviceHelperLaunch{started: true, pid: pid}, nil
 }
 
 // offerMissingConsoleProgram settles the console program the service action

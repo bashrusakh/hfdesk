@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bashrusakh/hfdesk/internal/app"
 	"github.com/bashrusakh/hfdesk/internal/service"
 	"golang.org/x/sys/windows"
 )
@@ -78,16 +77,14 @@ func RunServiceAction(o ServiceActionOptions) error {
 	// The reports of the helper name the log of the desktop host that
 	// launched it: the host records the action it launched and the exit of
 	// this helper there, so the path has to be honest from the first
-	// window. A hand-typed helper command line carries no path, so it
-	// names the default per-user log of this session. The previous value
-	// is restored on the way out, so the seam stays clean for the tests
-	// that drive this entry point in-process.
+	// window. A hand-typed helper command line carries no --log-file, so
+	// this run writes no log file of its own and its windows name none —
+	// naming the default per-user log would point at a file this run never
+	// writes and that may not exist. The previous value is restored on the
+	// way out, so the seam stays clean for the tests that drive this entry
+	// point in-process.
 	previousLogPath := runLogPath
-	if path := strings.TrimSpace(o.LogFile); path != "" {
-		runLogPath = path
-	} else {
-		runLogPath = app.DefaultLogPath()
-	}
+	runLogPath = strings.TrimSpace(o.LogFile)
 	defer func() { runLogPath = previousLogPath }()
 
 	action, err := parseServiceAction(o.Action)

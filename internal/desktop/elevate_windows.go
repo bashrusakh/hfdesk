@@ -58,6 +58,15 @@ type elevatedLaunch struct {
 
 // launchElevated starts the service helper with administrator rights.
 //
+// The outcome contract of every launch: an error means that NO helper was
+// started — the user declined the elevation, or the shell could not start the
+// program — while a nil error means the helper WAS started. The returned
+// process id is zero when that started helper carries no process record to
+// wait for: the shell named no process handle although the start succeeded,
+// or the id of the handle could not be read. Zero therefore never means "the
+// launch did not happen"; the callers keep the two outcomes apart (see
+// serviceHelperLaunch) instead of reading the id as one.
+//
 // It is a package level variable so the tests can drive the launch: a test
 // cannot answer a prompt of the user account control, and a real elevated
 // process would change the machine.
@@ -136,13 +145,20 @@ type shellExecuteInfo struct {
 //
 // A refusal of the user is reported as such: the desktop host is not allowed to
 // change the machine, and it keeps running untouched. Every other failure
-// carries the error of the shell.
+// carries the error of the shell. A nil error means the helper WAS started;
+// its process id is zero when the launch carries no process record (see
+// launchElevated), never when nothing was started.
 func shellExecuteElevated(l elevatedLaunch) (uint32, error) {
 	process, err := shellExecuteElevatedProcess(l)
 	if err != nil {
 		return 0, err
 	}
 	if process == nil {
+		// The process function names a started helper on every success,
+		// so a success without any process record is read as the same
+		// outcome as the handle below whose id could not be read — a
+		// started helper nothing can wait for — and never as a launch
+		// that did not happen.
 		return 0, nil
 	}
 	defer process.Close()
@@ -192,6 +208,11 @@ func shellExecuteElevatedProcess(l elevatedLaunch) (*elevatedProcess, error) {
 		return nil, errors.New("the elevated service helper could not be started")
 	}
 
+	// The shell reported a started program. A process handle it did not
+	// name — or a handle whose id cannot be read — leaves the pid zero:
+	// the launch is still a started helper, only one without a process
+	// record to wait for (see launchElevated), so the zero id never reads
+	// as a launch that did not happen.
 	process := &elevatedProcess{}
 	if info.hProcess != 0 {
 		process.handle = windows.Handle(info.hProcess)
