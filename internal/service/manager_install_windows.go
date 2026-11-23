@@ -413,7 +413,12 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 			return result, &InstallStartError{Cause: cause, Outcome: StartOutcomeNotPerformed,
 				CleanupError: errors.New("the registration configuration could not be proven unchanged; it was not started or removed")}
 		}
-		if !scmSameOwnedConfig(ownedConfig, config) {
+		// Only what this write established is compared here: the program
+		// and its vector, the type and start it registered, the display
+		// data and the identity of the account. The full read-against-read
+		// comparison stays where both sides are reads — in
+		// startFirstRegistration and in cleanup below.
+		if !scmSameRequestedConfig(ownedConfig, config) {
 			cause := errors.New("service: the newly created registration changed before its first start")
 			return result, &InstallStartError{Cause: cause, Outcome: StartOutcomeNotPerformed,
 				CleanupError: errors.New("the changed registration was not started, stopped or removed")}
@@ -655,6 +660,42 @@ func scmSameOwnedConfig(current, expected mgr.Config) bool {
 	current.BinaryPathName = expected.BinaryPathName
 	current.Dependencies = expected.Dependencies
 	return reflect.DeepEqual(current, expected)
+}
+
+// scmSameRequestedConfig reports whether a read-back of the registration this
+// installation created still holds what its write established.
+//
+// The first install compares the configuration it asked for with what the
+// platform reports, so only a field the write set has an expectation to
+// compare against. A value this attempt never wrote — a SID type CreateService
+// skips when it is SERVICE_SID_TYPE_NONE, a delayed auto start it skips when it
+// is false, a tag that needs a load order group, a password QueryServiceConfig
+// never returns, a dependency list the platform decodes in its own shape — has
+// no expectation here: its zero in the request is an assumption about a
+// platform default, and comparing against that assumption reports our own
+// registration as changed. Those fields are read-against-read questions and
+// stay with scmSameOwnedConfig, which compares two reads of the same platform.
+//
+// The program and its vector stay guarded exactly as before: a command line
+// that names another program or another argument vector is refused first.
+func scmSameRequestedConfig(current, expected mgr.Config) bool {
+	if !scmSameRegistration(current.BinaryPathName, expected.BinaryPathName) {
+		return false
+	}
+	// The account is compared by identity, not by spelling: the operating
+	// system reports the name in the form its account database spells it,
+	// and the write establishes the supported identity — the rule the update
+	// refusal already applies to this very field (scmSupportedServiceAccount).
+	if !strings.EqualFold(expected.ServiceStartName, current.ServiceStartName) &&
+		!(scmSupportedServiceAccount(expected.ServiceStartName) &&
+			scmSupportedServiceAccount(current.ServiceStartName)) {
+		return false
+	}
+	return current.ServiceType == expected.ServiceType &&
+		current.StartType == expected.StartType &&
+		current.ErrorControl == expected.ErrorControl &&
+		current.DisplayName == expected.DisplayName &&
+		current.Description == expected.Description
 }
 
 func (m *scmManager) cleanupFailedFirstRegistration(ctx context.Context, target scmFirstInstallTarget, ownedConfig mgr.Config, processID uint32, cause error) error {
