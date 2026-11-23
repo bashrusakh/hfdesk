@@ -11,8 +11,8 @@
 - The Windows desktop host's service status line and Runtime / Logs badge only say whether the service is installed — `Service: installed`, `Service: not installed`, `Service: unknown` — dropping the state word that used to follow "installed".
 - The service status in the tray and in the window follows every reading of the service, keeping both surfaces on the real state.
 - The tray menu adds Start service, Stop service, Update service and Delete service next to Install service…, and deleting removes only the registration, keeping all data.
-- Error reports now name the log file written by that launch.
-- Window and report texts now give the state and no more than one next step.
+- Error reports now name the log file of the launch they belong to.
+- Window and report texts are now short and plain: the state and what to do next.
 - Installing from a removable or network drive now warns that Windows may start the service before the drive is ready.
 
 ### Fixed
