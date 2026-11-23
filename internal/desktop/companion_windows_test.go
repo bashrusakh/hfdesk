@@ -89,13 +89,15 @@ func driveHostToTheTray(t *testing.T, opts Options) *capturedTrayRun {
 }
 
 // assertCompanionWiring pins what every companion host wires into its tray:
-// the decided composition — including the install action of the absence
-// rule: without it a relaunch on a machine without a registration, and a
+// the decided root — including the install action of the absence rule:
+// without it a relaunch on a machine without a registration, and a
 // menu after Delete, would be a dead end — plus the two items of the user's
 // decision: Open HFDesk (the address of the registration) and Exit (the
-// end path of this companion) — and NO handler for the one item the
-// composition never carries (an action without its item would be a hidden
-// second menu): the registered-service dialog belongs to the desktop host.
+// end path of this companion) — and NO handler for a registered-service
+// dialog action: no current menu carries such an item (the Service entry
+// is the submenu, and the dialog itself stays reachable through the
+// install recheck), so an action without its item would be a hidden
+// second menu.
 func assertCompanionWiring(t *testing.T, captured *capturedTrayRun) {
 	t.Helper()
 	if captured.style != trayMenuCompanion {
@@ -120,9 +122,9 @@ func assertCompanionWiring(t *testing.T, captured *capturedTrayRun) {
 		}
 	}
 	// The decided composition carries no registered-service dialog item
-	// — its handler must not exist either.
+	// — no menu does anymore, so no host may wire its handler.
 	if captured.actions.service != nil {
-		t.Error("the companion wires the service-dialog action although its item belongs to the desktop host only")
+		t.Error("the companion wires the service-dialog action although no current menu carries an item for it")
 	}
 }
 
@@ -684,40 +686,37 @@ func TestCompanionWindowReadsEachAskTheMenuToCatchUp(t *testing.T) {
 }
 
 // TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping proves the
-// whole composition of the companion menu per read — the absence rule of
-// the service group beside the shared mapping everything else follows:
+// whole Service submenu of the companion menu per read — the absence rule
+// beside the shared mapping everything else follows:
 //
 //   - beside a proven REGISTRATION the four lifecycle actions show and
-//     enable per state, the install item HIDES (it cannot act — the
-//     registered menu is status + Open HFDesk + four actions +
-//     Runtime / Logs + Exit), and Open HFDesk shows — enabled while the
-//     service serves the address, grey beside a registered service that
-//     does not run;
+//     enable per state, the install item HIDES (the submenu then reads
+//     status line + four actions — one action group, never two), and
+//     Open HFDesk shows — enabled while the service serves the address,
+//     grey beside a registered service that does not run;
+//   - beside a TRANSITION the group stays on screen — the registration
+//     is proven — but every action is grey until the reading settles,
+//     and the line names the transition ("Service: starting");
 //   - beside a PROVEN ABSENCE the install item shows and acts while the
 //     lifecycle items AND Open HFDesk hide (an item that would open
-//     nothing never sits there) — the
-//     shape a catch-up reaches after Delete from the companion and the
-//     shape the relaunched child finds on a machine whose installation
-//     failed: no dead end;
+//     nothing never sits there) — the shape a catch-up reaches after
+//     Delete from the companion and the shape the relaunched child finds
+//     on a machine whose installation failed: no dead end;
 //   - an UNSETTLED read offers neither group and no Open HFDesk — the
-//     honest unknown line
-//     alone — because neither claim was proven;
-//   - the registered-service dialog item stays NIL throughout: the
-//     desktop host owns that dialog.
+//     honest unknown line alone — because neither claim was proven;
+//   - every write follows the hide rule (no update after Hide, pinned by
+//     its own order test): an already hidden item receives nothing.
 func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
-	line := &fakeTrayItem{}
-	open := &fakeTrayItem{}
-	install := &fakeTrayItem{}
-	start := &fakeTrayItem{}
-	stop := &fakeTrayItem{}
-	update := &fakeTrayItem{}
-	del := &fakeTrayItem{}
+	line := newFakeTrayItem()
+	open := newFakeTrayItem()
+	install := newFakeTrayItem()
+	start := newFakeTrayItem()
+	stop := newFakeTrayItem()
+	update := newFakeTrayItem()
+	del := newFakeTrayItem()
 	menu := &trayServiceMenu{
 		line: line, open: open, install: install, start: start, stop: stop, update: update, delete: del,
-		installOnAbsence:   true,
 		openFollowsService: true,
-		// service stays NIL: the decided companion composition carries
-		// no registered-service dialog item.
 	}
 	lifecycleItems := map[string]*fakeTrayItem{
 		"start": start, "stop": stop, "update": update, "delete": del,
@@ -727,6 +726,14 @@ func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
 		for name, item := range lifecycleItems {
 			if _, _, visible, _ := item.snapshot(); visible {
 				t.Errorf("the %s item is visible at %q although that read offers no lifecycle action", name, stage)
+			}
+		}
+	}
+	requireLifecycleVisible := func(t *testing.T, stage string) {
+		t.Helper()
+		for name, item := range lifecycleItems {
+			if _, _, visible, _ := item.snapshot(); !visible {
+				t.Errorf("the %s item is hidden at %q although that read proves a registration", name, stage)
 			}
 		}
 	}
@@ -743,13 +750,13 @@ func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
 		}
 	}
 
-	// Registered and running: the line, the visible lifecycle section,
+	// Registered and running: the line, the visible lifecycle group,
 	// stop/update/delete enabled, start grey, Open HFDesk visible and
 	// enabled — and NO install item: the registered shape of the
-	// composition.
+	// submenu.
 	menu.apply(serviceMenuFor(service.Status{State: service.StateRunning, Running: true}, nil))
-	if title, _, _, _ := line.snapshot(); title != "Service: installed" {
-		t.Errorf("the status line = %q, want the shared presence-only line", title)
+	if title, _, _, _ := line.snapshot(); title != "Service: running" {
+		t.Errorf("the status line = %q, want the honest running line", title)
 	}
 	requireInstallHidden(t, "a running registration")
 	if _, enabled, visible, _ := open.snapshot(); !visible || !enabled {
@@ -773,6 +780,9 @@ func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
 	// proven, but nothing answers it yet; the install item stays hidden
 	// — the registration is proven.
 	menu.apply(serviceMenuFor(service.Status{State: service.StateStopped}, nil))
+	if title, _, _, _ := line.snapshot(); title != "Service: installed" {
+		t.Errorf("the status line = %q, want the honest installed line", title)
+	}
 	requireInstallHidden(t, "a stopped registration")
 	if _, enabled, visible, _ := open.snapshot(); !visible || enabled {
 		t.Errorf("Open HFDesk visible=%t enabled=%t, want it visible and grey beside a stopped service", visible, enabled)
@@ -782,6 +792,25 @@ func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
 	}
 	if _, enabled, _, _ := stop.snapshot(); enabled {
 		t.Error("the stop item acts beside a stopped service")
+	}
+
+	// A TRANSITION: the group stays — the registration is proven — but
+	// every action is grey until the reading settles, the line names the
+	// transition, and Open HFDesk keeps following the running fact of
+	// the pending start (the classification every surface decides with).
+	menu.apply(serviceMenuFor(service.Status{State: service.StateStarting}, nil))
+	if title, _, _, _ := line.snapshot(); title != "Service: starting" {
+		t.Errorf("the status line = %q, want the line that names the transition", title)
+	}
+	requireInstallHidden(t, "a service on its way up")
+	requireLifecycleVisible(t, "a service on its way up")
+	for name, item := range lifecycleItems {
+		if _, enabled, _, _ := item.snapshot(); enabled {
+			t.Errorf("the %s item acts during a transition: a pending state is not a state to decide on", name)
+		}
+	}
+	if _, enabled, visible, _ := open.snapshot(); !visible || !enabled {
+		t.Errorf("Open HFDesk visible=%t enabled=%t, want it following the running fact of the pending start", visible, enabled)
 	}
 
 	// An UNSETTLED read offers neither group: the honest unknown line
@@ -803,7 +832,7 @@ func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
 	// applies after the helper of a delete ended.
 	menu.apply(serviceMenuFor(service.Status{State: service.StateNotInstalled}, nil))
 	if title, _, _, _ := line.snapshot(); title != "Service: not installed" {
-		t.Errorf("the status line = %q, want the shared presence-only line", title)
+		t.Errorf("the status line = %q, want the honest absence line", title)
 	}
 	if _, enabled, visible, _ := install.snapshot(); !visible || !enabled {
 		t.Errorf("the install item visible=%t enabled=%t beside a proven absence, want it visible and enabled: the menu must not be a dead end", visible, enabled)

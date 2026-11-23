@@ -11,59 +11,68 @@ import (
 )
 
 // TestServiceMenuForOneRead proves that one read of the registration maps
-// onto the status line and the two items of the tray menu exactly as the
-// surface promises:
+// onto the status line and the two visibility claims of the Service
+// submenu exactly as the surface promises:
 //
-//   - a proven absence enables the install item and hides the service item,
-//     so a machine without a service shows no dead second item,
-//   - a proven registration greys the install item and shows the
-//     registered-service item beside it,
-//   - and an unsettled read claims neither: the line says unknown and the
-//     install item is greyed, because "no service is installed" was not
-//     proven by a read that failed.
+//   - a proven absence shows the install item and hides the lifecycle
+//     group, so a machine without a service shows no dead actions,
+//   - a proven registration shows the lifecycle group and hides the
+//     install item, so exactly one action group is ever on screen,
+//   - a transition names itself in the line ("Service: starting",
+//     "Service: stopping") while the registration is still proven,
+//   - and an unsettled read claims neither: the line says unknown and no
+//     action shows, because "no service is installed" was not proven by
+//     a read that failed.
 func TestServiceMenuForOneRead(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
 		status         service.Status
 		readErr        error
 		line           string
-		installEnabled bool
-		serviceVisible bool
+		installVisible bool
+		actionsVisible bool
 	}{
 		{
 			name:           "no registration",
 			status:         service.Status{State: service.StateNotInstalled},
 			line:           "Service: not installed",
-			installEnabled: true,
-			serviceVisible: false,
+			installVisible: true,
+			actionsVisible: false,
 		},
 		{
 			name:           "running service",
 			status:         service.Status{State: service.StateRunning, Running: true},
-			line:           "Service: installed",
-			installEnabled: false,
-			serviceVisible: true,
+			line:           "Service: running",
+			installVisible: false,
+			actionsVisible: true,
 		},
 		{
 			name:           "stopped service",
 			status:         service.Status{State: service.StateStopped},
 			line:           "Service: installed",
-			installEnabled: false,
-			serviceVisible: true,
+			installVisible: false,
+			actionsVisible: true,
 		},
 		{
 			name:           "service on its way up",
 			status:         service.Status{State: service.StateStarting},
-			line:           "Service: installed",
-			installEnabled: false,
-			serviceVisible: true,
+			line:           "Service: starting",
+			installVisible: false,
+			actionsVisible: true,
+		},
+		{
+			name:           "service on its way down",
+			status:         service.Status{State: service.StateStopping},
+			line:           "Service: stopping",
+			installVisible: false,
+			actionsVisible: true,
 		},
 		{
 			name:           "failed service",
 			status:         service.Status{State: service.StateFailed},
 			line:           "Service: installed",
-			installEnabled: false,
-			serviceVisible: true,
+			installVisible: false,
+			actionsVisible: true,
 		},
 		{
 			// A registration whose program is gone is still a
@@ -73,8 +82,8 @@ func TestServiceMenuForOneRead(t *testing.T) {
 			name:           "broken registration",
 			status:         service.Status{State: service.StateBroken},
 			line:           "Service: installed",
-			installEnabled: false,
-			serviceVisible: true,
+			installVisible: false,
+			actionsVisible: true,
 		},
 		{
 			// The read failed: the line must not claim a machine
@@ -83,22 +92,22 @@ func TestServiceMenuForOneRead(t *testing.T) {
 			name:           "unreadable registration",
 			readErr:        errors.New("the service control manager did not answer"),
 			line:           "Service: unknown",
-			installEnabled: false,
-			serviceVisible: false,
+			installVisible: false,
+			actionsVisible: false,
 		},
 		{
 			name:           "state the supervisor could not report",
 			status:         service.Status{State: service.StateUnknown},
 			line:           "Service: unknown",
-			installEnabled: false,
-			serviceVisible: false,
+			installVisible: false,
+			actionsVisible: false,
 		},
 		{
 			name:           "empty state",
 			status:         service.Status{},
 			line:           "Service: unknown",
-			installEnabled: false,
-			serviceVisible: false,
+			installVisible: false,
+			actionsVisible: false,
 		},
 		{
 			// The error decides alone: a status beside it is not a
@@ -107,8 +116,8 @@ func TestServiceMenuForOneRead(t *testing.T) {
 			status:         service.Status{State: service.StateNotInstalled},
 			readErr:        errors.New("the service control manager did not answer"),
 			line:           "Service: unknown",
-			installEnabled: false,
-			serviceVisible: false,
+			installVisible: false,
+			actionsVisible: false,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -116,11 +125,17 @@ func TestServiceMenuForOneRead(t *testing.T) {
 			if state.Line != tc.line {
 				t.Errorf("line = %q, want %q", state.Line, tc.line)
 			}
-			if state.InstallEnabled != tc.installEnabled {
-				t.Errorf("install enabled = %t, want %t", state.InstallEnabled, tc.installEnabled)
+			if state.InstallVisible != tc.installVisible {
+				t.Errorf("install visible = %t, want %t", state.InstallVisible, tc.installVisible)
 			}
-			if state.ServiceVisible != tc.serviceVisible {
-				t.Errorf("service item visible = %t, want %t", state.ServiceVisible, tc.serviceVisible)
+			if state.ActionsVisible != tc.actionsVisible {
+				t.Errorf("lifecycle items visible = %t, want %t", state.ActionsVisible, tc.actionsVisible)
+			}
+
+			// Exactly one action group is ever on screen: the install
+			// item and the lifecycle group are each other's alternate.
+			if state.InstallVisible && state.ActionsVisible {
+				t.Errorf("both action groups are visible at once: %+v", state)
 			}
 
 			// The line of the menu and the line a standalone read
@@ -137,8 +152,8 @@ func TestServiceMenuForOneRead(t *testing.T) {
 // registration (a proven absence and an unsettled read hide it — an item
 // that would open nothing never sits there), and inside a registration it
 // acts only while the service serves the address — the supervisor's running
-// fact, the same classification the stop item follows — and stays grey for
-// a registered service that does not run. The desktop host opens the
+// fact, the same classification the stop item follows — and stays grey for a
+// registered service that does not run. The desktop host opens the
 // address of its OWN server, so apply leaves its open item out of this
 // mapping (openFollowsService is the companion's flag, pinned by the apply
 // test of the companion menu).
@@ -203,26 +218,28 @@ func TestServiceMenuOpenItemFollowsRegistrationAndRunningFact(t *testing.T) {
 }
 
 // TestServiceMenuLifecycleItemsPerState pins the enablement map of the four
-// lifecycle items of the tray menu (start, stop, update, delete): which of
-// them are visible and enabled for every class of read, on the
+// lifecycle items of the Service submenu (start, stop, update, delete):
+// which of them are visible and enabled for every class of read, on the
 // classifications every other surface already decides with.
 //
 // The chosen mapping, pinned here on purpose:
 //
 //   - visibility follows the registration claim alone: a proven
-//     registration shows the whole section, a proven absence and an
+//     registration shows the whole group, a proven absence and an
 //     unsettled read hide it — a destructive action is never offered
 //     without a state that was read;
-//   - start is enabled on a settled state that does not run (stopped,
-//     failed, broken without an instance) and stays grey during a
-//     transition — a pending state is not a state to decide on, the rule
-//     of the service gate;
-//   - stop follows the running fact, where a pending start counts as
-//     running and a pending stop does not — the same classification the
-//     gate's first button and the reports use;
-//   - update and delete follow the registration alone: the update
-//     re-points it and the removal stops a running instance inside
-//     Manager.Uninstall as part of the action.
+//   - INSIDE a proven registration every action needs a SETTLED state:
+//     start is enabled on a settled state that does not run (stopped,
+//     failed, broken without an instance), stop on a settled state whose
+//     running fact stands (a pending start counts as running only once
+//     it settled into one), update and delete on the settled
+//     registration alone;
+//   - a TRANSITION (a pending start or stop) greys the whole group until
+//     the reading settles again — the rule of the service gate, "a
+//     pending state is not a state to decide on", applied to every
+//     action instead of only to start;
+//   - unknown claims no action at all (the honesty pin of the line
+//     above), and auto re-reading continues outside this mapping.
 func TestServiceMenuLifecycleItemsPerState(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
@@ -266,19 +283,17 @@ func TestServiceMenuLifecycleItemsPerState(t *testing.T) {
 			stop:   true, update: true, delete: true,
 		},
 		{
-			// On its way up the instance counts as running (stop is
-			// offered) but the state is no result yet, so start stays
-			// grey.
+			// On its way up nothing is decided: the group stays on
+			// screen — the registration is proven — but every action
+			// is grey until the transition ends.
 			name: "on its way up", visible: true,
 			status: service.Status{State: service.StateStarting},
-			stop:   true, update: true, delete: true,
 		},
 		{
-			// On its way down it neither runs nor settled: both
-			// lifecycle actions stay grey until the transition ends.
+			// On its way down the same rule: no action decides on a
+			// state that is no result yet.
 			name: "on its way down", visible: true,
 			status: service.Status{State: service.StateStopping},
-			update: true, delete: true,
 		},
 		{
 			name:   "not registered",
@@ -299,8 +314,8 @@ func TestServiceMenuLifecycleItemsPerState(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			state := serviceMenuFor(tc.status, tc.readErr)
-			if state.ServiceVisible != tc.visible {
-				t.Errorf("lifecycle items visible = %t, want %t", state.ServiceVisible, tc.visible)
+			if state.ActionsVisible != tc.visible {
+				t.Errorf("lifecycle items visible = %t, want %t", state.ActionsVisible, tc.visible)
 			}
 			if state.StartEnabled != tc.start {
 				t.Errorf("start enabled = %t, want %t", state.StartEnabled, tc.start)
@@ -318,10 +333,10 @@ func TestServiceMenuLifecycleItemsPerState(t *testing.T) {
 			// A destructive action never leaves the visibility claim:
 			// whatever a state enables, an unsettled read shows none of
 			// the items — the enablement flags may only be set where the
-			// section is visible at all.
-			if !state.ServiceVisible && (state.StartEnabled || state.StopEnabled ||
+			// group is visible at all.
+			if !state.ActionsVisible && (state.StartEnabled || state.StopEnabled ||
 				state.UpdateEnabled || state.DeleteEnabled) {
-				t.Errorf("an item is enabled although the section is hidden: %+v", state)
+				t.Errorf("an item is enabled although the group is hidden: %+v", state)
 			}
 		})
 	}

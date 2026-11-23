@@ -669,38 +669,36 @@ func TestServiceHelperUninstallRemovesOnlyTheRegistration(t *testing.T) {
 }
 
 // TestTrayMenuAppliesLifecycleItems proves the write side of the menu map:
-// one read is applied to all seven items — the four lifecycle items appear
-// beside the registration and enable per state, and a machine without one
-// hides the whole registered-service section while the install item stays
-// the only active action.
+// one read is applied to all the submenu items — the four lifecycle items
+// appear beside the registration and enable per state, and a machine
+// without one hides the whole group while the install item becomes the
+// only active action.
 func TestTrayMenuAppliesLifecycleItems(t *testing.T) {
-	line := &fakeTrayItem{}
-	install := &fakeTrayItem{}
-	start := &fakeTrayItem{}
-	stop := &fakeTrayItem{}
-	update := &fakeTrayItem{}
-	del := &fakeTrayItem{}
-	serviceItem := &fakeTrayItem{}
+	line := newFakeTrayItem()
+	install := newFakeTrayItem()
+	start := newFakeTrayItem()
+	stop := newFakeTrayItem()
+	update := newFakeTrayItem()
+	del := newFakeTrayItem()
 	menu := &trayServiceMenu{
 		line: line, install: install, start: start, stop: stop,
-		update: update, delete: del, service: serviceItem,
+		update: update, delete: del,
 	}
-	snapshot := func() (serviceVisible, startVisible, startEnabled, stopEnabled, updateEnabled, delEnabled, installEnabled bool) {
-		_, _, serviceVisible, _ = serviceItem.snapshot()
+	snapshot := func() (startVisible, startEnabled, stopEnabled, updateEnabled, delEnabled, installVisible bool) {
 		_, startEnabled, startVisible, _ = start.snapshot()
 		_, stopEnabled, _, _ = stop.snapshot()
 		_, updateEnabled, _, _ = update.snapshot()
 		_, delEnabled, _, _ = del.snapshot()
-		_, installEnabled, _, _ = install.snapshot()
+		_, _, installVisible, _ = install.snapshot()
 		return
 	}
 
-	// Registered and running: the section appears, stop is the action,
-	// start stays grey, update and delete act, install is greyed.
+	// Registered and running: the group appears, stop is the action,
+	// start stays grey, update and delete act, install hides.
 	menu.apply(serviceMenuFor(service.Status{State: service.StateRunning, Running: true}, nil))
-	visible, startVisible, startEnabled, stopEnabled, updateEnabled, delEnabled, installEnabled := snapshot()
-	if !visible || !startVisible {
-		t.Errorf("the section is visible = %t/%t, want both items beside the registration", visible, startVisible)
+	startVisible, startEnabled, stopEnabled, updateEnabled, delEnabled, installVisible := snapshot()
+	if !startVisible {
+		t.Error("the start item is hidden although the registration is shown")
 	}
 	// Every lifecycle item is SHOWN in the shown state — not just enabled:
 	// the enablement flags are written in the same branch and would still
@@ -719,34 +717,46 @@ func TestTrayMenuAppliesLifecycleItems(t *testing.T) {
 		t.Errorf("the running registration enables start=%t stop=%t update=%t delete=%t, want stop/update/delete only",
 			startEnabled, stopEnabled, updateEnabled, delEnabled)
 	}
-	if installEnabled {
-		t.Error("the install item acts although a registration is proven")
+	if installVisible {
+		t.Error("the install item is visible although a registration is proven")
 	}
 
 	// Registered and stopped: start becomes the action, stop goes grey.
 	menu.apply(serviceMenuFor(service.Status{State: service.StateStopped}, nil))
-	_, _, startEnabled, stopEnabled, updateEnabled, delEnabled, _ = snapshot()
+	_, startEnabled, stopEnabled, updateEnabled, delEnabled, _ = snapshot()
 	if !startEnabled || stopEnabled || !updateEnabled || !delEnabled {
 		t.Errorf("the stopped registration enables start=%t stop=%t update=%t delete=%t, want start/update/delete only",
 			startEnabled, stopEnabled, updateEnabled, delEnabled)
 	}
 
-	// No registration: the whole section disappears, install acts.
+	// A transition keeps the group on screen but greys every action: a
+	// pending state is not a state to decide on.
+	menu.apply(serviceMenuFor(service.Status{State: service.StateStarting}, nil))
+	startVisible, startEnabled, stopEnabled, updateEnabled, delEnabled, installVisible = snapshot()
+	if !startVisible || startEnabled || stopEnabled || updateEnabled || delEnabled {
+		t.Errorf("the transition produced visible=%t start=%t stop=%t update=%t delete=%t, want the visible group with every action grey",
+			startVisible, startEnabled, stopEnabled, updateEnabled, delEnabled)
+	}
+	if installVisible {
+		t.Error("the install item is visible during a transition: the registration is proven")
+	}
+
+	// No registration: the whole group disappears, install acts.
 	menu.apply(serviceMenuFor(service.Status{State: service.StateNotInstalled}, nil))
-	visible, startVisible, _, _, _, _, installEnabled = snapshot()
-	if visible || startVisible {
-		t.Errorf("the section is visible = %t/%t beside a proven absence, want it hidden", visible, startVisible)
+	startVisible, _, _, _, _, installVisible = snapshot()
+	if startVisible {
+		t.Error("the start item is visible beside a proven absence, want the group hidden")
 	}
-	if _, _, v, _ := serviceItem.snapshot(); v {
-		t.Error("the registered-service dialog item stayed visible beside a proven absence")
-	}
-	for name, item := range map[string]*fakeTrayItem{"stop": stop, "update": update, "delete": del} {
+	for name, item := range map[string]*fakeTrayItem{"start": start, "stop": stop, "update": update, "delete": del} {
 		if _, _, itemVisible, _ := item.snapshot(); itemVisible {
 			t.Errorf("the %s item stayed visible beside a proven absence", name)
 		}
 	}
-	if !installEnabled {
-		t.Error("the install item is grey although the read proved no registration")
+	if !installVisible {
+		t.Error("the install item is hidden although the read proved no registration")
+	}
+	if _, enabled, visible, _ := install.snapshot(); !visible || !enabled {
+		t.Errorf("the install item visible=%t enabled=%t beside a proven absence, want it visible and enabled", visible, enabled)
 	}
 }
 
