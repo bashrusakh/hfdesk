@@ -1002,7 +1002,9 @@ replaces the other.
   registered address, enabled while the service serves it), the install item
   beside a proven absence or the lifecycle items beside a proven
   registration, **Runtime / Logs**, and — after a separator — **Exit**, which
-  closes only the companion and leaves the service running. Its Runtime /
+  closes only the companion and leaves the service running. The **Open
+  HFDesk** item appears only beside a proven registration and hides beside a
+  proven absence and an unsettled or unreadable read. Its Runtime /
   Logs window renders fresh on every show: the state of the service, a link
   to the web UI the registration names, the tail of the service's own log
   file (from the registered log directory, see
