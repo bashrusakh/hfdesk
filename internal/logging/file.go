@@ -36,7 +36,10 @@ type FileSink struct {
 // that rotates it at maxSize bytes, keeping maxBackups rotated files.
 //
 // The file is created with owner only permissions because logs may contain
-// information that is sensitive even after redaction.
+// information that is sensitive even after redaction. The mode is the Unix
+// permission model: on Windows the mode does not apply and the descriptor
+// the log directory gives the new file governs, which the service layer
+// owns (see the log grant of the service package).
 func NewFileSink(path string, maxSize int64, maxBackups int) (*FileSink, error) {
 	if path == "" {
 		return nil, fmt.Errorf("logging: file sink requires a path")

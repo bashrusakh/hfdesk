@@ -604,6 +604,14 @@ func applyRestrictiveACL(path string) error {
 //
 // The descriptor is protected ("D:P"), so the access of the parent
 // directory is not inherited.
+//
+// The one exception to "nobody else" is the log, and it lives at the other
+// end of the layer: grantLogReadToInteractiveUsers adds read access for
+// interactive users to the log directory and the active log file at a start
+// of the instance — because the log a window names must be readable from
+// outside the window — but only when it finds exactly this list untouched,
+// and only on the two log paths. The config and state descriptors keep the
+// rule above.
 func scmStateSDDL() string {
 	return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;LS)"
 }

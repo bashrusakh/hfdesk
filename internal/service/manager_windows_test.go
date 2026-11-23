@@ -316,6 +316,7 @@ var scmTestAliases = map[string]string{
 	"SY": "S-1-5-18",     // LocalSystem
 	"BA": "S-1-5-32-544", // Administrators
 	"LS": "S-1-5-19",     // LocalService
+	"IU": "S-1-5-4",      // Interactive
 	"WD": "S-1-1-0",      // Everyone
 }
 
