@@ -1007,8 +1007,8 @@ replaces the other.
   to the web UI the registration names, the tail of the service's own log
   file (from the registered log directory, see
   [Where the state lives](#where-the-state-lives)) with the one action that
-  opens the whole file in the default editor, and the log file of this
-  launch.
+  opens the whole file with the default handler of Windows, and the log file
+  of this launch.
 - **The dialog** is a Windows task dialog, which needs the common controls
   version 6 that the embedded application manifest declares. A locally built
   binary without that resource still works: it falls back to message boxes that
