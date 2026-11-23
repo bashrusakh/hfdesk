@@ -191,6 +191,23 @@ func TestRuntimeUIServiceStatusAndInstallAction(t *testing.T) {
 	runRuntimeUIHarness(t, "service")
 }
 
+// TestRuntimeUIOpenLogActions proves that the log open actions of the
+// Runtime view are owned by the right process in the right context: in a
+// plain browser the folder action goes to the endpoint of the server and
+// the file action has no owner (its button stays disabled and names the
+// window), while inside the Logs window the window-host-bound functions
+// own both clicks — no request reaches the server, because the server of
+// a service runs in session 0 and could not open a folder or a file on
+// the user's desktop — and the host path claims nothing beside the
+// host's own native report.
+//
+// Node's built-in VM drives the shipped runtime.js with DOM and fetch
+// stubs, so the harness exercises the view itself and not a copy of its
+// rules.
+func TestRuntimeUIOpenLogActions(t *testing.T) {
+	runRuntimeUIHarness(t, "open")
+}
+
 // TestRuntimeUIAllScenarioGroups proves that the Runtime / Logs view works
 // when every scenario of the harness runs in one process.
 //

@@ -108,7 +108,7 @@ for (const id of [
   'statusDot', 'statusLabel', 'versionLabel', 'serviceBadge', 'installServiceButton',
   'serverUrl', 'activeJobs',
   'queuedJobs', 'logFile', 'errorBanner', 'errorTitle', 'errorText',
-  'openUiButton', 'openUiNote', 'openLogsButton', 'copyButton', 'clearButton',
+  'openUiButton', 'openUiNote', 'openLogsButton', 'openLogFileButton', 'copyButton', 'clearButton',
   'levelFilter', 'searchInput', 'followToggle', 'streamDot', 'streamLabel',
   'recordCount', 'logView', 'logBody', 'emptyState', 'emptyTitle',
   'emptyText', 'liveRegion', 'toastContainer'
@@ -170,6 +170,8 @@ const server = {
   truncated: false,
   statusFails: false,
   version: 'test',
+  // logFile is the path of the log file the status reports.
+  logFile: '',
   // runId is the run of the server. The status reports it, the way the
   // server does. A null value means that the server does not report a run
   // id at all, the way an older build answers.
@@ -189,6 +191,11 @@ const installs = {
   mode: 'ok',
   release: null
 };
+
+// openLogsPosts counts the requests the view made to the open-logs
+// endpoint — the browser path of the folder action. Inside the window the
+// window host owns that click, so the count must not move.
+const openLogsPosts = { posts: 0 };
 
 const calls = [];
 
@@ -290,7 +297,7 @@ const context = {
         address: '127.0.0.1:8080',
         activeJobs: { running: 0, queued: 0 },
         logCursor: server.head,
-        logFile: ''
+        logFile: server.logFile
       };
       // A server that does not report a run id leaves the field out, the
       // way an older build answers.
@@ -324,6 +331,10 @@ const context = {
         });
       }
       return jsonResponse({ ok: true });
+    }
+    if (rawPath === '/api/runtime/open-logs') {
+      openLogsPosts.posts += 1;
+      return jsonResponse({ ok: true, path: '/logs' });
     }
     if (rawPath.startsWith('/api/runtime/logs?')) {
       // The server answers with the cursor of the last record it
@@ -545,6 +556,7 @@ function resetView() {
   server.truncated = false;
   server.statusFails = false;
   server.version = 'test';
+  server.logFile = '';
   server.runId = 'run-1';
   server.serviceState = 'not-installed';
 
@@ -554,6 +566,9 @@ function resetView() {
   installs.posts = 0;
   installs.mode = 'ok';
   installs.release = null;
+
+  // The endpoint count of the previous scenario is reset with it.
+  openLogsPosts.posts = 0;
 
   // The service badge and the install button start from the state the
   // shipped markup carries, so a scenario reads them from a known place.
@@ -1261,6 +1276,96 @@ async function scenarioServiceStatusOffline() {
   server.statusFails = false;
 }
 
+// The log open actions belong to the right owner in the right context:
+//
+//   - in a PLAIN BROWSER the folder action goes to the endpoint of the
+//     server, and the file action has no owner — its button stays
+//     disabled and names the window where it works, instead of failing
+//     on every click;
+//   - inside the Logs WINDOW the window host binds both functions, the
+//     clicks reach the host (which runs in the user's session — a
+//     service server runs in session 0 and could not open a folder or a
+//     file on the user's desktop), and NO request goes to the server:
+//     the endpoint must not be the owner of the click in the window.
+//
+// The host reports its own outcome natively, so the host path claims
+// nothing in the page: no success toast appears beside it.
+async function scenarioOpenLogActions() {
+  resetView();
+  server.logFile = '/logs/hfdesk.log';
+  await ui.refreshStatus();
+  await settle();
+
+  const folder = nodes.get('#openLogsButton');
+  const file = nodes.get('#openLogFileButton');
+
+  // A plain browser: the folder acts through the endpoint, the file
+  // button is disabled and points at the window.
+  eq(folder.disabled, false, 'the folder button is enabled beside a log file');
+  eq(file.disabled, true,
+    'the file button is disabled outside the window: no host owns the action there');
+  ok(file.title.includes('HFDesk window'),
+    `the file button says where it works (${file.title})`);
+
+  fireClick(folder);
+  await settle();
+  eq(openLogsPosts.posts, 1, 'the folder click in a browser reached the endpoint');
+  ok(toastMessages().some(message => /log folder was opened/.test(message)),
+    `the endpoint path reports the opened folder (${JSON.stringify(toastMessages())})`);
+
+  // The window host binds both actions.
+  let hostFolder = 0;
+  let hostFile = 0;
+  window.hfdeskOpenLogFolder = async () => { hostFolder += 1; };
+  window.hfdeskOpenLogFile = async () => { hostFile += 1; };
+  try {
+    await ui.refreshStatus();
+    await settle();
+    eq(file.disabled, false,
+      'the file button is enabled inside the window: the host owns the action');
+    eq(file.title, 'Open the file /logs/hfdesk.log',
+      'the file button names the file it opens inside the window');
+
+    fireClick(file);
+    await settle();
+    eq(hostFile, 1, 'the file click reached the window host');
+    eq(openLogsPosts.posts, 1, 'the file click sent no request to the server');
+
+    fireClick(folder);
+    await settle();
+    eq(hostFolder, 1, 'the folder click reached the window host');
+    eq(openLogsPosts.posts, 1,
+      'the folder click sent no request to the server: the host owns it inside the window');
+    eq(toastMessages().length, 1,
+      'the host path claims nothing beside the host\u2019s own native report');
+
+    // The open-UI action goes to the host as well: the browser belongs
+    // to the user's session, and the endpoint of a service server could
+    // not reach the desktop from session 0. The calls list records
+    // every request the view made, so a fetch would show up there even
+    // though the stub would reject it.
+    let hostOpenUi = 0;
+    window.hfdeskOpenUi = async () => { hostOpenUi += 1; };
+    const openUiRequests = () => calls.filter(path => path === '/api/runtime/open-ui').length;
+    const openUiBefore = openUiRequests();
+    fireClick(nodes.get('#openUiButton'));
+    await settle();
+    eq(hostOpenUi, 1, 'the open-UI click reached the window host');
+    eq(openUiRequests(), openUiBefore,
+      'the open-UI click sent no request to the server: the host owns it inside the window');
+    delete window.hfdeskOpenUi;
+  } finally {
+    delete window.hfdeskOpenLogFolder;
+    delete window.hfdeskOpenLogFile;
+  }
+
+  // The bindings are gone again: the next status refresh decides the
+  // buttons by the browser rule, so no scenario inherits a window state.
+  await ui.refreshStatus();
+  await settle();
+  eq(file.disabled, true, 'the file button falls back to the browser rule without the host');
+}
+
 // The groups of the scenarios of the harness.
 //
 // The group is picked with the HFDESK_RUNTIME_SCENARIO environment
@@ -1293,6 +1398,9 @@ const scenarioGroups = {
     scenarioServiceStatus,
     scenarioInstallServiceAction,
     scenarioServiceStatusOffline
+  ],
+  open: [
+    scenarioOpenLogActions
   ]
 };
 

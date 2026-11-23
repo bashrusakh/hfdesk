@@ -45,7 +45,7 @@ func alreadyRunningText(url string) string {
 // notice names the way to reach the running instance instead.
 func alreadyRunningUnreachableText() string {
 	return "HFDesk is already running.\n\n" +
-		"Use the icon in the notification area to open the Runtime / Logs window."
+		"Use the icon in the notification area to open the Logs window."
 }
 
 // alreadyRunningOpenFailedText returns the text of the notice of a launch
@@ -59,7 +59,7 @@ func alreadyRunningUnreachableText() string {
 func alreadyRunningOpenFailedText(url string, openErr error) string {
 	return "HFDesk is already running.\n\n" +
 		browserOpenFailedText(url, openErr) +
-		"\n\nUse the icon in the notification area to open the Runtime / Logs window."
+		"\n\nUse the icon in the notification area to open the Logs window."
 }
 
 // trayStartupFailureText returns the text of the report of a host whose
@@ -72,16 +72,16 @@ func trayStartupFailureText() string {
 		"The desktop host needs the icon in the notification area to be reachable, so it stops.")
 }
 
-// runtimeWindowShowFailedText returns the text of the report of a Runtime /
-// Logs window that could not be shown. The failure is recorded in the log
+// runtimeWindowShowFailedText returns the text of the report of a Logs
+// window that could not be shown. The failure is recorded in the log
 // before this text is built (the host logs it beside the box), so the log
 // path the window names carries the very failure.
 func runtimeWindowShowFailedText(err error) string {
-	return failureWindowText(fmt.Sprintf("The Runtime / Logs window could not be shown.\n\n%v", err))
+	return failureWindowText(fmt.Sprintf("The Logs window could not be shown.\n\n%v", err))
 }
 
-// runtimeWindowUnavailableText returns the text of the report of a Runtime /
-// Logs window that cannot be shown because the WebView2 runtime is missing.
+// runtimeWindowUnavailableText returns the text of the report of a Logs
+// window that cannot be shown because the WebView2 runtime is missing.
 //
 // The host keeps running: the server and the tray keep working, and the
 // action shows the same message again. The report is a failure window of
@@ -89,7 +89,7 @@ func runtimeWindowShowFailedText(err error) string {
 // the one action (install the runtime) beside the standard log-path line,
 // in the words the tray companion's mirror of it already carries.
 func runtimeWindowUnavailableText(url string) string {
-	return failureWindowText("The Microsoft Edge WebView2 runtime is not installed, so the Runtime / Logs window cannot be shown.\n\n" +
+	return failureWindowText("The Microsoft Edge WebView2 runtime is not installed, so the Logs window cannot be shown.\n\n" +
 		"Install the Evergreen runtime from\nhttps://developer.microsoft.com/microsoft-edge/webview2/\n\n" +
 		"HFDesk keeps running in the notification area. The web UI is still available at " + url + ".")
 }

@@ -37,7 +37,7 @@ func TestAlreadyRunningOpenFailedTextNamesTheFailureAndTheWayOut(t *testing.T) {
 		"http://127.0.0.1:8080",
 		"the browser could not be started",
 		"notification area",
-		"Runtime / Logs window",
+		"Logs window",
 	})
 }
 

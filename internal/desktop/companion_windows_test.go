@@ -522,75 +522,73 @@ func TestAcquireInstanceLockForLaunchWaitsOnlyForTheRelaunch(t *testing.T) {
 }
 
 // TestCompanionWindowPageReportsStateAndRegistrationAddress proves the
-// page source of the companion window: the honest state of the service —
+// fallback document of the Logs window: the honest state of the service —
 // including the STOPPED state, where the window works exactly the same —
-// and the web-UI link offered by the fact of the registration, with the
-// menu catch-up after every read like every other display read (failed
-// reads included).
+// the honest line that the registered address did not answer (or the
+// honest reason there is no address to name), with the menu catch-up
+// after every read like every other display read (failed reads
+// included). The address is stated as a fact and never linked: it just
+// proved it does not answer.
 func TestCompanionWindowPageReportsStateAndRegistrationAddress(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		status    service.Status
 		readErr   error
 		wantState string
-		wantLink  string
-		noLink    bool
+		wantNote  string
+		wantAddr  string
+		noAddr    bool
 	}{
 		{
-			name:      "a stopped service still shows its registered address",
+			name:      "a stopped service names the address that did not answer",
 			status:    registeredStoppedService(),
 			wantState: "The HFDesk service is stopped.",
-			wantLink:  "http://127.0.0.1:18080",
+			wantAddr:  "http://127.0.0.1:18080",
 		},
 		{
-			name:      "a running service",
+			name:      "a running service whose address did not answer",
 			status:    runningServiceStatus(service.StateRunning, "127.0.0.1:18080"),
 			wantState: "The HFDesk service is running.",
-			wantLink:  "http://127.0.0.1:18080",
+			wantAddr:  "http://127.0.0.1:18080",
 		},
 		{
 			name:      "a machine without a registration names no address",
 			status:    service.Status{State: service.StateNotInstalled},
 			wantState: "HFDesk is not registered as a Windows service.",
-			noLink:    true,
+			wantNote:  "The registration names no address, so there is nothing to open.",
+			noAddr:    true,
 		},
 		{
 			name:      "a read that fails reports the honest unknown",
 			readErr:   errors.New("the service control manager did not answer"),
 			wantState: "The state of the Windows service could not be read.",
-			noLink:    true,
+			wantNote:  "The address of the web UI could not be read.",
+			noAddr:    true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
 				return tc.status, tc.readErr
 			})
-			// The service-log section of the page is fixed for this
-			// test: the page must not depend on the ProgramData log
-			// of the machine the test runs on.
-			replaceSeam(t, &serviceLogSectionOfCompanion, func() serviceLogSection {
-				return serviceLogSection{
-					Path: `C:\ProgramData\HFDesk\logs\hfdesk.log`,
-					Tail: "record one\nrecord two",
-				}
-			})
 			var refreshes atomic.Int32
 			replaceSeam(t, &serviceMenuRefresh, func() { refreshes.Add(1) })
 
 			page := companionWindowPage()
 
-			assertNames(t, page, "the companion page", []string{"<h1>" + tc.wantState + "</h1>"})
-			if tc.noLink {
-				if strings.Contains(page, "<a href") {
-					t.Errorf("the page links an address although this state names none: %q", page)
-				}
+			assertNames(t, page, "the fallback document", []string{"<h1>" + tc.wantState + "</h1>"})
+			if tc.noAddr {
+				assertNamesWithout(t, page, "the honest reason", []string{tc.wantNote},
+					[]string{"does not answer.", "<a ", "href="})
 			} else {
-				assertNames(t, page, "the companion page link", []string{
-					`<a href="` + tc.wantLink, tc.wantLink,
-				})
+				assertNamesWithout(t, page, "the address line", []string{
+					"The web UI at <code>" + tc.wantAddr + "</code> does not answer.",
+				}, []string{"<a ", "href="})
 			}
-			if got := refreshes.Load(); got != 1 {
-				t.Errorf("the window read asked for the menu catch-up %d time(s), want exactly once after every read", got)
+			// The render reads the registration twice — the state
+			// line and the service-log path of the same document —
+			// and every read is reflected exactly once.
+			if got := refreshes.Load(); got != 2 {
+				t.Errorf("the window read asked for the menu catch-up %d time(s), want exactly once per read (2)", got)
 			}
 		})
 	}
@@ -655,6 +653,28 @@ func TestCompanionWindowReadsEachAskTheMenuToCatchUp(t *testing.T) {
 
 		if got := reads.Load(); got != 1 {
 			t.Errorf("the click read the registration %d time(s), want exactly one", got)
+		}
+		if got := refreshes.Load(); got != reads.Load() {
+			t.Errorf("%d display read(s) asked for the menu catch-up %d time(s), want one request per read",
+				reads.Load(), got)
+		}
+	})
+
+	t.Run("the live-URL read reflects its read", func(t *testing.T) {
+		var reads atomic.Int32
+		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+			reads.Add(1)
+			return status, nil
+		})
+		var refreshes atomic.Int32
+		replaceSeam(t, &serviceMenuRefresh, func() { refreshes.Add(1) })
+
+		if url := companionRuntimePageURL(); url != "http://127.0.0.1:18080/runtime.html" {
+			t.Errorf("companionRuntimePageURL() = %q, want the runtime page of the registered address", url)
+		}
+
+		if got := reads.Load(); got != 1 {
+			t.Errorf("the live-URL resolve read the registration %d time(s), want exactly one", got)
 		}
 		if got := refreshes.Load(); got != reads.Load() {
 			t.Errorf("%d display read(s) asked for the menu catch-up %d time(s), want one request per read",
@@ -1019,24 +1039,48 @@ func TestCompanionExitEndsTheHostWithoutTouchingTheService(t *testing.T) {
 	}
 }
 
-// TestCompanionWindowActionsCarryTheOpenFullLogAction pins the bridge of
-// the service-log section: the window binds exactly the one fixed action
-// name the page's button calls, that action opens EXACTLY the service log
-// file the page section speaks about (the same resolver, so the tail and
-// the file the default handler receives can never be different files), and
-// a file the service has not written yet reports honestly instead of
-// starting a handler without a target.
-func TestCompanionWindowActionsCarryTheOpenFullLogAction(t *testing.T) {
-	actions := companionWindowActions(panicGuard{})
-	if len(actions) != 1 || actions[companionOpenLogAction] == nil {
+// TestCompanionWindowActionsCarryTheOpenLogActions pins the bridge of
+// the fallback document and the live page: the window binds exactly the
+// four fixed action names the documents call (open the file, open the
+// folder, open the web UI, retry), the open-file action opens EXACTLY the service log
+// file the document's path speaks about (the same resolver, so the path
+// the document shows and the file the default handler receives can never
+// be different files), the open-folder action opens that file's folder —
+// both in the process of the window, on the host side — and a file or
+// folder the service has not written yet reports honestly instead of
+// starting a handler without a target. The retry beside a window that is
+// gone (current() returns nil) is a no-op instead of a panic.
+func TestCompanionWindowActionsCarryTheOpenLogActions(t *testing.T) {
+	actions := companionWindowActions(panicGuard{},
+		func() *runtimeWindow { return nil },
+		func() bool { return false })
+	if len(actions) != 4 {
 		keys := make([]string, 0, len(actions))
 		for name := range actions {
 			keys = append(keys, name)
 		}
-		t.Fatalf("the window actions = %v, want exactly the one %q action", keys, companionOpenLogAction)
+		t.Fatalf("the window actions = %v, want exactly the four fixed names", keys)
+	}
+	for _, name := range []string{openLogFileAction, openLogFolderAction, openUiAction, logsTryAgainAction} {
+		if actions[name] == nil {
+			t.Fatalf("the window action %q is not bound: its button would find no function", name)
+		}
 	}
 
-	t.Run("the action opens exactly the file the page section shows", func(t *testing.T) {
+	t.Run("the retry beside a gone window is a no-op", func(t *testing.T) {
+		// current() returns nil: the handler must not panic and must
+		// not show anything — a retry can only fail when the window
+		// that asked for it is already gone.
+		replaceSeam(t, &showMessage, func(caption, text string, icon uint32) {
+			t.Errorf("the retry showed %q although there is no window to retry", caption)
+		})
+		actions[logsTryAgainAction]()
+		// The handler runs on its own goroutine: a panic there would
+		// fail the test process, so a moment without one is the proof.
+		time.Sleep(50 * time.Millisecond)
+	})
+
+	t.Run("the file action opens exactly the file the document shows", func(t *testing.T) {
 		logDir := t.TempDir()
 		logPath := filepath.Join(logDir, serviceLogFileName)
 		if err := os.WriteFile(logPath, []byte("record one\nrecord two\n"), 0o600); err != nil {
@@ -1055,21 +1099,54 @@ func TestCompanionWindowActionsCarryTheOpenFullLogAction(t *testing.T) {
 		})
 		shown := recordMessagesChannel(t)
 
-		actions[companionOpenLogAction]()
+		actions[openLogFileAction]()
 
 		select {
 		case path := <-opened:
 			if path != logPath {
 				t.Errorf("the default handler received %q, want the service log file %q", path, logPath)
 			}
-			// The page section reads through the very same
-			// resolver, so the tail and the opened file are one
-			// and the same path.
-			if section := serviceLogSectionOfCompanion(); section.Path != path {
-				t.Errorf("the page section speaks about %q, the action opened %q: two different files", section.Path, path)
+			// The document's path reads through the very same
+			// resolver, so the path it shows and the file the
+			// default handler receives are one and the same path.
+			if resolved := companionServiceLogPath(); resolved != path {
+				t.Errorf("the document speaks about %q, the action opened %q: two different files", resolved, path)
 			}
 		case <-time.After(5 * time.Second):
 			t.Fatal("the window action never handed the service log file to the default handler")
+		}
+		if messages := drainMessages(shown); len(messages) != 0 {
+			t.Errorf("a successful open showed %v, want no report", messages)
+		}
+	})
+
+	t.Run("the folder action opens the folder of that log", func(t *testing.T) {
+		logDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(logDir, serviceLogFileName), []byte("record\n"), 0o600); err != nil {
+			t.Fatalf("write the service log: %v", err)
+		}
+		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+			return service.Status{
+				State: service.StateRunning,
+				Paths: runtimepaths.Paths{LogDir: logDir},
+			}, nil
+		})
+		opened := make(chan string, 1)
+		replaceSeam(t, &openExternalFolder, func(path string) error {
+			opened <- path
+			return nil
+		})
+		shown := recordMessagesChannel(t)
+
+		actions[openLogFolderAction]()
+
+		select {
+		case dir := <-opened:
+			if dir != logDir {
+				t.Errorf("the file manager received %q, want the log folder %q", dir, logDir)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the window action never handed the log folder to the file manager")
 		}
 		if messages := drainMessages(shown); len(messages) != 0 {
 			t.Errorf("a successful open showed %v, want no report", messages)
@@ -1090,7 +1167,7 @@ func TestCompanionWindowActionsCarryTheOpenFullLogAction(t *testing.T) {
 		})
 		shown := recordMessagesChannel(t)
 
-		actions[companionOpenLogAction]()
+		actions[openLogFileAction]()
 
 		waitForTrayCondition(t, "the honest report of a service log that does not exist yet",
 			func() bool { return len(shown) == 1 })
@@ -1103,6 +1180,41 @@ func TestCompanionWindowActionsCarryTheOpenFullLogAction(t *testing.T) {
 		}
 		assertNames(t, messages[0].text, "the missing-log report", []string{
 			"The service log file has not been created yet",
+		})
+	})
+
+	t.Run("a folder that does not exist yet reports honestly and opens nothing", func(t *testing.T) {
+		// The registration names a log directory that was never
+		// created: the service has never written a log on this
+		// machine.
+		missing := filepath.Join(t.TempDir(), "never-created")
+		logPath := filepath.Join(missing, serviceLogFileName)
+		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+			return service.Status{
+				State: service.StateRunning,
+				Paths: runtimepaths.Paths{LogDir: missing},
+			}, nil
+		})
+		replaceSeam(t, &openExternalFolder, func(path string) error {
+			t.Errorf("the file manager was started for the missing folder %q", path)
+			return nil
+		})
+		shown := recordMessagesChannel(t)
+
+		actions[openLogFolderAction]()
+
+		waitForTrayCondition(t, "the honest report of a log folder that does not exist yet",
+			func() bool { return len(shown) == 1 })
+		messages := drainMessages(shown)
+		if len(messages) != 1 {
+			t.Fatalf("the missing folder showed %d reports, want exactly one: %v", len(messages), messages)
+		}
+		if messages[0].caption != logFolderOpenFailedCaption {
+			t.Errorf("the report is captioned %q, want %q", messages[0].caption, logFolderOpenFailedCaption)
+		}
+		assertNames(t, messages[0].text, "the missing-folder report", []string{
+			"The log folder has not been created yet",
+			"The log folder is at " + filepath.Dir(logPath),
 		})
 	})
 }

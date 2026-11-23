@@ -4,10 +4,11 @@
 package desktop
 
 import (
+	"context"
 	"fmt"
 	"html"
 	"io"
-	"os"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"time"
@@ -38,7 +39,7 @@ const (
 
 // companionLaunch is the companion part of a desktop command line.
 type companionLaunch struct {
-	// Enabled reports that the launch was asked to be a tray companion.
+	// Enabled reports that the launch asked to be a tray companion.
 	Enabled bool
 	// Wait is the bounded wait for the single instance lock, zero for
 	// every launch but the relaunch of an installation.
@@ -95,7 +96,7 @@ func SplitCompanionArgs(args []string) (companionLaunch, []string, error) {
 		wait, err := time.ParseDuration(waitValue)
 		if err != nil || wait < 0 {
 			return companionLaunch{}, rest, fmt.Errorf(
-				"%s %q is not a non-negative duration (for example 2m30s)", companionWaitFlag, waitValue)
+				"%s %q is not a non-negative duration (for example %s)", companionWaitFlag, waitValue, companionWaitFlag)
 		}
 		launch.Wait = wait
 	}
@@ -112,33 +113,44 @@ func companionRelaunchArgs(argv []string, wait time.Duration) []string {
 	return append(relaunch, companionModeFlag, companionWaitFlag, wait.String())
 }
 
-// companionOpenLogAction is the name of the one action the document of the
-// companion window can ask the window to perform: open the full service log
-// file with the default handler of the operating system.
+// The fixed action names the document of the Logs window can call on the
+// window host.
 //
-// The window binds this name on the host side (companionWindowActions) and
-// the page's single button calls it. The page names a fixed action and
-// carries no data: the path of the file comes from the host, never from the
-// document, and nothing of the page reaches a server — the companion
-// listens to nothing.
-const companionOpenLogAction = "hfdeskOpenServiceLog"
+// The window binds these names on the host side (companionWindowActions,
+// desktopWindowActions) and the pages call them: the live runtime page of
+// the server calls the two open actions, the fallback document calls the
+// open action and the retry. Every name has ONE source of truth — these
+// constants — and the pages reference them through the substituted
+// template or through the pinned literals of runtime.js, so the page and
+// the host binding cannot drift apart into a dead button.
+//
+// The names carry no data: the host owns every path it acts on, and the
+// open actions run in the process of the WINDOW — in the user's session —
+// because the server of a service runs in session 0 and cannot open a
+// file or a folder on the user's desktop.
+const (
+	// openLogFolderAction opens the folder of the active log file.
+	openLogFolderAction = "hfdeskOpenLogFolder"
+	// openLogFileAction opens the active log file itself with the
+	// default handler: the service log for a tray companion, the log of
+	// this launch for the desktop host.
+	openLogFileAction = "hfdeskOpenLogFile"
+	// openUiAction opens the web UI in the default browser: the
+	// registered address beside a tray companion (the very address the
+	// link of the old static window carried), the address of the own
+	// server for the desktop host. The browser belongs to the user's
+	// session, so the window host opens it — a server that runs as a
+	// service could not reach the desktop from session 0.
+	openUiAction = "hfdeskOpenUi"
+	// logsTryAgainAction retries the live page: it re-reads the
+	// registration, probes the address and shows the live runtime page
+	// when it answers, or this fallback again when it does not.
+	logsTryAgainAction = "hfdeskTryAgain"
+)
 
 // serviceLogFileName is the name of the active log file of a service
 // instance, next to its rotated generations (documented in docs/SERVICE.md).
 const serviceLogFileName = "hfdesk.log"
-
-// The bounds of the service log tail the companion window shows.
-//
-// The tail is the END of the file and it is read under both limits, so a
-// large log never reaches the page as a whole: the byte bound caps the read
-// itself — the file is seeked to its end and only the last
-// serviceLogTailBytes are read — and the line bound caps what a tail of
-// that size renders. The window states nothing of the limits; they are the
-// honest volume bound of this view, pinned by test.
-const (
-	serviceLogTailBytes = 64 * 1024
-	serviceLogTailLines = 200
-)
 
 // serviceLogPath returns the path of the active service log file.
 //
@@ -157,110 +169,16 @@ func serviceLogPath(registeredLogDir string) string {
 	return filepath.Join(paths.LogDir, serviceLogFileName)
 }
 
-// readServiceLogTail returns the tail of the log file at path under the
-// documented bounds: at most serviceLogTailBytes from the end of the file,
-// cut to whole lines, at most serviceLogTailLines of them, in file order and
-// ending with the newest line.
-//
-// A file that cannot be opened or read returns its error; a read that was
-// bound reports no error — the bound is the view, not a failure.
-func readServiceLogTail(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
-	// Only the end of the file is read: everything before the window is
-	// seeked over, never loaded.
-	var start int64
-	if info, statErr := file.Stat(); statErr == nil && info.Size() > serviceLogTailBytes {
-		start = info.Size() - serviceLogTailBytes
-	}
-	if start > 0 {
-		if _, err := file.Seek(start, io.SeekStart); err != nil {
-			return "", err
-		}
-	}
-	data, err := io.ReadAll(io.LimitReader(file, serviceLogTailBytes))
-	if err != nil {
-		return "", err
-	}
-	text := string(data)
-	if start > 0 {
-		// The bound cut a line in half at its start: that fragment is
-		// dropped, so the tail begins with a whole line.
-		if newline := strings.IndexByte(text, '\n'); newline >= 0 {
-			text = text[newline+1:]
-		} else {
-			text = ""
-		}
-	}
-	lines := strings.Split(text, "\n")
-	for i, line := range lines {
-		lines[i] = strings.TrimSuffix(line, "\r")
-	}
-	if last := len(lines) - 1; last >= 0 && lines[last] == "" {
-		lines = lines[:last]
-	}
-	if len(lines) > serviceLogTailLines {
-		lines = lines[len(lines)-serviceLogTailLines:]
-	}
-	return strings.Join(lines, "\n"), nil
-}
-
-// serviceLogSection is the service-log part of the page of the companion
-// window: the path of the file, and exactly one of the honest shapes the
-// section shows — the bounded tail of a readable file, the fact that the
-// file does not exist yet, or the one-line reason it could not be read. An
-// empty section (no path) claims nothing and renders no content.
-type serviceLogSection struct {
-	// Path is the service log file this section speaks about — the very
-	// file the open-full-file action opens. Empty when no path could be
-	// resolved.
-	Path string
-	// Missing reports the file does not exist: the service has not
-	// written a log yet.
-	Missing bool
-	// ReadError is the one-line reason the file could not be read
-	// (permissions and the like), empty when it could.
-	ReadError string
-	// Tail is the bounded tail of the file, newest line last.
-	Tail string
-}
-
-// serviceLogSectionAt reads the service-log section from the file at path.
-//
-// The states are the honest ones: a file that is not there is missing, a
-// file that cannot be read carries its reason as a single line, and a
-// readable file carries its bounded tail.
-func serviceLogSectionAt(path string) serviceLogSection {
-	section := serviceLogSection{Path: path}
-	if path == "" {
-		return section
-	}
-	tail, err := readServiceLogTail(path)
-	switch {
-	case err == nil:
-		section.Tail = tail
-	case os.IsNotExist(err):
-		section.Missing = true
-	default:
-		section.ReadError = oneLine(err.Error())
-	}
-	return section
-}
-
 // oneLine collapses a multi-line machine message into the one line the
 // window shows it on.
 func oneLine(message string) string {
 	return strings.Join(strings.Fields(message), " ")
 }
 
-// serviceLogMissingText returns the report of the open-full-file action when
-// the service log does not exist yet — the honest state of a service that
-// has not written a log, with no action to offer (there is nothing to open)
-// and the standard log-path line of this launch.
+// serviceLogMissingText returns the report of the open-the-log-file action
+// when the service log does not exist yet — the honest state of a service
+// that has not written a log, with no action to offer (there is nothing to
+// open) and the standard log-path line of this launch.
 func serviceLogMissingText(path string) string {
 	text := "The service log file has not been created yet, so there is nothing to open."
 	if path != "" {
@@ -269,11 +187,11 @@ func serviceLogMissingText(path string) string {
 	return failureWindowText(text)
 }
 
-// serviceLogOpenFailedText returns the report of the open-full-file action
-// whose default handler could not open the file: the state, the cause as
-// presented by the system, the path of the service log itself, and the
-// standard log-path line of this launch like every failure window of a
-// launch that has a log.
+// serviceLogOpenFailedText returns the report of the open-the-log-file
+// action whose default handler could not open the service log: the state,
+// the cause as presented by the system, the path of the service log
+// itself, and the standard log-path line of this launch like every failure
+// window of a launch that has a log.
 func serviceLogOpenFailedText(path string, openErr error) string {
 	text := "The service log file could not be opened in the default program."
 	if openErr != nil {
@@ -284,8 +202,70 @@ func serviceLogOpenFailedText(path string, openErr error) string {
 }
 
 // serviceLogOpenFailedCaption is the caption of both reports of the
-// open-full-file action, so the user reads one title for one button.
+// open-the-log-file action of a tray companion, so the user reads one
+// title for one button.
 const serviceLogOpenFailedCaption = "HFDesk - the service log file could not be opened"
+
+// noLogFileText returns the report of an open action whose log file could
+// not be resolved at all: state only, no action and no invented path, with
+// the standard log-path line of this launch when this launch has one.
+func noLogFileText() string {
+	return failureWindowText("There is no log file to open.")
+}
+
+// logFileMissingText returns the report of the open-the-log-file action of
+// the desktop host when the log file of this launch does not exist yet —
+// state only, nothing to open, plus the standard log-path line that names
+// exactly the file the action looked for.
+func logFileMissingText() string {
+	return failureWindowText("The log file has not been created yet, so there is nothing to open.")
+}
+
+// logFileOpenFailedText returns the report of the open-the-log-file action
+// of the desktop host whose default handler refused the file: the state,
+// the cause as presented by the system, and the standard log-path line of
+// this launch — which is the very file the action tried to open.
+func logFileOpenFailedText(openErr error) string {
+	text := "The log file could not be opened in the default program."
+	if openErr != nil {
+		text += "\n\n" + oneLine(openErr.Error())
+	}
+	return failureWindowText(text)
+}
+
+// logFileOpenFailedCaption is the caption of both reports of the
+// open-the-log-file action of the desktop host, so the user reads one
+// title for one button.
+const logFileOpenFailedCaption = "HFDesk - the log file could not be opened"
+
+// logFolderMissingText returns the report of the open-the-log-folder action
+// when the folder of the log file does not exist yet: state, the folder it
+// would have opened, and the standard log-path line of this launch.
+func logFolderMissingText(dir string) string {
+	text := "The log folder has not been created yet, so there is nothing to open."
+	if dir != "" {
+		text += "\n\nThe log folder is at " + dir + "."
+	}
+	return failureWindowText(text)
+}
+
+// logFolderOpenFailedText returns the report of the open-the-log-folder
+// action whose opener failed: the state, the cause as presented by the
+// system, the folder itself and the standard log-path line of this launch.
+func logFolderOpenFailedText(dir string, openErr error) string {
+	text := "The log folder could not be opened."
+	if openErr != nil {
+		text += "\n\n" + oneLine(openErr.Error())
+	}
+	if dir != "" {
+		text += "\n\nThe log folder is at " + dir + "."
+	}
+	return failureWindowText(text)
+}
+
+// logFolderOpenFailedCaption is the caption of both reports of the
+// open-the-log-folder action, so the user reads one title for one button.
+const logFolderOpenFailedCaption = "HFDesk - the log folder could not be opened"
 
 // companionRelaunchWaitTimeoutText returns the report of a relaunch child
 // that could not take the single instance lock of the session within its
@@ -304,8 +284,8 @@ func companionRelaunchWaitTimeoutText() string {
 }
 
 // companionWebView2MissingText returns the report of a tray companion
-// whose Runtime / Logs window cannot be shown because the WebView2
-// runtime is missing.
+// whose Logs window cannot be shown because the WebView2 runtime is
+// missing.
 //
 // The report is the state (the window cannot be shown while the
 // companion itself keeps running) and the one action that ends it —
@@ -313,160 +293,234 @@ func companionRelaunchWaitTimeoutText() string {
 // every failure window of a launch that has a log.
 func companionWebView2MissingText() string {
 	return failureWindowText(
-		"The Microsoft Edge WebView2 runtime is not installed, so the Runtime / Logs window of the tray companion cannot be shown.\n\n" +
+		"The Microsoft Edge WebView2 runtime is not installed, so the Logs window of the tray companion cannot be shown.\n\n" +
 			"Install the Evergreen runtime from\nhttps://developer.microsoft.com/microsoft-edge/webview2/\n\n" +
 			"The tray companion itself keeps running: its service actions stay available from the icon in the notification area.")
 }
 
-// companionPageState is the model of the page the Runtime / Logs window of
-// a tray companion shows.
+// runtimePageProbeTimeout bounds the probe of the registered address of
+// the Logs window.
 //
-// The companion has no server, so its window cannot render the runtime
-// page of an instance: the page is built here, from the facts the window
-// read — the honest state of the service, the web-UI address the
-// REGISTRATION names (offered by the fact of the registration, whether or
-// not the service currently answers it), the log file of this launch, and
-// the service-log section (the bounded tail of the service's own log, or
-// the honest state of a file that is not there or could not be read).
-type companionPageState struct {
-	// State is the honest one-line state of the service.
-	State string
-	// WebURL is the browser URL of the registered listen address, empty
-	// when the registration names none or one that cannot be read as a
-	// URL.
-	WebURL string
-	// Address names the registered address when WebURL is empty: the raw
-	// address beside an unreadable URL, or the honest sentence of a
-	// registration without any address. Empty when there is no
-	// registration to speak of.
-	Address string
-	// LogPath is the path of the log file of this launch, empty for a
-	// launch that has none yet.
-	LogPath string
-	// ServiceLog is the service-log section: the bounded tail of the
-	// service log file, or the honest state of a file that does not
-	// exist yet or could not be read. The zero value claims nothing and
-	// renders no section content.
-	ServiceLog serviceLogSection
+// The budget covers the round trip to a local server: a service that does
+// not answer within it is treated as unreachable, so the window shows its
+// fallback state instead of sitting on a navigation that never completes.
+var runtimePageProbeTimeout = 3 * time.Second
+
+// runtimePageAnswers reports whether the runtime page at url answers with
+// a successful response right now.
+//
+// It is a package level variable so the tests can decide the answer
+// without a real service on the machine they run on.
+var runtimePageAnswers = probeRuntimePage
+
+// probeRuntimePage performs the probe: one bounded GET of the runtime
+// page, following the same navigation the window would take. Only a
+// successful response counts — a refusal, a timeout and a non-200 answer
+// all mean the address does not serve the page right now.
+func probeRuntimePage(url string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), runtimePageProbeTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return false
+	}
+	defer response.Body.Close()
+	// A bounded drain keeps the connection reusable without ever loading
+	// a body of an unknown size into memory.
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	return response.StatusCode == http.StatusOK
 }
 
-// serviceLogScriptActionPlaceholder is the token of the script template the
-// page builder replaces with companionOpenLogAction.
+// resolveLogsWindow decides what the Logs window shows on an open: the
+// runtime page of the registered address when that address answers, the
+// fallback document otherwise.
 //
-// The action name has ONE source of truth: the companionOpenLogAction
-// constant, which is also the key the host binds (companionWindowActions).
-// The template never names it — the name is substituted while the page is
-// generated — so the page and the host binding cannot drift apart, and a
-// literal name that reaches the page from anywhere else fails the test that
-// pins the rendered document.
-const serviceLogScriptActionPlaceholder = "{{action}}"
+// The probe runs on every open, so the window shows the actual state at
+// the moment the user asks for it: a service that stopped since the last
+// open meets the honest fallback instead of a hanging navigation, and a
+// service that came back meets the live log instead of a stale state
+// page. An empty address skips the probe — there is nothing to ask.
+func resolveLogsWindow(resolve func() string, fallback func() string) (string, string) {
+	if url := resolve(); url != "" && runtimePageAnswers(url) {
+		return url, ""
+	}
+	return "", fallback()
+}
 
-// serviceLogScriptTemplate is the only script of the page, and it performs
-// exactly two local operations with no channel of any kind: the tail box is
-// scrolled to its end — the window shows the END of the service log — and
-// the one button forwards the fixed open-file action name to the function
-// the window bound on the host side.
+// logsFallbackState is the model of the fallback document of the Logs
+// window — the state the window shows when the registered address does
+// not answer (or names none), in the visual language of the runtime page
+// the live window would have loaded.
+//
+// The document is self-contained and reaches out of nowhere: it fetches
+// nothing and listens to nothing — the invariant of the companion is that
+// nothing of it listens, and a local document honors that by having no
+// channel to any server. Its single script only forwards the fixed
+// host-bound actions to the functions the window bound.
+type logsFallbackState struct {
+	// State is the honest one-line state of the service, the heading of
+	// the document.
+	State string
+	// Address is the registered web-UI address that did not answer,
+	// stated as a fact (never linked — a link to a dead address would
+	// be a dead path). Empty when the registration names none.
+	Address string
+	// Note is the honest one-line reason there is no address to state,
+	// used when Address is empty. Empty when Address is set.
+	Note string
+	// LogPath is the path of the service log file — the very file the
+	// open action opens, so the path and the action always name one
+	// file. Empty when none could be resolved: the document then states
+	// that fact and offers no action with nothing to open.
+	LogPath string
+}
+
+// The placeholders of the script template the page builder replaces with
+// the bound action names.
+//
+// The action names have ONE source of truth: the openLogFileAction and
+// logsTryAgainAction constants, which are also the keys the host binds
+// (companionWindowActions). The template never names them — the names are
+// substituted while the page is generated — so the page and the host
+// binding cannot drift apart, and a literal name that reaches the page
+// from anywhere else fails the test that pins the rendered document.
+const (
+	logsFallbackOpenPlaceholder = "{{open}}"
+	logsFallbackTryPlaceholder  = "{{try}}"
+)
+
+// logsFallbackScriptTemplate is the only script of the fallback document,
+// and it performs exactly one local operation with no channel of any kind:
+// it forwards the two fixed action names to the functions the window
+// bound on the host side — open the log file, and retry the live page.
 //
 // Nothing here fetches, listens or carries data out of the document: the
-// path of the file never travels through the page (the host owns it), and
-// the invariant of the companion — nothing of it listens — is unchanged.
-// Both operations guard their element, so a section without a tail or
-// without a button runs the script as a no-op.
-const serviceLogScriptTemplate = `<script>
+// paths never travel through the page (the host owns them), and the
+// invariant of the companion — nothing of it listens — is unchanged.
+// Both wirings guard their element, so a document without one of the
+// buttons runs the script as a no-op.
+const logsFallbackScriptTemplate = `<script>
 (function () {
-	var tail = document.getElementById("service-log-tail");
-	if (tail) { tail.scrollTop = tail.scrollHeight; }
-	var button = document.getElementById("open-service-log");
-	if (button && window.` + serviceLogScriptActionPlaceholder + `) {
-		button.addEventListener("click", function () { window.` + serviceLogScriptActionPlaceholder + `(); });
+	var open = document.getElementById("open-log-file");
+	if (open && window.` + logsFallbackOpenPlaceholder + `) {
+		open.addEventListener("click", function () { window.` + logsFallbackOpenPlaceholder + `(); });
+	}
+	var again = document.getElementById("try-again");
+	if (again && window.` + logsFallbackTryPlaceholder + `) {
+		again.addEventListener("click", function () { window.` + logsFallbackTryPlaceholder + `(); });
 	}
 })();
 </script>
 `
 
-// serviceLogScript renders the script template of the page with the one
-// action name of this build substituted in — the same constant the host
+// logsFallbackScript renders the script template of the document with the
+// action names of this build substituted in — the same constants the host
 // binds, so the two can never name different functions.
-func serviceLogScript() string {
-	return strings.ReplaceAll(serviceLogScriptTemplate, serviceLogScriptActionPlaceholder, companionOpenLogAction)
+func logsFallbackScript() string {
+	script := strings.ReplaceAll(logsFallbackScriptTemplate, logsFallbackOpenPlaceholder, openLogFileAction)
+	return strings.ReplaceAll(script, logsFallbackTryPlaceholder, logsTryAgainAction)
 }
 
-// companionPage renders the model into the page of the companion window.
+// logsFallbackPage renders the model into the fallback document of the
+// Logs window.
 //
-// Everything the model carries is escaped, so a value from the machine
-// can never become markup. The page fetches nothing: it is a document,
-// not a client of a listener — the invariant of the companion is that
-// nothing of it listens, and the page honors that by having no channel
-// to a server of its own. Its single script (serviceLogScript) only
-// scrolls the tail box to its end and forwards the one fixed open-file
-// action to the host-bound function — the action name it calls is
-// substituted from companionOpenLogAction while the page is generated.
-//
-// The service log section is the last content of the document: it shows
-// the bounded tail ending with the newest line, or the one honest state
-// of a file that is not there or could not be read, plus the single
-// action that opens the whole file with the default handler.
-func companionPage(state companionPageState) string {
+// The document wears the visual language of the runtime page — the same
+// header with the status line, the same fact strip, the same design token
+// values — inlined, because a fallback document has no server to load a
+// stylesheet from; that is exactly why it is a document and not a page.
+// It states the honest state of the service, the address that did not
+// answer (or the honest reason there is none), the path of the service log
+// file with the action that opens it, and the one action that retries the
+// live page. Everything the model carries is escaped, so a value from the
+// machine can never become markup.
+func logsFallbackPage(state logsFallbackState) string {
 	var page strings.Builder
 	page.WriteString(`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HFDesk - Runtime / Logs</title>
+<title>HFDesk - Logs</title>
 <style>
-body { font-family: "Segoe UI", system-ui, sans-serif; margin: 0; padding: 2rem; color: #1a1a1a; background: #f6f7f9; }
-main { max-width: 44rem; margin: 0 auto; }
-h1 { font-size: 1.15rem; font-weight: 600; margin: 0 0 1rem; }
-p { margin: 0.6rem 0; line-height: 1.5; }
-a { color: #0b57d0; }
-code { font-family: Consolas, "Courier New", monospace; font-size: 0.9em; background: #eceff3; padding: 0.1em 0.35em; border-radius: 3px; word-break: break-all; }
-.label { color: #5a6270; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; margin-top: 1.75rem; }
-pre { font-family: Consolas, "Courier New", monospace; font-size: 0.85em; background: #eceff3; padding: 0.75rem; border-radius: 4px; margin: 0.6rem 0; max-height: 20rem; overflow: auto; white-space: pre-wrap; word-break: break-word; }
-button { font: inherit; font-size: 0.9rem; padding: 0.35rem 0.9rem; border: 1px solid #c3c8d0; border-radius: 4px; background: #fff; color: #1a1a1a; cursor: pointer; }
-button:hover { background: #f0f2f5; }
+:root {
+  --color-bg: #0a0a0f;
+  --color-bg-secondary: #12121a;
+  --color-bg-tertiary: #1a1a24;
+  --color-surface: #1e1e2a;
+  --color-surface-hover: #252532;
+  --color-border: #2a2a3a;
+  --color-border-light: #3a3a4a;
+  --color-text: #c8c8d0;
+  --color-text-secondary: #a0a0b0;
+  --color-text-muted: #6a6a7a;
+  --color-primary: #6366f1;
+  --color-primary-hover: #7c7ff7;
+  --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  --radius-sm: 6px;
+  --radius-full: 9999px;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--color-bg); color: var(--color-text); font-family: var(--font-family); font-size: 14px; }
+.shell { display: flex; flex-direction: column; min-height: 100vh; }
+.header { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 20px; padding: 14px 20px; background: var(--color-bg-secondary); border-bottom: 1px solid var(--color-border); }
+.logo { font-size: 14px; font-weight: 600; }
+.status { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.dot { width: 8px; height: 8px; border-radius: var(--radius-full); background: var(--color-text-muted); flex-shrink: 0; }
+.status h1 { margin: 0; font-size: 13px; font-weight: 500; color: var(--color-text-secondary); }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-left: auto; }
+.banner { padding: 10px 20px; background: rgba(239, 68, 68, 0.08); border-bottom: 1px solid rgba(239, 68, 68, 0.3); color: var(--color-text-secondary); font-size: 13px; }
+.strip { display: flex; flex-wrap: wrap; gap: 10px 32px; padding: 12px 20px; background: var(--color-bg-secondary); border-bottom: 1px solid var(--color-border); }
+.stat { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.stat-label { font-size: 11px; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.stat-empty { font-size: 13px; color: var(--color-text-muted); }
+code { font-family: var(--font-mono); font-size: 12px; background: var(--color-bg-tertiary); border: 1px solid var(--color-border); border-radius: var(--radius-sm); padding: 3px 8px; overflow-wrap: anywhere; color: var(--color-text-secondary); }
+.btn { font: inherit; font-size: 13px; padding: 7px 14px; border: 1px solid var(--color-border-light); border-radius: var(--radius-sm); background: var(--color-surface); color: var(--color-text); cursor: pointer; }
+.btn:hover { background: var(--color-surface-hover); }
+.btn-primary { background: var(--color-primary); border-color: var(--color-primary); color: #fff; }
+.btn-primary:hover { background: var(--color-primary-hover); }
+@media (max-width: 720px) {
+  .header, .banner, .strip { padding-left: 14px; padding-right: 14px; }
+  .actions { margin-left: 0; }
+}
 </style>
 </head>
 <body>
-<main>
+<div class="shell">
+<header class="header">
+<div class="logo">HFDesk</div>
 `)
 	if state.State != "" {
-		page.WriteString("<h1>" + html.EscapeString(state.State) + "</h1>\n")
+		page.WriteString("<div class=\"status\"><span class=\"dot\" aria-hidden=\"true\"></span><h1>" +
+			html.EscapeString(state.State) + "</h1></div>\n")
 	}
-	if state.WebURL != "" {
-		escaped := html.EscapeString(state.WebURL)
-		page.WriteString("<p>The web UI of the service is at <a href=\"" + escaped + "\">" + escaped + "</a>.</p>\n")
-	} else if state.Address != "" {
-		page.WriteString("<p>" + html.EscapeString(state.Address) + "</p>\n")
-	}
-	// The log file of THIS launch: the standard line of every surface of
-	// a launch that has a log, stated before the section that speaks
-	// about the log of the service.
+	page.WriteString("<div class=\"actions\">")
 	if state.LogPath != "" {
-		page.WriteString("<p>The log file is at <code>" + html.EscapeString(state.LogPath) + "</code>.</p>\n")
+		page.WriteString("<button class=\"btn btn-primary\" id=\"open-log-file\" type=\"button\">Open the log file</button>")
 	}
-	section := state.ServiceLog
-	if section.Path == "" && !section.Missing && section.ReadError == "" && section.Tail == "" {
-		// A model without a service-log source claims nothing: the
-		// section stays out instead of showing a heading over
-		// nothing.
-		page.WriteString("</main>\n</body>\n</html>\n")
-		return page.String()
-	}
-	page.WriteString("<p class=\"label\">Service log</p>\n")
+	page.WriteString("<button class=\"btn\" id=\"try-again\" type=\"button\">Try again</button>")
+	page.WriteString("</div>\n</header>\n")
+
 	switch {
-	case section.Missing:
-		page.WriteString("<p>The service log file has not been created yet.</p>\n")
-	case section.ReadError != "":
-		reason := html.EscapeString(strings.TrimSuffix(section.ReadError, "."))
-		page.WriteString("<p>The service log file could not be read: " + reason + ".</p>\n")
-	case section.Tail != "":
-		page.WriteString("<pre id=\"service-log-tail\">" + html.EscapeString(section.Tail) + "</pre>\n")
+	case state.Address != "":
+		page.WriteString("<div class=\"banner\" role=\"status\">The web UI at <code>" +
+			html.EscapeString(state.Address) + "</code> does not answer.</div>\n")
+	case state.Note != "":
+		page.WriteString("<div class=\"banner\" role=\"status\">" + html.EscapeString(state.Note) + "</div>\n")
 	}
-	if section.Path != "" && !section.Missing {
-		page.WriteString("<p><button id=\"open-service-log\" type=\"button\">Open the full log file</button></p>\n")
+
+	page.WriteString("<section class=\"strip\">\n<div class=\"stat\"><div class=\"stat-label\">Log file</div>")
+	if state.LogPath != "" {
+		page.WriteString("<code>" + html.EscapeString(state.LogPath) + "</code>")
+	} else {
+		page.WriteString("<span class=\"stat-empty\">The log file is not known.</span>")
 	}
-	page.WriteString(serviceLogScript())
-	page.WriteString("</main>\n</body>\n</html>\n")
+	page.WriteString("</div>\n</section>\n</div>\n")
+	page.WriteString(logsFallbackScript())
+	page.WriteString("</body>\n</html>\n")
 	return page.String()
 }
