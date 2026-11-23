@@ -136,7 +136,7 @@ func RunServiceAction(o ServiceActionOptions) error {
 			return err
 		}
 		if err := handover.waitForAuthorization(serviceWaitBudget, serviceParentExitBudget); err != nil {
-			(&serviceActionReporter{action: action, handover: handover}).handoverFailure(err)
+			(&serviceActionReporter{action: action, handover: handover}).handoverUnconfirmed(err)
 			return err
 		}
 		// Authorization is settled: only the singleton outlives it, through
@@ -785,6 +785,30 @@ func (r *serviceActionReporter) handoverFailure(err error) {
 	desktopLog.Error("the service helper could not prepare its coordination with the desktop", "action", string(r.action), "error", err)
 	showMessage(serviceFailureCaption(r.action), serviceHandoverRefusedText(err),
 		windows.MB_ICONERROR)
+}
+
+// handoverUnconfirmed ends a handover whose authorization never arrived
+// AFTER this helper signaled ready.
+//
+// From the ready signal on the desktop host owns the report of the
+// handover: it committed the action and reports why it could not finish it,
+// through its own window with the cause it observed — the real cause, not
+// the missing success signal this helper waited for. This helper therefore
+// records the refusal and opens no second window for the same event: one
+// failed handover is one report, and the honest cause stays with the
+// process that saw it.
+//
+// The failures BEFORE the ready signal still report through handoverFailure:
+// there the helper never became ready, its window is the only one, and the
+// desktop reports its distinct not-ready reference beside it.
+func (r *serviceActionReporter) handoverUnconfirmed(err error) {
+	if err == nil {
+		return
+	}
+	if r.handover != nil {
+		r.handover.close()
+	}
+	desktopLog.Error("the service helper received no authorization from the desktop", "action", string(r.action), "error", err)
 }
 
 // singletonHoldRefused reports a mutation that refused before it changed

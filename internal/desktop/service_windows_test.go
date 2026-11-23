@@ -1178,9 +1178,23 @@ func TestTrayServiceInstallLaunchesTheHelperAfterTheConfirmation(t *testing.T) {
 		t.Fatal("the tray action did not hand the installation over to the helper")
 	}
 	t.Cleanup(handover.close)
-	assertNames(t, confirmed, "the confirmation", []string{
-		"starts at boot",
+	// The confirmation of the current contract (decision of 2026-11-24):
+	// the question as the headline and exactly two fact lines — the
+	// lifetime of the service and the separate data directory — with none
+	// of the phrases released from this window.
+	if !strings.HasPrefix(confirmed, "Install HFDesk as a Windows service?\n\n") {
+		t.Errorf("the confirmation %q does not open with the headline question", confirmed)
+	}
+	assertNamesWithout(t, confirmed, "the confirmation", []string{
+		"It starts at boot and keeps running after this window closes.",
 		"Its data is separate: ",
+	}, []string{
+		"Do you want to install the service?",
+		"This registers",
+		"HFDesk stays portable",
+		"The one file",
+		"SHA-256",
+		"nothing else is downloaded",
 		"are not there",
 	})
 	// No rights sentence anywhere in it (decision of 2026-11-24): the
@@ -2438,11 +2452,80 @@ func TestServiceHelperRejectsDesktopExitWithoutSuccessfulShutdown(t *testing.T) 
 	if len(manager.steps) != 0 {
 		t.Errorf("the helper touched the service before authorization: %v", manager.steps)
 	}
-	if len(*messages) != 1 {
-		t.Fatalf("the helper showed %d message boxes, want the authorization failure", len(*messages))
+	// After the ready signal the desktop owns the report of the handover:
+	// it observed why the shutdown could not finish, and its window is the
+	// single report of this event. The helper records the refusal without
+	// opening a second window beside it.
+	if len(*messages) != 0 {
+		t.Fatalf("the helper showed %d message boxes, want none: the desktop reports the handover failure", len(*messages))
 	}
-	if !strings.Contains((*messages)[0].text, "without confirming successful graceful completion") {
-		t.Errorf("the report %q does not identify the missing success signal", (*messages)[0].text)
+}
+
+// TestOneHandoverFailureIsReportedOnce proves the dedup of a failed
+// handover end to end: the refusal the helper reaches because the
+// successful shutdown never arrived and the failure the desktop reports
+// with the real cause are ONE event, and the desktop — the process that
+// observed the cause — is its single reporter. The one window that stays
+// keeps the established form: state, honest cause, and exactly one action.
+func TestOneHandoverFailureIsReportedOnce(t *testing.T) {
+	replaceSeam(t, &serviceWaitBudget, 50*time.Millisecond)
+	replaceSeam(t, &serviceParentExitBudget, 50*time.Millisecond)
+	stubConsoleProgram(t)
+	handover := testHelperHandover(t)
+	replaceSeam(t, &prepareHelperHandover, func(ServiceActionOptions) (*helperHandover, error) { return handover, nil })
+	manager := &fakeServiceManager{}
+	replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+		return manager, nil
+	})
+	messages := recordMessages(t)
+
+	// The helper side of the event: ready, and then no successful-shutdown
+	// authorization ever arrives — the refusal must stay without a window.
+	done := make(chan error, 1)
+	go func() {
+		done <- RunServiceAction(ServiceActionOptions{
+			Action: "install", WaitPID: 4321,
+			ReadyEvent: "ready", SuccessEvent: "success", InstanceMutex: "mutex",
+		})
+	}()
+	if result, err := windows.WaitForSingleObject(handover.ready, 2_000); err != nil || result != windows.WAIT_OBJECT_0 {
+		t.Fatalf("the helper did not signal ready: result=%#x err=%v", result, err)
+	}
+	if err := <-done; err == nil {
+		t.Fatal("the helper acted although the successful shutdown was never confirmed")
+	}
+	if len(*messages) != 0 {
+		t.Fatalf("the helper showed %d message boxes for the refused handover, want none: the desktop reports this event", len(*messages))
+	}
+
+	// The desktop side of the SAME event: its shutdown missed the deadline
+	// and it reports the handover failure with the cause it observed. This
+	// window is the one and only report of the event.
+	finishHandover(errors.New("shutdown HTTP server: context deadline exceeded"),
+		committedHandover{action: serviceActionInstall, relaunch: handoverRelaunchCompanion})
+
+	if len(*messages) != 1 {
+		t.Fatalf("the failed handover showed %d windows, want exactly the report of the desktop", len(*messages))
+	}
+	if caption := serviceFailureCaption(serviceActionInstall); (*messages)[0].caption != caption {
+		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
+	}
+	assertNames(t, (*messages)[0].text, "the report", []string{
+		"could not finish the service installation",
+		"shutdown HTTP server: context deadline exceeded",
+		serviceStatusCommandText,
+	})
+	if got := strings.Count((*messages)[0].text, "hfdesk service status"); got != 1 {
+		t.Errorf("the report %q names the state command %d times, want exactly one", (*messages)[0].text, got)
+	}
+
+	// The refusal preserved the guard of the protocol: no acknowledgment
+	// and no service step.
+	if result, err := windows.WaitForSingleObject(handover.confirmed, 0); err != nil || result != uint32(windows.WAIT_TIMEOUT) {
+		t.Errorf("the refused handover was acknowledged: result=%#x err=%v", result, err)
+	}
+	if len(manager.steps) != 0 {
+		t.Errorf("the helper touched the service before authorization: %v", manager.steps)
 	}
 }
 
@@ -4492,11 +4575,22 @@ func TestInstallConfirmationWarnsOnlyForARemovableOrNetworkProgram(t *testing.T)
 			}
 			// Whatever the drive says, the rest of the confirmation
 			// is the established one: the warning is an added line,
-			// never a replacement of the surprising fact or the
-			// question.
-			assertNames(t, text, "the confirmation", []string{
+			// never a replacement of the headline question or the two
+			// fact lines (decision of 2026-11-24).
+			if !strings.HasPrefix(text, "Install HFDesk as a Windows service?\n\n") {
+				t.Errorf("the confirmation %q does not open with the headline question", text)
+			}
+			assertNamesWithout(t, text, "the confirmation", []string{
+				"It starts at boot and keeps running after this window closes.",
 				"Its data is separate",
+			}, []string{
 				"Do you want to install the service?",
+				"This registers",
+				"HFDesk stays portable",
+				"The one file",
+				"SHA-256",
+				"nothing else is downloaded",
+				"are not there",
 			})
 			if len(*messages) != 0 {
 				t.Errorf("the declined install showed %v, want no report: nothing was attempted", *messages)
