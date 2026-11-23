@@ -375,10 +375,31 @@ func withdrawHandoverAuthorization(success windows.Handle, failure error) error 
 // desktop exit it describes.
 func completeHandoverWithNotice(handover *desktopHandover, waitForCompletion func() error) error {
 	go showMessage("HFDesk - finishing service installation",
-		"HFDesk is shutting down and finishing its graceful save before the service can start.\n\n"+
-			"The service starts only if the server and its saved state both complete successfully.",
+		"HFDesk is shutting down to finish the service installation.\n\n"+
+			"The service starts after HFDesk has closed.",
 		windows.MB_ICONINFORMATION)
 	return authorizeHandoverCompletion(waitForCompletion, handover.helper.handle, handover.events.success, handover.events.confirmed)
+}
+
+// completeInstallHandover joins the completion evidence of a COMMITTED
+// installation handover with the two end paths of the desktop: it shows the
+// native waiting state, waits for the graceful stop and the acknowledgment
+// of the helper, closes the handover — twice, exactly as the shutdown did
+// before this function owned the sequence, so the handles are dropped on
+// every path — and hands the outcome to finishInstallHandover.
+//
+// The order is the contract: the relaunch of the tray companion runs only
+// AFTER the authorization settled (the success signal stands and the helper
+// acknowledged it — from that moment the helper waits solely for the exit
+// of this process, so the spawn is quick and this process then exits), and
+// a failed authorization is reported like every other handover failure and
+// relaunches nothing. The test of this function pins both branches at the
+// very event handles the real protocol uses.
+func completeInstallHandover(handover *desktopHandover, waitForCompletion func() error) {
+	defer handover.close()
+	err := completeHandoverWithNotice(handover, waitForCompletion)
+	handover.close()
+	finishInstallHandover(err)
 }
 
 func stopDesktopServer(shutdown func(), coordinator *desktopShutdownCoordinator) {

@@ -62,6 +62,24 @@ func alreadyRunningOpenFailedText(url string, openErr error) string {
 		"\n\nUse the icon in the notification area to open the Runtime / Logs window."
 }
 
+// trayStartupFailureText returns the text of the report of a host whose
+// notification-area icon could not be created within its budget: without
+// the icon the host would be unreachable, so it stops. The record of this
+// refusal is written by the caller beside the box, so the log the window
+// names really carries it.
+func trayStartupFailureText() string {
+	return failureWindowText("HFDesk could not create its icon in the notification area.\n\n" +
+		"The desktop host needs the icon in the notification area to be reachable, so it stops.")
+}
+
+// runtimeWindowShowFailedText returns the text of the report of a Runtime /
+// Logs window that could not be shown. The failure is recorded in the log
+// before this text is built (the host logs it beside the box), so the log
+// path the window names carries the very failure.
+func runtimeWindowShowFailedText(err error) string {
+	return failureWindowText(fmt.Sprintf("The Runtime / Logs window could not be shown.\n\n%v", err))
+}
+
 // publishStateStartupText returns the report of a launch that could not
 // publish its effective URL and therefore stopped without serving.
 //
@@ -97,5 +115,8 @@ func browserOpenFailedText(url string, openErr error) string {
 	if openErr != nil {
 		text += "\n\n" + openErr.Error()
 	}
-	return text
+	// A launch that has no log of its own (the second launch reaches this
+	// text before any logging started) appends nothing: runLogPath names
+	// the file only when this launch really writes it.
+	return failureWindowText(text)
 }

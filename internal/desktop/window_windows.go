@@ -37,6 +37,10 @@ type webView interface {
 	Hide()
 	// Navigate loads a URL in the window.
 	Navigate(url string)
+	// NavigateDocument loads a self-contained HTML document in the
+	// window — the window of a tray companion, which has no server to
+	// fetch its page from.
+	NavigateDocument(html string)
 	// Close destroys the window.
 	Close()
 }
@@ -55,8 +59,15 @@ type runtimeWindow struct {
 	// createMu serializes the creation of a window, so two actions cannot
 	// create two windows.
 	createMu sync.Mutex
-	// url is the page the window shows.
+	// url is the page the window shows. It is the page of the running
+	// own server, and it is only used in URL mode (content == nil).
 	url string
+	// content builds the page of the window in document mode — the tray
+	// companion, which has no server. A non-nil content means the window
+	// renders this document fresh on every show, because the state it
+	// reports can change while the window exists; in URL mode nothing
+	// re-navigates after the creation, exactly as before.
+	content func() string
 	// iconBytes are the bytes of the icon of the window.
 	iconBytes []byte
 }
@@ -74,15 +85,29 @@ type windowInstance struct {
 	icons windowIcons
 }
 
-// newRuntimeWindow builds the owner of the Runtime / Logs window.
+// newRuntimeWindow builds the owner of the Runtime / Logs window that
+// shows the runtime page of the running own server.
 func newRuntimeWindow(url string, iconBytes []byte) *runtimeWindow {
 	return &runtimeWindow{url: url, iconBytes: iconBytes}
+}
+
+// newCompanionWindow builds the owner of the Runtime / Logs window of a
+// tray companion: the window has no server of its own, so it renders the
+// document content builds — the honest state of the service, its
+// registered web-UI address and the log file of this launch — and
+// re-renders it on every show.
+func newCompanionWindow(content func() string, iconBytes []byte) *runtimeWindow {
+	return &runtimeWindow{content: content, iconBytes: iconBytes}
 }
 
 // Show makes the runtime window visible.
 //
 // The window is created when it does not exist yet, so the action works
-// again after the user closed it.
+// again after the user closed it. A window in document mode renders its
+// page right before it is shown: the state of the service can change
+// while the window exists, and a show is the moment the user asks for
+// it. A URL-mode window navigates once at its creation, exactly as
+// before.
 func (w *runtimeWindow) Show() error {
 	// Two attempts: the first one can lose the race against a window
 	// that was closed in the meantime, the second one works with a fresh
@@ -91,6 +116,9 @@ func (w *runtimeWindow) Show() error {
 		instance, err := w.active()
 		if err != nil {
 			return err
+		}
+		if w.content != nil {
+			instance.view.NavigateDocument(w.content())
 		}
 		if err := instance.view.Show(); err != nil {
 			// The window was closed while the action was on its way:
@@ -186,7 +214,14 @@ func (w *runtimeWindow) create() (*windowInstance, error) {
 		w.instance = instance
 		w.mu.Unlock()
 
-		view.Navigate(w.url)
+		if w.content == nil {
+			// URL mode: the page of the own server is loaded right
+			// here, once. A companion window (content != nil)
+			// starts blank: Show renders its document, so the
+			// state the page reports is the state of the moment
+			// the user opens it.
+			view.Navigate(w.url)
+		}
 		ready <- creation{instance: instance}
 
 		// The message loop ends when the window is destroyed.
@@ -271,6 +306,16 @@ func (d *webview2Driver) Hide() {
 // Navigate loads a URL in the window.
 func (d *webview2Driver) Navigate(url string) {
 	d.view.Dispatch(func() { d.view.Navigate(url) })
+}
+
+// NavigateDocument loads a self-contained HTML document in the window.
+//
+// The navigation runs through the documented HTML entry of the WebView2
+// binding (SetHtml → NavigateToString) on the thread of the window, like
+// every other action of the driver: the document needs no listener, which
+// is the point of the companion window — nothing of it listens.
+func (d *webview2Driver) NavigateDocument(html string) {
+	d.view.Dispatch(func() { d.view.SetHtml(html) })
 }
 
 // Close destroys the window.

@@ -29,6 +29,13 @@ const (
 	// service has it, and it is that dialog's default button, so Enter
 	// selects it.
 	serviceGateDesktopButtonID = 104
+	// serviceGateCompanionButtonID is the button that continues the launch
+	// as a tray companion. Every dialog of the launch gate has it (the
+	// prompt offers it through OfferCompanion), it is never the default
+	// button, and it sits directly in front of Cancel — so the buttons the
+	// state offered keep their labels, their relative order and their
+	// default, and the layout only grows the new choice.
+	serviceGateCompanionButtonID = 105
 )
 
 // serviceGateButton is one button of the choice dialog: the command id the
@@ -47,24 +54,39 @@ type serviceGateButton struct {
 // dialog keeps the open/start button first and as its default: the action the
 // user asked for by starting HFDesk again.
 //
+// A prompt that offers the tray companion (OfferCompanion — the launch gate)
+// carries that choice directly in front of Cancel in EVERY state. The
+// extension never moves an existing button out of its position, never changes
+// a label and never changes the default: the three state layouts the dialog
+// had before keep their buttons, and the companion answer joins them. A prompt
+// without the offer (the registered-service dialog of a running desktop) gets
+// exactly the layouts as before.
+//
 // The layout is a pure function, so a test can prove the buttons, their order
 // and the default of every state without a dialog: the real dialog blocks the
 // process until the user answers it.
 func serviceGateButtonLayout(prompt serviceChoicePrompt) (buttons []serviceGateButton, defaultButton int32) {
+	companion := serviceGateButton{id: serviceGateCompanionButtonID, label: serviceGateCompanionLabel}
 	first := serviceGateButton{id: serviceGateOpenButtonID, label: serviceGateOpenLabel(prompt)}
 	if servicePromptStopped(prompt) {
-		return []serviceGateButton{
+		buttons = []serviceGateButton{
 			{id: serviceGateDesktopButtonID, label: serviceGateDesktopLabel},
 			first,
 			{id: serviceGateUpdateButtonID, label: serviceGateUpdateLabel},
-			{id: serviceGateCancelButtonID, label: serviceGateCancelLabel},
-		}, serviceGateDesktopButtonID
+		}
+		defaultButton = serviceGateDesktopButtonID
+	} else {
+		buttons = []serviceGateButton{
+			first,
+			{id: serviceGateUpdateButtonID, label: serviceGateUpdateLabel},
+		}
+		defaultButton = first.id
 	}
-	return []serviceGateButton{
-		first,
-		{id: serviceGateUpdateButtonID, label: serviceGateUpdateLabel},
-		{id: serviceGateCancelButtonID, label: serviceGateCancelLabel},
-	}, first.id
+	if prompt.OfferCompanion {
+		buttons = append(buttons, companion)
+	}
+	return append(buttons, serviceGateButton{id: serviceGateCancelButtonID, label: serviceGateCancelLabel}),
+		defaultButton
 }
 
 // The task dialog flags of the Windows API.
@@ -320,6 +342,12 @@ func serviceGateChoiceForButton(prompt serviceChoicePrompt, pressed int32) (serv
 		// Only the dialog of a positively confirmed stopped service has
 		// this button; the gate re-checks that state before it continues.
 		return serviceChoiceDesktop, nil
+	case serviceGateCompanionButtonID:
+		// Only the dialog of the launch gate renders this button
+		// (OfferCompanion); the mapping is id-based like every other
+		// answer, and the gate honors the choice for any state the
+		// dialog was built from — the companion binds no address.
+		return serviceChoiceCompanion, nil
 	case serviceGateUpdateButtonID:
 		return serviceChoiceUpdate, nil
 	case serviceGateCancelButtonID, messageBoxCancel, 0:

@@ -24,6 +24,7 @@ package desktop
 
 import (
 	"errors"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/app"
 )
@@ -44,4 +45,28 @@ type Options struct {
 	// Version is the build version of the binary. It is reported through
 	// the API and shown in the Runtime window.
 	Version string
+
+	// Companion starts this launch as a tray companion instead of an
+	// ordinary desktop host: the tray icon, the service actions and the
+	// Runtime / Logs window, WITHOUT a server of its own. The flag is
+	// private to the desktop executable (SplitCompanionArgs strips it
+	// before the host flags are parsed, so it is not part of the usage
+	// text); the post-installation relaunch passes it, and a launch that
+	// carries it skips the service gate — it was told what to do.
+	//
+	// An invariant of the companion: it never binds any address, so two
+	// HFDesk instances can never serve one address beside each other.
+	Companion bool
+
+	// CompanionWait is the bounded wait for the single instance lock of
+	// this session at the startup of a companion launch.
+	//
+	// It is zero for every ordinary launch — a launch that finds the lock
+	// reports the running instance exactly as before — and non-zero only
+	// for the relaunch the installation spawns: that child is started
+	// while the exiting host and the elevated helper still hold the lock,
+	// so it waits for the moment both released it instead of refusing as
+	// a second instance. The wait is bounded; a launch that runs out of
+	// it reports that another HFDesk process still holds the session.
+	CompanionWait time.Duration
 }

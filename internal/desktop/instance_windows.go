@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/service"
 	"golang.org/x/sys/windows"
@@ -81,6 +82,55 @@ func acquireInstanceLock() (*instanceLock, error) {
 // and those holders from naming different objects.
 func instanceMutexName() (string, error) {
 	return service.DesktopSingletonName()
+}
+
+// companionAcquirePollInterval is the pause between two attempts of the
+// bounded lock wait of a companion relaunch.
+var companionAcquirePollInterval = 250 * time.Millisecond
+
+// acquireInstanceLockForLaunch takes the single instance lock for a launch
+// whose options it knows.
+//
+// Every launch with CompanionWait == 0 behaves exactly like
+// acquireInstanceLock: the existence of the object means another instance
+// runs, and the launch reports it (the ordinary second-launch notice) — this
+// is the behavior of every ordinary desktop launch and of a hand-typed
+// companion launch alike.
+//
+// A non-zero CompanionWait belongs to ONE launch only: the relaunch child
+// the installation spawns. That child is started while the exiting host and
+// the elevated helper still hold the object (both facts are part of the
+// handover protocol), so it waits — bounded — for the moment both released
+// it instead of refusing as a second instance. Two rules make the wait
+// honest:
+//
+//   - every attempt's handle is dropped BEFORE the next pause: the kernel
+//     object dies with its last handle, and a handle this loop kept would
+//     keep the object alive BY ITS OWN — the wait could never end;
+//   - the wait is bounded: a holder that never releases (a helper that
+//     hung beyond its own action budget) ends the launch with the honest
+//     report of a session that is still held, never with an infinite
+//     silent wait.
+//
+// The caller decides what a lock that still Exists() after the wait means;
+// acquiring never fails for the wait itself.
+func acquireInstanceLockForLaunch(o Options) (*instanceLock, error) {
+	lock, err := acquireInstanceLock()
+	if err != nil {
+		return nil, err
+	}
+	if !lock.Exists() || o.CompanionWait <= 0 {
+		return lock, nil
+	}
+	deadline := time.Now().Add(o.CompanionWait)
+	for lock.Exists() && time.Now().Before(deadline) {
+		lock.Release()
+		time.Sleep(companionAcquirePollInterval)
+		if lock, err = acquireInstanceLock(); err != nil {
+			return nil, err
+		}
+	}
+	return lock, nil
 }
 
 // instanceLockStartupText returns the report of a launch that could not take

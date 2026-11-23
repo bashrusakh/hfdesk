@@ -474,6 +474,27 @@ type InstallStartResult struct {
 	Status       Status
 }
 
+// StartOutcome classifies how the start step of a first installation ended,
+// so its report names the class of the failure instead of a generic
+// "could not confirm".
+type StartOutcome string
+
+const (
+	// StartOutcomeNotPerformed reports a start that put no process into
+	// service: the step did not run, or the service control manager
+	// refused the start.
+	StartOutcomeNotPerformed StartOutcome = "not-performed"
+	// StartOutcomeEnded reports a started process that was observed ended
+	// before it came up.
+	StartOutcomeEnded StartOutcome = "ended"
+	// StartOutcomeNotReady reports a started service that did not come up
+	// within the readiness budget of the wait that failed.
+	StartOutcomeNotReady StartOutcome = "not-ready"
+	// StartOutcomeUnverified reports a process that was started, but whose
+	// state, ownership or identity the installation could not verify.
+	StartOutcomeUnverified StartOutcome = "unverified"
+)
+
 // InstallStartError reports a first-install start failure and what its
 // ownership-scoped cleanup established.
 type InstallStartError struct {
@@ -482,6 +503,14 @@ type InstallStartError struct {
 	RegistrationOwned   bool
 	ProcessStopped      bool
 	CleanupError        error
+	// Outcome classifies how the start step itself ended. The empty value
+	// classifies nothing: an error built without it keeps the cause-only
+	// report.
+	Outcome StartOutcome
+	// Budget is the readiness budget that elapsed when Outcome is
+	// StartOutcomeNotReady: the value the failing wait actually applied,
+	// not a constant of another layer.
+	Budget time.Duration
 }
 
 func (e *InstallStartError) Error() string {

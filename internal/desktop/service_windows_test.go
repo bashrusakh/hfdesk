@@ -293,8 +293,8 @@ func stubNoServiceRegistration(t *testing.T) {
 // test look like the second click of the same action.
 func freshServiceInstallGuard(t *testing.T) {
 	t.Helper()
-	serviceInstallRunning.Store(false)
-	t.Cleanup(func() { serviceInstallRunning.Store(false) })
+	serviceActionRunning.Store(false)
+	t.Cleanup(func() { serviceActionRunning.Store(false) })
 }
 
 func runHelperInstallForTest(version string) error {
@@ -382,7 +382,7 @@ func TestServiceGateContinuesWhenNoServiceIsInstalled(t *testing.T) {
 		return serviceChoiceCancel
 	})
 
-	if !serviceGate(testGateSingleton) {
+	if serviceGate(testGateSingleton) != gateDesktop {
 		t.Fatal("the service gate stopped a launch on a machine without a service")
 	}
 }
@@ -474,7 +474,7 @@ func TestServiceGateEndsTheLaunchWhenTheRegistrationCannotBeRead(t *testing.T) {
 	slog.SetDefault(slog.New(records))
 	t.Cleanup(func() { slog.SetDefault(previousLogger) })
 
-	if serviceGate(testGateSingleton) {
+	if serviceGate(testGateSingleton) != gateEnd {
 		t.Fatal("the service gate let a launch whose registration could not be read start its own server")
 	}
 	if len(*messages) != 1 {
@@ -530,7 +530,7 @@ func TestServiceGateStartsAStoppedServiceWithTheElevatedHelper(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate(testGateSingleton) {
+	if serviceGate(testGateSingleton) != gateEnd {
 		t.Fatal("the service gate let a launch with an installed service start its own server")
 	}
 	if len(launches) != 1 {
@@ -589,7 +589,7 @@ func TestServiceGateContinuesInDesktopModeForAStoppedService(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if !serviceGate(testGateSingleton) {
+	if serviceGate(testGateSingleton) != gateDesktop {
 		t.Fatal("the service gate ended the launch although the user chose to work in desktop mode")
 	}
 	if len(*messages) != 0 {
@@ -635,7 +635,7 @@ func TestServiceGateNeverContinuesWithoutAConfirmedStoppedService(t *testing.T) 
 			})
 			messages := recordMessages(t)
 
-			if serviceGate(testGateSingleton) {
+			if serviceGate(testGateSingleton) != gateEnd {
 				t.Fatal("the service gate continued into desktop mode although the service was not confirmed stopped")
 			}
 			if len(*messages) != 0 {
@@ -666,7 +666,7 @@ func TestServiceGateCancelOfAStoppedServiceChangesNothing(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate(testGateSingleton) {
+	if serviceGate(testGateSingleton) != gateEnd {
 		t.Fatal("a cancelled launch of a stopped service continued into desktop mode")
 	}
 	if len(*messages) != 0 {
@@ -706,7 +706,7 @@ func TestServiceGateOpensAStartingServiceAfterItSettled(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate(testGateSingleton) {
+	if serviceGate(testGateSingleton) != gateEnd {
 		t.Fatal("the service gate let a launch with an installed service start its own server")
 	}
 	if len(opened) != 1 || opened[0] != "http://127.0.0.1:18080" {
@@ -755,7 +755,7 @@ func TestServiceGateOpensABrokenButRunningService(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate(testGateSingleton) {
+	if serviceGate(testGateSingleton) != gateEnd {
 		t.Fatal("the service gate let a launch with an installed service start its own server")
 	}
 	if len(opened) != 1 || opened[0] != "http://127.0.0.1:18080" {
@@ -802,7 +802,7 @@ func TestServiceGateStartsAStoppingServiceAfterItSettled(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate(testGateSingleton) {
+	if serviceGate(testGateSingleton) != gateEnd {
 		t.Fatal("the service gate let a launch with an installed service start its own server")
 	}
 	if len(launches) != 1 || launches[0].Action != serviceActionStart {
@@ -836,7 +836,7 @@ func TestServiceGateEndsAPendingLaunchWithoutAChoice(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate(testGateSingleton) {
+	if serviceGate(testGateSingleton) != gateEnd {
 		t.Fatal("the service gate let a launch with an installed service start its own server")
 	}
 	if len(*messages) != 1 {
@@ -877,7 +877,7 @@ func TestServiceGateUpdatesTheServiceWithTheElevatedHelper(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate(testGateSingleton) {
+	if serviceGate(testGateSingleton) != gateEnd {
 		t.Fatal("the service gate let a launch with an installed service start its own server")
 	}
 	if len(launches) != 1 || launches[0].Action != serviceActionUpdate {
@@ -1010,7 +1010,7 @@ func TestServiceGateUpdateSettlesTheMissingConsoleProgram(t *testing.T) {
 			return filepath.Join(notice.Folder, testReleaseAsset), nil
 		})
 
-		if serviceGate(testGateSingleton) {
+		if serviceGate(testGateSingleton) != gateEnd {
 			t.Fatal("the service gate let a launch with an installed service start its own server")
 		}
 		if shown == nil || shown.Action != serviceActionUpdate {
@@ -1043,7 +1043,7 @@ func TestServiceGateUpdateSettlesTheMissingConsoleProgram(t *testing.T) {
 			return "", nil
 		})
 
-		if serviceGate(testGateSingleton) {
+		if serviceGate(testGateSingleton) != gateEnd {
 			t.Fatal("the service gate let a launch with an installed service start its own server")
 		}
 		if shown == nil || shown.Action != serviceActionUpdate {
@@ -1068,7 +1068,7 @@ func TestServiceGateUpdateSettlesTheMissingConsoleProgram(t *testing.T) {
 			return "", cause
 		})
 
-		if serviceGate(testGateSingleton) {
+		if serviceGate(testGateSingleton) != gateEnd {
 			t.Fatal("the service gate let a launch with an installed service start its own server")
 		}
 		if len(*launches) != 0 {
@@ -1108,7 +1108,7 @@ func TestServiceGateCancelChangesNothing(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate(testGateSingleton) {
+	if serviceGate(testGateSingleton) != gateEnd {
 		t.Fatal("the service gate let a cancelled launch start its own server")
 	}
 	if len(*messages) != 0 {
@@ -1130,7 +1130,7 @@ func TestServiceGateReportsARefusedHelperLaunch(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate(testGateSingleton) {
+	if serviceGate(testGateSingleton) != gateEnd {
 		t.Fatal("the service gate let a launch with an installed service start its own server")
 	}
 	if len(*messages) != 1 {
@@ -1180,8 +1180,8 @@ func TestTrayServiceInstallLaunchesTheHelperAfterTheConfirmation(t *testing.T) {
 	assertNames(t, confirmed, "the confirmation", []string{
 		"starts at boot",
 		"administrator rights",
-		"its own data in ",
-		"do not appear in the service",
+		"Its data is separate: ",
+		"are not there",
 	})
 	if len(launches) != 1 {
 		t.Fatalf("the tray action launched %d helpers, want one installation", len(launches))
@@ -1492,12 +1492,11 @@ func TestServiceHandoverFailureReportNamesTheStateCommand(t *testing.T) {
 	}
 	text := (*messages)[0].text
 	assertNames(t, text, "the report", []string{
-		"could not confirm the graceful service handover",
-		"a successful completion signal and the desktop exits",
+		"could not finish the service installation",
 		reason.Error(),
 		`"hfdesk service status"`,
 	})
-	assertNamesWithout(t, text, "the report", nil, []string{"Read the current service state", "before trying again"})
+	assertNamesWithout(t, text, "the report", nil, []string{"Read the current service state", "before trying again", "completion signal"})
 }
 
 func TestTrayServiceInstallReadinessFailureKeepsRetryAvailable(t *testing.T) {
@@ -1528,7 +1527,7 @@ func TestTrayServiceInstallReadinessFailureKeepsRetryAvailable(t *testing.T) {
 		handover.close()
 		t.Fatal("the tray action committed after the helper had already exited")
 	}
-	if serviceInstallRunning.Load() {
+	if serviceActionRunning.Load() {
 		t.Fatal("the failed pre-shutdown attempt kept the tray retry guard")
 	}
 	// The first attempt shows exactly one box, and it is the report of a
@@ -1546,7 +1545,7 @@ func TestTrayServiceInstallReadinessFailureKeepsRetryAvailable(t *testing.T) {
 	assertNames(t, firstAttempt.text, "the first attempt report", []string{
 		"exited before it became ready",
 		"No service action was performed",
-		"shows its own message with the reason",
+		"Read the message the administrator helper showed",
 	})
 	if strings.Contains(firstAttempt.text, "could not start its administrator helper") {
 		t.Errorf("the first attempt report %q claims the helper could not be started although it was started",
@@ -1646,6 +1645,11 @@ func TestTrayServiceInstallOffersTheRegisteredServiceInsteadOfAHandover(t *testi
 	fixture := func(t *testing.T, choice serviceChoice) (*[]shownMessage, *[]elevatedLaunch, *[]elevatedLaunch, *serviceChoicePrompt) {
 		t.Helper()
 		freshServiceInstallGuard(t)
+		// The answers that launch a helper inherit the service-action
+		// guard and wait for its exit; the wait ends immediately here,
+		// so no test goroutine waits for whichever process carries the
+		// stubbed id and every subtest ends with the guard released.
+		replaceSeam(t, &waitForServiceActionHelper, func(uint32) {})
 		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
 			return runningServiceStatus(service.StateStopped, "127.0.0.1:18080"), nil
 		})
@@ -2226,7 +2230,7 @@ func TestServiceHelperKeepsAnUnconfirmedCleanupResult(t *testing.T) {
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the cleanup outcome", len(*messages))
 	}
-	assertNames(t, (*messages)[0].text, "the report", []string{"could not be proven", "registration was kept", "service status"})
+	assertNames(t, (*messages)[0].text, "the report", []string{"could not prove", "registration was kept", "service status"})
 }
 
 // stubConsoleProgram points the console-program lookup at a real executable
@@ -2614,9 +2618,11 @@ func TestServiceHelperStartReportsTheAddress(t *testing.T) {
 }
 
 // TestServiceHelperSingletonArgumentRules proves the helper accepts exactly
-// the gate command lines — update and start carrying the singleton alone,
-// without a wait — and still refuses handover names without the process to
-// wait for, so no action gains a wait it did not have.
+// the command lines every action may carry — update and start with the
+// singleton alone, stop and removal bare or with the launching desktop's
+// claim path — and still refuses handover names without the process to wait
+// for, so no action gains a wait it did not have: a stop and a removal hold
+// no singleton and never receive one.
 func TestServiceHelperSingletonArgumentRules(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -2629,6 +2635,16 @@ func TestServiceHelperSingletonArgumentRules(t *testing.T) {
 			ServiceActionOptions{Action: "start", InstanceMutex: `Local\m`}},
 		{"update carries the launching desktop's claim path", serviceActionUpdate,
 			ServiceActionOptions{Action: "update", InstanceMutex: `Local\m`,
+				DesktopState: `C:\portable\hfdesk\desktop-state.json`}},
+		{"stop runs bare", serviceActionStop,
+			ServiceActionOptions{Action: "stop"}},
+		{"stop carries the launching desktop's claim path", serviceActionStop,
+			ServiceActionOptions{Action: "stop",
+				DesktopState: `C:\portable\hfdesk\desktop-state.json`}},
+		{"uninstall runs bare", serviceActionUninstall,
+			ServiceActionOptions{Action: "uninstall"}},
+		{"uninstall carries the launching desktop's claim path", serviceActionUninstall,
+			ServiceActionOptions{Action: "uninstall",
 				DesktopState: `C:\portable\hfdesk\desktop-state.json`}},
 	} {
 		if err := validateServiceHandoverOptions(tc.action, tc.o); err != nil {
@@ -2655,6 +2671,14 @@ func TestServiceHelperSingletonArgumentRules(t *testing.T) {
 		{"start with a relative claim path", serviceActionStart,
 			ServiceActionOptions{Action: "start", InstanceMutex: `Local\m`,
 				DesktopState: `desktop-state.json`}},
+		// A stop and a removal hold no singleton, so a command line that
+		// hands them one is refused instead of silently ignoring it —
+		// and they gain no handover wait either.
+		{"stop with a singleton it never holds", serviceActionStop,
+			ServiceActionOptions{Action: "stop", InstanceMutex: `Local\m`}},
+		{"uninstall with an install handover", serviceActionUninstall,
+			ServiceActionOptions{Action: "uninstall", WaitPID: 4321,
+				ReadyEvent: "ready", SuccessEvent: "success", InstanceMutex: `Local\m`}},
 	} {
 		if err := validateServiceHandoverOptions(tc.action, tc.o); err == nil {
 			t.Errorf("%s was accepted, want the refusal of incomplete handover arguments", tc.name)
@@ -3236,7 +3260,7 @@ func TestServiceGateRechecksTheStateBeforeDesktopMode(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if serviceGate(testGateSingleton) {
+	if serviceGate(testGateSingleton) != gateEnd {
 		t.Fatal("the gate admitted desktop mode although the service was started while the dialog was open")
 	}
 	if reads != 2 {
@@ -3323,7 +3347,7 @@ func TestServiceGateStopsWhenTheRecheckIsNotPositivelyStopped(t *testing.T) {
 			})
 			messages := recordMessages(t)
 
-			if serviceGate(testGateSingleton) {
+			if serviceGate(testGateSingleton) != gateEnd {
 				t.Fatal("the gate admitted desktop mode although the re-read state is not positively stopped")
 			}
 			if len(*messages) != 1 {
@@ -3838,6 +3862,11 @@ func TestTrayServiceInstallDoesNotAskForElevationTheGuardWouldRefuse(t *testing.
 		t.Helper()
 		useTemporaryStateDir(t)
 		freshServiceInstallGuard(t)
+		// The answer that reaches the helper inherits the service-action
+		// guard and waits for its exit; the wait ends immediately here,
+		// so the subtest never waits for whichever process carries the
+		// stubbed id.
+		replaceSeam(t, &waitForServiceActionHelper, func(uint32) {})
 		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) { return state, nil })
 		replaceSeam(t, &confirmServiceInstall, func(string) bool { return true })
 		replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
@@ -3937,4 +3966,32 @@ func TestTrayServiceInstallDoesNotAskForElevationTheGuardWouldRefuse(t *testing.
 			"No service action was performed", "serves its local server", "notification-area icon",
 		})
 	})
+}
+
+// TestReportStartupFailureNamesTheLogPathOnlyWhenThereIsOne pins the
+// pre-logging exception of the log-path rule at the box that owns it: a
+// startup failure before the logging pipeline exists passes an empty path
+// and the box appends no line, because this launch writes no file yet (the
+// single instance refusal, a log directory or file that could not be
+// opened); a failure after the pipeline exists passes the real path and the
+// box appends the one standard line, exactly once.
+func TestReportStartupFailureNamesTheLogPathOnlyWhenThereIsOne(t *testing.T) {
+	messages := recordMessages(t)
+
+	reportStartupFailure("HFDesk could not start", "the failure before logging", "")
+	reportStartupFailure("HFDesk could not start", "the failure after logging", `C:\logs\hfdesk.log`)
+
+	if len(*messages) != 2 {
+		t.Fatalf("the startup failures showed %d boxes, want two: %v", len(*messages), *messages)
+	}
+	if strings.Contains((*messages)[0].text, "The log file is at") {
+		t.Errorf("the pre-logging box %q names a log file this launch does not write", (*messages)[0].text)
+	}
+	assertNames(t, (*messages)[1].text, "the box", []string{
+		"the failure after logging",
+		"The log file is at " + `C:\logs\hfdesk.log`,
+	})
+	if got := strings.Count((*messages)[1].text, "The log file is at"); got != 1 {
+		t.Errorf("the box names the log file %d times, want exactly once:\n%s", got, (*messages)[1].text)
+	}
 }

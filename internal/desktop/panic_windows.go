@@ -42,10 +42,7 @@ func (g panicGuard) report(recovered any) string {
 		"panic", detail,
 		"stack", string(debug.Stack()))
 
-	text := "HFDesk stopped after an unexpected error.\n\n" + detail
-	if g.logPath != "" {
-		text += "\n\nThe log file is at " + g.logPath + "."
-	}
+	text := "HFDesk stopped after an unexpected error.\n\n" + detail + logFileLine(g.logPath)
 	showMessage("HFDesk stopped unexpectedly", text, windows.MB_ICONERROR)
 	return detail
 }

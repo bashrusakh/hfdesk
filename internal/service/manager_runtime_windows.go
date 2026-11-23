@@ -182,6 +182,11 @@ type scmStartVerification struct {
 	imageCheck      scmImageCheck
 	versionVerified bool
 	processID       uint32
+	// stateKnown and lastState record the last state the control manager
+	// reported, so a failed verification can classify what it observed: an
+	// ended process, a service that never settled, or no state at all.
+	stateKnown bool
+	lastState  svc.State
 }
 
 // verifyRunningExecutableVersion also waits for the expected version.
@@ -194,15 +199,24 @@ func (m *scmManager) verifyRunningExecutableVersion(ctx context.Context, handle 
 func (m *scmManager) verifyRunningExecutableVersionUsing(ctx context.Context, target scmRunningImageTarget, executable, listen, expectedVersion string, requireReadiness bool, exclude ...uint32) (scmStartVerification, error) {
 	deadline := time.Now().Add(scmVerifyBudget)
 	detail := "the service control manager did not report the instance as running"
-	var lastProcessID uint32
-	lastImageCheck := scmImageUnverified
+	verification := scmStartVerification{imageCheck: scmImageUnverified}
 	for {
 		status, err := target.Query()
+		if err == nil {
+			verification.stateKnown = true
+			verification.lastState = status.State
+		}
 		switch {
 		case err != nil:
 			detail = fmt.Sprintf("the state of %s cannot be read: %v", ServiceName, err)
 		case status.State != svc.Running:
-			detail = fmt.Sprintf("the service control manager reports the state %v", status.State)
+			// The state is named as the lifecycle word a user and every
+			// report read, not the numeric platform value, and a stopped
+			// process carries the exit code the control manager reports.
+			detail = fmt.Sprintf("the service control manager reports the state %q", string(scmState(status.State)))
+			if status.State == svc.Stopped {
+				detail += fmt.Sprintf(" with the exit code %d", status.Win32ExitCode)
+			}
 		case status.ProcessId == 0:
 			detail = "the service control manager reports no process of the running instance"
 		case scmProcessExcluded(exclude, status.ProcessId):
@@ -210,19 +224,20 @@ func (m *scmManager) verifyRunningExecutableVersionUsing(ctx context.Context, ta
 			// registration is not in service yet.
 			detail = fmt.Sprintf("the process %d that ran before the attempt still runs", status.ProcessId)
 		default:
-			lastProcessID = status.ProcessId
+			verification.processID = status.ProcessId
 			settled, check, reason := target.ReadRunningImage(status.ProcessId, executable)
 			if settled {
-				lastImageCheck = check
+				verification.imageCheck = check
 				if expectedVersion == "" && !requireReadiness {
-					return scmStartVerification{imageCheck: check, processID: status.ProcessId}, nil
+					return verification, nil
 				}
 				verified, probeErr := serviceInstallProbe(listen, expectedVersion)
 				if probeErr == nil {
-					return scmStartVerification{imageCheck: check, versionVerified: verified, processID: status.ProcessId}, nil
+					verification.versionVerified = verified
+					return verification, nil
 				}
 				if errors.Is(probeErr, errServiceVersionMismatch) {
-					return scmStartVerification{imageCheck: check, processID: status.ProcessId}, fmt.Errorf("the instance does not run the expected version: %w", probeErr)
+					return verification, fmt.Errorf("the instance does not run the expected version: %w", probeErr)
 				}
 				detail = fmt.Sprintf("the instance does not answer on %s: %v", probeAddressOrListen(listen), probeErr)
 			} else {
@@ -232,11 +247,11 @@ func (m *scmManager) verifyRunningExecutableVersionUsing(ctx context.Context, ta
 			}
 		}
 		if !time.Now().Before(deadline) {
-			return scmStartVerification{imageCheck: lastImageCheck, processID: lastProcessID}, fmt.Errorf("the instance does not run %q within %s: %s", executable, scmVerifyBudget, detail)
+			return verification, fmt.Errorf("the instance does not run %q within %s: %s", executable, scmVerifyBudget, detail)
 		}
 		select {
 		case <-ctx.Done():
-			return scmStartVerification{imageCheck: lastImageCheck, processID: lastProcessID}, ctx.Err()
+			return verification, ctx.Err()
 		case <-time.After(scmVerifyPollInterval):
 		}
 	}

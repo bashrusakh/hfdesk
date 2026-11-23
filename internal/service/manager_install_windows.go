@@ -410,11 +410,13 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 		ownedConfig, err := handle.Config()
 		if err != nil {
 			cause := fmt.Errorf("service: read the newly created registration before its first start: %w", err)
-			return result, &InstallStartError{Cause: cause, CleanupError: errors.New("the registration configuration could not be proven unchanged; it was not started or removed")}
+			return result, &InstallStartError{Cause: cause, Outcome: StartOutcomeNotPerformed,
+				CleanupError: errors.New("the registration configuration could not be proven unchanged; it was not started or removed")}
 		}
 		if !scmSameOwnedConfig(ownedConfig, config) {
 			cause := errors.New("service: the newly created registration changed before its first start")
-			return result, &InstallStartError{Cause: cause, CleanupError: errors.New("the changed registration was not started, stopped or removed")}
+			return result, &InstallStartError{Cause: cause, Outcome: StartOutcomeNotPerformed,
+				CleanupError: errors.New("the changed registration was not started, stopped or removed")}
 		}
 		verified, status, err := m.startFirstRegistration(ctx, target, opts, ownedConfig)
 		if err != nil {
@@ -486,7 +488,8 @@ type scmFirstInstallTarget interface {
 func (m *scmManager) startFirstRegistration(ctx context.Context, target scmFirstInstallTarget, opts InstallOptions, ownedConfig mgr.Config) (bool, Status, error) {
 	if !scmFirstInstallRegistrationStillOwned(target, ownedConfig) {
 		cause := errors.New("service: the newly created registration changed before its first start")
-		return false, Status{}, &InstallStartError{Cause: cause, CleanupError: errors.New("the changed registration was not started, stopped or removed")}
+		return false, Status{}, &InstallStartError{Cause: cause, Outcome: StartOutcomeNotPerformed,
+			CleanupError: errors.New("the changed registration was not started, stopped or removed")}
 	}
 	startErr := target.Start()
 	startedHere := startErr == nil
@@ -497,7 +500,8 @@ func (m *scmManager) startFirstRegistration(ctx context.Context, target scmFirst
 	}
 	if startErr != nil {
 		failure := scmRefused("a start", fmt.Errorf("service: start %s: %w", ServiceName, startErr))
-		return false, Status{}, m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, 0, failure)
+		return false, Status{}, withStartOutcome(
+			m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, 0, failure), StartOutcomeNotPerformed, 0)
 	}
 
 	verification, err := m.verifyRunningExecutableVersionUsing(ctx, target,
@@ -508,7 +512,9 @@ func (m *scmManager) startFirstRegistration(ctx context.Context, target scmFirst
 			processID = 0
 		}
 		failure := fmt.Errorf("service: the first installation did not put the new executable into service: %w", err)
-		return false, Status{}, m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, processID, failure)
+		outcome, budget := classifyStartVerification(verification, err)
+		return false, Status{}, withStartOutcome(
+			m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, processID, failure), outcome, budget)
 	}
 	if verification.imageCheck != scmImageVerified {
 		message := fmt.Sprintf("hfdesk: %s is running its registered program %s, but the process image could not be read from the installation shell", ServiceName, opts.Executable)
@@ -518,7 +524,8 @@ func (m *scmManager) startFirstRegistration(ctx context.Context, target scmFirst
 
 	if !scmFirstInstallRegistrationStillOwned(target, ownedConfig) {
 		failure := errors.New("service: the first-install registration changed after readiness verification")
-		return false, Status{}, m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, verification.processID, failure)
+		return false, Status{}, withStartOutcome(
+			m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, verification.processID, failure), StartOutcomeUnverified, 0)
 	}
 	status, finalState, err := scmStatusFromTarget(target)
 	if err != nil {
@@ -527,21 +534,65 @@ func (m *scmManager) startFirstRegistration(ctx context.Context, target scmFirst
 		if !startedHere {
 			processID = 0
 		}
-		return false, Status{}, m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, processID, failure)
+		return false, Status{}, withStartOutcome(
+			m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, processID, failure), StartOutcomeUnverified, 0)
 	}
 	if !scmFirstInstallRegistrationStillOwned(target, ownedConfig) {
 		failure := errors.New("service: the first-install registration changed while its final state was read")
-		return false, Status{}, m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, verification.processID, failure)
+		return false, Status{}, withStartOutcome(
+			m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, verification.processID, failure), StartOutcomeUnverified, 0)
 	}
 	if !status.Running || finalState.State != svc.Running || finalState.ProcessId != verification.processID {
-		failure := fmt.Errorf("service: the first installed process did not remain in service (state %v, process %d, running %t)", finalState.State, finalState.ProcessId, status.Running)
+		failure := fmt.Errorf("service: the first installed process did not remain in service (state %q, process %d, running %t)",
+			string(scmState(finalState.State)), finalState.ProcessId, status.Running)
 		processID := verification.processID
 		if !startedHere {
 			processID = 0
 		}
-		return false, Status{}, m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, processID, failure)
+		return false, Status{}, withStartOutcome(
+			m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, processID, failure), StartOutcomeUnverified, 0)
 	}
 	return verification.versionVerified, status, nil
+}
+
+// withStartOutcome stamps the observed class of the start step onto the
+// ownership-scoped cleanup result, so the report of the desktop helper can
+// state which class of failure occurred. The cleanup decisions themselves are
+// unchanged: this only records what the start step observed.
+func withStartOutcome(err error, outcome StartOutcome, budget time.Duration) error {
+	var startErr *InstallStartError
+	if errors.As(err, &startErr) {
+		startErr.Outcome = outcome
+		startErr.Budget = budget
+	}
+	return err
+}
+
+// classifyStartVerification returns the class of a failed first-start
+// verification: a version mismatch is a failed verification; a wait the
+// action context interrupted did not exhaust the readiness budget of this
+// wait, so it claims no budget and reports the interruption the cause already
+// carries; a process the control manager reported as stopped ended before it
+// came up; a state that could never be read claims no class the installation
+// did not observe; any other state left at the deadline is a service that did
+// not come up within the budget the wait actually applied (scmVerifyBudget).
+func classifyStartVerification(result scmStartVerification, err error) (StartOutcome, time.Duration) {
+	if errors.Is(err, errServiceVersionMismatch) {
+		return StartOutcomeUnverified, 0
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		// The action context ended this wait, not its own readiness budget:
+		// the report must not name a budget that never elapsed, and the
+		// interruption is the fact the cause already states.
+		return StartOutcomeUnverified, 0
+	}
+	if !result.stateKnown {
+		return StartOutcomeUnverified, 0
+	}
+	if result.lastState == svc.Stopped {
+		return StartOutcomeEnded, 0
+	}
+	return StartOutcomeNotReady, scmVerifyBudget
 }
 
 type scmOwnedFirstInstallControl struct {
