@@ -17,7 +17,7 @@
 
 ### Fixed
 
-- A failed service installation now says what actually went wrong — the start did not run, the program ended too early, or the service did not come up in time.
+- A failed service installation now says what actually went wrong — the start did not run, the program ended too early, the service did not come up in time, or the started service could not be verified — instead of a vague "could not confirm".
 - A registration removed after a failed installation attempt no longer reads as if the service had never been registered.
 
 ## [1.3.0-beta.9] - 2026-11-19
