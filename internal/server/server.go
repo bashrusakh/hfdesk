@@ -160,9 +160,14 @@ type Server struct {
 	handoverErr          error
 	saveSettingsConfigFn func(*ConfigFile, *string) error
 	httpServer           *http.Server
-	jobs                 *JobManager
-	wsHub                *WSHub
-	selectedDeleteHooks  selectedDeleteHooks
+	// stopOnce guards the lazily created stop signal of the long-lived
+	// streaming responses, so every construction path — the production New
+	// and the hand-built test servers — gets a working signal.
+	stopOnce            sync.Once
+	stopped             chan struct{}
+	jobs                *JobManager
+	wsHub               *WSHub
+	selectedDeleteHooks selectedDeleteHooks
 	// boundAddr holds the effective address the server is actually bound to.
 	// It is written once the listener exists and read by BoundAddr and
 	// BrowserURL, which must work before the server finished starting.
@@ -631,6 +636,25 @@ func (s *Server) serveListener(ctx context.Context, listener net.Listener, handl
 	return s.serveHTTPListener(ctx, listener, shutdownTimeout)
 }
 
+// stopSignal returns the channel that is closed once the server begins its
+// orderly shutdown. Streaming handlers select on it beside their request
+// context, so a stream ends on the stop signal of the server itself.
+func (s *Server) stopSignal() <-chan struct{} {
+	s.stopOnce.Do(func() { s.stopped = make(chan struct{}) })
+	return s.stopped
+}
+
+// signalStop announces the orderly shutdown to the long-lived streaming
+// responses before the HTTP drain starts waiting for them. http.Server.Shutdown
+// waits for every active response to finish and never cancels its request
+// context, so a live stream — the log stream of an open Logs window — has to
+// end on this signal instead of burning the whole drain deadline. Ordinary
+// in-flight requests are untouched: they drain through the graceful shutdown.
+func (s *Server) signalStop() {
+	s.stopOnce.Do(func() { s.stopped = make(chan struct{}) })
+	close(s.stopped)
+}
+
 func (s *Server) serveHTTPListener(ctx context.Context, listener net.Listener, shutdownTimeout time.Duration) error {
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- s.httpServer.Serve(listener) }()
@@ -647,6 +671,12 @@ func (s *Server) serveHTTPListener(ctx context.Context, listener net.Listener, s
 	if ctx.Err() != nil {
 		stoppingForContext = true
 	}
+
+	// The streaming responses end on the stop signal before the drain
+	// begins, so the graceful shutdown below waits only for ordinary
+	// in-flight requests and completes within its budget even with a live
+	// log stream open.
+	s.signalStop()
 
 	// Quiesce before HTTP drain: accepted handlers may still mutate manager
 	// state, but neither their mutations nor runner completion may dispatch work.

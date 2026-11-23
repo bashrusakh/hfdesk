@@ -499,7 +499,7 @@ func (s *Server) handleRuntimeLogStream(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	stream.run(r.Context())
+	stream.run(r.Context(), s.stopSignal())
 }
 
 // runtimeLogStream writes log records to a Server-Sent Events response.
@@ -590,8 +590,9 @@ func (st *runtimeLogStream) replay(pipeline *logging.Pipeline) error {
 	return nil
 }
 
-// run writes the live records until the client goes away.
-func (st *runtimeLogStream) run(ctx context.Context) {
+// run writes the live records until the client goes away or the server
+// stops.
+func (st *runtimeLogStream) run(ctx context.Context, stop <-chan struct{}) {
 	keepAlive := time.NewTicker(runtimeLogStreamKeepAlive)
 	defer keepAlive.Stop()
 
@@ -604,6 +605,12 @@ func (st *runtimeLogStream) run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			// The client is gone: the caller closes the subscription.
+			return
+
+		case <-stop:
+			// The server is stopping: the stream ends on the stop
+			// signal instead of holding the HTTP drain open until its
+			// deadline. The caller closes the subscription.
 			return
 
 		case record, ok := <-records:
