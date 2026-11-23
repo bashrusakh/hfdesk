@@ -1247,10 +1247,11 @@ func TestServiceNotInstalledTextNamesTheWayToInstall(t *testing.T) {
 
 // TestNewSiblingMissingNoticeNamesFileFolderAndOneAction proves the copy of
 // the redesigned notice of a missing console program: the bold instruction
-// names the file, the first-glance content names what the program is for and
-// the folder it is not in, the offer is attached with the facts of the
-// command link, and the long pairing explanation stays out of the first
-// glance — it belongs to the manual expander.
+// names the file and why the service needs it, the first-glance content is
+// the two facts (what the program is for, the folder it is expected in), the
+// offer is attached with the facts of its command link, the manual route
+// carries only its steps, and the pairing explanation stays out of the first
+// glance — it belongs to the folded details.
 //
 // The notice is built without a dialog, so this pins the wording every
 // renderer shows.
@@ -1274,12 +1275,12 @@ func TestNewSiblingMissingNoticeNamesFileFolderAndOneAction(t *testing.T) {
 		t.Fatalf("the empty folder of a version-stamped program failed with %v, want the pairing failure", findErr)
 	}
 
-	notice := newSiblingMissingNotice(serviceActionInstall, folder, desktop, findErr, offer)
+	notice := newSiblingMissingNotice(serviceActionInstall, folder, desktop, findErr, offer, nil)
 
-	assertNames(t, notice.Instruction, "the instruction", []string{asset, "is missing"})
+	assertNames(t, notice.Instruction, "the instruction", []string{asset, "is missing", "the Windows service needs it"})
 	assertNames(t, notice.Content, "the content", []string{
 		"The Windows service runs this program",
-		folder,
+		"It is expected in " + folder,
 	})
 	if strings.Contains(notice.Content, "only runs the console program") {
 		t.Errorf("the content %q carries the pairing explanation", notice.Content)
@@ -1293,27 +1294,46 @@ func TestNewSiblingMissingNoticeNamesFileFolderAndOneAction(t *testing.T) {
 	if notice.Folder != folder {
 		t.Errorf("the notice carries folder %q, want %q", notice.Folder, folder)
 	}
+	// A notice that offers a download states no reason for the absence of
+	// one, and the log path travels as a field the dialog turns into an
+	// action — never as dead text beside the facts.
+	if notice.Reason != "" {
+		t.Errorf("the reason line is %q although a download is offered, want none", notice.Reason)
+	}
+	if strings.Contains(notice.Content, "The log file is at") {
+		t.Errorf("the content %q prints the log path as text", notice.Content)
+	}
 
-	// The pairing explanation is long and belongs to the expander, not
-	// to the first glance; the manual text carries the get-put-retry steps.
+	// The pairing explanation is long and belongs to the folded details,
+	// not to the first glance; the manual text carries the get-put-retry
+	// steps alone.
 	if strings.Contains(notice.Content, "release") {
 		t.Errorf("the content %q carries the pairing explanation", notice.Content)
 	}
+	assertNames(t, notice.Details, "the folded details", []string{
+		"only runs the console program of that same release",
+		"both belong in one folder",
+	})
 	assertNames(t, notice.Manual, "the manual text", []string{
 		"Get release v1.3.0-beta.7",
 		"releases/tag/v1.3.0-beta.7",
 		"put " + asset + " next to hfdesk-desktop.exe",
 		folder,
 		"run the action again",
-		"only runs the console program of that same release",
 	})
+	if strings.Contains(notice.Manual, "only runs the console program") {
+		t.Errorf("the manual text %q carries the pairing explanation", notice.Manual)
+	}
 
-	// The labels of the two buttons and the note of the command link are
-	// the approved copy; the note states size, release, the check and
+	// The labels of the links and the note of the download command link
+	// are the approved copy; the note states size, release, the check and
 	// what follows it.
 	assertNames(t, siblingMissingDownloadLabel, "the primary label", []string{"Download it and continue"})
 	assertNames(t, siblingMissingDismissLabel, "the dismiss label", []string{"Not now"})
-	assertNames(t, siblingMissingManualLabel, "the expander label", []string{"Install it manually instead"})
+	assertNames(t, siblingMissingManualLabel, "the manual label", []string{"Install it manually instead"})
+	assertNames(t, siblingMissingRetryLabel, "the retry label", []string{"Try again"})
+	assertNames(t, siblingMissingDetailsLabel, "the details label", []string{"Details"})
+	assertNames(t, logFileOpenLabel, "the log label", []string{"Open the log file"})
 	assertNames(t, siblingMissingDownloadNote(notice), "the note line", []string{
 		"12.2 MB",
 		"from the official release v1.3.0-beta.7",
@@ -1327,6 +1347,7 @@ func TestNewSiblingMissingNoticeNamesFileFolderAndOneAction(t *testing.T) {
 		"instruction": notice.Instruction,
 		"content":     notice.Content,
 		"manual":      notice.Manual,
+		"details":     notice.Details,
 	} {
 		if strings.Contains(text, "never downloads") || strings.Contains(text, "nothing is downloaded or copied") {
 			t.Errorf("the %s %q carries the falsified download claim", name, text)
@@ -1336,22 +1357,33 @@ func TestNewSiblingMissingNoticeNamesFileFolderAndOneAction(t *testing.T) {
 
 // TestNewSiblingMissingNoticeWithoutAReleaseKeepsManualInstructionsOnly
 // proves that a local build — a desktop program whose name carries no
-// release version — gets no download offer: the notice names hfdesk.exe,
-// keeps the cause of the failed lookup beside the first sentence and offers
-// the manual steps alone.
+// release version — gets no download offer and says why: the notice names
+// hfdesk.exe, states the honest reason where the button would be, keeps the
+// cause of the failed lookup and the pairing rule in the folded details, and
+// offers the manual steps alone.
 func TestNewSiblingMissingNoticeWithoutAReleaseKeepsManualInstructionsOnly(t *testing.T) {
 	const folder = `C:\portable`
 	notice := newSiblingMissingNotice(serviceActionInstall, folder, filepath.Join(folder, "hfdesk-desktop.exe"),
-		errors.New("there is no hfdesk.exe in "+folder), nil)
+		errors.New("there is no hfdesk.exe in "+folder), nil, nil)
 
 	if notice.Download != nil {
 		t.Errorf("the notice offers the download %v for a local build, want no offer", notice.Download)
 	}
+	// No offer and no failure to classify is exactly the state of a name
+	// without a release version: the reason line stands where the button
+	// would be, so nothing disappears in silence.
+	assertNames(t, notice.Reason, "the reason line", []string{"no release version"})
 	assertNames(t, notice.Instruction, "the instruction", []string{"hfdesk.exe", "is missing"})
 	assertNames(t, notice.Content, "the content", []string{
 		"The Windows service runs this program",
 		folder,
+	})
+	if strings.Contains(notice.Content, "there is no hfdesk.exe") {
+		t.Errorf("the content %q carries the raw cause of the lookup", notice.Content)
+	}
+	assertNames(t, notice.Details, "the folded details", []string{
 		"there is no hfdesk.exe",
+		"ships both programs in one folder",
 	})
 	assertNames(t, notice.Manual, "the manual text", []string{
 		"Put hfdesk.exe next to hfdesk-desktop.exe",
@@ -1365,9 +1397,9 @@ func TestNewSiblingMissingNoticeWithoutAReleaseKeepsManualInstructionsOnly(t *te
 
 // TestNewSiblingMissingNoticeKeepsTheCauseOfANonPairingLookupFailure proves
 // the cause rule of the notice for a version-stamped desktop program: a
-// folder that cannot be read is not the pairing rule, so its cause sits
-// beside the first sentence of the content — the version stamp alone never
-// silences it.
+// folder that cannot be read is not the pairing rule, so its raw cause is
+// kept — in the folded details, where every raw cause lives, never in the
+// first glance the user reads before choosing anything.
 func TestNewSiblingMissingNoticeKeepsTheCauseOfANonPairingLookupFailure(t *testing.T) {
 	// A folder that does not exist: the lookup fails at the read, long
 	// before it could apply the pairing rule.
@@ -1381,12 +1413,93 @@ func TestNewSiblingMissingNoticeKeepsTheCauseOfANonPairingLookupFailure(t *testi
 		t.Fatalf("the failed read %v is marked as the pairing failure", findErr)
 	}
 
-	notice := newSiblingMissingNotice(serviceActionInstall, folder, desktop, findErr, nil)
+	notice := newSiblingMissingNotice(serviceActionInstall, folder, desktop, findErr, nil, nil)
 	assertNames(t, notice.Content, "the content", []string{
 		"The Windows service runs this program",
 		folder,
-		"cannot be read",
 	})
+	assertNames(t, notice.Details, "the folded details", []string{"cannot be read"})
+	if strings.Contains(notice.Content, "cannot be read") {
+		t.Errorf("the content %q carries the raw cause of the lookup", notice.Content)
+	}
+}
+
+// TestSiblingMissingNoticeStatesTheReasonOfAnUnavailableDownload proves the
+// rule of the notice when no download can be offered: one honest line stands
+// where the button would be — the build whose name carries no release
+// version, a release that could not be reached, a release that publishes
+// nothing verifiable, and a failure no class names — while the raw cause
+// stays in the folded details and never enters the first glance. With an
+// offer there is no reason line at all.
+func TestSiblingMissingNoticeStatesTheReasonOfAnUnavailableDownload(t *testing.T) {
+	const folder = `C:\portable`
+	desktop := filepath.Join(folder, testReleaseDesktop)
+
+	for _, tc := range []struct {
+		name       string
+		offer      *consoleDownloadOffer
+		offerErr   error
+		wantReason string
+	}{
+		{
+			name: "an offer exists",
+			offer: &consoleDownloadOffer{
+				Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
+				Size:    1024,
+			},
+		},
+		{name: "the build carries no release version", wantReason: "no release version"},
+		{
+			name:     "the release could not be reached",
+			offerErr: offerUnreachable(errors.New("dial tcp: no route to host")),
+			// The connection is the one thing the user can act on
+			// here, so the line names it and asks for exactly that.
+			wantReason: "could not be reached",
+		},
+		{
+			name:       "the release publishes nothing verifiable",
+			offerErr:   offerUnpublished(errors.New("the release " + testReleaseTag + " publishes no SHA-256 checksum for " + testReleaseAsset)),
+			wantReason: "does not publish this file with a checksum",
+		},
+		{
+			name:       "a failure no class names",
+			offerErr:   errors.New("something the resolve did not classify"),
+			wantReason: "could not offer a verified download",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			notice := newSiblingMissingNotice(serviceActionInstall, folder, desktop,
+				errors.New("there is no program in "+folder), tc.offer, tc.offerErr)
+
+			if tc.wantReason == "" {
+				if notice.Reason != "" {
+					t.Errorf("the reason line is %q although a download is offered, want none", notice.Reason)
+				}
+				return
+			}
+			if notice.Download != nil {
+				t.Errorf("the notice offers %v although no download can be offered", notice.Download)
+			}
+			assertNames(t, notice.Reason, "the reason line", []string{tc.wantReason})
+			// The raw cause belongs to the folded details only: the
+			// first glance states the fact, never the failure behind
+			// it.
+			if tc.offerErr != nil {
+				assertNames(t, notice.Details, "the folded details", []string{tc.offerErr.Error()})
+				if strings.Contains(notice.Reason, tc.offerErr.Error()) {
+					t.Errorf("the reason line %q carries the raw cause %q", notice.Reason, tc.offerErr)
+				}
+				if strings.Contains(notice.Content, tc.offerErr.Error()) {
+					t.Errorf("the content %q carries the raw cause %q", notice.Content, tc.offerErr)
+				}
+			}
+			// The reason never leaves the notice silent: the manual
+			// route and the way to ask the release again are the
+			// approved labels the links carry.
+			assertNames(t, siblingMissingManualLabel, "the manual label", []string{"Install it manually instead"})
+			assertNames(t, siblingMissingRetryLabel, "the retry label", []string{"Try again"})
+		})
+	}
 }
 
 // TestSiblingMissingChooseTextMapsYesNo proves the Yes/No text of an
@@ -1401,12 +1514,13 @@ func TestSiblingMissingChooseTextMapsYesNo(t *testing.T) {
 		errors.New("pairing"), &consoleDownloadOffer{
 			Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
 			Size:    1024,
-		})
+		}, nil)
 
 	text := siblingMissingChooseText(notice)
 	assertNames(t, text, "the fallback", []string{
 		testReleaseAsset + " is missing",
-		"The Windows service runs this program, and it is not in " + folder,
+		"The Windows service runs this program",
+		"It is expected in " + folder,
 		"Choose Yes to download " + testReleaseAsset,
 		"official release " + testReleaseTag,
 		"SHA-256",
@@ -1420,15 +1534,17 @@ func TestSiblingMissingChooseTextMapsYesNo(t *testing.T) {
 // the message box fallback never offers what the transfer behind it would
 // refuse: the offer survives only an attempt that did not fail, while the
 // failure the fallback exists for drops it — whatever made the task dialog
-// fail, and independently of the machine's progress-dialog gate — and the
-// box keeps the file, the folder and the manual path.
+// fail, and independently of the machine's progress-dialog gate — and the box
+// then states that no download is offered instead of hiding a vanished
+// button, beside the file, the folder, the manual path and the details this
+// box has no fold for.
 func TestSiblingMissingNoticeForFallbackSuppressesAnOfferThatCannotRun(t *testing.T) {
 	const folder = `C:\portable`
 	offered := newSiblingMissingNotice(serviceActionInstall, folder, filepath.Join(folder, testReleaseDesktop),
 		errors.New("pairing"), &consoleDownloadOffer{
 			Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
 			Size:    1024,
-		})
+		}, nil)
 
 	kept := siblingMissingNoticeForFallback(offered, nil)
 	if kept != offered {
@@ -1441,11 +1557,15 @@ func TestSiblingMissingNoticeForFallbackSuppressesAnOfferThatCannotRun(t *testin
 	// transfer behind this offer shows its progress and its Cancel in
 	// exactly that task dialog machinery a moment later. The offer is
 	// dropped, so the box never asks a Yes whose transfer could only end
-	// in the "nothing was downloaded" report.
+	// in the "nothing was downloaded" report — and the reason line stands
+	// where the button was, so the box explains itself.
 	manual := siblingMissingNoticeForFallback(offered,
 		errors.New("the dialog could not be shown (HRESULT 0x80070057)"))
 	if manual.Download != nil {
 		t.Errorf("the fallback keeps the offer %v although the transfer cannot run, want no offer", manual.Download)
+	}
+	if manual.Reason == "" {
+		t.Error("the fallback drops the offer without stating why no download is offered")
 	}
 	if manual.Instruction != offered.Instruction || manual.Content != offered.Content ||
 		manual.Folder != offered.Folder || manual.Manual != offered.Manual {
@@ -1457,6 +1577,8 @@ func TestSiblingMissingNoticeForFallbackSuppressesAnOfferThatCannotRun(t *testin
 		offered.Instruction,
 		folder,
 		offered.Manual,
+		manual.Reason,
+		manual.Details,
 	})
 	assertNamesWithout(t, text, "the manual-only box", nil, []string{"Choose Yes"})
 }
@@ -1472,7 +1594,7 @@ func TestConsoleDownloadFailedTextReportsTheReasonAndTheManualPath(t *testing.T)
 		errors.New("pairing"), &consoleDownloadOffer{
 			Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
 			Size:    1024,
-		})
+		}, nil)
 
 	cause := errors.New("the SHA-256 of the downloaded file is abcd, but release " + testReleaseTag + " publishes efgh for it")
 	text := consoleDownloadFailedText(notice, cause)
@@ -1547,7 +1669,7 @@ func TestSiblingMissingNoticeCopyNamesTheActionItContinues(t *testing.T) {
 			errors.New("pairing"), &consoleDownloadOffer{
 				Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
 				Size:    12772352,
-			})
+			}, nil)
 	}
 
 	install := noticeFor(serviceActionInstall)
@@ -2038,12 +2160,12 @@ func TestFailureWindowsNameTheLogFileOfThisLaunch(t *testing.T) {
 	kept := &service.InstallStartError{Cause: cause, CleanupError: errors.New("the process identity changed")}
 	removed := &service.InstallStartError{Cause: cause, RegistrationRemoved: true}
 	notice := newSiblingMissingNotice(serviceActionInstall, `C:\portable`,
-		filepath.Join(`C:\portable`, "hfdesk-desktop.exe"), cause, nil)
+		filepath.Join(`C:\portable`, "hfdesk-desktop.exe"), cause, nil, nil)
 	downloadNotice := newSiblingMissingNotice(serviceActionInstall, `C:\portable`,
 		filepath.Join(`C:\portable`, "hfdesk-desktop.exe"), cause, &consoleDownloadOffer{
 			Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
 			Size:    1024,
-		})
+		}, nil)
 
 	windows := map[string]string{
 		"the installation failure": serviceActionFailureText(serviceActionInstall, cause, program),
@@ -2130,6 +2252,44 @@ func TestFailureWindowsNameTheLogFileOfThisLaunch(t *testing.T) {
 	}
 }
 
+// TestSplitLogFileLineReadsBackWhatLogFileLinePrinted proves the inverse of
+// the standard log-path line: the renderer that turns that line into the
+// action "Open the log file" gets the body of the window and the path the
+// line really named — so the window and the action always name one file. A
+// text that carries no line, or one that merely mentions the marker without
+// ending in a path, keeps its whole body: nothing is ever opened on a guess.
+func TestSplitLogFileLineReadsBackWhatLogFileLinePrinted(t *testing.T) {
+	const path = `C:\Users\ada\AppData\Local\HFDesk\logs\hfdesk.log`
+	body := "HFDesk could not install the Windows service.\n\nthe cause of the failure"
+
+	gotBody, gotPath := splitLogFileLine(body + logFileLine(path))
+	if gotBody != body {
+		t.Errorf("the body is %q, want the window without its log line %q", gotBody, body)
+	}
+	if gotPath != path {
+		t.Errorf("the path is %q, want %q", gotPath, path)
+	}
+
+	// A launch without a log file prints no line at all, so there is
+	// nothing to split off and no file to open.
+	if gotBody, gotPath = splitLogFileLine(body); gotBody != body || gotPath != "" {
+		t.Errorf("splitLogFileLine of a window without a log line gave (%q, %q), want the whole body and no path",
+			gotBody, gotPath)
+	}
+
+	// The marker without a path behind it is not that line.
+	if gotBody, gotPath = splitLogFileLine(body + logFileLineMarker); gotBody != body+logFileLineMarker || gotPath != "" {
+		t.Errorf("splitLogFileLine of a dangling marker gave (%q, %q), want the whole text and no path",
+			gotBody, gotPath)
+	}
+	// Nor is a line followed by more text: only the closing line of the
+	// window is the line.
+	followed := body + logFileLine(path) + "\n\none more sentence"
+	if _, middlePath := splitLogFileLine(followed); middlePath != "" {
+		t.Errorf("splitLogFileLine of a line in the middle gave the path %q, want none", middlePath)
+	}
+}
+
 // TestGateAndReportsCarryNoInternalMechanism pins the rule of the sixth plan
 // item for the gate family and the reports: state plus at most one action,
 // and no internal mechanism in the text the window itself writes — no
@@ -2153,7 +2313,7 @@ func TestGateAndReportsCarryNoInternalMechanism(t *testing.T) {
 	program := `C:\portable\hfdesk.exe`
 	dataDir := `C:\ProgramData\HFDesk`
 	notice := newSiblingMissingNotice(serviceActionInstall, `C:\portable`,
-		filepath.Join(`C:\portable`, "hfdesk-desktop.exe"), cause, nil)
+		filepath.Join(`C:\portable`, "hfdesk-desktop.exe"), cause, nil, nil)
 
 	texts := map[string]string{
 		"the running gate": serviceGateText(serviceChoicePrompt{

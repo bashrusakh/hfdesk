@@ -25,6 +25,16 @@ import (
 // its helper there.
 var runLogPath string
 
+// logFileLineMarker is the standard line every failure window carries about
+// the log file of this launch. It is a marker as well as a sentence: the
+// renderer that turns the line into an action (splitLogFileLine) reads the
+// path back out of it, so the window and the action always name one file.
+const logFileLineMarker = "\n\nThe log file is at "
+
+// logFileOpenLabel is the command link that opens that file, in the notice of
+// the missing console program and in every failure window that names a log.
+const logFileOpenLabel = "Open the log file"
+
 // logFileLine returns the one standard line every failure window carries:
 // the path of the log file of this launch, so the log is reachable from
 // outside the window. A launch without a log file of its own names none —
@@ -33,7 +43,29 @@ func logFileLine(path string) string {
 	if strings.TrimSpace(path) == "" {
 		return ""
 	}
-	return "\n\nThe log file is at " + path + "."
+	return logFileLineMarker + path + "."
+}
+
+// splitLogFileLine is the exact inverse of logFileLine: it splits the standard
+// log-path line off the text of a failure window and returns the body of the
+// window together with the path the line names — empty when the text carries
+// no complete line, which is every window of a launch without a log file of
+// its own. A text that merely mentions the marker without ending in a path
+// keeps its whole body, so nothing is ever opened on a guess.
+func splitLogFileLine(text string) (body, path string) {
+	index := strings.LastIndex(text, logFileLineMarker)
+	if index < 0 {
+		return text, ""
+	}
+	tail := text[index+len(logFileLineMarker):]
+	if !strings.HasSuffix(tail, ".") {
+		return text, ""
+	}
+	path = strings.TrimSuffix(tail, ".")
+	if strings.TrimSpace(path) == "" {
+		return text, ""
+	}
+	return text[:index], path
 }
 
 // failureWindowText appends that standard line to the text of a failure
@@ -1084,41 +1116,89 @@ const (
 	// siblingMissingDismissLabel dismisses the notice and changes
 	// nothing.
 	siblingMissingDismissLabel = "Not now"
-	// siblingMissingManualLabel is the collapsed expander that carries
-	// the instructions for putting the file in place by hand.
+	// siblingMissingManualLabel is the visible item that carries the
+	// instructions for putting the file in place by hand — the way the
+	// notice offered before there was a download, now a choice of its own
+	// instead of a fold.
 	siblingMissingManualLabel = "Install it manually instead"
+	// siblingMissingRetryLabel re-reads the release: it is the item that
+	// replaces the download button whenever no download can be offered,
+	// so the button never disappears without a way back.
+	siblingMissingRetryLabel = "Try again"
+	// siblingMissingDetailsLabel is the fold that carries what the first
+	// glance of the notice deliberately leaves out: the pairing rule and
+	// the raw cause of a failed lookup.
+	siblingMissingDetailsLabel = "Details"
+)
+
+// The reasons a notice without a download states, one line each, in human
+// words: what stopped the offer, without the failure behind it, which stays in
+// the folded details.
+const (
+	// consoleOfferNoVersionReason names the state of a build whose file
+	// name carries no release version: such a build names no release, so
+	// there is nothing to download its pair from. The product rule of that
+	// state is the honest reason alone — it is never turned into an offer.
+	consoleOfferNoVersionReason = "This copy of HFDesk carries no release version, so there is no release to download this file from."
+	// consoleOfferUnreachableReason names a release that could not be
+	// read: no network, a timeout or a broken answer, with the one thing
+	// the user can act on beside it.
+	consoleOfferUnreachableReason = "The release page of HFDesk could not be reached. Check your connection and try again."
+	// consoleOfferUnpublishedReason names a release that was read but
+	// publishes neither this file nor a checksum for it — the two cases
+	// one line covers, because both mean there is nothing to fetch and
+	// verify.
+	consoleOfferUnpublishedReason = "The release does not publish this file with a checksum to verify it against."
+	// consoleOfferUnknownReason is the honest sentence of a failure no
+	// class names: no cause is invented for it.
+	consoleOfferUnknownReason = "HFDesk could not offer a verified download of this file."
 )
 
 // siblingMissingNotice is the copy of the notice a service action shows when
 // its console program is missing.
 //
 // The fields are the parts of the redesigned TaskDialog layout: the bold
-// instruction names the file, the first-glance content states what the
-// program is for and the folder it is not in, the download offer — nil when
-// no verified download can be offered — carries the release facts the command
-// link shows, and the manual text is what the collapsed expander and the
-// message box fallback carry as the way without a download. Action is the
-// service action the user invoked, so the copy that continues after a
-// verified download names that action and never another one. The copy is
-// built without any dialog or network in it, so a test can pin the wording.
+// instruction names the file and why the service needs it, the first-glance
+// content states what the program is for and the folder it is expected in,
+// the download offer — nil when no verified download can be offered — carries
+// the release facts the command link shows, and the reason line stands in for
+// that button when there is none. The manual text is the route without a
+// download, shown as its own visible item; the details hold what the first
+// glance leaves out (the pairing rule and the raw cause of a failed lookup);
+// and the log file is the file this launch writes, which the dialog opens with
+// one action instead of naming it as dead text. Action is the service action
+// the user invoked, so the copy that continues after a verified download names
+// that action and never another one. The copy is built without any dialog or
+// network in it, so a test can pin the wording.
 type siblingMissingNotice struct {
 	// Action is the service action that continues after a verified
 	// download: install or update.
 	Action serviceAction
 	// Title is the window title of the notice.
 	Title string
-	// Instruction is the bold main line: the missing file, named.
+	// Instruction is the bold main line: the missing file, and why it is
+	// needed.
 	Instruction string
-	// Content is the first-glance sentence under it.
+	// Content is the first-glance facts under it: what the program is for
+	// and the folder it is expected in.
 	Content string
 	// Folder is the folder the lookup looked in and the manual steps
 	// point at.
 	Folder string
 	// Download is the resolved offer of the paired release asset, or nil
-	// when only the manual instructions are shown.
+	// when only the manual route is shown.
 	Download *consoleDownloadOffer
 	// Manual is the text of the manual path.
 	Manual string
+	// Reason is the one line that states why no download is offered, and
+	// empty when one is.
+	Reason string
+	// Details is what the folded part of the dialog carries: the pairing
+	// rule and the raw cause of the failed lookups.
+	Details string
+	// LogFile is the log file of this launch, empty when this launch
+	// writes none.
+	LogFile string
 }
 
 // serviceActionNoticePhrases returns how the notice names the action that
@@ -1146,70 +1226,143 @@ func serviceActionNoticePhrases(action serviceAction) (steps, continueWith strin
 // console program for the service action that asked for it.
 //
 // The instruction always names the file the action expected — the pair of a
-// version-stamped program, or hfdesk.exe for a local build — and the content
-// states the folder it is not in. The one failure whose cause stays out of
-// the first glance is the pairing failure of a version-stamped program
-// (marked with errConsolePairMissing): its explanation is the pairing rule
-// the collapsed expander already states. Every other failure of the lookup —
-// an unreadable folder, no candidate, several candidates — keeps its cause
-// beside the first sentence, because that cause is what the manual steps
-// have to deal with.
-func newSiblingMissingNotice(action serviceAction, folder, desktop string, findErr error, offer *consoleDownloadOffer) siblingMissingNotice {
+// version-stamped program, or hfdesk.exe for a local build — beside the fact
+// that the service needs it, and the content states the folder the file is
+// expected in. Nothing raw enters that first glance: the pairing rule, the
+// cause of a failed lookup and the cause of a failed release read all live in
+// the folded details (siblingMissingDetails), and the reason line stands where
+// the download button would be whenever there is no button to show
+// (siblingMissingOfferReason). The log file of this launch travels as its own
+// field, so the dialog opens it with an action instead of printing its path as
+// dead text beside the facts.
+func newSiblingMissingNotice(action serviceAction, folder, desktop string, findErr error, offer *consoleDownloadOffer, offerErr error) siblingMissingNotice {
 	missing := pairedConsoleExecutableName(desktop)
 	if missing == "" {
 		missing = consoleExecutableName + executableSuffix
 	}
-	notice := siblingMissingNotice{
+	return siblingMissingNotice{
 		Action:      action,
 		Title:       serviceSiblingMissingCaption,
-		Instruction: missing + " is missing",
+		Instruction: missing + " is missing, and the Windows service needs it.",
 		Content:     missingProgramContent(folder),
 		Folder:      folder,
 		Download:    offer,
 		Manual:      siblingMissingManualText(folder, desktop, missing),
+		Reason:      siblingMissingOfferReason(offer, offerErr),
+		Details:     siblingMissingDetails(desktop, missing, findErr, offerErr),
+		LogFile:     runLogPath,
 	}
-	if findErr != nil && !errors.Is(findErr, errConsolePairMissing) {
-		notice.Content += "\n\n" + findErr.Error()
-	}
-	// The missing program is the failure that blocked the action, and the
-	// lookup wrote its cause to the log: the notice carries the standard
-	// line that makes that log reachable from outside the window.
-	notice.Content = failureWindowText(notice.Content)
-	return notice
 }
 
-// missingProgramContent returns the first-glance sentence of the notice: what
-// the program is for and the folder it is not in.
+// missingProgramContent returns the first-glance facts of the notice: what
+// the program is for, and the folder it is expected in — one fact per line,
+// so the two read at a glance.
 func missingProgramContent(folder string) string {
-	where := folder
-	if where == "" {
-		where = "the folder of this desktop app"
+	return "The Windows service runs this program.\nIt is expected in " + missingProgramFolder(folder) + "."
+}
+
+// missingProgramFolder names the folder the lookup looked in, or the folder
+// of the desktop app when the caller names none.
+func missingProgramFolder(folder string) string {
+	if folder == "" {
+		return "the folder of this desktop app"
 	}
-	return "The Windows service runs this program, and it is not in " + where + "."
+	return folder
+}
+
+// siblingMissingOfferReason returns the one line that stands in for the
+// download button when no download can be offered, and an empty string when
+// one can.
+//
+// The reason names the state and nothing behind it: a build whose name carries
+// no release version names no release to fetch from, an unreadable release is
+// a connection the user can check, and a release that was read but publishes
+// nothing verifiable says exactly that. A failure no class names gets an
+// honest sentence that claims no cause.
+func siblingMissingOfferReason(offer *consoleDownloadOffer, offerErr error) string {
+	switch {
+	case offer != nil:
+		return ""
+	case offerErr == nil:
+		// No offer and no failure is the state of a name without a
+		// release version: the resolve reads that state from the name
+		// alone and reaches no server for it.
+		return consoleOfferNoVersionReason
+	}
+	if reason, classified := consoleOfferReasonOf(offerErr); classified {
+		switch reason {
+		case consoleOfferUnreachable:
+			return consoleOfferUnreachableReason
+		case consoleOfferUnpublished:
+			return consoleOfferUnpublishedReason
+		}
+	}
+	return consoleOfferUnknownReason
+}
+
+// siblingMissingDetails returns the folded part of the notice: the pairing
+// rule, the raw cause of a lookup that failed for a reason of its own, and
+// the raw cause of a release read that failed.
+//
+// The pairing failure is left out of the raw list because its message states
+// that very rule, whose human sentence is already the first part here — one
+// rule, stated once, in the words a user reads.
+func siblingMissingDetails(desktop, missing string, findErr, offerErr error) string {
+	var parts []string
+	if rule := siblingMissingPairRule(desktop, missing); rule != "" {
+		parts = append(parts, rule)
+	}
+	if findErr != nil && !errors.Is(findErr, errConsolePairMissing) {
+		parts = append(parts, findErr.Error())
+	}
+	if offerErr != nil {
+		parts = append(parts, offerErr.Error())
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// siblingMissingPairRule returns the one sentence that states why the two
+// programs belong together: a desktop program of a release only runs the
+// console program of that same release, and both ship in one folder. A local
+// build names no release, so it gets the short form of the same fact.
+func siblingMissingPairRule(desktop, missing string) string {
+	if _, namesRelease := consoleReleaseFor(desktop); namesRelease {
+		return "A desktop program of a release only runs the console program of that same release, " +
+			"so the release ships " + missing + " beside hfdesk-desktop.exe and both belong in one folder."
+	}
+	return "A release of HFDesk ships both programs in one folder, so the console program belongs beside the desktop app."
+}
+
+// siblingMissingBody returns the first-glance text of the notice: the
+// instruction, the facts, and — when no download is offered — the one reason
+// line where its button would be.
+func siblingMissingBody(notice siblingMissingNotice) string {
+	body := notice.Instruction + "\n\n" + notice.Content
+	if notice.Reason != "" {
+		body += "\n\n" + notice.Reason
+	}
+	return body
 }
 
 // siblingMissingManualText returns the text of the manual path: how to get
 // the file without a download and where to put it.
 //
-// A desktop program that names its release gets the release to fetch and the
-// pairing rule that makes the two programs belong in one folder; a local
+// A desktop program that names its release gets the release to fetch; a local
 // build names no release, so its text only states where the file goes. Both
-// end with the one action that follows: run the action again.
+// end with the one action that follows: run the action again. The pairing
+// rule beside these steps is not part of them — it lives in the folded
+// details of the dialog (siblingMissingDetails), where it belongs with the
+// other cause a first glance leaves out.
 func siblingMissingManualText(folder, desktop, missing string) string {
-	where := folder
-	if where == "" {
-		where = "the folder of this desktop app"
-	}
+	where := missingProgramFolder(folder)
 	release, namesRelease := consoleReleaseFor(desktop)
 	if namesRelease {
 		return "Get release " + release.Tag + " from " + releaseTagPagePrefix + release.Tag +
 			", put " + missing + " next to hfdesk-desktop.exe in " + where +
-			", and run the action again.\n\n" +
-			"A desktop program of a release only runs the console program of that same release, " +
-			"so the release ships " + missing + " beside hfdesk-desktop.exe and both belong in one folder."
+			", and run the action again."
 	}
 	return "Put " + missing + " next to hfdesk-desktop.exe in " + where +
-		" — a release of HFDesk ships both programs in one folder — and run the action again."
+		", and run the action again."
 }
 
 // siblingMissingDownloadNote returns the note line under the download command
@@ -1238,20 +1391,34 @@ func siblingMissingDownloadNote(notice siblingMissingNotice) string {
 // Only an attempt that did not fail keeps the notice as it is; the notice
 // flow reaches this fallback only when one did fail. The instruction, the
 // content and the manual path stay exactly as they are, so the manual-only
-// box still names the file, the folder and the way without a download.
+// box still names the file, the folder and the way without a download — and
+// a notice that carried an offer gains the reason line, so the box says that
+// no download is offered instead of hiding a button it never shows.
 func siblingMissingNoticeForFallback(notice siblingMissingNotice, dialogErr error) siblingMissingNotice {
 	if dialogErr == nil {
 		return notice
 	}
 	notice.Download = nil
+	if notice.Reason == "" {
+		// The box never shows the download button the dialog was going
+		// to show, so it states that plainly instead of leaving a
+		// vanished button unexplained.
+		notice.Reason = consoleOfferUnknownReason
+	}
 	return notice
 }
 
 // siblingMissingManualNoticeText returns the whole text of the manual-only
-// notice for the message box fallback: instruction, content and the manual
-// path, in one box.
+// notice for the message box fallback: instruction, facts, the reason line
+// when there is no download to offer, the manual path, the folded details this
+// box has no fold for, and the standard log-path line — in one box, so the
+// degraded window keeps everything the task dialog would have shown.
 func siblingMissingManualNoticeText(notice siblingMissingNotice) string {
-	return notice.Instruction + "\n\n" + notice.Content + "\n\n" + notice.Manual
+	text := siblingMissingBody(notice) + "\n\n" + notice.Manual
+	if notice.Details != "" {
+		text += "\n\n" + notice.Details
+	}
+	return text + logFileLine(notice.LogFile)
 }
 
 // siblingMissingChooseText returns the Yes/No text of the message box of a
@@ -1269,7 +1436,7 @@ func siblingMissingManualNoticeText(notice siblingMissingNotice) string {
 func siblingMissingChooseText(notice siblingMissingNotice) string {
 	offer := notice.Download
 	_, continueWith := serviceActionNoticePhrases(notice.Action)
-	return notice.Instruction + "\n\n" + notice.Content + "\n\n" +
+	return siblingMissingBody(notice) + "\n\n" +
 		"Choose Yes to download " + offer.Release.Asset + " from the official release " + offer.Release.Tag +
 		", check its SHA-256, and continue with " + continueWith + ".\n" +
 		"Choose No to change nothing and put the file there yourself:\n\n" +

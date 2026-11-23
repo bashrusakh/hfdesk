@@ -338,10 +338,12 @@ var findSiblingExecutable = findConsoleExecutable
 // errConsolePairMissing marks the lookup failure that states the pairing rule
 // itself: a version-stamped desktop program whose console pair is not in the
 // folder. The notice of the missing program keeps that explanation out of its
-// first glance — the collapsed expander already carries the pairing sentence —
-// and shows the cause of every other lookup failure (an unreadable folder, no
-// candidate, several candidates) beside its first sentence, so errors.Is
-// tells the two classes of failure apart.
+// first glance — the folded details already carry the pairing sentence — and
+// keeps the cause of every other lookup failure (an unreadable folder, no
+// candidate, several candidates) in those folded details too, beside that
+// sentence, so errors.Is tells the two classes of failure apart: the pairing
+// failure needs no raw quote beside its own human rule, every other one is
+// quoted as it happened.
 var errConsolePairMissing = errors.New("the console program paired with this desktop program is missing")
 
 // consolePairingFailure is that pairing failure with its full sentence: it

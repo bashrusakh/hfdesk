@@ -82,6 +82,115 @@ func consoleReleaseFor(desktop string) (consoleRelease, bool) {
 	}, true
 }
 
+// normalizedReleaseName returns a release file name in the one spelling every
+// name comparison of this package reduces to: lower case, with the version
+// segment written without the "v" a tag carries.
+//
+// The version inside a file name is spelled the way the build that produced
+// the name spelled it — a release workflow tags v1.3.0 and names its assets
+// after that tag, a development build names 1.3.0 — while the pair of the
+// desktop program carries the spelling of the desktop program's own name.
+// Neither spelling is the wrong one, so both sides are normalized instead of
+// one being taken as the truth: the very same file matches in either spelling
+// and in any case, and another version, another platform or another program
+// still never does.
+func normalizedReleaseName(name string) string {
+	segments := strings.Split(strings.ToLower(name), "_")
+	for index, segment := range segments {
+		segments[index] = normalizedVersionSegment(segment)
+	}
+	return strings.Join(segments, "_")
+}
+
+// normalizedVersionSegment drops the leading "v" of a name segment that
+// starts a release version and keeps every other segment byte for byte.
+//
+// The version starts where a digit, a dot and another digit follow the
+// optional "v" — the shape 1.3.0 and v1.3.0 share. What follows that shape (a
+// pre-release suffix, the file extension, a platform name) is left alone, so a
+// segment that merely begins with a v never loses one.
+func normalizedVersionSegment(segment string) string {
+	rest, found := strings.CutPrefix(segment, "v")
+	if !found || !startsReleaseVersion(rest) {
+		return segment
+	}
+	return rest
+}
+
+// startsReleaseVersion reports whether the tail of a name segment begins like
+// a release version: an all-digit part, a dot and the start of another digit —
+// at least the two numeric parts every release tag of this repository carries.
+func startsReleaseVersion(value string) bool {
+	dot := strings.IndexByte(value, '.')
+	if dot < 1 || dot+1 >= len(value) {
+		return false
+	}
+	for _, symbol := range value[:dot] {
+		if symbol < '0' || symbol > '9' {
+			return false
+		}
+	}
+	return value[dot+1] >= '0' && value[dot+1] <= '9'
+}
+
+// consoleOfferReason classifies why a release cannot offer the download of
+// the paired console program, so the notice can state one honest reason line
+// while the raw cause stays in the folded details of its dialog.
+type consoleOfferReason string
+
+const (
+	// consoleOfferUnreachable is a release that could not be read at all: a
+	// machine without a network, a timeout, a broken answer.
+	consoleOfferUnreachable consoleOfferReason = "unreachable"
+	// consoleOfferUnpublished is a release that was read but does not
+	// publish the paired program with an authoritative checksum.
+	consoleOfferUnpublished consoleOfferReason = "unpublished"
+)
+
+// consoleOfferFailure is that classification wrapped around the raw cause.
+// The message stays the message of the cause alone — the report, the log and
+// every test that reads the failure read exactly what they read before — while
+// the reason tells the notice which one-line explanation it may state.
+type consoleOfferFailure struct {
+	reason consoleOfferReason
+	cause  error
+}
+
+func (e *consoleOfferFailure) Error() string {
+	if e == nil || e.cause == nil {
+		return "the release cannot offer the download"
+	}
+	return e.cause.Error()
+}
+
+func (e *consoleOfferFailure) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// offerUnreachable marks a release that could not be read.
+func offerUnreachable(cause error) error {
+	return &consoleOfferFailure{reason: consoleOfferUnreachable, cause: cause}
+}
+
+// offerUnpublished marks a release that was read but publishes nothing this
+// download could be taken from or verified against.
+func offerUnpublished(cause error) error {
+	return &consoleOfferFailure{reason: consoleOfferUnpublished, cause: cause}
+}
+
+// consoleOfferReasonOf reads the classification of a failed offer resolve,
+// and reports whether the failure carries one.
+func consoleOfferReasonOf(err error) (consoleOfferReason, bool) {
+	var failure *consoleOfferFailure
+	if errors.As(err, &failure) {
+		return failure.reason, true
+	}
+	return "", false
+}
+
 // consoleDownloadOffer is everything the notice and the transfer need about
 // the paired asset of one release: where it is published, how large it is,
 // and the authoritative SHA-256 sources of that same release.
@@ -123,7 +232,8 @@ type githubReleaseResponse struct {
 // publish exactly the paired asset, when no authoritative checksum source
 // exists, or when the release cannot be read at all: a download is only ever
 // offered where it can be verified, and a machine without a network gets the
-// manual path instead of a button that would fail.
+// manual path instead of a button that would fail. Every failure is classified
+// (consoleOfferFailure) so the notice can state its reason honestly.
 func resolveConsoleDownloadOffer(desktop string) (*consoleDownloadOffer, error) {
 	release, ok := consoleReleaseFor(desktop)
 	if !ok {
@@ -134,38 +244,44 @@ func resolveConsoleDownloadOffer(desktop string) (*consoleDownloadOffer, error) 
 
 	metadata, err := fetchConsoleRelease(ctx, release.Tag)
 	if err != nil {
-		return nil, err
+		return nil, offerUnreachable(err)
 	}
 	var asset *consoleReleaseAsset
 	checksumsURL := ""
+	paired := normalizedReleaseName(release.Asset)
 	for index := range metadata.Assets {
 		assetMeta := &metadata.Assets[index]
 		switch {
-		// The asset matches the paired name case-insensitively: the
+		// The asset is the paired name in whichever spelling of the
+		// version the release published it: both names are reduced to
+		// one normalized spelling before they are compared
+		// (normalizedReleaseName), so a tag that carries the "v" and a
+		// program name that does not still name the same file. The
 		// local lookup that found the pair compares names the way the
 		// Windows file system does, so the release metadata must not
-		// narrow that rule and silently drop the offer for a
+		// narrow that rule either — case is part of the same
+		// normalization — and silently drop the offer for a
 		// case-renamed program.
-		case strings.EqualFold(assetMeta.Name, release.Asset):
+		case normalizedReleaseName(assetMeta.Name) == paired:
 			asset = assetMeta
 		case assetMeta.Name == releaseChecksumsAssetName && allowedReleaseDownloadURL(assetMeta.BrowserDownloadURL):
 			checksumsURL = assetMeta.BrowserDownloadURL
 		}
 	}
 	if asset == nil {
-		return nil, fmt.Errorf("the release %s does not publish %s", release.Tag, release.Asset)
+		return nil, offerUnpublished(fmt.Errorf("the release %s does not publish %s", release.Tag, release.Asset))
 	}
 	if asset.Size <= 0 {
-		return nil, fmt.Errorf("the release %s publishes %s with an empty size", release.Tag, release.Asset)
+		return nil, offerUnpublished(fmt.Errorf("the release %s publishes %s with an empty size", release.Tag, release.Asset))
 	}
 	if !allowedReleaseDownloadURL(asset.BrowserDownloadURL) {
-		return nil, fmt.Errorf("the release %s does not publish %s from the official release downloads", release.Tag, release.Asset)
+		return nil, offerUnpublished(fmt.Errorf("the release %s does not publish %s from the official release downloads", release.Tag, release.Asset))
 	}
 	// Fail closed before the button exists: without an authoritative
 	// checksum of this release there is nothing the download could be
 	// verified against, so no download is offered.
 	if !validSHA256Digest(asset.Digest) && checksumsURL == "" {
-		return nil, fmt.Errorf("the release %s publishes no SHA-256 checksum for %s", release.Tag, release.Asset)
+		return nil, offerUnpublished(fmt.Errorf("the release %s publishes no SHA-256 checksum for %s", release.Tag, release.Asset))
 	}
 	return &consoleDownloadOffer{
 		Release:      release,
@@ -549,13 +665,18 @@ func releaseSHA256(ctx context.Context, offer *consoleDownloadOffer) (string, er
 // sha256FromChecksums finds the SHA-256 a sha256sum checksums list states
 // for exactly this asset name. The list is authoritative for the release it
 // was published with, and a line for another file is never taken as this
-// file's checksum. The name comparison is case-insensitive, the same rule
-// the local pair lookup follows, so a case-renamed desktop program still
-// resolves the line of its pair.
+// file's checksum. The name comparison is the normalized one every name match
+// of this package uses (normalizedReleaseName): case and the spelling of the
+// version both fold away, so the list a release published under its own tag
+// still holds the line of a pair named without the "v" — and a line of
+// another version, another platform or another program still never matches.
+// The rule is fail-closed as before: a line that is found has to carry a
+// well-formed SHA-256, and a file whose line is not there is not downloaded.
 func sha256FromChecksums(list, asset string) (string, bool) {
+	expected := normalizedReleaseName(asset)
 	for _, line := range strings.Split(list, "\n") {
 		fields := strings.Fields(strings.TrimRight(line, "\r"))
-		if len(fields) != 2 || !strings.EqualFold(strings.TrimPrefix(fields[1], "*"), asset) {
+		if len(fields) != 2 || normalizedReleaseName(strings.TrimPrefix(fields[1], "*")) != expected {
 			continue
 		}
 		if !validSHA256Hex(fields[0]) {

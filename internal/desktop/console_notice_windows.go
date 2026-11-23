@@ -22,13 +22,17 @@ import (
 // The task dialog reports the id of the pressed button back, so the answer is
 // a value of the dialog and not a position in a list. The ids start above the
 // ids of the standard buttons, and the progress dialog keeps its own id, so
-// no answer of one dialog can be read as a button of the other.
+// no answer of one dialog can be read as a button of the other. The id of the
+// log link is the one the failure reports use (logFileButtonID), because it
+// is the same action in both windows.
 const (
 	siblingMissingDownloadButtonID = 105
 	siblingMissingDismissButtonID  = 106
 	consoleDownloadCancelButtonID  = 107
+	siblingMissingManualButtonID   = 108
+	siblingMissingRetryButtonID    = 109
 	// standardButtonOKID is the id the task dialog reports for its common
-	// OK button, which is the only button of the manual-only notice.
+	// OK button.
 	standardButtonOKID = 1
 )
 
@@ -51,8 +55,12 @@ const (
 const (
 	tdmClickButton       = 0x0400 + 102
 	tdmSetProgressBarPos = 0x0400 + 106
-	tdnButtonClicked     = 2
-	tdnTimer             = 4
+	// tdnCreated is the notification of a task dialog that has been built
+	// but is not on screen yet — the one moment a window can still be
+	// ordered before the user sees where it landed.
+	tdnCreated       = 0
+	tdnButtonClicked = 2
+	tdnTimer         = 4
 )
 
 // The common-button flag of the OK button of a task dialog.
@@ -63,92 +71,130 @@ const tdcOKButton = 0x0001
 // its window, and the shared system library carries no Go wrapper for them.
 var user32SendMessageW = windows.NewLazySystemDLL("user32.dll").NewProc("SendMessageW")
 
-// siblingMissingAnswer is what the notice of the missing console program
-// asks the caller to do: download the paired release asset and continue, or
-// leave everything as it is.
+// siblingMissingAnswer is what the notice of the missing console program asks
+// the caller to do: download the paired release asset and continue, read the
+// release again, or leave everything as it is.
 type siblingMissingAnswer int
 
 const (
-	// siblingMissingDismiss closes the notice and changes nothing.
+	// siblingMissingDismiss closes the notice and changes nothing. Every
+	// way of leaving the window without a choice — Not now, Enter, Esc,
+	// the close button, and the log link, which opens a file but decides
+	// nothing about the action — answers this.
 	siblingMissingDismiss siblingMissingAnswer = iota
 	// siblingMissingDownload runs the verified download and lets the
 	// caller continue the very same service action.
 	siblingMissingDownload
+	// siblingMissingRetry reads the release again and shows the notice
+	// anew: it is the answer of "Try again", the item that stands where
+	// the download button would be whenever no download can be offered.
+	siblingMissingRetry
 )
 
-// siblingMissingButton is one button of the notice's task dialog: the id the
-// dialog reports back, the label the user reads, and the answer the press
-// performs. The label and the answer are parts of one decision, so a test
-// reads them side by side.
+// siblingMissingButton is one command link of the notice's task dialog: the id
+// the dialog reports back, the label the user reads, the note line under it —
+// empty when the link carries none — and the answer the press performs. The
+// label and the answer are parts of one decision, so a test reads them side
+// by side.
 type siblingMissingButton struct {
 	id     int32
 	label  string
+	note   string
 	answer siblingMissingAnswer
 }
 
+// commandLinkText is what the dialog hands to Windows for this link: the
+// label, and the note on the line under it — the note of a command link is
+// everything after its first new line, which is why a link worth reading
+// before the press carries one.
+func (button siblingMissingButton) commandLinkText() string {
+	if button.note == "" {
+		return button.label
+	}
+	return button.label + "\n" + button.note
+}
+
 // siblingMissingDialog is the composition of the task dialog of the notice:
-// the buttons in display order, the id Enter selects, the set of
-// OS-standard buttons, and whether the buttons render as command links.
+// the command links in display order and the id Enter selects.
 //
 // The composition is a pure function of the notice, so a test can pin the
-// button set, their order, the default and the answer of every press
-// without a dialog: the real dialog blocks the process until the user
-// answers it.
+// button set, their order, the default and the answer of every press without
+// a dialog: the real dialog blocks the process until the user answers it.
 type siblingMissingDialog struct {
-	// buttons are the custom buttons in display order. Only the notice
-	// that offers the download has them: a task dialog renders every
-	// custom button of a command-link dialog as a link — a plain push
-	// button can only be an OS-standard one with a fixed label — so the
-	// manual-only notice carries no custom button at all and closes with
-	// the standard OK button below.
+	// buttons are the command links in display order. Every state of the
+	// notice has them: a task dialog renders every custom button of a
+	// command-link dialog as a link, and the answers of this notice are
+	// all named actions — the download, the manual route, the retry, the
+	// log, and the dismissal.
 	buttons []siblingMissingButton
 	// defaultButton is the id Enter selects. It is the dismiss answer of
-	// both compositions, so a stray Enter never starts a download.
+	// every composition, so a stray Enter never starts a download and
+	// never reads the release again either.
 	defaultButton int32
-	// standardButtons is the set of OS-standard buttons of the dialog:
-	// the single OK button of the manual-only notice, and none when the
-	// answers are the custom buttons above.
-	standardButtons uint32
-	// commandLinks renders buttons as command links, whose note is the
-	// label text after its first new line.
-	commandLinks bool
 }
 
 // siblingMissingDialogLayout returns the composition of the task dialog of
 // the missing console program.
 //
-// The offered download is the first command link with its note under it;
-// "Not now" sits directly below and is the default button, so Enter never
-// starts a download, and it keeps its approved label and place in the link
-// style Windows forces on it. Without an offer the dialog keeps the same
-// instruction and content and closes with the single standard OK button,
-// which is its default and changes nothing.
+// With an offer the download is the first command link, carrying its note
+// under it; the manual route is a visible item in every state — the way
+// without a download used to hide behind a fold — and "Not now" is always the
+// last link and the default button, so Enter, Esc and the close button all
+// change nothing. Without an offer the download link is replaced by the
+// reason line in the content and by "Try again", which reads the release
+// again: the button never disappears without a way back. The log link joins
+// every state that has a log file of this launch to name.
 func siblingMissingDialogLayout(notice siblingMissingNotice) siblingMissingDialog {
-	if notice.Download == nil {
-		return siblingMissingDialog{
-			standardButtons: tdcOKButton,
-			defaultButton:   standardButtonOKID,
-		}
+	buttons := make([]siblingMissingButton, 0, 4)
+	if notice.Download != nil {
+		buttons = append(buttons, siblingMissingButton{
+			id:     siblingMissingDownloadButtonID,
+			label:  siblingMissingDownloadLabel,
+			note:   siblingMissingDownloadNote(notice),
+			answer: siblingMissingDownload,
+		})
 	}
+	buttons = append(buttons, siblingMissingButton{
+		id:     siblingMissingManualButtonID,
+		label:  siblingMissingManualLabel,
+		note:   notice.Manual,
+		answer: siblingMissingDismiss,
+	})
+	if notice.Download == nil {
+		buttons = append(buttons, siblingMissingButton{
+			id:     siblingMissingRetryButtonID,
+			label:  siblingMissingRetryLabel,
+			answer: siblingMissingRetry,
+		})
+	}
+	if notice.LogFile != "" {
+		buttons = append(buttons, siblingMissingButton{
+			id:     logFileButtonID,
+			label:  logFileOpenLabel,
+			note:   notice.LogFile,
+			answer: siblingMissingDismiss,
+		})
+	}
+	buttons = append(buttons, siblingMissingButton{
+		id:     siblingMissingDismissButtonID,
+		label:  siblingMissingDismissLabel,
+		answer: siblingMissingDismiss,
+	})
 	return siblingMissingDialog{
-		buttons: []siblingMissingButton{
-			{id: siblingMissingDownloadButtonID,
-				label:  siblingMissingDownloadLabel + "\n" + siblingMissingDownloadNote(notice),
-				answer: siblingMissingDownload},
-			{id: siblingMissingDismissButtonID,
-				label:  siblingMissingDismissLabel,
-				answer: siblingMissingDismiss},
-		},
+		buttons:       buttons,
 		defaultButton: siblingMissingDismissButtonID,
-		commandLinks:  true,
 	}
 }
 
 // answer maps the id the dialog reports back onto the answer of the notice.
 //
 // The answer is read from the pressed id alone: the download link continues
-// the action, and an id the dialog never sends is reported instead of
-// guessed — a button the host does not know must never start a download.
+// the action, the retry link reads the release again, and an id the dialog
+// never sends is reported instead of guessed — a button the host does not know
+// must never start a download. The log link opens its file inside the dialog
+// and keeps the dialog open, so it never reaches this mapping while the window
+// stands; if the window ends on it anyway, nothing about the action was
+// decided, which is the dismiss answer.
 func (dialog siblingMissingDialog) answer(pressed int32) (siblingMissingAnswer, error) {
 	for _, button := range dialog.buttons {
 		if button.id == pressed {
@@ -157,9 +203,9 @@ func (dialog siblingMissingDialog) answer(pressed int32) (siblingMissingAnswer, 
 	}
 	switch pressed {
 	case standardButtonOKID, messageBoxCancel, 0:
-		// The OK of the manual-only dialog, the id a closed dialog
-		// reports for Esc or the close button, and a call that
-		// reported no button at all all change nothing.
+		// The id a closed dialog reports for Esc or the close button,
+		// and a call that reported no button at all, all change
+		// nothing.
 		return siblingMissingDismiss, nil
 	default:
 		return siblingMissingDismiss, fmt.Errorf("the notice of the missing console program returned the unknown button %d", pressed)
@@ -223,13 +269,17 @@ func consoleProgressDialogGate() error {
 // taskDialogSiblingMissing shows the notice of the missing console program
 // as a task dialog.
 //
-// It renders the composition of siblingMissingDialogLayout: the buttons,
-// their order, the default button and the answer of every press all come
-// from that pure function, so the layout and what the dialog shows are one
-// decision. The manual instructions live in the collapsed expander of the
-// dialog; without an offer the dialog keeps the same instruction and content
-// and closes with a standard OK button.
+// It renders the composition of siblingMissingDialogLayout: the links, their
+// order and the default button all come from that pure function, so the
+// layout and what the dialog shows are one decision. The first glance is the
+// instruction, the two facts and — when no download can be offered — the one
+// reason line where the download button would be; the manual route is the note
+// under its own visible link; the pairing rule and the raw cause of a failed
+// lookup live in the folded details; and the log file of this launch is an
+// action of its own, which opens the file and leaves this window standing.
 func taskDialogSiblingMissing(notice siblingMissingNotice) (siblingMissingAnswer, error) {
+	layout := siblingMissingDialogLayout(notice)
+
 	title, err := windows.UTF16PtrFromString(notice.Title)
 	if err != nil {
 		return siblingMissingDismiss, err
@@ -238,42 +288,46 @@ func taskDialogSiblingMissing(notice siblingMissingNotice) (siblingMissingAnswer
 	if err != nil {
 		return siblingMissingDismiss, err
 	}
-	content, err := windows.UTF16PtrFromString(notice.Content)
-	if err != nil {
-		return siblingMissingDismiss, err
+	content := notice.Content
+	if notice.Reason != "" {
+		content += "\n\n" + notice.Reason
 	}
-	manual, err := windows.UTF16PtrFromString(notice.Manual)
-	if err != nil {
-		return siblingMissingDismiss, err
-	}
-	manualLabel, err := windows.UTF16PtrFromString(siblingMissingManualLabel)
+	contentPtr, err := windows.UTF16PtrFromString(content)
 	if err != nil {
 		return siblingMissingDismiss, err
 	}
 
 	config := taskDialogConfig{
-		dwFlags:                 tdfAllowDialogCancellation,
-		pszWindowTitle:          title,
-		pszMainInstruction:      instruction,
-		pszContent:              content,
-		pszExpandedInformation:  manual,
-		pszExpandedControlText:  manualLabel,
-		pszCollapsedControlText: manualLabel,
+		dwFlags:            tdfAllowDialogCancellation | tdfUseCommandLinks,
+		pszWindowTitle:     title,
+		pszMainInstruction: instruction,
+		pszContent:         contentPtr,
+		nDefaultButton:     layout.defaultButton,
+	}
+	if notice.Details != "" {
+		details, err := windows.UTF16PtrFromString(notice.Details)
+		if err != nil {
+			return siblingMissingDismiss, err
+		}
+		detailsLabel, err := windows.UTF16PtrFromString(siblingMissingDetailsLabel)
+		if err != nil {
+			return siblingMissingDismiss, err
+		}
+		config.pszExpandedInformation = details
+		config.pszExpandedControlText = detailsLabel
+		config.pszCollapsedControlText = detailsLabel
+	}
+	if notice.LogFile != "" {
+		config.pfCallback = logFileCallback(notice.LogFile, false)
 	}
 
-	layout := siblingMissingDialogLayout(notice)
-	config.dwCommonButtons = layout.standardButtons
-	config.nDefaultButton = layout.defaultButton
 	var buttons []taskDialogButton
-	if layout.commandLinks {
-		config.dwFlags |= tdfUseCommandLinks
-		for _, item := range layout.buttons {
-			label, err := windows.UTF16PtrFromString(item.label)
-			if err != nil {
-				return siblingMissingDismiss, err
-			}
-			buttons = append(buttons, taskDialogButton{id: item.id, text: label})
+	for _, item := range layout.buttons {
+		label, err := windows.UTF16PtrFromString(item.commandLinkText())
+		if err != nil {
+			return siblingMissingDismiss, err
 		}
+		buttons = append(buttons, taskDialogButton{id: item.id, text: label})
 	}
 
 	pressed, err := runTaskDialog(config, buttons)
