@@ -238,28 +238,33 @@ const serviceProgramDriveWarningLine = "HFDesk is on a removable or network driv
 // installServiceText returns the text of the confirmation that registers the
 // Windows service.
 //
-// The confirmation states the facts the user has to know before a
-// machine-wide registration is written — the service starts at boot and
-// survives this window, the narrowed download rule, and the one surprising
-// fact (the separate data) as its single line — then asks the one question.
-// It carries no administrator-rights or prompt sentence: the Windows prompt
-// that follows states that itself (decision of 2026-11-24). dataDir is the
-// state directory of the service, so the text names the directory it will
-// really own.
+// The confirmation is the question as its headline and exactly two fact
+// lines (decision of 2026-11-24: the text is cut to this and nothing else) —
+// the lifetime of the service (starts at boot, survives this window) and the
+// one surprising fact, the separate data, named by its directory alone. The
+// portability, one-file download and SHA-256 facts the earlier text carried
+// are released from this window (decision of 2026-11-24): they live in the
+// download dialog, where they are needed, and this window states none of
+// them. It carries no administrator-rights or prompt sentence: the Windows
+// prompt that follows states that itself (decision of 2026-11-24). dataDir is
+// the state directory of the service, so the text names the directory it
+// will really own; an empty one keeps the fallback line that states the
+// separation with no directory to name.
 //
-// unusualDrive adds the B2 warning as its own single line right before that
-// surprising fact: it is present exactly when the program the registration
-// runs sits on a removable or network drive, and a program on an ordinary
-// drive changes nothing.
+// unusualDrive adds the B2 warning as its own single line between the
+// lifetime line and the data line: it is present exactly when the program
+// the registration runs sits on a removable or network drive, and a program
+// on an ordinary drive changes nothing.
 func installServiceText(dataDir string, unusualDrive bool) string {
-	text := "This registers HFDesk as a Windows service.\n\n" +
-		"The service starts at boot and keeps running after this window closes.\n\n" +
-		"HFDesk stays portable: the service runs the hfdesk program that sits next to this desktop app. The one file HFDesk can download is that missing program from its own release — only when you ask for it, and only after its SHA-256 is verified; nothing else is downloaded or copied.\n\n"
+	text := "Install HFDesk as a Windows service?\n\n" +
+		"It starts at boot and keeps running after this window closes.\n"
 	if unusualDrive {
-		text += serviceProgramDriveWarningLine + "\n\n"
+		text += serviceProgramDriveWarningLine + "\n"
 	}
-	return text + dataSeparationLine(dataDir) + "\n\n" +
-		"Do you want to install the service?"
+	if dataDir != "" {
+		return text + "Its data is separate: " + dataDir + "."
+	}
+	return text + dataSeparationLine(dataDir)
 }
 
 // stopServiceConfirmText returns the text of the confirmation that stops the
