@@ -262,6 +262,23 @@ func TestServiceGateChoiceForButtonMapsTheOtherIds(t *testing.T) {
 		t.Errorf("the update button returned (%v, %v), want the update", choice, err)
 	}
 
+	// The tray-companion button of the gate maps onto the companion
+	// decision for every state: the companion binds no address, so the
+	// answer never depends on the state the dialog was built from.
+	for _, prompt := range []serviceChoicePrompt{
+		{State: service.StateRunning},
+		{State: service.StateStopped},
+		{State: service.StateFailed},
+	} {
+		choice, err := serviceGateChoiceForButton(prompt, serviceGateCompanionButtonID)
+		if err != nil {
+			t.Errorf("the companion button of the %s service returned an error: %v", prompt.State, err)
+		}
+		if choice != serviceChoiceCompanion {
+			t.Errorf("the companion button of the %s service performs %v, want the tray companion choice", prompt.State, choice)
+		}
+	}
+
 	// Both statuses matter for the cancel ids as well: the answer may never
 	// depend on the state when the user did not ask for an action.
 	for _, prompt := range []serviceChoicePrompt{
@@ -293,19 +310,140 @@ func TestServiceGateChoiceForButtonMapsTheOtherIds(t *testing.T) {
 	}
 }
 
-// TestServiceGateButtonLayoutPerState proves which buttons each state gets, in
-// which order, which one Enter selects and what each id performs: the label,
-// the position and the action of a button are three renderings of one
-// decision, so a test reads them side by side.
+// TestServiceGateButtonLayoutPerState proves which buttons each state of the
+// LAUNCH GATE gets, in which order, which one Enter selects and what each id
+// performs: the label, the position and the action of a button are three
+// renderings of one decision, so a test reads them side by side.
 //
-// The positively confirmed stopped service is the only dialog with the desktop
-// mode, and it is its first button and its default — every other state keeps
-// the open/start button first and as its default.
+// The gate offers the tray companion in every state (OfferCompanion), so
+// each of the three state layouts carries "Work as tray companion" directly
+// in front of Cancel: the buttons the state offered keep their labels, their
+// relative order and their default — the desktop mode stays the first button
+// and the default of the positively confirmed stopped service, the open/start
+// button stays first and as the default of every other state — and the new
+// choice never becomes the default.
 func TestServiceGateButtonLayoutPerState(t *testing.T) {
 	// The state reads stopped but the supervisor reports a serving
 	// instance: the running fact wins, so the dialog is the running one.
 	stoppedButRunning := serviceChoicePrompt{State: service.StateStopped, Running: true}
 
+	// gate marks a prompt the launch gate builds: it offers the tray
+	// companion beside the answers of the state.
+	gate := func(prompt serviceChoicePrompt) serviceChoicePrompt {
+		prompt.OfferCompanion = true
+		return prompt
+	}
+
+	for _, tc := range []struct {
+		name        string
+		prompt      serviceChoicePrompt
+		wantLabels  []string
+		wantIDs     []int32
+		wantDefault int32
+		wantChoices []serviceChoice
+	}{
+		{
+			name:   "stopped",
+			prompt: gate(serviceChoicePrompt{State: service.StateStopped}),
+			wantLabels: []string{"Work in desktop mode", "Start service", "Update service",
+				"Work as tray companion", "Cancel"},
+			wantIDs: []int32{serviceGateDesktopButtonID, serviceGateOpenButtonID, serviceGateUpdateButtonID,
+				serviceGateCompanionButtonID, serviceGateCancelButtonID},
+			wantDefault: serviceGateDesktopButtonID,
+			wantChoices: []serviceChoice{serviceChoiceDesktop, serviceChoiceStart, serviceChoiceUpdate,
+				serviceChoiceCompanion, serviceChoiceCancel},
+		},
+		{
+			name:   "running",
+			prompt: gate(serviceChoicePrompt{State: service.StateRunning}),
+			wantLabels: []string{"Open HFDesk", "Update service",
+				"Work as tray companion", "Cancel"},
+			wantIDs: []int32{serviceGateOpenButtonID, serviceGateUpdateButtonID,
+				serviceGateCompanionButtonID, serviceGateCancelButtonID},
+			wantDefault: serviceGateOpenButtonID,
+			wantChoices: []serviceChoice{serviceChoiceOpen, serviceChoiceUpdate,
+				serviceChoiceCompanion, serviceChoiceCancel},
+		},
+		{
+			name:   "failed",
+			prompt: gate(serviceChoicePrompt{State: service.StateFailed}),
+			wantLabels: []string{"Start service", "Update service",
+				"Work as tray companion", "Cancel"},
+			wantIDs: []int32{serviceGateOpenButtonID, serviceGateUpdateButtonID,
+				serviceGateCompanionButtonID, serviceGateCancelButtonID},
+			wantDefault: serviceGateOpenButtonID,
+			wantChoices: []serviceChoice{serviceChoiceStart, serviceChoiceUpdate,
+				serviceChoiceCompanion, serviceChoiceCancel},
+		},
+		{
+			name:   "broken without an instance",
+			prompt: gate(serviceChoicePrompt{State: service.StateBroken}),
+			wantLabels: []string{"Start service", "Update service",
+				"Work as tray companion", "Cancel"},
+			wantIDs: []int32{serviceGateOpenButtonID, serviceGateUpdateButtonID,
+				serviceGateCompanionButtonID, serviceGateCancelButtonID},
+			wantDefault: serviceGateOpenButtonID,
+			wantChoices: []serviceChoice{serviceChoiceStart, serviceChoiceUpdate,
+				serviceChoiceCompanion, serviceChoiceCancel},
+		},
+		{
+			name:   "broken but running",
+			prompt: gate(serviceChoicePrompt{State: service.StateBroken, Running: true}),
+			wantLabels: []string{"Open HFDesk", "Update service",
+				"Work as tray companion", "Cancel"},
+			wantIDs: []int32{serviceGateOpenButtonID, serviceGateUpdateButtonID,
+				serviceGateCompanionButtonID, serviceGateCancelButtonID},
+			wantDefault: serviceGateOpenButtonID,
+			wantChoices: []serviceChoice{serviceChoiceOpen, serviceChoiceUpdate,
+				serviceChoiceCompanion, serviceChoiceCancel},
+		},
+		{
+			name:   "stopped with the running fact",
+			prompt: gate(stoppedButRunning),
+			wantLabels: []string{"Open HFDesk", "Update service",
+				"Work as tray companion", "Cancel"},
+			wantIDs: []int32{serviceGateOpenButtonID, serviceGateUpdateButtonID,
+				serviceGateCompanionButtonID, serviceGateCancelButtonID},
+			wantDefault: serviceGateOpenButtonID,
+			wantChoices: []serviceChoice{serviceChoiceOpen, serviceChoiceUpdate,
+				serviceChoiceCompanion, serviceChoiceCancel},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buttons, defaultButton := serviceGateButtonLayout(tc.prompt)
+			if defaultButton != tc.wantDefault {
+				t.Errorf("the default button is %d, want %d: Enter must select %q",
+					defaultButton, tc.wantDefault, tc.wantLabels[0])
+			}
+			if len(buttons) != len(tc.wantLabels) {
+				t.Fatalf("the dialog has %d buttons %v, want %d %v",
+					len(buttons), buttonLabels(buttons), len(tc.wantLabels), tc.wantLabels)
+			}
+			for i, button := range buttons {
+				if button.label != tc.wantLabels[i] {
+					t.Errorf("the button %d is labelled %q, want %q", i, button.label, tc.wantLabels[i])
+				}
+				if button.id != tc.wantIDs[i] {
+					t.Errorf("the button %d has the id %d, want %d", i, button.id, tc.wantIDs[i])
+				}
+				choice, err := serviceGateChoiceForButton(tc.prompt, button.id)
+				assertNoError(t, err, "the button %d returned an error: %v", i, err)
+				if choice != tc.wantChoices[i] {
+					t.Errorf("the button %d performs %v, want %v", i, choice, tc.wantChoices[i])
+				}
+			}
+		})
+	}
+}
+
+// TestServiceGateLayoutsKeepTheOriginalButtonsWithoutTheCompanionChoice
+// pins the OTHER user of the same layout function — the registered-service
+// dialog of a RUNNING desktop (its prompt carries no OfferCompanion,
+// because none of its answers switches the mode of this host): without the
+// companion offer, every state gets exactly the three original layouts,
+// byte for byte — same labels, same order, same default. The extension of
+// the gate therefore added a choice instead of rewriting the map.
+func TestServiceGateLayoutsKeepTheOriginalButtonsWithoutTheCompanionChoice(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		prompt      serviceChoicePrompt
@@ -338,49 +476,25 @@ func TestServiceGateButtonLayoutPerState(t *testing.T) {
 			wantDefault: serviceGateOpenButtonID,
 			wantChoices: []serviceChoice{serviceChoiceStart, serviceChoiceUpdate, serviceChoiceCancel},
 		},
-		{
-			name:        "broken without an instance",
-			prompt:      serviceChoicePrompt{State: service.StateBroken},
-			wantLabels:  []string{"Start service", "Update service", "Cancel"},
-			wantIDs:     []int32{serviceGateOpenButtonID, serviceGateUpdateButtonID, serviceGateCancelButtonID},
-			wantDefault: serviceGateOpenButtonID,
-			wantChoices: []serviceChoice{serviceChoiceStart, serviceChoiceUpdate, serviceChoiceCancel},
-		},
-		{
-			name:        "broken but running",
-			prompt:      serviceChoicePrompt{State: service.StateBroken, Running: true},
-			wantLabels:  []string{"Open HFDesk", "Update service", "Cancel"},
-			wantIDs:     []int32{serviceGateOpenButtonID, serviceGateUpdateButtonID, serviceGateCancelButtonID},
-			wantDefault: serviceGateOpenButtonID,
-			wantChoices: []serviceChoice{serviceChoiceOpen, serviceChoiceUpdate, serviceChoiceCancel},
-		},
-		{
-			name:        "stopped with the running fact",
-			prompt:      stoppedButRunning,
-			wantLabels:  []string{"Open HFDesk", "Update service", "Cancel"},
-			wantIDs:     []int32{serviceGateOpenButtonID, serviceGateUpdateButtonID, serviceGateCancelButtonID},
-			wantDefault: serviceGateOpenButtonID,
-			wantChoices: []serviceChoice{serviceChoiceOpen, serviceChoiceUpdate, serviceChoiceCancel},
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.prompt.OfferCompanion {
+				t.Fatal("the prompt of this test must not offer the companion choice")
+			}
 			buttons, defaultButton := serviceGateButtonLayout(tc.prompt)
 			if defaultButton != tc.wantDefault {
-				t.Errorf("the default button is %d, want %d: Enter must select %q",
-					defaultButton, tc.wantDefault, tc.wantLabels[0])
+				t.Errorf("the default button is %d, want %d", defaultButton, tc.wantDefault)
 			}
-			if len(buttons) != len(tc.wantLabels) {
-				t.Fatalf("the dialog has %d buttons %v, want %d %v",
-					len(buttons), buttonLabels(buttons), len(tc.wantLabels), tc.wantLabels)
+			got := buttonLabels(buttons)
+			if len(got) != len(tc.wantLabels) {
+				t.Fatalf("the dialog has the buttons %v, want exactly the original layout %v", got, tc.wantLabels)
 			}
-			for i, button := range buttons {
-				if button.label != tc.wantLabels[i] {
-					t.Errorf("the button %d is labelled %q, want %q", i, button.label, tc.wantLabels[i])
+			for i := range got {
+				if got[i] != tc.wantLabels[i] || buttons[i].id != tc.wantIDs[i] {
+					t.Errorf("the button %d is (%q, %d), want the original (%q, %d)",
+						i, got[i], buttons[i].id, tc.wantLabels[i], tc.wantIDs[i])
 				}
-				if button.id != tc.wantIDs[i] {
-					t.Errorf("the button %d has the id %d, want %d", i, button.id, tc.wantIDs[i])
-				}
-				choice, err := serviceGateChoiceForButton(tc.prompt, button.id)
+				choice, err := serviceGateChoiceForButton(tc.prompt, buttons[i].id)
 				assertNoError(t, err, "the button %d returned an error: %v", i, err)
 				if choice != tc.wantChoices[i] {
 					t.Errorf("the button %d performs %v, want %v", i, choice, tc.wantChoices[i])
@@ -397,6 +511,107 @@ func buttonLabels(buttons []serviceGateButton) []string {
 		labels = append(labels, button.label)
 	}
 	return labels
+}
+
+// TestServiceGateLayoutMapCoversEveryState pins the state → dialog map of
+// the gate: it composes exactly three layouts — a running service gets
+// Open/Update/TrayCompanion/Cancel, a positively confirmed stopped service
+// gets Work in desktop mode/Start/Update/TrayCompanion/Cancel, failed and
+// broken get Start/Update/TrayCompanion/Cancel — and every state of the
+// vocabulary, with and without the running fact, falls into exactly one of
+// them. The tray-companion choice is part of every gate layout (the label
+// is pinned here by its literal), sitting directly in front of Cancel.
+//
+// The desktop-mode layout is the only layout whose answer continues the
+// launch WITH a server, so this map also proves that no other state can
+// produce it: the label of the first button is the check, because the
+// layout cannot carry "Work in desktop mode" without offering that answer.
+// Enter selects the first button of every layout — the companion choice is
+// never the default. A pending state is settled by the action read before
+// any dialog in production; the pure function is pinned for it as well, so
+// a change of its classification stays a deliberate one — and a later
+// extension of the map (more buttons) has to change these three layouts on
+// purpose.
+func TestServiceGateLayoutMapCoversEveryState(t *testing.T) {
+	openUpdateCancel := []string{"Open HFDesk", "Update service", "Work as tray companion", "Cancel"}
+	desktopStartUpdateCancel := []string{"Work in desktop mode", "Start service", "Update service", "Work as tray companion", "Cancel"}
+	startUpdateCancel := []string{"Start service", "Update service", "Work as tray companion", "Cancel"}
+
+	// The layouts WITHOUT the companion offer — the registered-service
+	// dialog of a running desktop — are the three original layouts, byte
+	// for byte: the extension of the gate never rewrote them.
+	originalOpenUpdateCancel := []string{"Open HFDesk", "Update service", "Cancel"}
+	originalDesktopStartUpdateCancel := []string{"Work in desktop mode", "Start service", "Update service", "Cancel"}
+	originalStartUpdateCancel := []string{"Start service", "Update service", "Cancel"}
+
+	for _, tc := range []struct {
+		name    string
+		state   service.State
+		running bool
+		want    []string
+	}{
+		{name: "running", state: service.StateRunning, want: openUpdateCancel},
+		// A service on its way up counts as serving, exactly like the
+		// status classification of the host counts it.
+		{name: "starting", state: service.StateStarting, want: openUpdateCancel},
+		{name: "positively confirmed stopped", state: service.StateStopped, want: desktopStartUpdateCancel},
+		{name: "failed", state: service.StateFailed, want: startUpdateCancel},
+		{name: "broken", state: service.StateBroken, want: startUpdateCancel},
+		{name: "masked", state: service.StateMasked, want: startUpdateCancel},
+		{name: "masked-runtime without the running fact", state: service.StateMaskedRuntime, want: startUpdateCancel},
+		{name: "stopping", state: service.StateStopping, want: startUpdateCancel},
+		{name: "unknown", state: service.StateUnknown, want: startUpdateCancel},
+		{name: "not installed", state: service.StateNotInstalled, want: startUpdateCancel},
+		{name: "no state at all", state: "", want: startUpdateCancel},
+		// The running fact decides alone: a serving instance keeps the
+		// open layout whatever state sits beside it.
+		{name: "stopped with the running fact", state: service.StateStopped, running: true, want: openUpdateCancel},
+		{name: "failed with the running fact", state: service.StateFailed, running: true, want: openUpdateCancel},
+		{name: "broken with the running fact", state: service.StateBroken, running: true, want: openUpdateCancel},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The gate offers the companion: every state carries the
+			// extension.
+			prompt := serviceChoicePrompt{State: tc.state, Running: tc.running, OfferCompanion: true}
+			assertGateLayout(t, prompt, tc.want)
+
+			// Without the offer the map is the original one.
+			original := serviceChoicePrompt{State: tc.state, Running: tc.running}
+			wantOriginal := tc.want
+			switch tc.want[0] {
+			case "Open HFDesk":
+				wantOriginal = originalOpenUpdateCancel
+			case "Work in desktop mode":
+				wantOriginal = originalDesktopStartUpdateCancel
+			default:
+				wantOriginal = originalStartUpdateCancel
+			}
+			assertGateLayout(t, original, wantOriginal)
+		})
+	}
+}
+
+// assertGateLayout proves the buttons of one layout: the labels in order,
+// and the default as the FIRST button — Enter selects it in every layout,
+// so the companion choice (never first) can never become the default.
+func assertGateLayout(t *testing.T, prompt serviceChoicePrompt, want []string) {
+	t.Helper()
+	buttons, defaultButton := serviceGateButtonLayout(prompt)
+	got := buttonLabels(buttons)
+	if len(got) != len(want) {
+		t.Fatalf("the state %q (companion offered: %t) gets the buttons %v, want the layout %v",
+			prompt.State, prompt.OfferCompanion, got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("the button %d of the state %q is %q, want %q: the layout is %v",
+				i, prompt.State, got[i], want[i], want)
+		}
+	}
+	if defaultButton != buttons[0].id {
+		t.Errorf("the default button is %d, want the first button %d (%q): Enter selects the first button of every layout",
+			defaultButton, buttons[0].id, buttons[0].label)
+	}
 }
 
 // TestServiceGateMessageBoxFallbackMapsYesNoCancel proves the mapping of the

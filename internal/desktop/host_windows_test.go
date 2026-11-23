@@ -101,10 +101,14 @@ func TestDesktopTrayHostBecomesReady(t *testing.T) {
 			},
 			refresh: make(chan struct{}),
 		}
-		runTray(iconBytes, "HFDesk - test", trayActions{
+		runTray(iconBytes, "HFDesk - test", trayMenuFull, trayActions{
 			open:    func() {},
 			runtime: func() {},
 			install: func() {},
+			start:   func() {},
+			stop:    func() {},
+			update:  func() {},
+			delete:  func() {},
 			service: func() {},
 			quit:    func() {},
 		}, serviceView, ready)

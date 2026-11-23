@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bashrusakh/hfdesk/internal/app"
 	"github.com/bashrusakh/hfdesk/internal/service"
 	"golang.org/x/sys/windows"
 )
@@ -74,6 +75,21 @@ var newServiceManager = service.New
 // The helper installs no logging pipeline: the rotating log file belongs to the
 // launch that runs the desktop host, and a second writer breaks its rotation.
 func RunServiceAction(o ServiceActionOptions) error {
+	// The reports of the helper name the log of the desktop host that
+	// launched it: the host records the action it launched and the exit of
+	// this helper there, so the path has to be honest from the first
+	// window. A hand-typed helper command line carries no path, so it
+	// names the default per-user log of this session. The previous value
+	// is restored on the way out, so the seam stays clean for the tests
+	// that drive this entry point in-process.
+	previousLogPath := runLogPath
+	if path := strings.TrimSpace(o.LogFile); path != "" {
+		runLogPath = path
+	} else {
+		runLogPath = app.DefaultLogPath()
+	}
+	defer func() { runLogPath = previousLogPath }()
+
 	action, err := parseServiceAction(o.Action)
 	if err != nil {
 		desktopLog.Error("the service helper was started with an unknown action", "action", o.Action)
@@ -123,7 +139,7 @@ func RunServiceAction(o ServiceActionOptions) error {
 		// Authorization is settled: only the singleton outlives it, through
 		// the service mutation, and is released before the final notice.
 		handover.releaseAuthorizationHandles()
-	} else if action == serviceActionUpdate || action == serviceActionStart {
+	} else if serviceActionHoldsSingleton(action) {
 		// Every mutation that starts or restarts the service holds the
 		// per-session desktop singleton, whether the gate handed this
 		// launch's object over or a command line was typed by hand: the
@@ -135,6 +151,10 @@ func RunServiceAction(o ServiceActionOptions) error {
 		// it before the final notice, and the deferred close covers every
 		// other return. A hold that cannot be established refuses the
 		// action before anything is touched.
+		//
+		// A stop and a removal hold nothing: they start no instance and
+		// free state only, so no relaunch of this session competes with
+		// them (see serviceActionHoldsSingleton).
 		//
 		// The probe runs before the hold and keeps its own handle, so the
 		// object never disappears between the two and the action learns
@@ -224,14 +244,18 @@ func validateServiceHandoverOptions(action serviceAction, o ServiceActionOptions
 		// the helper computes the desktop singleton of its own session
 		// and holds it through the mutation itself (see RunServiceAction),
 		// so a hand-typed command line holds the same window the gate
-		// hands over, and it still waits for no desktop exit.
+		// hands over, and it still waits for no desktop exit. A stop and
+		// a removal are accepted for the plainer reason that they hold no
+		// singleton at all: they start nothing and only free state.
 		return nil
 	}
 	// An update or a start may carry the singleton identity alone: it holds
 	// that desktop singleton through its mutation without waiting for a
 	// desktop exit, because the gate that asked for it already ended. Every
-	// other combination still needs the complete install handover below.
-	if (action == serviceActionUpdate || action == serviceActionStart) && o.WaitPID == 0 &&
+	// other combination still needs the complete install handover below —
+	// a stop or a removal that carries a singleton identity is refused with
+	// it, because no such action holds one.
+	if serviceActionHoldsSingleton(action) && o.WaitPID == 0 &&
 		strings.TrimSpace(o.ReadyEvent) == "" && strings.TrimSpace(o.SuccessEvent) == "" &&
 		strings.TrimSpace(o.InstanceMutex) != "" {
 		return nil
@@ -252,6 +276,10 @@ func runServiceAction(action serviceAction, version string, reporter *serviceAct
 		return updateWindowsService(reporter, version)
 	case serviceActionStart:
 		return startWindowsService(reporter)
+	case serviceActionStop:
+		return stopWindowsService(reporter)
+	case serviceActionUninstall:
+		return uninstallWindowsService(reporter)
 	}
 	return fmt.Errorf("desktop: the service action %q cannot be performed", action)
 }
@@ -460,6 +488,88 @@ func startWindowsService(reporter *serviceActionReporter) error {
 	return nil
 }
 
+// stopWindowsService stops the registered service and verifies that it settled.
+//
+// The stop never starts anything and binds no address, so it needs neither a
+// desktop handover nor the desktop singleton: a desktop instance of this
+// session may serve its own address beside it, and the two never compete for
+// it. The state is read before the stop so the report of a machine without a
+// registration stays the honest "no service to stop" instead of the stable
+// success the manager reports for stopping an absent instance, and the state
+// is read again until it settled, so the report never claims a stop the
+// service control manager had not confirmed.
+func stopWindowsService(reporter *serviceActionReporter) error {
+	ctx, cancel := context.WithTimeout(context.Background(), serviceActionBudget)
+	defer cancel()
+
+	manager, err := newServiceManager(service.ScopeSystem)
+	if err != nil {
+		reporter.failure(err, "")
+		return err
+	}
+	before, err := manager.Status(ctx)
+	if err != nil {
+		reporter.failure(fmt.Errorf("the state of the service cannot be read: %w", err), "")
+		return err
+	}
+	if before.State == service.StateNotInstalled {
+		return reporter.notInstalled()
+	}
+	if err := manager.Stop(ctx); err != nil {
+		reporter.failure(err, before.Executable)
+		return err
+	}
+	status, err := waitForServiceState(ctx, manager, false)
+	if err != nil {
+		reporter.failure(err, before.Executable)
+		return err
+	}
+
+	desktopLog.Info("the service is stopped", "executable", status.Executable, "listen", status.Listen)
+	reporter.message(serviceStoppedCaption, serviceStoppedText(), windows.MB_ICONINFORMATION)
+	return nil
+}
+
+// uninstallWindowsService removes the registration of the service, and only
+// that.
+//
+// The one mutator of this action is Manager.Uninstall — the very call the
+// command line performs — whose contract removes the registration and nothing
+// else: the config file, the jobs, the history, the logs, the models and the
+// cache are never touched, an absent registration is a clean success, and a
+// running instance is stopped inside that call as part of the removal. This
+// helper adds no mutator of its own: the state read before it exists only so
+// the report can say whether a registration was there, and the report never
+// claims or implies that any data was deleted.
+func uninstallWindowsService(reporter *serviceActionReporter) error {
+	ctx, cancel := context.WithTimeout(context.Background(), serviceActionBudget)
+	defer cancel()
+
+	manager, err := newServiceManager(service.ScopeSystem)
+	if err != nil {
+		reporter.failure(err, "")
+		return err
+	}
+	before, err := manager.Status(ctx)
+	if err != nil {
+		reporter.failure(fmt.Errorf("the state of the service cannot be read: %w", err), "")
+		return err
+	}
+	if err := manager.Uninstall(ctx); err != nil {
+		reporter.failure(err, "")
+		return err
+	}
+
+	if before.State == service.StateNotInstalled {
+		desktopLog.Info("the service has no registration to remove")
+		reporter.message(serviceNoRegistrationCaption, serviceNoRegistrationText(), windows.MB_ICONINFORMATION)
+		return nil
+	}
+	desktopLog.Info("the service registration is removed")
+	reporter.message(serviceRegistrationRemovedCaption, serviceRegistrationRemovedText(), windows.MB_ICONINFORMATION)
+	return nil
+}
+
 // serviceInstallation returns the installation options and the manager of an
 // installation or an update: the defaults of the service layer for the console
 // program in the folder of the helper. The desktop host names no value of its
@@ -628,29 +738,6 @@ func (r *serviceActionReporter) unreadableClaimRefused() error {
 	return fmt.Errorf("the published claim of the desktop at %q cannot be read: no service action was performed", claim)
 }
 
-// serviceUnreadableClaimRefusedText returns the report of a mutation that
-// refused over a published claim it could not read: the result (no service
-// action was performed) and the cause (the claim cannot be read, so whether
-// a desktop of this session serves cannot be determined). The report
-// carries no next action: no single step clears a file the guard cannot
-// inspect, so it stays an honest terminal.
-func serviceUnreadableClaimRefusedText(action serviceAction, claim string) string {
-	return serviceActionFailureHeadline(action) + "\n\n" +
-		fmt.Sprintf("No service action was performed: the published claim of the desktop at %q cannot be read, so whether a desktop of this session serves its local server cannot be determined.", claim)
-}
-
-// serviceServingDesktopRefusedText returns the report of a mutation that
-// refused beside a serving desktop instance: the result (no service action
-// was performed), the cause (the desktop serves its local server) and the
-// one next action (quit the desktop, which ends the cause). The report
-// carries no second command: reading the state of the service would not end
-// the refusal.
-func serviceServingDesktopRefusedText(action serviceAction) string {
-	return serviceActionFailureHeadline(action) + "\n\n" +
-		"No service action was performed: a running HFDesk desktop instance of this session serves its local server.\n\n" +
-		"Quit HFDesk from the notification-area icon and perform the action again."
-}
-
 func (r *serviceActionReporter) handoverFailure(err error) {
 	if err == nil {
 		return
@@ -658,11 +745,8 @@ func (r *serviceActionReporter) handoverFailure(err error) {
 	if r.handover != nil {
 		r.handover.close()
 	}
-	desktopLog.Error("the service helper could not authorize the desktop handover", "action", string(r.action), "error", err)
-	text := "HFDesk could not confirm the desktop handover. No service action was performed.\n\n" + err.Error()
-	// Exactly one action, input-independent: a cause that already names
-	// the state command keeps it as the single action of the report.
-	showMessage(serviceFailureCaption(r.action), text+statusIfUnnamed(err.Error()),
+	desktopLog.Error("the service helper could not prepare its coordination with the desktop", "action", string(r.action), "error", err)
+	showMessage(serviceFailureCaption(r.action), serviceHandoverRefusedText(err),
 		windows.MB_ICONERROR)
 }
 
@@ -688,14 +772,17 @@ func (r *serviceActionReporter) firstInstallStartFailure(err error, cleanup *ser
 	}
 	var cleanupErr error
 	removed := false
+	outcome := ""
 	if cleanup != nil {
 		cleanupErr = cleanup.CleanupError
 		removed = cleanup.RegistrationRemoved
+		outcome = string(cleanup.Outcome)
 	}
 	desktopLog.Error("the first service installation could not be started",
 		"error", err,
 		"program", program,
 		"registrationRemoved", removed,
+		"startOutcome", outcome,
 		"cleanupError", cleanupErr)
 	r.message(serviceFailureCaption(serviceActionInstall),
 		serviceInstallStartFailureText(err, program, cleanup), windows.MB_ICONERROR)

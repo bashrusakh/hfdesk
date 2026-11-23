@@ -131,3 +131,128 @@ func TestServiceMenuForOneRead(t *testing.T) {
 		})
 	}
 }
+
+// TestServiceMenuLifecycleItemsPerState pins the enablement map of the four
+// lifecycle items of the tray menu (start, stop, update, delete): which of
+// them are visible and enabled for every class of read, on the
+// classifications every other surface already decides with.
+//
+// The chosen mapping, pinned here on purpose:
+//
+//   - visibility follows the registration claim alone: a proven
+//     registration shows the whole section, a proven absence and an
+//     unsettled read hide it — a destructive action is never offered
+//     without a state that was read;
+//   - start is enabled on a settled state that does not run (stopped,
+//     failed, broken without an instance) and stays grey during a
+//     transition — a pending state is not a state to decide on, the rule
+//     of the service gate;
+//   - stop follows the running fact, where a pending start counts as
+//     running and a pending stop does not — the same classification the
+//     gate's first button and the reports use;
+//   - update and delete follow the registration alone: the update
+//     re-points it and the removal stops a running instance inside
+//     Manager.Uninstall as part of the action.
+func TestServiceMenuLifecycleItemsPerState(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		status         service.Status
+		readErr        error
+		visible        bool
+		start, stop    bool
+		update, delete bool
+	}{
+		{
+			name: "registered and running", visible: true,
+			status: service.Status{State: service.StateRunning, Running: true},
+			stop:   true, update: true, delete: true,
+		},
+		{
+			name: "registered and stopped", visible: true,
+			status: service.Status{State: service.StateStopped},
+			start:  true, update: true, delete: true,
+		},
+		{
+			// The supervisor's running fact wins over the diagnosed
+			// state: such a service serves, so stop is the action and
+			// start is not offered beside it.
+			name: "stopped with the running fact", visible: true,
+			status: service.Status{State: service.StateStopped, Running: true},
+			stop:   true, update: true, delete: true,
+		},
+		{
+			name: "failed", visible: true,
+			status: service.Status{State: service.StateFailed},
+			start:  true, update: true, delete: true,
+		},
+		{
+			name: "broken without an instance", visible: true,
+			status: service.Status{State: service.StateBroken},
+			start:  true, update: true, delete: true,
+		},
+		{
+			name: "broken but running", visible: true,
+			status: service.Status{State: service.StateBroken, Running: true},
+			stop:   true, update: true, delete: true,
+		},
+		{
+			// On its way up the instance counts as running (stop is
+			// offered) but the state is no result yet, so start stays
+			// grey.
+			name: "on its way up", visible: true,
+			status: service.Status{State: service.StateStarting},
+			stop:   true, update: true, delete: true,
+		},
+		{
+			// On its way down it neither runs nor settled: both
+			// lifecycle actions stay grey until the transition ends.
+			name: "on its way down", visible: true,
+			status: service.Status{State: service.StateStopping},
+			update: true, delete: true,
+		},
+		{
+			name:   "not registered",
+			status: service.Status{State: service.StateNotInstalled},
+		},
+		{
+			name:    "unreadable registration",
+			readErr: errors.New("the service control manager did not answer"),
+		},
+		{
+			name:   "state the supervisor could not report",
+			status: service.Status{State: service.StateUnknown},
+		},
+		{
+			name:   "empty state",
+			status: service.Status{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := serviceMenuFor(tc.status, tc.readErr)
+			if state.ServiceVisible != tc.visible {
+				t.Errorf("lifecycle items visible = %t, want %t", state.ServiceVisible, tc.visible)
+			}
+			if state.StartEnabled != tc.start {
+				t.Errorf("start enabled = %t, want %t", state.StartEnabled, tc.start)
+			}
+			if state.StopEnabled != tc.stop {
+				t.Errorf("stop enabled = %t, want %t", state.StopEnabled, tc.stop)
+			}
+			if state.UpdateEnabled != tc.update {
+				t.Errorf("update enabled = %t, want %t", state.UpdateEnabled, tc.update)
+			}
+			if state.DeleteEnabled != tc.delete {
+				t.Errorf("delete enabled = %t, want %t", state.DeleteEnabled, tc.delete)
+			}
+
+			// A destructive action never leaves the visibility claim:
+			// whatever a state enables, an unsettled read shows none of
+			// the items — the enablement flags may only be set where the
+			// section is visible at all.
+			if !state.ServiceVisible && (state.StartEnabled || state.StopEnabled ||
+				state.UpdateEnabled || state.DeleteEnabled) {
+				t.Errorf("an item is enabled although the section is hidden: %+v", state)
+			}
+		})
+	}
+}

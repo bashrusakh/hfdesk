@@ -49,6 +49,11 @@ type elevatedLaunch struct {
 	// the action reads the ORIGINATING desktop's claim even when another
 	// administrator approves the elevation.
 	DesktopState string
+	// LogFile is the path of the log file the launching desktop host
+	// writes. The reports of the helper name that path so the log is
+	// reachable from outside the window; the host records the action it
+	// launched and the exit of this helper there.
+	LogFile string
 }
 
 // launchElevated starts the service helper with administrator rights.
@@ -219,6 +224,9 @@ func serviceHelperArguments(l elevatedLaunch) string {
 	}
 	if path := strings.TrimSpace(l.DesktopState); path != "" {
 		args = append(args, "--desktop-state", quoteHelperArgument(path))
+	}
+	if path := strings.TrimSpace(l.LogFile); path != "" {
+		args = append(args, "--log-file", quoteHelperArgument(path))
 	}
 	return strings.Join(args, " ")
 }

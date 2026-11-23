@@ -117,6 +117,18 @@ func run(o Options, logPath string) (err error) {
 		},
 	}
 
+	// endWithoutTray ends a host whose icon in the notification area
+	// could not come up: it is exactly the guard end — the published
+	// state is removed, the server (or the window of a companion) stops
+	// through the normal path and the log pipeline closes — and the
+	// process exits with a failure code, so no invisible host keeps
+	// running. Both hosts take this end, each after recording its
+	// refusal and showing its report first.
+	endWithoutTray := func() {
+		guard.end()
+		os.Exit(1)
+	}
+
 	// The panic handler is registered before the startup runs, so a panic
 	// of the startup is caught as well. The other deferred cleanups run
 	// before it (the defers run in reverse order of their registration),
@@ -144,7 +156,13 @@ func run(o Options, logPath string) (err error) {
 	// than a lock this identity could not create: the report names the
 	// other Windows identity that holds the object, and the launch still
 	// starts no server.
-	lock, err := acquireInstanceLock()
+	//
+	// Only a companion relaunch (CompanionWait > 0 — the child of an
+	// installation, started while the exiting host and the elevated
+	// helper still hold the object) waits for the object instead of
+	// deciding on it right away; every other launch takes it exactly as
+	// before (acquireInstanceLockForLaunch).
+	lock, err := acquireInstanceLockForLaunch(o)
 	if err != nil {
 		// The logging pipeline does not exist yet, so the failure cannot
 		// be recorded in the log file. The message box is the only
@@ -160,6 +178,20 @@ func run(o Options, logPath string) (err error) {
 		// Another instance holds the lock: the lock is the authority on
 		// whether HFDesk is already running. This instance starts no
 		// server and opens no log file.
+		if o.CompanionWait > 0 {
+			// This launch IS the relaunched companion, and its
+			// bounded wait for the session ran out: the holder —
+			// usually the elevated helper finishing the
+			// installation — never released the object within the
+			// budget. The report states that state and the one
+			// action that resolves it. It carries no log-path line:
+			// the lock is taken before the log file is opened, so
+			// this launch has no log yet — the established rule of
+			// the lock reports.
+			reportStartupFailure("HFDesk could not start",
+				companionRelaunchWaitTimeoutText(), "")
+			return nil
+		}
 		reportAlreadyRunning()
 		return nil
 	}
@@ -168,6 +200,12 @@ func run(o Options, logPath string) (err error) {
 	if err != nil {
 		return err
 	}
+	// The logging pipeline is installed: from here this launch writes the
+	// log file, and every failure window it shows names that path. The
+	// seam is restored on the way out so an in-process test of this entry
+	// point leaves no path behind for a window of another launch.
+	runLogPath = logPath
+	defer func() { runLogPath = "" }()
 
 	// The failure of the persistent log is reported to the user in a native
 	// message box: the desktop host has no console, so a failure that is
@@ -208,18 +246,39 @@ func run(o Options, logPath string) (err error) {
 		showSubsystemWarning(subsystemWarningText)
 	}
 
+	// A launch that carries the private companion flag was told what to
+	// do: it skips the service gate — the gate exists to decide whether
+	// this launch may bind the listen address, and a companion never
+	// binds one. The registration is read by the companion's menu and by
+	// its window through the established reader, and no claim is
+	// published for this launch: a claim would say that this session
+	// serves an address, and the companion serves nothing.
+	if o.Companion {
+		desktopLog.Info("the desktop host starts as a tray companion (from its launch flag): it creates no server",
+			"logFile", logPath)
+		return runCompanion(lock, guard, endWithoutTray, &shutdown)
+	}
+
 	// The Windows service binds the same address, so the gate reads the
 	// registration before the application is created: a launch that finds one
 	// asks the user what to do and ends without starting a server — except a
 	// positively confirmed stopped service whose dialog was answered with the
 	// desktop mode, which continues this launch like a launch without a
-	// registration and never starts the service. It runs after the logging
-	// pipeline (its records are the support material of the launch) and before
-	// app.New, the first step that can create a server. A launch that ends
-	// here publishes no claim.
-	if !serviceGate(lock.name) {
+	// registration and never starts the service, and any settled registration
+	// whose dialog was answered with the tray companion, which continues this
+	// launch as a tray icon and window WITHOUT a server of its own. It runs
+	// after the logging pipeline (its records are the support material of the
+	// launch) and before app.New, the first step that can create a server. A
+	// launch that ends here publishes no claim — and so does a companion:
+	// the branch below returns before the claim of a serving launch is
+	// ever published.
+	switch serviceGate(lock.name) {
+	case gateCompanion:
+		return runCompanion(lock, guard, endWithoutTray, &shutdown)
+	case gateEnd:
 		return nil
 	}
+	// gateDesktop: the ordinary desktop flow continues below.
 
 	// From here this launch can bind the address, so it publishes its claim
 	// BEFORE that window opens: the mutation guard of this session
@@ -274,8 +333,7 @@ func run(o Options, logPath string) (err error) {
 			handover, committed := shutdownCoordinator.beginShutdown()
 			cancel()
 			if committed {
-				defer handover.close()
-				err := completeHandoverWithNotice(handover, func() error {
+				completeInstallHandover(handover, func() error {
 					waitErr := application.Wait()
 					if waitErr != nil {
 						desktopLog.Error("the server did not stop cleanly before service installation", "error", waitErr)
@@ -286,10 +344,6 @@ func run(o Options, logPath string) (err error) {
 					}
 					return handoverErr
 				})
-				handover.close()
-				if err != nil {
-					reportServiceHandoverFailure(err)
-				}
 			} else if err := application.Wait(); err != nil {
 				desktopLog.Error("the server did not stop cleanly", "error", err)
 			}
@@ -380,11 +434,19 @@ func run(o Options, logPath string) (err error) {
 	//     loop of the tray, or the HTTP request of the window.
 	//   - The runtime surface of the server receives the registration read
 	//     the tray menu line is built from — so the window shows the same
-	//     status from the same reader — and the dispatch of the very same
-	//     install function. The registration happens before the window
+	//     status from the same reader — and every such read asks the menu
+	//     to catch up right after it ran, so a result read for the window
+	//     can never stay invisible in the menu until the next tick. The
+	//     surface also receives the dispatch of the very same install
+	//     function. The registration happens before the window
 	//     exists, so the surface answers from the first moment the window
 	//     can ask; without it (the console host) the status reports the
 	//     unknown state and the action answers 404.
+	//   - The lifecycle items of the menu (start, stop, update, delete)
+	//     run through the same signal from their end paths and from the
+	//     goroutine that waits for their elevated helper, so the status is
+	//     re-read after every service action — successful, failed or
+	//     declined — instead of waiting for the next tick.
 	serviceRefresh := make(chan struct{}, 1)
 	requestServiceMenuRefresh := func() {
 		select {
@@ -392,26 +454,16 @@ func run(o Options, logPath string) (err error) {
 		default:
 		}
 	}
+	// The one owner of the catch-up signal is published before any tray
+	// item can exist, so the goroutine that waits for a helper posts to
+	// this host's menu and never to a stale one. It is assigned only here,
+	// before the first waiter can start, so the assignment and every later
+	// read happen before the goroutines that read it.
+	serviceMenuRefresh = requestServiceMenuRefresh
 
 	installService := func() {
-		handover := installServiceFromTray(lock.name)
-		if handover == nil {
-			// Nothing was handed over: the state may have changed
-			// under a stale menu line — the flow re-read the
-			// registration and may have offered the dialog of an
-			// existing service — so the line catches up now instead
-			// of with the next tick.
-			requestServiceMenuRefresh()
-			return
-		}
-		if !shutdownCoordinator.commit(handover) {
-			handover.close()
-			serviceInstallRunning.Store(false)
-			desktopLog.Info("service handover was not committed because desktop shutdown already started")
-			requestServiceMenuRefresh()
-			return
-		}
-		requestQuit()
+		runInstallServiceAction(lock.name, requestServiceMenuRefresh,
+			shutdownCoordinator.commit, requestQuit)
 	}
 	dispatchInstallService := func() {
 		// The confirmation, the prompt of the user account control and
@@ -428,11 +480,7 @@ func run(o Options, logPath string) (err error) {
 	}
 	application.SetRuntimeService(
 		func() (string, error) {
-			status, err := readServiceDisplayStatus()
-			if err != nil {
-				return "", err
-			}
-			return string(status.State), nil
+			return readRuntimeServiceState(requestServiceMenuRefresh)
 		},
 		dispatchInstallService,
 	)
@@ -483,23 +531,26 @@ func run(o Options, logPath string) (err error) {
 		case <-ready:
 		case <-time.After(trayStartupTimeout):
 			// The tray did not come up: without it the host would be
-			// invisible, so the user is told and the host stops.
+			// invisible, so the user is told and the host stops. The
+			// refusal is recorded first — this is the only surface it
+			// ever reaches — so the log the window names really carries
+			// it, and the window carries the standard line that makes
+			// that log reachable.
+			desktopLog.Error("the desktop host could not create its icon in the notification area and stops")
 			showMessage("HFDesk could not start",
-				"HFDesk could not create its icon in the notification area.\n\n"+
-					"The desktop host needs the icon in the notification area to be reachable, so it stops.",
+				trayStartupFailureText(),
 				windows.MB_ICONERROR)
-			service.RemovePublishedState(statePath)
 			// The server is already serving: it is stopped through the
-			// normal path, so the jobs are quiesced, the HTTP drain
-			// runs and the job state is flushed.
-			stopDesktopServer(shutdown, &shutdownCoordinator)
-			closePipeline(pipeline, logFailure)
-			os.Exit(1)
+			// normal path (the guard end), so the jobs are quiesced,
+			// the HTTP drain runs and the job state is flushed, the
+			// published state is removed and the log pipeline closes
+			// before the process exits with a failure code.
+			endWithoutTray()
 		}
 	})
 
 	// The tray loop runs on the main thread until the user quits the host.
-	runTray(iconBytes, "HFDesk - running", trayActions{
+	runTrayLoop(iconBytes, "HFDesk - running", trayMenuFull, trayActions{
 		open: func() {
 			// The URL comes from the application, so it is the very URL
 			// the startup opened and the two cannot drift apart.
@@ -517,19 +568,45 @@ func run(o Options, logPath string) (err error) {
 			})
 		},
 		install: dispatchInstallService,
+		// The lifecycle items run on a goroutine of their own exactly
+		// like the installation: their confirmations, their dialogs and
+		// their elevated helpers must never block the message loop of
+		// the tray. Each item takes the single service-action guard
+		// itself, so a second click during any of them is refused with
+		// its own report, and each one ends with the menu catch-up on
+		// every of its paths (performServiceActionFromTray).
+		start: func() {
+			go guard.runBackground(func() {
+				performServiceActionFromTray(serviceActionStart, lock.name)
+			})
+		},
+		stop: func() {
+			go guard.runBackground(func() {
+				performServiceActionFromTray(serviceActionStop, lock.name)
+			})
+		},
+		update: func() {
+			go guard.runBackground(func() {
+				performServiceActionFromTray(serviceActionUpdate, lock.name)
+			})
+		},
+		delete: func() {
+			go guard.runBackground(func() {
+				performServiceActionFromTray(serviceActionUninstall, lock.name)
+			})
+		},
 		service: func() {
 			// The dialog waits for a settled state and stays open for
 			// an answer, so it runs on a goroutine of its own exactly
-			// like the installation does; the menu catches up when the
-			// choice was performed.
+			// like the installation does; the route below performs the
+			// choice and owns the menu catch-up that follows it.
 			go guard.runBackground(func() {
-				openRegisteredServiceFromTray(lock.name)
-				requestServiceMenuRefresh()
+				runServiceItemAction(lock.name, requestServiceMenuRefresh)
 			})
 		},
 		quit: requestQuit,
 	}, trayServiceView{
-		read:    readServiceDisplayStatus,
+		read:    serviceState.readForDisplay,
 		refresh: serviceRefresh,
 	}, ready)
 
@@ -544,6 +621,59 @@ func run(o Options, logPath string) (err error) {
 	// graceful path.
 	shutdown()
 	return nil
+}
+
+// runInstallServiceAction performs the install-service flow of one surface —
+// the tray item and the install button of the Runtime / Logs window run this
+// very function — and hands its outcome to the host. The refresh argument is
+// the host's menu catch-up signal, commit is the shutdown coordinator that
+// takes a committed handover over, and quit ends the host; the route runs
+// them in exactly the order the wrappers of the host ran them before.
+//
+// No handover means every path that ended without one — a declined
+// confirmation, a refused elevation, a dialog answer that changed nothing, a
+// failed helper — may have changed what the menu shows, so the refresh runs
+// right here instead of waiting for the next tick. A handover the host
+// cannot commit is closed by this route, the guard is released with the
+// record of why, and the same refresh follows. A committed handover quits
+// the host, and the quit owns the end of the menu, so no refresh runs
+// beside it.
+func runInstallServiceAction(instanceMutex string, refresh func(),
+	commit func(*desktopHandover) bool, quit func(),
+) {
+	handover := installServiceFromTray(instanceMutex)
+	if handover == nil {
+		// Nothing was handed over: the state may have changed
+		// under a stale menu line — the flow re-read the
+		// registration and may have offered the dialog of an
+		// existing service — so the line catches up now instead
+		// of with the next tick.
+		refresh()
+		return
+	}
+	if !commit(handover) {
+		handover.close()
+		serviceActionRunning.Store(false)
+		desktopLog.Info("service handover was not committed because desktop shutdown already started")
+		refresh()
+		return
+	}
+	// The record of the launch this host owns: the desktop exits here and
+	// the helper performs the installation afterwards, so this line —
+	// beside "the elevated service installation is running" — is the part
+	// of the action the log of this launch can still carry.
+	desktopLog.Info("the service installation handover was committed: the desktop shuts down so the elevated helper can act")
+	quit()
+}
+
+// runServiceItemAction performs the Service... item of one surface and asks
+// for the menu catch-up right after the dialog — after every answer and
+// after every early return alike, so no result of the dialog can stay
+// invisible in the menu until the next tick. The refresh argument is the
+// host's menu catch-up signal.
+func runServiceItemAction(instanceMutex string, refresh func()) {
+	openRegisteredServiceFromTray(instanceMutex)
+	refresh()
 }
 
 // endHost ends the desktop host.
@@ -733,7 +863,7 @@ func showRuntimeWindow(window *runtimeWindow, url string, webview2Ready bool) {
 	if err := window.Show(); err != nil {
 		desktopLog.Error("could not show the runtime window", "error", err)
 		showMessage("HFDesk - the Runtime / Logs window could not be shown",
-			fmt.Sprintf("The Runtime / Logs window could not be shown.\n\n%v", err),
+			runtimeWindowShowFailedText(err),
 			windows.MB_ICONERROR)
 	}
 }

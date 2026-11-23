@@ -48,9 +48,32 @@ type serviceMenuState struct {
 	Line string
 	// InstallEnabled reports whether the install item may act.
 	InstallEnabled bool
-	// ServiceVisible reports whether the registered-service item belongs
-	// into the menu.
+	// ServiceVisible reports whether the registered-service section — the
+	// registered-service dialog item and the lifecycle items beside the
+	// greyed install item — belongs into the menu. It is the single
+	// visibility claim of that section: the dialog item and the lifecycle
+	// items appear and disappear together, because all of them act on a
+	// registration and a read that did not prove one offers none of them.
 	ServiceVisible bool
+	// StartEnabled reports whether the start item may act: only a
+	// registration whose state is settled and does not run — stopped,
+	// failed, broken without an instance — is a state a start can act on.
+	// A transition is not a state to decide on (the rule of the service
+	// gate), so a pending state leaves the item grey.
+	StartEnabled bool
+	// StopEnabled reports whether the stop item may act: it follows the
+	// supervisor's running fact — the same classification every other
+	// surface decides "the service runs" with, where a pending start
+	// counts as running and a pending stop does not.
+	StopEnabled bool
+	// UpdateEnabled reports whether the update item may act. Every
+	// registration is a state an update may re-point, so it follows the
+	// visibility claim alone.
+	UpdateEnabled bool
+	// DeleteEnabled reports whether the delete item may act. The removal
+	// stops a running instance inside Manager.Uninstall as part of the
+	// action, so every registration is a state it may act on as well.
+	DeleteEnabled bool
 }
 
 // serviceStatusLine returns the compact status line of a service read.
@@ -75,20 +98,35 @@ func serviceStatusLine(status service.Status, readErr error) string {
 // serviceMenuFor maps one read of the registration onto the menu it shows.
 //
 // The two items follow the same decision as the line: a proven absence
-// enables the install item and hides the service item — a menu with no
+// enables the install item and hides the service section — a menu with no
 // registration shows no dead second item beside the install action — while
 // a proven registration greys the install item and shows the
-// registered-service item beside it, so the grey item always sits next to
-// the state that greys it. An unsettled read takes neither claim: the
+// registered-service section beside it, so the grey item always sits next
+// to the state that greys it. An unsettled read takes neither claim: the
 // install item is greyed rather than left active, because "enabled only
-// while no service is installed" is not proven by a read that failed.
+// while no service is installed" is not proven by a read that failed, and
+// the lifecycle items stay hidden — a destructive action is never offered
+// without a state that was read.
+//
+// Inside a proven registration the lifecycle items enable per state, on the
+// classifications every other surface already decides with: the stop item
+// follows the running fact (a pending start counts as running, a pending
+// stop does not), the start item follows its negation restricted to settled
+// states (a transition is not a state to decide on), and update and delete
+// follow the registration alone — the update re-points it and the removal
+// stops a running instance inside Manager.Uninstall as part of the action.
 func serviceMenuFor(status service.Status, readErr error) serviceMenuState {
 	state := serviceMenuState{Line: serviceStatusLine(status, readErr)}
 	switch classifyRegistration(status, readErr) {
 	case registrationAbsent:
 		state.InstallEnabled = true
 	case registrationPresent:
+		running := serviceStatusRunning(status)
 		state.ServiceVisible = true
+		state.StartEnabled = !running && serviceStateSettled(status.State)
+		state.StopEnabled = running
+		state.UpdateEnabled = true
+		state.DeleteEnabled = true
 	}
 	return state
 }

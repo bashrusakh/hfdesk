@@ -11,6 +11,40 @@ import (
 	"github.com/bashrusakh/hfdesk/internal/service"
 )
 
+// runLogPath is the path of the log file THIS launch writes.
+//
+// The host assigns it when its logging pipeline is installed, so a window of
+// a launch that has no log file of its own — the single instance refusal, a
+// command line error, a log that could not be opened, a second launch — names
+// no file, because there is none to name. The elevated helper assigns the
+// path the launching host passed to it (ServiceActionOptions.LogFile,
+// falling back to the default per-user path for a hand-typed command line),
+// so a report the helper shows names the log the host of this session writes:
+// the host records every service action it launches and the exit of its
+// helper there.
+var runLogPath string
+
+// logFileLine returns the one standard line every failure window carries:
+// the path of the log file of this launch, so the log is reachable from
+// outside the window. A launch without a log file of its own names none —
+// the line is empty instead of pointing at a file this run does not write.
+func logFileLine(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	return "\n\nThe log file is at " + path + "."
+}
+
+// failureWindowText appends that standard line to the text of a failure
+// window. Windows whose path is passed by the box that shows them
+// (reportStartupFailure, the panic guard) do not use it: their path may be
+// empty for a failure before the logging started, and the box appends the
+// line itself from the path it was given — a constructor must never bake in
+// a path beside that explicit one.
+func failureWindowText(text string) string {
+	return text + logFileLine(runLogPath)
+}
+
 // The captions of the message boxes of the service actions.
 //
 // Every box of the service flow is captioned here, so the tray, the service
@@ -71,6 +105,42 @@ const (
 	serviceHelperNotReadyCaption = "HFDesk - the administrator helper did not become ready"
 )
 
+// The captions of the confirmations and the reports of the two service
+// actions the tray performs beside the installation: the stop of the
+// service and the removal of its registration. They sit beside the
+// installation family above, whose captions and classes stay what they are.
+const (
+	// stopServiceConfirmCaption is the caption of the confirmation that
+	// asks the user whether the running service is stopped before the
+	// administrator prompt follows.
+	stopServiceConfirmCaption = "HFDesk - stop the Windows service"
+
+	// removeServiceConfirmCaption is the caption of the confirmation that
+	// asks the user whether the service registration is removed before
+	// the administrator prompt follows.
+	removeServiceConfirmCaption = "HFDesk - remove the Windows service registration"
+
+	// serviceStoppedCaption is the caption of the report of a stopped
+	// service.
+	serviceStoppedCaption = "HFDesk - service stopped"
+
+	// serviceRegistrationRemovedCaption is the caption of the report of a
+	// removed service registration.
+	serviceRegistrationRemovedCaption = "HFDesk - service registration removed"
+
+	// serviceNoRegistrationCaption is the caption of the report of a
+	// removal that found no registration to remove: the same clean
+	// outcome the command line reports, in its own words instead of the
+	// caption that claims a removal.
+	serviceNoRegistrationCaption = "HFDesk - no Windows service registration"
+
+	// serviceActionBusyCaption is the caption of the refusal of a second
+	// service action while one is already running. It names the cause
+	// alone — no action is blamed, because the refused click is not the
+	// one at fault.
+	serviceActionBusyCaption = "HFDesk - another service action is already running"
+)
+
 // serviceFailureCaption returns the caption of a failed service action.
 //
 // The captions are per action, so the user reads which action failed instead
@@ -86,35 +156,81 @@ func serviceFailureCaption(action serviceAction) string {
 		return "HFDesk - the service update failed"
 	case serviceActionStart:
 		return "HFDesk - the service did not start"
+	case serviceActionStop:
+		return "HFDesk - the service did not stop"
+	case serviceActionUninstall:
+		return "HFDesk - the service registration was not removed"
 	default:
 		return "HFDesk - the service action failed"
 	}
 }
 
+// dataSeparationLine returns the one line that states the surprising fact of
+// the service family: the data of the service is not the data of this app.
+// It is shared by the installation confirmation and the service gate, so the
+// two windows never state the separation in different words.
+func dataSeparationLine(dataDir string) string {
+	if dataDir != "" {
+		return "Its data is separate: " + dataDir + " — this app's settings, jobs and models are not there."
+	}
+	return "Its data is separate — this app's settings, jobs and models do not appear in the service."
+}
+
 // installServiceText returns the text of the confirmation that registers the
 // Windows service.
 //
-// The confirmation states the four facts the user has to know: the service
-// starts at boot and keeps running after the window closes, the registration
-// needs administrator rights, the narrowed download rule — only the missing
-// console program of this release's own name, only on request, only after its
-// SHA-256 was verified — and that the desktop and the service keep separate
-// data (the surprising one). dataDir is the state directory of the service, so
-// the text names the directory it will really own.
+// The confirmation states the facts the user has to know before a
+// machine-wide registration is written — the service starts at boot and
+// survives this window, the registration needs administrator rights, the
+// narrowed download rule, and the one surprising fact (the separate data) as
+// its single line — then asks the one question. dataDir is the state
+// directory of the service, so the text names the directory it will really
+// own.
 func installServiceText(dataDir string) string {
-	text := "This registers HFDesk as a Windows service.\n\n" +
+	return "This registers HFDesk as a Windows service.\n\n" +
 		"The service starts at boot and keeps running after this window closes.\n" +
 		"Installing it needs administrator rights, so a Windows prompt follows.\n\n" +
 		"HFDesk stays portable: the service runs the hfdesk program that sits next to this desktop app. The one file HFDesk can download is that missing program from its own release — only when you ask for it, and only after its SHA-256 is verified; nothing else is downloaded or copied.\n\n" +
-		"This desktop app and the service keep separate data:\n" +
-		"- the settings, jobs and models of this app stay where they are, and\n" +
-		"- the service starts with its own data"
-	if dataDir != "" {
-		text += " in " + dataDir
-	}
-	text += ", so the settings, jobs and models of this app do not appear in the service.\n\n" +
+		// B2 of the plan (the warning about a removable or network
+		// drive) awaits the user's decision and goes here, as its own
+		// line before the one surprising fact below. It is deliberately
+		// not written yet.
+		dataSeparationLine(dataDir) + "\n\n" +
 		"Do you want to install the service?"
-	return text
+}
+
+// stopServiceConfirmText returns the text of the confirmation that stops the
+// Windows service before the administrator prompt follows.
+//
+// The confirmation follows the shape of the installation confirmation: what
+// the action does, the administrator rights it needs, the one fact the user
+// has to see before agreeing — nothing serves the address of the service
+// afterwards — and the question. It names no state of its own: the state the
+// menu item was enabled by can be stale by the time the box is read, and a
+// confirmation that claimed a state the machine no longer has would ask the
+// user to agree to something that is not there. The helper reads the state
+// again and reports what it really found.
+func stopServiceConfirmText() string {
+	return "This stops the HFDesk service.\n\n" +
+		"Stopping it needs administrator rights, so a Windows prompt follows.\n" +
+		"Nothing serves the address of the service until you start it again.\n\n" +
+		"Do you want to stop the service?"
+}
+
+// removeServiceConfirmText returns the text of the confirmation that removes
+// the Windows service registration before the administrator prompt follows.
+//
+// The confirmation states the one invariant the removal has: only the
+// registration goes, and the data stays. That is the surprising fact of this
+// action — the fact a user has to read before agreeing — so it is the one
+// line beside the administrator-rights sentence and the question. The
+// confirmation claims nothing about the state of the instance: a running one
+// is stopped inside the removal, which the user does not have to orchestrate.
+func removeServiceConfirmText() string {
+	return "This removes the Windows service registration of HFDesk.\n\n" +
+		"Removing it needs administrator rights, so a Windows prompt follows.\n" +
+		"Your settings, jobs, models, cache, history and logs stay untouched.\n\n" +
+		"Do you want to remove the registration?"
 }
 
 // serviceGateInstruction returns the main instruction of the choice dialog of
@@ -129,34 +245,30 @@ func serviceGateInstruction(prompt serviceChoicePrompt) string {
 // serviceGateContent returns the content of the choice dialog of the service
 // gate.
 //
-// The content names what the running service serves, what an update does and
-// that the service keeps its own data. The positively confirmed stopped
-// service gets the sentence of the desktop mode instead of the sentence of a
-// launch that ends: it is the one state whose dialog can continue this launch,
-// and the sentence states what that answer does and that it never starts the
-// service. The task dialog and the message box fallback share the content, so
-// the two cannot tell the user different things.
+// The dialog follows the rule of the family: the state (the instruction
+// above), at most one line beside it — what the one continuing answer does
+// for the positively confirmed stopped service, and that this launch starts
+// no server for every other state — and the one surprising fact, the
+// separate data, as its single line. The task dialog and the message box
+// fallback share the content, so the two cannot tell the user different
+// things. The buttons carry the actions; the text never explains why they
+// are right.
 func serviceGateContent(prompt serviceChoicePrompt) string {
 	var text string
-	if servicePromptRunning(prompt) && prompt.URL != "" {
-		text += "The web UI of the service is at " + prompt.URL + ".\n\n"
-	}
 	if prompt.Detail != "" {
 		text += prompt.Detail + "\n\n"
 	}
-
-	if servicePromptStopped(prompt) {
-		text += "Work in desktop mode continues this launch as a normal desktop app: it starts its own server and never starts the service, so the service stays stopped and two instances never compete for the same address.\n\n"
-	} else {
-		text += "This launch of the desktop app started no server of its own, so two instances never compete for the same address.\n\n"
+	switch {
+	case servicePromptRunning(prompt):
+		if prompt.URL != "" {
+			text += "Web UI: " + prompt.URL + "\n\n"
+		}
+	case servicePromptStopped(prompt):
+		text += "Work in desktop mode starts this app's own server; the service stays stopped.\n\n"
+	default:
+		text += "This launch starts no server.\n\n"
 	}
-	text += "Update re-registers the service from the hfdesk program next to this app. It keeps the settings of the service and its running state: a running service keeps running, and a stopped service stays stopped.\n\n" +
-		"The service keeps its own data"
-	if prompt.DataDir != "" {
-		text += " in " + prompt.DataDir
-	}
-	text += ", so the settings, jobs and models of this desktop app do not appear in the service."
-	return text
+	return text + dataSeparationLine(prompt.DataDir)
 }
 
 // serviceGateText returns the whole text of the choice dialog of the service
@@ -177,47 +289,51 @@ func serviceGatePendingText(state service.State) string {
 		transition = "stopping"
 	}
 	return "The HFDesk service is still " + transition + " and did not reach a settled state in time.\n\n" +
-		"This launch changes nothing: it starts no server of its own, so two instances never compete for the same address.\n\n" +
+		"This launch changes nothing: it starts no server.\n\n" +
 		"Start the desktop app again when the service has settled."
 }
+
+// serviceGateDiagnosticAction is the one action of the two notices that
+// could not settle the state: the read of the state from an elevated shell,
+// with its honesty boundary in the same sentence — a read that fails leaves
+// the state unknown and this launch never guesses it, so the notice promises
+// no relaunch that could show it again.
+const serviceGateDiagnosticAction = `Run "hfdesk service status" from an elevated shell: ` +
+	`a successful read settles the state and the desktop app can then be started again; ` +
+	`a failed read leaves the state unknown and HFDesk will not guess it.`
 
 // serviceGateUnreadableText returns the text of the notice of a launch that
 // could not read the registration of the Windows service.
 //
-// The launch cannot tell a machine without a service from one whose service is
-// installed, so it decides on neither: the notice says that a service may be
-// installed and running, that this launch started no server, and names the one
-// action that resolves the uncertainty — the read of the state. It does not
-// promise a relaunch: when that read itself fails, for example because a
-// Windows policy denies it to this account, the state stays unknown and the
-// notice says so instead of sending the user into a notice loop.
+// The launch cannot tell a machine without a service from one whose service
+// is installed, so it decides on neither: the notice is the state (the read
+// failed), the one risk the user has to see (a service may be running, so
+// this launch started no server), the cause on its own line and the one
+// action that resolves the uncertainty — the read of the state — with the
+// boundary of that promise in the same sentence.
 func serviceGateUnreadableText(err error) string {
 	text := "HFDesk could not read the state of the Windows service.\n\n"
 	if err != nil {
 		text += err.Error() + "\n\n"
 	}
-	return text + "An HFDesk service may be installed and running on this machine. " +
-		"This launch started no server of its own, so it cannot compete with that instance for the same address.\n\n" +
-		"Check the service state with \"hfdesk service status\" from an elevated shell: a successful read settles what this launch could not — whether a service is installed and running — and the desktop app can then be started again; a read that fails, for example because a Windows policy denies it to your account, leaves the state unknown, and this launch will not guess it."
+	return failureWindowText(text +
+		"An HFDesk service may be installed and running on this machine, so this launch started no server.\n\n" +
+		serviceGateDiagnosticAction)
 }
 
 // serviceGateChangedText returns the text of the notice of a launch that
 // chose the desktop mode for a positively confirmed stopped service and then
 // re-read a state that is no longer that.
 //
-// The dialog is modal and can outlive the snapshot it was built from: a
-// service another actor started in the meantime would serve the address this
-// launch binds, so the launch does not continue. The text is the result (no
-// server was started), the cause (the state the re-read reported) and one
-// next action: the command that reads the state. No relaunch is promised
-// beside it — when that read fails, for example because a Windows policy
-// denies it to this account, the state stays unknown and the notice says so
-// instead of sending the user into the same notice again.
+// The dialog is modal and can outlive the snapshot it was built from, so the
+// launch does not continue. The text is the state (the change and the state
+// the re-read reported), the result (no server was started) and the same one
+// action the unreadable notice carries, with the same boundary.
 func serviceGateChangedText(prompt serviceChoicePrompt) string {
-	return "The state of the HFDesk service changed while the dialog was open.\n\n" +
-		"It is " + serviceGateStatePhrase(prompt) + " now, so this launch did not continue into desktop mode: " +
-		"it started no server of its own, so two instances never compete for the same address.\n\n" +
-		"Check the state with \"hfdesk service status\" from an elevated shell: a successful read settles the state that changed while the dialog was open, and the desktop app can then be started again; a read that fails, for example because a Windows policy denies it to your account, leaves the state unknown, and this launch will not guess it."
+	return failureWindowText(
+		"The state of the HFDesk service changed while the dialog was open.\n\n" +
+			"It is " + serviceGateStatePhrase(prompt) + " now, so this launch did not continue into desktop mode; it started no server.\n\n" +
+			serviceGateDiagnosticAction)
 }
 
 // serviceGateStatePhrase describes the state of a prompt for a notice of the
@@ -258,8 +374,15 @@ const (
 	// launch into desktop mode. Only the dialog of a positively confirmed
 	// stopped service has it, and it is that dialog's default button.
 	serviceGateDesktopLabel = "Work in desktop mode"
-	serviceGateUpdateLabel  = "Update service"
-	serviceGateCancelLabel  = "Cancel"
+	// serviceGateCompanionLabel is the label of the button that continues
+	// the launch as a tray companion. Every dialog of the launch gate has
+	// it, beside the answers the state offers; it is never the default
+	// button, so a stray Enter keeps selecting the answer it selected
+	// before. The wording follows serviceGateDesktopLabel: a short,
+	// human sentence that names the mode the launch continues in.
+	serviceGateCompanionLabel = "Work as tray companion"
+	serviceGateUpdateLabel    = "Update service"
+	serviceGateCancelLabel    = "Cancel"
 )
 
 // serviceGateFallbackChoices returns the mapping of the answers of the
@@ -376,22 +499,23 @@ func serviceUpdatedText(version, console, dataDir, address string, running bool,
 	return text
 }
 
-// serviceUpdateNotRunningReport returns the result and the cause of the report
-// of an update that did not leave the service running.
+// serviceUpdateNotRunningReport returns the result of the report of an
+// update that did not leave the service running.
 //
-// The result is the outcome of the update, the cause is the state the update
-// observed before it and the rule that explains why nothing serves now. A
-// service that was stopped before the update keeps the sentence it always had.
-// Any other observed prior state is quoted as what the supervisor reported
-// instead of being restated as "stopped", the way the failure reports of these
-// actions already name a prior state. Every not-running report also says that
-// the service stays stopped: an update never starts a service that was not
-// running, so a report that lost that fact would leave it unstated.
+// The result is the outcome of the update: the service stays stopped, and
+// nothing serves HFDesk. The not-running case also names the prior state the
+// update actually observed (before): a registration that was stopped is
+// reported by that fact alone, and one that was failed, broken or in another
+// state is quoted as what it really was instead of being restated as
+// "stopped" — a report claiming a state the machine did not have would send
+// the user to a cause that is not there. The report argues with no rule
+// beside it: what an update does or never does is not the user's business in
+// the window; the state it left is.
 func serviceUpdateNotRunningReport(before service.State) string {
 	if before == service.StateStopped {
-		return "The service stays stopped: it was stopped before the update, and an update never starts a stopped service. Nothing serves HFDesk right now."
+		return "The service stays stopped.\n\nNothing serves HFDesk right now."
 	}
-	return fmt.Sprintf("The service is not running after the update: it was %q before the update, and an update never starts a service that was not running, so the service stays stopped. Nothing serves HFDesk right now.", before)
+	return fmt.Sprintf("The service is not running after the update: it was %q before the update, and it stays stopped.\n\nNothing serves HFDesk right now.", before)
 }
 
 // serviceStartedText returns the report of a started service.
@@ -403,6 +527,48 @@ func serviceStartedText(console, address string) string {
 	text += serviceAddressText(address)
 	text += "The desktop app is not needed to use the service: open the address above."
 	return text
+}
+
+// serviceStoppedText returns the report of a stopped service.
+//
+// The report is the state (stopped), the one fact the user did not ask for
+// and has to see — nothing serves the address of the service right now — and
+// the single way back. The way back names the quit of this desktop and the
+// startup gate of its next launch, because a start beside the desktop that
+// runs this very tray is refused by the established guard of the helper: the
+// desktop serves the address, and two instances never compete for it. A
+// report that pointed at a start the guard would refuse would send the user
+// into that refusal in a circle.
+func serviceStoppedText() string {
+	return "The HFDesk service is stopped.\n\n" +
+		"Nothing serves the address of the service right now.\n" +
+		"Quit HFDesk from the notification-area icon and choose Start service when you start the desktop app again."
+}
+
+// serviceRegistrationRemovedText returns the report of a removed service
+// registration.
+//
+// The report is the state (the registration is gone), the invariant of the
+// removal as its one line — the data stays, which is the surprising fact of
+// this action — and the single way back. It never claims, hints or implies
+// that any data was deleted: the removal writes no file, deletes no
+// directory and reads no configuration beyond the registration itself.
+func serviceRegistrationRemovedText() string {
+	return "The Windows service registration of HFDesk is removed.\n\n" +
+		"Your settings, jobs, models, cache, history and logs stay untouched.\n" +
+		"Install the service again from the tray of the desktop app whenever you want it back."
+}
+
+// serviceNoRegistrationText returns the report of a removal that found no
+// registration.
+//
+// The command line calls the same outcome a clean success, and this report
+// keeps it a success without claiming a removal that never happened: the
+// state (no registration) and the result of this attempt (nothing was
+// changed) is all it says.
+func serviceNoRegistrationText() string {
+	return "HFDesk is not registered as a Windows service.\n\n" +
+		"There was no registration to remove, so nothing was changed."
 }
 
 // serviceAddressText returns the sentence that names the address of the
@@ -426,11 +592,18 @@ func serviceNotInstalledText(action serviceAction) string {
 	switch action {
 	case serviceActionUpdate:
 		there = "There is no service to update."
+	case serviceActionStop:
+		// A settled absence needs no next action for a stop: there is
+		// nothing to stop, and sending the user to the installation of
+		// a service they asked to stop would answer a question they did
+		// not ask. The state is settled, so the report names it alone.
+		return failureWindowText("HFDesk is not installed as a Windows service.\n\n" +
+			"There is no service to stop.")
 	default:
 		there = "There is no service to start."
 	}
-	return "HFDesk is not installed as a Windows service.\n\n" +
-		there + " Install it from the tray of the desktop app first."
+	return failureWindowText("HFDesk is not installed as a Windows service.\n\n" +
+		there + " Install it from the tray of the desktop app first.")
 }
 
 // The command a failure report of a service action ends with: a report is
@@ -453,6 +626,19 @@ func statusIfUnnamed(detail string) string {
 		return ""
 	}
 	return "\n\n" + serviceStatusCommandText
+}
+
+// serviceActionBusyText returns the refusal of a second service action while
+// one is already running.
+//
+// The report is the result (this action was not started), the cause on its
+// single line (another action runs) and the one action that ends it (wait for
+// that action and repeat this one). It names no state of the service: the
+// running action is the one that moves it, and a state read beside it would
+// describe a machine that is already changing.
+func serviceActionBusyText() string {
+	return failureWindowText("Another HFDesk service action is already running, so this action was not started.\n\n" +
+		"Wait for the running action to finish, then try again.")
 }
 
 // isAlreadyRegisteredRefusal reports whether err is the refusal of a
@@ -493,7 +679,7 @@ func isServiceAccountRefusal(err error) bool {
 func serviceAlreadyRegisteredText(detail string) string {
 	return "HFDesk could not install the Windows service.\n\n" + detail + "\n\n" +
 		"The service registration already exists, and this attempt did not create, change or start it.\n\n" +
-		"Start HFDesk again: with the registration in place, its startup gate offers to open or start the service and to update it."
+		"Start HFDesk again: its startup gate offers to open or start the service and to update it."
 }
 
 // serviceActionFailureHeadline returns the first line of the report of a
@@ -505,6 +691,10 @@ func serviceActionFailureHeadline(action serviceAction) string {
 		return "HFDesk could not install the Windows service."
 	case serviceActionUpdate:
 		return "HFDesk could not update the Windows service."
+	case serviceActionStop:
+		return "HFDesk could not stop the Windows service."
+	case serviceActionUninstall:
+		return "HFDesk could not remove the Windows service registration."
 	default:
 		return "HFDesk could not start the Windows service."
 	}
@@ -531,7 +721,30 @@ func serviceSingletonHoldRefusedText(action serviceAction, err error) string {
 	if !errors.Is(err, service.ErrSingletonAccessDenied) {
 		text += statusIfUnnamed(detail)
 	}
-	return text
+	return failureWindowText(text)
+}
+
+// serviceUnreadableClaimRefusedText returns the report of a mutation that
+// refused over a published claim it could not read: the result (no service
+// action was performed) and the cause (the state file that would tell
+// whether a desktop serves cannot be read, so that question stays
+// undetermined). The report carries no next action: no single step clears a
+// file the guard cannot inspect, so it stays an honest terminal.
+func serviceUnreadableClaimRefusedText(action serviceAction, claim string) string {
+	return failureWindowText(serviceActionFailureHeadline(action) + "\n\n" +
+		fmt.Sprintf("No service action was performed: the state file of the desktop at %q cannot be read, so whether a desktop of this session serves its local server cannot be determined.", claim))
+}
+
+// serviceServingDesktopRefusedText returns the report of a mutation that
+// refused beside a serving desktop instance: the result (no service action
+// was performed), the cause (the desktop serves its local server) and the
+// one next action (quit the desktop, which ends the cause). The report
+// carries no second command: reading the state of the service would not end
+// the refusal.
+func serviceServingDesktopRefusedText(action serviceAction) string {
+	return failureWindowText(serviceActionFailureHeadline(action) + "\n\n" +
+		"No service action was performed: a running HFDesk desktop instance of this session serves its local server.\n\n" +
+		"Quit HFDesk from the notification-area icon and perform the action again.")
 }
 
 // serviceActionFailureText returns the report of a failed service action: the
@@ -549,6 +762,12 @@ func serviceSingletonHoldRefusedText(action serviceAction, err error) string {
 // unchanged state it left instead: that registration was never written by this
 // attempt, so neither the may-remain warning nor the removal belongs to it.
 func serviceActionFailureText(action serviceAction, err error, program string) string {
+	return failureWindowText(serviceActionFailureBody(action, err, program))
+}
+
+// serviceActionFailureBody builds the report itself; the wrapper above adds
+// the standard log-path line of every failure window exactly once.
+func serviceActionFailureBody(action serviceAction, err error, program string) string {
 	detail := ""
 	if err != nil {
 		detail = err.Error()
@@ -580,6 +799,12 @@ func serviceActionFailureText(action serviceAction, err error, program string) s
 			return serviceActionFailureHeadline(action) + "\n\n" + detail
 		}
 		return serviceActionFailureHeadline(action) + "\n\n" + detail + statusIfUnnamed(detail)
+	case serviceActionStop, serviceActionUninstall:
+		// The headline is the result, the manager text is the cause on
+		// its single line, and the state command resolves what the
+		// failure left — the shape of the update report, so no report of
+		// these actions ever claims a state its action did not observe.
+		return serviceActionFailureHeadline(action) + "\n\n" + detail + statusIfUnnamed(detail)
 	default:
 		return serviceActionFailureHeadline(action) + "\n\n" + detail + "\n\n" +
 			"The start was not confirmed." + statusIfUnnamed(detail)
@@ -590,18 +815,39 @@ func serviceActionFailureText(action serviceAction, err error, program string) s
 // the cleanup facts returned by the service manager. Cleanup is performed
 // through the creation handle, never by reopening a service name.
 //
-// The kept-registration branch states the uncertainty the cleanup actually
-// left — the registration may remain — and names the one action that
-// resolves it: the read of the state. Whether anything is left to remove is
-// exactly what that read decides, so no removal is offered next to it.
+// The report splits the start outcome into its classes: a start that was not
+// performed gets the headline that states it (no "could not confirm" claim
+// about a start that never happened), and every start that ran carries the one
+// line of what was observed — the process ended, the service did not come up
+// within the budget that elapsed, or the started service could not be
+// verified. The kept-registration branch states the uncertainty the cleanup
+// actually left — the registration may remain — and names the one action that
+// resolves it: the read of the state. The removed branch never shares its
+// wording with a machine that never had a registration: it says what this
+// attempt removed, not that HFDesk was never installed.
+//
+// The cleanup fact itself is stated exactly once: the detail carries the
+// cause and the one line the cleanup observed as a reason, never the
+// service layer's own gloss of the cleanup outcome — that gloss and the
+// outcome sentence below are two formulations of the same fact, and a
+// report states it once.
 func serviceInstallStartFailureText(err error, program string, cleanup *service.InstallStartError) string {
-	detail := ""
-	if err != nil {
-		detail = err.Error()
+	detail := installStartDetail(err, cleanup)
+	removed := cleanup != nil && cleanup.RegistrationRemoved
+	headline := "HFDesk registered the service but could not confirm its start."
+	switch {
+	case removed:
+		headline = "HFDesk registered the service but could not start it."
+	case cleanup != nil && cleanup.Outcome == service.StartOutcomeNotPerformed:
+		headline = "HFDesk registered the service but did not start it."
 	}
-	if cleanup != nil && cleanup.RegistrationRemoved {
-		return "HFDesk registered the service but could not start it.\n\n" + detail + "\n\n" +
-			"The failed instance was settled and the registration created by this attempt was removed. HFDesk is not installed as a Windows service, so start the desktop app normally again."
+	text := headline + "\n\n"
+	if outcome := serviceStartOutcomeText(cleanup); outcome != "" {
+		text += outcome + "\n\n"
+	}
+	text += detail + "\n\n"
+	if removed {
+		return failureWindowText(text + "The failed instance was settled and the registration created by this attempt was removed: this installation attempt left no registration behind, so start the desktop app normally again.")
 	}
 	outcome := "The registration was kept because cleanup could not prove that it was still owned by this attempt."
 	if cleanup != nil && cleanup.RegistrationOwned {
@@ -613,9 +859,54 @@ func serviceInstallStartFailureText(err error, program string, cleanup *service.
 	} else if cleanup != nil && cleanup.ProcessStopped {
 		outcome = "The failed process was proven stopped, but the registration changed and was kept."
 	}
-	text := "HFDesk registered the service but could not confirm its start.\n\n" + detail + "\n\n" +
-		outcome
-	return text + statusIfUnnamed(detail) + "\n\n" + serviceFolderAccessText(program)
+	text += outcome
+	return failureWindowText(text + statusIfUnnamed(detail) + "\n\n" + serviceFolderAccessText(program))
+}
+
+// installStartDetail returns the cause of a failed first start and the one
+// line its cleanup observed as a reason — never the cleanup fact itself.
+// InstallStartError.Error states that fact in its own words
+// ("(the registration was kept…)"); the report states the fact once, in its
+// own outcome sentence, so the two formulations can no longer appear beside
+// each other. An error the cleanup struct does not describe keeps its whole
+// message as the detail it always was.
+func installStartDetail(err error, cleanup *service.InstallStartError) string {
+	if cleanup == nil || cleanup.Cause == nil {
+		if err == nil {
+			return ""
+		}
+		return err.Error()
+	}
+	detail := cleanup.Cause.Error()
+	if cleanup.CleanupError != nil {
+		detail += "\n\n" + cleanup.CleanupError.Error()
+	}
+	return detail
+}
+
+// serviceStartOutcomeText returns the one-line class of the start failure a
+// report carries: the started process ended before it came up, the started
+// service did not come up within the budget that actually elapsed (named with
+// that very value), or the started service could not be verified. A start that
+// was not performed states its class in the headline itself and adds no second
+// line, and an error classified by no site keeps the cause-only report.
+func serviceStartOutcomeText(cleanup *service.InstallStartError) string {
+	if cleanup == nil {
+		return ""
+	}
+	switch cleanup.Outcome {
+	case service.StartOutcomeEnded:
+		return "The start ran, but the service process ended before it came up."
+	case service.StartOutcomeNotReady:
+		if cleanup.Budget > 0 {
+			return fmt.Sprintf("The start ran, but the service did not come up within %s.", cleanup.Budget)
+		}
+		return "The start ran, but the service did not come up within the readiness budget."
+	case service.StartOutcomeUnverified:
+		return "The start ran, but the installation could not verify the started service."
+	default:
+		return ""
+	}
 }
 
 // serviceFolderAccessText returns the sentence that names the access the folder
@@ -677,6 +968,10 @@ func serviceActionUnchangedText(action serviceAction) string {
 		return "The service was not installed."
 	case serviceActionUpdate:
 		return "The service was not updated."
+	case serviceActionStop:
+		return "The service was not stopped."
+	case serviceActionUninstall:
+		return "The registration was not removed."
 	default:
 		return "The service was not started."
 	}
@@ -686,22 +981,20 @@ func serviceActionUnchangedText(action serviceAction) string {
 // never became ready.
 //
 // The report is one coherent message for this state: it states the result
-// (nothing was performed, because the helper acts only after it becomes
-// ready), the observed cause of the failed readiness, and one next action.
-// It never claims that the helper could not be started — it was started —
-// and it never repeats the reason the helper reports in its own box: it
-// references that message, which is where the user reads the actual reason
-// and the step that follows from it.
+// (nothing was performed), carries the observed cause verbatim, and names
+// one next action — the message the helper shows itself, which is where the
+// user reads the actual reason and the step that follows from it. It never
+// claims that the helper could not be started — it was started — and it
+// never repeats the reason the helper reports in its own box.
 func serviceHelperNotReadyText(action serviceAction, err error) string {
 	detail := ""
 	if err != nil {
 		detail = err.Error()
 	}
-	return serviceActionUnchangedText(action) +
-		" No service action was performed: the helper acts only after it becomes ready, and it never did.\n\n" +
+	return failureWindowText(serviceActionUnchangedText(action) +
+		" No service action was performed.\n\n" +
 		detail + "\n\n" +
-		"The helper runs its checks before it becomes ready and shows its own message with the reason when one of them fails. " +
-		"Follow that message: it names the reason and the step that follows from it."
+		"Read the message the administrator helper showed: it names the reason and the step that follows.")
 }
 
 // serviceLaunchFailedText returns the report of a failed launch of the elevated
@@ -714,9 +1007,9 @@ func serviceHelperNotReadyText(action serviceAction, err error) string {
 // share the one next action: repeat the action and approve the elevation when
 // Windows asks for it — the approval is what a declined prompt lacked, and a
 // repeat is what a shell that could not start the helper needs. A cause that
-// keeps the prompt from ever appearing cannot be approved by that action, so
-// the report says so instead of promising the approval will come. A helper
-// that was started but never became ready is a different state and has its own
+// keeps the prompt from ever appearing is stated on its own line by the
+// detail; the report argues with no policy examples beside it. A helper that
+// was started but never became ready is a different state and has its own
 // report (serviceHelperNotReadyText).
 func serviceLaunchFailedText(action serviceAction, err error) string {
 	detail := ""
@@ -724,9 +1017,9 @@ func serviceLaunchFailedText(action serviceAction, err error) string {
 		detail = err.Error()
 	}
 
-	return "HFDesk could not start its administrator helper.\n\n" + detail + "\n\n" +
+	return failureWindowText("HFDesk could not start its administrator helper.\n\n" + detail + "\n\n" +
 		serviceActionUnchangedText(action) +
-		" Repeat the action and approve the administrator prompt when Windows shows it; a prompt Windows never shows — for example when a policy blocks the elevation — cannot be approved, and that cause stays."
+		" Repeat the action and approve the administrator prompt when Windows shows it.")
 }
 
 // The labels of the missing-program notice.
@@ -825,6 +1118,10 @@ func newSiblingMissingNotice(action serviceAction, folder, desktop string, findE
 	if findErr != nil && !errors.Is(findErr, errConsolePairMissing) {
 		notice.Content += "\n\n" + findErr.Error()
 	}
+	// The missing program is the failure that blocked the action, and the
+	// lookup wrote its cause to the log: the notice carries the standard
+	// line that makes that log reachable from outside the window.
+	notice.Content = failureWindowText(notice.Content)
 	return notice
 }
 
@@ -958,7 +1255,37 @@ func consoleDownloadFailedText(notice siblingMissingNotice, downloadErr error) s
 	} else {
 		text += "This download left no file behind in " + notice.Folder + ".\n\n"
 	}
-	return text + notice.Manual
+	return failureWindowText(text + notice.Manual)
+}
+
+// serviceHandoverRefusedText returns the report of a helper that could not
+// prepare its coordination with the launching desktop: the result (no
+// service action was performed), the observed cause on its own line and the
+// one command that reads the state — kept as the single action by the same
+// rule every report follows (a cause that already names the command keeps it
+// as the only one). The standard log-path line of every failure window closes
+// it.
+func serviceHandoverRefusedText(err error) string {
+	detail := ""
+	if err != nil {
+		detail = err.Error()
+	}
+	return failureWindowText("HFDesk could not prepare the service action.\n\n" +
+		"No service action was performed.\n\n" + detail + statusIfUnnamed(detail))
+}
+
+// serviceHandoverFailureText returns the report of the desktop host whose
+// installation could not be finished after its shutdown: the result (the
+// installation did not finish), the cause on its own line, the one command
+// that reads the state the failure left, and the standard log-path line —
+// with no description of the mechanism the wait used.
+func serviceHandoverFailureText(err error) string {
+	detail := ""
+	if err != nil {
+		detail = err.Error()
+	}
+	return failureWindowText("HFDesk could not finish the service installation.\n\n" +
+		detail + "\n\n" + serviceStatusCommandText)
 }
 
 // unknownServiceActionText returns the report of an action the helper does not
@@ -970,6 +1297,6 @@ func unknownServiceActionText(err error) string {
 	if err != nil {
 		detail = err.Error()
 	}
-	return fmt.Sprintf("HFDesk was started with a service action it does not know.\n\n%s\n\n"+
-		"Nothing was installed, updated or started. Start the desktop app again.", detail)
+	return failureWindowText(fmt.Sprintf("HFDesk was started with a service action it does not know.\n\n%s\n\n"+
+		"Nothing was installed, updated or started. Start the desktop app again.", detail))
 }

@@ -58,7 +58,7 @@ func TestServiceURLRejectsAnAddressWithoutAHostAndPort(t *testing.T) {
 }
 
 // TestParseServiceActionAcceptsTheHiddenActions proves that the helper accepts
-// the three actions the desktop host launches and nothing else.
+// the five actions the desktop host launches and nothing else.
 func TestParseServiceActionAcceptsTheHiddenActions(t *testing.T) {
 	for _, test := range []struct {
 		value string
@@ -67,6 +67,8 @@ func TestParseServiceActionAcceptsTheHiddenActions(t *testing.T) {
 		{"install", serviceActionInstall},
 		{"update", serviceActionUpdate},
 		{"start", serviceActionStart},
+		{"stop", serviceActionStop},
+		{"uninstall", serviceActionUninstall},
 		{" Install ", serviceActionInstall},
 	} {
 		action, err := parseServiceAction(test.value)
@@ -83,7 +85,7 @@ func TestParseServiceActionAcceptsTheHiddenActions(t *testing.T) {
 // TestParseServiceActionRejectsEveryOtherValue proves that a helper never
 // guesses the action it was asked to perform.
 func TestParseServiceActionRejectsEveryOtherValue(t *testing.T) {
-	for _, value := range []string{"", "uninstall", "restart", "install service"} {
+	for _, value := range []string{"", "restart", "install service", "remove"} {
 		if action, err := parseServiceAction(value); err == nil {
 			t.Errorf("parseServiceAction(%q) = %q, want an error", value, action)
 		}

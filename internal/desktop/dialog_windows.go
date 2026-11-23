@@ -49,11 +49,7 @@ func showNativeMessage(caption, text string, icon uint32) {
 // The desktop host has no console, so a failure that is only returned to the
 // caller would leave the user with a process that vanished.
 func reportStartupFailure(caption, detail, logPath string) {
-	text := detail
-	if logPath != "" {
-		text += "\n\nThe log file is at " + logPath + "."
-	}
-	showMessage(caption, text, windows.MB_ICONERROR)
+	showMessage(caption, detail+logFileLine(logPath), windows.MB_ICONERROR)
 }
 
 // standardLogWriter is the destination of the standard library logger.
@@ -79,10 +75,12 @@ func (w *standardLogWriter) Write(p []byte) (int, error) {
 	standardLog.Error("third party message", "message", message)
 
 	// The message box is shown under the lock, so two messages never
-	// overlap and the order of the messages is kept.
+	// overlap and the order of the messages is kept. The window names the
+	// log this launch writes — the message above reached it — so the log
+	// is reachable from outside the window.
 	w.mu.Lock()
 	showMessage("HFDesk reported a problem",
-		fmt.Sprintf("A component of HFDesk reported the following problem:\n\n%s", message),
+		failureWindowText(fmt.Sprintf("A component of HFDesk reported the following problem:\n\n%s", message)),
 		windows.MB_ICONERROR)
 	w.mu.Unlock()
 	return len(p), nil

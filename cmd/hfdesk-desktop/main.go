@@ -24,7 +24,10 @@
 //
 //	--service-action install --wait-pid N --handover-ready-event NAME
 //	  --handover-success-event NAME --instance-mutex NAME [--desktop-state PATH]
+//	  [--log-file PATH]
 //	--service-action update|start [--instance-mutex NAME] [--desktop-state PATH]
+//	  [--log-file PATH]
+//	--service-action stop|uninstall [--desktop-state PATH] [--log-file PATH]
 //
 // and the helper performs the action, reports it in a native message box and
 // ends without a server, a tray icon or a window. An update or a start holds
@@ -99,12 +102,27 @@ func runWithArgs(args []string) int {
 		return 0
 	}
 
-	opts, usageText, err := parseHostOptions(args)
+	// The private tray-companion flags are separated from the host flags
+	// and are never part of the usage text — the command line of the
+	// relaunch the installation spawns, and a hand-typed companion
+	// launch. A half of that protocol (a wait without the companion
+	// mode, an unreadable duration) is a command line problem like every
+	// other one and is reported with the usage of the host.
+	companion, hostArgs, companionErr := desktop.SplitCompanionArgs(args)
+	opts, usageText, err := parseHostOptions(hostArgs)
 	if err != nil {
 		return desktop.ReportCommandLine(err, usageText)
 	}
+	if companionErr != nil {
+		return desktop.ReportCommandLine(companionErr, usageText)
+	}
 
-	if err := desktop.Run(desktop.Options{App: opts, Version: Version}); err != nil {
+	if err := desktop.Run(desktop.Options{
+		App:           opts,
+		Version:       Version,
+		Companion:     companion.Enabled,
+		CompanionWait: companion.Wait,
+	}); err != nil {
 		// The desktop host reports its failures to the user itself, in a
 		// native message box. On a platform without a desktop host there
 		// is no message box, so the error goes to the console.
@@ -151,20 +169,22 @@ func parseHostOptions(args []string) (app.Options, string, error) {
 }
 
 const serviceHelperUsage = "Usage: hfdesk-desktop --service-action install --wait-pid N " +
-	"--handover-ready-event NAME --handover-success-event NAME --instance-mutex NAME [--desktop-state PATH]\n" +
-	"       hfdesk-desktop --service-action update|start [--instance-mutex NAME] [--desktop-state PATH]"
+	"--handover-ready-event NAME --handover-success-event NAME --instance-mutex NAME [--desktop-state PATH] [--log-file PATH]\n" +
+	"       hfdesk-desktop --service-action update|start [--instance-mutex NAME] [--desktop-state PATH] [--log-file PATH]\n" +
+	"       hfdesk-desktop --service-action stop|uninstall [--desktop-state PATH] [--log-file PATH]"
 
 func parseServiceHelperCommand(args []string) (desktop.ServiceActionOptions, bool, error) {
 	var helper desktop.ServiceActionOptions
 	var action string
 	flags := flag.NewFlagSet("hfdesk-desktop-service", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	flags.StringVar(&action, "service-action", "", "install, update or start the HFDesk service")
+	flags.StringVar(&action, "service-action", "", "install, update, start, stop or uninstall the HFDesk service")
 	flags.IntVar(&helper.WaitPID, "wait-pid", 0, "the original desktop process")
 	flags.StringVar(&helper.ReadyEvent, "handover-ready-event", "", "the per-attempt helper-ready event")
 	flags.StringVar(&helper.SuccessEvent, "handover-success-event", "", "the per-attempt graceful-completion event")
 	flags.StringVar(&helper.InstanceMutex, "instance-mutex", "", "the existing per-session desktop singleton")
 	flags.StringVar(&helper.DesktopState, "desktop-state", "", "the published state file of the launching desktop")
+	flags.StringVar(&helper.LogFile, "log-file", "", "the log file of the launching desktop host")
 	err := flags.Parse(args)
 	if !hasServiceHelperArgument(args) {
 		return desktop.ServiceActionOptions{}, false, nil

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/service"
 )
@@ -32,9 +33,10 @@ func TestInstallServiceTextStatesWhatTheRegistrationChanges(t *testing.T) {
 		"The one file HFDesk can download",
 		"only after its SHA-256 is verified",
 		"nothing else is downloaded or copied",
+		"Its data is separate",
 		"settings, jobs and models",
 		dataDir,
-		"do not appear in the service",
+		"are not there",
 	})
 	// The narrowed rule must not read as the old blanket claim: the
 	// desktop app CAN download one file now, so "nothing is downloaded or
@@ -76,14 +78,19 @@ func TestServiceGateTextAsksToOpenARunningService(t *testing.T) {
 	text := serviceGateText(prompt)
 	assertNames(t, text, "the dialog", []string{
 		"The HFDesk service is running.",
-		"http://127.0.0.1:8080",
-		"started no server of its own",
-		"stopped service stays stopped",
+		"Web UI: http://127.0.0.1:8080",
+		"Its data is separate",
 		prompt.DataDir,
 	})
+	// The plan's target for this layout: the state, the address and the one
+	// surprising fact — no mechanism, no justification beside them.
 	if strings.Contains(text, "Work in desktop mode") {
 		t.Errorf("the dialog %q offers the desktop mode next to a running service", text)
 	}
+	assertNamesWithout(t, text, "the running dialog", nil, []string{
+		"two instances never compete",
+		"Update re-registers",
+	})
 
 	if got, want := serviceGateOpenLabel(prompt), "Open HFDesk"; got != want {
 		t.Errorf("the first button is %q, want %q", got, want)
@@ -118,10 +125,10 @@ func TestServiceGateTextAsksToStartAStoppedService(t *testing.T) {
 
 // TestServiceGateTextOffersTheDesktopModeForAStoppedService proves that the
 // dialog of a positively confirmed stopped service offers the desktop mode and
-// states what that answer does: it starts the server of this app, never starts
-// the service and leaves the registration alone. The dialog never claims an
-// address for a service that does not serve, and it never carries the sentence
-// of the dialogs that always end the launch, because this one can continue it.
+// states what that answer does: it starts the server of this app and leaves
+// the service stopped. The dialog never claims an address for a service that
+// does not serve, and it never carries the sentence of the dialogs that
+// always end the launch, because this one can continue it.
 func TestServiceGateTextOffersTheDesktopModeForAStoppedService(t *testing.T) {
 	prompt := serviceChoicePrompt{
 		State:   service.StateStopped,
@@ -132,18 +139,21 @@ func TestServiceGateTextOffersTheDesktopModeForAStoppedService(t *testing.T) {
 	text := serviceGateText(prompt)
 	assertNames(t, text, "the dialog", []string{
 		"installed, but it is not running",
-		"Work in desktop mode continues this launch as a normal desktop app",
-		"never starts the service",
-		"service stays stopped",
-		"stopped service stays stopped",
+		"Work in desktop mode starts this app's own server",
+		"the service stays stopped",
+		"Its data is separate",
 		prompt.DataDir,
 	})
 	assertNamesWithout(t, text, "the dialog", nil, []string{
 		// The service does not serve, so no address is offered.
 		"The web UI of the service is at",
 		// This dialog can continue the launch, so the sentence of the
-		// dialogs that always end it does not belong to it.
-		"started no server of its own",
+		// dialogs that always end it does not belong to it, and the
+		// text argues with no mechanism beside the one continuing
+		// answer.
+		"started no server",
+		"two instances never compete",
+		"Update re-registers",
 	})
 	if got, want := serviceGateDesktopLabel, "Work in desktop mode"; got != want {
 		t.Errorf("the desktop button is %q, want %q", got, want)
@@ -296,7 +306,7 @@ func TestServiceUpdatedTextKeepsAStoppedServiceStopped(t *testing.T) {
 		"HFDesk 1.3.0",
 		`C:\portable\hfdesk.exe`,
 		"stays stopped",
-		"never starts a stopped service",
+		"Nothing serves HFDesk right now",
 		"Start the desktop app again and choose Start service",
 	})
 	// One report, one route: the relaunch of the desktop app is the single
@@ -355,7 +365,6 @@ func TestServiceUpdatedTextNamesTheObservedPriorState(t *testing.T) {
 			assertNames(t, text, "the report", []string{
 				tc.quote,
 				"is not running after the update",
-				"never starts a service that was not running",
 				"stays stopped",
 				"Nothing serves HFDesk right now",
 				"Start the desktop app again and choose Start service",
@@ -610,7 +619,7 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 	cleanupErr := errors.New("the service process identity changed")
 	cleanup := &service.InstallStartError{Cause: reason, CleanupError: cleanupErr}
 	kept := serviceInstallStartFailureText(cleanup, program, cleanup)
-	assertNames(t, kept, "the kept-install report", []string{reason.Error(), cleanupErr.Error(), "registration was kept", "could not be proven", "hfdesk service status", program})
+	assertNames(t, kept, "the kept-install report", []string{reason.Error(), cleanupErr.Error(), "registration was kept", "could not prove", "hfdesk service status", program})
 	if strings.Contains(kept, "the service does not run") {
 		t.Errorf("the kept-install report %q claims more than the cleanup established", kept)
 	}
@@ -642,6 +651,98 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 	if got := strings.Count(removeText, "hfdesk service"); got != 1 {
 		t.Errorf("the stopped-but-kept report %q names %d commands, want exactly one", removeText, got)
 	}
+}
+
+// TestServiceInstallStartFailureTextSplitsTheStartOutcomeClasses proves that
+// the report of a failed first start names the class of the start outcome
+// instead of a generic "could not confirm", and that the not-ready class
+// names the budget that actually elapsed.
+//
+// A start that was not performed states that in its headline and never claims
+// a start could not be confirmed; a start that ran carries the one observed
+// line — the process ended before it came up, the service did not come up
+// within the applied budget, or the started service could not be verified.
+// The budget shown is the value the failing wait applied, so a different
+// applied budget must show a different number. An error classified by no site
+// keeps the older cause-only report.
+func TestServiceInstallStartFailureTextSplitsTheStartOutcomeClasses(t *testing.T) {
+	program := `C:\portable\hfdesk.exe`
+	cause := errors.New("the first installation did not put the new executable into service")
+	kept := func(outcome service.StartOutcome, budget time.Duration) *service.InstallStartError {
+		return &service.InstallStartError{
+			Cause:        cause,
+			Outcome:      outcome,
+			Budget:       budget,
+			CleanupError: errors.New("the registration was kept"),
+		}
+	}
+
+	notPerformed := serviceInstallStartFailureText(cause, program, kept(service.StartOutcomeNotPerformed, 0))
+	assertNamesWithout(t, notPerformed, "the not-performed report",
+		[]string{"HFDesk registered the service but did not start it.", cause.Error(), "registration was kept"},
+		[]string{"could not confirm"})
+
+	ended := serviceInstallStartFailureText(cause, program, kept(service.StartOutcomeEnded, 0))
+	assertNames(t, ended, "the ended report",
+		[]string{"could not confirm its start", "ended before it came up", "registration was kept"})
+
+	notReady := serviceInstallStartFailureText(cause, program, kept(service.StartOutcomeNotReady, 45*time.Second))
+	assertNames(t, notReady, "the not-ready report", []string{"did not come up within 45s"})
+	otherBudget := serviceInstallStartFailureText(cause, program, kept(service.StartOutcomeNotReady, 48*time.Second))
+	assertNamesWithout(t, otherBudget, "the not-ready report with another applied budget",
+		[]string{"did not come up within 48s"}, []string{"45s"})
+
+	// Even a mis-stamped budget never renders for another class: only the
+	// not-ready line may name a budget, so an interrupted or unverifiable
+	// wait can never claim "within <budget>" at the text layer.
+	unverified := serviceInstallStartFailureText(cause, program, kept(service.StartOutcomeUnverified, 45*time.Second))
+	assertNamesWithout(t, unverified, "the unverified report",
+		[]string{"could not verify the started service"}, []string{"did not come up within", "within 45s"})
+
+	legacyErr := &service.InstallStartError{Cause: cause, CleanupError: errors.New("ownership unproven")}
+	legacy := serviceInstallStartFailureText(legacyErr, program, legacyErr)
+	assertNamesWithout(t, legacy, "the unclassified report", []string{cause.Error(), "ownership unproven"},
+		[]string{"ended before", "did not come up", "could not verify the started service", "did not start it"})
+}
+
+// TestServiceInstallStartFailureTextDistinguishesRemovedFromNeverInstalled
+// proves that a registration this attempt removed after a failed start is
+// never worded like a machine that never had one: the removed report says
+// what the attempt removed and names its one action, while the never-installed
+// report is the only one that claims HFDesk is not installed at all.
+func TestServiceInstallStartFailureTextDistinguishesRemovedFromNeverInstalled(t *testing.T) {
+	program := `C:\portable\hfdesk.exe`
+	cause := errors.New("the service control manager refused the start")
+
+	removed := serviceInstallStartFailureText(cause, program, &service.InstallStartError{
+		Cause:               cause,
+		RegistrationRemoved: true,
+		RegistrationOwned:   true,
+		ProcessStopped:      true,
+		Outcome:             service.StartOutcomeNotPerformed,
+	})
+	assertNamesWithout(t, removed, "the removed-after-failure report",
+		[]string{"could not start it", "registration created by this attempt was removed",
+			"left no registration behind", "start the desktop app normally again"},
+		[]string{"HFDesk is not installed as a Windows service", "There is no service"})
+
+	never := serviceNotInstalledText(serviceActionStart)
+	assertNames(t, never, "the never-installed report",
+		[]string{"HFDesk is not installed as a Windows service", "Install it from the tray of the desktop app first"})
+
+	// The removed branch carries the start class too: a registration this
+	// attempt removed after a service that never came up within its budget
+	// states both facts, and still never claims the machine never had one.
+	removedNotReady := serviceInstallStartFailureText(cause, program, &service.InstallStartError{
+		Cause:               cause,
+		RegistrationRemoved: true,
+		Outcome:             service.StartOutcomeNotReady,
+		Budget:              45 * time.Second,
+	})
+	assertNamesWithout(t, removedNotReady, "the removed not-ready report",
+		[]string{"could not start it", "did not come up within 45s", "registration created by this attempt was removed",
+			"start the desktop app normally again"},
+		[]string{"HFDesk is not installed as a Windows service"})
 }
 
 // TestServiceGateUnreadableTextStatesWhatTheLaunchDid proves that the notice of
@@ -1208,10 +1309,9 @@ func TestServiceHelperNotReadyTextIsOneCoherentReport(t *testing.T) {
 		assertNames(t, text, "the report of", []string{
 			serviceActionUnchangedText(action),
 			"No service action was performed",
-			"the helper acts only after it becomes ready",
 			"desktop: the service helper exited before it became ready",
-			"shows its own message with the reason",
-			"Follow that message: it names the reason and the step that follows from it",
+			"Read the message the administrator helper showed",
+			"names the reason and the step that follows",
 		})
 		// One report, one unconditional action: the helper's own message
 		// is the single place that carries the real cause, so no
@@ -1247,12 +1347,6 @@ func TestServiceLaunchFailedTextKeepsTheNeverRanReport(t *testing.T) {
 		elevationDeclined,
 		"The service was not installed.",
 		"Repeat the action and approve the administrator prompt when Windows shows it",
-		// The persistent case has its own honest sentence: a prompt
-		// that never appears cannot be approved, so the report never
-		// promises the approval will come.
-		"prompt Windows never shows",
-		"cannot be approved",
-		"that cause stays",
 	})
 	assertNamesWithout(t, text, "the report", nil, []string{"hfdesk service status", "hfdesk service install", "hfdesk service uninstall", " or "})
 }
@@ -1270,4 +1364,449 @@ func TestUnknownServiceActionTextNamesOneAction(t *testing.T) {
 		"Start the desktop app again.",
 	})
 	assertNamesWithout(t, text, "the report", nil, []string{"hfdesk service status", "hfdesk service install", "elevated shell"})
+}
+
+// deletionClaimForms are the deletion-claim shapes the confirmations and
+// the reports of the removal must never carry beside the data the user
+// keeps: the plural and the singular, the past and the perfect — "was
+// removed" beside "has been removed". A stop list that pinned only the
+// plural let the singular regression through unnoticed, so every surface
+// that forbids a deletion claim consults this one list; the positive pins
+// ("stay untouched", the registration that "is removed") are phrased so
+// none of these forms touches them.
+var deletionClaimForms = []string{
+	"deleted", "erased", "cleared", "wiped",
+	"was removed", "were removed",
+	"has been removed", "have been removed",
+	"has been deleted", "has been erased", "has been cleared", "has been wiped",
+	"is deleted", "is erased", "is cleared",
+}
+
+// TestStopAndRemoveConfirmationsStateTheActionAndTheOneFact proves that the
+// two confirmations that guard the new machine-wide changes follow the shape
+// of the installation confirmation and the text rule of the reports: what the
+// action does, the administrator rights it needs, the one fact the user has
+// to see before agreeing, and the question — with no internal mechanism and
+// no claim about a state the confirmation did not read.
+func TestStopAndRemoveConfirmationsStateTheActionAndTheOneFact(t *testing.T) {
+	stop := stopServiceConfirmText()
+	assertNames(t, stop, "the stop confirmation", []string{
+		"This stops the HFDesk service.",
+		"administrator rights",
+		"Windows prompt follows",
+		"Nothing serves the address of the service until you start it again.",
+		"Do you want to stop the service?",
+	})
+	// The confirmation names no state of its own: the state the menu item
+	// was enabled by can be stale by the time the box is read, and no
+	// mechanism of the stop is the user's business.
+	assertNamesWithout(t, stop, "the stop confirmation", nil, []string{
+		"service control manager", "SCM", "registry", "is running", "was running",
+	})
+
+	remove := removeServiceConfirmText()
+	assertNames(t, remove, "the removal confirmation", []string{
+		"removes the Windows service registration of HFDesk",
+		"administrator rights",
+		"Windows prompt follows",
+		"settings, jobs, models, cache, history and logs stay untouched",
+		"Do you want to remove the registration?",
+	})
+	// The invariant of the removal is stated as what stays, and the
+	// confirmation never claims that any data is deleted — in any of the
+	// singular or plural, past or perfect shapes of such a claim.
+	forbidden := append(append([]string{}, deletionClaimForms...), "removed your", "will be removed")
+	assertNamesWithout(t, remove, "the removal confirmation", nil, forbidden)
+
+	if stopServiceConfirmCaption == "" || removeServiceConfirmCaption == "" {
+		t.Error("a confirmation of a new service action has no caption")
+	}
+	if stopServiceConfirmCaption == removeServiceConfirmCaption ||
+		stopServiceConfirmCaption == installServiceCaption || removeServiceConfirmCaption == installServiceCaption {
+		t.Errorf("the confirmations share a caption: %q, %q, %q",
+			stopServiceConfirmCaption, removeServiceConfirmCaption, installServiceCaption)
+	}
+}
+
+// TestServiceStoppedTextNamesTheStateTheFactAndOneWayBack proves that the
+// report of a stopped service is the state, the one fact the user did not
+// ask for — nothing serves the address of the service right now — and
+// exactly one way back. The way back goes through the quit and the startup
+// gate, because a start beside the desktop that runs this very tray is
+// refused by the established guard of the helper: a report that pointed at
+// that start would send the user into the refusal in a circle.
+func TestServiceStoppedTextNamesTheStateTheFactAndOneWayBack(t *testing.T) {
+	text := serviceStoppedText()
+	assertNames(t, text, "the report", []string{
+		"The HFDesk service is stopped.",
+		"Nothing serves the address of the service right now.",
+		"Quit HFDesk from the notification-area icon",
+		"choose Start service",
+	})
+	// One report, one route: no elevated command line and no alternative
+	// beside the established way.
+	assertNamesWithout(t, text, "the report", nil, []string{`"hfdesk service`, " or ", "elevated shell"})
+	if serviceStoppedCaption == "" {
+		t.Error("the report of a stopped service has no caption")
+	}
+}
+
+// TestServiceRegistrationRemovedTextNeverClaimsDataDeletion proves the
+// invariant of the removal report: it names the state (the registration is
+// gone), states that every data the user keeps stays untouched, and offers
+// the one way back — while it never claims, hints or implies that any data
+// was deleted, because the removal writes no file and deletes no directory.
+func TestServiceRegistrationRemovedTextNeverClaimsDataDeletion(t *testing.T) {
+	text := serviceRegistrationRemovedText()
+	assertNames(t, text, "the report", []string{
+		"The Windows service registration of HFDesk is removed.",
+		"settings, jobs, models, cache, history and logs stay untouched",
+		"Install the service again from the tray of the desktop app",
+	})
+	// Every data noun appears only in the "stay untouched" sentence: the
+	// report never pairs any of them with a deletion — in any of the
+	// singular or plural, past or perfect shapes of such a claim.
+	assertNamesWithout(t, text, "the report", nil, deletionClaimForms)
+	// One report, one route: the installation is the single named action.
+	if got := strings.Count(text, "Install the service again"); got != 1 {
+		t.Errorf("the report names the way back %d times, want exactly one", got)
+	}
+	if serviceRegistrationRemovedCaption == "" {
+		t.Error("the report of a removed registration has no caption")
+	}
+}
+
+// TestServiceNoRegistrationTextStatesTheCleanOutcome proves that a removal
+// that found no registration reports the same clean outcome the command
+// line reports — without claiming a removal that never happened.
+func TestServiceNoRegistrationTextStatesTheCleanOutcome(t *testing.T) {
+	text := serviceNoRegistrationText()
+	assertNames(t, text, "the report", []string{
+		"HFDesk is not registered as a Windows service.",
+		"There was no registration to remove, so nothing was changed.",
+	})
+	assertNamesWithout(t, text, "the report", nil, []string{
+		"registration of HFDesk is removed", "stay untouched",
+	})
+	if serviceNoRegistrationCaption == serviceRegistrationRemovedCaption {
+		t.Errorf("the report of a machine without a registration shares the caption of a real removal: %q",
+			serviceNoRegistrationCaption)
+	}
+}
+
+// TestNewServiceActionReportClasses pins the report family of the two new
+// actions beside the classes the reports of the established actions already
+// have: a caption per failed action, the headline of a failure, the result
+// sentence of a report whose helper never ran, and the settled state of an
+// action that found no registration. None of them claims a state the action
+// did not observe.
+func TestNewServiceActionReportClasses(t *testing.T) {
+	if got, want := serviceFailureCaption(serviceActionStop), "HFDesk - the service did not stop"; got != want {
+		t.Errorf("the failure caption of the stop is %q, want %q", got, want)
+	}
+	if got, want := serviceFailureCaption(serviceActionUninstall), "HFDesk - the service registration was not removed"; got != want {
+		t.Errorf("the failure caption of the removal is %q, want %q", got, want)
+	}
+	if got, want := serviceActionFailureHeadline(serviceActionStop), "HFDesk could not stop the Windows service."; got != want {
+		t.Errorf("the failure headline of the stop is %q, want %q", got, want)
+	}
+	if got, want := serviceActionFailureHeadline(serviceActionUninstall), "HFDesk could not remove the Windows service registration."; got != want {
+		t.Errorf("the failure headline of the removal is %q, want %q", got, want)
+	}
+	if got, want := serviceActionUnchangedText(serviceActionStop), "The service was not stopped."; got != want {
+		t.Errorf("the unchanged result of the stop is %q, want %q", got, want)
+	}
+	if got, want := serviceActionUnchangedText(serviceActionUninstall), "The registration was not removed."; got != want {
+		t.Errorf("the unchanged result of the removal is %q, want %q", got, want)
+	}
+
+	// A machine without a registration: the stop names the settled state
+	// alone — installing a service the user asked to stop would answer a
+	// question they did not ask — while the established actions keep the
+	// guidance they have.
+	stop := serviceNotInstalledText(serviceActionStop)
+	assertNames(t, stop, "the not-installed report of the stop", []string{
+		"HFDesk is not installed as a Windows service.",
+		"There is no service to stop.",
+	})
+	assertNamesWithout(t, stop, "the not-installed report of the stop", nil,
+		[]string{"Install it from the tray", "There is no service to start"})
+	start := serviceNotInstalledText(serviceActionStart)
+	assertNames(t, start, "the not-installed report of the start", []string{
+		"There is no service to start.", "Install it from the tray of the desktop app first.",
+	})
+
+	// The failure of each new action is the headline, the cause of the
+	// manager on its line and the single state command — it never claims
+	// an outcome the action did not observe.
+	reason := errors.New("the service control manager refused the operation")
+	for _, action := range []serviceAction{serviceActionStop, serviceActionUninstall} {
+		text := serviceActionFailureText(action, reason, "")
+		assertNames(t, text, "the failure report", []string{
+			serviceActionFailureHeadline(action), reason.Error(), `"hfdesk service status"`,
+		})
+		if got := strings.Count(text, "hfdesk service"); got != 1 {
+			t.Errorf("the failure report of %q names %d commands, want exactly one", action, got)
+		}
+		assertNamesWithout(t, text, "the failure report", nil, []string{
+			"The service was stopped", "is stopped.", "was removed", "is removed.",
+		})
+	}
+}
+
+// TestServiceActionBusyTextIsResultCauseAndOneAction proves that the refusal
+// of a second service action while one runs reports the result (this action
+// was not started), the cause on its line and the one action that ends it —
+// and names no state, because the running action is the one that moves it.
+func TestServiceActionBusyTextIsResultCauseAndOneAction(t *testing.T) {
+	text := serviceActionBusyText()
+	assertNames(t, text, "the refusal", []string{
+		"Another HFDesk service action is already running",
+		"this action was not started",
+		"Wait for the running action to finish, then try again.",
+	})
+	assertNamesWithout(t, text, "the refusal", nil, []string{
+		"hfdesk service", "is running.", "is stopped.",
+	})
+	if serviceActionBusyCaption == "" {
+		t.Error("the refusal of a concurrent service action has no caption")
+	}
+}
+
+// useLogPath points the log-path seam of the failure windows at path for the
+// duration of the test and restores it afterwards, so the windows of another
+// test never inherit a path.
+func useLogPath(t *testing.T, path string) {
+	t.Helper()
+	previous := runLogPath
+	runLogPath = path
+	t.Cleanup(func() { runLogPath = previous })
+}
+
+// TestFailureWindowsNameTheLogFileOfThisLaunch proves the rule of the fifth
+// plan item for the whole family: every window that reports a failure of
+// this launch carries the one standard line with the path of the log file of
+// this launch, so the log is reachable from outside the window — named
+// exactly once, and never with the path baked in twice.
+//
+// The path is the seam runLogPath: the host sets it when its logging
+// pipeline is installed and the elevated helper sets it from the path the
+// launching host passed, so the line names the file this run really writes
+// (the configured one, or the default %LocalAppData%\HFDesk\logs\hfdesk.log
+// of an unconfigured host) instead of a hard-coded guess.
+//
+// The exception is pinned explicitly with the empty path: a launch that
+// installed no logging pipeline names no file, because there is none — the
+// single instance refusal before logging starts, the log directory or file
+// that could not be opened, a command line error, and a second launch, whose
+// log belongs to the running instance. logFileLine("") returns no line, and
+// the windows whose path is passed by the box that shows them
+// (reportStartupFailure with an explicit path) never bake one in beside it.
+func TestFailureWindowsNameTheLogFileOfThisLaunch(t *testing.T) {
+	const path = `C:\Users\ada\AppData\Local\HFDesk\logs\hfdesk.log`
+	useLogPath(t, path)
+	wantLine := "The log file is at " + path + "."
+
+	cause := errors.New("the service control manager did not answer")
+	program := `C:\portable\hfdesk.exe`
+	kept := &service.InstallStartError{Cause: cause, CleanupError: errors.New("the process identity changed")}
+	removed := &service.InstallStartError{Cause: cause, RegistrationRemoved: true}
+	notice := newSiblingMissingNotice(serviceActionInstall, `C:\portable`,
+		filepath.Join(`C:\portable`, "hfdesk-desktop.exe"), cause, nil)
+	downloadNotice := newSiblingMissingNotice(serviceActionInstall, `C:\portable`,
+		filepath.Join(`C:\portable`, "hfdesk-desktop.exe"), cause, &consoleDownloadOffer{
+			Release: consoleRelease{Tag: testReleaseTag, Asset: testReleaseAsset},
+			Size:    1024,
+		})
+
+	windows := map[string]string{
+		"the installation failure": serviceActionFailureText(serviceActionInstall, cause, program),
+		"the update failure":       serviceActionFailureText(serviceActionUpdate, cause, program),
+		"the start failure":        serviceActionFailureText(serviceActionStart, cause, program),
+		"the stop failure":         serviceActionFailureText(serviceActionStop, cause, program),
+		"the removal failure":      serviceActionFailureText(serviceActionUninstall, cause, program),
+		"the already-registered refusal": serviceActionFailureText(serviceActionInstall,
+			fmt.Errorf("service: hfdesk is already registered%w", service.ErrAlreadyRegistered), program),
+		"the kept-start failure":      serviceInstallStartFailureText(kept, program, kept),
+		"the removed-start failure":   serviceInstallStartFailureText(removed, program, removed),
+		"the singleton refusal":       serviceSingletonHoldRefusedText(serviceActionUpdate, cause),
+		"the serving-desktop refusal": serviceServingDesktopRefusedText(serviceActionStart),
+		"the unreadable-state refusal": serviceUnreadableClaimRefusedText(serviceActionInstall,
+			`C:\Users\ada\AppData\Roaming\HFDesk\desktop-state.json`),
+		"the not-installed report": serviceNotInstalledText(serviceActionStart),
+		"the busy refusal":         serviceActionBusyText(),
+		"the not-ready report": serviceHelperNotReadyText(serviceActionInstall,
+			&helperNotReadyError{cause: errors.New("the service helper exited before it became ready")}),
+		"the launch-failure report":     serviceLaunchFailedText(serviceActionInstall, cause),
+		"the unknown-action report":     unknownServiceActionText(errors.New("unknown service action")),
+		"the preparation refusal":       serviceHandoverRefusedText(cause),
+		"the unfinished-install report": serviceHandoverFailureText(cause),
+		"the unreadable gate notice":    serviceGateUnreadableText(cause),
+		"the changed gate notice":       serviceGateChangedText(serviceChoicePrompt{State: service.StateRunning}),
+		"the download failure":          consoleDownloadFailedText(downloadNotice, cause),
+		"the missing-program notice":    siblingMissingManualNoticeText(notice),
+		"the browser failure":           browserOpenFailedText("http://127.0.0.1:8080", cause),
+		"the tray-startup failure":      trayStartupFailureText(),
+		"the runtime-window failure":    runtimeWindowShowFailedText(errors.New("the window could not be shown")),
+	}
+	for name, text := range windows {
+		if !strings.Contains(text, wantLine) {
+			t.Errorf("the %s does not name the log file of this launch:\n%s", name, text)
+		}
+		if got := strings.Count(text, "The log file is at"); got != 1 {
+			t.Errorf("the %s names the log file %d times, want exactly once:\n%s", name, got, text)
+		}
+	}
+
+	// A launch without a log file names none: logFileLine is the whole
+	// pre-logging rule, and every pre-logging window reaches the box
+	// through it (reportStartupFailure with an empty path, the singleton
+	// refusal, the command line error, the log that could not be opened,
+	// the second launch).
+	if line := logFileLine(""); line != "" {
+		t.Errorf("logFileLine of an empty path = %q, want no line for a launch without a log file", line)
+	}
+	if line := logFileLine("   "); line != "" {
+		t.Errorf("logFileLine of a blank path = %q, want no line", line)
+	}
+
+	// The windows whose path is passed by the box that shows them never
+	// bake a line in beside that explicit argument — otherwise a box that
+	// appends the real path would show it twice, and a pre-logging box
+	// that passes "" would still name a file this run does not write.
+	for name, text := range map[string]string{
+		"the unpublished-URL report":   publishStateStartupText(cause),
+		"the unpublished-claim report": publishClaimStartupText(cause),
+	} {
+		if strings.Contains(text, "The log file is at") {
+			t.Errorf("the %s bakes in a log path beside the path its box passes:\n%s", name, text)
+		}
+	}
+
+	// The choice dialog and the success reports are not failure windows:
+	// they carry state and actions, never the log line.
+	notFailure := map[string]string{
+		"the gate of a running service": serviceGateText(serviceChoicePrompt{
+			State: service.StateRunning, URL: "http://127.0.0.1:8080", DataDir: `C:\ProgramData\HFDesk`}),
+		"the installation confirmation":   installServiceText(`C:\ProgramData\HFDesk`),
+		"the report of an installation":   serviceInstalledText("1.3.0", program, `C:\ProgramData\HFDesk`, "http://127.0.0.1:8080"),
+		"the report of a stopped service": serviceStoppedText(),
+	}
+	for name, text := range notFailure {
+		if strings.Contains(text, "The log file is at") {
+			t.Errorf("the %s carries the failure-only log line:\n%s", name, text)
+		}
+	}
+}
+
+// TestGateAndReportsCarryNoInternalMechanism pins the rule of the sixth plan
+// item for the gate family and the reports: state plus at most one action,
+// and no internal mechanism in the text the window itself writes — no
+// guards, admissions, cadences, algorithms or flags, no coordination
+// vocabulary, no argument about why the buttons are right. The causes a
+// report carries verbatim are outside this rule (they are the one fact line
+// of the window), so every text below is built with a neutral cause.
+func TestGateAndReportsCarryNoInternalMechanism(t *testing.T) {
+	banned := []string{
+		"guard", "admission", "cadence", "algorithm", "flag",
+		"singleton", "mutex", "claim", "handover", "rotation",
+		// The two justifications the gate used to argue with.
+		"two instances never compete", "Update re-registers",
+	}
+	cause := errors.New("the state of the service could not be settled")
+	program := `C:\portable\hfdesk.exe`
+	dataDir := `C:\ProgramData\HFDesk`
+	notice := newSiblingMissingNotice(serviceActionInstall, `C:\portable`,
+		filepath.Join(`C:\portable`, "hfdesk-desktop.exe"), cause, nil)
+
+	texts := map[string]string{
+		"the running gate": serviceGateText(serviceChoicePrompt{
+			State: service.StateRunning, URL: "http://127.0.0.1:8080", DataDir: dataDir}),
+		"the stopped gate": serviceGateText(serviceChoicePrompt{
+			State: service.StateStopped, DataDir: dataDir}),
+		"the failed gate": serviceGateText(serviceChoicePrompt{
+			State: service.StateFailed, Detail: "the instance exited with the code 1", DataDir: dataDir}),
+		"the broken gate with a running instance": serviceGateText(serviceChoicePrompt{
+			State: service.StateBroken, Running: true, DataDir: dataDir}),
+		"the pending notice":            serviceGatePendingText(service.StateStarting),
+		"the unreadable notice":         serviceGateUnreadableText(cause),
+		"the changed notice":            serviceGateChangedText(serviceChoicePrompt{State: service.StateRunning}),
+		"the installation confirmation": installServiceText(dataDir),
+		"the stop confirmation":         stopServiceConfirmText(),
+		"the removal confirmation":      removeServiceConfirmText(),
+		"the installation failure":      serviceActionFailureText(serviceActionInstall, cause, program),
+		"the kept-start failure": serviceInstallStartFailureText(
+			&service.InstallStartError{Cause: cause, CleanupError: errors.New("the process identity changed")}, program,
+			&service.InstallStartError{Cause: cause, CleanupError: errors.New("the process identity changed")}),
+		"the already-registered refusal": serviceActionFailureText(serviceActionInstall,
+			fmt.Errorf("service: hfdesk is already registered%w", service.ErrAlreadyRegistered), program),
+		"the not-ready report": serviceHelperNotReadyText(serviceActionStart,
+			&helperNotReadyError{cause: cause}),
+		"the launch-failure report":     serviceLaunchFailedText(serviceActionStart, cause),
+		"the preparation refusal":       serviceHandoverRefusedText(cause),
+		"the unfinished-install report": serviceHandoverFailureText(cause),
+		"the serving-desktop refusal":   serviceServingDesktopRefusedText(serviceActionStart),
+		"the unreadable-state refusal": serviceUnreadableClaimRefusedText(serviceActionStart,
+			`C:\Users\ada\AppData\Roaming\HFDesk\desktop-state.json`),
+		"the not-installed report":   serviceNotInstalledText(serviceActionStart),
+		"the busy refusal":           serviceActionBusyText(),
+		"the unknown-action report":  unknownServiceActionText(cause),
+		"the stopped report":         serviceStoppedText(),
+		"the removed report":         serviceRegistrationRemovedText(),
+		"the no-registration report": serviceNoRegistrationText(),
+		"the missing-program notice": siblingMissingManualNoticeText(notice),
+	}
+	for name, text := range texts {
+		lower := strings.ToLower(text)
+		for _, word := range banned {
+			if strings.Contains(lower, word) {
+				t.Errorf("the %s carries the internal word %q:\n%s", name, word, text)
+			}
+		}
+	}
+}
+
+// TestInstallStartFailureStatesTheCleanupFactOnce closes F2: the report of a
+// failed first start states the cleanup fact exactly once. The service layer
+// states it in the message of its error ("(the registration was kept…)",
+// "(the failed instance was settled…)"), and the report states it in its own
+// outcome sentence — two formulations of one fact in one window. The report
+// now takes only the cause and the cleanup reason from the error and keeps
+// its own sentence as the single formulation, while the cause, the reason and
+// every class of the start outcome stay what they were.
+func TestInstallStartFailureStatesTheCleanupFactOnce(t *testing.T) {
+	program := `C:\portable\hfdesk.exe`
+	cause := errors.New("the first installation did not put the new executable into service")
+	reason := errors.New("the service process identity changed")
+
+	// The production shape: the error the helper receives IS the cleanup
+	// record, so its message carries the gloss the report must not repeat.
+	kept := &service.InstallStartError{Cause: cause, CleanupError: reason}
+	keptText := serviceInstallStartFailureText(kept, program, kept)
+	assertNames(t, keptText, "the kept report", []string{
+		cause.Error(), reason.Error(), "registration was kept",
+	})
+	if got := strings.Count(keptText, "kept"); got != 1 {
+		t.Errorf("the kept report states the cleanup fact %d times, want once:\n%s", got, keptText)
+	}
+	for _, gloss := range []string{
+		"(the registration was kept", "(the failed instance was settled",
+		"(the failed process was stopped", "(the failed process was proven",
+	} {
+		if strings.Contains(keptText, gloss) {
+			t.Errorf("the kept report repeats the service layer's gloss %q:\n%s", gloss, keptText)
+		}
+	}
+
+	removed := &service.InstallStartError{Cause: cause, RegistrationRemoved: true}
+	removedText := serviceInstallStartFailureText(removed, program, removed)
+	assertNames(t, removedText, "the removed report", []string{
+		cause.Error(), "registration created by this attempt was removed",
+		"start the desktop app normally again",
+	})
+	assertNamesWithout(t, removedText, "the removed report", nil,
+		[]string{"HFDesk is not installed as a Windows service", "(the failed instance was settled"})
+	if got := strings.Count(removedText, "removed"); got != 1 {
+		t.Errorf("the removed report states the cleanup fact %d times, want once:\n%s", got, removedText)
+	}
 }

@@ -16,7 +16,7 @@ import (
 // ErrUnsupportedServiceAction is returned by RunServiceAction on a platform
 // that has no Windows service helper.
 var ErrUnsupportedServiceAction = errors.New(
-	"desktop: installing, updating and starting the HFDesk service is only supported on Windows")
+	"desktop: installing, updating, starting, stopping and removing the registration of the HFDesk service is only supported on Windows")
 
 // elevationDeclined is the reason of a refused request for administrator
 // rights.
@@ -42,16 +42,42 @@ const (
 	// serviceActionStart starts the registered service and verifies that
 	// it runs.
 	serviceActionStart serviceAction = "start"
+	// serviceActionStop stops the registered service and verifies that it
+	// settled. It starts nothing and binds no address, so it holds no
+	// desktop singleton (see serviceActionHoldsSingleton).
+	serviceActionStop serviceAction = "stop"
+	// serviceActionUninstall removes the registration of the service and
+	// only that: the config file, the jobs, the history, the logs, the
+	// models and the cache are never touched — the literal invariant of
+	// `hfdesk service uninstall`, performed through the very same
+	// Manager.Uninstall of the service layer. A running instance is
+	// stopped inside that call, as part of the removal.
+	serviceActionUninstall serviceAction = "uninstall"
 )
+
+// serviceActionHoldsSingleton reports whether the action of the helper holds
+// the per-session desktop singleton across its mutation.
+//
+// A start and an update take the service onto the address a relaunch of this
+// session would bind, so both hold the singleton from before their first
+// change through the whole mutation — the gate passes the lock of its launch,
+// a hand-typed command line computes the object of the helper's own session.
+// A stop and a removal start nothing and only free state, so they are launched
+// without a singleton and never hold one. The tray side consults the same
+// predicate before it names an --instance-mutex argument, so the two sides can
+// never disagree about which actions hold the window.
+func serviceActionHoldsSingleton(action serviceAction) bool {
+	return action == serviceActionUpdate || action == serviceActionStart
+}
 
 // ServiceActionOptions describes one invocation of the elevated helper.
 //
 // The flags are private to the desktop executable: they are not part of the
 // shared options of the server host, and they are not documented in its usage.
 type ServiceActionOptions struct {
-	// Action is the action the helper performs: "install", "update" or
-	// "start". Every other value is reported and ends the helper with a
-	// failure.
+	// Action is the action the helper performs: "install", "update",
+	// "start", "stop" or "uninstall". Every other value is reported and
+	// ends the helper with a failure.
 	Action string
 
 	// WaitPID is the original desktop process for a tray-install handover.
@@ -88,6 +114,13 @@ type ServiceActionOptions struct {
 	// desktop of the originating user. Empty keeps the claim directory of
 	// the helper's own session.
 	DesktopState string
+
+	// LogFile is the path of the log file the launching desktop host
+	// writes. The windows this helper shows name that path, so the log is
+	// reachable from outside the window: the host records the action it
+	// launched and the exit of this helper there. Empty (a hand-typed
+	// command line) names the default per-user log of this session.
+	LogFile string
 }
 
 // parseServiceAction converts the value of the helper flag into an action.
@@ -98,11 +131,13 @@ type ServiceActionOptions struct {
 func parseServiceAction(value string) (serviceAction, error) {
 	action := serviceAction(strings.ToLower(strings.TrimSpace(value)))
 	switch action {
-	case serviceActionInstall, serviceActionUpdate, serviceActionStart:
+	case serviceActionInstall, serviceActionUpdate, serviceActionStart,
+		serviceActionStop, serviceActionUninstall:
 		return action, nil
 	default:
-		return "", fmt.Errorf("desktop: unknown service action %q (want %q, %q or %q)",
-			value, serviceActionInstall, serviceActionUpdate, serviceActionStart)
+		return "", fmt.Errorf("desktop: unknown service action %q (want %q, %q, %q, %q or %q)",
+			value, serviceActionInstall, serviceActionUpdate, serviceActionStart,
+			serviceActionStop, serviceActionUninstall)
 	}
 }
 
@@ -125,6 +160,13 @@ const (
 	// the registration stays untouched and the service stays stopped. The
 	// gate honors it only for a positively confirmed stopped service.
 	serviceChoiceDesktop
+	// serviceChoiceCompanion continues the launch as a tray companion:
+	// the tray icon, the service actions and the Runtime / Logs window
+	// WITHOUT a server of this launch, so the registration keeps serving
+	// the address alone. Unlike the desktop mode it is honored for every
+	// registration state the gate asks about: the companion binds no
+	// address, so no state can make the two instances compete for one.
+	serviceChoiceCompanion
 )
 
 // serviceChoicePrompt describes the choice the service gate asks the user. The
@@ -149,6 +191,14 @@ type serviceChoicePrompt struct {
 	// Detail is the human readable detail of the state, when the service
 	// reports one.
 	Detail string
+
+	// OfferCompanion adds the tray-companion choice to the buttons of the
+	// dialog. Only the launch gate sets it: a launch with a registration
+	// may decide to work as a tray companion beside the service. The
+	// registered-service dialog of a RUNNING desktop never offers it —
+	// that dialog runs beside a desktop that already serves its own
+	// address, and none of its answers switches the mode of this host.
+	OfferCompanion bool
 }
 
 // serviceStateRunning reports whether the state is a service that serves.

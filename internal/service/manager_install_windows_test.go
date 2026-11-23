@@ -1905,8 +1905,9 @@ func TestSCMFirstInstallUsesTheRealImageAccessAndHealthProbePaths(t *testing.T) 
 			}
 			if tc.wantErr {
 				var startErr *InstallStartError
-				if !errors.As(err, &startErr) || !errors.Is(err, errServiceVersionMismatch) || !startErr.RegistrationRemoved {
-					t.Fatalf("startFirstRegistration() error = %v, want the observed mismatch and owned cleanup", err)
+				if !errors.As(err, &startErr) || !errors.Is(err, errServiceVersionMismatch) || !startErr.RegistrationRemoved ||
+					startErr.Outcome != StartOutcomeUnverified {
+					t.Fatalf("startFirstRegistration() error = %v, want the observed mismatch, its unverified class and owned cleanup", err)
 				}
 				if controls != 1 || deletes != 1 {
 					t.Errorf("mismatch cleanup controls=%d deletes=%d, want one stop and removal on the same handle", controls, deletes)
@@ -2124,4 +2125,167 @@ func TestSCMConfigExecutableNamesTheProgramOfTheRegistration(t *testing.T) {
 	if got := scmConfigExecutable(mgr.Config{BinaryPathName: ""}); got != "" {
 		t.Errorf("scmConfigExecutable(an empty command line) = %q, want no program", got)
 	}
+}
+
+// TestFirstInstallStartClassifiesTheObservedOutcome drives the first-start
+// path through its outcome classes and proves that the class the report
+// depends on is stamped on the ownership-scoped cleanup result: a refused
+// start, a service that never settled within the budget the wait actually
+// applied, a process the control manager reported as stopped, and a started
+// instance whose verification failed. It also pins that the readiness probe
+// is handed the listen address of the registration's argument vector — not a
+// default and not a desktop address.
+//
+// Windows-only: the classification lives in the service control manager path
+// of the elevated helper.
+func TestFirstInstallStartClassifiesTheObservedOutcome(t *testing.T) {
+	newTarget := func(status svc.Status, config mgr.Config) *scmTestFirstInstallTarget {
+		return &scmTestFirstInstallTarget{status: status, config: config}
+	}
+	runFirstStart := func(t *testing.T, target *scmTestFirstInstallTarget, opts InstallOptions, config mgr.Config) *InstallStartError {
+		t.Helper()
+		_, _, err := (&scmManager{scope: ScopeSystem}).startFirstRegistration(
+			context.Background(), target, opts, config)
+		var startErr *InstallStartError
+		if !errors.As(err, &startErr) {
+			t.Fatalf("startFirstRegistration() error = %v, want *InstallStartError", err)
+		}
+		return startErr
+	}
+
+	t.Run("the service control manager refused the start", func(t *testing.T) {
+		opts := scmTestFirstInstallOptions(t, "127.0.0.1:18081", "")
+		config := buildSCMConfig(opts)
+		target := newTarget(svc.Status{State: svc.Stopped}, config)
+		target.startErr = errors.New("Access is denied")
+
+		startErr := runFirstStart(t, target, opts, config)
+		if startErr.Outcome != StartOutcomeNotPerformed || !startErr.RegistrationRemoved {
+			t.Errorf("outcome=%q removed=%t, want a refused start classified as not-performed with its owned registration removed",
+				startErr.Outcome, startErr.RegistrationRemoved)
+		}
+		if target.starts != 1 || target.deletes != 1 {
+			t.Errorf("starts=%d deletes=%d, want the start attempted once and the owned registration removed",
+				target.starts, target.deletes)
+		}
+	})
+
+	t.Run("the service never came up within the applied budget", func(t *testing.T) {
+		previousBudget := scmVerifyBudget
+		scmVerifyBudget = 150 * time.Millisecond
+		t.Cleanup(func() { scmVerifyBudget = previousBudget })
+
+		opts := scmTestFirstInstallOptions(t, "127.0.0.1:18081", "")
+		config := buildSCMConfig(opts)
+		target := newTarget(svc.Status{State: svc.StartPending}, config)
+
+		startErr := runFirstStart(t, target, opts, config)
+		if startErr.Outcome != StartOutcomeNotReady || startErr.Budget != scmVerifyBudget {
+			t.Errorf("outcome=%q budget=%s, want not-ready stamped with the budget the wait applied (%q, %s)",
+				startErr.Outcome, startErr.Budget, StartOutcomeNotReady, scmVerifyBudget)
+		}
+		if startErr.RegistrationRemoved || startErr.CleanupError == nil {
+			t.Errorf("removed=%t cleanup=%v, want the kept registration of a process that was never proven stopped",
+				startErr.RegistrationRemoved, startErr.CleanupError)
+		}
+		if target.starts != 1 || target.controls != 0 || target.deletes != 0 {
+			t.Errorf("starts=%d controls=%d deletes=%d, want one start and an untouched registration",
+				target.starts, target.controls, target.deletes)
+		}
+	})
+
+	t.Run("the started process was observed stopped", func(t *testing.T) {
+		previousBudget := scmVerifyBudget
+		scmVerifyBudget = 150 * time.Millisecond
+		t.Cleanup(func() { scmVerifyBudget = previousBudget })
+
+		opts := scmTestFirstInstallOptions(t, "127.0.0.1:18081", "")
+		config := buildSCMConfig(opts)
+		target := newTarget(svc.Status{State: svc.Stopped, Win32ExitCode: 1}, config)
+
+		startErr := runFirstStart(t, target, opts, config)
+		if startErr.Outcome != StartOutcomeEnded {
+			t.Errorf("outcome=%q, want the observed state classified as ended", startErr.Outcome)
+		}
+		// The report's cause carries the facts the control manager
+		// reported: the named state and the exit code, not a raw number.
+		assertNoErrorMatches := func(want string) {
+			t.Helper()
+			if !strings.Contains(startErr.Error(), want) {
+				t.Errorf("error = %q, want the fact %q", startErr.Error(), want)
+			}
+		}
+		assertNoErrorMatches(`state "stopped"`)
+		assertNoErrorMatches("exit code 1")
+		if !startErr.RegistrationRemoved || target.deletes != 1 {
+			t.Errorf("removed=%t deletes=%d, want the stopped owned registration removed", startErr.RegistrationRemoved, target.deletes)
+		}
+	})
+
+	t.Run("the wait was interrupted before its own budget elapsed", func(t *testing.T) {
+		// The readiness budget stays at its full value: only the action
+		// context ends the wait, so the report must claim no budget and no
+		// not-ready class — the interruption is the observed outcome.
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		t.Cleanup(cancel)
+
+		opts := scmTestFirstInstallOptions(t, "127.0.0.1:18081", "")
+		config := buildSCMConfig(opts)
+		target := newTarget(svc.Status{State: svc.StartPending}, config)
+
+		_, _, err := (&scmManager{scope: ScopeSystem}).startFirstRegistration(ctx, target, opts, config)
+		var startErr *InstallStartError
+		if !errors.As(err, &startErr) {
+			t.Fatalf("startFirstRegistration() error = %v, want *InstallStartError", err)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("error = %v, want the context interruption as its cause", err)
+		}
+		if startErr.Outcome != StartOutcomeUnverified || startErr.Budget != 0 {
+			t.Errorf("outcome=%q budget=%s, want the interrupted wait classified as unverified without any budget",
+				startErr.Outcome, startErr.Budget)
+		}
+		if claim := fmt.Sprintf("within %s", scmVerifyBudget); strings.Contains(startErr.Error(), claim) {
+			t.Errorf("error = %q, must not claim the unelapsed readiness budget %q", startErr.Error(), claim)
+		}
+		if target.controls != 0 || target.deletes != 0 {
+			t.Errorf("controls=%d deletes=%d, want the unproven process left with its kept registration",
+				target.controls, target.deletes)
+		}
+	})
+
+	t.Run("the started instance could not be verified", func(t *testing.T) {
+		opts := scmTestFirstInstallOptions(t, "127.0.0.1:18081", "1.4.0")
+		config := buildSCMConfig(opts)
+		var probedListen string
+		replaceSCMTestSeam(t, &serviceInstallProbe, func(listen, _ string) (bool, error) {
+			probedListen = listen
+			return false, fmt.Errorf("the health endpoint reports another version: %w", errServiceVersionMismatch)
+		})
+		target := newTarget(svc.Status{State: svc.Running, ProcessId: 8142}, config)
+		target.imageCheck = scmImageVerified
+
+		startErr := runFirstStart(t, target, opts, config)
+		if startErr.Outcome != StartOutcomeUnverified || startErr.Budget != 0 {
+			t.Errorf("outcome=%q budget=%s, want the mismatch classified as unverified without a budget",
+				startErr.Outcome, startErr.Budget)
+		}
+		// The probe asks the address of the registration's own argument
+		// vector: the listen value RunArgs writes is the listen value the
+		// probe dials, so neither a default nor a desktop address can slip
+		// between the registration and its verification.
+		want := ""
+		args := RunArgs(opts)
+		for i, arg := range args {
+			if arg == "--listen" && i+1 < len(args) {
+				want = args[i+1]
+			}
+		}
+		if want != "127.0.0.1:18081" || probedListen != want {
+			t.Errorf("registration --listen=%q, probe asked %q, want the probe on the registration's address", want, probedListen)
+		}
+		if !startErr.RegistrationRemoved {
+			t.Errorf("removed=%t, want the owned failing instance settled and removed", startErr.RegistrationRemoved)
+		}
+	})
 }
