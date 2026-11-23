@@ -511,6 +511,14 @@ type InstallStartError struct {
 	// StartOutcomeNotReady: the value the failing wait actually applied,
 	// not a constant of another layer.
 	Budget time.Duration
+	// Observation is the clean inner observation of the readiness wait
+	// when the cause was built through that wait's deadline wrapper: the
+	// state word, the exit code or the probe's answer, without the
+	// wrapper that also names the program and the budget. The report of
+	// the helper prefers it for its cause line, so the class and the
+	// budget the headline speaks are never echoed inside a cause. Empty
+	// keeps the cause chain as it is.
+	Observation string
 }
 
 func (e *InstallStartError) Error() string {

@@ -2204,6 +2204,14 @@ func TestFirstInstallStartClassifiesTheObservedOutcome(t *testing.T) {
 			t.Errorf("outcome=%q budget=%s, want not-ready stamped with the budget the wait applied (%q, %s)",
 				startErr.Outcome, startErr.Budget, StartOutcomeNotReady, scmVerifyBudget)
 		}
+		// The record carries the clean observation of the wait
+		// structurally: the state word as a fact, never the deadline
+		// wrapper that would restate the program and the budget the
+		// report's headline already speaks.
+		if !strings.Contains(startErr.Observation, `the service control manager reports the state `) ||
+			strings.Contains(startErr.Observation, "does not run") || strings.Contains(startErr.Observation, "within") {
+			t.Errorf("observation = %q, want the clean state fact without the deadline wrapper", startErr.Observation)
+		}
 		if startErr.RegistrationRemoved || startErr.CleanupError == nil {
 			t.Errorf("removed=%t cleanup=%v, want the kept registration of a process that was never proven stopped",
 				startErr.RegistrationRemoved, startErr.CleanupError)
@@ -2237,6 +2245,14 @@ func TestFirstInstallStartClassifiesTheObservedOutcome(t *testing.T) {
 		}
 		assertNoErrorMatches(`state "stopped"`)
 		assertNoErrorMatches("exit code 1")
+		// The record carries those very facts as its clean observation
+		// — state word and exit code — without the deadline wrapper
+		// that would restate the budget the report does not speak.
+		if !strings.Contains(startErr.Observation, `state "stopped"`) ||
+			!strings.Contains(startErr.Observation, "exit code 1") ||
+			strings.Contains(startErr.Observation, "does not run") || strings.Contains(startErr.Observation, "within") {
+			t.Errorf("observation = %q, want the state and exit-code facts without the deadline wrapper", startErr.Observation)
+		}
 		if !startErr.RegistrationRemoved || target.deletes != 1 {
 			t.Errorf("removed=%t deletes=%d, want the stopped owned registration removed", startErr.RegistrationRemoved, target.deletes)
 		}

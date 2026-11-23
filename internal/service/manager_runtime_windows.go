@@ -247,7 +247,11 @@ func (m *scmManager) verifyRunningExecutableVersionUsing(ctx context.Context, ta
 			}
 		}
 		if !time.Now().Before(deadline) {
-			return verification, fmt.Errorf("the instance does not run %q within %s: %s", executable, scmVerifyBudget, detail)
+			return verification, &verifyTimeoutError{
+				executable:  executable,
+				budget:      scmVerifyBudget,
+				observation: detail,
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -262,6 +266,26 @@ func probeAddressOrListen(listen string) string {
 		return "the instance"
 	}
 	return probeServiceAddress(listen)
+}
+
+// verifyTimeoutError reports that the readiness budget of a verification
+// elapsed. It carries the clean inner observation of the verify loop — the
+// state word, the exit code, the probe's answer — structurally beside its
+// message, so the reader that reports a failed first start can state those
+// facts directly instead of re-quoting a wrapper that also names the program
+// and the budget (see InstallStartError.Observation).
+//
+// Its message is the established wrapper the verification, the rollback and
+// the command line read; it stays byte for byte what the formatted form was,
+// and it wraps nothing: the observation travels as a field, not as text.
+type verifyTimeoutError struct {
+	executable  string
+	budget      time.Duration
+	observation string
+}
+
+func (e *verifyTimeoutError) Error() string {
+	return fmt.Sprintf("the instance does not run %q within %s: %s", e.executable, e.budget, e.observation)
 }
 
 // scmProcessExcluded reports whether a process is one the verification must not
