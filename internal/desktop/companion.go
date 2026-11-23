@@ -159,11 +159,17 @@ func desktopRelaunchArgs(argv []string, wait time.Duration) []string {
 //
 // The window binds these names on the host side (companionWindowActions,
 // desktopWindowActions) and the pages call them: the live runtime page of
-// the server calls the two open actions, the fallback document calls the
-// open action and the retry. Every name has ONE source of truth — these
-// constants — and the pages reference them through the substituted
-// template or through the pinned literals of runtime.js, so the page and
-// the host binding cannot drift apart into a dead button.
+// the server calls the open actions, the fallback document calls the open
+// action, the retry and — in the state its own button shows — ONE service
+// action: the start beside a registration the read found settled without a
+// running instance, the installation beside a proven absence of one. Every
+// name has ONE source of truth — these constants — and the pages reference
+// them through the substituted template or through the pinned literals of
+// runtime.js, so the page and the host binding cannot drift apart into a
+// dead button. The two service actions belong to the companion window
+// alone: the fallback document only ever loads beside a tray companion
+// (the desktop host always loads the page of its own server), so
+// companionWindowActions is the one binding they have.
 //
 // The names carry no data: the host owns every path it acts on, and the
 // open actions run in the process of the WINDOW — in the user's session —
@@ -187,6 +193,35 @@ const (
 	// registration, probes the address and shows the live runtime page
 	// when it answers, or this fallback again when it does not.
 	logsTryAgainAction = "hfdeskTryAgain"
+	// logsStartServiceAction starts the registered service the state
+	// read of the fallback document found settled without a running
+	// instance — the button of that state, and the very flow the Start
+	// service item of the menu runs.
+	logsStartServiceAction = "hfdeskStartService"
+	// logsInstallServiceAction registers the service on the machine
+	// the state read proved WITHOUT a registration — the button of that
+	// state, and the very flow the Install service item of the menu
+	// runs.
+	logsInstallServiceAction = "hfdeskInstallService"
+)
+
+// logsServiceAction is the primary action the fallback document of the
+// Logs window offers for one read of the state — the step of the state,
+// in the vocabulary of the menu item it mirrors. The zero value offers no
+// step: a state that cannot prove one keeps the document to the two
+// buttons it has always had.
+type logsServiceAction int
+
+const (
+	// logsServiceActionNone offers no step: a running service, a
+	// transition, and a state the read could not settle or report.
+	logsServiceActionNone logsServiceAction = iota
+	// logsServiceActionStart starts the registered service the read
+	// found settled without a running instance.
+	logsServiceActionStart
+	// logsServiceActionInstall registers the service on a machine the
+	// read proved without a registration.
+	logsServiceActionInstall
 )
 
 // serviceLogFileName is the name of the active log file of a service
@@ -532,34 +567,47 @@ type logsFallbackState struct {
 	// could not be read. The zero value claims nothing and renders no
 	// section content.
 	Log serviceLogSection
+	// ServiceAction is the primary action of the header — the step this
+	// state proves: the start of the registration beside a settled state
+	// that does not run, the installation beside a proven absence, and no
+	// step beside a state that proves neither. It leads the header, the
+	// open of the log file follows it, and the retry comes last; without
+	// it the header is the one it has always been.
+	ServiceAction logsServiceAction
 }
 
 // The placeholders of the script template the page builder replaces with
 // the bound action names.
 //
-// The action names have ONE source of truth: the openLogFileAction and
-// logsTryAgainAction constants, which are also the keys the host binds
+// The action names have ONE source of truth: the openLogFileAction,
+// logsTryAgainAction, logsStartServiceAction and logsInstallServiceAction
+// constants, which are also the keys the host binds
 // (companionWindowActions). The template never names them — the names are
 // substituted while the page is generated — so the page and the host
 // binding cannot drift apart, and a literal name that reaches the page
 // from anywhere else fails the test that pins the rendered document.
 const (
-	logsFallbackOpenPlaceholder = "{{open}}"
-	logsFallbackTryPlaceholder  = "{{try}}"
+	logsFallbackOpenPlaceholder    = "{{open}}"
+	logsFallbackTryPlaceholder     = "{{try}}"
+	logsFallbackStartPlaceholder   = "{{start}}"
+	logsFallbackInstallPlaceholder = "{{install}}"
 )
 
 // logsFallbackScriptTemplate is the only script of the fallback document,
 // and it performs exactly two local operations with no channel of any kind:
-// it forwards the two fixed action names to the functions the window bound
-// on the host side — open the log file, and retry the live page — and
-// scrolls the service-log tail box to its end, so the document shows the
-// END of that log.
+// it forwards the fixed action names to the functions the window bound
+// on the host side — open the log file, the service action this document's
+// state button names (start beside a settled registration that does not
+// run, installation beside a proven absence), and retry the live page —
+// and scrolls the service-log tail box to its end, so the document shows
+// the END of that log.
 //
 // Nothing here fetches, listens or carries data out of the document: the
 // paths never travel through the page (the host owns them), and the
 // invariant of the companion — nothing of it listens — is unchanged.
 // Every wiring guards its element, so a document without one of the
-// elements runs that part as a no-op.
+// elements — a state whose button is not on screen — runs that part as a
+// no-op.
 const logsFallbackScriptTemplate = `<script>
 (function () {
 	var tail = document.getElementById("service-log-tail");
@@ -567,6 +615,14 @@ const logsFallbackScriptTemplate = `<script>
 	var open = document.getElementById("open-log-file");
 	if (open && window.` + logsFallbackOpenPlaceholder + `) {
 		open.addEventListener("click", function () { window.` + logsFallbackOpenPlaceholder + `(); });
+	}
+	var start = document.getElementById("start-service");
+	if (start && window.` + logsFallbackStartPlaceholder + `) {
+		start.addEventListener("click", function () { window.` + logsFallbackStartPlaceholder + `(); });
+	}
+	var install = document.getElementById("install-service");
+	if (install && window.` + logsFallbackInstallPlaceholder + `) {
+		install.addEventListener("click", function () { window.` + logsFallbackInstallPlaceholder + `(); });
 	}
 	var again = document.getElementById("try-again");
 	if (again && window.` + logsFallbackTryPlaceholder + `) {
@@ -581,7 +637,9 @@ const logsFallbackScriptTemplate = `<script>
 // binds, so the two can never name different functions.
 func logsFallbackScript() string {
 	script := strings.ReplaceAll(logsFallbackScriptTemplate, logsFallbackOpenPlaceholder, openLogFileAction)
-	return strings.ReplaceAll(script, logsFallbackTryPlaceholder, logsTryAgainAction)
+	script = strings.ReplaceAll(script, logsFallbackTryPlaceholder, logsTryAgainAction)
+	script = strings.ReplaceAll(script, logsFallbackStartPlaceholder, logsStartServiceAction)
+	return strings.ReplaceAll(script, logsFallbackInstallPlaceholder, logsInstallServiceAction)
 }
 
 // logsFallbackPage renders the model into the fallback document of the
@@ -592,12 +650,16 @@ func logsFallbackScript() string {
 // values — inlined, because a fallback document has no server to load a
 // stylesheet from; that is exactly why it is a document and not a page.
 // It states the honest state of the service, the address that did not
-// answer (or the honest reason there is none), the path of the service log
-// file with the action that opens it, the bounded tail of that same log
-// under its own **Service log** section — or the honest state of a file
-// that is not there or could not be read — and the one action that retries
-// the live page. Everything the model carries is escaped, so a value from
-// the machine can never become markup.
+// answer (or the honest reason there is none), the step that state proves
+// as the primary action of the header — the start of the registration
+// beside a settled state that does not run, the installation beside a
+// proven absence, and no step beside a state that proves neither, so the
+// window-diagnosis always offers its treatment step when one exists — the
+// path of the service log file with the action that opens it, the bounded
+// tail of that same log under its own **Service log** section — or the
+// honest state of a file that is not there or could not be read — and the
+// one action that retries the live page. Everything the model carries is
+// escaped, so a value from the machine can never become markup.
 func logsFallbackPage(state logsFallbackState) string {
 	var page strings.Builder
 	page.WriteString(`<!doctype html>
@@ -661,8 +723,21 @@ pre { font-family: var(--font-mono); font-size: 12px; background: var(--color-bg
 			html.EscapeString(state.State) + "</h1></div>\n")
 	}
 	page.WriteString("<div class=\"actions\">")
+	// The step of the state leads the header, and it is the ONE primary
+	// button of that header: the open of the log file takes the
+	// secondary place beside it, and keeps the primary place it has
+	// always had when the state offers no step.
+	openClass := "btn btn-primary"
+	switch state.ServiceAction {
+	case logsServiceActionStart:
+		openClass = "btn"
+		page.WriteString("<button class=\"btn btn-primary\" id=\"start-service\" type=\"button\">Start service</button>")
+	case logsServiceActionInstall:
+		openClass = "btn"
+		page.WriteString("<button class=\"btn btn-primary\" id=\"install-service\" type=\"button\">Install service...</button>")
+	}
 	if state.LogPath != "" {
-		page.WriteString("<button class=\"btn btn-primary\" id=\"open-log-file\" type=\"button\">Open the log file</button>")
+		page.WriteString("<button class=\"" + openClass + "\" id=\"open-log-file\" type=\"button\">Open the log file</button>")
 	}
 	page.WriteString("<button class=\"btn\" id=\"try-again\" type=\"button\">Try again</button>")
 	page.WriteString("</div>\n</header>\n")

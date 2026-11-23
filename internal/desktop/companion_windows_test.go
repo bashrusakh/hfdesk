@@ -1080,8 +1080,9 @@ func TestCompanionExitEndsTheHostWithoutTouchingTheService(t *testing.T) {
 
 // TestCompanionWindowActionsCarryTheOpenLogActions pins the bridge of
 // the fallback document and the live page: the window binds exactly the
-// four fixed action names the documents call (open the file, open the
-// folder, open the web UI, retry), the open-file action opens EXACTLY the service log
+// six fixed action names the documents call (open the file, open the
+// folder, open the web UI, retry, and — for the two states that prove a
+// step — start and install), the open-file action opens EXACTLY the service log
 // file the document's path speaks about (the same resolver, so the path
 // the document shows and the file the default handler receives can never
 // be different files), the open-folder action opens that file's folder —
@@ -1092,15 +1093,18 @@ func TestCompanionExitEndsTheHostWithoutTouchingTheService(t *testing.T) {
 func TestCompanionWindowActionsCarryTheOpenLogActions(t *testing.T) {
 	actions := companionWindowActions(panicGuard{},
 		func() *runtimeWindow { return nil },
-		func() bool { return false })
-	if len(actions) != 4 {
+		func() bool { return false }, testGateSingleton)
+	if len(actions) != 6 {
 		keys := make([]string, 0, len(actions))
 		for name := range actions {
 			keys = append(keys, name)
 		}
-		t.Fatalf("the window actions = %v, want exactly the four fixed names", keys)
+		t.Fatalf("the window actions = %v, want exactly the six fixed names", keys)
 	}
-	for _, name := range []string{openLogFileAction, openLogFolderAction, openUiAction, logsTryAgainAction} {
+	for _, name := range []string{
+		openLogFileAction, openLogFolderAction, openUiAction, logsTryAgainAction,
+		logsStartServiceAction, logsInstallServiceAction,
+	} {
 		if actions[name] == nil {
 			t.Fatalf("the window action %q is not bound: its button would find no function", name)
 		}
@@ -1254,6 +1258,297 @@ func TestCompanionWindowActionsCarryTheOpenLogActions(t *testing.T) {
 		assertNames(t, messages[0].text, "the missing-folder report", []string{
 			"The log folder has not been created yet",
 			"The log folder is at " + filepath.Dir(logPath),
+		})
+	})
+}
+
+// TestCompanionWindowPageOffersTheServiceActionOfTheState pins the step
+// the fallback document offers for one read of the registration — the
+// header of every state, verbatim and in its order:
+//
+//   - a settled registration that does not run (stopped, failed, broken
+//     without an instance) leads with Start service — the state the Start
+//     service item of the menu acts on;
+//   - a machine the read proved WITHOUT a registration leads with
+//     Install service... — the state the Install service item acts on;
+//   - every other state — a running service, a transition, a state the
+//     supervisor could not report, an empty state and a read that failed
+//     — proves no step, so the header keeps only the open of the log file
+//     and the retry, exactly as before.
+//
+// In every shape the step leads, the open follows, the retry comes last,
+// and the document still carries no link to the address that just proved
+// it does not answer.
+func TestCompanionWindowPageOffersTheServiceActionOfTheState(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    service.Status
+		readErr   error
+		header    string
+		forbidden []string
+	}{
+		{
+			name:      "a stopped registration offers the start",
+			status:    registeredStoppedService(),
+			header:    logsHeaderStepStart,
+			forbidden: []string{"Install service..."},
+		},
+		{
+			name:      "a failed registration offers the start",
+			status:    runningServiceStatus(service.StateFailed, "127.0.0.1:18080"),
+			header:    logsHeaderStepStart,
+			forbidden: []string{"Install service..."},
+		},
+		{
+			name:      "a broken registration without an instance offers the start",
+			status:    runningServiceStatus(service.StateBroken, "127.0.0.1:18080"),
+			header:    logsHeaderStepStart,
+			forbidden: []string{"Install service..."},
+		},
+		{
+			name:      "a machine without a registration offers the installation",
+			status:    service.Status{State: service.StateNotInstalled},
+			header:    logsHeaderStepInstall,
+			forbidden: []string{"Start service"},
+		},
+		{
+			name:      "a running service offers no step",
+			status:    runningServiceStatus(service.StateRunning, "127.0.0.1:18080"),
+			header:    logsHeaderNoStep,
+			forbidden: []string{"Start service", "Install service..."},
+		},
+		{
+			name:      "a service on its way up offers no step",
+			status:    service.Status{State: service.StateStarting, Listen: "127.0.0.1:18080"},
+			header:    logsHeaderNoStep,
+			forbidden: []string{"Start service", "Install service..."},
+		},
+		{
+			name:      "a service on its way down offers no step",
+			status:    service.Status{State: service.StateStopping, Listen: "127.0.0.1:18080"},
+			header:    logsHeaderNoStep,
+			forbidden: []string{"Start service", "Install service..."},
+		},
+		{
+			name:      "a state the supervisor could not report offers no step",
+			status:    service.Status{State: service.StateUnknown, Listen: "127.0.0.1:18080"},
+			header:    logsHeaderNoStep,
+			forbidden: []string{"Start service", "Install service..."},
+		},
+		{
+			name:      "an empty state offers no step",
+			status:    service.Status{},
+			header:    logsHeaderNoStep,
+			forbidden: []string{"Start service", "Install service..."},
+		},
+		{
+			name:      "a read that failed offers no step",
+			readErr:   errors.New("the service control manager did not answer"),
+			header:    logsHeaderNoStep,
+			forbidden: []string{"Start service", "Install service..."},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+				return tc.status, tc.readErr
+			})
+
+			page := companionWindowPage()
+
+			if got := headerActions(t, page); got != tc.header {
+				t.Errorf("the header =\n%s\nwant:\n%s", got, tc.header)
+			}
+			for _, unwanted := range tc.forbidden {
+				if strings.Contains(page, unwanted) {
+					t.Errorf("the document of this state carries %q beside its own header:\n%s", unwanted, page)
+				}
+			}
+			assertNamesWithout(t, page, "the fallback document", nil, []string{"<a ", "href="})
+		})
+	}
+}
+
+// TestCompanionWindowServiceActionRunsTheMenuItemFlow proves the bridge
+// of the service action of the fallback document end to end: a press runs
+// the VERY flow the matching menu item runs — performServiceActionFromTray
+// with the start action, runInstallServiceAction with the install —
+// exactly ONCE, behind the one service-action guard both surfaces share,
+// and it ends with the very re-read the Try again button runs.
+//
+// The re-read is observed through the established report of that path:
+// the window of this test reports no runtime, so the show every retry
+// performs finishes in the WebView2 report of showCompanionRuntimeWindow
+// — its arrival after the press is the proof that the action re-read the
+// window exactly like Try again.
+func TestCompanionWindowServiceActionRunsTheMenuItemFlow(t *testing.T) {
+	t.Run("the start button runs the menu's start flow once and re-reads after it", func(t *testing.T) {
+		freshServiceInstallGuard(t)
+		launched := make(chan elevatedLaunch, 2)
+		replaceSeam(t, &launchElevated, func(launch elevatedLaunch) (uint32, error) {
+			launched <- launch
+			return 7771, nil
+		})
+		waiterCalled := make(chan uint32, 1)
+		releaseWaiter := make(chan struct{})
+		replaceSeam(t, &waitForServiceActionHelper, func(pid uint32) {
+			waiterCalled <- pid
+			<-releaseWaiter
+		})
+		var refreshes atomic.Int32
+		replaceSeam(t, &serviceMenuRefresh, func() { refreshes.Add(1) })
+		shown := recordMessagesChannel(t)
+		actions := companionWindowActions(panicGuard{},
+			func() *runtimeWindow { return &runtimeWindow{} },
+			func() bool { return false }, testGateSingleton)
+
+		actions[logsStartServiceAction]()
+
+		var launch elevatedLaunch
+		select {
+		case launch = <-launched:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the start button never reached the menu's start flow")
+		}
+		if launch.Action != serviceActionStart {
+			t.Errorf("the helper performs %q, want the action of the menu's start item %q",
+				launch.Action, serviceActionStart)
+		}
+		if launch.InstanceMutex != testGateSingleton {
+			t.Errorf("the helper carries the singleton %q, want the one of this launch %q",
+				launch.InstanceMutex, testGateSingleton)
+		}
+		if !serviceActionRunning.Load() {
+			t.Error("the guard was released although the helper of the action is still running")
+		}
+		// The action re-reads the window afterwards — the path the
+		// Try again button runs.
+		waitForTrayCondition(t, "the re-read of the window after the start", func() bool {
+			return len(shown) == 1
+		})
+		if messages := drainMessages(shown); len(messages) != 1 ||
+			messages[0].caption != companionWindowUnavailableCaption {
+			t.Errorf("the reports after the start = %v, want the one report of the window re-read", messages)
+		}
+		if got := refreshes.Load(); got != 0 {
+			t.Errorf("the launch itself asked for the menu catch-up %d times, want the helper's exit to ask instead", got)
+		}
+
+		// The guard belongs to the action and ends with its helper —
+		// the same end the menu's own press waits for.
+		if pid := <-waiterCalled; pid != 7771 {
+			t.Errorf("the waiter waits for the process %d, want the launched helper 7771", pid)
+		}
+		close(releaseWaiter)
+		waitForTrayCondition(t, "the guard release and the menu catch-up after the helper ended",
+			func() bool {
+				return !serviceActionRunning.Load() && refreshes.Load() == 1
+			})
+	})
+
+	t.Run("the install button runs the menu's install flow once", func(t *testing.T) {
+		freshServiceInstallGuard(t)
+		// The machine reads as without a registration — the state
+		// whose button this is — for both reads of the flow: the data
+		// directory of the confirmation and the recheck beside the
+		// elevated launch (never reached: the confirmation declines).
+		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+			return service.Status{State: service.StateNotInstalled}, nil
+		})
+		replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+			return `C:\portable\hfdesk.exe`, nil
+		})
+		var confirmations atomic.Int32
+		replaceSeam(t, &confirmServiceInstall, func(string) bool {
+			confirmations.Add(1)
+			return false
+		})
+		replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+			t.Error("a declined confirmation launched an elevated helper")
+			return 0, nil
+		})
+		var refreshes atomic.Int32
+		replaceSeam(t, &serviceMenuRefresh, func() { refreshes.Add(1) })
+		shown := recordMessagesChannel(t)
+		actions := companionWindowActions(panicGuard{},
+			func() *runtimeWindow { return &runtimeWindow{} },
+			func() bool { return false }, testGateSingleton)
+
+		actions[logsInstallServiceAction]()
+
+		waitForTrayCondition(t, "the declined install to run once, re-read and release the guard",
+			func() bool {
+				return confirmations.Load() == 1 && !serviceActionRunning.Load() &&
+					refreshes.Load() == 1 && len(shown) == 1
+			})
+		if got := confirmations.Load(); got != 1 {
+			t.Errorf("the install button asked %d confirmations, want exactly one question", got)
+		}
+		messages := drainMessages(shown)
+		if len(messages) != 1 || messages[0].caption != companionWindowUnavailableCaption {
+			t.Errorf("the reports after the declined install = %v, "+
+				"want no report of the attempt and the one report of the window re-read", messages)
+		}
+	})
+
+	t.Run("one guard covers both service buttons", func(t *testing.T) {
+		freshServiceInstallGuard(t)
+		launched := make(chan elevatedLaunch, 1)
+		replaceSeam(t, &launchElevated, func(launch elevatedLaunch) (uint32, error) {
+			launched <- launch
+			return 7772, nil
+		})
+		waiterCalled := make(chan uint32, 1)
+		releaseWaiter := make(chan struct{})
+		replaceSeam(t, &waitForServiceActionHelper, func(pid uint32) {
+			waiterCalled <- pid
+			<-releaseWaiter
+		})
+		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+			t.Error("a refused press read the service registration")
+			return service.Status{}, nil
+		})
+		replaceSeam(t, &confirmServiceInstall, func(string) bool {
+			t.Error("a refused press asked the installation confirmation")
+			return false
+		})
+		shown := recordMessagesChannel(t)
+		actions := companionWindowActions(panicGuard{},
+			func() *runtimeWindow { return nil },
+			func() bool { return false }, testGateSingleton)
+
+		// The start takes the guard and keeps it while its helper runs.
+		actions[logsStartServiceAction]()
+		select {
+		case <-launched:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the start button never reached the menu's start flow")
+		}
+		if !serviceActionRunning.Load() {
+			t.Fatal("the start did not take the service-action guard")
+		}
+
+		// The install press beside that running action is refused by
+		// the ONE guard: its own busy report, no state read, no
+		// confirmation, no helper — and the guard of the running
+		// action survives it.
+		actions[logsInstallServiceAction]()
+		waitForTrayCondition(t, "the busy report of the refused install press", func() bool {
+			return len(shown) == 1
+		})
+		messages := drainMessages(shown)
+		if len(messages) != 1 || messages[0].caption != serviceActionBusyCaption {
+			t.Errorf("the reports of the refused press = %v, want the one busy report", messages)
+		}
+		if !serviceActionRunning.Load() {
+			t.Error("the refused press released the guard of the action that is still running")
+		}
+
+		if pid := <-waiterCalled; pid != 7772 {
+			t.Errorf("the waiter waits for the process %d, want the launched helper 7772", pid)
+		}
+		close(releaseWaiter)
+		waitForTrayCondition(t, "the guard release after the helper ended", func() bool {
+			return !serviceActionRunning.Load()
 		})
 	})
 }

@@ -232,13 +232,18 @@ func launchDesktopRelaunch() {
 //     plain outgoing navigation of the WebView2 (the same log, filters
 //     and search the desktop window shows). When the address does not
 //     answer it shows the local fallback document instead: the honest
-//     state of the service, the address that did not answer, the path of
-//     the service log with the one open-the-file action, and the retry —
+//     state of the service, the step that state proves as its one
+//     primary action — Start service beside a settled registration that
+//     does not run, Install service... beside a proven absence, each
+//     running the very flow of the matching menu item behind the same
+//     guard and followed by the window's own re-read — the address that
+//     did not answer, the path of
+//     the service log with the open-the-file action, and the retry —
 //     a document that fetches and listens to nothing, rendered from
-//     reads under the display policy. The window host binds the open
+//     reads under the display policy. The window host binds these
 //     actions, so they run in THIS process — the user's session — and
 //     not in the service, which runs in session 0 and could not open a
-//     window or a program on the user's desktop.
+//     window, a program or a service action on the user's desktop.
 //
 // A companion never writes the claim file of this session; the panic
 // guard of run() removes it on a panic like every launch's guard does.
@@ -368,7 +373,7 @@ func runCompanion(lock *instanceLock, guard panicGuard,
 	// captures them.
 	windowActions := companionWindowActions(guard,
 		func() *runtimeWindow { return window },
-		func() bool { return webview2Ready })
+		func() bool { return webview2Ready }, lock.name)
 	window = newCompanionWindow(companionRuntimePageURL, companionWindowPage, iconBytes, windowActions)
 	if !webview2Ready {
 		desktopLog.Warn("the WebView2 runtime is not installed", "mode", "tray companion")
@@ -529,7 +534,9 @@ func companionRuntimePageURL() string {
 // The document states the honest state of the service, the address that
 // did not answer as a FACT — never a link: the address just proved it
 // does not answer, so a link would be a dead path — and the honest reason
-// when there is no address to name. The path of the service log file
+// when there is no address to name. The step that state proves leads the
+// header of the document (the two bound service actions and their common
+// flow are companionWindowActions). The path of the service log file
 // completes it: the very file the open action opens, resolved fresh on
 // every render (a second display read with its own catch-up), so the path
 // the document shows and the file the action hands to the default handler
@@ -550,6 +557,11 @@ func companionWindowPage() string {
 	case status.State == service.StateNotInstalled:
 		state.State = "HFDesk is not registered as a Windows service."
 		state.Note = "The registration names no address, so there is nothing to open."
+		// The proven absence is the state the Install service item
+		// of the menu acts on, so it is the step this document
+		// offers — the very same flow, through the bound action of
+		// the same name.
+		state.ServiceAction = logsServiceActionInstall
 	case status.State == "":
 		state.State = "The state of the Windows service is unknown."
 		state.Note = "The address of the web UI is not known."
@@ -565,6 +577,18 @@ func companionWindowPage() string {
 			state.Address = raw
 		} else {
 			state.Note = "The registration names no address, so there is nothing to open."
+		}
+		// The settled registration that does not run is the state the
+		// Start service item of the menu acts on — the same two
+		// predicates, so the window and the menu can never disagree
+		// about which state starts. Every other state offers no step
+		// here: a running service needs none, a transition is not a
+		// state to decide on, and the state the supervisor could not
+		// report (settled by its own definition) proves nothing to act
+		// on — the menu shows no action for it either.
+		if status.State != service.StateUnknown &&
+			serviceStateSettled(status.State) && !serviceStatusRunning(status) {
+			state.ServiceAction = logsServiceActionStart
 		}
 	}
 	return logsFallbackPage(state)
@@ -595,18 +619,41 @@ func companionServiceLogPath() string {
 // (openLogFileAction), open the folder of that log (openLogFolderAction),
 // open the web UI in the default browser (openUiAction — the very
 // address the link of the old static window carried, re-read from the
-// registration on the click) and retry the live page (logsTryAgainAction).
+// registration on the click), retry the live page (logsTryAgainAction)
+// and — one per state of the fallback document — the service action its
+// own button names: the start of the registration
+// (logsStartServiceAction) and its installation
+// (logsInstallServiceAction).
 //
 // The handlers run on a goroutine of its own under the panic guard, like
 // every other action of this host: each one resolves its target on the
 // host side — in THIS process, the user's session, never the server of
 // the service, which runs in session 0 and cannot open a file, a folder,
-// a browser or a window on the user's desktop — and the page carries no
-// path and no logic beyond naming these fixed actions. The retry re-runs
-// the show the tray item runs, through the getters the caller passes: the
-// window itself exists only after this function returned.
+// a browser, a window or a service action on the user's desktop — and the
+// page carries no path and no logic beyond naming these fixed actions.
+//
+// The two service actions run the VERY flow the matching menu item runs —
+// performServiceActionFromTray with the start action, and
+// runInstallServiceAction with this host's published handover endpoints
+// and catch-up signal (serviceHandoverCommit, serviceHandoverQuit and
+// requestServiceMenuCatchUp — the pair every surface reads) — one call
+// per press, behind the one service-action guard both surfaces share, and
+// instanceMutex is the singleton of THIS launch, the very name the menu
+// items pass. They then re-read the window's state through the very
+// retry the Try again button runs (retry below), so a document whose
+// state moved under its own action catches up instead of offering a
+// stale step.
+//
+// The retry re-runs the show the tray item runs, through the getters the
+// caller passes: the window itself exists only after this function
+// returned.
 func companionWindowActions(guard panicGuard, current func() *runtimeWindow,
-	webview2Ready func() bool) map[string]func() {
+	webview2Ready func() bool, instanceMutex string) map[string]func() {
+	retry := func() {
+		if window := current(); window != nil {
+			showCompanionRuntimeWindow(window, webview2Ready())
+		}
+	}
 	return map[string]func(){
 		openLogFileAction: func() {
 			go guard.runBackground(openCompanionServiceLog)
@@ -618,10 +665,19 @@ func companionWindowActions(guard panicGuard, current func() *runtimeWindow,
 			go guard.runBackground(openCompanionServiceURL)
 		},
 		logsTryAgainAction: func() {
+			go guard.runBackground(retry)
+		},
+		logsStartServiceAction: func() {
 			go guard.runBackground(func() {
-				if window := current(); window != nil {
-					showCompanionRuntimeWindow(window, webview2Ready())
-				}
+				performServiceActionFromTray(serviceActionStart, instanceMutex)
+				retry()
+			})
+		},
+		logsInstallServiceAction: func() {
+			go guard.runBackground(func() {
+				runInstallServiceAction(instanceMutex, requestServiceMenuCatchUp,
+					serviceHandoverCommit, serviceHandoverQuit)
+				retry()
 			})
 		},
 	}
