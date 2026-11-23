@@ -356,6 +356,29 @@ func TestTrayServiceActionsRefreshTheMenuAfterEveryUnsuccessfulOutcome(t *testin
 	}
 }
 
+// TestUntrackedHelperHoldCoversTheActionBudgetAndItsWarmUpMargin pins the
+// relationship the untracked hold is built on: the hold measured from the
+// launch must outlast the action budget measured from the start of the
+// action, or the mutation window of a helper nobody can wait for could
+// outlive the guard. Shrinking the hold to the bare action budget, deleting
+// the warm-up margin or making that margin non-positive all fail here; the
+// busy-refusal behavior of the hold itself is pinned by
+// TestTrayServiceActionHoldsTheGuardForAHelperWithoutAProcessRecord.
+func TestUntrackedHelperHoldCoversTheActionBudgetAndItsWarmUpMargin(t *testing.T) {
+	if untrackedHelperHoldBudget <= serviceActionBudget {
+		t.Errorf("the untracked hold %s does not outlast the action budget %s: the mutation window of an untracked helper could outlive the guard",
+			untrackedHelperHoldBudget, serviceActionBudget)
+	}
+	if untrackedHelperHoldBudget != serviceActionBudget+untrackedHelperWarmUpMargin {
+		t.Errorf("the untracked hold %s is not the action budget %s plus the warm-up margin %s",
+			untrackedHelperHoldBudget, serviceActionBudget, untrackedHelperWarmUpMargin)
+	}
+	if untrackedHelperWarmUpMargin <= 0 {
+		t.Errorf("the warm-up margin %s does not cover the window between the launch of the helper and the start of its action",
+			untrackedHelperWarmUpMargin)
+	}
+}
+
 // TestTrayServiceActionHoldsTheGuardForAHelperWithoutAProcessRecord proves
 // the guard policy for the launch outcome the process id used to hide: the
 // shell started the helper but named no process for it, so nothing can wait

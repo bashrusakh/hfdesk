@@ -70,6 +70,39 @@ func serviceActionHoldsSingleton(action serviceAction) bool {
 	return action == serviceActionUpdate || action == serviceActionStart
 }
 
+// launchSurface names the surface a helper was launched from: the user
+// interface its reports must send the user back to. It is the launch surface
+// of the host (the desktop host or the tray companion), not the item of a
+// menu (beginServiceAction names those for its records).
+type launchSurface string
+
+const (
+	// launchSurfaceDesktop is the desktop host — and the honest default of
+	// a helper command line that carries no companion marker (see
+	// ServiceActionOptions.CompanionSurface).
+	launchSurfaceDesktop launchSurface = "desktop"
+	// launchSurfaceCompanion is the tray companion: the host that serves
+	// no address of its own and whose Start service item therefore runs
+	// immediately.
+	launchSurfaceCompanion launchSurface = "companion"
+)
+
+// launchSurfaceOf maps the launch markers of a helper command line onto the
+// surface its reports address.
+//
+// A command line without the companion marker — a hand-typed helper run —
+// reports the desktop surface: its way back runs through the desktop app
+// itself, which exists on every machine that has HFDesk, while the
+// companion's names a menu item only a running companion has. Only the
+// launching host knows it runs as a companion, so only its marker (passed
+// like --log-file) can make that route honest.
+func launchSurfaceOf(companion bool) launchSurface {
+	if companion {
+		return launchSurfaceCompanion
+	}
+	return launchSurfaceDesktop
+}
+
 // ServiceActionOptions describes one invocation of the elevated helper.
 //
 // The flags are private to the desktop executable: they are not part of the
@@ -122,6 +155,16 @@ type ServiceActionOptions struct {
 	// command line) means this run writes no log file of its own, and its
 	// windows name no file at all.
 	LogFile string
+
+	// CompanionSurface reports that the launching host runs as a tray
+	// companion, so the way back of a report names that companion's own
+	// Start service item — the item that works immediately, because the
+	// companion serves no address. It travels as a helper argument flag
+	// exactly like LogFile. A command line without the marker (a
+	// hand-typed helper run) keeps the desktop surface: that route needs
+	// only the desktop app the user can start, so it is the honest
+	// default where no launch surface is known (launchSurfaceOf).
+	CompanionSurface bool
 }
 
 // parseServiceAction converts the value of the helper flag into an action.

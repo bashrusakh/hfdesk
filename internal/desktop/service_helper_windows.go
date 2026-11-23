@@ -184,7 +184,7 @@ func RunServiceAction(o ServiceActionOptions) error {
 		}}
 		defer handover.close()
 	}
-	return runServiceAction(action, o.Version,
+	return runServiceAction(action, o.Version, launchSurfaceOf(o.CompanionSurface),
 		&serviceActionReporter{action: action, handover: handover, singletonPreExisting: singletonPreExisting})
 }
 
@@ -265,16 +265,16 @@ func validateServiceHandoverOptions(action serviceAction, o ServiceActionOptions
 	return nil
 }
 
-func runServiceAction(action serviceAction, version string, reporter *serviceActionReporter) error {
+func runServiceAction(action serviceAction, version string, surface launchSurface, reporter *serviceActionReporter) error {
 	switch action {
 	case serviceActionInstall:
 		return installWindowsService(reporter, version)
 	case serviceActionUpdate:
-		return updateWindowsService(reporter, version)
+		return updateWindowsService(reporter, version, surface)
 	case serviceActionStart:
 		return startWindowsService(reporter)
 	case serviceActionStop:
-		return stopWindowsService(reporter)
+		return stopWindowsService(reporter, surface)
 	case serviceActionUninstall:
 		return uninstallWindowsService(reporter)
 	}
@@ -351,12 +351,13 @@ func installWindowsService(reporter *serviceActionReporter, version string) erro
 // A service that was running has to run afterwards, and one that was not
 // running has to be stopped afterwards. The update never starts a stopped
 // service, so a running service after an update of a stopped one is a failure
-// of the action.
+// of the action. surface is the launch surface the report of a not-running
+// outcome sends the user back to (serviceUpdatedText).
 //
 // The update only re-points an existing registration: a machine without one is
 // a failure, because an update that registered a stopped service would leave an
 // instance that serves nothing.
-func updateWindowsService(reporter *serviceActionReporter, version string) error {
+func updateWindowsService(reporter *serviceActionReporter, version string, surface launchSurface) error {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceActionBudget)
 	defer cancel()
 
@@ -429,7 +430,7 @@ func updateWindowsService(reporter *serviceActionReporter, version string) error
 		"versionVerified", installed.VersionVerified)
 	reporter.message(serviceUpdatedCaption,
 		serviceUpdatedText(verifiedVersion(installed), report, status.Paths.StateDir,
-			serviceWebAddress(status), serviceStatusRunning(status), before.State),
+			serviceWebAddress(status), serviceStatusRunning(status), before.State, surface),
 		windows.MB_ICONINFORMATION)
 	return nil
 }
@@ -494,8 +495,9 @@ func startWindowsService(reporter *serviceActionReporter) error {
 // registration stays the honest "no service to stop" instead of the stable
 // success the manager reports for stopping an absent instance, and the state
 // is read again until it settled, so the report never claims a stop the
-// service control manager had not confirmed.
-func stopWindowsService(reporter *serviceActionReporter) error {
+// service control manager had not confirmed. surface is the launch surface
+// the report's way back names (serviceStoppedText).
+func stopWindowsService(reporter *serviceActionReporter, surface launchSurface) error {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceActionBudget)
 	defer cancel()
 
@@ -523,7 +525,7 @@ func stopWindowsService(reporter *serviceActionReporter) error {
 	}
 
 	desktopLog.Info("the service is stopped", "executable", status.Executable, "listen", status.Listen)
-	reporter.message(serviceStoppedCaption, serviceStoppedText(), windows.MB_ICONINFORMATION)
+	reporter.message(serviceStoppedCaption, serviceStoppedText(surface), windows.MB_ICONINFORMATION)
 	return nil
 }
 

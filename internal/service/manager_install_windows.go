@@ -442,7 +442,7 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 		result.createdDirsSafeToRemove = createdDirsSafeToRemove
 		return result, rollbackErr
 	}
-	check, versionVerified, err := m.startAndVerifyVersion(ctx, handle, opts.Executable, opts.Listen, opts.ExpectedVersion, previous.processID)
+	check, versionVerified, err := m.startAndVerifyVersion(ctx, handle, opts.Executable, registrationListen(opts), opts.ExpectedVersion, previous.processID)
 	if err != nil {
 		createdDirsSafeToRemove, rollbackErr := m.rollbackInstallation(ctx, target, previous, scmRollbackRestart,
 			fmt.Errorf("service: the installation did not put the new executable into service: %w", err))
@@ -504,8 +504,12 @@ func (m *scmManager) startFirstRegistration(ctx context.Context, target scmFirst
 			m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, 0, failure), StartOutcomeNotPerformed, 0)
 	}
 
+	// The probe asks the address of the registration's own argument
+	// vector: the --listen value RunArgs wrote is the value parsed back
+	// out of it (registrationListen), so neither a default nor a desktop
+	// address can slip between the registration and its verification.
 	verification, err := m.verifyRunningExecutableVersionUsing(ctx, target,
-		opts.Executable, opts.Listen, opts.ExpectedVersion, true)
+		opts.Executable, registrationListen(opts), opts.ExpectedVersion, true)
 	if err != nil {
 		processID := verification.processID
 		if !startedHere {

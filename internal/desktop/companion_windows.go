@@ -185,6 +185,13 @@ func launchCompanionRelaunch() {
 func runCompanion(lock *instanceLock, guard panicGuard,
 	endWithoutTray func(), shutdownSink *func(),
 ) error {
+	// Every helper this host launches is launched by a tray companion, so
+	// its reports name this companion's own Start service item as the way
+	// back. The surface is assigned before the first service action can be
+	// wired (the tray below), and it travels to the helper beside the log
+	// path (launchServiceHelper).
+	hostLaunchSurface = launchSurfaceCompanion
+
 	// The signal ends the whole companion, exactly like the desktop
 	// host: the window is closed and the tray loop ends through the same
 	// quit path the menu would use.

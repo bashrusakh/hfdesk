@@ -510,20 +510,30 @@ func serviceInstalledText(version, console, dataDir, address string) string {
 // HFDesk after such an update, and a message that claimed otherwise would send
 // the user to a dead address.
 //
-// The not-running case names the relaunch of the desktop app and not the tray:
-// an update is launched only from the service gate of a launch, and that launch
-// ends the desktop host, so the tray is gone by the time this report is read. A
-// sentence that pointed at a tray icon that is not there would send the user
-// looking for an action they cannot reach.
-func serviceUpdatedText(version, console, dataDir, address string, running bool, before service.State) string {
+// The not-running case names the way back to a serving service, and that way
+// back depends on the surface the helper was launched from. An update is
+// reachable from the menu and the dialog of a running desktop host, from the
+// tray companion and from the launch gate: a menu, dialog or companion update
+// leaves that host running, while a gate update runs after the launch that
+// carried the gate already ended. Each surface is therefore told the route
+// its user can actually reach — the tray companion gets its own Start service
+// item (the companion serves no address, so that item starts the service
+// immediately), and the desktop surface keeps the established route of this
+// report (the relaunch of the desktop app and its Start service) byte for
+// byte, as decided on 2026-11-23. A hand-typed helper command line carries
+// no surface marker and gets the desktop route (launchSurfaceOf).
+func serviceUpdatedText(version, console, dataDir, address string, running bool, before service.State, surface launchSurface) string {
 	text := serviceVersionName(version) + " is updated as a Windows service.\n\n" +
 		"The registration now runs " + console + " and keeps the settings of the service and its data.\n\n"
 	if running {
 		text += serviceAddressText(address)
 		text += "The desktop app is not needed to use the service: open the address above."
 	} else {
-		text += serviceUpdateNotRunningReport(before) + "\n\n" +
-			"Start the desktop app again and choose Start service."
+		wayBack := "Start the desktop app again and choose Start service."
+		if surface == launchSurfaceCompanion {
+			wayBack = serviceCompanionStartWayBack
+		}
+		text += serviceUpdateNotRunningReport(before) + "\n\n" + wayBack
 	}
 	if dataDir != "" {
 		text += "\n\nThe service keeps its own data in " + dataDir + ". The settings, jobs and models of the desktop app do not appear in the service."
@@ -561,20 +571,37 @@ func serviceStartedText(console, address string) string {
 	return text
 }
 
+// serviceCompanionStartWayBack is the one step back to a serving service
+// both not-running reports name on the companion surface: the companion's
+// own Start service item — the current menu item of that tray. The claim is
+// true for this surface alone: the companion serves no address of its own,
+// so the guard of the helper never refuses a start beside it and the item
+// runs the start immediately. The sentence names no mechanism behind the
+// state, like every way back of these reports.
+const serviceCompanionStartWayBack = "Choose Start service from the tray menu."
+
 // serviceStoppedText returns the report of a stopped service.
 //
 // The report is the state (stopped), the one fact the user did not ask for
 // and has to see — nothing serves the address of the service right now — and
-// the single way back. The way back names the quit of this desktop and the
+// the single way back. The way back depends on the surface the helper was
+// launched from. The desktop route names the quit of this desktop and the
 // startup gate of its next launch, because a start beside the desktop that
-// runs this very tray is refused by the established guard of the helper: the
-// desktop serves the address, and two instances never compete for it. A
-// report that pointed at a start the guard would refuse would send the user
-// into that refusal in a circle.
-func serviceStoppedText() string {
+// serves its own address is refused by the established guard of the helper:
+// a report that pointed at that start would send the user into that refusal
+// in a circle. The companion route names the companion's own Start service
+// item directly (serviceCompanionStartWayBack), and that is true for its
+// surface: the companion serves no address of its own, so the guard of the
+// helper never refuses that item and it starts the service immediately. A
+// hand-typed helper command line carries no surface marker and gets the
+// desktop route (launchSurfaceOf).
+func serviceStoppedText(surface launchSurface) string {
+	wayBack := "Quit HFDesk from the notification-area icon and choose Start service when you start the desktop app again."
+	if surface == launchSurfaceCompanion {
+		wayBack = serviceCompanionStartWayBack
+	}
 	return "The HFDesk service is stopped.\n\n" +
-		"Nothing serves the address of the service right now.\n" +
-		"Quit HFDesk from the notification-area icon and choose Start service when you start the desktop app again."
+		"Nothing serves the address of the service right now.\n" + wayBack
 }
 
 // serviceRegistrationRemovedText returns the report of a removed service
@@ -840,16 +867,20 @@ func serviceActionFailureBody(action serviceAction, err error, program string) s
 // the cleanup facts returned by the service manager. Cleanup is performed
 // through the creation handle, never by reopening a service name.
 //
-// The report splits the start outcome into its classes: a start that was not
-// performed gets the headline that states it (no "could not confirm" claim
-// about a start that never happened), and every start that ran carries the one
-// line of what was observed — the process ended, the service did not come up
-// within the budget that elapsed, or the started service could not be
-// verified. The kept-registration branch states the uncertainty the cleanup
-// actually left — the registration may remain — and names the one action that
-// resolves it: the read of the state. The removed branch never shares its
-// wording with a machine that never had a registration: it says what this
-// attempt removed, not that HFDesk was never installed.
+// The headline names the class of the start outcome: a start that was not
+// performed, a program that ended before it was ready, a service that did
+// not come up within the budget that elapsed, or a started service that
+// could not be verified — and an error no site classified gets the honest
+// state of a start that did not finish. No headline of this family ever
+// claims a "could not confirm" vagueness again, not even the legacy shape.
+// Every classified class keeps its one observed line below the headline, and
+// the not-ready class is the only one whose report names a budget — the one
+// the failing wait actually applied. The kept-registration branch states the
+// uncertainty the cleanup actually left — the registration may remain — and
+// names the one action that resolves it: the read of the state. The removed
+// branch never shares its wording with a machine that never had a
+// registration: it says what this attempt removed, not that HFDesk was never
+// installed.
 //
 // The cleanup fact itself is stated exactly once: the detail carries the
 // cause and the one line the cleanup observed as a reason, never the
@@ -859,14 +890,7 @@ func serviceActionFailureBody(action serviceAction, err error, program string) s
 func serviceInstallStartFailureText(err error, program string, cleanup *service.InstallStartError) string {
 	detail := installStartDetail(err, cleanup)
 	removed := cleanup != nil && cleanup.RegistrationRemoved
-	headline := "HFDesk registered the service but could not confirm its start."
-	switch {
-	case removed:
-		headline = "HFDesk registered the service but could not start it."
-	case cleanup != nil && cleanup.Outcome == service.StartOutcomeNotPerformed:
-		headline = "HFDesk registered the service but did not start it."
-	}
-	text := headline + "\n\n"
+	text := serviceInstallStartHeadline(cleanup) + "\n\n"
 	if outcome := serviceStartOutcomeText(cleanup); outcome != "" {
 		text += outcome + "\n\n"
 	}
@@ -886,6 +910,33 @@ func serviceInstallStartFailureText(err error, program string, cleanup *service.
 	}
 	text += outcome
 	return failureWindowText(text + statusIfUnnamed(detail))
+}
+
+// serviceInstallStartHeadline returns the headline of a failed first start:
+// every classified class names itself, so the reader sees the class before
+// the observed line below it. An error that no site classified — the empty
+// Outcome of a record built without one, or a value no class owns — gets the
+// honest state of a start that did not finish, with the cause following as
+// the detail. The budget is read only for the not-ready class and only from
+// the field the failing wait stamped; a not-ready record without one names
+// no number.
+func serviceInstallStartHeadline(cleanup *service.InstallStartError) string {
+	if cleanup != nil {
+		switch cleanup.Outcome {
+		case service.StartOutcomeNotPerformed:
+			return "HFDesk registered the service but did not start it."
+		case service.StartOutcomeEnded:
+			return "HFDesk registered the service, but the service program ended before it was ready."
+		case service.StartOutcomeNotReady:
+			if cleanup.Budget > 0 {
+				return fmt.Sprintf("HFDesk registered the service, but the service did not come up within %s.", cleanup.Budget)
+			}
+			return "HFDesk registered the service, but the service did not come up within the readiness budget."
+		case service.StartOutcomeUnverified:
+			return "HFDesk registered the service, but the started service could not be verified."
+		}
+	}
+	return "HFDesk registered the service, but its start did not finish."
 }
 
 // installStartDetail returns the cause of a failed first start and the one
@@ -915,7 +966,8 @@ func installStartDetail(err error, cleanup *service.InstallStartError) string {
 // service did not come up within the budget that actually elapsed (named with
 // that very value), or the started service could not be verified. A start that
 // was not performed states its class in the headline itself and adds no second
-// line, and an error classified by no site keeps the cause-only report.
+// line, and an error classified by no site carries no class line at all: its
+// headline states the honest unfinished start and the cause stays the detail.
 func serviceStartOutcomeText(cleanup *service.InstallStartError) string {
 	if cleanup == nil {
 		return ""

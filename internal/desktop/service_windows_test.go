@@ -298,7 +298,8 @@ func freshServiceInstallGuard(t *testing.T) {
 }
 
 func runHelperInstallForTest(version string) error {
-	return runServiceAction(serviceActionInstall, version, &serviceActionReporter{action: serviceActionInstall})
+	return runServiceAction(serviceActionInstall, version, launchSurfaceDesktop,
+		&serviceActionReporter{action: serviceActionInstall})
 }
 
 // runningServiceStatus is the status of a running service of a test.
@@ -2554,6 +2555,57 @@ func TestServiceHelperArgumentsNameTheActionAndHandover(t *testing.T) {
 	})
 	if want := `--service-action start --desktop-state "C:\Users\First Last\AppData\Roaming\hfdesk\desktop-state.json"`; spacedState != want {
 		t.Errorf("the arguments are %q, want the state path quoted as one value: %q", spacedState, want)
+	}
+	// The launch surface travels as a marker beside the log path, and only
+	// a companion launch carries it: every established command line of the
+	// desktop host stays byte for byte what it was, and the helper keeps
+	// the honest desktop default without the marker.
+	companion := serviceHelperArguments(elevatedLaunch{
+		Action: serviceActionStop, LogFile: `C:\Users\ada\hfdesk.log`, CompanionSurface: true,
+	})
+	if want := `--service-action stop --log-file C:\Users\ada\hfdesk.log --companion-surface`; companion != want {
+		t.Errorf("the arguments are %q, want the companion marker beside the log path: %q", companion, want)
+	}
+	desktopLaunch := serviceHelperArguments(elevatedLaunch{
+		Action: serviceActionStop, LogFile: `C:\Users\ada\hfdesk.log`,
+	})
+	if want := `--service-action stop --log-file C:\Users\ada\hfdesk.log`; desktopLaunch != want {
+		t.Errorf("the arguments are %q, want no companion marker on the desktop host: %q", desktopLaunch, want)
+	}
+}
+
+// TestLaunchServiceHelperPassesTheLaunchSurfaceToTheHelper proves the middle
+// hop of the surface transport: the surface this host runs as reaches the
+// command line marker of the helper, so a companion launch's reports name the
+// companion's Start service item while a desktop launch keeps the established
+// route. Dropping the wiring on either side fails here.
+func TestLaunchServiceHelperPassesTheLaunchSurfaceToTheHelper(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		surface launchSurface
+		want    bool
+	}{
+		{name: "the desktop host keeps the default", surface: launchSurfaceDesktop, want: false},
+		{name: "the tray companion marks its launches", surface: launchSurfaceCompanion, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			replaceSeam(t, &hostLaunchSurface, tc.surface)
+			var captured elevatedLaunch
+			replaceSeam(t, &launchElevated, func(l elevatedLaunch) (uint32, error) {
+				captured = l
+				return 1234, nil
+			})
+
+			launch, err := launchServiceHelper(serviceActionStop, 0, "")
+			assertNoError(t, err, "the launch of the helper failed: %v", err)
+			if !launch.started {
+				t.Fatal("the launch reported no started helper")
+			}
+			if captured.CompanionSurface != tc.want {
+				t.Errorf("the helper command line carried CompanionSurface=%t, want %t",
+					captured.CompanionSurface, tc.want)
+			}
+		})
 	}
 }
 

@@ -54,6 +54,12 @@ type elevatedLaunch struct {
 	// reachable from outside the window; the host records the action it
 	// launched and the exit of this helper there.
 	LogFile string
+	// CompanionSurface reports that the launching host runs as a tray
+	// companion, so the helper's reports name that companion's own Start
+	// service item as the way back. It travels as a command line marker
+	// exactly like LogFile, and its absence (a hand-typed helper run) is
+	// the honest desktop default (ServiceActionOptions.CompanionSurface).
+	CompanionSurface bool
 }
 
 // launchElevated starts the service helper with administrator rights.
@@ -248,6 +254,14 @@ func serviceHelperArguments(l elevatedLaunch) string {
 	}
 	if path := strings.TrimSpace(l.LogFile); path != "" {
 		args = append(args, "--log-file", quoteHelperArgument(path))
+	}
+	// The launch surface travels beside the log path: the reports of the
+	// helper send the user back to the surface that launched it. Only a
+	// companion launch carries the marker, so every established command
+	// line of the desktop host stays byte for byte what it was, and a
+	// command line without it keeps the honest desktop default.
+	if l.CompanionSurface {
+		args = append(args, "--companion-surface")
 	}
 	return strings.Join(args, " ")
 }

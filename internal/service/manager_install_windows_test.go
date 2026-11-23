@@ -2127,6 +2127,25 @@ func TestSCMConfigExecutableNamesTheProgramOfTheRegistration(t *testing.T) {
 	}
 }
 
+// scmRunArgsListen parses the --listen value back OUT of the registration
+// argument vector RunArgs writes. The vector IS the registration: the value
+// found here is the address the registered process was asked to bind, and a
+// vector that stops naming one fails the claim instead of quietly defaulting.
+func scmRunArgsListen(t *testing.T, opts InstallOptions) string {
+	t.Helper()
+	args := RunArgs(opts)
+	for i, arg := range args {
+		if arg == "--listen" {
+			if i+1 >= len(args) {
+				t.Fatalf("the registration vector %q names --listen without a value", args)
+			}
+			return args[i+1]
+		}
+	}
+	t.Fatalf("the registration vector %q carries no --listen: the probe could not ask the address of the registration", args)
+	return ""
+}
+
 // TestFirstInstallStartClassifiesTheObservedOutcome drives the first-start
 // path through its outcome classes and proves that the class the report
 // depends on is stamped on the ownership-scoped cleanup result: a refused
@@ -2134,7 +2153,8 @@ func TestSCMConfigExecutableNamesTheProgramOfTheRegistration(t *testing.T) {
 // applied, a process the control manager reported as stopped, and a started
 // instance whose verification failed. It also pins that the readiness probe
 // is handed the listen address of the registration's argument vector — not a
-// default and not a desktop address.
+// default and not a desktop address — including the discriminating case of a
+// request without a listen, where only the vector names the default.
 //
 // Windows-only: the classification lives in the service control manager path
 // of the elevated helper.
@@ -2270,22 +2290,49 @@ func TestFirstInstallStartClassifiesTheObservedOutcome(t *testing.T) {
 			t.Errorf("outcome=%q budget=%s, want the mismatch classified as unverified without a budget",
 				startErr.Outcome, startErr.Budget)
 		}
-		// The probe asks the address of the registration's own argument
-		// vector: the listen value RunArgs writes is the listen value the
-		// probe dials, so neither a default nor a desktop address can slip
-		// between the registration and its verification.
-		want := ""
-		args := RunArgs(opts)
-		for i, arg := range args {
-			if arg == "--listen" && i+1 < len(args) {
-				want = args[i+1]
-			}
-		}
+		// The probe asks the --listen value parsed back OUT of the
+		// registration's argument vector: the value RunArgs wrote is the
+		// value the probe dials. The request and the vector agree for an
+		// explicit listen, so the empty-listen case below is what
+		// separates the registration's address from the input value.
+		want := scmRunArgsListen(t, opts)
 		if want != "127.0.0.1:18081" || probedListen != want {
 			t.Errorf("registration --listen=%q, probe asked %q, want the probe on the registration's address", want, probedListen)
 		}
 		if !startErr.RegistrationRemoved {
 			t.Errorf("removed=%t, want the owned failing instance settled and removed", startErr.RegistrationRemoved)
+		}
+	})
+
+	t.Run("the probe asks the registration address of a request without a listen", func(t *testing.T) {
+		// The discriminating case: the request carries no listen while
+		// the vector RunArgs writes names the default explicitly, so a
+		// probe fed from the request value — or from any other defaulting
+		// source — fails here. Both sides of the default have to agree:
+		// the vector names DefaultListen and the probe is handed exactly
+		// that value.
+		opts := scmTestFirstInstallOptions(t, "", "")
+		config := buildSCMConfig(opts)
+		var probedListen string
+		replaceSCMTestSeam(t, &serviceInstallProbe, func(listen, _ string) (bool, error) {
+			probedListen = listen
+			return false, fmt.Errorf("the health endpoint reports another version: %w", errServiceVersionMismatch)
+		})
+		target := newTarget(svc.Status{State: svc.Running, ProcessId: 8142}, config)
+		target.imageCheck = scmImageVerified
+
+		startErr := runFirstStart(t, target, opts, config)
+		if startErr.Outcome != StartOutcomeUnverified {
+			t.Errorf("outcome=%q, want the mismatch classified as unverified", startErr.Outcome)
+		}
+		want := scmRunArgsListen(t, opts)
+		if want != DefaultListen {
+			t.Errorf("registration --listen=%q, want the vector of a request without a listen to name the default %q explicitly",
+				want, DefaultListen)
+		}
+		if probedListen != want {
+			t.Errorf("registration --listen=%q, probe asked %q, want the probe on the registration's address and not the empty request value",
+				want, probedListen)
 		}
 	})
 }

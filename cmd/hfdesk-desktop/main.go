@@ -24,10 +24,11 @@
 //
 //	--service-action install --wait-pid N --handover-ready-event NAME
 //	  --handover-success-event NAME --instance-mutex NAME [--desktop-state PATH]
-//	  [--log-file PATH]
+//	  [--log-file PATH] [--companion-surface]
 //	--service-action update|start [--instance-mutex NAME] [--desktop-state PATH]
-//	  [--log-file PATH]
+//	  [--log-file PATH] [--companion-surface]
 //	--service-action stop|uninstall [--desktop-state PATH] [--log-file PATH]
+//	  [--companion-surface]
 //
 // and the helper performs the action, reports it in a native message box and
 // ends without a server, a tray icon or a window. An update or a start holds
@@ -169,9 +170,9 @@ func parseHostOptions(args []string) (app.Options, string, error) {
 }
 
 const serviceHelperUsage = "Usage: hfdesk-desktop --service-action install --wait-pid N " +
-	"--handover-ready-event NAME --handover-success-event NAME --instance-mutex NAME [--desktop-state PATH] [--log-file PATH]\n" +
-	"       hfdesk-desktop --service-action update|start [--instance-mutex NAME] [--desktop-state PATH] [--log-file PATH]\n" +
-	"       hfdesk-desktop --service-action stop|uninstall [--desktop-state PATH] [--log-file PATH]"
+	"--handover-ready-event NAME --handover-success-event NAME --instance-mutex NAME [--desktop-state PATH] [--log-file PATH] [--companion-surface]\n" +
+	"       hfdesk-desktop --service-action update|start [--instance-mutex NAME] [--desktop-state PATH] [--log-file PATH] [--companion-surface]\n" +
+	"       hfdesk-desktop --service-action stop|uninstall [--desktop-state PATH] [--log-file PATH] [--companion-surface]"
 
 func parseServiceHelperCommand(args []string) (desktop.ServiceActionOptions, bool, error) {
 	var helper desktop.ServiceActionOptions
@@ -185,6 +186,7 @@ func parseServiceHelperCommand(args []string) (desktop.ServiceActionOptions, boo
 	flags.StringVar(&helper.InstanceMutex, "instance-mutex", "", "the existing per-session desktop singleton")
 	flags.StringVar(&helper.DesktopState, "desktop-state", "", "the published state file of the launching desktop")
 	flags.StringVar(&helper.LogFile, "log-file", "", "the log file of the launching desktop host")
+	flags.BoolVar(&helper.CompanionSurface, "companion-surface", false, "the launching host runs as a tray companion")
 	err := flags.Parse(args)
 	if !hasServiceHelperArgument(args) {
 		return desktop.ServiceActionOptions{}, false, nil
@@ -218,6 +220,7 @@ func hasServiceHelperArgument(args []string) bool {
 			"--handover-success-event", "-handover-success-event",
 			"--instance-mutex", "-instance-mutex",
 			"--desktop-state", "-desktop-state",
+			"--companion-surface", "-companion-surface",
 		} {
 			if arg == name || strings.HasPrefix(arg, name+"=") {
 				return true
