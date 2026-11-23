@@ -16,6 +16,7 @@
 - Everything about the service now lives in one **Service** submenu with its status line at the top: the duplicate **Service…** item is gone, and **Install service…** shows only where there is nothing to install.
 - One **Logs** window replaces the separate Runtime / Logs window in both desktop and tray-companion mode: the live log while the address answers, and an honest state with actions when it does not.
 - The Logs window and the error windows open their log file with one action instead of showing its path as text.
+- When the address does not answer, the Logs window also offers the step that fits the state — **Start service** for a registered service that does not run, **Install service…** when none is installed.
 - The notice about the missing service program says in one short line which file is needed and where, and keeps its actions — the download and the manual route — visible side by side.
 - Error reports now name the log file of the launch they belong to.
 - Window and report texts are now short and plain: the state and what to do next.
@@ -23,6 +24,7 @@
 
 ### Fixed
 
+- The service log under `%ProgramData%` can be read from the Logs window again: at every start the instance grants interactive users read access to its own log directory and active log file, and touches no other descriptor.
 - A start, a delete or an update of a service that is not stopped switches the app from desktop mode to the tray and performs instead of asking the user to quit HFDesk.
 - Deleting the service in that switch returns the app to desktop mode.
 - Updating a stopped service keeps the window open.
