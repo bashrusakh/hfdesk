@@ -815,8 +815,10 @@ replaces the other.
   dialog — the same question the install item opens when its own recheck
   finds a registration: open it, start it or update it — so no capability
   leaves the tray. A read that proves no registration enables the install
-  item and shows none of the registration-bound items; a read that could
-  settle neither greys the install item and offers no lifecycle items, so a
+  item and shows none of the registration-bound items; a proven registration
+  keeps the install item visible but grey, sitting beside the items that
+  grey it; a read that could settle neither greys the install item and
+  offers no lifecycle items, so a
   destructive action is never offered without a state that was read. The
   status line is re-read after every service action, after every reading the
   tray and the window make, and every 30 seconds, so both surfaces keep the
