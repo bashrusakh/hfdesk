@@ -59,14 +59,14 @@ type Options struct {
 	Companion bool
 
 	// CompanionWait is the bounded wait for the single instance lock of
-	// this session at the startup of a companion launch.
+	// this session at the startup of a relaunch child.
 	//
 	// It is zero for every ordinary launch — a launch that finds the lock
 	// reports the running instance exactly as before — and non-zero only
-	// for the relaunch the installation spawns: that child is started
-	// while the exiting host and the elevated helper still hold the lock,
-	// so it waits for the moment both released it instead of refusing as
-	// a second instance. The wait is bounded; a launch that runs out of
-	// it reports that another HFDesk process still holds the session.
+	// for the relaunch child of a handover: that child is started while
+	// the exiting host and the elevated helper still hold the lock, so it
+	// waits for the moment both released it instead of refusing as a
+	// second instance. The wait is bounded; a launch that runs out of it
+	// reports that another HFDesk process still holds the session.
 	CompanionWait time.Duration
 }

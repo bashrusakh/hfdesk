@@ -57,34 +57,47 @@ var companionRelaunchBudget = 150 * time.Second
 var endCompanionTray = systray.Quit
 
 // startCompanionRelaunch starts the tray-companion relaunch after a
-// successful installation handover.
+// successful handover whose end state leaves the host beside the service.
 //
 // It is a package level variable so the tests can prove WHEN — and
 // whether — the relaunch runs, without spawning a real process.
 var startCompanionRelaunch = launchCompanionRelaunch
 
-// finishInstallHandover ends the committed installation handover: the
-// failure of the authorization is reported exactly like every other
-// handover failure, and a settled authorization relaunches this host as a
-// tray companion.
+// startDesktopRelaunch starts the ordinary relaunch after a successful
+// handover whose end state frees the address again — the removal of the
+// registration, whose child takes the desktop mode through its own service
+// gate.
+//
+// It is a package level variable for the same reason
+// startCompanionRelaunch is.
+var startDesktopRelaunch = launchDesktopRelaunch
+
+// finishHandover ends a committed handover: the failure of the authorization
+// is reported exactly like every other handover failure, and a settled
+// authorization relaunches this host in the launch its action ends in.
 //
 // The relaunch runs HERE — right after the success event was sent and the
 // helper acknowledged it — for three reasons the protocol fixes:
 //
 //   - from this point on the helper waits ONLY for the exit of this
-//     process before it installs (waitForHandoverAuthorization, second
+//     process before it acts (waitForHandoverAuthorization, second
 //     phase), so this process must exit promptly: a blocking report in
 //     this path could outlive that exit budget and abort the
-//     installation itself;
+//     action itself;
 //   - the helper still holds the single instance lock, so a child started
-//     now waits for the exact moment the installation released it — the
-//     companion appears with the registration the installation created;
-//   - an authorization that FAILED never spawns: the installation does
-//     not run, and a companion beside a machine without the registration
-//     the user asked for would be a claim the outcome does not support.
-func finishInstallHandover(err error) {
+//     now waits for the exact moment the action released it — the child
+//     appears with the registration the action created, updated or
+//     removed;
+//   - an authorization that FAILED never spawns: the action does
+//     not run, and a host beside a machine whose registration the user
+//     asked for would be a claim the outcome does not support.
+func finishHandover(err error, plan committedHandover) {
 	if err != nil {
-		reportServiceHandoverFailure(err)
+		reportServiceHandoverFailure(plan.action, err)
+		return
+	}
+	if plan.relaunch == handoverRelaunchDesktop {
+		startDesktopRelaunch()
 		return
 	}
 	startCompanionRelaunch()
@@ -136,6 +149,44 @@ func launchCompanionRelaunch() {
 	_ = command.Process.Release()
 }
 
+// launchDesktopRelaunch starts a detached copy of this very executable as an
+// ORDINARY launch: the arguments of this launch plus the mode-neutral bounded
+// lock wait, and no companion flag, so the child runs the ordinary startup and
+// its own service gate decides how it continues.
+//
+// This is the end state of the removal of the registration: the action this
+// host handed over is over when the child takes the lock, so a machine whose
+// registration is gone reaches the gate's "no registration" answer and takes
+// the desktop mode — the address the service held is free again. A removal
+// that FAILED leaves the registration in place, and the child then meets the
+// very choice dialog every launch of a machine with a registration sees
+// instead of binding an address beside it.
+//
+// The spawn rules are the ones launchCompanionRelaunch documents: the child
+// is started by THIS departing host under this session's identity, a failure
+// of the spawn reaches only the log of this launch (the helper waits for this
+// process to exit, so a blocking box here could abort the action), and the
+// child owns its process from the release below.
+func launchDesktopRelaunch() {
+	executable, err := desktopExecutable()
+	if err != nil {
+		desktopLog.Error("the desktop relaunch could not be built: start the desktop app manually",
+			"error", err)
+		return
+	}
+	args := desktopRelaunchArgs(os.Args[1:], companionRelaunchBudget)
+	command := exec.Command(executable, args...)
+	if err := command.Start(); err != nil {
+		desktopLog.Error("the desktop relaunch could not be started: start the desktop app manually",
+			"error", err)
+		return
+	}
+	desktopLog.Info("the desktop relaunch was started",
+		"pid", command.Process.Pid,
+		"waitBudget", companionRelaunchBudget.String())
+	_ = command.Process.Release()
+}
+
 // runCompanion runs the desktop host as a tray companion.
 //
 // THE INVARIANT: a companion never listens. It creates no application —
@@ -159,14 +210,17 @@ func launchCompanionRelaunch() {
 //     companion serves nothing and may start the service. The helper
 //     decides the same way from the same two facts.
 //   - the tray with the decided composition (trayMenuCompanion): the
-//     status line, Open HFDesk — the address of the REGISTRATION in the
+//     root carries Open HFDesk — the address of the REGISTRATION in the
 //     default browser, visible beside a proven registration and enabled
-//     while the service serves the address — the service group — the
-//     install item beside a proven absence of the registration, the four
-//     lifecycle actions beside a proven one (the absence rule of apply)
-//     — the Logs window item, and the separator with Exit as
+//     while the service serves the address — the Logs window item, the
+//     Service submenu and the separator with Exit as
 //     the last item (Exit ends THIS companion through the normal path
 //     and touches no service, the way Quit closes the desktop host);
+//     the whole service section — the status line, the install item
+//     beside a proven absence of the registration and the four
+//     lifecycle actions beside a proven one (the absence rule of
+//     apply) — lives INSIDE that submenu, so exactly one action group is
+//     ever on screen behind the Service entry;
 //     every action runs through the SAME flow as the desktop host (the
 //     single service-action guard, the confirmations with No as
 //     default, the administrator prompt, the menu catch-up), and the
@@ -213,8 +267,8 @@ func runCompanion(lock *instanceLock, guard panicGuard,
 	var window *runtimeWindow
 
 	// The shutdown of a companion stops no server: there is none. It
-	// completes a committed installation handover first — the companion
-	// installs the service through the very protocol of the desktop host
+	// completes a committed handover first — the companion
+	// acts through the very protocol of the desktop host
 	// (the helper waits for THIS process to exit, and a settled
 	// authorization relaunches the companion through the child), with
 	// nothing to drain or persist: there is no server and no job state
@@ -226,8 +280,8 @@ func runCompanion(lock *instanceLock, guard panicGuard,
 	var shutdownOnce sync.Once
 	shutdown := func() {
 		shutdownOnce.Do(func() {
-			if handover, committed := coordinator.beginShutdown(); committed {
-				completeInstallHandover(handover, func() error {
+			if plan, committed := coordinator.beginShutdown(); committed {
+				completeHandover(plan, func() error {
 					// The companion has no server, so there is
 					// nothing to stop and nothing to persist:
 					// the completion evidence is complete the
@@ -267,7 +321,16 @@ func runCompanion(lock *instanceLock, guard panicGuard,
 		}
 	}
 	serviceMenuRefresh = requestServiceMenuRefresh
-
+	// The handover endpoints of THIS host — published before any service
+	// action of the menu can be wired, the same rule as the catch-up
+	// signal: a lifecycle action that has to hand over commits the
+	// handover to this host's shutdown coordinator and ends this host
+	// through the very quit the menu's Exit item uses. The companion
+	// never reaches the handover itself (it serves no address, so the
+	// guard never refuses beside it), and the endpoints are what its
+	// install recheck's start and update answers commit through.
+	serviceHandoverCommit = coordinator.commit
+	serviceHandoverQuit = requestQuit
 	// The install item of the companion runs the very flow the desktop
 	// host's install item runs — runInstallServiceAction: the missing-
 	// console settlement, the confirmation, the elevated helper, the
@@ -342,16 +405,16 @@ func runCompanion(lock *instanceLock, guard panicGuard,
 
 	// The tray loop runs on the main thread until the signal or the Exit
 	// item ends this companion. The menu is the decided composition: the
-	// status line, Open HFDesk (the address of the registration), the
-	// service group — the install item beside a proven absence of the
-	// registration, the four lifecycle actions beside a proven
-	// registration (the absence rule of apply) — the Logs
-	// window item, the separator and Exit, every action wired to the
+	// root carries Open HFDesk (the address of the registration), Logs,
+	// the Service submenu — the install item beside a proven absence of
+	// the registration, the four lifecycle actions beside a proven
+	// registration (the absence rule of apply), both inside the submenu —
+	// the separator and Exit, every action wired to the
 	// very same flow the desktop host runs (the single guard, the
 	// confirmations, the elevation, the catch-up). Exit runs the end
-	// path above: it closes this companion and touches no service. The
-	// registered-service-dialog item does not exist — that dialog
-	// belongs to the desktop host.
+	// path above: it closes this companion and touches no service. There
+	// is no registered-service dialog item: that dialog belongs to the
+	// install recheck of the desktop host.
 	runTrayLoop(iconBytes, companionTrayTooltip, trayMenuCompanion, trayActions{
 		open: func() {
 			// The address comes from the REGISTRATION (the very

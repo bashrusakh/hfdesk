@@ -232,6 +232,118 @@ func taskDialogReport(caption, text, logPath string, icon uint32) error {
 	return nil
 }
 
+// deleteOldFileButtonID is the command link that deletes the old registered
+// program in the report of a finished update. Its id sits above the ids of
+// the standard buttons and outside the range of the choice dialog, so a press
+// can never be read as an answer of another dialog by accident.
+const deleteOldFileButtonID = 111
+
+// showReportWithOldFileCommand shows the report of a finished update whose
+// registration moved to another file: the very window every report shows,
+// with the one command that deletes the file it names beside it.
+//
+// The command runs ONLY on a deliberate press: the task dialog offers it as a
+// command link while OK stays the default button, so Enter and Esc close the
+// window without deleting anything, and the message box fallback of a machine
+// whose common controls have no task dialog maps Yes and No with No as its
+// default for the same reason. A report whose command the dialog could not
+// show never loses it — the fallback carries the same wording.
+//
+// It is a package level variable so the tests can answer it: the real dialog
+// blocks the process until the user presses something.
+var showReportWithOldFileCommand = showNativeReportWithOldFileCommand
+
+// showNativeReportWithOldFileCommand is the production window of that report.
+func showNativeReportWithOldFileCommand(caption, text string, icon uint32, oldFile string) {
+	err := taskDialogReportWithOldFile(caption, text, icon, oldFile)
+	if err == nil {
+		return
+	}
+	desktopLog.Warn("the report with the old-file command is shown in a message box", "error", err)
+	choice, err := windows.UTF16PtrFromString(text + "\n\n" + deleteOldFileChoiceText(oldFile))
+	if err != nil {
+		return
+	}
+	captionPtr, err := windows.UTF16PtrFromString(caption)
+	if err != nil {
+		return
+	}
+	result, _ := windows.MessageBox(0, choice, captionPtr,
+		icon|windows.MB_YESNO|windows.MB_DEFBUTTON2|windows.MB_SETFOREGROUND|windows.MB_TOPMOST)
+	if result == messageBoxYes {
+		showDeleteOldFileOutcome(oldFile)
+	}
+}
+
+// taskDialogReportWithOldFile shows the report as a task dialog: its first
+// line as the instruction, the rest as content, the old file as one command
+// link, and OK as the default button. The press of the link is read after the
+// dialog returned — a callback that deleted from inside the dialog would have
+// to open a second window while the first one still owns the thread — and the
+// deletion then shows its own honest outcome.
+func taskDialogReportWithOldFile(caption, text string, icon uint32, oldFile string) error {
+	title, err := windows.UTF16PtrFromString(caption)
+	if err != nil {
+		return err
+	}
+	first, rest := splitReportText(text)
+	if strings.TrimSpace(first) == "" {
+		return fmt.Errorf("the failure window %q carries no text", caption)
+	}
+	instruction, err := windows.UTF16PtrFromString(first)
+	if err != nil {
+		return err
+	}
+	var content *uint16
+	if rest != "" {
+		if content, err = windows.UTF16PtrFromString(rest); err != nil {
+			return err
+		}
+	}
+	// The command link names the command and, under it, the exact object
+	// it deletes — the path the report itself states — so the press acts
+	// on a file the user has just read, never on a guess.
+	commandLabel, err := windows.UTF16PtrFromString(deleteOldFileLabel + "\n" + oldFile)
+	if err != nil {
+		return err
+	}
+
+	config := taskDialogConfig{
+		dwFlags:            tdfAllowDialogCancellation | tdfUseCommandLinks,
+		pszWindowTitle:     title,
+		pszMainInstruction: instruction,
+		pszContent:         content,
+		mainIcon:           taskDialogIcon(icon),
+		dwCommonButtons:    tdcOKButton,
+		nDefaultButton:     standardButtonOKID,
+	}
+	pressed, err := runTaskDialog(config, []taskDialogButton{{id: deleteOldFileButtonID, text: commandLabel}})
+	if err != nil {
+		return err
+	}
+	if pressed == deleteOldFileButtonID {
+		showDeleteOldFileOutcome(oldFile)
+	}
+	return nil
+}
+
+// showDeleteOldFileOutcome shows what the press of the command really did:
+// the fact of the deletion beside the path it deleted, and the honest
+// failure — a file another program holds, a file this identity may not write
+// — with the cause on its own line beside that same path. Both outcomes
+// record which path was acted on, so the log of this launch carries the
+// command beside the report that offered it.
+func showDeleteOldFileOutcome(oldFile string) {
+	caption, text, failed := runDeleteOldFileCommand(oldFile)
+	if failed {
+		desktopLog.Error("the old registered program could not be deleted", "path", oldFile)
+		showMessage(caption, text, windows.MB_ICONERROR)
+		return
+	}
+	desktopLog.Info("the old registered program was deleted", "path", oldFile)
+	showMessage(caption, text, windows.MB_ICONINFORMATION)
+}
+
 // reportStartupFailure shows a startup failure to the user.
 //
 // The desktop host has no console, so a failure that is only returned to the

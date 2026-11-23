@@ -70,6 +70,30 @@ func serviceActionHoldsSingleton(action serviceAction) bool {
 	return action == serviceActionUpdate || action == serviceActionStart
 }
 
+// serviceActionTakesHandover reports whether the action may run through the
+// full desktop handover: the elevated helper that waits for the ready signal,
+// for the successful completion and for the exit of the desktop host.
+//
+// The installation always ran that way. The start and the removal take it
+// whenever the desktop that asks for them serves its own local
+// server, and the update takes it beside that desktop for exactly the states
+// whose refusal it replaces — every state but the positively confirmed
+// stopped registration, whose update starts nothing and stays the pure
+// rewrite it always was (see updateRegisteredServiceFromSurface). In each
+// case the host leaves desktop mode for the duration of the action, so the
+// helper acts beside a host that is already gone instead of beside one that
+// still holds the address (see performServiceActionFromTray). The stop is
+// the one action that never hands over — it starts nothing and binds no
+// address, so a desktop beside it never competes with it.
+func serviceActionTakesHandover(action serviceAction) bool {
+	switch action {
+	case serviceActionInstall, serviceActionUpdate, serviceActionStart, serviceActionUninstall:
+		return true
+	default:
+		return false
+	}
+}
+
 // launchSurface names the surface a helper was launched from: the user
 // interface its reports must send the user back to. It is the launch surface
 // of the host (the desktop host or the tray companion), not the item of a
@@ -205,7 +229,7 @@ const (
 	// gate honors it only for a positively confirmed stopped service.
 	serviceChoiceDesktop
 	// serviceChoiceCompanion continues the launch as a tray companion:
-	// the tray icon, the service actions and the Runtime / Logs window
+	// the tray icon, the service actions and the Logs window
 	// WITHOUT a server of this launch, so the registration keeps serving
 	// the address alone. Unlike the desktop mode it is honored for every
 	// registration state the gate asks about: the companion binds no

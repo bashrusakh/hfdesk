@@ -105,8 +105,10 @@ func runWithArgs(args []string) int {
 
 	// The private tray-companion flags are separated from the host flags
 	// and are never part of the usage text — the command line of the
-	// relaunch the installation spawns, and a hand-typed companion
-	// launch. A half of that protocol (a wait without the companion
+	// relaunch child of a handover (as a tray companion, or as an
+	// ordinary launch that returns to desktop mode after a removal), and
+	// a hand-typed companion launch. A half of the companion protocol (a
+	// wait without the companion
 	// mode, an unreadable duration) is a command line problem like every
 	// other one and is reported with the usage of the host.
 	companion, hostArgs, companionErr := desktop.SplitCompanionArgs(args)

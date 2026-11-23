@@ -120,10 +120,16 @@ func RunServiceAction(o ServiceActionOptions) error {
 		defer handover.close()
 		// Ready authorizes the desktop shutdown, so the image the action
 		// would put in service is checked before it: a program the host
-		// cannot execute must fail while the desktop is still open.
-		if err := preflightServiceProgram(); err != nil {
-			(&serviceActionReporter{action: action, handover: handover}).handoverFailure(err)
-			return err
+		// cannot execute must fail while the desktop is still open. Only
+		// the actions that register FROM the folder have such an image —
+		// a start runs the program the registration already names and a
+		// removal runs no program at all, so neither resolves a console
+		// program anywhere in its flow.
+		if action == serviceActionInstall || action == serviceActionUpdate {
+			if err := preflightServiceProgram(); err != nil {
+				(&serviceActionReporter{action: action, handover: handover}).handoverFailure(err)
+				return err
+			}
 		}
 		if err := handover.signalReady(); err != nil {
 			(&serviceActionReporter{action: action, handover: handover}).handoverFailure(err)
@@ -249,15 +255,23 @@ func validateServiceHandoverOptions(action serviceAction, o ServiceActionOptions
 	// An update or a start may carry the singleton identity alone: it holds
 	// that desktop singleton through its mutation without waiting for a
 	// desktop exit, because the gate that asked for it already ended. Every
-	// other combination still needs the complete install handover below —
-	// a stop or a removal that carries a singleton identity is refused with
-	// it, because no such action holds one.
+	// other combination still needs the complete handover below —
+	// a stop or a removal that carries a singleton identity alone is
+	// refused with it, because no such action holds one.
 	if serviceActionHoldsSingleton(action) && o.WaitPID == 0 &&
 		strings.TrimSpace(o.ReadyEvent) == "" && strings.TrimSpace(o.SuccessEvent) == "" &&
 		strings.TrimSpace(o.InstanceMutex) != "" {
 		return nil
 	}
-	if action != serviceActionInstall || o.WaitPID <= 0 ||
+	// The complete handover — the process to wait for, both event names
+	// and the singleton — belongs to exactly the actions that can take it:
+	// the installation, and the start, update and removal a desktop host
+	// hands over when it serves its own local server. The stop never hands
+	// over (it binds no address), so a command line that hands it the
+	// complete set is refused instead of silently ignored, and an
+	// incomplete set is refused for every action: a half of the protocol
+	// never authorizes the shutdown of the desktop.
+	if !serviceActionTakesHandover(action) || o.WaitPID <= 0 ||
 		strings.TrimSpace(o.ReadyEvent) == "" || strings.TrimSpace(o.SuccessEvent) == "" ||
 		strings.TrimSpace(o.InstanceMutex) == "" {
 		return errors.New("desktop: incomplete service handover arguments")
@@ -384,7 +398,9 @@ func updateWindowsService(reporter *serviceActionReporter, version string, surfa
 	// update over a positively confirmed stopped registration only
 	// rewrites the registration and starts nothing, so it proceeds beside
 	// that desktop; every state that is not positively stopped fails
-	// closed.
+	// closed. The tray side decides the same question with this very
+	// standard (updateRegisteredServiceFromSurface), so the two surfaces
+	// can never disagree about which updates hand the host over.
 	positivelyStopped := before.State == service.StateStopped && !wasRunning
 	serving, unreadableClaim := service.CheckLiveServingDesktop(reporter.singletonPreExisting)
 	if !positivelyStopped && serving {
@@ -423,15 +439,27 @@ func updateWindowsService(reporter *serviceActionReporter, version string, surfa
 	}
 
 	report := serviceProgram(installed, opts)
+	// The old file is decided from the state the update really read
+	// before it wrote, beside the program the registration runs now: the
+	// report names the file the registration moved OFF only when that
+	// move really happened and the old file is still there to name —
+	// an update in place, and every rollback onto the previous program,
+	// name no old file and carry no command for one.
+	oldFile := serviceUpdateOldFile(before.Executable, report)
 	desktopLog.Info("the service is updated",
 		"executable", report,
 		"state", string(status.State),
 		"wasRunning", wasRunning,
-		"versionVerified", installed.VersionVerified)
-	reporter.message(serviceUpdatedCaption,
-		serviceUpdatedText(verifiedVersion(installed), report, status.Paths.StateDir,
-			serviceWebAddress(status), serviceStatusRunning(status), before.State, surface),
-		windows.MB_ICONINFORMATION)
+		"versionVerified", installed.VersionVerified,
+		"oldExecutable", before.Executable,
+		"oldFileOffered", oldFile != "")
+	text := serviceUpdatedText(verifiedVersion(installed), report, status.Paths.StateDir,
+		serviceWebAddress(status), serviceStatusRunning(status), before.State, surface, oldFile)
+	if oldFile != "" {
+		reporter.messageWithOldFile(serviceUpdatedCaption, text, windows.MB_ICONINFORMATION, oldFile)
+		return nil
+	}
+	reporter.message(serviceUpdatedCaption, text, windows.MB_ICONINFORMATION)
 	return nil
 }
 
@@ -694,6 +722,16 @@ func (r *serviceActionReporter) message(caption, text string, icon uint32) {
 		r.handover.close()
 	}
 	showMessage(caption, text, icon)
+}
+
+// messageWithOldFile shows the report of a finished update whose
+// registration moved to another file: the same window, with the one command
+// that deletes the file it names beside it (showReportWithOldFileCommand).
+func (r *serviceActionReporter) messageWithOldFile(caption, text string, icon uint32, oldFile string) {
+	if r.handover != nil {
+		r.handover.close()
+	}
+	showReportWithOldFileCommand(caption, text, icon, oldFile)
 }
 
 // failure reports a service-action failure after releasing the singleton that

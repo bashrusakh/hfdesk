@@ -157,8 +157,8 @@ func run(o Options, logPath string) (err error) {
 	// other Windows identity that holds the object, and the launch still
 	// starts no server.
 	//
-	// Only a companion relaunch (CompanionWait > 0 — the child of an
-	// installation, started while the exiting host and the elevated
+	// Only a relaunch child (CompanionWait > 0 — the child of a
+	// handover, started while the exiting host and the elevated
 	// helper still hold the object) waits for the object instead of
 	// deciding on it right away; every other launch takes it exactly as
 	// before (acquireInstanceLockForLaunch).
@@ -179,10 +179,11 @@ func run(o Options, logPath string) (err error) {
 		// whether HFDesk is already running. This instance starts no
 		// server and opens no log file.
 		if o.CompanionWait > 0 {
-			// This launch IS the relaunched companion, and its
+			// This launch IS the relaunched child, and its
 			// bounded wait for the session ran out: the holder —
 			// usually the elevated helper finishing the
-			// installation — never released the object within the
+			// service action this child was relaunched for —
+			// never released the object within the
 			// budget. The report states that state and the one
 			// action that resolves it. It carries no log-path line:
 			// the lock is taken before the log file is opened, so
@@ -330,13 +331,13 @@ func run(o Options, logPath string) (err error) {
 	var shutdownOnce sync.Once
 	shutdown = func() {
 		shutdownOnce.Do(func() {
-			handover, committed := shutdownCoordinator.beginShutdown()
+			plan, committed := shutdownCoordinator.beginShutdown()
 			cancel()
 			if committed {
-				completeInstallHandover(handover, func() error {
+				completeHandover(plan, func() error {
 					waitErr := application.Wait()
 					if waitErr != nil {
-						desktopLog.Error("the server did not stop cleanly before service installation", "error", waitErr)
+						desktopLog.Error("the server did not stop cleanly before the service action", "error", waitErr)
 					}
 					handoverErr := application.WaitForHandover()
 					if waitErr != nil && handoverErr == nil {
@@ -460,6 +461,15 @@ func run(o Options, logPath string) (err error) {
 	// before the first waiter can start, so the assignment and every later
 	// read happen before the goroutines that read it.
 	serviceMenuRefresh = requestServiceMenuRefresh
+	// The handover endpoints of THIS host are published beside it, under
+	// the same rule: a lifecycle action whose click found this host
+	// serving its own local server hands its elevated helper over to this
+	// host's shutdown coordinator and ends this host through the very
+	// quit the menu's Quit item uses. They are the shutdown coordinator
+	// and the quit themselves, so a committed handover is completed by
+	// the ordinary shutdown of this launch and nothing else.
+	serviceHandoverCommit = shutdownCoordinator.commit
+	serviceHandoverQuit = requestQuit
 
 	installService := func() {
 		runInstallServiceAction(lock.name, requestServiceMenuRefresh,
@@ -603,15 +613,6 @@ func run(o Options, logPath string) (err error) {
 				performServiceActionFromTray(serviceActionUninstall, lock.name)
 			})
 		},
-		service: func() {
-			// The dialog waits for a settled state and stays open for
-			// an answer, so it runs on a goroutine of its own exactly
-			// like the installation does; the route below performs the
-			// choice and owns the menu catch-up that follows it.
-			go guard.runBackground(func() {
-				runServiceItemAction(lock.name, requestServiceMenuRefresh)
-			})
-		},
 		quit: requestQuit,
 	}, trayServiceView{
 		read:    serviceState.readForDisplay,
@@ -647,7 +648,7 @@ func run(o Options, logPath string) (err error) {
 // the host, and the quit owns the end of the menu, so no refresh runs
 // beside it.
 func runInstallServiceAction(instanceMutex string, refresh func(),
-	commit func(*desktopHandover) bool, quit func(),
+	commit func(*desktopHandover, serviceAction, handoverRelaunch) bool, quit func(),
 ) {
 	handover := installServiceFromTray(instanceMutex)
 	if handover == nil {
@@ -659,7 +660,7 @@ func runInstallServiceAction(instanceMutex string, refresh func(),
 		refresh()
 		return
 	}
-	if !commit(handover) {
+	if !commit(handover, serviceActionInstall, handoverRelaunchCompanion) {
 		handover.close()
 		serviceActionRunning.Store(false)
 		desktopLog.Info("service handover was not committed because desktop shutdown already started")
@@ -672,16 +673,6 @@ func runInstallServiceAction(instanceMutex string, refresh func(),
 	// of the action the log of this launch can still carry.
 	desktopLog.Info("the service installation handover was committed: the desktop shuts down so the elevated helper can act")
 	quit()
-}
-
-// runServiceItemAction performs the Service... item of one surface and asks
-// for the menu catch-up right after the dialog — after every answer and
-// after every early return alike, so no result of the dialog can stay
-// invisible in the menu until the next tick. The refresh argument is the
-// host's menu catch-up signal.
-func runServiceItemAction(instanceMutex string, refresh func()) {
-	openRegisteredServiceFromTray(instanceMutex)
-	refresh()
 }
 
 // endHost ends the desktop host.
