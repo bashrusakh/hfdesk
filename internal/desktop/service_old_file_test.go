@@ -64,10 +64,11 @@ func TestServiceUpdateOldFileNamesOnlyARealMoveToAnotherFile(t *testing.T) {
 
 // TestServiceUpdatedTextCarriesTheOldFileBlockOnlyForAMove pins the report of
 // a finished update in both shapes: with an old file it states exactly that
-// file and the warning beside it — the file may belong to the pair of its old
-// folder — while the established state and its single way back of the report
-// stay what they are; without one the report is the report this family has
-// always shown, with no mention of an old file anywhere in it.
+// file as the one fact line — still on the disk, and nothing behind it: no
+// assumption about the file (decision of 2026-11-24: reports carry facts,
+// never guesses) — while the established state and its single way back of the
+// report stay what they are; without one the report is the report this family
+// has always shown, with no mention of an old file anywhere in it.
 //
 // The block follows the MOVE and never the route: the direct and the handover
 // surface build the report through this one function, so both carry it, and
@@ -96,13 +97,12 @@ func TestServiceUpdatedTextCarriesTheOldFileBlockOnlyForAMove(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			withOld := build(tc.surface, oldFile)
 			assertNames(t, withOld, "the report with an old file", []string{
-				// The new program, then the old file and the warning
-				// beside it.
+				// The new program, then the old file as the one
+				// fact line beside it.
 				"The registration now runs " + newFile,
-				"The registration ran " + oldFile + " before this update, and that file is still there.",
-				"It may belong to the pair of its old folder, where its hfdesk-desktop program sits next to it.",
+				"Old file still on disk: " + oldFile + ".",
 				// The established state and its single way back
-				// survive the addition: the report still says what
+				// survive the block: the report still says what
 				// the update left and names exactly one route back —
 				// the route of THIS surface.
 				"The service stays stopped.",
@@ -112,14 +112,15 @@ func TestServiceUpdatedTextCarriesTheOldFileBlockOnlyForAMove(t *testing.T) {
 			if got := strings.Count(withOld, "Start service"); got != 1 {
 				t.Errorf("the report names Start service %d times, want exactly one:\n%s", got, withOld)
 			}
-			// The block states the file and the pair beside it — never
-			// a second object, and never a deletion the report
-			// performed itself.
+			// The block states the file and nothing behind it: no
+			// assumption about the file, never a second object, and
+			// never a deletion the report performed itself.
 			assertNamesWithout(t, withOld, "the report with an old file", nil,
-				[]string{"hfdesk-desktop.exe", "was deleted", "could not be deleted"})
+				[]string{"hfdesk-desktop.exe", "may belong", "old folder", "pair of",
+					"was deleted", "could not be deleted"})
 
 			without := build(tc.surface, "")
-			if strings.Contains(without, oldFile) || strings.Contains(without, "before this update") {
+			if strings.Contains(without, oldFile) || strings.Contains(without, "Old file still on disk") {
 				t.Errorf("the report without an old file mentions one:\n%s", without)
 			}
 			// The same report the family always built: the addition is
@@ -157,6 +158,11 @@ func TestTheOldFileCommandTouchesExactlyTheNamedFileAndOnlyWhenItRuns(t *testing
 	_ = serviceUpdateOldFile(target, `C:\new\hfdesk.exe`)
 	if len(removed) != 0 {
 		t.Fatalf("building the report deleted %v, want nothing: the deletion needs the press of the command", removed)
+	}
+
+	// The command keeps its exact label: one press, this one file.
+	if deleteOldFileLabel != "Delete the old file" {
+		t.Errorf("the command is labelled %q, want %q", deleteOldFileLabel, "Delete the old file")
 	}
 
 	caption, text, failed := runDeleteOldFileCommand(target)

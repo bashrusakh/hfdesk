@@ -801,15 +801,19 @@ func TestSiblingMissingDialogLayoutPinsButtonsOrderAndDefault(t *testing.T) {
 			name:   "the offered download",
 			notice: offered,
 			wantLabels: []string{
-				"Download it and continue", "Install it manually instead", "Not now"},
-			wantNotes: []string{siblingMissingDownloadNote(offered), offered.Manual, ""},
+				"Download and install now", "Open the release page", "Not now"},
+			wantNotes: []string{siblingMissingDownloadNote(offered), siblingMissingManualNote, ""},
 			wantIDs: []int32{
 				siblingMissingDownloadButtonID, siblingMissingManualButtonID, siblingMissingDismissButtonID},
 			wantAnswers: []siblingMissingAnswer{
-				siblingMissingDownload, siblingMissingDismiss, siblingMissingDismiss},
+				siblingMissingDownload, siblingMissingManual, siblingMissingDismiss},
 			wantDefault: siblingMissingDismissButtonID,
 		},
 		{
+			// A local build names no release page, so its manual
+			// route keeps the plain instructions instead of
+			// promising a page that does not exist — and it is
+			// still its own answer, never the dismiss one.
 			name:   "the notice without a download",
 			notice: manual,
 			wantLabels: []string{
@@ -818,20 +822,20 @@ func TestSiblingMissingDialogLayoutPinsButtonsOrderAndDefault(t *testing.T) {
 			wantIDs: []int32{
 				siblingMissingManualButtonID, siblingMissingRetryButtonID, siblingMissingDismissButtonID},
 			wantAnswers: []siblingMissingAnswer{
-				siblingMissingDismiss, siblingMissingRetry, siblingMissingDismiss},
+				siblingMissingManual, siblingMissingRetry, siblingMissingDismiss},
 			wantDefault: siblingMissingDismissButtonID,
 		},
 		{
 			name:   "the launch with a log file",
 			notice: withLog,
 			wantLabels: []string{
-				"Download it and continue", "Install it manually instead", "Open the log file", "Not now"},
-			wantNotes: []string{siblingMissingDownloadNote(withLog), withLog.Manual, logPath, ""},
+				"Download and install now", "Open the release page", "Open the log file", "Not now"},
+			wantNotes: []string{siblingMissingDownloadNote(withLog), siblingMissingManualNote, logPath, ""},
 			wantIDs: []int32{
 				siblingMissingDownloadButtonID, siblingMissingManualButtonID, logFileButtonID,
 				siblingMissingDismissButtonID},
 			wantAnswers: []siblingMissingAnswer{
-				siblingMissingDownload, siblingMissingDismiss, siblingMissingDismiss, siblingMissingDismiss},
+				siblingMissingDownload, siblingMissingManual, siblingMissingDismiss, siblingMissingDismiss},
 			wantDefault: siblingMissingDismissButtonID,
 		},
 	} {

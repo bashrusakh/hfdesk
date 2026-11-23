@@ -89,6 +89,15 @@ const (
 	// anew: it is the answer of "Try again", the item that stands where
 	// the download button would be whenever no download can be offered.
 	siblingMissingRetry
+	// siblingMissingManual is the answer of the manual route: it opens
+	// the release page of this build in the default browser (the very
+	// URL the manual instruction text names) and decides nothing about
+	// the action — the program stays missing, so the caller changes
+	// nothing. A build whose name carries no release version opens no
+	// page, because it names none; the press still decides nothing. It
+	// is a distinct answer and never the dismiss one: the manual route
+	// performs an action, it is not a way of leaving the window.
+	siblingMissingManual
 )
 
 // siblingMissingButton is one command link of the notice's task dialog: the id
@@ -138,12 +147,15 @@ type siblingMissingDialog struct {
 //
 // With an offer the download is the first command link, carrying its note
 // under it; the manual route is a visible item in every state — the way
-// without a download used to hide behind a fold — and "Not now" is always the
-// last link and the default button, so Enter, Esc and the close button all
-// change nothing. Without an offer the download link is replaced by the
-// reason line in the content and by "Try again", which reads the release
-// again: the button never disappears without a way back. The log link joins
-// every state that has a log file of this launch to name.
+// without a download used to hide behind a fold — labelled **Open the release
+// page** with the note under it for a build that names a release (its press
+// opens that page), and kept as the plain instructions for a local build,
+// whose name names no page to open; "Not now" is always the last link and the
+// default button, so Enter, Esc and the close button all change nothing.
+// Without an offer the download link is replaced by the reason line in the
+// content and by "Try again", which reads the release again: the button never
+// disappears without a way back. The log link joins every state that has a
+// log file of this launch to name.
 func siblingMissingDialogLayout(notice siblingMissingNotice) siblingMissingDialog {
 	buttons := make([]siblingMissingButton, 0, 4)
 	if notice.Download != nil {
@@ -154,12 +166,18 @@ func siblingMissingDialogLayout(notice siblingMissingNotice) siblingMissingDialo
 			answer: siblingMissingDownload,
 		})
 	}
-	buttons = append(buttons, siblingMissingButton{
+	manual := siblingMissingButton{
 		id:     siblingMissingManualButtonID,
-		label:  siblingMissingManualLabel,
-		note:   notice.Manual,
-		answer: siblingMissingDismiss,
-	})
+		answer: siblingMissingManual,
+	}
+	if notice.ReleaseURL != "" {
+		manual.label = siblingMissingManualLabel
+		manual.note = siblingMissingManualNote
+	} else {
+		manual.label = siblingMissingNoReleaseManualLabel
+		manual.note = notice.Manual
+	}
+	buttons = append(buttons, manual)
 	if notice.Download == nil {
 		buttons = append(buttons, siblingMissingButton{
 			id:     siblingMissingRetryButtonID,
@@ -189,12 +207,13 @@ func siblingMissingDialogLayout(notice siblingMissingNotice) siblingMissingDialo
 // answer maps the id the dialog reports back onto the answer of the notice.
 //
 // The answer is read from the pressed id alone: the download link continues
-// the action, the retry link reads the release again, and an id the dialog
-// never sends is reported instead of guessed — a button the host does not know
-// must never start a download. The log link opens its file inside the dialog
-// and keeps the dialog open, so it never reaches this mapping while the window
-// stands; if the window ends on it anyway, nothing about the action was
-// decided, which is the dismiss answer.
+// the action, the manual link opens the release page, the retry link reads
+// the release again, and an id the dialog never sends is reported instead of
+// guessed — a button the host does not know must never start a download. The
+// log link opens its file inside the dialog and keeps the dialog open, so it
+// never reaches this mapping while the window stands; if the window ends on
+// it anyway, nothing about the action was decided, which is the dismiss
+// answer.
 func (dialog siblingMissingDialog) answer(pressed int32) (siblingMissingAnswer, error) {
 	for _, button := range dialog.buttons {
 		if button.id == pressed {

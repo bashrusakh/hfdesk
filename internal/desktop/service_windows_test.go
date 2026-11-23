@@ -1180,10 +1180,15 @@ func TestTrayServiceInstallLaunchesTheHelperAfterTheConfirmation(t *testing.T) {
 	t.Cleanup(handover.close)
 	assertNames(t, confirmed, "the confirmation", []string{
 		"starts at boot",
-		"administrator rights",
 		"Its data is separate: ",
 		"are not there",
 	})
+	// No rights sentence anywhere in it (decision of 2026-11-24): the
+	// Windows prompt that follows states that itself.
+	if lower := strings.ToLower(confirmed); strings.Contains(lower, "administrator") ||
+		strings.Contains(confirmed, "Windows prompt") {
+		t.Errorf("the confirmation %q carries the rights sentence, want none", confirmed)
+	}
 	if len(launches) != 1 {
 		t.Fatalf("the tray action launched %d helpers, want one installation", len(launches))
 	}
@@ -4203,7 +4208,14 @@ func TestTrayServiceAnswersHandOverOnlyWhenThisDesktopServes(t *testing.T) {
 		if caption != confirmCaption {
 			t.Errorf("the confirmation is captioned %q, want %q", caption, confirmCaption)
 		}
-		assertNames(t, text, "the confirmation", []string{"administrator rights", fact})
+		// The confirmation carries the question and its fact, and no
+		// rights sentence: the Windows prompt that follows states that
+		// itself (decision of 2026-11-24).
+		assertNames(t, text, "the confirmation", []string{fact})
+		if lower := strings.ToLower(text); strings.Contains(lower, "administrator") ||
+			strings.Contains(text, "Windows prompt") {
+			t.Errorf("the confirmation %q carries the rights sentence, want none", text)
+		}
 		if len(*out.commits) != 1 {
 			t.Fatalf("the handover committed %d times, want exactly one", len(*out.commits))
 		}
@@ -4282,7 +4294,7 @@ func TestTrayServiceAnswersHandOverOnlyWhenThisDesktopServes(t *testing.T) {
 		performServiceActionFromTray(serviceActionUninstall, name)
 
 		assertHandover(t, out, serviceActionUninstall, removeServiceConfirmCaption,
-			"starts again in desktop mode once the registration is gone")
+			"starts again in desktop mode")
 		if (*out.commits)[0].relaunch != handoverRelaunchDesktop {
 			t.Errorf("the removal committed relaunch %d, want the desktop relaunch: the address is free again",
 				(*out.commits)[0].relaunch)

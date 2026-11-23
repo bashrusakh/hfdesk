@@ -1404,11 +1404,13 @@ func launchServiceHelper(action serviceAction, waitPID int, instanceMutex string
 //
 // It reports the program the action continues with and whether it may
 // continue at all. false means the program is still missing and the action
-// must change nothing: a declined notice ends without any further report, and
-// a failed download was reported by this flow itself — the caller adds no
-// second report beside it. The install precheck and both update entries run
-// through here, so the notice, the fail-closed download and the rule that
-// keeps a decline quiet are one implementation instead of three.
+// must change nothing: a declined notice ends without any further report, a
+// press of the manual route opens the release page of this build and ends the
+// same way — it decides nothing about the action — and a failed download was
+// reported by this flow itself — the caller adds no second report beside it.
+// The install precheck and both update entries run through here, so the
+// notice, the fail-closed download and the rule that keeps a decline quiet
+// are one implementation instead of three.
 func offerMissingConsoleProgram(action serviceAction, executable string) (string, bool) {
 	console, err := findSiblingExecutable(filepath.Dir(executable), executable)
 	if err == nil {
@@ -1442,6 +1444,17 @@ func offerMissingConsoleProgram(action serviceAction, executable string) (string
 		}
 		notice = newSiblingMissingNotice(action, filepath.Dir(executable), executable, err, offer, offerErr)
 		answer = showSiblingMissingNotice(notice)
+	}
+	if answer == siblingMissingManual && notice.ReleaseURL != "" {
+		// The manual route opens the release page of this build — the
+		// very URL the manual instruction text names — through the one
+		// opener every browser call of this host uses, in the user's
+		// session, with the one report every failed open ends in. The
+		// press decides nothing about the action: the program is still
+		// missing, so the decline below still ends it.
+		if openErr := openBrowser(notice.ReleaseURL); openErr != nil {
+			reportBrowserFailure(notice.ReleaseURL, openErr)
+		}
 	}
 	if answer != siblingMissingDownload {
 		desktopLog.Info("the console program stays missing: the service action changes nothing",
