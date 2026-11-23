@@ -329,17 +329,22 @@ func TestServiceGatePendingTextNamesTheTransitionAndTheUnchangedLaunch(t *testin
 	}
 }
 
-// TestServiceUpdatedTextKeepsAStoppedServiceStopped proves that the report of an
-// update of a stopped service says that nothing serves HFDesk afterwards.
+// TestServiceUpdatedTextKeepsAStoppedServiceStopped proves that the report of
+// an update of a stopped service says that nothing serves HFDesk afterwards.
 //
 // An update never starts a stopped service, so a message that sent the user to
-// the address of the service would send them to a dead address. The way to
-// start it names the relaunch of the desktop app: the update ran from the
-// service gate, whose launch ended the desktop host, so no tray icon is left
-// that the report could point at.
+// the address of the service would send them to a dead address. The desktop
+// surface keeps its established way back — the relaunch of the desktop app and
+// its Start service — byte for byte (the decision of 2026-11-23 kept that
+// route), and the companion surface names its own Start service item instead
+// (TestServiceUpdatedTextNamesTheCompanionsOwnStartItem). An update is
+// reachable from the menu, the dialog, the companion and the launch gate; a
+// menu, dialog or companion update leaves the desktop host running and a
+// gate update runs after its launch already ended, so each surface gets the
+// route its user can actually reach.
 func TestServiceUpdatedTextKeepsAStoppedServiceStopped(t *testing.T) {
 	const address = "http://127.0.0.1:8080"
-	text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, false, service.StateStopped)
+	text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, false, service.StateStopped, launchSurfaceDesktop)
 
 	assertNames(t, text, "the report", []string{
 		"HFDesk 1.3.0",
@@ -355,7 +360,31 @@ func TestServiceUpdatedTextKeepsAStoppedServiceStopped(t *testing.T) {
 		t.Errorf("the report %q sends the user to the address of a stopped service", text)
 	}
 	if strings.Contains(text, "tray") {
-		t.Errorf("the report %q points at the tray of a desktop app that ended before the report", text)
+		t.Errorf("the report %q carries the companion route on the desktop surface", text)
+	}
+}
+
+// TestServiceUpdatedTextNamesTheCompanionsOwnStartItem proves the companion
+// half of the surface-dependent way back: the report of a not-running update
+// on the companion surface names that companion's own Start service item —
+// exactly one step — and never the desktop route of a launch that never ran
+// here.
+func TestServiceUpdatedTextNamesTheCompanionsOwnStartItem(t *testing.T) {
+	const address = "http://127.0.0.1:8080"
+	for _, before := range []service.State{service.StateStopped, service.StateFailed} {
+		text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, false, before, launchSurfaceCompanion)
+
+		assertNames(t, text, "the companion report", []string{
+			"Nothing serves HFDesk right now",
+			"Choose Start service from the tray menu.",
+		})
+		// The way back is ONE step, the current menu item of this tray.
+		if got := strings.Count(text, "Start service"); got != 1 {
+			t.Errorf("the companion report names Start service %d times, want exactly one:\n%s", got, text)
+		}
+		assertNamesWithout(t, text, "the companion report", nil, []string{
+			"Quit HFDesk", "Start the desktop app again", "hfdesk service", "elevated shell", " or ",
+		})
 	}
 }
 
@@ -364,7 +393,7 @@ func TestServiceUpdatedTextKeepsAStoppedServiceStopped(t *testing.T) {
 // desktop app is not needed to use the service.
 func TestServiceUpdatedTextReportsARunningService(t *testing.T) {
 	const address = "http://127.0.0.1:8080"
-	text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, true, service.StateRunning)
+	text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, true, service.StateRunning, launchSurfaceDesktop)
 
 	assertNames(t, text, "the report", []string{address, "not needed to use the service", `C:\portable\hfdesk.exe`, "keeps the settings"})
 }
@@ -399,7 +428,7 @@ func TestServiceUpdatedTextNamesTheObservedPriorState(t *testing.T) {
 		{name: "broken", before: service.StateBroken, quote: `it was "broken" before the update`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, false, tc.before)
+			text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, false, tc.before, launchSurfaceDesktop)
 
 			assertNames(t, text, "the report", []string{
 				tc.quote,
@@ -538,9 +567,10 @@ func TestServiceInstalledTextCarriesTheAuthorizedTrayFallbackOnce(t *testing.T) 
 	// The line belongs to this report alone: the update (in both of its
 	// states) and the start report carry neither it nor any tray wording.
 	for name, text := range map[string]string{
-		"the update of a running service": serviceUpdatedText("1.3.0", console, dataDir, address, true, service.StateRunning),
-		"the update of a stopped service": serviceUpdatedText("1.3.0", console, dataDir, address, false, service.StateStopped),
-		"the start report":                serviceStartedText(console, address),
+		"the update of a running service":                          serviceUpdatedText("1.3.0", console, dataDir, address, true, service.StateRunning, launchSurfaceDesktop),
+		"the update of a stopped service":                          serviceUpdatedText("1.3.0", console, dataDir, address, false, service.StateStopped, launchSurfaceDesktop),
+		"the update of a stopped service on the companion surface": serviceUpdatedText("1.3.0", console, dataDir, address, false, service.StateStopped, launchSurfaceCompanion),
+		"the start report":                                         serviceStartedText(console, address),
 	} {
 		if strings.Contains(text, serviceInstalledTrayFallbackLine) || strings.Contains(text, "tray icon") {
 			t.Errorf("the %s carries the tray fallback:\n%s", name, text)
@@ -731,14 +761,14 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 	const program = `C:\portable\hfdesk.exe`
 	removed := serviceInstallStartFailureText(reason, program, &service.InstallStartError{Cause: reason, RegistrationRemoved: true})
 	assertNames(t, removed, "the removed-install report", []string{reason.Error(), "registration created by this attempt was removed", "start the desktop app normally again"})
-	assertNamesWithout(t, removed, "the removed-install report", nil, []string{"hfdesk service uninstall", program, `NT AUTHORITY\LocalService`})
+	assertNamesWithout(t, removed, "the removed-install report", nil, []string{"hfdesk service uninstall", program, `NT AUTHORITY\LocalService`, "could not confirm"})
 
 	cleanupErr := errors.New("the service process identity changed")
 	cleanup := &service.InstallStartError{Cause: reason, CleanupError: cleanupErr}
 	kept := serviceInstallStartFailureText(cleanup, program, cleanup)
 	assertNamesWithout(t, kept, "the kept-install report",
 		[]string{reason.Error(), cleanupErr.Error(), "registration was kept", "could not prove", "hfdesk service status"},
-		[]string{program, `NT AUTHORITY\LocalService`})
+		[]string{program, `NT AUTHORITY\LocalService`, "could not confirm"})
 	if strings.Contains(kept, "the service does not run") {
 		t.Errorf("the kept-install report %q claims more than the cleanup established", kept)
 	}
@@ -766,24 +796,28 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 	if strings.Contains(removeText, "ownership could not be proven") {
 		t.Errorf("the stopped-but-kept report %q misstates registration ownership", removeText)
 	}
-	assertNamesWithout(t, removeText, "the stopped-but-kept report", nil, []string{`"hfdesk service uninstall"`, "do not want to keep the registration"})
+	assertNamesWithout(t, removeText, "the stopped-but-kept report", nil, []string{`"hfdesk service uninstall"`, "do not want to keep the registration", "could not confirm"})
 	if got := strings.Count(removeText, "hfdesk service"); got != 1 {
 		t.Errorf("the stopped-but-kept report %q names %d commands, want exactly one", removeText, got)
 	}
 }
 
 // TestServiceInstallStartFailureTextSplitsTheStartOutcomeClasses proves that
-// the report of a failed first start names the class of the start outcome
-// instead of a generic "could not confirm", and that the not-ready class
-// names the budget that actually elapsed.
+// every classified class of a failed first start carries its OWN headline —
+// the class the reader must see first — instead of a generic "could not
+// confirm", and that the not-ready class names the budget that actually
+// elapsed.
 //
 // A start that was not performed states that in its headline and never claims
 // a start could not be confirmed; a start that ran carries the one observed
-// line — the process ended before it came up, the service did not come up
-// within the applied budget, or the started service could not be verified.
-// The budget shown is the value the failing wait applied, so a different
-// applied budget must show a different number. An error classified by no site
-// keeps the older cause-only report.
+// line beside its class headline — the process ended before it came up, the
+// service did not come up within the applied budget, or the started service
+// could not be verified. The budget shown is the value the failing wait
+// applied, so a different applied budget must show a different number, and no
+// class but the not-ready one may name a budget at all. An error classified by
+// no site gets the honest state of a start that did not finish plus its cause.
+// The vague phrase "could not confirm" is forbidden in EVERY report of the
+// family, the legacy shape included.
 func TestServiceInstallStartFailureTextSplitsTheStartOutcomeClasses(t *testing.T) {
 	program := `C:\portable\hfdesk.exe`
 	cause := errors.New("the first installation did not put the new executable into service")
@@ -802,26 +836,57 @@ func TestServiceInstallStartFailureTextSplitsTheStartOutcomeClasses(t *testing.T
 		[]string{"could not confirm"})
 
 	ended := serviceInstallStartFailureText(cause, program, kept(service.StartOutcomeEnded, 0))
-	assertNames(t, ended, "the ended report",
-		[]string{"could not confirm its start", "ended before it came up", "registration was kept"})
+	assertNamesWithout(t, ended, "the ended report",
+		[]string{
+			"HFDesk registered the service, but the service program ended before it was ready.",
+			"ended before it came up", "registration was kept",
+		},
+		[]string{"could not confirm"})
 
 	notReady := serviceInstallStartFailureText(cause, program, kept(service.StartOutcomeNotReady, 45*time.Second))
-	assertNames(t, notReady, "the not-ready report", []string{"did not come up within 45s"})
+	assertNames(t, notReady, "the not-ready report",
+		[]string{"HFDesk registered the service, but the service did not come up within 45s.", "did not come up within 45s"})
+	assertNamesWithout(t, notReady, "the not-ready report", nil, []string{"could not confirm"})
 	otherBudget := serviceInstallStartFailureText(cause, program, kept(service.StartOutcomeNotReady, 48*time.Second))
 	assertNamesWithout(t, otherBudget, "the not-ready report with another applied budget",
 		[]string{"did not come up within 48s"}, []string{"45s"})
 
 	// Even a mis-stamped budget never renders for another class: only the
-	// not-ready line may name a budget, so an interrupted or unverifiable
+	// not-ready report may name a budget, so an interrupted or unverifiable
 	// wait can never claim "within <budget>" at the text layer.
 	unverified := serviceInstallStartFailureText(cause, program, kept(service.StartOutcomeUnverified, 45*time.Second))
 	assertNamesWithout(t, unverified, "the unverified report",
-		[]string{"could not verify the started service"}, []string{"did not come up within", "within 45s"})
+		[]string{
+			"HFDesk registered the service, but the started service could not be verified.",
+			"could not verify the started service",
+		},
+		[]string{"did not come up within", "within 45s", "could not confirm"})
 
 	legacyErr := &service.InstallStartError{Cause: cause, CleanupError: errors.New("ownership unproven")}
 	legacy := serviceInstallStartFailureText(legacyErr, program, legacyErr)
-	assertNamesWithout(t, legacy, "the unclassified report", []string{cause.Error(), "ownership unproven"},
-		[]string{"ended before", "did not come up", "could not verify the started service", "did not start it"})
+	assertNamesWithout(t, legacy, "the unclassified report",
+		[]string{
+			"HFDesk registered the service, but its start did not finish.",
+			cause.Error(), "ownership unproven",
+		},
+		[]string{"ended before", "did not come up", "could not verify the started service", "did not start it", "could not confirm"})
+
+	// The vague phrase is gone from the WHOLE family — every class, the
+	// removed shape and the legacy shape included. Without this sweep a
+	// single report could keep it while the per-class pins above pass.
+	for name, text := range map[string]string{
+		"the not-performed report": notPerformed,
+		"the ended report":         ended,
+		"the not-ready report":     notReady,
+		"the unverified report":    unverified,
+		"the unclassified report":  legacy,
+		"the removed report": serviceInstallStartFailureText(cause, program,
+			&service.InstallStartError{Cause: cause, RegistrationRemoved: true, Outcome: service.StartOutcomeEnded}),
+	} {
+		if strings.Contains(text, "could not confirm") {
+			t.Errorf("the %s carries the forbidden vague phrase:\n%s", name, text)
+		}
+	}
 }
 
 // TestServiceInstallStartFailureTextDistinguishesRemovedFromNeverInstalled
@@ -841,17 +906,18 @@ func TestServiceInstallStartFailureTextDistinguishesRemovedFromNeverInstalled(t 
 		Outcome:             service.StartOutcomeNotPerformed,
 	})
 	assertNamesWithout(t, removed, "the removed-after-failure report",
-		[]string{"could not start it", "registration created by this attempt was removed",
+		[]string{"HFDesk registered the service but did not start it.", "registration created by this attempt was removed",
 			"left no registration behind", "start the desktop app normally again"},
-		[]string{"HFDesk is not installed as a Windows service", "There is no service"})
+		[]string{"HFDesk is not installed as a Windows service", "There is no service", "could not confirm"})
 
 	never := serviceNotInstalledText(serviceActionStart)
 	assertNames(t, never, "the never-installed report",
 		[]string{"HFDesk is not installed as a Windows service", "Install it from the tray of the desktop app first"})
 
-	// The removed branch carries the start class too: a registration this
-	// attempt removed after a service that never came up within its budget
-	// states both facts, and still never claims the machine never had one.
+	// The removed report carries the start class in its own headline too:
+	// a registration this attempt removed after a service that never came
+	// up within its budget states both facts, and still never claims the
+	// machine never had one.
 	removedNotReady := serviceInstallStartFailureText(cause, program, &service.InstallStartError{
 		Cause:               cause,
 		RegistrationRemoved: true,
@@ -859,9 +925,10 @@ func TestServiceInstallStartFailureTextDistinguishesRemovedFromNeverInstalled(t 
 		Budget:              45 * time.Second,
 	})
 	assertNamesWithout(t, removedNotReady, "the removed not-ready report",
-		[]string{"could not start it", "did not come up within 45s", "registration created by this attempt was removed",
+		[]string{"HFDesk registered the service, but the service did not come up within 45s.",
+			"did not come up within 45s", "registration created by this attempt was removed",
 			"start the desktop app normally again"},
-		[]string{"HFDesk is not installed as a Windows service"})
+		[]string{"HFDesk is not installed as a Windows service", "could not confirm"})
 }
 
 // TestServiceGateUnreadableTextStatesWhatTheLaunchDid proves that the notice of
@@ -1550,12 +1617,15 @@ func TestStopAndRemoveConfirmationsStateTheActionAndTheOneFact(t *testing.T) {
 // TestServiceStoppedTextNamesTheStateTheFactAndOneWayBack proves that the
 // report of a stopped service is the state, the one fact the user did not
 // ask for — nothing serves the address of the service right now — and
-// exactly one way back. The way back goes through the quit and the startup
-// gate, because a start beside the desktop that runs this very tray is
-// refused by the established guard of the helper: a report that pointed at
-// that start would send the user into the refusal in a circle.
+// exactly one way back. On the desktop surface that way back goes through
+// the quit and the startup gate, and it stays byte for byte the established
+// route: a start beside the desktop that serves its own address is refused
+// by the established guard of the helper, so a report that pointed at that
+// start would send the user into the refusal in a circle. The companion
+// surface gets its own route instead
+// (TestServiceStoppedTextNamesTheCompanionsOwnStartItem).
 func TestServiceStoppedTextNamesTheStateTheFactAndOneWayBack(t *testing.T) {
-	text := serviceStoppedText()
+	text := serviceStoppedText(launchSurfaceDesktop)
 	assertNames(t, text, "the report", []string{
 		"The HFDesk service is stopped.",
 		"Nothing serves the address of the service right now.",
@@ -1564,9 +1634,48 @@ func TestServiceStoppedTextNamesTheStateTheFactAndOneWayBack(t *testing.T) {
 	})
 	// One report, one route: no elevated command line and no alternative
 	// beside the established way.
-	assertNamesWithout(t, text, "the report", nil, []string{`"hfdesk service`, " or ", "elevated shell"})
+	assertNamesWithout(t, text, "the report", nil, []string{`"hfdesk service`, " or ", "elevated shell", "tray menu"})
 	if serviceStoppedCaption == "" {
 		t.Error("the report of a stopped service has no caption")
+	}
+}
+
+// TestServiceStoppedTextNamesTheCompanionsOwnStartItem proves the companion
+// half of the surface-dependent way back: the report of a stopped service on
+// the companion surface names that companion's own Start service item — the
+// current menu item — as exactly one step, because the companion serves no
+// address and that item runs the start immediately. The desktop route of a
+// launch that did not run here is absent.
+func TestServiceStoppedTextNamesTheCompanionsOwnStartItem(t *testing.T) {
+	text := serviceStoppedText(launchSurfaceCompanion)
+	assertNames(t, text, "the companion report", []string{
+		"The HFDesk service is stopped.",
+		"Nothing serves the address of the service right now.",
+		"Choose Start service from the tray menu.",
+	})
+	if got := strings.Count(text, "Start service"); got != 1 {
+		t.Errorf("the companion report names Start service %d times, want exactly one:\n%s", got, text)
+	}
+	assertNamesWithout(t, text, "the companion report", nil, []string{
+		"Quit HFDesk", "Start the desktop app again", `"hfdesk service`, " or ", "elevated shell",
+	})
+}
+
+// TestLaunchSurfaceOfKeepsTheDesktopDefaultForAHandTypedHelper pins the
+// honest default of a helper command line without the surface marker: the
+// desktop route, which needs only the desktop app the user can start. The
+// companion route is never the default — it names a menu item only a running
+// companion has — so a hand-typed run cannot be sent looking for it.
+func TestLaunchSurfaceOfKeepsTheDesktopDefaultForAHandTypedHelper(t *testing.T) {
+	if got := launchSurfaceOf(false); got != launchSurfaceDesktop {
+		t.Errorf("launchSurfaceOf without the marker = %q, want the desktop default %q", got, launchSurfaceDesktop)
+	}
+	if got := launchSurfaceOf(true); got != launchSurfaceCompanion {
+		t.Errorf("launchSurfaceOf with the marker = %q, want %q", got, launchSurfaceCompanion)
+	}
+	if got, want := serviceStoppedText(launchSurfaceOf(false)),
+		"Quit HFDesk from the notification-area icon and choose Start service when you start the desktop app again."; !strings.HasSuffix(got, want) {
+		t.Errorf("the report of a marker-less helper run does not end with the established desktop way back %q:\n%s", want, got)
 	}
 }
 
@@ -1811,9 +1920,10 @@ func TestFailureWindowsNameTheLogFileOfThisLaunch(t *testing.T) {
 	notFailure := map[string]string{
 		"the gate of a running service": serviceGateText(serviceChoicePrompt{
 			State: service.StateRunning, URL: "http://127.0.0.1:8080", DataDir: `C:\ProgramData\HFDesk`}),
-		"the installation confirmation":   installServiceText(`C:\ProgramData\HFDesk`, true),
-		"the report of an installation":   serviceInstalledText("1.3.0", program, `C:\ProgramData\HFDesk`, "http://127.0.0.1:8080"),
-		"the report of a stopped service": serviceStoppedText(),
+		"the installation confirmation":                            installServiceText(`C:\ProgramData\HFDesk`, true),
+		"the report of an installation":                            serviceInstalledText("1.3.0", program, `C:\ProgramData\HFDesk`, "http://127.0.0.1:8080"),
+		"the report of a stopped service":                          serviceStoppedText(launchSurfaceDesktop),
+		"the report of a stopped service on the companion surface": serviceStoppedText(launchSurfaceCompanion),
 	}
 	for name, text := range notFailure {
 		if strings.Contains(text, "The log file is at") {
@@ -1882,13 +1992,16 @@ func TestGateAndReportsCarryNoInternalMechanism(t *testing.T) {
 		"the serving-desktop refusal":   serviceServingDesktopRefusedText(serviceActionStart),
 		"the unreadable-state refusal": serviceUnreadableClaimRefusedText(serviceActionStart,
 			`C:\Users\ada\AppData\Roaming\HFDesk\desktop-state.json`),
-		"the not-installed report":   serviceNotInstalledText(serviceActionStart),
-		"the busy refusal":           serviceActionBusyText(),
-		"the unknown-action report":  unknownServiceActionText(cause),
-		"the stopped report":         serviceStoppedText(),
-		"the removed report":         serviceRegistrationRemovedText(),
-		"the no-registration report": serviceNoRegistrationText(),
-		"the missing-program notice": siblingMissingManualNoticeText(notice),
+		"the not-installed report":                               serviceNotInstalledText(serviceActionStart),
+		"the busy refusal":                                       serviceActionBusyText(),
+		"the unknown-action report":                              unknownServiceActionText(cause),
+		"the stopped report":                                     serviceStoppedText(launchSurfaceDesktop),
+		"the stopped report of the companion surface":            serviceStoppedText(launchSurfaceCompanion),
+		"the not-running update report":                          serviceUpdatedText("1.3.0", program, dataDir, "", false, service.StateStopped, launchSurfaceDesktop),
+		"the not-running update report of the companion surface": serviceUpdatedText("1.3.0", program, dataDir, "", false, service.StateStopped, launchSurfaceCompanion),
+		"the removed report":                                     serviceRegistrationRemovedText(),
+		"the no-registration report":                             serviceNoRegistrationText(),
+		"the missing-program notice":                             siblingMissingManualNoticeText(notice),
 	}
 	for name, text := range texts {
 		lower := strings.ToLower(text)

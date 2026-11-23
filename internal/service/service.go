@@ -784,6 +784,18 @@ func listenArg(listen string) string {
 	return listen
 }
 
+// registrationListen returns the bind address the registration's argument
+// vector carries: the --listen value of RunArgs(opts), parsed back out of
+// that vector with the same reader the registration readers use.
+//
+// It is the address a start is verified on: the readiness probe dials what
+// the registered process was asked to bind, so neither an empty request
+// (whose vector carries the default explicitly) nor any substituted source
+// can make the probe ask an address the registration does not name.
+func registrationListen(opts InstallOptions) string {
+	return runArgValue(RunArgs(opts), "--listen")
+}
+
 // ValidateInstallOptions rejects an installation that cannot be registered or
 // started safely: an unusable executable, a relative runtime path, a relative
 // output directory, an invalid listen address or an unknown scope.

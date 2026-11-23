@@ -923,6 +923,15 @@ func keepServiceActionGuardUntilHelperEnds(pid uint32, wait func(uint32), refres
 	endServiceActionGuard(refresh)
 }
 
+// untrackedHelperWarmUpMargin is the part of that hold that covers the window
+// between the launch of the helper and the start of its action budget:
+// process creation, the runtime start, the option parse and the singleton
+// hold that precede the action. The ordinary warm-up is well under a second;
+// thirty seconds is a wide margin for the same window on a loaded machine or
+// one whose antivirus scan delays the process start. The margin cannot make
+// the coverage complete — see the honest residual on untrackedHelperHoldBudget.
+const untrackedHelperWarmUpMargin = 30 * time.Second
+
 // untrackedHelperHoldBudget bounds the guard hold of a helper that runs
 // without a process record.
 //
@@ -930,17 +939,24 @@ func keepServiceActionGuardUntilHelperEnds(pid uint32, wait func(uint32), refres
 // caller can wait for its exit: releasing the single service-action guard at
 // the launch would admit a second action beside a possibly live helper, and
 // two helpers would move the same registration next to each other. The hold
-// is bounded on purpose, and its budget is the action budget of the helper
-// itself: serviceActionBudget bounds the context of every action the helper
-// runs — the installation, the update, the start, the stop and the removal
-// alike — so holding the guard for exactly that budget covers the whole
-// mutation window of a helper nobody can wait for. What can outlive that
-// budget is only the final report window of the helper, which performs no
-// further change; the hold then ends like the run of a waited-for helper:
-// the guard is released and the menu catches up.
+// is bounded on purpose, and its budget covers the mutation window measured
+// from the launch this caller returned from: the action budget of the helper
+// itself (serviceActionBudget — the installation, the update, the start, the
+// stop and the removal alike, measured from the start of the action) plus
+// the warm-up margin above for the window before that action starts. A helper that reached its action is
+// inside the covered window: its mutation ends with its action budget, and
+// only the final report window of the helper can outlive that budget, which
+// performs no further change; the hold then ends like the run of a
+// waited-for helper: the guard is released and the menu catches up. What the
+// hold does NOT cover is a warm-up that outlasts the margin — a helper whose
+// start is delayed past it (a deep antivirus scan, a heavily paging machine)
+// can still begin its mutation after the hold ended. That residual stays
+// open on purpose: nothing can observe the progress of a helper the shell
+// named no process for, and closing it would need a process record or a
+// freshness protocol of its own.
 //
 // It is a variable so the tests can shorten the hold.
-var untrackedHelperHoldBudget = serviceActionBudget
+var untrackedHelperHoldBudget = serviceActionBudget + untrackedHelperWarmUpMargin
 
 // keepServiceActionGuardForUntrackedHelper keeps the single service-action
 // guard for the bounded hold of a helper that runs without a process record
@@ -1135,6 +1151,17 @@ type serviceHelperLaunch struct {
 	pid uint32
 }
 
+// hostLaunchSurface is the surface THIS host runs as: the launch surface the
+// reports of the helpers this host launches must send the user back to.
+//
+// It is launch-scoped state in the sense of runLogPath: the desktop host keeps
+// the default and the tray companion assigns its own surface before the first
+// service action of its menu can be wired (runCompanion). The value travels to
+// the helper as a command line marker beside the log path
+// (serviceHelperArguments), because the elevated helper cannot see the mode of
+// the process that started it.
+var hostLaunchSurface = launchSurfaceDesktop
+
 // launchServiceHelper starts the elevated helper of the desktop host.
 //
 // The helper is this very program, started with administrator rights: the
@@ -1169,12 +1196,13 @@ func launchServiceHelper(action serviceAction, waitPID int, instanceMutex string
 		}
 	}
 	pid, err := launchElevated(elevatedLaunch{
-		Executable:    executable,
-		Action:        action,
-		WaitPID:       waitPID,
-		InstanceMutex: instanceMutex,
-		DesktopState:  service.PublishedStatePath(),
-		LogFile:       runLogPath,
+		Executable:       executable,
+		Action:           action,
+		WaitPID:          waitPID,
+		InstanceMutex:    instanceMutex,
+		DesktopState:     service.PublishedStatePath(),
+		LogFile:          runLogPath,
+		CompanionSurface: hostLaunchSurface == launchSurfaceCompanion,
 	})
 	if err != nil {
 		return serviceHelperLaunch{}, err
@@ -1253,14 +1281,15 @@ func launchServiceHandover(action serviceAction, waitPID int, instanceMutex stri
 		return nil, err
 	}
 	helper, err := launchElevatedProcess(elevatedLaunch{
-		Executable:    executable,
-		Action:        action,
-		WaitPID:       waitPID,
-		ReadyEvent:    events.readyName,
-		SuccessEvent:  events.successName,
-		InstanceMutex: instanceMutex,
-		DesktopState:  service.PublishedStatePath(),
-		LogFile:       runLogPath,
+		Executable:       executable,
+		Action:           action,
+		WaitPID:          waitPID,
+		ReadyEvent:       events.readyName,
+		SuccessEvent:     events.successName,
+		InstanceMutex:    instanceMutex,
+		DesktopState:     service.PublishedStatePath(),
+		LogFile:          runLogPath,
+		CompanionSurface: hostLaunchSurface == launchSurfaceCompanion,
 	})
 	if err != nil {
 		if helper != nil {

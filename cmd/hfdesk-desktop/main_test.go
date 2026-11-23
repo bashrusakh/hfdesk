@@ -95,6 +95,7 @@ func TestParseServiceHelperCommandAcceptsTheLegitimateInvocations(t *testing.T) 
 		{"--service-action", "update"},
 		{"--service-action", "start"},
 		{"--service-action", "update", "--instance-mutex", `Local\HFDesk.Desktop.sid.1`},
+		{"--service-action", "stop", "--companion-surface"},
 	} {
 		helper, handled, err := parseServiceHelperCommand(args)
 		if !handled || err != nil {
@@ -105,6 +106,30 @@ func TestParseServiceHelperCommandAcceptsTheLegitimateInvocations(t *testing.T) 
 		if helper.Action == "" {
 			t.Errorf("parseServiceHelperCommand(%q) named no action", args)
 		}
+	}
+}
+
+// TestParseServiceHelperCommandKeepsTheDesktopSurfaceWithoutTheMarker pins
+// the launch-surface transport and its honest default: the companion marker
+// travels as a helper argument flag like --log-file, and a command line
+// without it — the hand-typed helper run — keeps the desktop surface, whose
+// way back needs only the desktop app the user can start.
+func TestParseServiceHelperCommandKeepsTheDesktopSurfaceWithoutTheMarker(t *testing.T) {
+	marked, handled, err := parseServiceHelperCommand(
+		[]string{"--service-action", "stop", "--companion-surface"})
+	if !handled || err != nil {
+		t.Fatalf("parse helper arguments returned handled=%t, err=%v", handled, err)
+	}
+	if !marked.CompanionSurface {
+		t.Errorf("parsed helper options = %+v, want the companion marker applied", marked)
+	}
+
+	plain, handled, err := parseServiceHelperCommand([]string{"--service-action", "stop"})
+	if !handled || err != nil {
+		t.Fatalf("parse helper arguments returned handled=%t, err=%v", handled, err)
+	}
+	if plain.CompanionSurface {
+		t.Errorf("parsed helper options = %+v, want no companion marker on a hand-typed command line", plain)
 	}
 }
 
