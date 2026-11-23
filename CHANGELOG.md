@@ -21,6 +21,7 @@
 - Error reports now name the log file of the launch they belong to.
 - Window and report texts are now short and plain: the state and what to do next.
 - Installing from a removable or network drive now warns that Windows may start the service before the drive is ready.
+- The install confirmation is cut to the question and two short fact lines — the service starts at boot and keeps running, and its data is separate — with the removable-drive warning as its own line.
 
 ### Fixed
 
@@ -33,6 +34,9 @@
 - The log no longer records a state reading while nothing changes; it records state changes and actions.
 - A failed service installation now says what actually went wrong — the start did not run, the program ended too early, the service did not come up in time, or the started service could not be verified — instead of a vague "could not confirm".
 - A registration removed after a failed installation attempt no longer reads as if the service had never been registered.
+- Installation and service actions now work while the Logs window or the web UI is open, without waiting for the open log view to end.
+- A service action that fails during the switch to the tray now shows one error window with the cause instead of two in a row.
+- A first installation no longer reports that the just-created registration changed before its first start when nothing else touched it: the check now compares only what the installation itself wrote.
 
 ## [1.3.0-beta.9] - 2026-11-19
 

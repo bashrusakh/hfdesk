@@ -898,14 +898,13 @@ replaces the other.
   as plain text, the path of the service log file with the action **Open
   the log file** that opens it, the bounded tail of that same log under the
   heading **Service log**, and **Try again** to re-read the live page.
-- **Install service…** asks for confirmation first, because the registration is
-  a machine-wide change that outlives the app: the service starts at boot, keeps
-  running without the desktop app, needs administrator rights, and keeps its own
-  data. When the program sits on a removable or network drive, the confirmation
-  adds one honest line: Windows may start the service before that drive is
-  ready. The confirmation also states the one file the desktop host can download:
-  the missing console program of its own release, only on request and only after
-  its SHA-256 is verified — nothing else is downloaded or copied. The action
+- **Install service…** asks for confirmation first: a headline question —
+  **Install HFDesk as a Windows service?** — and exactly two short fact
+  lines: it starts at boot and keeps running after this window closes, and
+  its data is separate (named by the directory it will own). When the
+  program sits on a removable or network drive, one honest line sits
+  between them: Windows may start the service before that drive is
+  ready. The action
   requires the console program in the folder of the desktop program — the
   program paired with this desktop program, the same name with the
   `hfdesk-desktop` prefix replaced by `hfdesk` — and installs the service from
