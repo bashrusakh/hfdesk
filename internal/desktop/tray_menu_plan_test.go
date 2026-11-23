@@ -5,142 +5,159 @@ package desktop
 
 import "testing"
 
-// TestTrayMenuPlanCompanionIsTheDecidedComposition pins the composition of
-// the tray companion menu: the status line, Open HFDesk, the service group
-// (the install item of the absence rule beside the four lifecycle actions),
-// the Runtime / Logs item, the separator and Exit — in that order and
-// nothing else: no registered-service dialog item (that dialog belongs to
-// the desktop host). WHICH of the service-group items is on screen for one
-// read is apply's absence-rule decision (pinned by the apply test of the
-// companion menu); the plan lists every item this style can show at all.
-// The shared titles are the very titles the desktop menu uses, so one
-// vocabulary serves both hosts; Exit is the companion's own last item, the
-// way Quit closes the desktop host.
-func TestTrayMenuPlanCompanionIsTheDecidedComposition(t *testing.T) {
-	plan := trayMenuPlan(trayMenuCompanion)
-
-	wantKinds := []trayMenuKind{
-		trayItemLine, trayItemOpen, trayItemInstall, trayItemStart, trayItemStop, trayItemUpdate,
-		trayItemDelete, trayItemRuntime, trayItemSeparator, trayItemQuit,
-	}
-	if len(plan) != len(wantKinds) {
-		t.Fatalf("the companion plan has %d items (%v), want exactly %d: %v",
-			len(plan), planKinds(plan), len(wantKinds), wantKinds)
-	}
-	for i, want := range wantKinds {
-		if plan[i].Kind != want {
-			t.Errorf("the companion item %d is %d, want %d: the plan is %v",
-				i, plan[i].Kind, want, planKinds(plan))
-		}
-	}
-
-	// The forbidden items must not appear anywhere in the plan: the
-	// registered-service dialog is the desktop host's surface, and its
-	// absence is pinned by its own diagnostic so a silently added item
-	// fails the item it resembles. Install is NOT forbidden — it is the
-	// absence rule's item, shown and hidden by apply.
-	for _, forbidden := range []struct {
-		kind trayMenuKind
-		name string
+// TestTrayMenuPlanRootsPinBothCompositions pins the ROOT of both tray
+// menus: Open HFDesk, Logs, the Service entry, the separator and the
+// style's own end item — in that order and nothing else. The whole
+// service section (the status line and every service action) lives in
+// the submenu serviceSubmenuPlan describes, so no root can ever show the
+// install item beside the lifecycle actions: the state and exactly the
+// actions of that state are one short list behind the Service entry.
+// The shared titles are the very titles both roots use, so one
+// vocabulary serves both hosts; Exit is the companion's own last item,
+// the way Quit closes the desktop host.
+func TestTrayMenuPlanRootsPinBothCompositions(t *testing.T) {
+	for _, tc := range []struct {
+		style     trayMenuStyle
+		styleName string
+		endTitle  string
 	}{
-		{trayItemService, "Service..."},
+		{style: trayMenuCompanion, styleName: "companion", endTitle: "Exit"},
+		{style: trayMenuFull, styleName: "full", endTitle: "Quit HFDesk"},
 	} {
-		for i, spec := range plan {
-			if spec.Kind == forbidden.kind {
-				t.Errorf("the companion item %d is the %s item: the decided composition does not carry it", i, forbidden.name)
-			}
-		}
-	}
+		t.Run(tc.styleName, func(t *testing.T) {
+			plan := trayMenuPlan(tc.style)
 
-	// Open HFDesk is the FIRST action after the status line, and the
-	// separator sits directly in front of Exit: the exit group stays the
-	// group a user reaches for last, the way the desktop menu ends with
-	// its Quit.
-	if plan[1].Kind != trayItemOpen {
-		t.Errorf("the companion item after the status line is %d, want Open HFDesk (%d): %v",
-			plan[1].Kind, trayItemOpen, planKinds(plan))
-	}
-	if plan[len(plan)-2].Kind != trayItemSeparator || plan[len(plan)-1].Kind != trayItemQuit {
-		t.Errorf("the plan ends with %v, want the separator directly in front of Exit", planKinds(plan[len(plan)-2:]))
-	}
+			wantKinds := []trayMenuKind{
+				trayItemOpen, trayItemRuntime, trayItemService, trayItemSeparator, trayItemQuit,
+			}
+			if len(plan) != len(wantKinds) {
+				t.Fatalf("the %s root has %d items (%v), want exactly %d: %v",
+					tc.styleName, len(plan), planKinds(plan), len(wantKinds), wantKinds)
+			}
+			for i, want := range wantKinds {
+				if plan[i].Kind != want {
+					t.Errorf("the %s item %d is %d, want %d: the plan is %v",
+						tc.styleName, i, plan[i].Kind, want, planKinds(plan))
+				}
+			}
 
-	// The titles of the fixed items; the status line carries none — the
-	// runner creates it with the result of the first read, so the line
-	// is right from the first moment the menu exists.
-	wantTitles := map[trayMenuKind]string{
-		trayItemOpen:    "Open HFDesk",
-		trayItemInstall: "Install service...",
-		trayItemStart:   "Start service",
-		trayItemStop:    "Stop service",
-		trayItemUpdate:  "Update service",
-		trayItemDelete:  "Delete service",
-		trayItemRuntime: "Runtime / Logs",
-		trayItemQuit:    "Exit",
-	}
-	for _, spec := range plan {
-		if spec.Kind == trayItemLine {
-			if spec.Title != "" {
-				t.Errorf("the status line carries the title %q, want it created from the first read", spec.Title)
+			// No service action and no status line may appear in a
+			// ROOT: those items belong to the Service submenu only —
+			// an install item or a lifecycle action in the root is
+			// exactly the duplicate layout the submenu removes.
+			for _, forbidden := range []struct {
+				kind trayMenuKind
+				name string
+			}{
+				{trayItemLine, "the status line"},
+				{trayItemInstall, "Install service..."},
+				{trayItemStart, "Start service"},
+				{trayItemStop, "Stop service"},
+				{trayItemUpdate, "Update service"},
+				{trayItemDelete, "Delete service"},
+			} {
+				for i, spec := range plan {
+					if spec.Kind == forbidden.kind {
+						t.Errorf("the %s item %d carries %s: it lives in the Service submenu, never in the root",
+							tc.styleName, i, forbidden.name)
+					}
+				}
 			}
-			if spec.Tooltip == "" {
-				t.Error("the status line carries no tooltip")
+
+			// The separator sits directly in front of the end item:
+			// the exit group stays the group a user reaches for last.
+			if plan[len(plan)-2].Kind != trayItemSeparator || plan[len(plan)-1].Kind != trayItemQuit {
+				t.Errorf("the plan ends with %v, want the separator directly in front of the end item",
+					planKinds(plan[len(plan)-2:]))
 			}
-			continue
-		}
-		if spec.Kind == trayItemSeparator {
-			if spec.Title != "" || spec.Tooltip != "" {
-				t.Errorf("the separator carries text %q/%q, want none", spec.Title, spec.Tooltip)
+
+			wantTitles := map[trayMenuKind]string{
+				trayItemOpen:    "Open HFDesk",
+				trayItemRuntime: "Logs",
+				trayItemService: "Service",
+				trayItemQuit:    tc.endTitle,
 			}
-			continue
-		}
-		if want := wantTitles[spec.Kind]; spec.Title != want {
-			t.Errorf("the item of kind %d is titled %q, want %q", spec.Kind, spec.Title, want)
-		}
-		if spec.Tooltip == "" {
-			t.Errorf("the item %q carries no tooltip", spec.Title)
-		}
+			for _, spec := range plan {
+				if spec.Kind == trayItemSeparator {
+					if spec.Title != "" || spec.Tooltip != "" {
+						t.Errorf("the separator carries text %q/%q, want none", spec.Title, spec.Tooltip)
+					}
+					continue
+				}
+				if want := wantTitles[spec.Kind]; spec.Title != want {
+					t.Errorf("the item of kind %d is titled %q, want %q", spec.Kind, spec.Title, want)
+				}
+				if spec.Tooltip == "" {
+					t.Errorf("the item %q carries no tooltip", spec.Title)
+				}
+			}
+		})
 	}
 }
 
-// TestTrayMenuPlanFullKeepsTheDesktopComposition pins the OTHER plan byte
-// for byte: the desktop host menu keeps every item it has always had, in
-// its order — so the plan-driven runner cannot silently add, drop or move
-// an item of the established menu while it learned to build two of them.
-func TestTrayMenuPlanFullKeepsTheDesktopComposition(t *testing.T) {
-	plan := trayMenuPlan(trayMenuFull)
+// TestServiceSubmenuPlanPinsTheSharedServiceSection pins the ONE submenu
+// both styles build behind their Service entry: the status line first
+// (created from the first read, disabled: it reports, it does not act),
+// then Install service... and the four lifecycle actions — that order and
+// nothing else: no dialog item, no separator, no end item inside the
+// submenu. WHICH of these items are on screen for one read is apply's
+// mode-times-state decision (pinned by the apply tests); the plan lists
+// every item the submenu can show at all.
+func TestServiceSubmenuPlanPinsTheSharedServiceSection(t *testing.T) {
+	plan := serviceSubmenuPlan()
 
 	want := []struct {
 		kind  trayMenuKind
 		title string
 	}{
-		{trayItemOpen, "Open HFDesk"},
-		{trayItemRuntime, "Runtime / Logs"},
 		{trayItemLine, ""},
 		{trayItemInstall, "Install service..."},
 		{trayItemStart, "Start service"},
 		{trayItemStop, "Stop service"},
 		{trayItemUpdate, "Update service"},
 		{trayItemDelete, "Delete service"},
-		{trayItemService, "Service..."},
-		{trayItemSeparator, ""},
-		{trayItemQuit, "Quit HFDesk"},
 	}
 	if len(plan) != len(want) {
-		t.Fatalf("the full plan has %d items (%v), want %d", len(plan), planKinds(plan), len(want))
+		t.Fatalf("the Service submenu has %d items (%v), want %d", len(plan), planKinds(plan), len(want))
 	}
 	for i, expected := range want {
 		if plan[i].Kind != expected.kind {
-			t.Errorf("the full item %d is %d, want %d: the plan is %v",
+			t.Errorf("the submenu item %d is %d, want %d: the plan is %v",
 				i, plan[i].Kind, expected.kind, planKinds(plan))
 		}
 		if plan[i].Title != expected.title {
-			t.Errorf("the full item %d is titled %q, want %q", i, plan[i].Title, expected.title)
+			t.Errorf("the submenu item %d is titled %q, want %q", i, plan[i].Title, expected.title)
 		}
 	}
-	// The separator sits directly in front of quit: the quit group stays
-	// the group a user reaches for last.
-	if plan[len(plan)-2].Kind != trayItemSeparator || plan[len(plan)-1].Kind != trayItemQuit {
-		t.Errorf("the plan ends with %v, want the separator directly in front of quit", planKinds(plan[len(plan)-2:]))
+	for _, forbidden := range []struct {
+		kind trayMenuKind
+		name string
+	}{
+		{trayItemOpen, "Open HFDesk"},
+		{trayItemRuntime, "Logs"},
+		{trayItemSeparator, "the separator"},
+		{trayItemQuit, "the end item"},
+	} {
+		for i, spec := range plan {
+			if spec.Kind == forbidden.kind {
+				t.Errorf("the submenu item %d is %s: the Service submenu carries only the status line and the service actions",
+					i, forbidden.name)
+			}
+		}
+	}
+	// The status line carries no title (the runner creates it from the
+	// first read) but does carry its tooltip; every action carries both.
+	for _, spec := range plan {
+		if spec.Kind == trayItemLine {
+			if spec.Title != "" {
+				t.Errorf("the status line carries the title %q, want it created from the first read", spec.Title)
+			}
+		} else if spec.Title == "" {
+			t.Errorf("the submenu item of kind %d carries no title", spec.Kind)
+		}
+		if spec.Tooltip == "" {
+			t.Errorf("the submenu item %q carries no tooltip", spec.Title)
+		}
 	}
 }
 

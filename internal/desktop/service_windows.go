@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -85,7 +86,7 @@ var serviceStatus = lookupServiceStatus
 //
 //   - Single reads without settle run through readSingle under the budget
 //     their caller names:
-//   - the display surfaces (the tray line, the Runtime / Logs window) name
+//   - the display surfaces (the tray line, the Logs window) name
 //     serviceDisplayStatusTimeout (2s): the read is bounded, never waits
 //     for a pending state to settle and never holds its caller longer than
 //     that budget — it runs behind a menu refresh and behind the HTTP
@@ -135,29 +136,88 @@ func (serviceStateReader) readForDisplay() (service.Status, error) {
 	return serviceState.readSingle(serviceDisplayStatusTimeout)
 }
 
+// serviceReadStamp is what one state read reported: the state word, the
+// running fact and — when the read failed — its error text.
+type serviceReadStamp struct {
+	state   string
+	running bool
+	errText string // "" when the read succeeded
+	seen    bool
+}
+
+// serviceReadLogMu guards serviceReadLogLast: the menu refresh goroutine,
+// the tick reads and the HTTP handlers of the Logs window read beside
+// each other.
+var serviceReadLogMu sync.Mutex
+
+// serviceReadLogLast is the last read the host recorded in its log.
+//
+// The display surfaces re-read on a cadence — the tray menu refresh and
+// the status polls of the open Logs window — so a record per read would
+// add lines every few seconds while nothing moves. The stamp turns the
+// record into a CHANGE record: the first read, a state that moved (the
+// record carries the previous state word beside the new one), a read
+// that starts failing and one that recovers. A repeated read of what is
+// already on the record writes nothing — the open window at rest adds no
+// lines — while every transition stays on the record, so the diagnostic
+// value of the reads survives.
+//
+// It is a package level variable so a test can start from an empty stamp
+// with the established seam.
+var serviceReadLogLast serviceReadStamp
+
+// recordServiceRead stores the stamp of a read and reports whether it is
+// a change beside the previous record — plus the previous state word
+// when the record names a different one.
+func recordServiceRead(stamp serviceReadStamp) (changed bool, previous string) {
+	serviceReadLogMu.Lock()
+	defer serviceReadLogMu.Unlock()
+	if serviceReadLogLast.seen && serviceReadLogLast == stamp {
+		return false, ""
+	}
+	if serviceReadLogLast.seen && serviceReadLogLast.state != stamp.state {
+		previous = serviceReadLogLast.state
+	}
+	serviceReadLogLast = stamp
+	return true, previous
+}
+
 // readSingle reads the registration exactly once under the budget its
 // caller names: the one mechanism of the owner for every read that does not
 // wait for a transition. The callers differ in the budget they name, never
 // in the mechanism.
 //
-// Every read and its result are recorded: the log of the host is where a
-// user checks what the status surfaces saw, and the record is written as the
-// read it was — never as the outcome of an action this host did not perform.
+// A read that CHANGES what the host last recorded is written as the read
+// it was — never as the outcome of an action this host did not perform —
+// and a read that reports what is already on the record writes nothing:
+// the periodic reads of the open status surfaces then stay silent while
+// the machine rests (the record of every change, and the menu's own
+// transition record, carry the diagnostics).
 func (serviceStateReader) readSingle(budget time.Duration) (service.Status, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	status, err := serviceStatus(ctx)
+	stamp := serviceReadStamp{state: string(status.State), running: status.Running, seen: true}
+	if err != nil {
+		stamp.errText = err.Error()
+	}
+	changed, previous := recordServiceRead(stamp)
+	if !changed {
+		return status, err
+	}
 	if err != nil {
 		desktopLog.Warn("read the Windows service state", "error", err)
 		return status, err
 	}
-	desktopLog.Info("read the Windows service state",
-		"state", string(status.State),
-		"running", status.Running)
+	args := []any{"state", string(status.State), "running", status.Running}
+	if previous != "" {
+		args = append(args, "previous", previous)
+	}
+	desktopLog.Info("read the Windows service state", args...)
 	return status, nil
 }
 
-// readRuntimeServiceState answers the state read of the Runtime / Logs
+// readRuntimeServiceState answers the state read of the Logs
 // window under the display policy.
 //
 // Every display read asks the tray menu to catch up right after it ran, so a
@@ -394,7 +454,7 @@ func (serviceStateReader) readForAction(ctx context.Context) (service.Status, er
 // process: the installation, and the start, update, stop and removal of a
 // registered service, from every surface that can ask for one — the install
 // item, the Service... dialog, the lifecycle items of the menu and the
-// install button of the Runtime / Logs window.
+// install button of the Logs window.
 //
 // The tray keeps delivering clicks while the confirmation of a click is open
 // and while an already launched helper still works: the action runs on a

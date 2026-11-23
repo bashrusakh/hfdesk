@@ -8,7 +8,7 @@ import (
 )
 
 // serviceRegistrationClass is how one read of the registration classifies
-// the machine for the service section of the tray menu.
+// the machine for the Service submenu of the tray menu.
 type serviceRegistrationClass int
 
 const (
@@ -41,20 +41,23 @@ func classifyRegistration(status service.Status, readErr error) serviceRegistrat
 	}
 }
 
-// serviceMenuState is what the service section of the tray menu shows for
-// one read of the registration.
+// serviceMenuState is what the Service submenu of the tray menu shows
+// for one read of the registration.
 type serviceMenuState struct {
-	// Line is the compact status line of the menu.
+	// Line is the compact status line of the submenu.
 	Line string
-	// InstallEnabled reports whether the install item may act.
-	InstallEnabled bool
-	// ServiceVisible reports whether the registered-service section — the
-	// registered-service dialog item and the lifecycle items beside the
-	// greyed install item — belongs into the menu. It is the single
-	// visibility claim of that section: the dialog item and the lifecycle
-	// items appear and disappear together, because all of them act on a
-	// registration and a read that did not prove one offers none of them.
-	ServiceVisible bool
+	// InstallVisible reports whether the install item belongs into the
+	// submenu: it acts ONLY on a proven absence of a registration, so
+	// exactly one group of service actions — install or the lifecycle
+	// group — is ever on screen beside the line. A visible install item
+	// always acts; there is no grey install state anymore.
+	InstallVisible bool
+	// ActionsVisible reports whether the four lifecycle items (start,
+	// stop, update, delete) belong into the submenu: they act on a
+	// registration, so a read that proved one shows them and a proven
+	// absence and an unsettled read hide them — a destructive action is
+	// never offered without a state that was read.
+	ActionsVisible bool
 	// OpenVisible reports whether the Open HFDesk item belongs into the
 	// menu: it acts on the address of the REGISTRATION, so a proven
 	// registration shows it and a proven absence and an unsettled read
@@ -72,77 +75,85 @@ type serviceMenuState struct {
 	// StartEnabled reports whether the start item may act: only a
 	// registration whose state is settled and does not run — stopped,
 	// failed, broken without an instance — is a state a start can act on.
-	// A transition is not a state to decide on (the rule of the service
-	// gate), so a pending state leaves the item grey.
 	StartEnabled bool
-	// StopEnabled reports whether the stop item may act: it follows the
-	// supervisor's running fact — the same classification every other
-	// surface decides "the service runs" with, where a pending start
-	// counts as running and a pending stop does not.
+	// StopEnabled reports whether the stop item may act: a settled
+	// registration whose running fact stands — where a pending start
+	// counts as running only after it settled into one.
 	StopEnabled bool
-	// UpdateEnabled reports whether the update item may act. Every
-	// registration is a state an update may re-point, so it follows the
-	// visibility claim alone.
+	// UpdateEnabled reports whether the update item may act: a settled
+	// registration is a state an update may re-point.
 	UpdateEnabled bool
-	// DeleteEnabled reports whether the delete item may act. The removal
-	// stops a running instance inside Manager.Uninstall as part of the
-	// action, so every registration is a state it may act on as well.
+	// DeleteEnabled reports whether the delete item may act: a settled
+	// registration is a state the removal may take — it stops a running
+	// instance inside Manager.Uninstall as part of the action.
 	DeleteEnabled bool
 }
 
 // serviceStatusLine returns the compact status line of a service read.
 //
-// The wording never claims "not installed" for a state that could not be
-// read: an unsettled read is "Service: unknown", the one honest word for
-// that machine. A proven registration is named by the one word the
-// decision rests on — the line reads "Service: installed" and nothing
-// else, because the line answers only whether a registration exists, not
-// how it is doing.
+// The wording is one honest word per class of machine: an unsettled read
+// is "Service: unknown", a proven absence is "Service: not installed",
+// a registration in a transition names the transition it is in
+// ("Service: starting", "Service: stopping"), a settled registration
+// that serves reads "Service: running", and any other settled
+// registration reads "Service: installed". The line answers what the
+// machine has right now — never a guess: a state that could not be read
+// never claims a machine without a service.
 func serviceStatusLine(status service.Status, readErr error) string {
 	switch classifyRegistration(status, readErr) {
 	case registrationAbsent:
 		return "Service: not installed"
 	case registrationPresent:
+		if !serviceStateSettled(status.State) {
+			return "Service: " + string(status.State)
+		}
+		if serviceStatusRunning(status) {
+			return "Service: running"
+		}
 		return "Service: installed"
 	default:
 		return "Service: unknown"
 	}
 }
 
-// serviceMenuFor maps one read of the registration onto the menu it shows.
+// serviceMenuFor maps one read of the registration onto the submenu it
+// shows — the mode-times-state model both styles share:
 //
-// The two items follow the same decision as the line: a proven absence
-// enables the install item and hides the service section — a menu with no
-// registration shows no dead second item beside the install action — while
-// a proven registration greys the install item and shows the
-// registered-service section beside it, so the grey item always sits next
-// to the state that greys it. An unsettled read takes neither claim: the
-// install item is greyed rather than left active, because "enabled only
-// while no service is installed" is not proven by a read that failed, and
-// the lifecycle items stay hidden — a destructive action is never offered
-// without a state that was read.
+//   - a proven ABSENCE shows the install item and nothing else that
+//     acts: a menu with no registration shows no dead lifecycle items,
+//     and the install item is the one action of that state;
+//   - a proven REGISTRATION shows the four lifecycle items and hides the
+//     install item, so exactly one action group is ever on screen —
+//     beside a registration whose state is SETTLED: start is enabled on
+//     a settled state that does not run, stop on a settled state whose
+//     running fact stands, update and delete on the registration alone;
+//   - a TRANSITION (a pending start or stop) is not a state to decide
+//     on — the rule of the service gate applied to the whole group — so
+//     every lifecycle item goes grey until the reading settles again;
+//   - an UNSETTLED read claims neither group: the line says unknown and
+//     no action is offered, because "no service is installed" was not
+//     proven by a read that failed. Auto re-reading continues, so the
+//     submenu catches up as soon as a read proves a state.
 //
-// Inside a proven registration the lifecycle items enable per state, on the
-// classifications every other surface already decides with: the stop item
-// follows the running fact (a pending start counts as running, a pending
-// stop does not), the start item follows its negation restricted to settled
-// states (a transition is not a state to decide on), and update and delete
-// follow the registration alone — the update re-points it and the removal
-// stops a running instance inside Manager.Uninstall as part of the action.
+// The Open HFDesk item keeps its own two claims (visible beside a proven
+// registration, enabled on the running fact) — the companion rule apply
+// consumes; the desktop host opens its own address and leaves its item
+// out of this mapping.
 func serviceMenuFor(status service.Status, readErr error) serviceMenuState {
 	state := serviceMenuState{Line: serviceStatusLine(status, readErr)}
 	switch classifyRegistration(status, readErr) {
 	case registrationAbsent:
-		state.InstallEnabled = true
+		state.InstallVisible = true
 	case registrationPresent:
 		running := serviceStatusRunning(status)
-		state.ServiceVisible = true
+		settled := serviceStateSettled(status.State)
+		state.ActionsVisible = true
 		state.OpenVisible = true
 		state.OpenEnabled = running
-		state.StartEnabled = !running && serviceStateSettled(status.State)
-		state.StopEnabled = running
-		state.UpdateEnabled = true
-		state.DeleteEnabled = true
+		state.StartEnabled = settled && !running
+		state.StopEnabled = settled && running
+		state.UpdateEnabled = settled
+		state.DeleteEnabled = settled
 	}
 	return state
 }

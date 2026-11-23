@@ -29,7 +29,7 @@ type trayActions struct {
 	// opens the address of its own instance, the companion the address
 	// of the REGISTRATION.
 	open func()
-	// runtime shows the Runtime / Logs window.
+	// runtime shows the Logs window.
 	runtime func()
 	// install registers the desktop host as a Windows service.
 	install func()
@@ -42,7 +42,11 @@ type trayActions struct {
 	// delete removes the registration of the registered service.
 	delete func()
 	// service opens the registered-service dialog of an installed
-	// service: the open/start/update choices the service gate asks.
+	// service: the open/start/update choices the gate asks. No item of
+	// the current plans is wired to it — the Service entry became the
+	// submenu, and the dialog itself stays reachable through the
+	// install recheck — so the desktop host's write below reaches no
+	// item until a plan carries the dialog again.
 	service func()
 	// quit stops the host: the desktop host stops its server, the
 	// companion closes the tray and its window — the Windows service is
@@ -84,11 +88,11 @@ type trayMenuItem interface {
 	Click(func())
 }
 
-// trayServiceMenu is the service section of the tray menu: the status line
-// and the items that act on the state the line reports — the installation
-// and the registered-service dialog, with the lifecycle items (start, stop,
-// update, delete) between them that belong to the menu only while a
-// registration was proven.
+// trayServiceMenu is the service section of the tray menu: the status
+// line and the items that act on the state the line reports — both live
+// INSIDE the Service submenu, with the lifecycle items (start, stop,
+// update, delete) beside the install item; each group belongs to the
+// submenu only for the state that proved it.
 type trayServiceMenu struct {
 	line    trayMenuItem
 	open    trayMenuItem
@@ -97,24 +101,18 @@ type trayServiceMenu struct {
 	stop    trayMenuItem
 	update  trayMenuItem
 	delete  trayMenuItem
-	service trayMenuItem
 	// shown is the state the items currently display, and shownSet
 	// reports whether a state was ever applied. Together they let an
 	// update identical to the visible one be dropped: the result of the
 	// read is already on the items, and the refresh that follows every
 	// display read must not rewrite the same values on every status
-	// poll of the Runtime window.
+	// poll of the Logs window. shown is also where each managed item's
+	// current VISIBILITY comes from: apply writes an item differently
+	// depending on whether the previously applied state showed it
+	// (writeItem), and before the first apply every item counts as
+	// visible — the items are created visible.
 	shown    serviceMenuState
 	shownSet bool
-	// installOnAbsence is the absence rule of the tray companion: its
-	// install item exists in the menu ONLY beside a proven absence of
-	// the registration — registered and unsettled reads hide it, so an
-	// item that cannot act never clutters the strict companion menu.
-	// The desktop menu keeps its own documented rule instead (the item
-	// always sits beside the status line, greyed when it cannot act),
-	// so this flag is false there and the install write stays byte for
-	// byte what it was.
-	installOnAbsence bool
 	// openFollowsService is the companion rule of the Open HFDesk item:
 	// the companion opens the address of the REGISTRATION, so its item
 	// shows beside a proven registration (grey while the service does
@@ -128,26 +126,26 @@ type trayServiceMenu struct {
 
 // apply writes one read of the registration into the menu.
 //
-// The install item stays visible and greyed when a service is installed —
-// the grey item beside the status line is the reason it is grey — while the
-// registered-service section is hidden on a machine without one, so no
-// dead-looking second item sits beside the active install action. The
-// section carries the dialog item and the four lifecycle items: they appear
-// and disappear together (a read that proved no registration offers none of
-// them), and inside a proven registration each lifecycle item enables per
-// state — start and stop on the running fact, update and delete on the
-// registration alone.
+// Every item follows the mode-times-state mapping of serviceMenuFor: the
+// install item belongs to a proven absence only, the four lifecycle
+// items belong to a proven registration only (inside it they enable per
+// state — start and stop on the settled running fact, update and delete
+// on the settled registration), so exactly one action group is ever on
+// screen beside the status line, and an unsettled read shows the honest
+// unknown line with no action at all.
 //
 // The Open HFDesk item is written only where its style says so
 // (openFollowsService): the companion's item follows the registration and
 // the running fact exactly like the mapping above, and the desktop item —
 // the address of this host's own server — is left alone.
 //
-// The install item and the dialog item belong to the FULL menu only: the
-// companion menu is the strict composition without them, so its fields stay
-// nil and every write here skips a nil item instead of inventing one —
-// the companion gets the identical status line and the identical
-// enable-per-state mapping of the four lifecycle items, and nothing else.
+// Every visibility write goes through writeItem, which owns the rule that
+// keeps a hidden item hidden: the tray library re-inserts a hidden item
+// on ANY update of it, so an already-hidden item is never written again,
+// and Hide is the last write of the pass that hides an item. The
+// visibility of the PREVIOUSLY applied state (shown) tells writeItem what
+// the item looks like right now; before the first apply every item counts
+// as visible, because the runner creates them visible.
 //
 // An update that equals the state already shown is dropped: the result of
 // that read is visible by definition, so nothing has to be rewritten. Every
@@ -160,95 +158,78 @@ func (m *trayServiceMenu) apply(state serviceMenuState) {
 	}
 	desktopLog.Info("the tray service menu updated",
 		"line", state.Line,
-		"installEnabled", state.InstallEnabled,
-		"serviceVisible", state.ServiceVisible,
+		"installVisible", state.InstallVisible,
+		"actionsVisible", state.ActionsVisible,
 		"startEnabled", state.StartEnabled,
 		"stopEnabled", state.StopEnabled)
 	m.line.SetTitle(state.Line)
+	wasShown := m.shownSet
 	if m.openFollowsService {
 		// The companion rule of Open HFDesk: the item acts on the
 		// address of the registration, so it shows beside a proven
 		// registration — grey while nothing serves the address —
 		// and hides beside a proven absence and an unsettled read.
-		if state.OpenVisible {
-			showItem(m.open)
-		} else {
-			hideItem(m.open)
-		}
-		enableItem(m.open, state.OpenEnabled)
+		writeItem(m.open, state.OpenVisible, state.OpenEnabled,
+			!wasShown || m.shown.OpenVisible)
 	}
-	if m.installOnAbsence {
-		// The absence rule of the companion: the install item shows
-		// only beside a PROVEN absence (the only state InstallEnabled
-		// claims) and hides beside a registration or an unsettled
-		// read — the four lifecycle items below follow their own
-		// visibility claim, so exactly one group of the service
-		// actions is ever on screen.
-		if state.InstallEnabled {
-			showItem(m.install)
-		} else {
-			hideItem(m.install)
-		}
-		enableItem(m.install, state.InstallEnabled)
-	} else {
-		// The desktop rule: the install item always sits beside the
-		// status line, greyed when it cannot act.
-		enableItem(m.install, state.InstallEnabled)
-	}
-	if state.ServiceVisible {
-		showItem(m.service)
-		showItem(m.start)
-		showItem(m.stop)
-		showItem(m.update)
-		showItem(m.delete)
-		enableItem(m.start, state.StartEnabled)
-		enableItem(m.stop, state.StopEnabled)
-		enableItem(m.update, state.UpdateEnabled)
-		enableItem(m.delete, state.DeleteEnabled)
-	} else {
-		hideItem(m.service)
-		hideItem(m.start)
-		hideItem(m.stop)
-		hideItem(m.update)
-		hideItem(m.delete)
-	}
+	// The absence rule of BOTH styles: the install item exists only
+	// beside a PROVEN absence and acts whenever it shows — exactly one
+	// group of the service actions is ever on screen.
+	writeItem(m.install, state.InstallVisible, state.InstallVisible,
+		!wasShown || m.shown.InstallVisible)
+	// The lifecycle group follows its own visibility claim: it appears
+	// and disappears together beside a proven registration, and inside
+	// it each item enables per state.
+	wasActions := !wasShown || m.shown.ActionsVisible
+	writeItem(m.start, state.ActionsVisible, state.StartEnabled, wasActions)
+	writeItem(m.stop, state.ActionsVisible, state.StopEnabled, wasActions)
+	writeItem(m.update, state.ActionsVisible, state.UpdateEnabled, wasActions)
+	writeItem(m.delete, state.ActionsVisible, state.DeleteEnabled, wasActions)
 	m.shown = state
 	m.shownSet = true
 }
 
-// enableItem lets the item act when enabled and greys it otherwise, so every
-// lifecycle item is written through one rule. A menu without the item (the
-// companion composition) skips it: the item does not exist to act.
-func enableItem(item trayMenuItem, enabled bool) {
+// writeItem writes one managed menu item for one read, owning the rule
+// that keeps a hidden item hidden:
+//
+//   - an item that shows is shown first when it was hidden, then enabled
+//     or greyed — both writes land on a VISIBLE item, which the tray
+//     library updates in place;
+//   - an item that hides receives exactly one write, Hide, and nothing
+//     after it in this pass;
+//   - an item that is already hidden receives NO write at all: any
+//     update (Enable, Disable, SetTitle) re-inserts a hidden item into
+//     the menu in the tray library, which resurrected the grey install
+//     item beside a registration — the duplicate this menu no longer
+//     shows.
+//
+// wasVisible is the visibility of the previously applied state (true
+// before the first apply: the runner creates every item visible). A menu
+// without the item (a nil field) skips the write: the item does not
+// exist to act.
+func writeItem(item trayMenuItem, visible, enabled, wasVisible bool) {
 	if item == nil {
 		return
 	}
-	if enabled {
-		item.Enable()
-	} else {
-		item.Disable()
+	if visible {
+		if !wasVisible {
+			item.Show()
+		}
+		if enabled {
+			item.Enable()
+		} else {
+			item.Disable()
+		}
+		return
 	}
-}
-
-// showItem makes an existing item visible; a menu without it (the
-// companion composition) skips the write.
-func showItem(item trayMenuItem) {
-	if item != nil {
-		item.Show()
-	}
-}
-
-// hideItem removes an existing item from the menu; a menu without it (the
-// companion composition) skips the write.
-func hideItem(item trayMenuItem) {
-	if item != nil {
+	if wasVisible {
 		item.Hide()
 	}
 }
 
 // keepFresh keeps the menu truthful while the tray runs: it re-reads on the
 // cadence, whenever an action asks for a refresh, and after every display
-// read made elsewhere — the state reads of the Runtime / Logs window ask for
+// read made elsewhere — the state reads of the Logs window ask for
 // the same catch-up, so no read result can stay invisible in the menu until
 // the next tick. The goroutine owns the items after the menu was built and
 // ends when the tray loop closes
@@ -296,18 +277,18 @@ var runTrayLoop = runTray
 // in its package init and the window it creates belongs to the thread that
 // pumps its messages.
 //
-// The items come from the plan of the given style: the full composition of
-// the desktop host or the strict composition of the tray companion (see
-// trayMenuPlan). Both share the status line, the enable-per-state mapping
-// and the catch-up refresh, so an action of either host runs through the
-// same machinery.
+// The items come from the plan of the given style: the root of the
+// desktop host or the root of the tray companion (see trayMenuPlan), plus
+// the Service submenu both styles share (see serviceSubmenuPlan). Both
+// share the status line, the enable-per-state mapping and the catch-up
+// refresh, so an action of either host runs through the same machinery.
 //
 // The ready callback runs on a goroutine of its own, the click callbacks run
 // in the message loop of the main thread. The ready channel is closed as
 // soon as the tray is up, so the caller can watch for a tray that never
 // comes up.
 func runTray(iconBytes []byte, tooltip string, style trayMenuStyle, actions trayActions, serviceView trayServiceView, ready chan struct{}) {
-	// The left click opens the Runtime / Logs window.
+	// The left click opens the Logs window.
 	systray.SetOnClick(func(systray.IMenu) {
 		actions.runtime()
 	})
@@ -330,15 +311,16 @@ func runTray(iconBytes []byte, tooltip string, style trayMenuStyle, actions tray
 		// the read is bounded by the display budget of the host.
 		menuState := readServiceMenuState(serviceView)
 
-		// The items are built from the plan, in its order. The service
-		// group reads top down in both styles: the status line says
-		// what the machine has, and the items under it act on that
-		// state — install when no registration was read, and the
-		// registered-service section beside the greyed install item
-		// when one was (the full menu only), and the four lifecycle
-		// items with the same enable-per-state mapping everywhere.
+		// The root items are built from the plan of the style, in its
+		// order: Open HFDesk, Logs, the Service entry, the separator
+		// and the style's end item. The Service entry carries the
+		// submenu both styles share — the status line first, created
+		// from the first read and disabled (it reports, it does not
+		// act), then the install and lifecycle actions with the same
+		// click wiring everywhere; the shell draws the submenu marker
+		// itself. Which of the submenu items are on screen for one
+		// read is apply's mode-times-state decision.
 		menu := &trayServiceMenu{
-			installOnAbsence:   style == trayMenuCompanion,
 			openFollowsService: style == trayMenuCompanion,
 		}
 		for _, spec := range trayMenuPlan(style) {
@@ -346,36 +328,40 @@ func runTray(iconBytes []byte, tooltip string, style trayMenuStyle, actions tray
 				systray.AddSeparator()
 				continue
 			}
-			// The status line is created with the result of the
-			// first read, so the line is right from the first
-			// moment the menu exists; every other item carries its
-			// fixed title from the plan.
-			title := spec.Title
-			if spec.Kind == trayItemLine {
-				title = menuState.Line
-			}
-			item := systray.AddMenuItem(title, spec.Tooltip)
+			item := systray.AddMenuItem(spec.Title, spec.Tooltip)
 			switch spec.Kind {
-			case trayItemLine:
-				menu.line = item
-			case trayItemInstall:
-				menu.install = item
-				item.Click(func() { actions.install() })
-			case trayItemStart:
-				menu.start = item
-				item.Click(func() { actions.start() })
-			case trayItemStop:
-				menu.stop = item
-				item.Click(func() { actions.stop() })
-			case trayItemUpdate:
-				menu.update = item
-				item.Click(func() { actions.update() })
-			case trayItemDelete:
-				menu.delete = item
-				item.Click(func() { actions.delete() })
 			case trayItemService:
-				menu.service = item
-				item.Click(func() { actions.service() })
+				for _, child := range serviceSubmenuPlan() {
+					title := child.Title
+					if child.Kind == trayItemLine {
+						// The status line is created with the
+						// result of the first read, so the line
+						// is right from the first moment the
+						// menu exists.
+						title = menuState.Line
+					}
+					sub := item.AddSubMenuItem(title, child.Tooltip)
+					switch child.Kind {
+					case trayItemLine:
+						menu.line = sub
+						sub.Disable()
+					case trayItemInstall:
+						menu.install = sub
+						sub.Click(func() { actions.install() })
+					case trayItemStart:
+						menu.start = sub
+						sub.Click(func() { actions.start() })
+					case trayItemStop:
+						menu.stop = sub
+						sub.Click(func() { actions.stop() })
+					case trayItemUpdate:
+						menu.update = sub
+						sub.Click(func() { actions.update() })
+					case trayItemDelete:
+						menu.delete = sub
+						sub.Click(func() { actions.delete() })
+					}
+				}
 			case trayItemOpen:
 				menu.open = item
 				item.Click(func() { actions.open() })

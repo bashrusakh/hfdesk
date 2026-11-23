@@ -110,9 +110,9 @@ func TestDisplayReadPolicyReportsHonestUnknownWhenTheReadRunsOut(t *testing.T) {
 	if state.Line != "Service: unknown" {
 		t.Errorf("the menu shows %q for the timed-out read, want the honest unknown state", state.Line)
 	}
-	if state.InstallEnabled || state.ServiceVisible {
-		t.Errorf("the timed-out read produced installEnabled=%t serviceVisible=%t: neither claim was proven by it",
-			state.InstallEnabled, state.ServiceVisible)
+	if state.InstallVisible || state.ActionsVisible {
+		t.Errorf("the timed-out read produced installVisible=%t actionsVisible=%t: neither claim was proven by it",
+			state.InstallVisible, state.ActionsVisible)
 	}
 }
 
@@ -193,7 +193,7 @@ func TestActionReadPolicySettlesAndReportsPending(t *testing.T) {
 }
 
 // TestRuntimeWindowReadAsksTheMenuToCatchUp proves the redraw seam of the
-// Runtime / Logs window: every state read made for the window ends with the
+// Logs window: every state read made for the window ends with the
 // request that makes the tray menu catch up — after the read, and for a
 // failed read as well, so the honest unknown state a failure classifies as
 // reaches the menu too. The cadence of the tray's own polling is not part of
@@ -260,6 +260,10 @@ func TestRuntimeWindowReadAsksTheMenuToCatchUp(t *testing.T) {
 // that reading.
 func TestStateReadRecordsReadAsReads(t *testing.T) {
 	records := captureLogRecords(t)
+	// The record is written for a CHANGE beside the last read, so this
+	// test starts from an empty stamp: reads of earlier tests in this
+	// binary must not make the first read here look unchanged.
+	replaceSeam(t, &serviceReadLogLast, serviceReadStamp{})
 	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
 		return service.Status{State: service.StateStopped}, nil
 	})
@@ -364,6 +368,109 @@ func TestDataDirAndDisplayReadsKeepTheirOwnBudgets(t *testing.T) {
 	if got := serviceDataDir(); got != paths.StateDir {
 		t.Errorf("serviceDataDir() = %q beside a failed read, want the default of the scope %q",
 			got, paths.StateDir)
+	}
+}
+
+// TestDisplayReadsRecordOnlyChanges pins the log policy of the periodic
+// state reads: a read that reports what the last record already carries
+// writes NOTHING — the open Logs window polls every few seconds beside
+// the menu refresh, and at rest that must add no lines — while every
+// CHANGE is recorded with the state it saw and, when known, the state it
+// moved from. A read that starts failing records once, and the recovery
+// records again: the silence belongs to the unchanged repeat, never to a
+// transition.
+func TestDisplayReadsRecordOnlyChanges(t *testing.T) {
+	records := captureLogRecords(t)
+	// This test owns the stamp: reads of earlier tests in this binary
+	// must not make its first read look unchanged.
+	replaceSeam(t, &serviceReadLogLast, serviceReadStamp{})
+	current := service.Status{State: service.StateStopped}
+	var readErr error
+	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+		return current, readErr
+	})
+	reads := func() []capturedLogRecord {
+		var found []capturedLogRecord
+		for _, record := range records.all() {
+			if record.message == "read the Windows service state" {
+				found = append(found, record)
+			}
+		}
+		return found
+	}
+	readOnce := func() {
+		// The display policy: one read, one answer. One stage below
+		// the read fails on purpose, so its error is not checked here.
+		_, _ = serviceState.readForDisplay()
+	}
+
+	// The first read records what it saw.
+	readOnce()
+	if got := len(reads()); got != 1 {
+		t.Fatalf("the first read recorded %d lines, want the one record of the first observation: %v",
+			got, records.messages())
+	}
+
+	// The machine rests: repeated reads of the same state record
+	// nothing — this is the open window at its status poll.
+	readOnce()
+	readOnce()
+	if got := len(reads()); got != 1 {
+		t.Errorf("the resting reads recorded %d lines in total, want the single first record: %v",
+			got, records.messages())
+	}
+
+	// A state change records exactly once, and the record names the
+	// state it saw beside the one it moved from.
+	current = service.Status{State: service.StateRunning, Running: true}
+	readOnce()
+	changed := reads()
+	if len(changed) != 2 {
+		t.Fatalf("the state change recorded %d lines in total, want the first record plus the change: %v",
+			len(changed), records.messages())
+	}
+	last := changed[1]
+	if last.attrs["state"] != string(service.StateRunning) || last.attrs["running"] != "true" {
+		t.Errorf("the record of the change carries %v, want the facts of the new state", last.attrs)
+	}
+	if last.attrs["previous"] != string(service.StateStopped) {
+		t.Errorf("the record of the change carries previous=%q, want the state it moved from", last.attrs["previous"])
+	}
+
+	// The new state rests: still no lines.
+	readOnce()
+	if got := len(reads()); got != 2 {
+		t.Errorf("the resting reads after the change recorded %d lines in total, want the two records so far: %v",
+			got, records.messages())
+	}
+
+	// A read that starts failing records once with its error, and the
+	// identical failing read after it stays silent.
+	readErr = errors.New("the service control manager did not answer")
+	current = service.Status{}
+	readOnce()
+	readOnce()
+	failing := reads()
+	if len(failing) != 3 {
+		t.Fatalf("the failing reads recorded %d lines in total, want one record of the failure: %v",
+			len(failing), records.messages())
+	}
+	if failing[2].attrs["error"] != readErr.Error() {
+		t.Errorf("the record of the failure carries %v, want the error of the read", failing[2].attrs)
+	}
+
+	// The recovery is a change again: it records with the state it
+	// reads now.
+	readErr = nil
+	current = service.Status{State: service.StateStopped}
+	readOnce()
+	recovered := reads()
+	if len(recovered) != 4 {
+		t.Fatalf("the recovery recorded %d lines in total, want the fourth record: %v",
+			len(recovered), records.messages())
+	}
+	if recovered[3].attrs["state"] != string(service.StateStopped) {
+		t.Errorf("the record of the recovery carries %v, want the state it settled into", recovered[3].attrs)
 	}
 }
 
