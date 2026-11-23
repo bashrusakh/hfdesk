@@ -161,6 +161,32 @@ func installLogging(logDir string) (*logging.Pipeline, error) {
 	}
 	logPath := filepath.Join(logDir, logFileName)
 
+	// The log the window names has to be readable from outside the window.
+	// The installation gives the directories it creates the restrictive
+	// descriptor of the instance and the active file inherits it, which
+	// leaves an interactive user without read access to exactly that file.
+	// The grant adds read access for interactive users — but only to a
+	// descriptor that is still the instance's own restrictive list, and
+	// only on the log directory and the active file; every other
+	// descriptor stays as it is. A failure is reported like a log failure:
+	// it never stops the instance, and the window keeps its honest
+	// one-line "could not be read" for a refusal that remains.
+	//
+	// The grant runs twice and both calls are load bearing: the first one
+	// repairs the directory the installation restricted at install time —
+	// the attribute query of ensureDir below is refused for every account
+	// outside the instance's own list, so without the grant this start
+	// could not even stat that directory; the second one covers a
+	// directory this start created itself under a restrictive parent, so
+	// the file the sink creates next inherits the grant. The grant finds
+	// its own work on the second call and leaves it alone.
+	grantInteractiveRead := func(path string, container bool) {
+		if err := grantLogReadToInteractiveUsers(path, container); err != nil {
+			fmt.Fprintln(os.Stderr, "service: interactive users may not be able to read the log of the instance ("+path+"): "+err.Error())
+		}
+	}
+	grantInteractiveRead(logDir, true)
+
 	// The log directory is created owner-only before the pipeline is
 	// installed: the shared file sink creates the directory of the log file
 	// with a wider mode, and the log directory of an instance holds the log
@@ -171,6 +197,9 @@ func installLogging(logDir string) (*logging.Pipeline, error) {
 		return installConsoleLogging(
 			fmt.Errorf("service: create the log directory %q: %w", logDir, err), "")
 	}
+
+	grantInteractiveRead(logDir, true)
+	grantInteractiveRead(logPath, false)
 
 	pipeline, err := app.SetupLogging(app.LogOptions{
 		Console:  true,
