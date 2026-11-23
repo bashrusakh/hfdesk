@@ -596,6 +596,73 @@ func TestCompanionWindowPageReportsStateAndRegistrationAddress(t *testing.T) {
 	}
 }
 
+// TestCompanionWindowReadsEachAskTheMenuToCatchUp pins the catch-up rule of
+// EVERY display read of the companion surfaces: the state read of a render,
+// the read the service-log resolver runs for that same render, and the read
+// it runs for the open-full-file click — each asks the tray menu to catch
+// up right after it ran, a failed read included, so a result read can never
+// stay invisible in the menu until the next tick.
+//
+// The counts are the pin: removing the catch-up of either read leaves reads
+// ahead of catch-ups, and an extra read — with or without its own catch-up —
+// breaks the exact count of a render.
+func TestCompanionWindowReadsEachAskTheMenuToCatchUp(t *testing.T) {
+	status := runningServiceStatus(service.StateRunning, "127.0.0.1:18080")
+
+	for _, tc := range []struct {
+		name    string
+		readErr error
+	}{
+		{name: "a readable registration"},
+		{name: "a failed read is reflected as well", readErr: errors.New("the service control manager did not answer")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reads atomic.Int32
+			replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+				reads.Add(1)
+				return status, tc.readErr
+			})
+			var refreshes atomic.Int32
+			replaceSeam(t, &serviceMenuRefresh, func() { refreshes.Add(1) })
+
+			companionWindowPage()
+
+			// The render reads the registration twice — the state
+			// line and the service-log path of the same page — and
+			// every read is reflected exactly once.
+			if got := reads.Load(); got != 2 {
+				t.Errorf("the render read the registration %d time(s), want its two reads", got)
+			}
+			if got := refreshes.Load(); got != reads.Load() {
+				t.Errorf("%d display read(s) asked for the menu catch-up %d time(s), want one request per read",
+					reads.Load(), got)
+			}
+		})
+	}
+
+	t.Run("the open-full-file click reflects its read", func(t *testing.T) {
+		var reads atomic.Int32
+		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+			reads.Add(1)
+			return status, nil
+		})
+		var refreshes atomic.Int32
+		replaceSeam(t, &serviceMenuRefresh, func() { refreshes.Add(1) })
+		replaceSeam(t, &showMessage, func(caption, text string, icon uint32) {})
+		replaceSeam(t, &openExternalFile, func(path string) error { return nil })
+
+		openCompanionServiceLog()
+
+		if got := reads.Load(); got != 1 {
+			t.Errorf("the click read the registration %d time(s), want exactly one", got)
+		}
+		if got := refreshes.Load(); got != reads.Load() {
+			t.Errorf("%d display read(s) asked for the menu catch-up %d time(s), want one request per read",
+				reads.Load(), got)
+		}
+	})
+}
+
 // TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping proves the
 // whole composition of the companion menu per read — the absence rule of
 // the service group beside the shared mapping everything else follows:

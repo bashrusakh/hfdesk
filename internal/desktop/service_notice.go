@@ -298,15 +298,16 @@ func serviceGateText(prompt serviceChoicePrompt) string {
 //
 // A pending state is not a state to decide on, so the launch offers neither
 // Open nor Start. The notice names the transition and that the launch changed
-// nothing.
+// nothing — with the standard log-path line of every failure window of a
+// launch that has a log, like the two notices beside it.
 func serviceGatePendingText(state service.State) string {
 	transition := "starting"
 	if state == service.StateStopping {
 		transition = "stopping"
 	}
-	return "The HFDesk service is still " + transition + " and did not reach a settled state in time.\n\n" +
+	return failureWindowText("The HFDesk service is still " + transition + " and did not reach a settled state in time.\n\n" +
 		"This launch changes nothing: it starts no server.\n\n" +
-		"Start the desktop app again when the service has settled."
+		"Start the desktop app again when the service has settled.")
 }
 
 // serviceGateDiagnosticAction is the one action of the two notices that
@@ -464,18 +465,32 @@ func serviceVersionName(version string) string {
 	return "HFDesk " + version
 }
 
+// serviceInstalledTrayFallbackLine is the one conditional instruction of the
+// report of a finished installation: the host of this session restarts as a
+// tray companion, and one that leaves no tray icon is answered by this single
+// human action. The user authorized exactly this one line (decision of
+// 2026-11-23) for this report alone — the update and start reports never carry
+// it — as the acknowledged exception to the report's one-next-step rule: it is
+// conditional, so it is not a second next step beside the address instruction,
+// and it names no mechanism behind the rare failure it covers.
+const serviceInstalledTrayFallbackLine = "If the tray icon does not appear, start HFDesk manually."
+
 // serviceInstalledText returns the report of a finished installation.
 //
 // The report names the program the registration runs, the address the service
 // serves and the data directory it owns. The last sentence tells the user the
 // consequence they need: the desktop app is not needed to use the service, and
-// its own data stays where it is. The helper runs only after the desktop process
-// ended, so the report never tells the user to quit an app that is gone.
+// its own data stays where it is. Right after that consequence follows the one
+// authorized conditional instruction (serviceInstalledTrayFallbackLine), which
+// belongs to this report alone because only this action restarts the host as a
+// tray companion. The helper runs only after the desktop process ended,
+// so the report never tells the user to quit an app that is gone.
 func serviceInstalledText(version, console, dataDir, address string) string {
 	text := serviceVersionName(version) + " is installed as a Windows service.\n\n" +
 		"The service runs " + console + ", starts at boot and keeps running after this window closes.\n\n"
 	text += serviceAddressText(address)
-	text += "The desktop app is not needed to use the service: open the address above."
+	text += "The desktop app is not needed to use the service: open the address above.\n\n" +
+		serviceInstalledTrayFallbackLine
 	if dataDir != "" {
 		text += "\n\nThe service keeps its own data in " + dataDir + ". The settings, jobs and models of the desktop app do not appear in the service."
 	}
@@ -689,9 +704,7 @@ func isServiceAccountRefusal(err error) bool {
 // a service the user did not ask to remove here. The next action is the one
 // this state offers: the startup gate of the next launch of the desktop app,
 // whose choices cover opening or starting the service and updating the
-// registration to the program this app runs from. The folder guidance of a
-// failed installation is left out as well: the cause is known, and it is not
-// the folder of the program.
+// registration to the program this app runs from.
 func serviceAlreadyRegisteredText(detail string) string {
 	return "HFDesk could not install the Windows service.\n\n" + detail + "\n\n" +
 		"The service registration already exists, and this attempt did not create, change or start it.\n\n" +
@@ -769,12 +782,9 @@ func serviceServingDesktopRefusedText(action serviceAction) string {
 //
 // It never claims that a registration was restored: a failure can happen after
 // the registration was written, so an installation report names a registration
-// that may remain. An installation report carries the folder of its program as
-// well, because a machine-wide service runs under its own account and a program
-// only the installing user can read is the common reason a first installation
-// fails. An installation whose service-owned first start failed is reported
-// from the cleanup facts returned by the service manager instead. A first
-// installation that refused an existing registration is reported as the
+// that may remain. An installation whose service-owned first start failed is
+// reported from the cleanup facts returned by the service manager instead. A
+// first installation that refused an existing registration is reported as the
 // unchanged state it left instead: that registration was never written by this
 // attempt, so neither the may-remain warning nor the removal belongs to it.
 func serviceActionFailureText(action serviceAction, err error, program string) string {
@@ -802,9 +812,7 @@ func serviceActionFailureBody(action serviceAction, err error, program string) s
 		// manager text that already names the command keeps it as the
 		// single action.
 		return serviceActionFailureHeadline(action) + "\n\n" + detail + "\n\n" +
-			"A registration may remain.\n\n" +
-			serviceFolderAccessText(program) +
-			statusIfUnnamed(detail)
+			"A registration may remain." + statusIfUnnamed(detail)
 	case serviceActionUpdate:
 		// The refusal of a changed account states its own report: the
 		// result (nothing was changed), the cause (the account the
@@ -876,16 +884,17 @@ func serviceInstallStartFailureText(err error, program string, cleanup *service.
 		outcome = "The failed process was proven stopped, but the registration changed and was kept."
 	}
 	text += outcome
-	return failureWindowText(text + statusIfUnnamed(detail) + "\n\n" + serviceFolderAccessText(program))
+	return failureWindowText(text + statusIfUnnamed(detail))
 }
 
 // installStartDetail returns the cause of a failed first start and the one
-// line its cleanup observed as a reason — never the cleanup fact itself.
-// InstallStartError.Error states that fact in its own words
-// ("(the registration was kept…)"); the report states the fact once, in its
-// own outcome sentence, so the two formulations can no longer appear beside
-// each other. An error the cleanup struct does not describe keeps its whole
-// message as the detail it always was.
+// line its cleanup observed as a reason — never the cleanup fact itself, and
+// always as ONE line: the cause of the error is one line of the report, never
+// two paragraphs the reader has to join. InstallStartError.Error states the
+// cleanup fact in its own words ("(the registration was kept…)"); the report
+// states the fact once, in its own outcome sentence, so the two formulations
+// can no longer appear beside each other. An error the cleanup struct does
+// not describe keeps its whole message as the detail it always was.
 func installStartDetail(err error, cleanup *service.InstallStartError) string {
 	if cleanup == nil || cleanup.Cause == nil {
 		if err == nil {
@@ -895,7 +904,7 @@ func installStartDetail(err error, cleanup *service.InstallStartError) string {
 	}
 	detail := cleanup.Cause.Error()
 	if cleanup.CleanupError != nil {
-		detail += "\n\n" + cleanup.CleanupError.Error()
+		detail += " — " + cleanup.CleanupError.Error()
 	}
 	return detail
 }
@@ -923,27 +932,6 @@ func serviceStartOutcomeText(cleanup *service.InstallStartError) string {
 	default:
 		return ""
 	}
-}
-
-// serviceFolderAccessText returns the sentence that names the access the folder
-// of the program needs.
-//
-// A machine-wide service runs under its own account, so a program that
-// account cannot execute is not usable for the instance. The sentence names
-// the program the action tried to put into service and states the rule the
-// preflight checks: that account must be able to execute the program and to
-// traverse its folder; read access to the program is demanded only where a
-// handler genuinely needs it, never as a blanket requirement — the image is
-// executed without being read. It is a statement and not an instruction,
-// because the repair belongs to the user. It belongs to the reports of an
-// installation only: an update and a start describe a registration that
-// already ran.
-func serviceFolderAccessText(program string) string {
-	subject := "the program"
-	if program != "" {
-		subject = program
-	}
-	return `The Windows service runs as NT AUTHORITY\LocalService, so that account must be able to execute ` + subject + ` and to traverse the folder that holds it; it needs read access to ` + subject + ` only where a handler genuinely needs it.`
 }
 
 // helperNotReadyError reports that the elevated helper was started but never
