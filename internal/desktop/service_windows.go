@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -471,7 +472,8 @@ func installServiceFromTray(instanceMutex string) *desktopHandover {
 		return nil
 	}
 
-	if !confirmServiceInstall(installServiceText(serviceDataDir())) {
+	if !confirmServiceInstall(installServiceText(serviceDataDir(),
+		programOnRemovableOrNetworkDrive(console))) {
 		desktopLog.Info("the service installation was not confirmed")
 		return nil
 	}
@@ -981,6 +983,65 @@ func serviceDataDir() string {
 		return ""
 	}
 	return paths.StateDir
+}
+
+// programDriveType returns the type of the drive the given program path lies
+// on.
+//
+// It is a package level variable so the tests decide the drive type of a
+// path themselves: a test machine has no removable or network drive to put
+// the program on.
+var programDriveType = driveTypeOfProgramPath
+
+// driveTypeOfProgramPath asks Windows for the drive type of the drive that
+// holds the given program path.
+//
+// The root of the path is what the query takes: the drive letter root for a
+// path on a local volume, and the share root for a UNC path — the root of a
+// mapped network drive is its drive letter, and Windows reports it as a
+// remote drive by itself. A path whose volume cannot be read reports the
+// unknown type, which the decision below treats like an ordinary drive: an
+// unknown root is never a reason to warn.
+func driveTypeOfProgramPath(path string) uint32 {
+	root := programDriveRoot(path)
+	if root == "" {
+		return windows.DRIVE_UNKNOWN
+	}
+	rootPtr, err := windows.UTF16PtrFromString(root)
+	if err != nil {
+		return windows.DRIVE_UNKNOWN
+	}
+	return windows.GetDriveType(rootPtr)
+}
+
+// programDriveRoot returns the root the drive-type query takes for the given
+// program path: "C:\" for a path on the volume C:, the share root for a UNC
+// path, and "" for a path without a readable volume.
+func programDriveRoot(path string) string {
+	volume := filepath.VolumeName(path)
+	if volume == "" {
+		return ""
+	}
+	if strings.HasPrefix(volume, `\\`) {
+		// A UNC path: the root of the share, with the trailing
+		// separator the query names it by.
+		return volume + `\`
+	}
+	return volume + `\`
+}
+
+// programOnRemovableOrNetworkDrive reports whether the program path lies on
+// a removable or a network drive — the fact the B2 warning of the
+// installation confirmation is shown for. Every other drive type (fixed,
+// optical, RAM, unknown) is an ordinary path and changes nothing about the
+// confirmation.
+func programOnRemovableOrNetworkDrive(path string) bool {
+	switch programDriveType(path) {
+	case windows.DRIVE_REMOVABLE, windows.DRIVE_REMOTE:
+		return true
+	default:
+		return false
+	}
 }
 
 // desktopExecutable returns the absolute path of the running desktop program.

@@ -7,6 +7,8 @@ package desktop
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -41,6 +43,16 @@ const companionWindowUnavailableCaption = "HFDesk - the Runtime / Logs window is
 // (CompanionWait is zero), and a holder that outlives this budget ends the
 // relaunch with the honest report of a session that is still held.
 var companionRelaunchBudget = 150 * time.Second
+
+// endCompanionTray ends the notification-area loop of the companion — the
+// last step of the established end path (endHost) that both the Exit item
+// and a signal take, so the two can never drift apart.
+//
+// It is a package level variable so the tests can prove an Exit really
+// reaches that end path without ending a notification-area host this
+// process never started (the tray library is a process wide singleton
+// whose quit is a one-shot).
+var endCompanionTray = systray.Quit
 
 // startCompanionRelaunch starts the tray-companion relaunch after a
 // successful installation handover.
@@ -144,18 +156,25 @@ func launchCompanionRelaunch() {
 //     Start/Update are NOT refused as "beside a serving desktop" — the
 //     companion serves nothing and may start the service. The helper
 //     decides the same way from the same two facts.
-//   - the tray with the strictly decided composition (trayMenuCompanion):
-//     the status line, the service group — the install item beside a
-//     proven absence of the registration, the four lifecycle actions
-//     beside a proven one (the absence rule of apply) — and the Runtime
-//     / Logs window item; every action runs through the SAME flow as
-//     the desktop host (the single service-action guard, the
-//     confirmations with No as default, the administrator prompt, the
-//     menu catch-up), and the installation commits its handover to this
-//     host's shutdown like the desktop host's installation does;
+//   - the tray with the decided composition (trayMenuCompanion): the
+//     status line, Open HFDesk — the address of the REGISTRATION in the
+//     default browser, visible beside a proven registration and enabled
+//     while the service serves the address — the service group — the
+//     install item beside a proven absence of the registration, the four
+//     lifecycle actions beside a proven one (the absence rule of apply)
+//     — the Runtime / Logs window item, and the separator with Exit as
+//     the last item (Exit ends THIS companion through the normal path
+//     and touches no service, the way Quit closes the desktop host);
+//     every action runs through the SAME flow as the desktop host (the
+//     single service-action guard, the confirmations with No as
+//     default, the administrator prompt, the menu catch-up), and the
+//     installation commits its handover to this host's shutdown like
+//     the desktop host's installation does;
 //   - the window in document mode: honest service state plus the address
-//     the registration names, rendered from a read under the display
-//     policy — no listener anywhere.
+//     the registration names, the bounded tail of the service log with
+//     its one open-the-full-file action, and the log file of this
+//     launch, rendered from a read under the display policy — no
+//     listener anywhere.
 //
 // A companion never writes the claim file of this session; the panic
 // guard of run() removes it on a panic like every launch's guard does.
@@ -207,11 +226,14 @@ func runCompanion(lock *instanceLock, guard panicGuard,
 	*shutdownSink = shutdown
 
 	// The quit ends the companion as one unit, on the same endHost the
-	// desktop host uses.
+	// desktop host uses: the shutdown first (an installation handover it
+	// must still complete, and the window), then the end of the
+	// notification-area loop. The Windows service is not part of this
+	// path — the companion owns no server and stops no service.
 	ready := make(chan struct{})
 	requestQuit := func() {
 		go guard.runBackground(func() {
-			endHost(shutdown, ready, systray.Quit)
+			endHost(shutdown, ready, endCompanionTray)
 		})
 	}
 
@@ -253,7 +275,7 @@ func runCompanion(lock *instanceLock, guard panicGuard,
 		desktopLog.Warn("could not build the product icon", "error", err)
 	}
 
-	window = newCompanionWindow(companionWindowPage, iconBytes)
+	window = newCompanionWindow(companionWindowPage, iconBytes, companionWindowActions(guard))
 	webview2Ready, webview2Version := webview2Available()
 	if !webview2Ready {
 		desktopLog.Warn("the WebView2 runtime is not installed", "mode", "tray companion")
@@ -288,17 +310,28 @@ func runCompanion(lock *instanceLock, guard panicGuard,
 		}
 	})
 
-	// The tray loop runs on the main thread until the signal ends this
-	// companion. The menu is the strictly decided composition: the status
-	// line, the service group — the install item beside a proven absence
-	// of the registration, the four lifecycle actions beside a proven
-	// registration (the absence rule of apply) — and the Runtime / Logs
-	// window item, every action wired to the very same flow the desktop
-	// host runs (the single guard, the confirmations, the elevation, the
-	// catch-up). The open, registered-service-dialog and quit ITEMS do
-	// not exist; quit exists only as the internal path above, until the
-	// user decides on an exit item.
+	// The tray loop runs on the main thread until the signal or the Exit
+	// item ends this companion. The menu is the decided composition: the
+	// status line, Open HFDesk (the address of the registration), the
+	// service group — the install item beside a proven absence of the
+	// registration, the four lifecycle actions beside a proven
+	// registration (the absence rule of apply) — the Runtime / Logs
+	// window item, the separator and Exit, every action wired to the
+	// very same flow the desktop host runs (the single guard, the
+	// confirmations, the elevation, the catch-up). Exit runs the end
+	// path above: it closes this companion and touches no service. The
+	// registered-service-dialog item does not exist — that dialog
+	// belongs to the desktop host.
 	runTrayLoop(iconBytes, companionTrayTooltip, trayMenuCompanion, trayActions{
+		open: func() {
+			// The address comes from the REGISTRATION (the very
+			// source the window link uses), read again on this
+			// click, so the browser never opens an address this
+			// host invented. The read is bounded by the display
+			// budget, so it runs on a goroutine like every other
+			// action that can hold the message loop.
+			go guard.runBackground(openCompanionServiceURL)
+		},
 		install: dispatchInstallService,
 		runtime: func() {
 			go guard.runBackground(func() {
@@ -325,6 +358,7 @@ func runCompanion(lock *instanceLock, guard panicGuard,
 				performServiceActionFromTray(serviceActionUninstall, lock.name)
 			})
 		},
+		quit: requestQuit,
 	}, trayServiceView{
 		read:    serviceState.readForDisplay,
 		refresh: serviceRefresh,
@@ -373,13 +407,16 @@ func showCompanionRuntimeWindow(window *runtimeWindow, webview2Ready bool) {
 // so it is there while the service is stopped too (it answers once the
 // service runs), and a machine without a registration gets no invented
 // address. The log path of this launch completes the page — the standard
-// line of every surface of a launch that has a log — and the service log
-// section stays out of it until its source is decided.
+// line of every surface of a launch that has a log — and the service-log
+// section carries the bounded tail of the service's own log file (or the
+// honest state of a file that does not exist yet or could not be read),
+// read fresh on every render: a show of the window is when the user asks
+// for it, so no live follow is needed.
 func companionWindowPage() string {
 	status, err := serviceState.readForDisplay()
 	requestServiceMenuCatchUp()
 
-	state := companionPageState{LogPath: runLogPath}
+	state := companionPageState{LogPath: runLogPath, ServiceLog: serviceLogSectionOfCompanion()}
 	switch {
 	case err != nil:
 		state.State = "The state of the Windows service could not be read."
@@ -397,4 +434,149 @@ func companionWindowPage() string {
 		}
 	}
 	return companionPage(state)
+}
+
+// serviceLogSectionOfCompanion reads the service-log section of the window
+// page: the tail of the service log file, or its honest state.
+//
+// It is a package level variable so the tests can render the page without
+// the ProgramData log of the machine the test runs on.
+var serviceLogSectionOfCompanion = loadCompanionServiceLog
+
+// loadCompanionServiceLog reads the section from the file the resolver
+// names.
+func loadCompanionServiceLog() serviceLogSection {
+	return serviceLogSectionAt(companionServiceLogPath())
+}
+
+// companionServiceLogPath resolves the path of the service log file for
+// this click or render: the log directory the REGISTRATION decides — the
+// same source the page section was built from, so the open-full-file action
+// and the tail the page shows speak about the same file — and a machine
+// without a readable registration falls back to the default of the
+// machine-wide scope.
+func companionServiceLogPath() string {
+	registered := ""
+	if status, err := serviceState.readForDisplay(); err == nil && status.Paths.LogDir != "" {
+		registered = status.Paths.LogDir
+	}
+	return serviceLogPath(registered)
+}
+
+// companionWindowActions returns the host handlers the document of the
+// companion window can call by name — today exactly one: open the full
+// service log file (companionOpenLogAction).
+//
+// The handler runs on a goroutine of its own under the panic guard, like
+// every other action of this host: it resolves the file on the host side,
+// starts the default handler of Windows for it and reports a file that is
+// not there or could not be opened — the page carries no path and no logic
+// beyond naming this fixed action.
+func companionWindowActions(guard panicGuard) map[string]func() {
+	return map[string]func(){
+		companionOpenLogAction: func() {
+			go guard.runBackground(openCompanionServiceLog)
+		},
+	}
+}
+
+// openCompanionServiceLog opens the full service log file with the default
+// handler of Windows — Notepad for a .log file with the standard
+// association — so the whole file is readable beside the bounded tail the
+// window shows.
+//
+// The two honest states end with their own report: a file the service has
+// not created yet, and a file the default handler refused to open. Both
+// reports carry the standard log-path line of this launch (the failure
+// window rule), and the second one names the service log path itself.
+func openCompanionServiceLog() {
+	section := loadCompanionServiceLog()
+	if section.Path == "" || section.Missing {
+		desktopLog.Info("the companion did not open the service log: the file does not exist yet",
+			"logFile", section.Path)
+		showMessage(serviceLogOpenFailedCaption, serviceLogMissingText(section.Path), windows.MB_ICONWARNING)
+		return
+	}
+	if err := openExternalFile(section.Path); err != nil {
+		desktopLog.Error("the companion could not open the service log",
+			"logFile", section.Path, "error", err)
+		showMessage(serviceLogOpenFailedCaption, serviceLogOpenFailedText(section.Path, err), windows.MB_ICONERROR)
+	}
+}
+
+// openExternalFile opens a file with the default handler of the operating
+// system.
+//
+// It is a package level variable so the tests can prove WHICH path the
+// open-full-file action hands over, without starting a real handler on the
+// machine.
+var openExternalFile = openFileWithDefaultHandler
+
+// openFileWithDefaultHandler hands the file to the shell association of
+// Windows: the verb "open" runs the program registered for the file's
+// extension — Notepad for a .log file with the standard association, or
+// whatever the user chose instead. The process is started, not waited for,
+// so the thread that runs this action is never held by it.
+//
+// The opener of internal/opener is deliberately not reused here: on
+// Windows it opens the CONTAINING FOLDER and selects the file (its job is
+// "show me where this lives"), while this action must open the FILE ITSELF
+// in its application.
+func openFileWithDefaultHandler(path string) error {
+	verb, err := windows.UTF16PtrFromString("open")
+	if err != nil {
+		return fmt.Errorf("the default handler verb for %s cannot be built: %w", path, err)
+	}
+	file, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return fmt.Errorf("the path %s cannot be handed to the default handler: %w", path, err)
+	}
+	if err := windows.ShellExecute(0, verb, file, nil, nil, windows.SW_SHOWNORMAL); err != nil {
+		return fmt.Errorf("the default handler did not open %s: %w", path, err)
+	}
+	return nil
+}
+
+// openCompanionServiceURL opens the web UI address of the REGISTRATION in
+// the default browser — the very address the link of the window carries,
+// read again on this click, so the two cannot drift apart and a browser
+// never opens an address this host invented.
+//
+// Every way it can end is reported through the established reports: a
+// registration that cannot be read gets the gate's unreadable notice (the
+// state the user has to know before anything else), a registration the
+// machine no longer has and an address that cannot be read as a URL reach
+// the one browser-failure report every opener of a browser uses, and a
+// browser that did not start reports through that same report.
+func openCompanionServiceURL() {
+	status, err := serviceState.readForDisplay()
+	// Like every display read beside the menu itself (readRuntimeServiceState
+	// and the window page), it asks the menu to catch up right after it
+	// ran: a result read for this surface must never stay invisible in
+	// the menu until the next tick — a failed read included.
+	requestServiceMenuCatchUp()
+	if err != nil {
+		desktopLog.Error("the tray companion could not read the Windows service registration for Open HFDesk",
+			"error", err)
+		showMessage(serviceGateUnreadableCaption,
+			serviceGateUnreadableText(err), windows.MB_ICONERROR)
+		return
+	}
+	switch status.State {
+	case "", service.StateUnknown, service.StateNotInstalled:
+		// The menu showed the item for a registration the machine no
+		// longer has (its line catches up with the next refresh): the
+		// report names that fact instead of inventing an address.
+		reportBrowserFailure(status.Listen,
+			errors.New("the Windows service is not registered, so there is no address to open"))
+		return
+	}
+	url, err := serviceURL(status.Listen)
+	if err != nil {
+		reportBrowserFailure(status.Listen, err)
+		return
+	}
+	if err := openBrowser(url); err != nil {
+		reportBrowserFailure(url, err)
+	}
 }

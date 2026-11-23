@@ -41,6 +41,13 @@ type webView interface {
 	// window — the window of a tray companion, which has no server to
 	// fetch its page from.
 	NavigateDocument(html string)
+	// BindAction registers a host handler for one fixed action name the
+	// loaded document can call — the WebView2 bridge of the companion
+	// window's single open-the-full-log button. The document names the
+	// action and carries no data; the host owns everything the handler
+	// acts on. Registration runs before the first document loads, so
+	// the page finds the function already bound.
+	BindAction(name string, handler func())
 	// Close destroys the window.
 	Close()
 }
@@ -68,6 +75,12 @@ type runtimeWindow struct {
 	// reports can change while the window exists; in URL mode nothing
 	// re-navigates after the creation, exactly as before.
 	content func() string
+	// actions are the host handlers the document of a companion window
+	// can call by name (nil for the URL-mode window of the desktop
+	// host): they are bound when the window is created, before any
+	// document loads, and they run on the host side — the page itself
+	// reaches no server.
+	actions map[string]func()
 	// iconBytes are the bytes of the icon of the window.
 	iconBytes []byte
 }
@@ -94,10 +107,11 @@ func newRuntimeWindow(url string, iconBytes []byte) *runtimeWindow {
 // newCompanionWindow builds the owner of the Runtime / Logs window of a
 // tray companion: the window has no server of its own, so it renders the
 // document content builds — the honest state of the service, its
-// registered web-UI address and the log file of this launch — and
-// re-renders it on every show.
-func newCompanionWindow(content func() string, iconBytes []byte) *runtimeWindow {
-	return &runtimeWindow{content: content, iconBytes: iconBytes}
+// registered web-UI address, the log file of this launch and the
+// service-log section — re-renders it on every show, and binds the host
+// handlers the document's single action calls.
+func newCompanionWindow(content func() string, iconBytes []byte, actions map[string]func()) *runtimeWindow {
+	return &runtimeWindow{content: content, actions: actions, iconBytes: iconBytes}
 }
 
 // Show makes the runtime window visible.
@@ -208,6 +222,15 @@ func (w *runtimeWindow) create() (*windowInstance, error) {
 
 		done := make(chan struct{})
 		driver := &webview2Driver{view: view, hwnd: hwnd, done: done}
+		// The host handlers the document can call are bound before
+		// any document loads: the binding injects its function into
+		// every document the window creates from here on, so the
+		// companion page finds it already there when its button is
+		// clicked. The URL-mode window carries no actions and binds
+		// nothing.
+		for name, handler := range w.actions {
+			driver.BindAction(name, handler)
+		}
 		instance := &windowInstance{view: driver, done: done, icons: icons}
 
 		w.mu.Lock()
@@ -316,6 +339,21 @@ func (d *webview2Driver) Navigate(url string) {
 // is the point of the companion window — nothing of it listens.
 func (d *webview2Driver) NavigateDocument(html string) {
 	d.view.Dispatch(func() { d.view.SetHtml(html) })
+}
+
+// BindAction registers a host handler for one fixed action name under the
+// WebView2 binding of the window (the binding injects a global function of
+// that name into every document the window creates).
+//
+// It runs at the creation of the window, on the thread that owns it, before
+// any document loads. A binding the library refuses is recorded — the
+// button of the page then finds no function and does nothing — instead of
+// failing the window that is otherwise fine.
+func (d *webview2Driver) BindAction(name string, handler func()) {
+	if err := d.view.Bind(name, handler); err != nil {
+		desktopLog.Warn("could not bind the action of the window document",
+			"action", name, "error", err)
+	}
 }
 
 // Close destroys the window.

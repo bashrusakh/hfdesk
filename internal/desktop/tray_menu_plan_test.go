@@ -6,20 +6,22 @@ package desktop
 import "testing"
 
 // TestTrayMenuPlanCompanionIsTheDecidedComposition pins the composition of
-// the tray companion menu: the status line, the service group (the install
-// item of the absence rule beside the four lifecycle actions) and the
-// Runtime / Logs item — in that order — and NOTHING else: no open item, no
-// registered-service dialog item, no separator and no quit item (the first
-// and the last await the user's decision). WHICH of the service-group items
-// is on screen for one read is apply's absence-rule decision (pinned by the
-// apply test of the companion menu); the plan lists every item this style
-// can show at all. The titles are the very titles the desktop menu uses,
-// so one vocabulary serves both hosts.
+// the tray companion menu: the status line, Open HFDesk, the service group
+// (the install item of the absence rule beside the four lifecycle actions),
+// the Runtime / Logs item, the separator and Exit — in that order and
+// nothing else: no registered-service dialog item (that dialog belongs to
+// the desktop host). WHICH of the service-group items is on screen for one
+// read is apply's absence-rule decision (pinned by the apply test of the
+// companion menu); the plan lists every item this style can show at all.
+// The shared titles are the very titles the desktop menu uses, so one
+// vocabulary serves both hosts; Exit is the companion's own last item, the
+// way Quit closes the desktop host.
 func TestTrayMenuPlanCompanionIsTheDecidedComposition(t *testing.T) {
 	plan := trayMenuPlan(trayMenuCompanion)
 
 	wantKinds := []trayMenuKind{
-		trayItemLine, trayItemInstall, trayItemStart, trayItemStop, trayItemUpdate, trayItemDelete, trayItemRuntime,
+		trayItemLine, trayItemOpen, trayItemInstall, trayItemStart, trayItemStop, trayItemUpdate,
+		trayItemDelete, trayItemRuntime, trayItemSeparator, trayItemQuit,
 	}
 	if len(plan) != len(wantKinds) {
 		t.Fatalf("the companion plan has %d items (%v), want exactly %d: %v",
@@ -32,18 +34,16 @@ func TestTrayMenuPlanCompanionIsTheDecidedComposition(t *testing.T) {
 		}
 	}
 
-	// The forbidden items must not appear anywhere in the plan: each one
-	// pinned by its own diagnostic, so a silently added item fails the
-	// item it resembles. Install is NOT forbidden — it is the absence
-	// rule's item, shown and hidden by apply.
+	// The forbidden items must not appear anywhere in the plan: the
+	// registered-service dialog is the desktop host's surface, and its
+	// absence is pinned by its own diagnostic so a silently added item
+	// fails the item it resembles. Install is NOT forbidden — it is the
+	// absence rule's item, shown and hidden by apply.
 	for _, forbidden := range []struct {
 		kind trayMenuKind
 		name string
 	}{
-		{trayItemOpen, "Open HFDesk"},
 		{trayItemService, "Service..."},
-		{trayItemQuit, "Quit HFDesk"},
-		{trayItemSeparator, "the separator"},
 	} {
 		for i, spec := range plan {
 			if spec.Kind == forbidden.kind {
@@ -52,16 +52,30 @@ func TestTrayMenuPlanCompanionIsTheDecidedComposition(t *testing.T) {
 		}
 	}
 
-	// The titles of the six fixed items; the status line carries none —
-	// the runner creates it with the result of the first read, so the
-	// line is right from the first moment the menu exists.
+	// Open HFDesk is the FIRST action after the status line, and the
+	// separator sits directly in front of Exit: the exit group stays the
+	// group a user reaches for last, the way the desktop menu ends with
+	// its Quit.
+	if plan[1].Kind != trayItemOpen {
+		t.Errorf("the companion item after the status line is %d, want Open HFDesk (%d): %v",
+			plan[1].Kind, trayItemOpen, planKinds(plan))
+	}
+	if plan[len(plan)-2].Kind != trayItemSeparator || plan[len(plan)-1].Kind != trayItemQuit {
+		t.Errorf("the plan ends with %v, want the separator directly in front of Exit", planKinds(plan[len(plan)-2:]))
+	}
+
+	// The titles of the fixed items; the status line carries none — the
+	// runner creates it with the result of the first read, so the line
+	// is right from the first moment the menu exists.
 	wantTitles := map[trayMenuKind]string{
+		trayItemOpen:    "Open HFDesk",
 		trayItemInstall: "Install service...",
 		trayItemStart:   "Start service",
 		trayItemStop:    "Stop service",
 		trayItemUpdate:  "Update service",
 		trayItemDelete:  "Delete service",
 		trayItemRuntime: "Runtime / Logs",
+		trayItemQuit:    "Exit",
 	}
 	for _, spec := range plan {
 		if spec.Kind == trayItemLine {
@@ -70,6 +84,12 @@ func TestTrayMenuPlanCompanionIsTheDecidedComposition(t *testing.T) {
 			}
 			if spec.Tooltip == "" {
 				t.Error("the status line carries no tooltip")
+			}
+			continue
+		}
+		if spec.Kind == trayItemSeparator {
+			if spec.Title != "" || spec.Tooltip != "" {
+				t.Errorf("the separator carries text %q/%q, want none", spec.Title, spec.Tooltip)
 			}
 			continue
 		}

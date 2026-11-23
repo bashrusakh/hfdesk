@@ -8,6 +8,7 @@ package desktop
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/app"
+	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/internal/service"
 	"golang.org/x/sys/windows"
 )
@@ -87,42 +89,40 @@ func driveHostToTheTray(t *testing.T, opts Options) *capturedTrayRun {
 }
 
 // assertCompanionWiring pins what every companion host wires into its tray:
-// the strict composition — including the install action of the absence
+// the decided composition — including the install action of the absence
 // rule: without it a relaunch on a machine without a registration, and a
-// menu after Delete, would be a dead end — and NO handler for the items
-// the composition never carries (an action without its item would be a
-// hidden second menu).
+// menu after Delete, would be a dead end — plus the two items of the user's
+// decision: Open HFDesk (the address of the registration) and Exit (the
+// end path of this companion) — and NO handler for the one item the
+// composition never carries (an action without its item would be a hidden
+// second menu): the registered-service dialog belongs to the desktop host.
 func assertCompanionWiring(t *testing.T, captured *capturedTrayRun) {
 	t.Helper()
 	if captured.style != trayMenuCompanion {
-		t.Errorf("the tray composition = %d, want the strict companion composition %d",
+		t.Errorf("the tray composition = %d, want the decided companion composition %d",
 			captured.style, trayMenuCompanion)
 	}
 	if captured.view.read == nil || captured.view.refresh == nil {
 		t.Error("the companion menu carries no status feed: the line must read through the display policy")
 	}
 	for name, action := range map[string]func(){
+		"open":    captured.actions.open,
 		"runtime": captured.actions.runtime,
 		"install": captured.actions.install,
 		"start":   captured.actions.start,
 		"stop":    captured.actions.stop,
 		"update":  captured.actions.update,
 		"delete":  captured.actions.delete,
+		"quit":    captured.actions.quit,
 	} {
 		if action == nil {
 			t.Errorf("the companion action %q is not wired", name)
 		}
 	}
-	// The decided composition carries no open, dialog or quit item —
-	// п.5: their handlers must not exist either.
-	for name, action := range map[string]func(){
-		"open":    captured.actions.open,
-		"service": captured.actions.service,
-		"quit":    captured.actions.quit,
-	} {
-		if action != nil {
-			t.Errorf("the companion wires the action %q although its item does not belong to the decided composition", name)
-		}
+	// The decided composition carries no registered-service dialog item
+	// — its handler must not exist either.
+	if captured.actions.service != nil {
+		t.Error("the companion wires the service-dialog action although its item belongs to the desktop host only")
 	}
 }
 
@@ -565,6 +565,15 @@ func TestCompanionWindowPageReportsStateAndRegistrationAddress(t *testing.T) {
 			replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
 				return tc.status, tc.readErr
 			})
+			// The service-log section of the page is fixed for this
+			// test: the page must not depend on the ProgramData log
+			// of the machine the test runs on.
+			replaceSeam(t, &serviceLogSectionOfCompanion, func() serviceLogSection {
+				return serviceLogSection{
+					Path: `C:\ProgramData\HFDesk\logs\hfdesk.log`,
+					Tail: "record one\nrecord two",
+				}
+			})
 			var refreshes atomic.Int32
 			replaceSeam(t, &serviceMenuRefresh, func() { refreshes.Add(1) })
 
@@ -592,27 +601,34 @@ func TestCompanionWindowPageReportsStateAndRegistrationAddress(t *testing.T) {
 // the service group beside the shared mapping everything else follows:
 //
 //   - beside a proven REGISTRATION the four lifecycle actions show and
-//     enable per state, and the install item HIDES (it cannot act — the
-//     registered menu is status + four actions + Runtime / Logs);
+//     enable per state, the install item HIDES (it cannot act — the
+//     registered menu is status + Open HFDesk + four actions +
+//     Runtime / Logs + Exit), and Open HFDesk shows — enabled while the
+//     service serves the address, grey beside a registered service that
+//     does not run;
 //   - beside a PROVEN ABSENCE the install item shows and acts while the
-//     lifecycle items hide (status + Install + Runtime / Logs) — the
+//     lifecycle items AND Open HFDesk hide (an item that would open
+//     nothing never sits there) — the
 //     shape a catch-up reaches after Delete from the companion and the
 //     shape the relaunched child finds on a machine whose installation
 //     failed: no dead end;
-//   - an UNSETTLED read offers neither group — the honest unknown line
+//   - an UNSETTLED read offers neither group and no Open HFDesk — the
+//     honest unknown line
 //     alone — because neither claim was proven;
 //   - the registered-service dialog item stays NIL throughout: the
 //     desktop host owns that dialog.
 func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
 	line := &fakeTrayItem{}
+	open := &fakeTrayItem{}
 	install := &fakeTrayItem{}
 	start := &fakeTrayItem{}
 	stop := &fakeTrayItem{}
 	update := &fakeTrayItem{}
 	del := &fakeTrayItem{}
 	menu := &trayServiceMenu{
-		line: line, install: install, start: start, stop: stop, update: update, delete: del,
-		installOnAbsence: true,
+		line: line, open: open, install: install, start: start, stop: stop, update: update, delete: del,
+		installOnAbsence:   true,
+		openFollowsService: true,
 		// service stays NIL: the decided companion composition carries
 		// no registered-service dialog item.
 	}
@@ -633,15 +649,25 @@ func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
 			t.Errorf("the install item is visible at %q although that read does not prove an absence", stage)
 		}
 	}
+	requireOpenHidden := func(t *testing.T, stage string) {
+		t.Helper()
+		if _, _, visible, _ := open.snapshot(); visible {
+			t.Errorf("Open HFDesk is visible at %q although that read proves no registration to open", stage)
+		}
+	}
 
 	// Registered and running: the line, the visible lifecycle section,
-	// stop/update/delete enabled, start grey — and NO install item: the
-	// registered shape of the composition.
+	// stop/update/delete enabled, start grey, Open HFDesk visible and
+	// enabled — and NO install item: the registered shape of the
+	// composition.
 	menu.apply(serviceMenuFor(service.Status{State: service.StateRunning, Running: true}, nil))
 	if title, _, _, _ := line.snapshot(); title != "Service: installed" {
 		t.Errorf("the status line = %q, want the shared presence-only line", title)
 	}
 	requireInstallHidden(t, "a running registration")
+	if _, enabled, visible, _ := open.snapshot(); !visible || !enabled {
+		t.Errorf("Open HFDesk visible=%t enabled=%t, want it visible and enabled beside the running service", visible, enabled)
+	}
 	if _, enabled, visible, _ := start.snapshot(); !visible || enabled {
 		t.Errorf("the start item visible=%t enabled=%t, want it visible and grey beside a running service", visible, enabled)
 	}
@@ -655,10 +681,15 @@ func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
 		t.Errorf("the delete item visible=%t enabled=%t, want it visible and enabled", visible, enabled)
 	}
 
-	// Registered and stopped: start becomes the action, stop goes grey;
-	// the install item stays hidden — the registration is proven.
+	// Registered and stopped: start becomes the action, stop goes grey,
+	// and Open HFDesk stays VISIBLE but goes grey — the address is
+	// proven, but nothing answers it yet; the install item stays hidden
+	// — the registration is proven.
 	menu.apply(serviceMenuFor(service.Status{State: service.StateStopped}, nil))
 	requireInstallHidden(t, "a stopped registration")
+	if _, enabled, visible, _ := open.snapshot(); !visible || enabled {
+		t.Errorf("Open HFDesk visible=%t enabled=%t, want it visible and grey beside a stopped service", visible, enabled)
+	}
 	if _, enabled, visible, _ := start.snapshot(); !visible || !enabled {
 		t.Errorf("the start item visible=%t enabled=%t, want it the visible action beside a stopped service", visible, enabled)
 	}
@@ -675,10 +706,12 @@ func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
 	}
 	requireInstallHidden(t, "an unsettled read")
 	requireLifecycleHidden(t, "an unsettled read")
+	requireOpenHidden(t, "an unsettled read")
 
 	// Proven absence — the shape after Delete from the companion and the
 	// shape of a relaunched child whose installation failed: the install
-	// item appears and acts, the lifecycle section is gone. This
+	// item appears and acts, the lifecycle section and Open HFDesk are
+	// gone. This
 	// transition (registered → absent) is exactly what the menu catch-up
 	// applies after the helper of a delete ended.
 	menu.apply(serviceMenuFor(service.Status{State: service.StateNotInstalled}, nil))
@@ -689,14 +722,19 @@ func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
 		t.Errorf("the install item visible=%t enabled=%t beside a proven absence, want it visible and enabled: the menu must not be a dead end", visible, enabled)
 	}
 	requireLifecycleHidden(t, "a proven absence")
+	requireOpenHidden(t, "a proven absence")
 
 	// And back: a registration the next read proves hides the install
-	// item again — the relaunch child after a SUCCESSFUL installation
+	// item again and brings Open HFDesk back — the relaunch child after
+	// a SUCCESSFUL installation
 	// lands on the registered shape.
 	menu.apply(serviceMenuFor(service.Status{State: service.StateRunning, Running: true}, nil))
 	requireInstallHidden(t, "the registration proved after the absence")
 	if _, _, visible, _ := stop.snapshot(); !visible {
 		t.Error("the lifecycle section did not return beside the proven registration")
+	}
+	if _, enabled, visible, _ := open.snapshot(); !visible || !enabled {
+		t.Errorf("Open HFDesk visible=%t enabled=%t after the registration was proved again", visible, enabled)
 	}
 }
 
@@ -803,5 +841,201 @@ func TestCompanionInstallRunsThroughTheCommonServiceFlow(t *testing.T) {
 			t.Errorf("the report is captioned %q, want %q",
 				(*messages)[0].caption, serviceFailureCaption(serviceActionInstall))
 		}
+	})
+}
+
+// TestCompanionOpenHFDeskOpensTheRegisteredAddress proves the Open HFDesk
+// item of the companion: the wired action reads the REGISTRATION on the
+// click and opens the address that read names in the default browser — not
+// an address this host invented — and a successful open reports nothing.
+func TestCompanionOpenHFDeskOpensTheRegisteredAddress(t *testing.T) {
+	probe, err := acquireInstanceLock()
+	assertNoError(t, err, "probe the single instance lock: %v", err)
+	if probe.Exists() {
+		probe.Release()
+		t.Skip("another desktop test or app owns the per-session singleton")
+	}
+	probe.Release()
+
+	captured := driveHostToTheTray(t, Options{Companion: true})
+	if captured.actions.open == nil {
+		t.Fatal("the companion does not wire its Open HFDesk action")
+	}
+
+	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+		return runningServiceStatus(service.StateRunning, "127.0.0.1:18080"), nil
+	})
+	opened := make(chan string, 1)
+	replaceSeam(t, &openBrowser, func(url string) error {
+		opened <- url
+		return nil
+	})
+	shown := recordMessagesChannel(t)
+
+	captured.actions.open()
+
+	select {
+	case url := <-opened:
+		if want := "http://127.0.0.1:18080"; url != want {
+			t.Errorf("the browser opened %q, want the address of the registration %q", url, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the Open HFDesk action never opened the address of the registration")
+	}
+	if messages := drainMessages(shown); len(messages) != 0 {
+		t.Errorf("a successful open showed %v, want no report", messages)
+	}
+}
+
+// TestCompanionExitEndsTheHostWithoutTouchingTheService proves the Exit
+// item: the wired action runs the ESTABLISHED end path of this companion
+// (shutdown first, then the end of the notification-area loop — the very
+// path a signal takes), and nothing of it touches the Windows service: no
+// registration is read, no confirmation is asked, no helper is launched,
+// no report is shown. The companion closes; the service keeps its state.
+func TestCompanionExitEndsTheHostWithoutTouchingTheService(t *testing.T) {
+	probe, err := acquireInstanceLock()
+	assertNoError(t, err, "probe the single instance lock: %v", err)
+	if probe.Exists() {
+		probe.Release()
+		t.Skip("another desktop test or app owns the per-session singleton")
+	}
+	probe.Release()
+	freshServiceInstallGuard(t)
+
+	// Every service surface is armed: Exit reaching any of them fails
+	// the test — the item closes THIS companion and nothing else.
+	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+		t.Error("the Exit read the Windows service registration")
+		return service.Status{}, nil
+	})
+	replaceSeam(t, &confirmServiceInstall, func(string) bool {
+		t.Error("the Exit asked for an installation confirmation")
+		return false
+	})
+	replaceSeam(t, &confirmServiceAction, func(string, string) bool {
+		t.Error("the Exit asked for a service-action confirmation")
+		return false
+	})
+	replaceSeam(t, &launchElevatedProcess, func(elevatedLaunch) (*elevatedProcess, error) {
+		t.Error("the Exit launched an elevated helper")
+		return nil, nil
+	})
+	ended := make(chan struct{}, 1)
+	replaceSeam(t, &endCompanionTray, func() {
+		ended <- struct{}{}
+	})
+
+	captured := driveHostToTheTray(t, Options{Companion: true})
+	if captured.actions.quit == nil {
+		t.Fatal("the companion does not wire its Exit action")
+	}
+	// The recorder joins after the launch: the WebView2 warning of a
+	// machine without the runtime belongs to the launch, not to the
+	// Exit this test pins.
+	shown := recordMessagesChannel(t)
+
+	captured.actions.quit()
+
+	select {
+	case <-ended:
+		// endHost ran to its last step: the shutdown before it ran
+		// first, so the host ended through the established path.
+	case <-time.After(5 * time.Second):
+		t.Fatal("the Exit never ended the notification-area loop through the established end path")
+	}
+	if serviceActionRunning.Load() {
+		t.Error("the Exit left the single service-action guard taken: it acted on the service")
+	}
+	if messages := drainMessages(shown); len(messages) != 0 {
+		t.Errorf("the Exit showed %v, want no report: it only closes the companion", messages)
+	}
+}
+
+// TestCompanionWindowActionsCarryTheOpenFullLogAction pins the bridge of
+// the service-log section: the window binds exactly the one fixed action
+// name the page's button calls, that action opens EXACTLY the service log
+// file the page section speaks about (the same resolver, so the tail and
+// the file the default handler receives can never be different files), and
+// a file the service has not written yet reports honestly instead of
+// starting a handler without a target.
+func TestCompanionWindowActionsCarryTheOpenFullLogAction(t *testing.T) {
+	actions := companionWindowActions(panicGuard{})
+	if len(actions) != 1 || actions[companionOpenLogAction] == nil {
+		keys := make([]string, 0, len(actions))
+		for name := range actions {
+			keys = append(keys, name)
+		}
+		t.Fatalf("the window actions = %v, want exactly the one %q action", keys, companionOpenLogAction)
+	}
+
+	t.Run("the action opens exactly the file the page section shows", func(t *testing.T) {
+		logDir := t.TempDir()
+		logPath := filepath.Join(logDir, serviceLogFileName)
+		if err := os.WriteFile(logPath, []byte("record one\nrecord two\n"), 0o600); err != nil {
+			t.Fatalf("write the service log: %v", err)
+		}
+		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+			return service.Status{
+				State: service.StateRunning,
+				Paths: runtimepaths.Paths{LogDir: logDir},
+			}, nil
+		})
+		opened := make(chan string, 1)
+		replaceSeam(t, &openExternalFile, func(path string) error {
+			opened <- path
+			return nil
+		})
+		shown := recordMessagesChannel(t)
+
+		actions[companionOpenLogAction]()
+
+		select {
+		case path := <-opened:
+			if path != logPath {
+				t.Errorf("the default handler received %q, want the service log file %q", path, logPath)
+			}
+			// The page section reads through the very same
+			// resolver, so the tail and the opened file are one
+			// and the same path.
+			if section := serviceLogSectionOfCompanion(); section.Path != path {
+				t.Errorf("the page section speaks about %q, the action opened %q: two different files", section.Path, path)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the window action never handed the service log file to the default handler")
+		}
+		if messages := drainMessages(shown); len(messages) != 0 {
+			t.Errorf("a successful open showed %v, want no report", messages)
+		}
+	})
+
+	t.Run("a log that does not exist yet reports honestly and opens nothing", func(t *testing.T) {
+		logDir := t.TempDir() // no log file in it
+		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+			return service.Status{
+				State: service.StateRunning,
+				Paths: runtimepaths.Paths{LogDir: logDir},
+			}, nil
+		})
+		replaceSeam(t, &openExternalFile, func(path string) error {
+			t.Errorf("the default handler was started for the missing file %q", path)
+			return nil
+		})
+		shown := recordMessagesChannel(t)
+
+		actions[companionOpenLogAction]()
+
+		waitForTrayCondition(t, "the honest report of a service log that does not exist yet",
+			func() bool { return len(shown) == 1 })
+		messages := drainMessages(shown)
+		if len(messages) != 1 {
+			t.Fatalf("the missing log showed %d reports, want exactly one: %v", len(messages), messages)
+		}
+		if messages[0].caption != serviceLogOpenFailedCaption {
+			t.Errorf("the report is captioned %q, want %q", messages[0].caption, serviceLogOpenFailedCaption)
+		}
+		assertNames(t, messages[0].text, "the missing-log report", []string{
+			"The service log file has not been created yet",
+		})
 	})
 }

@@ -25,8 +25,9 @@ const trayServiceRefreshInterval = 30 * time.Second
 
 // trayActions are the actions of the tray menu.
 type trayActions struct {
-	// open opens the web UI of the running instance in the default
-	// browser.
+	// open opens the web UI in the default browser: the desktop host
+	// opens the address of its own instance, the companion the address
+	// of the REGISTRATION.
 	open func()
 	// runtime shows the Runtime / Logs window.
 	runtime func()
@@ -43,7 +44,9 @@ type trayActions struct {
 	// service opens the registered-service dialog of an installed
 	// service: the open/start/update choices the service gate asks.
 	service func()
-	// quit stops the host.
+	// quit stops the host: the desktop host stops its server, the
+	// companion closes the tray and its window — the Windows service is
+	// not touched by either.
 	quit func()
 }
 
@@ -88,6 +91,7 @@ type trayMenuItem interface {
 // registration was proven.
 type trayServiceMenu struct {
 	line    trayMenuItem
+	open    trayMenuItem
 	install trayMenuItem
 	start   trayMenuItem
 	stop    trayMenuItem
@@ -111,6 +115,15 @@ type trayServiceMenu struct {
 	// so this flag is false there and the install write stays byte for
 	// byte what it was.
 	installOnAbsence bool
+	// openFollowsService is the companion rule of the Open HFDesk item:
+	// the companion opens the address of the REGISTRATION, so its item
+	// shows beside a proven registration (grey while the service does
+	// not serve the address) and hides beside a proven absence and an
+	// unsettled read. The desktop menu opens the address of its OWN
+	// server — the item is always there and acts whatever the
+	// registration says — so this flag is false there and apply leaves
+	// the desktop open item alone, byte for byte as before.
+	openFollowsService bool
 }
 
 // apply writes one read of the registration into the menu.
@@ -124,6 +137,11 @@ type trayServiceMenu struct {
 // them), and inside a proven registration each lifecycle item enables per
 // state — start and stop on the running fact, update and delete on the
 // registration alone.
+//
+// The Open HFDesk item is written only where its style says so
+// (openFollowsService): the companion's item follows the registration and
+// the running fact exactly like the mapping above, and the desktop item —
+// the address of this host's own server — is left alone.
 //
 // The install item and the dialog item belong to the FULL menu only: the
 // companion menu is the strict composition without them, so its fields stay
@@ -147,6 +165,18 @@ func (m *trayServiceMenu) apply(state serviceMenuState) {
 		"startEnabled", state.StartEnabled,
 		"stopEnabled", state.StopEnabled)
 	m.line.SetTitle(state.Line)
+	if m.openFollowsService {
+		// The companion rule of Open HFDesk: the item acts on the
+		// address of the registration, so it shows beside a proven
+		// registration — grey while nothing serves the address —
+		// and hides beside a proven absence and an unsettled read.
+		if state.OpenVisible {
+			showItem(m.open)
+		} else {
+			hideItem(m.open)
+		}
+		enableItem(m.open, state.OpenEnabled)
+	}
 	if m.installOnAbsence {
 		// The absence rule of the companion: the install item shows
 		// only beside a PROVEN absence (the only state InstallEnabled
@@ -307,7 +337,10 @@ func runTray(iconBytes []byte, tooltip string, style trayMenuStyle, actions tray
 		// registered-service section beside the greyed install item
 		// when one was (the full menu only), and the four lifecycle
 		// items with the same enable-per-state mapping everywhere.
-		menu := &trayServiceMenu{installOnAbsence: style == trayMenuCompanion}
+		menu := &trayServiceMenu{
+			installOnAbsence:   style == trayMenuCompanion,
+			openFollowsService: style == trayMenuCompanion,
+		}
 		for _, spec := range trayMenuPlan(style) {
 			if spec.Kind == trayItemSeparator {
 				systray.AddSeparator()
@@ -344,6 +377,7 @@ func runTray(iconBytes []byte, tooltip string, style trayMenuStyle, actions tray
 				menu.service = item
 				item.Click(func() { actions.service() })
 			case trayItemOpen:
+				menu.open = item
 				item.Click(func() { actions.open() })
 			case trayItemRuntime:
 				item.Click(func() { actions.runtime() })

@@ -55,6 +55,20 @@ type serviceMenuState struct {
 	// items appear and disappear together, because all of them act on a
 	// registration and a read that did not prove one offers none of them.
 	ServiceVisible bool
+	// OpenVisible reports whether the Open HFDesk item belongs into the
+	// menu: it acts on the address of the REGISTRATION, so a proven
+	// registration shows it and a proven absence and an unsettled read
+	// hide it — an item that would open nothing never sits in the menu
+	// (the rule of the companion menu; the desktop host opens its own
+	// server's address and keeps its open item out of this mapping).
+	OpenVisible bool
+	// OpenEnabled reports whether the Open HFDesk item may act: only a
+	// service that serves the address — the supervisor's running fact,
+	// the same classification the stop item follows — is a service whose
+	// address a browser can reach. A registered service that does not
+	// run leaves the item grey: the registration proved the address, but
+	// nothing answers it yet.
+	OpenEnabled bool
 	// StartEnabled reports whether the start item may act: only a
 	// registration whose state is settled and does not run — stopped,
 	// failed, broken without an instance — is a state a start can act on.
@@ -123,6 +137,8 @@ func serviceMenuFor(status service.Status, readErr error) serviceMenuState {
 	case registrationPresent:
 		running := serviceStatusRunning(status)
 		state.ServiceVisible = true
+		state.OpenVisible = true
+		state.OpenEnabled = running
 		state.StartEnabled = !running && serviceStateSettled(status.State)
 		state.StopEnabled = running
 		state.UpdateEnabled = true

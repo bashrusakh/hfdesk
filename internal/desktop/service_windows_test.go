@@ -3995,3 +3995,166 @@ func TestReportStartupFailureNamesTheLogPathOnlyWhenThereIsOne(t *testing.T) {
 		t.Errorf("the box names the log file %d times, want exactly once:\n%s", got, (*messages)[1].text)
 	}
 }
+
+// TestProgramDriveRootAndTheWarningClassification pins the seam the B2
+// warning decides on, without a real removable or network drive on the test
+// machine: the drive-type query takes the root of the program path (the
+// volume root, the share root of a UNC path, nothing for a path without a
+// volume), and the classification warns for exactly two drive types —
+// removable and remote — while an ordinary, optical or unknown drive
+// changes nothing.
+func TestProgramDriveRootAndTheWarningClassification(t *testing.T) {
+	if got, want := programDriveRoot(`C:\HFDesk\hfdesk.exe`), `C:\`; got != want {
+		t.Errorf("the root of a volume path = %q, want %q", got, want)
+	}
+	if got, want := programDriveRoot(`\\nas\share\HFDesk\hfdesk.exe`), `\\nas\share\`; got != want {
+		t.Errorf("the root of a UNC path = %q, want the share root %q", got, want)
+	}
+	if got := programDriveRoot(`hfdesk.exe`); got != "" {
+		t.Errorf("the root of a path without a volume = %q, want none", got)
+	}
+
+	replaceSeam(t, &programDriveType, func(path string) uint32 {
+		switch {
+		case strings.HasPrefix(path, `E:\usb`):
+			return windows.DRIVE_REMOVABLE
+		case strings.HasPrefix(path, `\\nas\`):
+			return windows.DRIVE_REMOTE
+		case strings.HasPrefix(path, `C:\`):
+			return windows.DRIVE_FIXED
+		case strings.HasPrefix(path, `D:\`):
+			return windows.DRIVE_CDROM
+		default:
+			return windows.DRIVE_UNKNOWN
+		}
+	})
+	for path, want := range map[string]bool{
+		`E:\usb\HFDesk\hfdesk.exe`:           true,
+		`\\nas\share\HFDesk\hfdesk.exe`:      true,
+		`C:\Program Files\HFDesk\hfdesk.exe`: false,
+		`D:\HFDesk\hfdesk.exe`:               false,
+		`relative\hfdesk.exe`:                false,
+		`X:\unclassifiable\hfdesk.exe`:       false,
+	} {
+		if got := programOnRemovableOrNetworkDrive(path); got != want {
+			t.Errorf("programOnRemovableOrNetworkDrive(%q) = %t, want %t", path, got, want)
+		}
+	}
+}
+
+// TestInstallConfirmationWarnsOnlyForARemovableOrNetworkProgram drives the
+// REAL install flow up to its confirmation and pins the B2 wiring end to
+// end: the warning line appears exactly when the program the registration
+// will run — the console program the flow settled — lies on a removable or
+// network drive, and is absent for an ordinary drive, where the text stays
+// the confirmation the family has always shown. The decision reads the path
+// of THAT program, never the path of the desktop executable beside it.
+func TestInstallConfirmationWarnsOnlyForARemovableOrNetworkProgram(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		console     string
+		driveType   uint32
+		wantWarning bool
+	}{
+		{name: "a program on a removable drive", console: `E:\usb\HFDesk\hfdesk.exe`,
+			driveType: windows.DRIVE_REMOVABLE, wantWarning: true},
+		{name: "a program on a network drive", console: `\\nas\share\HFDesk\hfdesk.exe`,
+			driveType: windows.DRIVE_REMOTE, wantWarning: true},
+		{name: "a program on an ordinary drive", console: `C:\Program Files\HFDesk\hfdesk.exe`,
+			driveType: windows.DRIVE_FIXED, wantWarning: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probe, err := acquireInstanceLock()
+			assertNoError(t, err, "probe the single instance lock: %v", err)
+			if probe.Exists() {
+				probe.Release()
+				t.Skip("another desktop test or app owns the per-session singleton")
+			}
+			probe.Release()
+			freshServiceInstallGuard(t)
+
+			// The machine reads as without a registration, so the
+			// flow reaches the confirmation instead of the dialog of
+			// an existing service.
+			replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+				return service.Status{State: service.StateNotInstalled}, nil
+			})
+			replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+				return tc.console, nil
+			})
+			// The drive type is decided per path: any decision that
+			// looked at the DESKTOP executable (a fixed-path test
+			// binary) instead of the registered console program
+			// would report a fixed drive for every case and fail
+			// the removable and the network rows.
+			var decidedPaths atomic.Value
+			decidedPaths.Store([]string{})
+			replaceSeam(t, &programDriveType, func(path string) uint32 {
+				seen := decidedPaths.Load().([]string)
+				decidedPaths.Store(append(seen, path))
+				if path == tc.console {
+					return tc.driveType
+				}
+				return windows.DRIVE_FIXED
+			})
+			captured := driveHostToTheTray(t, Options{Companion: true})
+			if captured.actions.install == nil {
+				t.Fatal("the companion does not wire its install action")
+			}
+
+			confirmation := make(chan string, 2)
+			replaceSeam(t, &confirmServiceInstall, func(text string) bool {
+				confirmation <- text
+				return false // declined: the flow ends here, before any elevation
+			})
+			replaceSeam(t, &launchElevatedProcess, func(elevatedLaunch) (*elevatedProcess, error) {
+				t.Error("a declined confirmation launched an elevated helper")
+				return nil, nil
+			})
+			var refreshes atomic.Int32
+			replaceSeam(t, &serviceMenuRefresh, func() { refreshes.Add(1) })
+			messages := recordMessages(t)
+
+			captured.actions.install()
+
+			waitForTrayCondition(t, "the declined install to release the guard and catch the menu up",
+				func() bool {
+					return !serviceActionRunning.Load() && refreshes.Load() == 1
+				})
+			var text string
+			select {
+			case text = <-confirmation:
+			default:
+				t.Fatal("the install asked no confirmation")
+			}
+
+			if has := strings.Contains(text, serviceProgramDriveWarningLine); has != tc.wantWarning {
+				t.Errorf("the confirmation carries the drive warning = %t, want %t:\n%s",
+					has, tc.wantWarning, text)
+			}
+			// Whatever the drive says, the rest of the confirmation
+			// is the established one: the warning is an added line,
+			// never a replacement of the surprising fact or the
+			// question.
+			assertNames(t, text, "the confirmation", []string{
+				"Its data is separate",
+				"Do you want to install the service?",
+			})
+			if len(*messages) != 0 {
+				t.Errorf("the declined install showed %v, want no report: nothing was attempted", *messages)
+			}
+			// The decision was made on the registered program.
+			seen := decidedPaths.Load().([]string)
+			found := false
+			for _, path := range seen {
+				if path == tc.console {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("the drive of the registered program %q was never asked about (paths: %v)",
+					tc.console, seen)
+			}
+		})
+	}
+}

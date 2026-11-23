@@ -176,6 +176,17 @@ func dataSeparationLine(dataDir string) string {
 	return "Its data is separate — this app's settings, jobs and models do not appear in the service."
 }
 
+// serviceProgramDriveWarningLine is the warning the installation
+// confirmation shows when the program the registration will run lies on a
+// removable or network drive (the B2 decision).
+//
+// It follows the rule of this text family: one short line, in human words,
+// that states the consequence for the user — Windows may bring the service
+// up before such a drive is there — and no mechanism behind that fact. The
+// caller decides WHEN the line appears (the drive type of the program
+// path), so this package states the line and nothing else.
+const serviceProgramDriveWarningLine = "HFDesk is on a removable or network drive: Windows may start the service before this drive is ready."
+
 // installServiceText returns the text of the confirmation that registers the
 // Windows service.
 //
@@ -186,16 +197,21 @@ func dataSeparationLine(dataDir string) string {
 // its single line — then asks the one question. dataDir is the state
 // directory of the service, so the text names the directory it will really
 // own.
-func installServiceText(dataDir string) string {
-	return "This registers HFDesk as a Windows service.\n\n" +
+//
+// unusualDrive adds the B2 warning as its own single line right before that
+// surprising fact: it is present exactly when the program the registration
+// runs sits on a removable or network drive, and a program on an ordinary
+// drive changes nothing — with the flag false the text is byte for byte the
+// confirmation this family has always shown.
+func installServiceText(dataDir string, unusualDrive bool) string {
+	text := "This registers HFDesk as a Windows service.\n\n" +
 		"The service starts at boot and keeps running after this window closes.\n" +
 		"Installing it needs administrator rights, so a Windows prompt follows.\n\n" +
-		"HFDesk stays portable: the service runs the hfdesk program that sits next to this desktop app. The one file HFDesk can download is that missing program from its own release — only when you ask for it, and only after its SHA-256 is verified; nothing else is downloaded or copied.\n\n" +
-		// B2 of the plan (the warning about a removable or network
-		// drive) awaits the user's decision and goes here, as its own
-		// line before the one surprising fact below. It is deliberately
-		// not written yet.
-		dataSeparationLine(dataDir) + "\n\n" +
+		"HFDesk stays portable: the service runs the hfdesk program that sits next to this desktop app. The one file HFDesk can download is that missing program from its own release — only when you ask for it, and only after its SHA-256 is verified; nothing else is downloaded or copied.\n\n"
+	if unusualDrive {
+		text += serviceProgramDriveWarningLine + "\n\n"
+	}
+	return text + dataSeparationLine(dataDir) + "\n\n" +
 		"Do you want to install the service?"
 }
 

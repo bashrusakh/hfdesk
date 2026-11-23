@@ -6,8 +6,13 @@ package desktop
 import (
 	"fmt"
 	"html"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/bashrusakh/hfdesk/internal/service"
 )
 
 // The private launch flags of the tray companion.
@@ -107,6 +112,181 @@ func companionRelaunchArgs(argv []string, wait time.Duration) []string {
 	return append(relaunch, companionModeFlag, companionWaitFlag, wait.String())
 }
 
+// companionOpenLogAction is the name of the one action the document of the
+// companion window can ask the window to perform: open the full service log
+// file with the default handler of the operating system.
+//
+// The window binds this name on the host side (companionWindowActions) and
+// the page's single button calls it. The page names a fixed action and
+// carries no data: the path of the file comes from the host, never from the
+// document, and nothing of the page reaches a server — the companion
+// listens to nothing.
+const companionOpenLogAction = "hfdeskOpenServiceLog"
+
+// serviceLogFileName is the name of the active log file of a service
+// instance, next to its rotated generations (documented in docs/SERVICE.md).
+const serviceLogFileName = "hfdesk.log"
+
+// The bounds of the service log tail the companion window shows.
+//
+// The tail is the END of the file and it is read under both limits, so a
+// large log never reaches the page as a whole: the byte bound caps the read
+// itself — the file is seeked to its end and only the last
+// serviceLogTailBytes are read — and the line bound caps what a tail of
+// that size renders. The window states nothing of the limits; they are the
+// honest volume bound of this view, pinned by test.
+const (
+	serviceLogTailBytes = 64 * 1024
+	serviceLogTailLines = 200
+)
+
+// serviceLogPath returns the path of the active service log file.
+//
+// A log directory the registration names decides (an installation may have
+// registered a non-default one), and a machine without a readable
+// registration falls back to the default of the machine-wide scope — the
+// ProgramData folder of the documented default.
+func serviceLogPath(registeredLogDir string) string {
+	if registeredLogDir != "" {
+		return filepath.Join(registeredLogDir, serviceLogFileName)
+	}
+	paths, err := service.DefaultPaths(service.ScopeSystem)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(paths.LogDir, serviceLogFileName)
+}
+
+// readServiceLogTail returns the tail of the log file at path under the
+// documented bounds: at most serviceLogTailBytes from the end of the file,
+// cut to whole lines, at most serviceLogTailLines of them, in file order and
+// ending with the newest line.
+//
+// A file that cannot be opened or read returns its error; a read that was
+// bound reports no error — the bound is the view, not a failure.
+func readServiceLogTail(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	// Only the end of the file is read: everything before the window is
+	// seeked over, never loaded.
+	var start int64
+	if info, statErr := file.Stat(); statErr == nil && info.Size() > serviceLogTailBytes {
+		start = info.Size() - serviceLogTailBytes
+	}
+	if start > 0 {
+		if _, err := file.Seek(start, io.SeekStart); err != nil {
+			return "", err
+		}
+	}
+	data, err := io.ReadAll(io.LimitReader(file, serviceLogTailBytes))
+	if err != nil {
+		return "", err
+	}
+	text := string(data)
+	if start > 0 {
+		// The bound cut a line in half at its start: that fragment is
+		// dropped, so the tail begins with a whole line.
+		if newline := strings.IndexByte(text, '\n'); newline >= 0 {
+			text = text[newline+1:]
+		} else {
+			text = ""
+		}
+	}
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimSuffix(line, "\r")
+	}
+	if last := len(lines) - 1; last >= 0 && lines[last] == "" {
+		lines = lines[:last]
+	}
+	if len(lines) > serviceLogTailLines {
+		lines = lines[len(lines)-serviceLogTailLines:]
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+// serviceLogSection is the service-log part of the page of the companion
+// window: the path of the file, and exactly one of the honest shapes the
+// section shows — the bounded tail of a readable file, the fact that the
+// file does not exist yet, or the one-line reason it could not be read. An
+// empty section (no path) claims nothing and renders no content.
+type serviceLogSection struct {
+	// Path is the service log file this section speaks about — the very
+	// file the open-full-file action opens. Empty when no path could be
+	// resolved.
+	Path string
+	// Missing reports the file does not exist: the service has not
+	// written a log yet.
+	Missing bool
+	// ReadError is the one-line reason the file could not be read
+	// (permissions and the like), empty when it could.
+	ReadError string
+	// Tail is the bounded tail of the file, newest line last.
+	Tail string
+}
+
+// serviceLogSectionAt reads the service-log section from the file at path.
+//
+// The states are the honest ones: a file that is not there is missing, a
+// file that cannot be read carries its reason as a single line, and a
+// readable file carries its bounded tail.
+func serviceLogSectionAt(path string) serviceLogSection {
+	section := serviceLogSection{Path: path}
+	if path == "" {
+		return section
+	}
+	tail, err := readServiceLogTail(path)
+	switch {
+	case err == nil:
+		section.Tail = tail
+	case os.IsNotExist(err):
+		section.Missing = true
+	default:
+		section.ReadError = oneLine(err.Error())
+	}
+	return section
+}
+
+// oneLine collapses a multi-line machine message into the one line the
+// window shows it on.
+func oneLine(message string) string {
+	return strings.Join(strings.Fields(message), " ")
+}
+
+// serviceLogMissingText returns the report of the open-full-file action when
+// the service log does not exist yet — the honest state of a service that
+// has not written a log, with no action to offer (there is nothing to open)
+// and the standard log-path line of this launch.
+func serviceLogMissingText(path string) string {
+	text := "The service log file has not been created yet, so there is nothing to open."
+	if path != "" {
+		text += "\n\nThe service writes its log at " + path + "."
+	}
+	return failureWindowText(text)
+}
+
+// serviceLogOpenFailedText returns the report of the open-full-file action
+// whose default handler could not open the file: the state, the cause as
+// presented by the system, the path of the service log itself, and the
+// standard log-path line of this launch like every failure window of a
+// launch that has a log.
+func serviceLogOpenFailedText(path string, openErr error) string {
+	text := "The service log file could not be opened in the default program."
+	if openErr != nil {
+		text += "\n\n" + oneLine(openErr.Error())
+	}
+	text += "\n\nThe service log is at " + path + "."
+	return failureWindowText(text)
+}
+
+// serviceLogOpenFailedCaption is the caption of both reports of the
+// open-full-file action, so the user reads one title for one button.
+const serviceLogOpenFailedCaption = "HFDesk - the service log file could not be opened"
+
 // companionRelaunchWaitTimeoutText returns the report of a relaunch child
 // that could not take the single instance lock of the session within its
 // bounded wait.
@@ -145,10 +325,9 @@ func companionWebView2MissingText() string {
 // page of an instance: the page is built here, from the facts the window
 // read — the honest state of the service, the web-UI address the
 // REGISTRATION names (offered by the fact of the registration, whether or
-// not the service currently answers it), and the log file of this launch.
-// The service log section is deliberately not part of the model: it waits
-// for the user's decision on its source, and the page reserves its place
-// without rendering it.
+// not the service currently answers it), the log file of this launch, and
+// the service-log section (the bounded tail of the service's own log, or
+// the honest state of a file that is not there or could not be read).
 type companionPageState struct {
 	// State is the honest one-line state of the service.
 	State string
@@ -164,16 +343,69 @@ type companionPageState struct {
 	// LogPath is the path of the log file of this launch, empty for a
 	// launch that has none yet.
 	LogPath string
+	// ServiceLog is the service-log section: the bounded tail of the
+	// service log file, or the honest state of a file that does not
+	// exist yet or could not be read. The zero value claims nothing and
+	// renders no section content.
+	ServiceLog serviceLogSection
+}
+
+// serviceLogScriptActionPlaceholder is the token of the script template the
+// page builder replaces with companionOpenLogAction.
+//
+// The action name has ONE source of truth: the companionOpenLogAction
+// constant, which is also the key the host binds (companionWindowActions).
+// The template never names it — the name is substituted while the page is
+// generated — so the page and the host binding cannot drift apart, and a
+// literal name that reaches the page from anywhere else fails the test that
+// pins the rendered document.
+const serviceLogScriptActionPlaceholder = "{{action}}"
+
+// serviceLogScriptTemplate is the only script of the page, and it performs
+// exactly two local operations with no channel of any kind: the tail box is
+// scrolled to its end — the window shows the END of the service log — and
+// the one button forwards the fixed open-file action name to the function
+// the window bound on the host side.
+//
+// Nothing here fetches, listens or carries data out of the document: the
+// path of the file never travels through the page (the host owns it), and
+// the invariant of the companion — nothing of it listens — is unchanged.
+// Both operations guard their element, so a section without a tail or
+// without a button runs the script as a no-op.
+const serviceLogScriptTemplate = `<script>
+(function () {
+	var tail = document.getElementById("service-log-tail");
+	if (tail) { tail.scrollTop = tail.scrollHeight; }
+	var button = document.getElementById("open-service-log");
+	if (button && window.` + serviceLogScriptActionPlaceholder + `) {
+		button.addEventListener("click", function () { window.` + serviceLogScriptActionPlaceholder + `(); });
+	}
+})();
+</script>
+`
+
+// serviceLogScript renders the script template of the page with the one
+// action name of this build substituted in — the same constant the host
+// binds, so the two can never name different functions.
+func serviceLogScript() string {
+	return strings.ReplaceAll(serviceLogScriptTemplate, serviceLogScriptActionPlaceholder, companionOpenLogAction)
 }
 
 // companionPage renders the model into the page of the companion window.
 //
 // Everything the model carries is escaped, so a value from the machine
-// can never become markup. The page has no script and fetches nothing:
-// it is a document, not a client of a listener — the invariant of the
-// companion is that nothing of it listens, and the page honors that by
-// having no channel to a server of its own. The comment where the
-// service log section will render keeps the interface ready for it.
+// can never become markup. The page fetches nothing: it is a document,
+// not a client of a listener — the invariant of the companion is that
+// nothing of it listens, and the page honors that by having no channel
+// to a server of its own. Its single script (serviceLogScript) only
+// scrolls the tail box to its end and forwards the one fixed open-file
+// action to the host-bound function — the action name it calls is
+// substituted from companionOpenLogAction while the page is generated.
+//
+// The service log section is the last content of the document: it shows
+// the bounded tail ending with the newest line, or the one honest state
+// of a file that is not there or could not be read, plus the single
+// action that opens the whole file with the default handler.
 func companionPage(state companionPageState) string {
 	var page strings.Builder
 	page.WriteString(`<!doctype html>
@@ -190,6 +422,9 @@ p { margin: 0.6rem 0; line-height: 1.5; }
 a { color: #0b57d0; }
 code { font-family: Consolas, "Courier New", monospace; font-size: 0.9em; background: #eceff3; padding: 0.1em 0.35em; border-radius: 3px; word-break: break-all; }
 .label { color: #5a6270; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; margin-top: 1.75rem; }
+pre { font-family: Consolas, "Courier New", monospace; font-size: 0.85em; background: #eceff3; padding: 0.75rem; border-radius: 4px; margin: 0.6rem 0; max-height: 20rem; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+button { font: inherit; font-size: 0.9rem; padding: 0.35rem 0.9rem; border: 1px solid #c3c8d0; border-radius: 4px; background: #fff; color: #1a1a1a; cursor: pointer; }
+button:hover { background: #f0f2f5; }
 </style>
 </head>
 <body>
@@ -204,11 +439,34 @@ code { font-family: Consolas, "Courier New", monospace; font-size: 0.9em; backgr
 	} else if state.Address != "" {
 		page.WriteString("<p>" + html.EscapeString(state.Address) + "</p>\n")
 	}
-	page.WriteString("<p class=\"label\">Service log</p>\n")
-	page.WriteString("<!-- The service log section renders here once its source is decided: nothing of this page fetches from a listener of its own. -->\n")
+	// The log file of THIS launch: the standard line of every surface of
+	// a launch that has a log, stated before the section that speaks
+	// about the log of the service.
 	if state.LogPath != "" {
 		page.WriteString("<p>The log file is at <code>" + html.EscapeString(state.LogPath) + "</code>.</p>\n")
 	}
+	section := state.ServiceLog
+	if section.Path == "" && !section.Missing && section.ReadError == "" && section.Tail == "" {
+		// A model without a service-log source claims nothing: the
+		// section stays out instead of showing a heading over
+		// nothing.
+		page.WriteString("</main>\n</body>\n</html>\n")
+		return page.String()
+	}
+	page.WriteString("<p class=\"label\">Service log</p>\n")
+	switch {
+	case section.Missing:
+		page.WriteString("<p>The service log file has not been created yet.</p>\n")
+	case section.ReadError != "":
+		reason := html.EscapeString(strings.TrimSuffix(section.ReadError, "."))
+		page.WriteString("<p>The service log file could not be read: " + reason + ".</p>\n")
+	case section.Tail != "":
+		page.WriteString("<pre id=\"service-log-tail\">" + html.EscapeString(section.Tail) + "</pre>\n")
+	}
+	if section.Path != "" && !section.Missing {
+		page.WriteString("<p><button id=\"open-service-log\" type=\"button\">Open the full log file</button></p>\n")
+	}
+	page.WriteString(serviceLogScript())
 	page.WriteString("</main>\n</body>\n</html>\n")
 	return page.String()
 }

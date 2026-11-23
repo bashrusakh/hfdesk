@@ -23,7 +23,7 @@ import (
 // out would let the user agree to something they did not read.
 func TestInstallServiceTextStatesWhatTheRegistrationChanges(t *testing.T) {
 	const dataDir = `C:\ProgramData\HFDesk`
-	text := installServiceText(dataDir)
+	text := installServiceText(dataDir, false)
 
 	assertNames(t, text, "the confirmation", []string{
 		"starts at boot",
@@ -50,12 +50,51 @@ func TestInstallServiceTextStatesWhatTheRegistrationChanges(t *testing.T) {
 // TestInstallServiceTextWithoutADataDirectoryStaysTrue proves that the
 // confirmation never names a directory it could not resolve.
 func TestInstallServiceTextWithoutADataDirectoryStaysTrue(t *testing.T) {
-	text := installServiceText("")
+	text := installServiceText("", false)
 	if strings.Contains(text, "  ") {
 		t.Errorf("the confirmation %q carries an empty directory", text)
 	}
 	if !strings.Contains(text, "do not appear in the service") {
 		t.Errorf("the confirmation %q does not state the separation of the data", text)
+	}
+}
+
+// TestInstallServiceTextWarnsOnlyForARemovableOrNetworkProgram pins the B2
+// line of the installation confirmation at the text level: the warning
+// appears exactly when its flag is set, the ordinary confirmation is
+// byte-for-byte the text without it, and the warning itself is one short
+// human line that states the consequence for the user and names no
+// mechanism behind it. The decision WHEN the flag is set (the drive type of
+// the program path) is pinned by the Windows test of the drive seam.
+func TestInstallServiceTextWarnsOnlyForARemovableOrNetworkProgram(t *testing.T) {
+	const dataDir = `C:\ProgramData\HFDesk`
+	ordinary := installServiceText(dataDir, false)
+	warned := installServiceText(dataDir, true)
+
+	if strings.Contains(ordinary, serviceProgramDriveWarningLine) {
+		t.Errorf("the confirmation of an ordinary drive carries the warning:\n%s", ordinary)
+	}
+	if !strings.Contains(warned, serviceProgramDriveWarningLine) {
+		t.Errorf("the confirmation of a removable or network drive carries no warning:\n%s", warned)
+	}
+	if count := strings.Count(warned, serviceProgramDriveWarningLine); count != 1 {
+		t.Errorf("the warning appears %d times, want exactly once", count)
+	}
+	// With the warning added, everything else stays: the ordinary text
+	// is this very text minus its one line, so a warning cannot quietly
+	// rewrite the rest of the confirmation.
+	if strings.Replace(warned, serviceProgramDriveWarningLine+"\n\n", "", 1) != ordinary {
+		t.Errorf("the warned confirmation differs from the ordinary one by more than its warning line")
+	}
+	// The warning is the single line of the family's rule: human words,
+	// the consequence for the user, and no internal mechanism.
+	for _, mechanism := range []string{
+		"GetDriveType", "DRIVE_", "kernel32", "drive type", "API",
+		"mount", "letter", "volume", "bus",
+	} {
+		if strings.Contains(serviceProgramDriveWarningLine, mechanism) {
+			t.Errorf("the warning names the mechanism %q: %q", mechanism, serviceProgramDriveWarningLine)
+		}
 	}
 }
 
@@ -1637,17 +1676,19 @@ func TestFailureWindowsNameTheLogFileOfThisLaunch(t *testing.T) {
 		"the busy refusal":         serviceActionBusyText(),
 		"the not-ready report": serviceHelperNotReadyText(serviceActionInstall,
 			&helperNotReadyError{cause: errors.New("the service helper exited before it became ready")}),
-		"the launch-failure report":     serviceLaunchFailedText(serviceActionInstall, cause),
-		"the unknown-action report":     unknownServiceActionText(errors.New("unknown service action")),
-		"the preparation refusal":       serviceHandoverRefusedText(cause),
-		"the unfinished-install report": serviceHandoverFailureText(cause),
-		"the unreadable gate notice":    serviceGateUnreadableText(cause),
-		"the changed gate notice":       serviceGateChangedText(serviceChoicePrompt{State: service.StateRunning}),
-		"the download failure":          consoleDownloadFailedText(downloadNotice, cause),
-		"the missing-program notice":    siblingMissingManualNoticeText(notice),
-		"the browser failure":           browserOpenFailedText("http://127.0.0.1:8080", cause),
-		"the tray-startup failure":      trayStartupFailureText(),
-		"the runtime-window failure":    runtimeWindowShowFailedText(errors.New("the window could not be shown")),
+		"the launch-failure report":      serviceLaunchFailedText(serviceActionInstall, cause),
+		"the unknown-action report":      unknownServiceActionText(errors.New("unknown service action")),
+		"the preparation refusal":        serviceHandoverRefusedText(cause),
+		"the unfinished-install report":  serviceHandoverFailureText(cause),
+		"the unreadable gate notice":     serviceGateUnreadableText(cause),
+		"the changed gate notice":        serviceGateChangedText(serviceChoicePrompt{State: service.StateRunning}),
+		"the download failure":           consoleDownloadFailedText(downloadNotice, cause),
+		"the missing-program notice":     siblingMissingManualNoticeText(notice),
+		"the browser failure":            browserOpenFailedText("http://127.0.0.1:8080", cause),
+		"the tray-startup failure":       trayStartupFailureText(),
+		"the runtime-window failure":     runtimeWindowShowFailedText(errors.New("the window could not be shown")),
+		"the service-log open failure":   serviceLogOpenFailedText(`C:\ProgramData\HFDesk\logs\hfdesk.log`, cause),
+		"the service-log missing report": serviceLogMissingText(`C:\ProgramData\HFDesk\logs\hfdesk.log`),
 	}
 	for name, text := range windows {
 		if !strings.Contains(text, wantLine) {
@@ -1688,7 +1729,7 @@ func TestFailureWindowsNameTheLogFileOfThisLaunch(t *testing.T) {
 	notFailure := map[string]string{
 		"the gate of a running service": serviceGateText(serviceChoicePrompt{
 			State: service.StateRunning, URL: "http://127.0.0.1:8080", DataDir: `C:\ProgramData\HFDesk`}),
-		"the installation confirmation":   installServiceText(`C:\ProgramData\HFDesk`),
+		"the installation confirmation":   installServiceText(`C:\ProgramData\HFDesk`, true),
 		"the report of an installation":   serviceInstalledText("1.3.0", program, `C:\ProgramData\HFDesk`, "http://127.0.0.1:8080"),
 		"the report of a stopped service": serviceStoppedText(),
 	}
@@ -1728,13 +1769,16 @@ func TestGateAndReportsCarryNoInternalMechanism(t *testing.T) {
 			State: service.StateFailed, Detail: "the instance exited with the code 1", DataDir: dataDir}),
 		"the broken gate with a running instance": serviceGateText(serviceChoicePrompt{
 			State: service.StateBroken, Running: true, DataDir: dataDir}),
-		"the pending notice":            serviceGatePendingText(service.StateStarting),
-		"the unreadable notice":         serviceGateUnreadableText(cause),
-		"the changed notice":            serviceGateChangedText(serviceChoicePrompt{State: service.StateRunning}),
-		"the installation confirmation": installServiceText(dataDir),
-		"the stop confirmation":         stopServiceConfirmText(),
-		"the removal confirmation":      removeServiceConfirmText(),
-		"the installation failure":      serviceActionFailureText(serviceActionInstall, cause, program),
+		"the pending notice":                                 serviceGatePendingText(service.StateStarting),
+		"the unreadable notice":                              serviceGateUnreadableText(cause),
+		"the changed notice":                                 serviceGateChangedText(serviceChoicePrompt{State: service.StateRunning}),
+		"the installation confirmation":                      installServiceText(dataDir, false),
+		"the installation confirmation on a removable drive": installServiceText(dataDir, true),
+		"the stop confirmation":                              stopServiceConfirmText(),
+		"the removal confirmation":                           removeServiceConfirmText(),
+		"the service-log open failure":                       serviceLogOpenFailedText(`C:\ProgramData\HFDesk\logs\hfdesk.log`, cause),
+		"the service-log missing report":                     serviceLogMissingText(`C:\ProgramData\HFDesk\logs\hfdesk.log`),
+		"the installation failure":                           serviceActionFailureText(serviceActionInstall, cause, program),
 		"the kept-start failure": serviceInstallStartFailureText(
 			&service.InstallStartError{Cause: cause, CleanupError: errors.New("the process identity changed")}, program,
 			&service.InstallStartError{Cause: cause, CleanupError: errors.New("the process identity changed")}),
