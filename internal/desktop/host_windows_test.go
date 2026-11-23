@@ -29,7 +29,7 @@ const trayReadyTimeout = 15 * time.Second
 // the moment between the quit and the end of the loop.
 const trayStopTimeout = 10 * time.Second
 
-// windowCreationTimeout bounds the wait for the Runtime / Logs window.
+// windowCreationTimeout bounds the wait for the Logs window.
 //
 // The window creates a WebView2 environment on a thread of its own, which
 // can take a moment on a cold machine.
@@ -143,7 +143,7 @@ func TestDesktopTrayHostBecomesReady(t *testing.T) {
 }
 
 // TestDesktopRuntimeHostCreatesWindow proves that the desktop host creates
-// the Runtime / Logs window: the window owner of the production code is
+// the Logs window: the window owner of the production code is
 // built, the window is shown and the window is destroyed again.
 //
 // The test never shows a message box: the production helper that shows the
@@ -155,7 +155,7 @@ func TestDesktopRuntimeHostCreatesWindow(t *testing.T) {
 	available, version := webview2Available()
 	if !available {
 		t.Skip("the Microsoft Edge WebView2 runtime is not installed in this environment: " +
-			"the Runtime / Logs window needs it")
+			"the Logs window needs it")
 	}
 
 	// The WebView2 runtime keeps its user data in the per user
@@ -182,7 +182,7 @@ func TestDesktopRuntimeHostCreatesWindow(t *testing.T) {
 	iconBytes, err := productIconBytes()
 	assertNoError(t, err, "build the product icon: %v", err)
 
-	window := newRuntimeWindow(page.URL, iconBytes)
+	window := newRuntimeWindow(page.URL, iconBytes, nil)
 	// The window is closed at the end of the test in every case, so the
 	// test leaves no window behind.
 	t.Cleanup(window.Close)
@@ -195,10 +195,10 @@ func TestDesktopRuntimeHostCreatesWindow(t *testing.T) {
 	select {
 	case err := <-shown:
 		if err != nil {
-			t.Skipf("the WebView2 runtime %s is installed, but the Runtime / Logs window could not be created in this environment: %v", version, err)
+			t.Skipf("the WebView2 runtime %s is installed, but the Logs window could not be created in this environment: %v", version, err)
 		}
 	case <-time.After(windowCreationTimeout):
-		t.Skipf("the WebView2 runtime %s is installed, but the Runtime / Logs window did not come up within %s in this environment", version, windowCreationTimeout)
+		t.Skipf("the WebView2 runtime %s is installed, but the Logs window did not come up within %s in this environment", version, windowCreationTimeout)
 	}
 
 	// The window owner holds the window that was created.

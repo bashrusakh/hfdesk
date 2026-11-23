@@ -35,29 +35,40 @@ type webView interface {
 	Show() error
 	// Hide hides the window without destroying it.
 	Hide()
-	// Navigate loads a URL in the window.
+	// Navigate loads a URL in the window: the runtime page of a
+	// server — the own server of the desktop host, or the server of the
+	// registered service beside a tray companion.
 	Navigate(url string)
 	// NavigateDocument loads a self-contained HTML document in the
-	// window — the window of a tray companion, which has no server to
-	// fetch its page from.
+	// window — the fallback state of a tray companion whose registered
+	// address does not answer, which has no server to fetch its page
+	// from.
 	NavigateDocument(html string)
 	// BindAction registers a host handler for one fixed action name the
-	// loaded document can call — the WebView2 bridge of the companion
-	// window's single open-the-full-log button. The document names the
-	// action and carries no data; the host owns everything the handler
-	// acts on. Registration runs before the first document loads, so
+	// loaded document can call — the WebView2 bridge of the window's
+	// host actions (open the log file, open the log folder, open the
+	// web UI, retry). The document names the action and carries no
+	// data; the host owns everything the handler acts on, and it acts
+	// in the process of the window — in the user's session.
+	// Registration runs before the first document loads, so
 	// the page finds the function already bound.
 	BindAction(name string, handler func())
 	// Close destroys the window.
 	Close()
 }
 
-// runtimeWindow owns the Runtime / Logs window.
+// runtimeWindow owns the Logs window — the ONE window both hosts open.
 //
 // The window lives on its own thread with its own message loop: the WebView2
 // library posts WM_QUIT to the thread of the window when the window is
 // destroyed, so its loop ends with the window and not with the application.
 // Closing the window therefore leaves HFDesk running in the tray.
+//
+// Every show decides what the window shows, so a repeated open shows the
+// actual state: in URL mode the page of the own server is (re)loaded, and
+// beside a tray companion the registered service address is probed and the
+// live runtime page is loaded when it answers, the fallback document when
+// it does not.
 type runtimeWindow struct {
 	// mu guards the current instance.
 	mu sync.Mutex
@@ -66,20 +77,28 @@ type runtimeWindow struct {
 	// createMu serializes the creation of a window, so two actions cannot
 	// create two windows.
 	createMu sync.Mutex
-	// url is the page the window shows. It is the page of the running
-	// own server, and it is only used in URL mode (content == nil).
+	// url is the page the window loads on every show in URL mode: the
+	// runtime page of the running own server (the desktop host). It is
+	// only used when live is nil.
 	url string
-	// content builds the page of the window in document mode — the tray
-	// companion, which has no server. A non-nil content means the window
-	// renders this document fresh on every show, because the state it
-	// reports can change while the window exists; in URL mode nothing
-	// re-navigates after the creation, exactly as before.
+	// live resolves the runtime page of the REGISTERED service address
+	// on every show — the tray companion, which has no server of its
+	// own. An empty result (no readable registration) and an address
+	// that does not answer both lead to the fallback document in
+	// content. Nil for the desktop host.
+	live func() string
+	// content builds the fallback document of the window: the honest
+	// state beside an address that does not answer, rendered fresh on
+	// every show that reaches it, because the state it reports can
+	// change while the window exists. Nil for the desktop host, whose
+	// own server always answers.
 	content func() string
-	// actions are the host handlers the document of a companion window
-	// can call by name (nil for the URL-mode window of the desktop
-	// host): they are bound when the window is created, before any
-	// document loads, and they run on the host side — the page itself
-	// reaches no server.
+	// actions are the host handlers the loaded document can call by
+	// name: they are bound when the window is created, before any
+	// document loads — the live runtime page and the fallback document
+	// alike — and they run on the host side, in the process of the
+	// window, so an open action reaches the user's session even when
+	// the server behind the page runs as a service in session 0.
 	actions map[string]func()
 	// iconBytes are the bytes of the icon of the window.
 	iconBytes []byte
@@ -98,30 +117,35 @@ type windowInstance struct {
 	icons windowIcons
 }
 
-// newRuntimeWindow builds the owner of the Runtime / Logs window that
-// shows the runtime page of the running own server.
-func newRuntimeWindow(url string, iconBytes []byte) *runtimeWindow {
-	return &runtimeWindow{url: url, iconBytes: iconBytes}
+// newRuntimeWindow builds the owner of the Logs window that shows the
+// runtime page of the running own server: every show reloads that page,
+// so a repeated open shows the actual state of the server instead of a
+// view the window remembered. actions are the host handlers the page can
+// call (nil binds nothing).
+func newRuntimeWindow(url string, iconBytes []byte, actions map[string]func()) *runtimeWindow {
+	return &runtimeWindow{url: url, actions: actions, iconBytes: iconBytes}
 }
 
-// newCompanionWindow builds the owner of the Runtime / Logs window of a
-// tray companion: the window has no server of its own, so it renders the
-// document content builds — the honest state of the service, its
-// registered web-UI address, the log file of this launch and the
-// service-log section — re-renders it on every show, and binds the host
-// handlers the document's single action calls.
-func newCompanionWindow(content func() string, iconBytes []byte, actions map[string]func()) *runtimeWindow {
-	return &runtimeWindow{content: content, actions: actions, iconBytes: iconBytes}
+// newCompanionWindow builds the owner of the Logs window of a tray
+// companion: the window has no server of its own, so every show resolves
+// the REGISTERED service address through live and loads its runtime page
+// when the address answers — the same live log, filters and search the
+// desktop window shows — or renders the fallback document content builds
+// when it does not, and it binds the host handlers the documents call.
+func newCompanionWindow(live func() string, content func() string,
+	iconBytes []byte, actions map[string]func()) *runtimeWindow {
+	return &runtimeWindow{live: live, content: content, actions: actions, iconBytes: iconBytes}
 }
 
-// Show makes the runtime window visible.
+// Show makes the Logs window visible.
 //
 // The window is created when it does not exist yet, so the action works
-// again after the user closed it. A window in document mode renders its
-// page right before it is shown: the state of the service can change
-// while the window exists, and a show is the moment the user asks for
-// it. A URL-mode window navigates once at its creation, exactly as
-// before.
+// again after the user closed it. Every show decides the content first:
+// in URL mode the page of the own server is loaded again, and beside a
+// tray companion the registered address is probed and the live runtime
+// page or the fallback document is loaded — the state can change while
+// the window exists, and a show is the moment the user asks for it, so a
+// repeated open shows what is actual now.
 func (w *runtimeWindow) Show() error {
 	// Two attempts: the first one can lose the race against a window
 	// that was closed in the meantime, the second one works with a fresh
@@ -131,8 +155,10 @@ func (w *runtimeWindow) Show() error {
 		if err != nil {
 			return err
 		}
-		if w.content != nil {
-			instance.view.NavigateDocument(w.content())
+		if target, document := w.resolve(); document != "" {
+			instance.view.NavigateDocument(document)
+		} else {
+			instance.view.Navigate(target)
 		}
 		if err := instance.view.Show(); err != nil {
 			// The window was closed while the action was on its way:
@@ -141,7 +167,18 @@ func (w *runtimeWindow) Show() error {
 		}
 		return nil
 	}
-	return errors.New("desktop: the runtime window could not be shown")
+	return errors.New("desktop: the logs window could not be shown")
+}
+
+// resolve decides what this show loads: the URL of the own server in URL
+// mode, and beside a tray companion the live runtime page of the
+// registered address when it answers, its fallback document when it does
+// not (see resolveLogsWindow).
+func (w *runtimeWindow) resolve() (string, string) {
+	if w.live == nil {
+		return w.url, ""
+	}
+	return resolveLogsWindow(w.live, w.content)
 }
 
 // Close destroys the runtime window.
@@ -203,7 +240,7 @@ func (w *runtimeWindow) create() (*windowInstance, error) {
 			Debug:     false,
 			AutoFocus: true,
 			WindowOptions: webview2.WindowOptions{
-				Title:  "HFDesk - Runtime / Logs",
+				Title:  "HFDesk - Logs",
 				Width:  760,
 				Height: 560,
 				Center: true,
@@ -217,17 +254,17 @@ func (w *runtimeWindow) create() (*windowInstance, error) {
 		hwnd := windows.HWND(uintptr(view.Window()))
 		icons, err := applyWindowIcon(hwnd, w.iconBytes)
 		if err != nil {
-			desktopLog.Warn("could not set the icon of the runtime window", "error", err)
+			desktopLog.Warn("could not set the icon of the logs window", "error", err)
 		}
 
 		done := make(chan struct{})
 		driver := &webview2Driver{view: view, hwnd: hwnd, done: done}
 		// The host handlers the document can call are bound before
 		// any document loads: the binding injects its function into
-		// every document the window creates from here on, so the
-		// companion page finds it already there when its button is
-		// clicked. The URL-mode window carries no actions and binds
-		// nothing.
+		// every document the window creates from here on, so the live
+		// runtime page of a server and the local fallback document
+		// find the functions already there when their buttons are
+		// clicked.
 		for name, handler := range w.actions {
 			driver.BindAction(name, handler)
 		}
@@ -237,14 +274,11 @@ func (w *runtimeWindow) create() (*windowInstance, error) {
 		w.instance = instance
 		w.mu.Unlock()
 
-		if w.content == nil {
-			// URL mode: the page of the own server is loaded right
-			// here, once. A companion window (content != nil)
-			// starts blank: Show renders its document, so the
-			// state the page reports is the state of the moment
-			// the user opens it.
-			view.Navigate(w.url)
-		}
+		// The window starts blank: Show decides the content right
+		// after the creation, so what the window shows is the state
+		// of the moment the user opens it — the page of the own
+		// server in URL mode, the live page of the registered
+		// address or the fallback document beside a companion.
 		ready <- creation{instance: instance}
 
 		// The message loop ends when the window is destroyed.
@@ -315,9 +349,9 @@ func (d *webview2Driver) Show() error {
 			return nil
 		default:
 		}
-		return errors.New("desktop: the runtime window was closed")
+		return errors.New("desktop: the logs window was closed")
 	case <-time.After(activateTimeout):
-		return errors.New("desktop: the runtime window did not answer")
+		return errors.New("desktop: the logs window did not answer")
 	}
 }
 
@@ -335,8 +369,9 @@ func (d *webview2Driver) Navigate(url string) {
 //
 // The navigation runs through the documented HTML entry of the WebView2
 // binding (SetHtml → NavigateToString) on the thread of the window, like
-// every other action of the driver: the document needs no listener, which
-// is the point of the companion window — nothing of it listens.
+// every other action of the driver: the fallback document needs no
+// listener — nothing of it reaches out of the document, which is the
+// point of the fallback beside a dead address.
 func (d *webview2Driver) NavigateDocument(html string) {
 	d.view.Dispatch(func() { d.view.SetHtml(html) })
 }

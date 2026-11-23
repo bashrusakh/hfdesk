@@ -9,7 +9,7 @@
 // adds the desktop shell:
 //
 //   - a system tray icon with the actions of the host,
-//   - a small Runtime / Logs window that renders the runtime page of the
+//   - a small Logs window that renders the runtime page of the
 //     running server,
 //   - the single instance lock that keeps one desktop host per interactive
 //     user session,
@@ -43,12 +43,12 @@ type Options struct {
 	App app.Options
 
 	// Version is the build version of the binary. It is reported through
-	// the API and shown in the Runtime window.
+	// the API and shown in the Logs window.
 	Version string
 
 	// Companion starts this launch as a tray companion instead of an
 	// ordinary desktop host: the tray icon, the service actions and the
-	// Runtime / Logs window, WITHOUT a server of its own. The flag is
+	// Logs window, WITHOUT a server of its own. The flag is
 	// private to the desktop executable (SplitCompanionArgs strips it
 	// before the host flags are parsed, so it is not part of the usage
 	// text); the post-installation relaunch passes it, and a launch that

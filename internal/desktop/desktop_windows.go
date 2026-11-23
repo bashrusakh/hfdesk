@@ -427,7 +427,7 @@ func run(o Options, logPath string) (err error) {
 	//   - installService is the install-service flow itself — the
 	//     missing-console notice, the confirmation, the administrator
 	//     prompt, the handover and the existing reports — factored out of
-	//     the tray click so the tray item and the Runtime window run the
+	//     the tray click so the tray item and the Logs window run the
 	//     very same function and cannot drift apart. It runs on a
 	//     goroutine of its own (dispatched by its callers), because its
 	//     dialogs and the shutdown must never block a caller: the message
@@ -490,7 +490,15 @@ func run(o Options, logPath string) (err error) {
 		desktopLog.Warn("could not build the product icon", "error", err)
 	}
 
-	window = newRuntimeWindow(runtimePageURL(url), iconBytes)
+	window = newRuntimeWindow(runtimePageURL(url), iconBytes, desktopWindowActions(guard, func() {
+		// The same open of the web UI the tray's Open HFDesk item
+		// runs: the URL comes from the application, and a failure is
+		// reported through the one browser-failure report every
+		// opener of a browser uses.
+		if err := application.OpenBrowser(); err != nil {
+			reportBrowserFailure(url, err)
+		}
+	}))
 	webview2Ready, webview2Version := webview2Available()
 	if !webview2Ready {
 		desktopLog.Warn("the WebView2 runtime is not installed", "url", url)
@@ -624,7 +632,7 @@ func run(o Options, logPath string) (err error) {
 }
 
 // runInstallServiceAction performs the install-service flow of one surface —
-// the tray item and the install button of the Runtime / Logs window run this
+// the tray item and the install button of the Logs window run this
 // very function — and hands its outcome to the host. The refresh argument is
 // the host's menu catch-up signal, commit is the shutdown coordinator that
 // takes a committed handover over, and quit ends the host; the route runs
@@ -851,7 +859,7 @@ func reportBrowserFailure(url string, err error) {
 		windows.MB_ICONERROR)
 }
 
-// showRuntimeWindow shows the Runtime / Logs window.
+// showRuntimeWindow shows the Logs window.
 //
 // When the WebView2 runtime is missing, the same actionable message is
 // shown again instead of failing silently.
@@ -861,24 +869,98 @@ func showRuntimeWindow(window *runtimeWindow, url string, webview2Ready bool) {
 		return
 	}
 	if err := window.Show(); err != nil {
-		desktopLog.Error("could not show the runtime window", "error", err)
-		showMessage("HFDesk - the Runtime / Logs window could not be shown",
+		desktopLog.Error("could not show the logs window", "error", err)
+		showMessage("HFDesk - the Logs window could not be shown",
 			runtimeWindowShowFailedText(err),
 			windows.MB_ICONERROR)
 	}
 }
 
-// reportWebView2Missing tells the user that the Runtime / Logs window is
-// not available.
+// reportWebView2Missing tells the user that the Logs window is not
+// available.
 //
 // The host keeps running: the server and the tray keep working, and the
 // action shows the same message again. The report carries the standard
 // log-path line of every failure window of a launch that has a log, like
 // the tray companion's mirror of it.
 func reportWebView2Missing(url string) {
-	showMessage("HFDesk - the Runtime / Logs window is not available",
+	showMessage("HFDesk - the Logs window is not available",
 		runtimeWindowUnavailableText(url),
 		windows.MB_ICONWARNING)
+}
+
+// desktopWindowActions returns the host handlers the runtime page of the
+// own server can call from the Logs window: open the folder of the log of
+// this launch, open the log file itself, and open the web UI in the
+// default browser (openUI — the very function the tray's Open HFDesk
+// item runs).
+//
+// The page is served by the own server, but the actions do NOT reach the
+// server: the window host owns them and performs them in the process of
+// the window, so the runtime page has exactly one owner for these actions
+// beside every host — the same fixed names the tray companion's window
+// binds (openLogFolderAction, openLogFileAction, openUiAction), and the
+// same rule: the page names the action, the host owns the path.
+func desktopWindowActions(guard panicGuard, openUI func()) map[string]func() {
+	return map[string]func(){
+		openLogFolderAction: func() {
+			go guard.runBackground(openDesktopLogFolder)
+		},
+		openLogFileAction: func() {
+			go guard.runBackground(openDesktopLogFile)
+		},
+		openUiAction: func() {
+			go guard.runBackground(openUI)
+		},
+	}
+}
+
+// openDesktopLogFile opens the log file of this launch with the default
+// handler of Windows — Notepad for a .log file with the standard
+// association — in the process of the window.
+//
+// The honest states end with their own report: a launch whose log path is
+// not set, a file that does not exist (anymore), and a file the default
+// handler refused to open. Every report is a failure window of this
+// launch, so the standard log-path line names exactly the file the action
+// looked for.
+func openDesktopLogFile() {
+	path := runLogPath
+	if path == "" {
+		showMessage(logFileOpenFailedCaption, noLogFileText(), windows.MB_ICONWARNING)
+		return
+	}
+	if _, err := os.Stat(path); err != nil && os.IsNotExist(err) {
+		showMessage(logFileOpenFailedCaption, logFileMissingText(), windows.MB_ICONWARNING)
+		return
+	}
+	if err := openExternalFile(path); err != nil {
+		desktopLog.Error("could not open the log file", "logFile", path, "error", err)
+		showMessage(logFileOpenFailedCaption, logFileOpenFailedText(err), windows.MB_ICONERROR)
+	}
+}
+
+// openDesktopLogFolder opens the folder of the log file of this launch
+// with the default file manager, in the process of the window.
+//
+// The honest states end with their own report: a launch whose log path is
+// not set, a folder that does not exist (anymore), and an opener that
+// refused the folder. Every report is a failure window of this launch.
+func openDesktopLogFolder() {
+	path := runLogPath
+	if path == "" {
+		showMessage(logFolderOpenFailedCaption, noLogFileText(), windows.MB_ICONWARNING)
+		return
+	}
+	dir := filepath.Dir(path)
+	if _, err := os.Stat(dir); err != nil && os.IsNotExist(err) {
+		showMessage(logFolderOpenFailedCaption, logFolderMissingText(dir), windows.MB_ICONWARNING)
+		return
+	}
+	if err := openExternalFolder(dir); err != nil {
+		desktopLog.Error("could not open the log folder", "dir", dir, "error", err)
+		showMessage(logFolderOpenFailedCaption, logFolderOpenFailedText(dir, err), windows.MB_ICONERROR)
+	}
 }
 
 // runtimePageURL returns the URL of the runtime page of the running server.

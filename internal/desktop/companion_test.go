@@ -5,7 +5,8 @@ package desktop
 
 import (
 	"errors"
-	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -164,84 +165,75 @@ func TestCompanionRelaunchArgsRoundTripThroughTheParser(t *testing.T) {
 	}
 }
 
-// TestCompanionPageRendersStateLinkAndLog pins the page of the companion
-// window: the honest state as its heading, the link of the REGISTRATION
-// (an anchor a click follows), the standard log-path line, and the
-// service-log section — the bounded tail ending with the newest line, the
-// one action that opens the full file, and the single script that scrolls
-// that tail to its end and forwards the fixed action name.
+// TestLogsFallbackPageRendersStateAddressLogAndActions pins the fallback
+// document of the Logs window: the honest state as its heading, the
+// honest line that the registered address does not answer (stated as a
+// fact in a code chip, never linked — the address just proved it does not
+// answer), the path of the service log with the one action that opens
+// that very file, and the retry action. The window title is the short
+// one: "Logs", without internal names.
 //
-// The page fetches nothing: its one script carries no channel of any kind,
-// so the companion still listens to nothing — a model without a
-// service-log source carries no script at all (pinned below and by the
-// seam tests of the companion launch).
-func TestCompanionPageRendersStateLinkAndLog(t *testing.T) {
-	page := companionPage(companionPageState{
+// The document fetches nothing: its one script carries no channel of any
+// kind, so the fallback beside a dead address reaches out of the document
+// just as little as the companion listened to nothing before — a model
+// without a log path still carries the retry and no open button (there is
+// nothing to open), pinned below.
+func TestLogsFallbackPageRendersStateAddressLogAndActions(t *testing.T) {
+	page := logsFallbackPage(logsFallbackState{
 		State:   "The HFDesk service is stopped.",
-		WebURL:  "http://127.0.0.1:18080",
-		LogPath: `C:\Users\First Last\hfdesk.log`,
-		ServiceLog: serviceLogSection{
-			Path: `C:\ProgramData\HFDesk\logs\hfdesk.log`,
-			Tail: "line one\nline two: newest",
-		},
+		Address: "http://127.0.0.1:18080",
+		LogPath: `C:\ProgramData\HFDesk\logs\hfdesk.log`,
 	})
 
-	assertNames(t, page, "the companion page", []string{
+	assertNames(t, page, "the fallback document", []string{
+		"<title>HFDesk - Logs</title>",
 		"<h1>The HFDesk service is stopped.</h1>",
-		`<a href="http://127.0.0.1:18080">http://127.0.0.1:18080</a>`,
-		"The log file is at",
-		`<code>C:\Users\First Last\hfdesk.log</code>`,
-		// The service log section: heading, the bounded tail in its
-		// box, and the one action of the section.
-		`<p class="label">Service log</p>`,
-		`<pre id="service-log-tail">`,
-		"line one\nline two: newest",
-		"Open the full log file",
-		`id="open-service-log"`,
+		"The web UI at <code>http://127.0.0.1:18080</code> does not answer.",
+		`<div class="stat-label">Log file</div>`,
+		`<code>C:\ProgramData\HFDesk\logs\hfdesk.log</code>`,
+		`id="open-log-file"`,
+		"Open the log file",
+		`id="try-again"`,
+		">Try again<",
 	})
-	// The tail ends with the newest line: what the window shows is the
-	// END of the file (the script below scrolls the box to it), and the
-	// section is the last content of the document.
-	if tail := strings.Index(page, `<pre id="service-log-tail">`); tail > strings.Index(page, "line two: newest") {
-		t.Errorf("the newest line sits before the tail box:\n%s", page)
+	// The address is stated, never linked: a link to the address that
+	// just failed to answer would be a dead path in the window.
+	assertNamesWithout(t, page, "the address line", nil, []string{"<a ", "href="})
+
+	// The section order: the state leads, the honest line follows, the
+	// log fact and its action come last — the document reads top down
+	// from what is true to what can be done.
+	state := strings.Index(page, "<h1>")
+	address := strings.Index(page, "does not answer.")
+	logFact := strings.Index(page, `<code>C:\ProgramData\HFDesk\logs\hfdesk.log</code>`)
+	if !(state >= 0 && state < address && address < logFact) {
+		t.Errorf("the document order is state %d, address %d, log %d, want state < address < log:\n%s",
+			state, address, logFact, page)
 	}
-	// The section order: the log file of this launch is stated above
-	// the Service log section, and the tail sits under its heading —
-	// the section is the last content a reader reaches.
-	launchLog := strings.Index(page, "The log file is at")
-	label := strings.Index(page, `<p class="label">Service log</p>`)
-	sectionBox := strings.Index(page, `<pre id="service-log-tail">`)
-	if launchLog == -1 || label == -1 || sectionBox == -1 || !(launchLog < label && label < sectionBox) {
-		t.Errorf("the page order is launch log %d, label %d, tail %d, want the section last:\n%s",
-			launchLog, label, sectionBox, page)
-	}
-	// The only script of the page performs the two local operations and
-	// nothing else: no fetch, no socket, no remote resource, no data
-	// leaves the document — the companion listens to nothing.
+
+	// The only script of the document performs the two local operations
+	// and nothing else: no fetch, no socket, no remote resource, no data
+	// leaves the document — the fallback reaches nowhere.
 	if count := strings.Count(page, "<script"); count != 1 {
-		t.Errorf("the page carries %d script elements, want exactly the one local script", count)
+		t.Errorf("the document carries %d script elements, want exactly the one local script", count)
 	}
-	assertPageReachesOutNowhere(t, page, "the companion page")
-	assertNames(t, page, "the page script", []string{
-		// Scroll the tail box to its end — the window shows the end
-		// of the log.
-		`getElementById("service-log-tail")`,
-		"tail.scrollTop = tail.scrollHeight",
-		// Forward the one fixed action to the host-bound function.
-		"window." + companionOpenLogAction,
-		`addEventListener("click"`,
-	})
+	assertPageReachesOutNowhere(t, page, "the fallback document")
 	if !strings.HasPrefix(page, "<!doctype html>") {
-		t.Errorf("the companion page = %q, want a self-contained document", page)
+		t.Errorf("the fallback document = %q, want a self-contained document", page)
 	}
 }
 
-// pageExternalPins lists every cheap route out of the companion document:
-// network calls, sockets, beacons, frames, subresources and imports. The
-// page fetches nothing — the companion listens to nothing — so ANY of these
-// is a defect, not a style choice: a page that starts reaching out fails
-// here instead of passing as "just one more attribute". Both shapes of the
-// page (with and without a service-log section) are pinned against it.
+// pageExternalPins lists every cheap route out of the fallback document
+// of the Logs window: network calls, sockets, beacons, frames,
+// subresources and imports. The document fetches nothing — it is the
+// fallback beside an address that does not answer, and the companion
+// itself listens to nothing — so ANY of these is a defect, not a style
+// choice: a document that starts reaching out fails here instead of
+// passing as "just one more attribute". Both shapes of the document (with
+// and without a log path) are pinned against it. (The LIVE page of the
+// window is a different mechanism: the window host navigates the WebView2
+// to the address of the service — an outgoing page load the host owns,
+// not a channel of any document.)
 var pageExternalPins = []string{
 	// Network calls, sockets and beacons.
 	"fetch(", "XMLHttpRequest", "WebSocket", "EventSource", "sendBeacon",
@@ -255,7 +247,7 @@ var pageExternalPins = []string{
 }
 
 // assertPageReachesOutNowhere pins the external-resource list against one
-// rendered page.
+// rendered document.
 func assertPageReachesOutNowhere(t *testing.T, page, context string) {
 	t.Helper()
 	for _, forbidden := range pageExternalPins {
@@ -265,362 +257,149 @@ func assertPageReachesOutNowhere(t *testing.T, page, context string) {
 	}
 }
 
-// TestCompanionPageScriptCallsTheOneBoundActionName pins the single source
-// of truth of the bridge name: the page's script may reference ONLY the
-// name substituted from companionOpenLogAction — the very constant
-// companionWindowActions binds as its map key — so renaming the constant
-// without the script (or the script without the constant) cannot pass: the
-// template derives the name at generation time, and this test fails
-// outright if any other literal name reaches the script, if the
-// substitution placeholder leaks into the page, or if the constant stops
-// being a usable JavaScript identifier.
+// TestLogsFallbackPageScriptCallsOnlyBoundActionNames pins the source of
+// truth of the bridge names: the document's script may reference ONLY the
+// names substituted from openLogFileAction and logsTryAgainAction — the
+// very constants companionWindowActions binds as its map keys — so
+// renaming a constant without the script (or the script without the
+// constant) cannot pass: the template derives the names at generation
+// time, and this test fails outright if any other literal name reaches
+// the script, if a substitution placeholder leaks into the document, or
+// if a constant stops being a usable JavaScript identifier.
 //
-// It also pins the two element ids the script looks up by: an id renamed in
+// It also pins the element ids the script looks up by: an id renamed in
 // one of its two places is a dead button, and the click would silently do
 // nothing.
-func TestCompanionPageScriptCallsTheOneBoundActionName(t *testing.T) {
+func TestLogsFallbackPageScriptCallsOnlyBoundActionNames(t *testing.T) {
 	identifier := regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
-	if !identifier.MatchString(companionOpenLogAction) {
-		t.Fatalf("companionOpenLogAction = %q is not a JavaScript identifier: "+
-			"substituting it would produce a script that cannot parse", companionOpenLogAction)
+	for _, name := range []string{openLogFileAction, logsTryAgainAction} {
+		if !identifier.MatchString(name) {
+			t.Fatalf("%q is not a JavaScript identifier: "+
+				"substituting it would produce a script that cannot parse", name)
+		}
 	}
 
-	page := companionPage(companionPageState{
-		State: "The HFDesk service is stopped.",
-		ServiceLog: serviceLogSection{
-			Path: `C:\ProgramData\HFDesk\logs\hfdesk.log`,
-			Tail: "record one\nrecord two",
-		},
+	page := logsFallbackPage(logsFallbackState{
+		State:   "The HFDesk service is stopped.",
+		Address: "http://127.0.0.1:18080",
+		LogPath: `C:\ProgramData\HFDesk\logs\hfdesk.log`,
 	})
 
-	// Every window.<name> reference of the document is THE bound action:
-	// no second, foreign name may sit beside it, and the guard and the
-	// call both carry it (at least twice).
-	want := "window." + companionOpenLogAction
+	// Every window.<name> reference of the document is one of THE bound
+	// actions: no foreign name may sit beside them, and each one carries
+	// its guard and its call (twice).
+	bound := map[string]bool{openLogFileAction: true, logsTryAgainAction: true}
+	counts := map[string]int{}
 	refs := regexp.MustCompile(`window\.[A-Za-z_$][A-Za-z0-9_$]*`).FindAllString(page, -1)
-	if len(refs) < 2 {
-		t.Errorf("the script references the bound action %d time(s), want the guard and the call: %v", len(refs), refs)
+	if len(refs) < 4 {
+		t.Errorf("the script references bound actions %d time(s), want the guard and the call of each: %v",
+			len(refs), refs)
 	}
 	for _, ref := range refs {
-		if ref != want {
-			t.Errorf("the page calls %q, want only the bound action %q: a foreign name is a dead button", ref, want)
+		name := strings.TrimPrefix(ref, "window.")
+		if !bound[name] {
+			t.Errorf("the document calls %q, want only %q and %q: a foreign name is a dead button",
+				ref, openLogFileAction, logsTryAgainAction)
+		}
+		counts[name]++
+	}
+	for _, name := range []string{openLogFileAction, logsTryAgainAction} {
+		if counts[name] < 2 {
+			t.Errorf("the script references %q %d time(s), want its guard and its call", name, counts[name])
 		}
 	}
-	if strings.Contains(page, serviceLogScriptActionPlaceholder) {
-		t.Errorf("the page carries the unsubstituted placeholder %q: the generation step is broken:\n%s",
-			serviceLogScriptActionPlaceholder, page)
+	for _, placeholder := range []string{logsFallbackOpenPlaceholder, logsFallbackTryPlaceholder} {
+		if strings.Contains(page, placeholder) {
+			t.Errorf("the document carries the unsubstituted placeholder %q: the generation step is broken:\n%s",
+				placeholder, page)
+		}
 	}
 
-	// The bare name must not appear either: a call without the window.
-	// prefix is just as dead when the constant is renamed. The scan runs
-	// inside the script element only — the page legitimately prints the
-	// log file name (hfdesk.log) as text.
+	// The bare names must not appear either: a call without the window.
+	// prefix is just as dead when a constant is renamed. The scan runs
+	// inside the script element only — the document legitimately prints
+	// the log file name (hfdesk.log) as text.
 	script := regexp.MustCompile(`(?s)<script>.*?</script>`).FindString(page)
 	if script == "" {
-		t.Fatal("the page carries no script: the section renders no tail and no button")
+		t.Fatal("the document carries no script: the actions have no forwarder")
 	}
 	for _, name := range regexp.MustCompile(`hfdesk[A-Za-z0-9_$]*`).FindAllString(script, -1) {
-		if name != companionOpenLogAction {
-			t.Errorf("the script carries the literal %q, want only companionOpenLogAction %q: "+
-				"a hardcoded name is a dead button", name, companionOpenLogAction)
+		if !bound[name] {
+			t.Errorf("the script carries the literal %q, want only openLogFileAction %q and logsTryAgainAction %q: "+
+				"a hardcoded name is a dead button", name, openLogFileAction, logsTryAgainAction)
 		}
 	}
 
-	// The button and the tail box are looked up by the very ids the
-	// markup carries.
+	// The buttons are looked up by the very ids the markup carries.
 	assertNames(t, page, "the bridge elements", []string{
-		`id="open-service-log"`, `getElementById("open-service-log")`,
-		`id="service-log-tail"`, `getElementById("service-log-tail")`,
+		`id="open-log-file"`, `getElementById("open-log-file")`,
+		`id="try-again"`, `getElementById("try-again")`,
 	})
 }
 
-// TestCompanionPageShowsTheAddressAsFactAndEscapesEverything proves the
-// two honest shapes of the address line — a registration without a
-// readable URL names the address itself, never an invented link, and a
-// machine without a registration carries no address at all — and that
-// every value from the machine is escaped, so none of it can become
-// markup.
-func TestCompanionPageShowsTheAddressAsFactAndEscapesEverything(t *testing.T) {
-	t.Run("an unreadable address is named, not linked", func(t *testing.T) {
-		page := companionPage(companionPageState{
+// TestLogsFallbackPageHonestShapesAndEscapesEverything proves the honest
+// shapes of the fallback document — an address that did not answer is
+// stated as a fact and never linked, a machine without an address states
+// the honest reason instead, and a model without a log path states that
+// fact and offers no open button beside the retry (a button with nothing
+// to open would be a dead action) — and that every value from the machine
+// is escaped, so none of it can become markup.
+func TestLogsFallbackPageHonestShapesAndEscapesEverything(t *testing.T) {
+	t.Run("an address that did not answer is stated, never linked", func(t *testing.T) {
+		page := logsFallbackPage(logsFallbackState{
 			State:   "The HFDesk service is stopped.",
-			Address: "The registration names no listen address, so the address of the service is not known.",
+			Address: "http://127.0.0.1:18080",
 		})
-		if strings.Contains(page, "<a href") {
-			t.Errorf("the page links an address it could not read as a URL: %q", page)
-		}
-		assertNames(t, page, "the address line", []string{
-			"The registration names no listen address",
-		})
+		assertNamesWithout(t, page, "the address line", []string{
+			"The web UI at <code>http://127.0.0.1:18080</code> does not answer.",
+		}, []string{"<a ", "href="})
 	})
 
-	t.Run("no registration and no log carry no lines", func(t *testing.T) {
-		page := companionPage(companionPageState{
+	t.Run("a machine without an address states the honest reason", func(t *testing.T) {
+		page := logsFallbackPage(logsFallbackState{
 			State: "HFDesk is not registered as a Windows service.",
+			Note:  "The registration names no address, so there is nothing to open.",
 		})
-		if strings.Contains(page, "<a href") {
-			t.Errorf("the page links an address beside a machine without a registration: %q", page)
+		assertNames(t, page, "the note line", []string{
+			"The registration names no address, so there is nothing to open.",
+		})
+		if strings.Contains(page, "does not answer") {
+			t.Errorf("the document claims an address did not answer although it names none: %q", page)
 		}
-		if strings.Contains(page, "The log file is at") {
-			t.Errorf("the page names a log file of a launch that has none: %q", page)
-		}
-		// A model without a service-log source carries no section and
-		// therefore no script at all: there is nothing to scroll and
-		// no button to forward.
-		if strings.Contains(page, "<script") || strings.Contains(page, "Service log") {
-			t.Errorf("the page carries the service-log section although its model has no source: %q", page)
-		}
-		// The sectionless shape reaches out of the document just as
+	})
+
+	t.Run("no log path states the fact and offers no open button", func(t *testing.T) {
+		page := logsFallbackPage(logsFallbackState{
+			State: "The HFDesk service is stopped.",
+			Note:  "The address of the web UI is not known.",
+		})
+		assertNamesWithout(t, page, "the pathless document", []string{
+			"The log file is not known.",
+			`id="try-again"`,
+		}, []string{`id="open-log-file"`, "Open the log file"})
+		// The pathless shape reaches out of the document just as
 		// little as the full one.
-		assertPageReachesOutNowhere(t, page, "the sectionless page")
+		assertPageReachesOutNowhere(t, page, "the pathless document")
 	})
 
 	t.Run("every value is escaped", func(t *testing.T) {
-		page := companionPage(companionPageState{
+		page := logsFallbackPage(logsFallbackState{
 			State:   `<script>alert("state")</script>`,
 			Address: `127.0.0.1:8080&<i>`,
 			LogPath: `<b>log</b>`,
-			ServiceLog: serviceLogSection{
-				Path: `C:\logs\<i>hfdesk.log`,
-				Tail: `</pre><script>alert("tail")</script>`,
-			},
 		})
 		for _, raw := range []string{
 			`<script>alert("state")</script>`, `&<i>`, `<b>log</b>`,
-			`</pre><script>alert("tail")</script>`,
 		} {
 			if strings.Contains(page, raw) {
-				t.Errorf("the page carries the raw value %q: nothing from the machine may become markup", raw)
+				t.Errorf("the document carries the raw value %q: nothing from the machine may become markup", raw)
 			}
 		}
-		assertNames(t, page, "the escaped page", []string{
+		assertNames(t, page, "the escaped document", []string{
 			"&lt;script&gt;",
 			"&amp;&lt;i&gt;",
 			"&lt;b&gt;log&lt;/b&gt;",
-			"&lt;/pre&gt;&lt;script&gt;",
 		})
-
-		unreadable := companionPage(companionPageState{
-			State: "The HFDesk service is stopped.",
-			ServiceLog: serviceLogSection{
-				Path:      `C:\logs\hfdesk.log`,
-				ReadError: `access <i> denied`,
-			},
-		})
-		assertNamesWithout(t, unreadable, "the escaped reason", []string{
-			"could not be read: access &lt;i&gt; denied.",
-		}, []string{`access <i> denied`})
-	})
-}
-
-// TestCompanionPageServiceLogSectionHonestStates pins the three honest
-// shapes of the service-log section on the page: a file the service has not
-// created yet is one line and offers no action (there is nothing to open),
-// a file that could not be read states its reason as one line and still
-// offers the action (the default handler may show what the page was denied),
-// and a readable file shows its bounded tail with the single
-// open-the-full-file button.
-func TestCompanionPageServiceLogSectionHonestStates(t *testing.T) {
-	t.Run("a log that does not exist yet", func(t *testing.T) {
-		page := companionPage(companionPageState{
-			State:      "The HFDesk service is stopped.",
-			ServiceLog: serviceLogSection{Path: `C:\ProgramData\HFDesk\logs\hfdesk.log`, Missing: true},
-		})
-		assertNamesWithout(t, page, "the missing-log section", []string{
-			"The service log file has not been created yet.",
-			`<p class="label">Service log</p>`,
-		}, []string{"Open the full log file", "<pre"})
-	})
-
-	t.Run("a log that could not be read", func(t *testing.T) {
-		page := companionPage(companionPageState{
-			State: "The HFDesk service is stopped.",
-			ServiceLog: serviceLogSection{
-				Path:      `C:\ProgramData\HFDesk\logs\hfdesk.log`,
-				ReadError: "open the file: access is denied",
-			},
-		})
-		assertNames(t, page, "the unreadable-log section", []string{
-			"The service log file could not be read: open the file: access is denied.",
-			"Open the full log file",
-		})
-		if strings.Contains(page, "<pre") {
-			t.Errorf("the unreadable section renders a tail although none could be read: %q", page)
-		}
-	})
-
-	t.Run("a readable log shows its tail and the one action", func(t *testing.T) {
-		page := companionPage(companionPageState{
-			State: "The HFDesk service is stopped.",
-			ServiceLog: serviceLogSection{
-				Path: `C:\ProgramData\HFDesk\logs\hfdesk.log`,
-				Tail: "oldest line\nnewest line",
-			},
-		})
-		assertNames(t, page, "the readable-log section", []string{
-			"<pre id=\"service-log-tail\">oldest line\nnewest line</pre>",
-			"Open the full log file",
-			"hfdeskOpenServiceLog",
-		})
-	})
-}
-
-// TestReadServiceLogTailBoundsOrderAndEndsAtTheFileEnd pins the read of the
-// tail itself, independent of any window: the byte bound caps what a large
-// file yields (the beginning of the file never leaves the disk as a whole),
-// every shown line is whole and in file order, the last line shown is the
-// newest line of the file, and the line bound caps what a small file with
-// many short lines yields.
-func TestReadServiceLogTailBoundsOrderAndEndsAtTheFileEnd(t *testing.T) {
-	t.Run("a large file is read only at its end, under the byte bound", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "hfdesk.log")
-		// ~400 bytes per line: 2000 lines are far more than the byte
-		// bound, so the read has to seek to the end.
-		var file strings.Builder
-		for i := 0; i < 2000; i++ {
-			line := fmt.Sprintf("line %06d:", i)
-			fmt.Fprintf(&file, "%s%.*s\n", line, 400-len(line), strings.Repeat("x", 400))
-		}
-		file.WriteString("line 999999: newest\n")
-		if err := os.WriteFile(path, []byte(file.String()), 0o600); err != nil {
-			t.Fatalf("write the log: %v", err)
-		}
-
-		tail, err := readServiceLogTail(path)
-		if err != nil {
-			t.Fatalf("readServiceLogTail: %v", err)
-		}
-		if len(tail) > serviceLogTailBytes {
-			t.Errorf("the tail is %d bytes, want at most the %d byte bound: a large file must not be read whole",
-				len(tail), serviceLogTailBytes)
-		}
-		if strings.Contains(tail, "line 000000:") {
-			t.Error("the tail carries the first line of the file: the file was read as a whole")
-		}
-		if !strings.HasSuffix(tail, "line 999999: newest") {
-			t.Errorf("the tail does not end with the newest line of the file: %q", tail[len(tail)-80:])
-		}
-		lines := strings.Split(tail, "\n")
-		if len(lines) > serviceLogTailLines {
-			t.Errorf("the tail carries %d lines, want at most %d", len(lines), serviceLogTailLines)
-		}
-		// Every line is whole and in file order: the first shown line
-		// starts at a line boundary and the numbers only grow.
-		first := strings.Split(lines[0], ":")[0]
-		if !strings.HasPrefix(lines[0], "line ") {
-			t.Errorf("the first shown line is a fragment: %q", lines[0])
-		}
-		previous := -1
-		for _, line := range lines {
-			var number int
-			if _, err := fmt.Sscanf(strings.SplitN(line, ":", 2)[0], "line %d", &number); err != nil {
-				t.Fatalf("the line %q is not a whole line of the file: %v", line, err)
-			}
-			if number <= previous {
-				t.Errorf("the line %d follows %d: the order of the file was not kept", number, previous)
-			}
-			previous = number
-		}
-		if first == "" {
-			t.Error("the first shown line is empty")
-		}
-	})
-
-	t.Run("a small file is capped by the line bound, in order", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "hfdesk.log")
-		var file strings.Builder
-		for i := 1; i <= 1000; i++ {
-			fmt.Fprintf(&file, "L%04d\n", i)
-		}
-		if err := os.WriteFile(path, []byte(file.String()), 0o600); err != nil {
-			t.Fatalf("write the log: %v", err)
-		}
-
-		tail, err := readServiceLogTail(path)
-		if err != nil {
-			t.Fatalf("readServiceLogTail: %v", err)
-		}
-		lines := strings.Split(tail, "\n")
-		if len(lines) != serviceLogTailLines {
-			t.Errorf("the tail carries %d lines, want the last %d of the file", len(lines), serviceLogTailLines)
-		}
-		if lines[0] != "L0801" || lines[len(lines)-1] != "L1000" {
-			t.Errorf("the tail spans %q..%q, want L0801..L1000: the last lines of the file, in order",
-				lines[0], lines[len(lines)-1])
-		}
-	})
-
-	t.Run("a short file is shown whole, without its line endings", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "hfdesk.log")
-		if err := os.WriteFile(path, []byte("first\r\nsecond\r\nthird\r\n"), 0o600); err != nil {
-			t.Fatalf("write the log: %v", err)
-		}
-		tail, err := readServiceLogTail(path)
-		if err != nil {
-			t.Fatalf("readServiceLogTail: %v", err)
-		}
-		if tail != "first\nsecond\nthird" {
-			t.Errorf("the tail = %q, want the whole file as three whole lines", tail)
-		}
-		if strings.Contains(tail, "\r") {
-			t.Errorf("the tail keeps carriage returns: %q", tail)
-		}
-	})
-
-	t.Run("a missing file reports its error instead of a tail", func(t *testing.T) {
-		_, err := readServiceLogTail(filepath.Join(t.TempDir(), "absent.log"))
-		if !os.IsNotExist(err) {
-			t.Errorf("readServiceLogTail of a missing file = %v, want a not-exist error", err)
-		}
-	})
-}
-
-// TestServiceLogSectionStates pins the loader of the section: missing,
-// unreadable and readable are told apart honestly, and a resolved path
-// travels with the section — the very path the open action hands to the
-// default handler.
-func TestServiceLogSectionStates(t *testing.T) {
-	t.Run("a file that does not exist is missing", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "hfdesk.log")
-		section := serviceLogSectionAt(path)
-		if !section.Missing || section.ReadError != "" || section.Tail != "" {
-			t.Errorf("the section = %+v, want the honest missing state", section)
-		}
-		if section.Path != path {
-			t.Errorf("the section path = %q, want the file it spoke about %q", section.Path, path)
-		}
-	})
-
-	t.Run("a file that cannot be read carries its reason", func(t *testing.T) {
-		// A directory in the place of the file: opening or reading it
-		// fails on every platform, which is exactly the class of a
-		// file this process may not read.
-		path := t.TempDir()
-		section := serviceLogSectionAt(path)
-		if section.Missing || section.ReadError == "" || section.Tail != "" {
-			t.Errorf("the section = %+v, want one line of reason and no tail", section)
-		}
-		if strings.ContainsAny(section.ReadError, "\r\n") {
-			t.Errorf("the reason spans several lines: %q", section.ReadError)
-		}
-	})
-
-	t.Run("a readable file carries its tail", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "hfdesk.log")
-		if err := os.WriteFile(path, []byte("record one\nrecord two\n"), 0o600); err != nil {
-			t.Fatalf("write the log: %v", err)
-		}
-		section := serviceLogSectionAt(path)
-		if section.Missing || section.ReadError != "" || section.Tail != "record one\nrecord two" {
-			t.Errorf("the section = %+v, want the tail of the file", section)
-		}
-	})
-
-	t.Run("no path claims nothing", func(t *testing.T) {
-		section := serviceLogSectionAt("")
-		if section.Path != "" || section.Missing || section.ReadError != "" || section.Tail != "" {
-			t.Errorf("the section = %+v, want the empty section that claims nothing", section)
-		}
 	})
 }
 
@@ -775,4 +554,254 @@ func TestCompanionReportsFollowTheWindowRule(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRuntimePageAnswersProbesTheAddressHonestly pins the probe that
+// decides between the live page and the fallback document: a runtime page
+// that answers 200 counts as reachable, an error answer does not, a
+// refused connection does not, and an address that stays silent past the
+// bounded budget does not — the budget is the reason a stopped service
+// meets the fallback instead of a window that hangs on a navigation that
+// never completes.
+func TestRuntimePageAnswersProbesTheAddressHonestly(t *testing.T) {
+	t.Run("an answering page counts as reachable", func(t *testing.T) {
+		page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer page.Close()
+
+		if !runtimePageAnswers(page.URL) {
+			t.Errorf("runtimePageAnswers(%q) = false, want true: the page answered 200", page.URL)
+		}
+	})
+
+	t.Run("an error answer counts as unreachable", func(t *testing.T) {
+		page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer page.Close()
+
+		if runtimePageAnswers(page.URL) {
+			t.Errorf("runtimePageAnswers(%q) = true, want false: the page answered 503", page.URL)
+		}
+	})
+
+	t.Run("a refused address counts as unreachable", func(t *testing.T) {
+		page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		url := page.URL
+		page.Close()
+
+		if runtimePageAnswers(url) {
+			t.Errorf("runtimePageAnswers(%q) = true, want false: nothing listens there anymore", url)
+		}
+	})
+
+	t.Run("a silent address is bounded by the probe budget", func(t *testing.T) {
+		previous := runtimePageProbeTimeout
+		runtimePageProbeTimeout = 50 * time.Millisecond
+		t.Cleanup(func() { runtimePageProbeTimeout = previous })
+
+		page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(2 * time.Second)
+		}))
+		defer page.Close()
+
+		start := time.Now()
+		if runtimePageAnswers(page.URL) {
+			t.Errorf("runtimePageAnswers(%q) = true, want false: the answer never arrived", page.URL)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Errorf("the probe took %s, want a budget close to %s: an unbounded probe hangs the window",
+				elapsed, runtimePageProbeTimeout)
+		}
+	})
+}
+
+// TestResolveLogsWindowPicksTheLivePageOrTheFallback pins the decision of
+// one open of the companion window: an address that answers yields the
+// live runtime page and no fallback document, an address that does not
+// answer yields the fallback document and no URL, and a registration that
+// names no address yields the fallback WITHOUT probing — there is nothing
+// to ask, and a probe of an empty URL would be a defect.
+func TestResolveLogsWindowPicksTheLivePageOrTheFallback(t *testing.T) {
+	fallback := func() string { return "<!doctype html>fallback" }
+	probeCalls := 0
+	previous := runtimePageAnswers
+	t.Cleanup(func() { runtimePageAnswers = previous })
+
+	t.Run("an answering address yields the live page", func(t *testing.T) {
+		probeCalls = 0
+		runtimePageAnswers = func(url string) bool {
+			probeCalls++
+			return url == "http://127.0.0.1:18080/runtime.html"
+		}
+		target, document := resolveLogsWindow(
+			func() string { return "http://127.0.0.1:18080/runtime.html" }, fallback)
+		if target != "http://127.0.0.1:18080/runtime.html" || document != "" {
+			t.Errorf("resolveLogsWindow = (%q, %q), want the live page and no document", target, document)
+		}
+		if probeCalls != 1 {
+			t.Errorf("the probe ran %d time(s), want exactly one per open", probeCalls)
+		}
+	})
+
+	t.Run("an address that does not answer yields the fallback", func(t *testing.T) {
+		runtimePageAnswers = func(string) bool { return false }
+		target, document := resolveLogsWindow(
+			func() string { return "http://127.0.0.1:18080/runtime.html" }, fallback)
+		if target != "" || document != "<!doctype html>fallback" {
+			t.Errorf("resolveLogsWindow = (%q, %q), want no URL and the fallback document", target, document)
+		}
+	})
+
+	t.Run("a registration without an address yields the fallback without a probe", func(t *testing.T) {
+		probeCalls = 0
+		runtimePageAnswers = func(string) bool {
+			probeCalls++
+			return true
+		}
+		target, document := resolveLogsWindow(func() string { return "" }, fallback)
+		if target != "" || document != "<!doctype html>fallback" {
+			t.Errorf("resolveLogsWindow = (%q, %q), want no URL and the fallback document", target, document)
+		}
+		if probeCalls != 0 {
+			t.Errorf("the probe ran %d time(s) beside an empty address, want no probe at all", probeCalls)
+		}
+	})
+}
+
+// TestTheOpenReportsOfTheWindowFollowTheWindowRule pins the new reports of
+// the host-owned open actions under the established window rule — the
+// state plus AT MOST one action, with the standard log-path line of this
+// launch named exactly once — as one map, the way the sibling reports are
+// pinned: a report that joins the family without the rule, or one that
+// names the log twice beside a path it also states itself, fails here.
+func TestTheOpenReportsOfTheWindowFollowTheWindowRule(t *testing.T) {
+	const launchLogPath = `C:\Users\First Last\hfdesk.log`
+	previous := runLogPath
+	runLogPath = launchLogPath
+	t.Cleanup(func() { runLogPath = previous })
+
+	cause := errors.New("the default handler refused the file")
+	logLine := "The log file is at " + launchLogPath + "."
+	folder := `C:\Users\First Last\logs`
+
+	for name, tc := range map[string]struct {
+		text string
+		// want is the state, the cause and the path facts the report
+		// must carry.
+		want []string
+		// forbidden is every action a state-only report must not
+		// offer and the facts its state contradicts.
+		forbidden []string
+	}{
+		"the no-log report": {
+			text: noLogFileText(),
+			want: []string{
+				"There is no log file to open.",
+				logLine,
+			},
+			forbidden: []string{
+				"Do you want to", "could not be opened", "has not been created yet",
+			},
+		},
+		"the missing-log report": {
+			text: logFileMissingText(),
+			want: []string{
+				"The log file has not been created yet, so there is nothing to open.",
+				logLine,
+			},
+			forbidden: []string{
+				"Do you want to", "could not be opened",
+			},
+		},
+		"the log open failure report": {
+			text: logFileOpenFailedText(cause),
+			want: []string{
+				"The log file could not be opened in the default program.",
+				cause.Error(),
+				logLine,
+			},
+			forbidden: []string{
+				"Do you want to", "has not been created yet",
+			},
+		},
+		"the missing-folder report": {
+			text: logFolderMissingText(folder),
+			want: []string{
+				"The log folder has not been created yet, so there is nothing to open.",
+				"The log folder is at " + folder + ".",
+				logLine,
+			},
+			forbidden: []string{
+				"Do you want to", "could not be opened",
+			},
+		},
+		"the folder open failure report": {
+			text: logFolderOpenFailedText(folder, cause),
+			want: []string{
+				"The log folder could not be opened.",
+				cause.Error(),
+				"The log folder is at " + folder + ".",
+				logLine,
+			},
+			forbidden: []string{
+				"Do you want to", "has not been created yet",
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assertNames(t, tc.text, name, tc.want)
+			for _, unwanted := range tc.forbidden {
+				if strings.Contains(tc.text, unwanted) {
+					t.Errorf("the %s carries %q beside its state and its cause:\n%s", name, unwanted, tc.text)
+				}
+			}
+			if got := strings.Count(tc.text, "The log file is at"); got != 1 {
+				t.Errorf("the %s names the log file %d times, want exactly once:\n%s", name, got, tc.text)
+			}
+		})
+	}
+}
+
+// TestRuntimeAssetsNameTheBoundWindowActions pins the JavaScript side of
+// the bridge against the Go constants: the shipped runtime.js may only
+// reference the two bound action names (plus the plain product prefix of
+// its storage key), and it must reference both of them — a rename on
+// either side that leaves the other behind is a dead button in the live
+// window, and this test fails outright. The shipped runtime.html must
+// carry both buttons the view drives, under the ids the view looks up.
+func TestRuntimeAssetsNameTheBoundWindowActions(t *testing.T) {
+	view, err := os.ReadFile(filepath.Join("..", "assets", "static", "js", "runtime.js"))
+	if err != nil {
+		t.Fatalf("read the shipped runtime.js: %v", err)
+	}
+	allowed := map[string]bool{
+		openLogFileAction:   true,
+		openLogFolderAction: true,
+		openUiAction:        true,
+		"hfdesk":            true, // the plain prefix of the storage key
+	}
+	for _, token := range regexp.MustCompile(`hfdesk[A-Za-z0-9_$]*`).FindAllString(string(view), -1) {
+		if !allowed[token] {
+			t.Errorf("runtime.js carries the token %q, want only the bound action names: a foreign name is a dead button",
+				token)
+		}
+	}
+	for _, name := range []string{openLogFolderAction, openLogFileAction, openUiAction} {
+		if !strings.Contains(string(view), name) {
+			t.Errorf("runtime.js never references %q: the window host binds it, so the view must call it", name)
+		}
+	}
+
+	markup, err := os.ReadFile(filepath.Join("..", "assets", "static", "runtime.html"))
+	if err != nil {
+		t.Fatalf("read the shipped runtime.html: %v", err)
+	}
+	assertNames(t, string(markup), "the shipped runtime.html", []string{
+		`id="openLogsButton"`,
+		"Open log folder",
+		`id="openLogFileButton"`,
+		"Open the log file",
+	})
 }

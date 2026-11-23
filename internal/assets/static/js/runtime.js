@@ -1,11 +1,15 @@
 /**
- * HFDesk - Runtime / Logs view
+ * HFDesk - Logs view
  *
- * A small self contained view for the HFDesk runtime window. It shows the
+ * A small self contained view for the HFDesk Logs window. It shows the
  * status of the running server and tails the runtime log.
  *
  * The page is served by the HFDesk server itself, so every request is same
- * origin: no CORS handling and no credentials are needed.
+ * origin: no CORS handling and no credentials are needed. Inside the Logs
+ * window the open actions belong to the WINDOW HOST (hfdeskOpenLogFolder,
+ * hfdeskOpenLogFile, hfdeskOpenUi — bound before the document loads); in a
+ * plain browser they are absent and the requests go to the endpoints of
+ * the server.
  */
 
 (function () {
@@ -179,6 +183,7 @@
     openUiButton: $('openUiButton'),
     openUiNote: $('openUiNote'),
     openLogsButton: $('openLogsButton'),
+    openLogFileButton: $('openLogFileButton'),
     copyButton: $('copyButton'),
     clearButton: $('clearButton'),
     levelFilter: $('levelFilter'),
@@ -474,6 +479,18 @@
     el.openLogsButton.title = logFile
       ? `Open the folder of ${logFile}`
       : 'The application does not write a log file';
+
+    // The log-file action belongs to the WINDOW: the host of the Logs
+    // window binds it, so it runs in the user's session — a service
+    // server runs in session 0 and could not open a program on the
+    // user's desktop. Outside the window (a plain browser) there is no
+    // host, so the button stays disabled and says where it works
+    // instead of failing on every click.
+    const hostOpenFile = typeof window.hfdeskOpenLogFile === 'function';
+    el.openLogFileButton.disabled = !logFile || !hostOpenFile;
+    el.openLogFileButton.title = hostOpenFile
+      ? (logFile ? `Open the file ${logFile}` : 'The application does not write a log file')
+      : 'Open the log file from the HFDesk window, where the action runs on this desktop';
 
     applyServiceView(status.serviceState);
   }
@@ -1282,8 +1299,25 @@
   }
 
   // openUi opens the main HFDesk interface in the default browser.
+  //
+  // Inside the Logs window the action belongs to the WINDOW HOST, like
+  // the log actions: the browser belongs to the user's session, and a
+  // server that runs as a service (session 0) could not reach the
+  // desktop. The host reports its own outcome natively, so the page
+  // claims nothing beside it. In a plain browser there is no host, and
+  // the request goes to the endpoint of the server, exactly as before.
   async function openUi() {
     el.openUiButton.disabled = true;
+
+    if (typeof window.hfdeskOpenUi === 'function') {
+      try {
+        await window.hfdeskOpenUi();
+      } catch (err) {
+        logErrorOnce(`The open-ui action of the window host failed: ${(err && err.message) || err}`);
+      }
+      el.openUiButton.disabled = false;
+      return;
+    }
 
     try {
       await fetchJSON('/api/runtime/open-ui', { method: 'POST' });
@@ -1306,8 +1340,29 @@
   }
 
   // openLogs opens the folder of the active log file.
+  //
+  // Inside the Logs window the action belongs to the WINDOW HOST: the
+  // bound function runs in the process of the window — the user's
+  // session — because the server of a service runs in session 0 and
+  // cannot open a folder on the user's desktop from there. The host
+  // reports its own outcome natively (like the install-service flow),
+  // so the page claims nothing beside it — no success toast, no second
+  // report beside the host's report.
+  //
+  // In a plain browser there is no host, and the request goes to the
+  // endpoint of the server, exactly as before.
   async function openLogs() {
     el.openLogsButton.disabled = true;
+
+    if (typeof window.hfdeskOpenLogFolder === 'function') {
+      try {
+        await window.hfdeskOpenLogFolder();
+      } catch (err) {
+        logErrorOnce(`The open-log-folder action of the window host failed: ${(err && err.message) || err}`);
+      }
+      el.openLogsButton.disabled = !(state.status?.logFile);
+      return;
+    }
 
     try {
       await fetchJSON('/api/runtime/open-logs', { method: 'POST' });
@@ -1321,6 +1376,22 @@
     } finally {
       el.openLogsButton.disabled = !(state.status?.logFile);
     }
+  }
+
+  // openLogFile opens the active log file itself with the default
+  // program. The action belongs to the window host, like openLogs —
+  // outside the window the button is disabled (see applyStatus), so a
+  // click only ever reaches the bound function.
+  async function openLogFile() {
+    if (typeof window.hfdeskOpenLogFile !== 'function') return;
+    el.openLogFileButton.disabled = true;
+
+    try {
+      await window.hfdeskOpenLogFile();
+    } catch (err) {
+      logErrorOnce(`The open-log-file action of the window host failed: ${(err && err.message) || err}`);
+    }
+    el.openLogFileButton.disabled = !(state.status?.logFile);
   }
 
   // installService hands the installation of the Windows service to the
@@ -1451,6 +1522,7 @@
     el.clearButton.addEventListener('click', clearView);
     el.openUiButton.addEventListener('click', openUi);
     el.openLogsButton.addEventListener('click', openLogs);
+    el.openLogFileButton.addEventListener('click', openLogFile);
     el.installServiceButton.addEventListener('click', installService);
 
     window.addEventListener('pagehide', () => {
