@@ -14,38 +14,50 @@ import (
 	"github.com/bashrusakh/hfdesk/internal/service"
 )
 
-// TestInstallServiceTextStatesWhatTheRegistrationChanges proves that the
-// confirmation of the installation carries the facts the user has to know
-// before a machine-wide registration is written.
+// TestInstallServiceTextIsTheHeadlineQuestionAndTwoFactLines proves the
+// contracted shape of the installation confirmation (decision of
+// 2026-11-24): the question as the headline, then exactly the two fact lines
+// — the lifetime of the service and the separate data.
 //
-// The registration survives the desktop app and its data is not the data of
-// the desktop. A confirmation that left one of them out would let the user
-// agree to something they did not read. No administrator-rights or
+// The portability, one-file-download and SHA-256 facts are released from
+// this window (they live in the download dialog, where they are needed), so
+// their wording is foreign here: a confirmation that still carried one of
+// them would be the old sheet again. No administrator-rights or
 // Windows-prompt sentence appears anywhere in it (decision of 2026-11-24):
 // the Windows prompt that follows states that itself.
-func TestInstallServiceTextStatesWhatTheRegistrationChanges(t *testing.T) {
+func TestInstallServiceTextIsTheHeadlineQuestionAndTwoFactLines(t *testing.T) {
 	const dataDir = `C:\ProgramData\HFDesk`
 	text := installServiceText(dataDir, false)
 
+	// The headline question, verbatim, with nothing before it.
+	if !strings.HasPrefix(text, "Install HFDesk as a Windows service?\n\n") {
+		t.Errorf("the confirmation %q does not open with the headline question", text)
+	}
+	// The two fact lines: the lifetime of the service, and the data of
+	// the service named by its directory alone.
 	assertNames(t, text, "the confirmation", []string{
-		"starts at boot",
-		"keeps running after this window closes",
-		"The one file HFDesk can download",
-		"only after its SHA-256 is verified",
-		"nothing else is downloaded or copied",
-		"Its data is separate",
-		"settings, jobs and models",
-		dataDir,
-		"are not there",
+		"It starts at boot and keeps running after this window closes.",
+		"Its data is separate: " + dataDir + ".",
 	})
-	assertNamesWithout(t, text, "the confirmation", nil,
-		[]string{"administrator", "Windows prompt"})
-	// The narrowed rule must not read as the old blanket claim: the
-	// desktop app CAN download one file now, so "nothing is downloaded or
-	// copied" without the qualifier is the wording that must be gone.
+	// The headline is the one question of the window: no tail question
+	// closes it.
+	if strings.HasSuffix(text, "?") {
+		t.Errorf("the confirmation %q ends with a question", text)
+	}
+	if strings.Contains(text, "Do you want to install") {
+		t.Errorf("the confirmation %q still asks the old tail question", text)
+	}
+	// The released facts are foreign to this window now, and the rights
+	// sentence never returns.
+	assertNamesWithout(t, text, "the confirmation", nil, []string{
+		"portable", "SHA-256", "Nothing else", "The one file",
+		"administrator", "Windows prompt",
+	})
+	// The old download rule must not creep back in any of its joining
+	// shapes: this window states no download wording at all.
 	if strings.Contains(text, ": nothing is downloaded or copied") ||
-		strings.Contains(text, "HFDesk stays portable: nothing is downloaded or copied") {
-		t.Errorf("the confirmation %q still carries the old blanket claim", text)
+		strings.Contains(text, "; nothing is downloaded or copied") {
+		t.Errorf("the confirmation %q still carries the old download claim", text)
 	}
 }
 
@@ -85,8 +97,16 @@ func TestInstallServiceTextWarnsOnlyForARemovableOrNetworkProgram(t *testing.T) 
 	// With the warning added, everything else stays: the ordinary text
 	// is this very text minus its one line, so a warning cannot quietly
 	// rewrite the rest of the confirmation.
-	if strings.Replace(warned, serviceProgramDriveWarningLine+"\n\n", "", 1) != ordinary {
+	if strings.Replace(warned, serviceProgramDriveWarningLine+"\n", "", 1) != ordinary {
 		t.Errorf("the warned confirmation differs from the ordinary one by more than its warning line")
+	}
+	// The warning is the single line between the lifetime line and the
+	// data line — exactly the position the contract gives it.
+	if !strings.Contains(warned,
+		"It starts at boot and keeps running after this window closes.\n"+
+			serviceProgramDriveWarningLine+"\n"+
+			"Its data is separate: "+dataDir+".") {
+		t.Errorf("the warning is not the single line between the lifetime line and the data line:\n%s", warned)
 	}
 	// The warning is the single line of the family's rule: human words,
 	// the consequence for the user, and no internal mechanism.
