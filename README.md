@@ -92,13 +92,18 @@ The desktop app wraps the same server in a small shell:
   **Runtime / Logs** window,
 - **Runtime / Logs** shows server status, active jobs, and live log records,
 - the tray menu offers **Open HFDesk**, **Runtime / Logs**, the Windows service
-  state, **Install service…**, **Service…**, and **Quit HFDesk**.
+  state, **Install service…**, **Start service**, **Stop service**,
+  **Update service**, **Delete service**, **Service…**, and **Quit HFDesk**.
 
 **Service.** **Install service…** can install the Windows service (it asks
 first, then requests administrator rights). The service is a second HFDesk
 with separate data under `%ProgramData%\HFDesk` — the desktop app's settings,
 jobs, and models are not shared. Full behavior is in
 [docs/SERVICE.md](docs/SERVICE.md#the-windows-desktop-host).
+
+**Tray companion.** With the service installed, the desktop app can sit in the
+tray beside it without running its own server, and after an installation it
+restarts exactly like that.
 
 **Portability.** HFDesk stays portable: the only file it can download is the
 missing paired console program, from its own official release, on request and

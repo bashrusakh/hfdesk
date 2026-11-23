@@ -2,9 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- The Windows desktop can work as a tray companion beside an installed service — without running its own server — and after an installation it restarts as exactly that.
+
 ### Changed
 
 - The Windows desktop host's service status line and Runtime / Logs badge only say whether the service is installed — `Service: installed`, `Service: not installed`, `Service: unknown` — dropping the state word that used to follow "installed".
+- The service status in the tray and in the window follows every reading of the service, keeping both surfaces on the real state.
+- The tray menu adds Start service, Stop service, Update service and Delete service next to Install service…, and deleting removes only the registration, keeping all data.
+- Every error report now names the log file written by that launch.
+- Window and report texts now give only the state plus the one action that follows from it.
+- Installing from a removable or network drive now warns that Windows may start the service before the drive is ready.
+
+### Fixed
+
+- A failed service installation now says what actually went wrong — the start did not run, the program ended too early, or the service did not come up in time — instead of a vague "could not confirm".
+- A registration removed after a failed installation attempt no longer reads as if the service had never been registered.
 
 ## [1.3.0-beta.9] - 2026-11-19
 

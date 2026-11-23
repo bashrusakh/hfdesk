@@ -803,32 +803,52 @@ is the only part of HFDesk that offers the service from a user interface. It is
 a program of its own: a release ships it next to the console host, and neither
 replaces the other.
 
-- **Tray menu.** The menu starts with a status line that reports the state of
+- **Tray menu.** The menu opens with **Open HFDesk** (the web UI of the
+  instance in the default browser) and **Runtime / Logs** (the runtime
+  window), then the service group: a status line that reports the state of
   the Windows service registration — `Service: installed`,
   `Service: not installed`, or `Service: unknown` when the state could not be
-  read, which never claims a machine without a service — followed by its
-  actions: **Open HFDesk** (the web UI of the instance in the default
-  browser), **Runtime / Logs** (the runtime window), **Install service…**
-  (registers the Windows service) and **Quit HFDesk** (a graceful shutdown).
-  **Install service…** is greyed out while a service is installed and sits
-  beside **Service…**, which opens the registered-service dialog — the same
-  question the install item opens when its own recheck finds a registration:
-  open it, start it or update it — so no capability leaves the tray; without a
-  registration, **Install service…** is the active item and **Service…** is
-  hidden. The status line is re-read after the service actions of the host and
-  every 30 seconds, so it stays truthful as the machine changes.
+  read, which never claims a machine without a service — followed by
+  **Install service…** (registers the Windows service) and, beside a proven
+  registration, **Start service**, **Stop service**, **Update service**,
+  **Delete service** and **Service…**, which opens the registered-service
+  dialog — the same question the install item opens when its own recheck
+  finds a registration: open it, start it or update it — so no capability
+  leaves the tray. A read that proves no registration enables the install
+  item and shows none of the registration-bound items; a read that could
+  settle neither greys the install item and offers no lifecycle items, so a
+  destructive action is never offered without a state that was read. The
+  status line is re-read after every service action, after every reading the
+  tray and the window make, and every 30 seconds, so both surfaces keep the
+  real state of the machine. A separator and **Quit HFDesk** (a graceful
+  shutdown) close the menu.
+- **Service actions.** **Install service…** (in the tray and as the window
+  button) and the four lifecycle items run one flow. The lifecycle items
+  appear beside a proven registration and each is enabled for the state it
+  can act on: **Start service** only for a settled state that does not run,
+  **Stop service** while the service runs, **Update service** and
+  **Delete service** beside any proven registration. Installing, stopping and
+  deleting ask for confirmation before Windows shows its administrator
+  prompt; a start or an update goes straight to that prompt. One service
+  action runs at a time: a second request while one is in flight is refused
+  with its own report instead of raising a second prompt beside the first.
+  **Delete service** removes only the registration — the data, the cache,
+  the config file, the history and the logs stay, the same invariant as
+  `hfdesk service uninstall`.
 - **Runtime / Logs window.** The header of the window shows the same service
   status as the tray menu, from the same read, and an **Install service…**
   button that is enabled only while no service is installed — the status
   refresh flips it once one exists. The button runs the exact installation
   flow of the tray item (the notice, the confirmation, the administrator
   prompt, the handover and the existing reports), and the host's
-  single-action guard refuses a second installation while one is in flight,
-  whichever surface started it.
+  single service-action guard refuses a second service action while one is
+  in flight, whichever surface or item started it.
 - **Install service…** asks for confirmation first, because the registration is
   a machine-wide change that outlives the app: the service starts at boot, keeps
   running without the desktop app, needs administrator rights, and keeps its own
-  data. The confirmation also states the one file the desktop host can download:
+  data. When the program sits on a removable or network drive, the confirmation
+  adds one honest line: Windows may start the service before that drive is
+  ready. The confirmation also states the one file the desktop host can download:
   the missing console program of its own release, only on request and only after
   its SHA-256 is verified — nothing else is downloaded or copied. The action
   requires the console program in the folder of the desktop program — the
@@ -906,22 +926,27 @@ replaces the other.
   of the desktop app are **not** migrated and do not appear in the service.
 - **Startup detection.** A launch that finds a registration — and no desktop
   app of its own already running — asks before anything serves: it starts no
-  server of its own and publishes no state, except when a positively confirmed
-  stopped service is answered with **Work in desktop mode**, the default
-  button. That answer continues the launch exactly like a launch without a
-  registration — and it is honored only after the service state is read again
-  when the answer is taken: the dialog is modal, so a service that is no
-  longer positively stopped at that re-read ends the launch with a notice
-  instead of binding the address the service now needs. Every other answer
-  ends it before anything serves. The gate never starts the service and never
-  changes the registration.
+  server of its own and publishes no state, except when one of two answers
+  continues the launch. **Work in desktop mode** — only for a positively
+  confirmed stopped service, where it is the default button — continues the
+  launch exactly like a launch without a registration — and it is honored
+  only after the service state is read again when the answer is taken: the
+  dialog is modal, so a service that is no longer positively stopped at that
+  re-read ends the launch with a notice instead of binding the address the
+  service now needs. **Work as tray companion** is offered in every settled
+  state, directly in front of **Cancel** and never the default button, and
+  continues the launch as the tray companion described below. Every other
+  answer ends the launch before anything serves. The gate never starts the
+  service and never changes the registration.
+
+  The dialog has one layout per state, and the companion choice joins each of
+  them:
 
   | Registered state | Buttons |
   |---|---|
-  | running | **Open HFDesk** / **Update service** / **Cancel** |
-  | broken, but the instance still runs | **Open HFDesk** / **Update service** / **Cancel** |
-  | stopped | **Work in desktop mode** (default) / **Start service** / **Update service** / **Cancel** |
-  | failed, or broken without a running instance | **Start service** / **Update service** / **Cancel** |
+  | running (also a broken registration whose instance still runs) | **Open HFDesk** / **Update service** / **Work as tray companion** / **Cancel** |
+  | stopped | **Work in desktop mode** (default) / **Start service** / **Update service** / **Work as tray companion** / **Cancel** |
+  | failed, or broken without a running instance | **Start service** / **Update service** / **Work as tray companion** / **Cancel** |
 
   A service that reports `starting` or `stopping` is not asked about: the
   launch waits for the state to settle and then asks about the state it
@@ -932,10 +957,11 @@ replaces the other.
   changes nothing, and the launch starts no server of its own.
 
   The gate never treats `failed` or `broken` as a positively confirmed
-  stopped service: those rows offer **Start service**, **Update service**
-  and **Cancel** only (a broken registration whose instance still runs
-  offers **Open HFDesk** instead of **Start service**), never **Work in
-  desktop mode**. Returning to desktop mode after a failed first
+  stopped service: those states never offer **Work in desktop mode** (a
+  broken registration whose instance still runs offers **Open HFDesk**
+  instead of **Start service**), while **Work as tray companion** is the one
+  answer every settled state shares — it starts nothing and binds no
+  address. Returning to desktop mode after a failed first
   installation is covered by the normal cleanup path of that installation,
   which removes the registration it created when the machine had none
   before; when a registration remains after the attempt, remove it with
@@ -952,7 +978,10 @@ replaces the other.
   starts the server of this app, never starts the service and never changes the
   registration, so a stopped service stays stopped. **Open HFDesk** opens the
   registered address, **Start service** starts the
-  registered service, and **Cancel** changes nothing. **Update service**
+  registered service, **Cancel** changes nothing, and **Work as tray
+  companion** continues the launch as the tray companion below: a tray icon
+  and a window with no server of their own, so the registered service keeps
+  the address alone. **Update service**
   re-registers the service from the folder of the new desktop program and keeps
   its settings and its running state: a running service keeps running on the new
   program, and a stopped service stays stopped. A registration that is broken or
@@ -961,14 +990,34 @@ replaces the other.
   service`, or `hfdesk service start`). A broken registration whose instance
   still runs is the exception: the update keeps that instance running on the new
   program, and the report names the address it serves.
+- **The tray companion.** Every settled registration offers **Work as tray
+  companion** in the launch dialog, and a successful installation restarts
+  the host as exactly that companion. A companion runs without a server of
+  its own — it binds no address, so the companion and the service can never
+  serve one address — and because it serves nothing it can run the service
+  actions itself, including starting the service. Its tray menu is the
+  service group above: the status line, **Open HFDesk** (the web UI of the
+  registered address, enabled while the service serves it), the install item
+  beside a proven absence or the lifecycle items beside a proven
+  registration, **Runtime / Logs**, and — after a separator — **Exit**, which
+  closes only the companion and leaves the service running. Its Runtime /
+  Logs window renders fresh on every show: the state of the service, a link
+  to the web UI the registration names, the tail of the service's own log
+  file (from the registered log directory, see
+  [Where the state lives](#where-the-state-lives)) with the one action that
+  opens the whole file in the default editor, and the log file of this
+  launch.
 - **The dialog** is a Windows task dialog, which needs the common controls
   version 6 that the embedded application manifest declares. A locally built
   binary without that resource still works: it falls back to message boxes that
   map Yes, No and Cancel onto the actions in their text. The stopped service
-  needs two boxes for its four actions — the first picks the desktop mode, a
+  needs two boxes for its four answers — the first picks the desktop mode, a
   service action or no action, and a stray Enter selects the desktop mode, the
   answer that changes nothing on the machine — while every other state keeps
-  its single box.
+  its single box. **Honest limitation (decided 23.11.2026):** that simplified
+  three-answer fallback offers no tray-companion choice — Windows gives a
+  message box no fourth button — so **Work as tray companion** appears only
+  in the full task dialog.
 
 ### The identity of a machine-wide instance
 
@@ -1063,7 +1112,9 @@ The **command line** never elevates: `hfdesk service …` invokes no `sudo`, `su
 fails with a permission error instead of escalating on its own.
 
 The **Windows desktop host** is the exception, and only on an explicit choice of
-the user: **Install service…** in its tray or in the Runtime / Logs window, and
+the user: **Install service…** in its tray or in the Runtime / Logs window, the
+**Start service**, **Stop service**, **Update service** and **Delete service**
+items of the tray (of the desktop host and of the tray companion alike), and
 **Update service** or **Start service** in its startup dialog, ask Windows for
 administrator rights through the standard prompt before an elevated helper
 performs the action (see
