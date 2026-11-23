@@ -935,6 +935,128 @@ func TestServiceInstallStartFailureTextSplitsTheStartOutcomeClasses(t *testing.T
 	}
 }
 
+// TestInstallStartFailureCauseLineCarriesTheObservationNotTheWrapper pins
+// the REAL cause chain a failed first start builds and its distillation in
+// the report: the readiness wait returns a wrapper that names the program
+// and the budget again ("the instance does not run … within 45s: …") and the
+// cause wraps that once more. Under a headline that already speaks the class
+// — and for not-ready the budget — that echo must not survive: the report's
+// cause line carries the clean observation facts the wait recorded
+// (InstallStartError.Observation), as one line and without the wrapper.
+//
+// Each class carries the fact style its wait really observed: the state word
+// for not-ready, the state word with the exit code for ended, the
+// unreadable-state reason when no state could ever be read (unverified). A
+// record whose Outcome classifies nothing keeps the same distillation, so
+// the budget never appears under a legacy headline either.
+func TestInstallStartFailureCauseLineCarriesTheObservationNotTheWrapper(t *testing.T) {
+	program := `C:\portable\hfdesk.exe`
+	reason := "the registration was kept"
+	wrapped := func(budget, observation string) error {
+		return fmt.Errorf("service: the first installation did not put the new executable into service: %w",
+			fmt.Errorf("the instance does not run %q within %s: %s", program, budget, observation))
+	}
+	// The cause paragraph is EXACTLY the observation (plus the cleanup
+	// reason on the same line); the wrapper and its budget echo never
+	// reach the report, and the class headline occurs once.
+	assertCleanCauseLine := func(t *testing.T, text, headline, observation string) {
+		t.Helper()
+		want := headline + "\n\n" + observation + " — " + reason + "\n\n"
+		if !strings.HasPrefix(text, want) {
+			t.Errorf("the report is not headline + the clean cause line:\n%s", text)
+		}
+		causeLine := strings.Split(text, "\n\n")[1]
+		if strings.Contains(causeLine, "within") || strings.Contains(causeLine, "does not run") {
+			t.Errorf("the cause line %q carries the service wrapper or its budget echo", causeLine)
+		}
+		if got := strings.Count(text, headline); got != 1 {
+			t.Errorf("the class headline appears %d times, want exactly once:\n%s", got, text)
+		}
+	}
+
+	// Not-ready: the budget is spoken exactly once — in the headline.
+	notReadyObservation := `the service control manager reports the state "start-pending"`
+	notReady := &service.InstallStartError{
+		Cause:        wrapped("45s", notReadyObservation),
+		Observation:  notReadyObservation,
+		Outcome:      service.StartOutcomeNotReady,
+		Budget:       45 * time.Second,
+		CleanupError: errors.New(reason),
+	}
+	text := serviceInstallStartFailureText(notReady, program, notReady)
+	assertCleanCauseLine(t, text,
+		"HFDesk registered the service, but the service did not come up within 45s.", notReadyObservation)
+	if got := strings.Count(text, "45s"); got != 1 {
+		t.Errorf("the budget appears %d times, want exactly once — in the headline:\n%s", got, text)
+	}
+	if strings.Contains(text, "the instance does not run") {
+		t.Errorf("the report carries the service wrapper of the wait:\n%s", text)
+	}
+
+	// Ended: the observation carries the state word and the exit code,
+	// and no budget appears in the report at all.
+	endedObservation := `the service control manager reports the state "stopped" with the exit code 1`
+	ended := &service.InstallStartError{
+		Cause:        wrapped("2m0s", endedObservation),
+		Observation:  endedObservation,
+		Outcome:      service.StartOutcomeEnded,
+		CleanupError: errors.New(reason),
+	}
+	text = serviceInstallStartFailureText(ended, program, ended)
+	assertCleanCauseLine(t, text,
+		"HFDesk registered the service, but the service program ended before it was ready.", endedObservation)
+	for _, banned := range []string{"within", "2m0s", "does not run"} {
+		if strings.Contains(text, banned) {
+			t.Errorf("the ended report carries %q although no budget belongs to it:\n%s", banned, text)
+		}
+	}
+
+	// Unverified: no state could ever be read — that reason is the fact,
+	// and the budget of the wrapper stays out of the report.
+	unverifiedObservation := `the state of HFDesk cannot be read: access is denied`
+	unverified := &service.InstallStartError{
+		Cause:        wrapped("2m0s", unverifiedObservation),
+		Observation:  unverifiedObservation,
+		Outcome:      service.StartOutcomeUnverified,
+		CleanupError: errors.New(reason),
+	}
+	text = serviceInstallStartFailureText(unverified, program, unverified)
+	assertCleanCauseLine(t, text,
+		"HFDesk registered the service, but the started service could not be verified.", unverifiedObservation)
+	for _, banned := range []string{"within", "2m0s", "does not run"} {
+		if strings.Contains(text, banned) {
+			t.Errorf("the unverified report carries %q although no budget belongs to it:\n%s", banned, text)
+		}
+	}
+
+	// A record that classifies nothing keeps the distillation: the legacy
+	// headline never inherits a budget from the cause either.
+	legacy := &service.InstallStartError{
+		Cause:        wrapped("2m0s", endedObservation),
+		Observation:  endedObservation,
+		CleanupError: errors.New(reason),
+	}
+	text = serviceInstallStartFailureText(legacy, program, legacy)
+	assertCleanCauseLine(t, text,
+		"HFDesk registered the service, but its start did not finish.", endedObservation)
+	for _, banned := range []string{"within", "2m0s", "does not run"} {
+		if strings.Contains(text, banned) {
+			t.Errorf("the legacy report carries %q although it names no budget:\n%s", banned, text)
+		}
+	}
+
+	// Without the recorded observation the cause chain stays exactly what
+	// it was — the distillation never invents facts of its own.
+	noObservation := &service.InstallStartError{
+		Cause:        errors.New("the first installation did not put the new executable into service"),
+		Outcome:      service.StartOutcomeEnded,
+		CleanupError: errors.New(reason),
+	}
+	if detail := installStartDetail(noObservation, noObservation); detail != "the first installation did not put the new executable into service — "+reason {
+		t.Errorf("the cause line without an observation = %q, want the untouched cause chain", detail)
+	}
+}
+
 // TestServiceInstallStartFailureTextDistinguishesRemovedFromNeverInstalled
 // proves that a registration this attempt removed after a failed start is
 // never worded like a machine that never had one: the removed report says

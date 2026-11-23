@@ -886,10 +886,13 @@ func serviceActionFailureBody(action serviceAction, err error, program string) s
 // The report keeps the compressed form decided on 2026-11-23: the headline
 // carries the class — and for the not-ready class the budget the failing
 // wait actually applied, the only place any budget is spoken — while the
-// ONE line below carries only the cause facts of the detail chain (the
-// state word, the exit code and the like). The class is never repeated
-// under its headline, so the class and the budget each occur exactly once.
-// The kept-registration branch states the uncertainty the cleanup actually
+// ONE line below carries only the cause facts: when the readiness wait
+// recorded its clean observation beside its deadline wrapper, that
+// observation is the line (InstallStartError.Observation), so the service
+// wrapper that would restate the program and the budget never reaches the
+// report; every other cause keeps its chain as the detail it always was.
+// The class is never repeated under its headline, so the class and the
+// budget each occur exactly once. The kept-registration branch states the
 // left — the registration may remain — and names the one action that
 // resolves it: the read of the state. The removed branch never shares its
 // wording with a machine that never had a registration: it says what this
@@ -951,19 +954,29 @@ func serviceInstallStartHeadline(cleanup *service.InstallStartError) string {
 // installStartDetail returns the cause of a failed first start and the one
 // line its cleanup observed as a reason — never the cleanup fact itself, and
 // always as ONE line: the cause of the error is one line of the report, never
-// two paragraphs the reader has to join. InstallStartError.Error states the
-// cleanup fact in its own words ("(the registration was kept…)"); the report
-// states the fact once, in its own outcome sentence, so the two formulations
-// can no longer appear beside each other. An error the cleanup struct does
-// not describe keeps its whole message as the detail it always was.
+// two paragraphs the reader has to join. When the readiness wait recorded its
+// clean observation beside its deadline wrapper (InstallStartError.
+// Observation), that observation IS the cause line: the state word, the exit
+// code, the probe's answer — without the wrapper, which would restate the
+// program and the budget the headline of this report already speaks.
+// InstallStartError.Error states the cleanup fact in its own words
+// ("(the registration was kept…)"); the report states the fact once, in its
+// own outcome sentence, so the two formulations can no longer appear beside
+// each other. An error the cleanup struct does not describe keeps its whole
+// message as the detail it always was.
 func installStartDetail(err error, cleanup *service.InstallStartError) string {
-	if cleanup == nil || cleanup.Cause == nil {
+	var detail string
+	switch {
+	case cleanup != nil && strings.TrimSpace(cleanup.Observation) != "":
+		detail = cleanup.Observation
+	case cleanup != nil && cleanup.Cause != nil:
+		detail = cleanup.Cause.Error()
+	default:
 		if err == nil {
 			return ""
 		}
 		return err.Error()
 	}
-	detail := cleanup.Cause.Error()
 	if cleanup.CleanupError != nil {
 		detail += " — " + cleanup.CleanupError.Error()
 	}

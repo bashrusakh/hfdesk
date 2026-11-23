@@ -517,8 +517,8 @@ func (m *scmManager) startFirstRegistration(ctx context.Context, target scmFirst
 		}
 		failure := fmt.Errorf("service: the first installation did not put the new executable into service: %w", err)
 		outcome, budget := classifyStartVerification(verification, err)
-		return false, Status{}, withStartOutcome(
-			m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, processID, failure), outcome, budget)
+		return false, Status{}, attachVerifyObservation(err, withStartOutcome(
+			m.cleanupFailedFirstRegistration(ctx, target, ownedConfig, processID, failure), outcome, budget))
 	}
 	if verification.imageCheck != scmImageVerified {
 		message := fmt.Sprintf("hfdesk: %s is running its registered program %s, but the process image could not be read from the installation shell", ServiceName, opts.Executable)
@@ -570,6 +570,22 @@ func withStartOutcome(err error, outcome StartOutcome, budget time.Duration) err
 		startErr.Budget = budget
 	}
 	return err
+}
+
+// attachVerifyObservation records the clean inner observation of the
+// readiness wait on the report record when the failure carries that wait's
+// deadline wrapper: the helper's report then states those facts — the state
+// word, the exit code, the probe's answer — instead of the wrapper, which
+// also names the program and the budget the headline of the report already
+// speaks. The cause itself keeps the wrapper, so the command line and every
+// other reader see the message they always saw.
+func attachVerifyObservation(source error, recorded error) error {
+	var startErr *InstallStartError
+	var timeout *verifyTimeoutError
+	if errors.As(recorded, &startErr) && errors.As(source, &timeout) {
+		startErr.Observation = timeout.observation
+	}
+	return recorded
 }
 
 // classifyStartVerification returns the class of a failed first-start
