@@ -122,10 +122,9 @@ func assertCompanionWiring(t *testing.T, captured *capturedTrayRun) {
 		}
 	}
 	// The decided composition carries no registered-service dialog item
-	// — no menu does anymore, so no host may wire its handler.
-	if captured.actions.service != nil {
-		t.Error("the companion wires the service-dialog action although no current menu carries an item for it")
-	}
+	// — no menu does anymore, so no host has a handler to wire; the field
+	// itself is gone from trayActions, which this map above already
+	// proves by name.
 }
 
 // TestCompanionFlagLaunchCreatesNoServerNoListenerAndNoClaim drives the
@@ -204,9 +203,9 @@ func TestGateCompanionChoiceContinuesAsCompanionWithoutAServer(t *testing.T) {
 }
 
 // TestRegisteredServiceDialogKeepsTheCompanionChoiceForTheGateOnly pins
-// the SURFACE split of the new choice: the registered-service dialog of a
-// running desktop (the Service... item and the install recheck reach it
-// through offerRegisteredServiceFromTray) never offers the companion —
+// the SURFACE split of the new choice: the registered-service dialog a
+// running desktop reaches through the install recheck
+// (offerRegisteredServiceFromTray) never offers the companion —
 // none of its answers switches the mode of this host — while the launch
 // gate always does.
 func TestRegisteredServiceDialogKeepsTheCompanionChoiceForTheGateOnly(t *testing.T) {
@@ -337,7 +336,9 @@ func TestCompleteInstallHandoverRelaunchesOnlyAfterSettledAuthorization(t *testi
 		// racing the assertions of this test.
 		shown := recordMessagesChannel(t)
 
-		completeInstallHandover(handover, func() error { return nil })
+		completeHandover(committedHandover{
+			handover: handover, action: serviceActionInstall, relaunch: handoverRelaunchCompanion,
+		}, func() error { return nil })
 
 		if spawns != 1 {
 			t.Errorf("the settled handover spawned the companion %d time(s), want exactly one", spawns)
@@ -364,10 +365,15 @@ func TestCompleteInstallHandoverRelaunchesOnlyAfterSettledAuthorization(t *testi
 		replaceSeam(t, &startCompanionRelaunch, func() {
 			t.Error("a handover that was not authorized relaunched the companion: the installation did not run")
 		})
+		replaceSeam(t, &startDesktopRelaunch, func() {
+			t.Error("a handover that was not authorized relaunched the host at all")
+		})
 		shown := recordMessagesChannel(t)
 
 		failure := errors.New("the persistence of the server did not complete")
-		completeInstallHandover(handover, func() error { return failure })
+		completeHandover(committedHandover{
+			handover: handover, action: serviceActionInstall, relaunch: handoverRelaunchCompanion,
+		}, func() error { return failure })
 
 		// The failure report of this very sequence is shown
 		// synchronously, so it has arrived by now: the established

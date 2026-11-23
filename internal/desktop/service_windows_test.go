@@ -1573,26 +1573,40 @@ func TestTrayServiceInstallReportsARefusedElevation(t *testing.T) {
 // that really reads the state: the earlier wording asked the user to read the
 // service state without naming a way to do it and hinted at an unnamed retry.
 // The report keeps its result, its cause, the error of the wait and exactly
-// one next action.
+// one next action — and it names THE ACTION that did not finish, so a start
+// handover is never reported as an unfinished installation.
 func TestServiceHandoverFailureReportNamesTheStateCommand(t *testing.T) {
-	messages := recordMessages(t)
+	for _, tc := range []struct {
+		action serviceAction
+		head   string
+	}{
+		{serviceActionInstall, "could not finish the service installation"},
+		{serviceActionStart, "could not finish the service start"},
+		{serviceActionUpdate, "could not finish the service update"},
+		{serviceActionUninstall, "could not finish the removal of the service registration"},
+	} {
+		t.Run(string(tc.action), func(t *testing.T) {
+			messages := recordMessages(t)
 
-	reason := errors.New("the completion signal was never confirmed")
-	reportServiceHandoverFailure(reason)
+			reason := errors.New("the completion signal was never confirmed")
+			reportServiceHandoverFailure(tc.action, reason)
 
-	if len(*messages) != 1 {
-		t.Fatalf("the handover failure showed %d message boxes, want one", len(*messages))
+			if len(*messages) != 1 {
+				t.Fatalf("the handover failure showed %d message boxes, want one", len(*messages))
+			}
+			if caption := serviceFailureCaption(tc.action); (*messages)[0].caption != caption {
+				t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
+			}
+			text := (*messages)[0].text
+			assertNames(t, text, "the report", []string{
+				tc.head,
+				reason.Error(),
+				`"hfdesk service status"`,
+			})
+			assertNamesWithout(t, text, "the report", nil,
+				[]string{"Read the current service state", "before trying again", "completion signal"})
+		})
 	}
-	if caption := serviceFailureCaption(serviceActionInstall); (*messages)[0].caption != caption {
-		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
-	}
-	text := (*messages)[0].text
-	assertNames(t, text, "the report", []string{
-		"could not finish the service installation",
-		reason.Error(),
-		`"hfdesk service status"`,
-	})
-	assertNamesWithout(t, text, "the report", nil, []string{"Read the current service state", "before trying again", "completion signal"})
 }
 
 func TestTrayServiceInstallReadinessFailureKeepsRetryAvailable(t *testing.T) {
@@ -2767,10 +2781,18 @@ func TestServiceHelperStartReportsTheAddress(t *testing.T) {
 // TestServiceHelperSingletonArgumentRules proves the helper accepts exactly
 // the command lines every action may carry — update and start with the
 // singleton alone, stop and removal bare or with the launching desktop's
-// claim path — and still refuses handover names without the process to wait
-// for, so no action gains a wait it did not have: a stop and a removal hold
-// no singleton and never receive one.
+// claim path, and the COMPLETE handover for exactly the actions that can
+// take one (install, update, start, removal) — while a stop still refuses
+// every wait and every singleton it never holds, and an incomplete handover
+// is refused for every action: a half of the protocol never authorizes the
+// shutdown of the desktop.
 func TestServiceHelperSingletonArgumentRules(t *testing.T) {
+	completeHandover := ServiceActionOptions{WaitPID: 4321,
+		ReadyEvent: "ready", SuccessEvent: "success", InstanceMutex: `Local\m`}
+	withAction := func(action string) ServiceActionOptions {
+		completeHandover.Action = action
+		return completeHandover
+	}
 	for _, tc := range []struct {
 		name   string
 		action serviceAction
@@ -2793,6 +2815,14 @@ func TestServiceHelperSingletonArgumentRules(t *testing.T) {
 		{"uninstall carries the launching desktop's claim path", serviceActionUninstall,
 			ServiceActionOptions{Action: "uninstall",
 				DesktopState: `C:\portable\hfdesk\desktop-state.json`}},
+		// The three lifecycle actions a desktop host that serves its own
+		// local server hands over take the COMPLETE handover exactly
+		// like the installation does: that is the protocol the host
+		// commits its shutdown to.
+		{"install takes the complete handover", serviceActionInstall, withAction("install")},
+		{"update takes the complete handover", serviceActionUpdate, withAction("update")},
+		{"start takes the complete handover", serviceActionStart, withAction("start")},
+		{"uninstall takes the complete handover", serviceActionUninstall, withAction("uninstall")},
 	} {
 		if err := validateServiceHandoverOptions(tc.action, tc.o); err != nil {
 			t.Errorf("%s was rejected: %v", tc.name, err)
@@ -2819,13 +2849,19 @@ func TestServiceHelperSingletonArgumentRules(t *testing.T) {
 			ServiceActionOptions{Action: "start", InstanceMutex: `Local\m`,
 				DesktopState: `desktop-state.json`}},
 		// A stop and a removal hold no singleton, so a command line that
-		// hands them one is refused instead of silently ignoring it —
-		// and they gain no handover wait either.
+		// hands them one is refused instead of silently ignoring it.
 		{"stop with a singleton it never holds", serviceActionStop,
 			ServiceActionOptions{Action: "stop", InstanceMutex: `Local\m`}},
-		{"uninstall with an install handover", serviceActionUninstall,
-			ServiceActionOptions{Action: "uninstall", WaitPID: 4321,
-				ReadyEvent: "ready", SuccessEvent: "success", InstanceMutex: `Local\m`}},
+		// The stop is the one action that never hands over — it binds no
+		// address — so even the complete set is refused for it.
+		{"stop with a complete handover", serviceActionStop, withAction("stop")},
+		// An incomplete set is refused for every action, the
+		// handover-capable lifecycle actions included.
+		{"uninstall with a wait but no event names", serviceActionUninstall,
+			ServiceActionOptions{Action: "uninstall", WaitPID: 4321}},
+		{"start with event names but no process", serviceActionStart,
+			ServiceActionOptions{Action: "start", ReadyEvent: "ready", SuccessEvent: "success",
+				InstanceMutex: `Local\m`}},
 	} {
 		if err := validateServiceHandoverOptions(tc.action, tc.o); err == nil {
 			t.Errorf("%s was accepted, want the refusal of incomplete handover arguments", tc.name)
@@ -4045,22 +4081,35 @@ func exitedProcessPID(t *testing.T) int {
 	return cmd.Process.Pid
 }
 
-// TestTrayServiceInstallDoesNotAskForElevationTheGuardWouldRefuse proves
-// the invariant of the tray offering (finding 19): no answer asks for
-// elevation for a mutation that is already decided against. The dialog
-// keeps the gate's vocabulary; a start beside this serving desktop and an
-// update that is not a pure rewrite of a positively confirmed stopped
-// registration are reported here with the helper's own refusal — result,
-// cause and the one action that ends it — and no user account control
-// prompt is spent on them. The guard of the helper stays authoritative: it
-// decides again when an answer that passed this check reaches the
-// elevation.
+// TestTrayServiceAnswersHandOverOnlyWhenThisDesktopServes proves the
+// decision the tray offering takes with the guard of the helper: an answer
+// that would mutate the registration beside THIS desktop serving its own
+// local server never spends an elevation on a refusal and never performs
+// beside that desktop either — it hands the host over, so the elevated
+// helper acts after this host is gone — while the very same answer beside a
+// desktop whose claim proves nothing reaches the established direct launch,
+// exactly as before.
 //
 // Perturbation: the published claim of this desktop. With a live claim the
-// guard refuses before the elevation; without one it has no second fact
-// and the launch reaches the helper, which reports the outcome itself.
-func TestTrayServiceInstallDoesNotAskForElevationTheGuardWouldRefuse(t *testing.T) {
-	fixture := func(t *testing.T, state service.Status, choice serviceChoice, claim bool) (*[]shownMessage, *[]elevatedLaunch) {
+// handover runs (confirmation, ready helper, commit, quit, no direct
+// elevation); without one the direct launch runs (no confirmation, no
+// commit, no quit) — and a positively confirmed stopped registration takes
+// that direct route even WITH the live claim, because its update starts
+// nothing and never had a refusal to replace. The removal is driven through
+// the lifecycle item,
+// because the registered-service dialog offers no removal — and it commits
+// the DESKTOP relaunch, the end state that returns this host to desktop mode
+// once the registration is gone.
+func TestTrayServiceAnswersHandOverOnlyWhenThisDesktopServes(t *testing.T) {
+	type outcome struct {
+		messages      *[]shownMessage
+		direct        *[]elevatedLaunch
+		handovers     *[]elevatedLaunch
+		confirmations *[]string
+		commits       *[]committedHandover
+		quits         *int
+	}
+	fixture := func(t *testing.T, state service.Status, choice serviceChoice, claim bool) outcome {
 		t.Helper()
 		useTemporaryStateDir(t)
 		freshServiceInstallGuard(t)
@@ -4075,17 +4124,39 @@ func TestTrayServiceInstallDoesNotAskForElevationTheGuardWouldRefuse(t *testing.
 			return `C:\portable\hfdesk.exe`, nil
 		})
 		replaceSeam(t, &showServiceChoice, func(serviceChoicePrompt) serviceChoice { return choice })
-		var launches []elevatedLaunch
+		out := outcome{
+			messages:      recordMessages(t),
+			direct:        &[]elevatedLaunch{},
+			handovers:     &[]elevatedLaunch{},
+			confirmations: &[]string{},
+			commits:       &[]committedHandover{},
+			quits:         new(int),
+		}
 		replaceSeam(t, &launchElevated, func(l elevatedLaunch) (uint32, error) {
-			launches = append(launches, l)
+			*out.direct = append(*out.direct, l)
 			return 4242, nil
 		})
+		replaceSeam(t, &launchElevatedProcess, func(l elevatedLaunch) (*elevatedProcess, error) {
+			*out.handovers = append(*out.handovers, l)
+			return readyTestProcess(t, l), nil
+		})
+		replaceSeam(t, &confirmServiceAction, func(caption, text string) bool {
+			*out.confirmations = append(*out.confirmations, caption+"|"+text)
+			return true
+		})
+		replaceSeam(t, &serviceHandoverCommit,
+			func(handover *desktopHandover, action serviceAction, relaunch handoverRelaunch) bool {
+				*out.commits = append(*out.commits,
+					committedHandover{handover: handover, action: action, relaunch: relaunch})
+				return true
+			})
+		replaceSeam(t, &serviceHandoverQuit, func() { *out.quits++ })
 		if claim {
 			if err := service.PublishState(service.PublishedStatePath(), "http://127.0.0.1:18080"); err != nil {
 				t.Fatalf("publish the claim of this desktop: %v", err)
 			}
 		}
-		return recordMessages(t), &launches
+		return out
 	}
 	// holdSessionSingleton gives the probe beside the guard the holder
 	// fact: this desktop holds its own singleton, exactly as the helper's
@@ -4096,77 +4167,150 @@ func TestTrayServiceInstallDoesNotAskForElevationTheGuardWouldRefuse(t *testing.
 		assertNoError(t, err, "hold the desktop singleton %q: %v", name, err)
 		return release
 	}
-
-	t.Run("a start beside this serving desktop is reported without elevation", func(t *testing.T) {
-		messages, launches := fixture(t,
-			runningServiceStatus(service.StateStopped, "127.0.0.1:18080"), serviceChoiceStart, true)
-		name := `Local\HFDesk.Test.TrayNoUac.Start`
+	// runAnswer drives the registered-service dialog answer of the install
+	// recheck — the surface beside the running desktop — for one choice.
+	runAnswer := func(t *testing.T, out outcome, name string) {
+		t.Helper()
 		release := holdSessionSingleton(t, name)
-
+		defer release()
 		if handover := installServiceFromTray(name); handover != nil {
 			handover.close()
 			t.Fatal("the tray handed a registered service over to the installation helper")
 		}
-		release()
+	}
+	// assertHandover pins the whole handover of one action: the ready
+	// helper with its complete protocol, the confirmation that stated the
+	// closing window before it, the commit of exactly that action and the
+	// quit of this host — and no direct elevation beside it.
+	assertHandover := func(t *testing.T, out outcome, action serviceAction, confirmCaption, fact string) {
+		t.Helper()
+		if len(*out.direct) != 0 {
+			t.Errorf("the tray launched %d direct helpers, want none: the elevation would run beside the desktop that serves", len(*out.direct))
+		}
+		if len(*out.handovers) != 1 {
+			t.Fatalf("the tray started %d handovers, want exactly one: %v", len(*out.handovers), *out.handovers)
+		}
+		launch := (*out.handovers)[0]
+		if launch.Action != action || launch.WaitPID <= 0 ||
+			launch.ReadyEvent == "" || launch.SuccessEvent == "" || launch.InstanceMutex == "" {
+			t.Errorf("the handover = %+v, want action %q with the complete ready/success/mutex protocol", launch, action)
+		}
+		if len(*out.confirmations) != 1 {
+			t.Fatalf("the handover asked %d confirmations, want exactly one: %v",
+				len(*out.confirmations), *out.confirmations)
+		}
+		caption, text, _ := strings.Cut((*out.confirmations)[0], "|")
+		if caption != confirmCaption {
+			t.Errorf("the confirmation is captioned %q, want %q", caption, confirmCaption)
+		}
+		assertNames(t, text, "the confirmation", []string{"administrator rights", fact})
+		if len(*out.commits) != 1 {
+			t.Fatalf("the handover committed %d times, want exactly one", len(*out.commits))
+		}
+		plan := (*out.commits)[0]
+		if plan.action != action {
+			t.Errorf("the commit carries action %q, want %q", plan.action, action)
+		}
+		if *out.quits != 1 {
+			t.Errorf("the handover quit this host %d time(s), want exactly once", *out.quits)
+		}
+		if len(*out.messages) != 0 {
+			t.Errorf("the handover showed %v, want the helper to report the outcome", *out.messages)
+		}
+	}
 
-		if len(*launches) != 0 {
-			t.Errorf("the tray launched %d helpers, want none: the elevation would only buy this refusal", len(*launches))
+	t.Run("a start beside this serving desktop hands over", func(t *testing.T) {
+		out := fixture(t, runningServiceStatus(service.StateStopped, "127.0.0.1:18080"),
+			serviceChoiceStart, true)
+		runAnswer(t, out, `Local\HFDesk.Test.TrayNoUac.Start`)
+		assertHandover(t, out, serviceActionStart, startServiceConfirmCaption,
+			"closes into the tray")
+		if (*out.commits)[0].relaunch != handoverRelaunchCompanion {
+			t.Errorf("the start committed relaunch %d, want the tray companion", (*out.commits)[0].relaunch)
 		}
-		if len(*messages) != 1 {
-			t.Fatalf("the tray showed %d message boxes, want the refusal alone: %v", len(*messages), *messages)
-		}
-		if (*messages)[0].caption != serviceFailureCaption(serviceActionStart) {
-			t.Errorf("the caption is %q, want %q", (*messages)[0].caption, serviceFailureCaption(serviceActionStart))
-		}
-		assertNames(t, (*messages)[0].text, "the report", []string{
-			"No service action was performed", "serves its local server", "notification-area icon",
-		})
 	})
 
-	t.Run("the same start reaches the helper when no claim says this desktop serves", func(t *testing.T) {
-		messages, launches := fixture(t,
-			runningServiceStatus(service.StateStopped, "127.0.0.1:18080"), serviceChoiceStart, false)
-		name := `Local\HFDesk.Test.TrayNoUac.StartNoClaim`
-		release := holdSessionSingleton(t, name)
-
-		if handover := installServiceFromTray(name); handover != nil {
-			handover.close()
-			t.Fatal("the tray handed a registered service over to the installation helper")
-		}
-		release()
-
-		if len(*launches) != 1 || (*launches)[0].Action != serviceActionStart {
-			t.Fatalf("the tray launched %v, want the one start the guard allowed", *launches)
-		}
-		if len(*messages) != 0 {
-			t.Errorf("the tray showed %v, want the helper to report the outcome", *messages)
+	t.Run("an update beside this serving desktop hands over", func(t *testing.T) {
+		out := fixture(t, runningServiceStatus(service.StateRunning, "127.0.0.1:18080"),
+			serviceChoiceUpdate, true)
+		runAnswer(t, out, `Local\HFDesk.Test.TrayNoUac.Update`)
+		assertHandover(t, out, serviceActionUpdate, updateServiceConfirmCaption,
+			"closes into the tray")
+		if (*out.commits)[0].relaunch != handoverRelaunchCompanion {
+			t.Errorf("the update committed relaunch %d, want the tray companion", (*out.commits)[0].relaunch)
 		}
 	})
 
-	t.Run("an update that is not a pure rewrite is reported without elevation", func(t *testing.T) {
-		messages, launches := fixture(t,
-			runningServiceStatus(service.StateRunning, "127.0.0.1:18080"), serviceChoiceUpdate, true)
-		name := `Local\HFDesk.Test.TrayNoUac.Update`
+	// The established exception, restored: an update over a POSITIVELY
+	// confirmed stopped registration starts nothing, so there was never a
+	// refusal for the handover to replace. It stays the pure rewrite it
+	// always was beside this serving desktop — the helper launched
+	// directly, no confirmation, no commit, no quit, and this window keeps
+	// running with its server.
+	t.Run("an update of a positively confirmed stopped registration stays a pure rewrite", func(t *testing.T) {
+		out := fixture(t, runningServiceStatus(service.StateStopped, "127.0.0.1:18080"),
+			serviceChoiceUpdate, true)
+		runAnswer(t, out, `Local\HFDesk.Test.TrayNoUac.UpdateStopped`)
+
+		if len(*out.direct) != 1 || (*out.direct)[0].Action != serviceActionUpdate {
+			t.Fatalf("the tray launched %v, want the one direct update the pure rewrite takes", *out.direct)
+		}
+		if len(*out.handovers) != 0 {
+			t.Errorf("the pure rewrite started %d handovers, want none: this window must keep running",
+				len(*out.handovers))
+		}
+		if len(*out.confirmations) != 0 {
+			t.Errorf("the pure rewrite asked %d confirmations, want none: there is no closing window to state",
+				len(*out.confirmations))
+		}
+		if len(*out.commits) != 0 || *out.quits != 0 {
+			t.Errorf("the pure rewrite committed %d times and quit %d times, want neither",
+				len(*out.commits), *out.quits)
+		}
+		if len(*out.messages) != 0 {
+			t.Errorf("the tray showed %v, want the helper to report the outcome", *out.messages)
+		}
+	})
+
+	t.Run("a removal beside this serving desktop hands over into desktop mode", func(t *testing.T) {
+		out := fixture(t, runningServiceStatus(service.StateStopped, "127.0.0.1:18080"),
+			serviceChoiceCancel, true)
+		name := `Local\HFDesk.Test.TrayNoUac.Delete`
 		release := holdSessionSingleton(t, name)
+		defer release()
 
-		if handover := installServiceFromTray(name); handover != nil {
-			handover.close()
-			t.Fatal("the tray handed a registered service over to the installation helper")
-		}
-		release()
+		performServiceActionFromTray(serviceActionUninstall, name)
 
-		if len(*launches) != 0 {
-			t.Errorf("the tray launched %d helpers, want none: a restart beside this desktop is refused", len(*launches))
+		assertHandover(t, out, serviceActionUninstall, removeServiceConfirmCaption,
+			"starts again in desktop mode once the registration is gone")
+		if (*out.commits)[0].relaunch != handoverRelaunchDesktop {
+			t.Errorf("the removal committed relaunch %d, want the desktop relaunch: the address is free again",
+				(*out.commits)[0].relaunch)
 		}
-		if len(*messages) != 1 {
-			t.Fatalf("the tray showed %d message boxes, want the refusal alone: %v", len(*messages), *messages)
+	})
+
+	t.Run("the same start reaches the helper directly when no claim says this desktop serves", func(t *testing.T) {
+		out := fixture(t, runningServiceStatus(service.StateStopped, "127.0.0.1:18080"),
+			serviceChoiceStart, false)
+		runAnswer(t, out, `Local\HFDesk.Test.TrayNoUac.StartNoClaim`)
+
+		if len(*out.direct) != 1 || (*out.direct)[0].Action != serviceActionStart {
+			t.Fatalf("the tray launched %v, want the one start the guard allowed", *out.direct)
 		}
-		if (*messages)[0].caption != serviceFailureCaption(serviceActionUpdate) {
-			t.Errorf("the caption is %q, want %q", (*messages)[0].caption, serviceFailureCaption(serviceActionUpdate))
+		if len(*out.handovers) != 0 {
+			t.Errorf("the tray started %d handovers beside a desktop that serves nothing, want none", len(*out.handovers))
 		}
-		assertNames(t, (*messages)[0].text, "the report", []string{
-			"No service action was performed", "serves its local server", "notification-area icon",
-		})
+		if len(*out.confirmations) != 0 {
+			t.Errorf("the direct start asked %d confirmations: start and update stay confirmation-free there",
+				len(*out.confirmations))
+		}
+		if len(*out.commits) != 0 || *out.quits != 0 {
+			t.Errorf("the direct start committed %d times and quit %d times, want neither",
+				len(*out.commits), *out.quits)
+		}
+		if len(*out.messages) != 0 {
+			t.Errorf("the tray showed %v, want the helper to report the outcome", *out.messages)
+		}
 	})
 }
 

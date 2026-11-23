@@ -569,7 +569,8 @@ func installServiceFromTray(instanceMutex string) *desktopHandover {
 		return nil
 	}
 
-	handover, err := launchServiceHandover(serviceActionInstall, os.Getpid(), instanceMutex)
+	handover, err := launchServiceHandover(serviceActionInstall, os.Getpid(), instanceMutex,
+		handoverRelaunchCompanion)
 	if err != nil {
 		reportServiceLaunchFailure(serviceActionInstall, err)
 		return nil
@@ -586,30 +587,28 @@ func installServiceFromTray(instanceMutex string) *desktopHandover {
 //
 // The dialog is the gate's dialog: the question and its buttons are the ones
 // every launch with a registration sees, so the vocabulary cannot drift
-// apart. No answer starts a handover — this host keeps running: the desktop
+// apart. No answer starts a handover of its own — this host keeps running
+// for the answers that change nothing: the desktop
 // mode and Cancel change nothing, the browser action opens the URL of the
-// registration, and the start and the update go to the elevated helper the
-// way the gate launches them, where the helper's own guards stay
+// registration, and the start and the update decide below exactly like the
+// lifecycle items of the menu do, where the helper's own guards stay
 // authoritative.
 //
-// The invariant at this surface is that no answer asks for elevation for a
-// mutation that is already decided against: a start beside this serving
-// desktop, and an update that is not a pure rewrite of a positively
-// confirmed stopped registration, are refused HERE with the helper's own
-// report — result, cause and the one action that ends it — instead of
-// costing the user a user account control prompt for that same refusal.
-// The decision reuses the guard of the helper itself (the singleton probe
-// beside the live published claim), so the two surfaces — this dialog and
-// the lifecycle items of the menu, which run the very same functions — can
-// never disagree about which mutations the serving desktop allows; the
-// helper decides again, authoritatively, when the elevation actually
-// happens.
+// The invariant at this surface is that a mutation beside a desktop of this
+// session that serves its own address never reaches a doomed elevation: the
+// start and the update hand the host over instead, so the helper acts after
+// this desktop is gone — the very decision the lifecycle items take, through
+// the same two functions, so the two surfaces can never disagree about which
+// mutations the serving desktop allows. Where no handover can be established
+// at all, the honest refusal of the serving desktop ends the answer instead
+// of the elevation (serviceActionHandover).
 //
 // The second result reports whether a helper was launched for the answer:
 // such a helper inherits the single service-action guard its caller holds
 // and releases it when it ends, so the caller must not release the guard
-// itself. false means nothing was launched and the caller keeps the
-// ownership of the guard.
+// itself — unless the answer committed a handover, in which case this host
+// quits on it and the guard stays until it does. false means nothing was
+// launched and the caller keeps the ownership of the guard.
 func offerRegisteredServiceFromTray(status service.Status, instanceMutex string) bool {
 	desktopLog.Info("the Windows service is registered already: the tray offers the actions of an existing service instead of an installation",
 		"state", string(status.State),
@@ -651,20 +650,34 @@ func offerRegisteredServiceFromTray(status service.Status, instanceMutex string)
 // registered-service dialog and the start item of the menu run this very
 // function, so the two surfaces can never disagree.
 //
-// This host runs the address a started service would take, so the guard of
-// the helper refuses every start beside it: the answer is reported here
-// instead of being sent through elevation to its own refusal. The guard
-// decides again, authoritatively, when a start that passed this check
-// reaches the elevation.
+// A desktop of this session that already serves the address hands the start
+// over instead of being asked elevation for a refusal the helper would only
+// repeat: the confirmation states that this window closes into the tray, the
+// host then leaves desktop mode, the helper starts the service beside a host
+// that is gone, and the host comes back as a tray companion. The start keeps
+// its confirmation-free behavior everywhere it does NOT hand over — the tray
+// companion beside a service it never competes with reaches the elevated
+// helper directly, where the guard of the helper decides again,
+// authoritatively.
 //
 // The result reports whether a helper was launched, with the same meaning
 // offerRegisteredServiceFromTray documents.
 func startRegisteredServiceFromSurface(instanceMutex string) bool {
-	if servingDesktopRefusesMutation(instanceMutex) {
+	if !servingDesktopRefusesMutation(instanceMutex) {
+		return launchTrayServiceAction(serviceActionStart, instanceMutex)
+	}
+	// The handover has to be establishable before the user is asked to
+	// confirm a window that would close: a surface without a host to hand
+	// over to refuses right here instead of asking first.
+	if !serviceActionCanHandOver() {
 		reportServingDesktopRefusal(serviceActionStart)
 		return false
 	}
-	return launchTrayServiceAction(serviceActionStart, instanceMutex)
+	if !confirmServiceAction(startServiceConfirmCaption, startServiceConfirmText()) {
+		desktopLog.Info("the service start was not confirmed")
+		return false
+	}
+	return serviceActionHandover(serviceActionStart, instanceMutex)
 }
 
 // updateRegisteredServiceFromSurface performs the update of a registered
@@ -672,60 +685,47 @@ func startRegisteredServiceFromSurface(instanceMutex string) bool {
 // registered-service dialog and the update item of the menu run this very
 // function, so the two surfaces can never disagree.
 //
-// Only the update of a positively confirmed stopped registration (the same
-// standard the gate's dialog and the helper use) is a pure rewrite that can
-// succeed beside this desktop; every other state restarts the instance and
-// is refused beside the desktop that serves the address. Both answers are
-// decided with the guard of the helper, so a doomed update never reaches
-// the elevation. The result carries the same meaning
+// The update re-points the registration at the console program of THIS
+// folder, and only the states that would move the service decide on the
+// guard beside this desktop — the very standard the helper applies to the
+// same question. An update over a POSITIVELY confirmed stopped registration
+// starts nothing: it is a pure rewrite that succeeds beside this desktop
+// exactly as it always did, so it reaches the elevated helper directly, with
+// no confirmation and without closing this window — no refusal ever existed
+// for it to replace. Every other state beside a desktop that serves the
+// address hands over instead: the console program is settled first — like
+// every other update entry, and always before anything asks the user — then
+// the confirmation states that this window closes into the tray, and only
+// then does the host leave desktop mode. Everywhere else the update reaches
+// the elevated helper directly, where the guard of the helper decides again.
+//
+// The result reports whether a helper was launched, with the same meaning
 // offerRegisteredServiceFromTray documents.
 func updateRegisteredServiceFromSurface(status service.Status, instanceMutex string) bool {
 	positivelyStopped := status.State == service.StateStopped && !serviceStatusRunning(status)
-	if !positivelyStopped {
-		if servingDesktopRefusesMutation(instanceMutex) {
-			reportServingDesktopRefusal(serviceActionUpdate)
-			return false
-		}
+	if positivelyStopped {
+		return launchTrayServiceAction(serviceActionUpdate, instanceMutex)
 	}
-	return launchTrayServiceAction(serviceActionUpdate, instanceMutex)
-}
-
-// openRegisteredServiceFromTray offers the choice of an existing
-// registration to the Service... item of the tray.
-//
-// The item exists only for a registration the menu read, but the machine
-// can change between that read and the click, so the state is read again
-// before the dialog is built — with the settle wait of the gate, because
-// the dialog decides on the state just like the gate's dialog does. The
-// dialog itself is reached through offerRegisteredServiceFromTray, the very
-// function the install item reaches when its own recheck finds a
-// registration, so the two items can never ask different questions or act
-// on different readings. A state that reads as no registration changes
-// nothing: the menu line catches up with its next refresh instead of
-// offering an installation the user did not ask for with this click.
-//
-// The item takes the single service-action guard for the whole dialog: a
-// click on any other service surface while the dialog is open is refused
-// with its own report instead of asking a second question beside the first
-// one. An answer that launches a helper inherits the guard through
-// offerRegisteredServiceFromTray's result and releases it when the helper
-// ends; every other answer releases it before this function returns.
-func openRegisteredServiceFromTray(instanceMutex string) {
-	if !beginServiceAction("Service... item") {
-		return
+	if !servingDesktopRefusesMutation(instanceMutex) {
+		return launchTrayServiceAction(serviceActionUpdate, instanceMutex)
 	}
-	handedToHelper := false
-	defer func() {
-		if !handedToHelper {
-			serviceActionRunning.Store(false)
-		}
-	}()
-
-	status, ok := readServiceStateForAction("Service... item")
-	if !ok {
-		return
+	if !serviceActionCanHandOver() {
+		reportServingDesktopRefusal(serviceActionUpdate)
+		return false
 	}
-	handedToHelper = offerRegisteredServiceFromTray(status, instanceMutex)
+	executable, err := desktopExecutable()
+	if err != nil {
+		reportServiceLaunchFailure(serviceActionUpdate, err)
+		return false
+	}
+	if _, ok := offerMissingConsoleProgram(serviceActionUpdate, executable); !ok {
+		return false
+	}
+	if !confirmServiceAction(updateServiceConfirmCaption, updateServiceConfirmText()) {
+		desktopLog.Info("the service update was not confirmed")
+		return false
+	}
+	return serviceActionHandover(serviceActionUpdate, instanceMutex)
 }
 
 // readServiceStateForAction reads the registration under the action policy
@@ -737,8 +737,9 @@ func openRegisteredServiceFromTray(instanceMutex string) {
 // registration that is gone changes nothing — the menu line catches up
 // with the refresh that follows the request instead of an action on a
 // machine this click no longer found. Every caller re-reads through this
-// one function, so the Service... dialog and the lifecycle items decide on
-// the same readings and report the same states.
+// one function, so the update item and the registered-service dialog of
+// the install recheck decide on the same readings and report the same
+// states.
 func readServiceStateForAction(surface string) (service.Status, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceStatusTimeout)
 	defer cancel()
@@ -789,19 +790,24 @@ func serviceActionSurface(action serviceAction) string {
 // The flow of every item is the established one: take the guard (a second
 // request during any of these steps is refused with its own report), ask the
 // confirmation the machine-wide change needs before the administrator prompt
-// follows (the stop and the removal; a start and an update keep the
-// confirmation-free behavior they have), decide the pre-elevation refusals
-// with the guard of the helper, then launch the elevated helper. The helper
+// follows (the stop and the removal always; the start and the update only
+// where they hand this host over, because there the confirmation states the
+// fact that this window closes), decide whether this desktop serves
+// the address, then act: a serving desktop hands the action over through the
+// established handover — this host leaves desktop mode and the elevated
+// helper acts beside a host that is already gone — and every other surface
+// launches the elevated helper directly. The helper
 // reports the outcome of the action itself, in a native message box.
 //
 // The guard covers the whole action: a launched helper inherits it through
 // the waiter and releases it when it ends, together with the menu refresh —
 // a helper without a process record through the bounded hold that stands in
-// for its exit (see launchTrayServiceAction) — and every other end path — a
-// declined confirmation, a refused mutation, a failed launch, an unknown
+// for its exit (see launchTrayServiceAction) — and a committed handover keeps
+// it until this host exits, exactly like the installation route. Every other
+// end path — a declined confirmation, a handover that could not be
+// established, a refused elevation, a failed launch, an unknown
 // state — releases it here and asks for the menu catch-up, so the status is
-// re-read after every request that acted, and after the helper ends for the
-// ones that launched it.
+// re-read after every request that acted.
 func performServiceActionFromTray(action serviceAction, instanceMutex string) {
 	if !beginServiceAction(serviceActionSurface(action)) {
 		return
@@ -810,7 +816,9 @@ func performServiceActionFromTray(action serviceAction, instanceMutex string) {
 	defer func() {
 		if launched {
 			// The helper inherited the guard; it releases the guard
-			// and asks for the menu catch-up when it ends.
+			// and asks for the menu catch-up when it ends — or this
+			// host exits on the handover it committed, exactly like
+			// an installation handover.
 			return
 		}
 		serviceActionRunning.Store(false)
@@ -824,25 +832,45 @@ func performServiceActionFromTray(action serviceAction, instanceMutex string) {
 			return
 		}
 	case serviceActionUninstall:
-		if !confirmServiceAction(removeServiceConfirmCaption, removeServiceConfirmText()) {
+		// One probe decides both the confirmation the user reads and the
+		// route the action takes, so the two can never disagree about
+		// whether this host leaves desktop mode: beside a desktop that
+		// serves the address the confirmation states that fact, and the
+		// removal then hands over and comes back in desktop mode.
+		handover := servingDesktopRefusesMutation(instanceMutex)
+		if handover && !serviceActionCanHandOver() {
+			// The refusal is the last resort of a handover that cannot
+			// be established, and it is read before the confirmation:
+			// this surface has no host to hand over to, so agreeing to
+			// a closing window would have nothing to close.
+			reportServingDesktopRefusal(serviceActionUninstall)
+			return
+		}
+		if !confirmServiceAction(removeServiceConfirmCaption, removeServiceConfirmText(handover)) {
 			desktopLog.Info("the removal of the service registration was not confirmed")
 			return
 		}
-	case serviceActionStart:
-		// The start answer of the registered-service dialog runs this
-		// very precheck: a start beside this serving desktop is refused
-		// here with the helper's own report instead of costing a user
-		// account control prompt for that same refusal.
-		if servingDesktopRefusesMutation(instanceMutex) {
-			reportServingDesktopRefusal(serviceActionStart)
+		if handover {
+			launched = serviceActionHandover(serviceActionUninstall, instanceMutex)
 			return
 		}
+	case serviceActionStart:
+		// The start beside this serving desktop does not reach a doomed
+		// elevation: the shared function below confirms the handover and
+		// performs it, and the refusal of the guard stays reachable only
+		// where no handover can be established at all
+		// (serviceActionHandover).
+		launched = startRegisteredServiceFromSurface(instanceMutex)
+		return
 	case serviceActionUpdate:
 		// The update decides beside the state, so it re-reads the
 		// registration under the action policy — the menu line may have
 		// been drawn seconds ago — and a state that cannot be decided on
 		// reaches the established notice instead of an elevation. The
-		// rest is the same function the dialog runs.
+		// state itself also decides the route: a positively confirmed
+		// stopped registration is the pure rewrite that never had a
+		// refusal to replace. The rest is the same function the dialog
+		// runs.
 		status, ok := readServiceStateForAction("Update service item")
 		if !ok {
 			return
@@ -1060,6 +1088,101 @@ func requestServiceMenuCatchUp() {
 	if serviceMenuRefresh != nil {
 		serviceMenuRefresh()
 	}
+}
+
+// serviceHandoverCommit and serviceHandoverQuit are the two endpoints a
+// lifecycle action needs from the host it runs on when its click found that
+// host serving its own local server: commit hands the ready handover to the
+// shutdown coordinator of THIS host, quit ends the host through the very path
+// the menu's Quit item takes.
+//
+// They are package level variables — like serviceMenuRefresh beside them —
+// because they belong to the host and not to one click: both hosts assign
+// them before any tray item exists, and every surface (the lifecycle items
+// and the registered-service dialog of the install recheck) reads the same
+// pair. A surface that finds them unset has no host to hand over to, so it
+// takes the honest refusal of the serving desktop instead of performing a
+// mutation beside it (serviceActionHandover).
+var (
+	serviceHandoverCommit func(*desktopHandover, serviceAction, handoverRelaunch) bool
+	serviceHandoverQuit   func()
+)
+
+// handoverRelaunchName is the record of which launch the host continues in
+// after a committed handover.
+func handoverRelaunchName(relaunch handoverRelaunch) string {
+	if relaunch == handoverRelaunchDesktop {
+		return "desktop"
+	}
+	return "tray companion"
+}
+
+// serviceActionCanHandOver reports whether this surface has the two host
+// endpoints a handover needs — the commit into the shutdown coordinator and
+// the quit of the host. Both hosts publish them before any tray item exists;
+// a surface without them has no host to hand over to, so it refuses instead
+// of asking a confirmation it could not act on (see serviceActionHandover,
+// where the same fact is the authoritative last resort).
+func serviceActionCanHandOver() bool {
+	return serviceHandoverCommit != nil && serviceHandoverQuit != nil
+}
+
+// serviceActionHandover runs one service action of a desktop host that serves
+// its own local server through the established handover — the very mechanism
+// the installation takes: the elevated helper opens its wait handles and
+// becomes ready, the host commits that handover to its own shutdown and quits,
+// and the helper then acts beside a host that is already gone.
+//
+// That is what makes the action really perform instead of being refused: the
+// refusal of the guard exists because a desktop of this session serves the
+// address while the mutation runs, and the handover ends exactly that window
+// — the host stops its server before the helper's first service step, so two
+// instances never compete for one address.
+//
+// The launch the host continues in follows the action: the start and the
+// update end beside the service, so the host comes back as a tray companion
+// that binds no address, while the removal frees the address again and its
+// child takes the desktop mode through its own service gate.
+//
+// The result reports whether a helper was launched AND its handover was
+// committed: true means this host quits on that handover, so the caller keeps
+// the single service-action guard with it (exactly like the installation
+// route). false means nothing runs — every path already reported its own
+// reason — and the caller keeps the guard and asks for the menu catch-up.
+//
+// The honest refusal of the serving desktop stays reachable here as the LAST
+// resort: a surface with no host endpoints to hand over to, and a shutdown
+// that already began when the commit arrived, are the two ways a handover
+// cannot be established at all, and performing the mutation beside the desktop
+// that serves the address is exactly what the guard refuses.
+func serviceActionHandover(action serviceAction, instanceMutex string) bool {
+	if !serviceActionCanHandOver() {
+		desktopLog.Error("this surface has no host to hand the service action over to",
+			"action", string(action))
+		reportServingDesktopRefusal(action)
+		return false
+	}
+	commit, quit := serviceHandoverCommit, serviceHandoverQuit
+	relaunch := handoverRelaunchCompanion
+	if action == serviceActionUninstall {
+		relaunch = handoverRelaunchDesktop
+	}
+	handover, err := launchServiceHandover(action, os.Getpid(), instanceMutex, relaunch)
+	if err != nil {
+		reportServiceLaunchFailure(action, err)
+		return false
+	}
+	if !commit(handover, action, relaunch) {
+		handover.close()
+		desktopLog.Info("the service action handover was not committed because desktop shutdown already started",
+			"action", string(action))
+		reportServingDesktopRefusal(action)
+		return false
+	}
+	desktopLog.Info("the service action handover was committed: the desktop shuts down so the elevated helper can act",
+		"action", string(action), "relaunch", handoverRelaunchName(relaunch))
+	quit()
+	return true
 }
 
 // servingDesktopRefusesMutation reports whether the guard of the elevated
@@ -1339,17 +1462,26 @@ func offerMissingConsoleProgram(action serviceAction, executable string) (string
 	return console, true
 }
 
-func reportServiceHandoverFailure(err error) {
+func reportServiceHandoverFailure(action serviceAction, err error) {
 	if err == nil {
 		return
 	}
-	desktopLog.Error("the desktop could not finish the service installation", "error", err)
-	showMessage(serviceFailureCaption(serviceActionInstall),
-		serviceHandoverFailureText(err),
+	desktopLog.Error("the desktop could not finish the service action", "action", string(action), "error", err)
+	showMessage(serviceFailureCaption(action),
+		serviceHandoverFailureText(action, err),
 		windows.MB_ICONERROR)
 }
 
-func launchServiceHandover(action serviceAction, waitPID int, instanceMutex string) (*desktopHandover, error) {
+// launchServiceHandover starts the elevated helper of the desktop host for a
+// full handover and waits until that helper became ready.
+//
+// relaunch is the launch THIS host continues in once the handover settled; it
+// decides the launch surface the helper's reports address, because those
+// reports send the user back to the surface they will really find after the
+// handover — the tray companion beside the service for a start and an update,
+// and the ordinary desktop launch for a removal that frees the address again.
+func launchServiceHandover(action serviceAction, waitPID int, instanceMutex string,
+	relaunch handoverRelaunch) (*desktopHandover, error) {
 	executable, err := desktopExecutable()
 	if err != nil {
 		return nil, err
@@ -1367,7 +1499,7 @@ func launchServiceHandover(action serviceAction, waitPID int, instanceMutex stri
 		InstanceMutex:    instanceMutex,
 		DesktopState:     service.PublishedStatePath(),
 		LogFile:          runLogPath,
-		CompanionSurface: hostLaunchSurface == launchSurfaceCompanion,
+		CompanionSurface: relaunch == handoverRelaunchCompanion,
 	})
 	if err != nil {
 		if helper != nil {

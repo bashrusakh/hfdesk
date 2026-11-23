@@ -6,6 +6,8 @@ package desktop
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/bashrusakh/hfdesk/internal/service"
@@ -153,6 +155,19 @@ const (
 	// the administrator prompt follows.
 	removeServiceConfirmCaption = "HFDesk - remove the Windows service registration"
 
+	// startServiceConfirmCaption is the caption of the confirmation of a
+	// start that hands this host over: the one start that closes the
+	// window the user clicked in, so the fact is read before the
+	// administrator prompt follows. A start that does not hand over has
+	// no confirmation and never shows this caption.
+	startServiceConfirmCaption = "HFDesk - start the Windows service"
+
+	// updateServiceConfirmCaption is the caption of the confirmation of
+	// an update that hands this host over — the counterpart of the start
+	// caption above, for the same reason. An update that does not hand
+	// over has no confirmation and never shows this caption.
+	updateServiceConfirmCaption = "HFDesk - update the Windows service"
+
 	// serviceStoppedCaption is the caption of the report of a stopped
 	// service.
 	serviceStoppedCaption = "HFDesk - service stopped"
@@ -266,6 +281,50 @@ func stopServiceConfirmText() string {
 		"Do you want to stop the service?"
 }
 
+// serviceHandoverCloseLine is the one fact the confirmations of a handover
+// state beside the administrator-rights sentence: this window serves HFDesk's
+// own local server, so it closes while the elevated helper acts. The two
+// lines differ because the two end states differ, and each says where the
+// host comes back — never a mechanism behind that.
+const (
+	// serviceHandoverCompanionLine is the fact of a handover whose end
+	// state leaves the host beside the service: the host comes back as a
+	// tray companion, which binds no address and therefore keeps the
+	// service's address alone.
+	serviceHandoverCompanionLine = "HFDesk serves its own local server in this window, so it closes into the tray while the administrator helper acts, and it stays in the tray afterwards."
+	// serviceHandoverReturnLine is the fact of the removal's handover: the
+	// registration is gone when the host comes back, so the address is
+	// free and the launch takes the desktop mode again.
+	serviceHandoverReturnLine = "HFDesk serves its own local server in this window, so it closes while the administrator helper acts, and it starts again in desktop mode once the registration is gone."
+)
+
+// startServiceConfirmText returns the text of the confirmation of a start
+// that hands this host over — the start of a desktop host that serves its own
+// local server, which has to close before the service can take the address.
+//
+// The shape is the one every confirmation of this family follows: what the
+// action does, the administrator rights it needs, the one fact the user has
+// to see before agreeing — this window closes and where the host comes back —
+// and the question. It names no state of the service for the same reason the
+// stop confirmation names none: the state the menu item was enabled by can be
+// stale by the time the box is read, and the helper reads it again.
+func startServiceConfirmText() string {
+	return "This starts the HFDesk service.\n\n" +
+		"Starting it needs administrator rights, so a Windows prompt follows.\n" +
+		serviceHandoverCompanionLine + "\n\n" +
+		"Do you want to start the service?"
+}
+
+// updateServiceConfirmText returns the text of the confirmation of an update
+// that hands this host over. Its shape and its honesty boundary are the ones
+// startServiceConfirmText documents.
+func updateServiceConfirmText() string {
+	return "This re-registers the HFDesk Windows service from the folder of this app.\n\n" +
+		"Updating it needs administrator rights, so a Windows prompt follows.\n" +
+		serviceHandoverCompanionLine + "\n\n" +
+		"Do you want to update the service?"
+}
+
 // removeServiceConfirmText returns the text of the confirmation that removes
 // the Windows service registration before the administrator prompt follows.
 //
@@ -275,10 +334,21 @@ func stopServiceConfirmText() string {
 // line beside the administrator-rights sentence and the question. The
 // confirmation claims nothing about the state of the instance: a running one
 // is stopped inside the removal, which the user does not have to orchestrate.
-func removeServiceConfirmText() string {
-	return "This removes the Windows service registration of HFDesk.\n\n" +
-		"Removing it needs administrator rights, so a Windows prompt follows.\n" +
-		"Your settings, jobs, models, cache, history and logs stay untouched.\n\n" +
+//
+// handover adds the fact of the handover a desktop host that serves its own
+// local server takes — this window closes, and the host comes back in desktop
+// mode once the registration is gone — between the administrator-rights
+// sentence and the invariant. With the flag false the text is byte for byte
+// the confirmation this family has always shown, which is what every surface
+// that does not hand over (the stop's sibling, and a removal beside a host
+// that serves no address) reads.
+func removeServiceConfirmText(handover bool) string {
+	text := "This removes the Windows service registration of HFDesk.\n\n" +
+		"Removing it needs administrator rights, so a Windows prompt follows.\n"
+	if handover {
+		text += serviceHandoverReturnLine + "\n"
+	}
+	return text + "Your settings, jobs, models, cache, history and logs stay untouched.\n\n" +
 		"Do you want to remove the registration?"
 }
 
@@ -554,9 +624,24 @@ func serviceInstalledText(version, console, dataDir, address string) string {
 // report (the relaunch of the desktop app and its Start service) byte for
 // byte, as decided on 2026-11-23. A hand-typed helper command line carries
 // no surface marker and gets the desktop route (launchSurfaceOf).
-func serviceUpdatedText(version, console, dataDir, address string, running bool, before service.State, surface launchSurface) string {
+//
+// oldFile is the program the registration ran BEFORE this update, and only
+// when that file still exists somewhere else: an update that moved the
+// registration to another file then states the fact right after the program
+// the registration runs now — the old file is still there, and it may belong
+// to the pair of its old folder — and its window carries the one command that
+// deletes exactly that file on a deliberate press (deleteOldFileLabel). An
+// update that kept the same path, one whose old file is already gone and one
+// that failed (a rollback puts the registration back on the previous program)
+// pass the empty string, and their report is byte for byte the report this
+// function always built.
+func serviceUpdatedText(version, console, dataDir, address string, running bool, before service.State,
+	surface launchSurface, oldFile string) string {
 	text := serviceVersionName(version) + " is updated as a Windows service.\n\n" +
 		"The registration now runs " + console + " and keeps the settings of the service and its data.\n\n"
+	if oldFile != "" {
+		text += serviceUpdateOldFileLines(oldFile) + "\n\n"
+	}
 	if running {
 		text += serviceAddressText(address)
 		text += "The desktop app is not needed to use the service: open the address above."
@@ -571,6 +656,108 @@ func serviceUpdatedText(version, console, dataDir, address string, running bool,
 		text += "\n\nThe service keeps its own data in " + dataDir + ". The settings, jobs and models of the desktop app do not appear in the service."
 	}
 	return text
+}
+
+// serviceUpdateOldFileLines returns the two lines the report of a finished
+// update states beside the program the registration runs now when the
+// registration MOVED to another file and the old one is still there: the
+// fact (which file, and that it is still on the disk), and the warning the
+// user needs before deleting it — the file may belong to the pair of its old
+// folder, where its hfdesk-desktop program sits next to it, and deleting it
+// would break that pair.
+//
+// The lines state the file and nothing behind it: no mechanism, no
+// instruction — the command that acts on the fact is the button of the
+// window, not a sentence in this text.
+func serviceUpdateOldFileLines(oldFile string) string {
+	return "The registration ran " + oldFile + " before this update, and that file is still there.\n" +
+		"It may belong to the pair of its old folder, where its hfdesk-desktop program sits next to it."
+}
+
+// serviceUpdateOldFile decides what the report of a finished update says
+// about the program the registration ran BEFORE it.
+//
+// It returns that path only when the registration really moved to ANOTHER
+// file and the old one is still on the disk — the two conditions the report's
+// command needs to name a real object: the same path (an update that
+// re-registered in place, and every rollback, which puts the registration
+// back on the previous program) names nothing, and a path that cannot be
+// read any more is not an object a command could delete. Every other answer
+// is the empty string, and the report carries no mention of an old file at
+// all.
+func serviceUpdateOldFile(previous, current string) string {
+	previous = strings.TrimSpace(previous)
+	if previous == "" {
+		return ""
+	}
+	if strings.EqualFold(filepath.Clean(previous), filepath.Clean(strings.TrimSpace(current))) {
+		return ""
+	}
+	if _, err := os.Stat(previous); err != nil {
+		return ""
+	}
+	return previous
+}
+
+// deleteOldFileLabel is the command the report of a finished update carries
+// when the registration moved to another file and the old one is still
+// there. It is the label of the command link of that window; the message box
+// fallback of a machine without a task dialog maps the same command onto Yes
+// in its own words (deleteOldFileChoiceText), so one wording names the one
+// action everywhere it can be pressed.
+const deleteOldFileLabel = "Delete the old file"
+
+// removeOldServiceProgram deletes the old registered program.
+//
+// It is a package level variable so the tests can prove WHICH path the
+// command of the report hands over — and that no outcome of an update ever
+// reaches it by itself: only the press of the report's command calls it
+// (showReportWithOldFileCommand), and no other flow of this package deletes
+// a program file.
+var removeOldServiceProgram = os.Remove
+
+// The captions of the two outcomes of the report's command.
+const (
+	// oldFileDeletedCaption is the caption of the fact that the old
+	// registered program is gone.
+	oldFileDeletedCaption = "HFDesk - the old file was deleted"
+	// oldFileDeleteFailedCaption is the caption of the honest failure of
+	// that command — a file another program holds, and a file this
+	// identity may not write.
+	oldFileDeleteFailedCaption = "HFDesk - the old file could not be deleted"
+)
+
+// runDeleteOldFileCommand performs the explicit command of the report of a
+// finished update and returns the window it shows: the fact of the deletion
+// beside the path it deleted, and — when Windows refuses the deletion — the
+// honest failure with the cause on its own line beside that same path, which
+// is the fact line a busy or unwritable file gives. failed picks the icon of
+// that window.
+//
+// target is exactly the path the report named: the program the registration
+// ran before this update. The function holds no path of its own and adds no
+// second object — nothing beside that one file is ever touched — and it
+// records nothing: the dialog that owns the press records the outcome beside
+// the window it then shows.
+func runDeleteOldFileCommand(target string) (caption, text string, failed bool) {
+	if err := removeOldServiceProgram(target); err != nil {
+		return oldFileDeleteFailedCaption,
+			failureWindowText("The old file could not be deleted.\n\n" + err.Error() +
+				"\n\nThe file is at " + target + "."),
+			true
+	}
+	return oldFileDeletedCaption, "The old file was deleted.\n\n" + target, false
+}
+
+// deleteOldFileChoiceText maps the answers of the message box fallback onto
+// the one command of the report: the deletion of exactly the file the report
+// named, and keeping it. No is the default button, so a stray Enter keeps the
+// file — the same rule every confirmation of this family follows, and the
+// reason the command really needs a deliberate press on a machine whose
+// common controls cannot show the command link.
+func deleteOldFileChoiceText(target string) string {
+	return "Choose Yes to delete the old file:\n" + target + "\n" +
+		"Choose No to keep it."
 }
 
 // serviceUpdateNotRunningReport returns the result of the report of an
@@ -1494,17 +1681,34 @@ func serviceHandoverRefusedText(err error) string {
 		"No service action was performed.\n\n" + detail + statusIfUnnamed(detail))
 }
 
+// serviceHandoverFailureHeadline returns the first line of the report of a
+// handover that could not finish: the action that did not finish, in the
+// words the reports of that action already use. Only an action that can take
+// a handover ever reaches it (serviceActionTakesHandover).
+func serviceHandoverFailureHeadline(action serviceAction) string {
+	switch action {
+	case serviceActionUpdate:
+		return "HFDesk could not finish the service update."
+	case serviceActionStart:
+		return "HFDesk could not finish the service start."
+	case serviceActionUninstall:
+		return "HFDesk could not finish the removal of the service registration."
+	default:
+		return "HFDesk could not finish the service installation."
+	}
+}
+
 // serviceHandoverFailureText returns the report of the desktop host whose
-// installation could not be finished after its shutdown: the result (the
-// installation did not finish), the cause on its own line, the one command
+// handover could not be finished after its shutdown: the result (the action
+// did not finish), the cause on its own line, the one command
 // that reads the state the failure left, and the standard log-path line —
 // with no description of the mechanism the wait used.
-func serviceHandoverFailureText(err error) string {
+func serviceHandoverFailureText(action serviceAction, err error) string {
 	detail := ""
 	if err != nil {
 		detail = err.Error()
 	}
-	return failureWindowText("HFDesk could not finish the service installation.\n\n" +
+	return failureWindowText(serviceHandoverFailureHeadline(action) + "\n\n" +
 		detail + "\n\n" + serviceStatusCommandText)
 }
 

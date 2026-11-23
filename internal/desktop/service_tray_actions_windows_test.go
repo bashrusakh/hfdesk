@@ -73,7 +73,6 @@ func TestTrayServiceActionsRefuseASecondActionOfAnyType(t *testing.T) {
 		handover.close()
 		t.Error("the install item handed over although another action runs")
 	}
-	openRegisteredServiceFromTray(testGateSingleton)
 	for _, action := range []serviceAction{
 		serviceActionStart, serviceActionStop, serviceActionUpdate, serviceActionUninstall,
 	} {
@@ -81,8 +80,8 @@ func TestTrayServiceActionsRefuseASecondActionOfAnyType(t *testing.T) {
 	}
 
 	// Every refusal showed exactly the report of a busy guard, and the
-	// guard of the running action is untouched by all six refusals.
-	if len(*messages) != 6 {
+	// guard of the running action is untouched by all five refusals.
+	if len(*messages) != 5 {
 		t.Fatalf("the refused requests showed %d message boxes, want one per request: %v", len(*messages), *messages)
 	}
 	for _, message := range *messages {
@@ -269,22 +268,40 @@ func TestTrayServiceActionsRefreshTheMenuAfterEveryUnsuccessfulOutcome(t *testin
 			wantReport: serviceFailureCaption(serviceActionUninstall),
 		},
 		{
-			name:   "a start the serving desktop refuses",
+			// The honest refusal of the serving desktop is the LAST
+			// resort of the handover, not its main path: this surface
+			// has no host endpoints to hand over to, so the start
+			// confirms nothing it could perform and ends with the
+			// refusal instead of an elevation or a handover beside the
+			// desktop that serves the address.
+			name:   "a start beside a serving desktop whose handover cannot be established",
 			action: serviceActionStart,
 			setup: func(t *testing.T) {
 				// The tray holds its own singleton and its published
 				// claim is live: the two facts the guard of the
-				// helper refuses a start from, spent here instead of
-				// on an elevation prompt.
+				// helper decides a start from.
 				release, err := service.HoldDesktopSingleton(testGateSingleton)
 				if err != nil {
 					t.Fatalf("hold the desktop singleton %q: %v", testGateSingleton, err)
 				}
 				t.Cleanup(release)
 				replaceSeam(t, &service.PublishedStateLive, func() (bool, bool) { return true, false })
+				// No host endpoints: this surface cannot hand over,
+				// which is the last resort the refusal below reports.
+				replaceSeam(t, &serviceHandoverCommit,
+					(func(*desktopHandover, serviceAction, handoverRelaunch) bool)(nil))
+				replaceSeam(t, &serviceHandoverQuit, (func())(nil))
+				replaceSeam(t, &confirmServiceAction, func(string, string) bool {
+					t.Error("the doomed start asked a confirmation it could not act on")
+					return true
+				})
 				replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
 					t.Error("the refused start launched an elevated helper")
 					return 0, nil
+				})
+				replaceSeam(t, &launchElevatedProcess, func(elevatedLaunch) (*elevatedProcess, error) {
+					t.Error("the refused start started a handover it has no host for")
+					return nil, nil
 				})
 			},
 			wantReport: serviceFailureCaption(serviceActionStart),
@@ -430,7 +447,6 @@ func TestTrayServiceActionHoldsTheGuardForAHelperWithoutAProcessRecord(t *testin
 		handover.close()
 		t.Error("the install item handed over during the bounded hold of another action")
 	}
-	openRegisteredServiceFromTray(testGateSingleton)
 	for _, action := range []serviceAction{
 		serviceActionStart, serviceActionStop, serviceActionUpdate, serviceActionUninstall,
 	} {
@@ -440,7 +456,7 @@ func TestTrayServiceActionHoldsTheGuardForAHelperWithoutAProcessRecord(t *testin
 		t.Fatalf("the refused requests launched %d new helpers, want none: %d launches in total",
 			launches-1, launches)
 	}
-	if len(*messages) != 6 {
+	if len(*messages) != 5 {
 		t.Fatalf("the refused requests showed %d message boxes, want one per request: %v",
 			len(*messages), *messages)
 	}
@@ -787,7 +803,7 @@ func TestInstallRouteCatchesTheMenuUpAfterEveryOutcome(t *testing.T) {
 		refreshes, commits, quits := 0, 0, 0
 
 		runInstallServiceAction(testGateSingleton, func() { refreshes++ },
-			func(*desktopHandover) bool { commits++; return true },
+			func(*desktopHandover, serviceAction, handoverRelaunch) bool { commits++; return true },
 			func() { quits++ })
 
 		if refreshes != 1 {
@@ -811,7 +827,7 @@ func TestInstallRouteCatchesTheMenuUpAfterEveryOutcome(t *testing.T) {
 		refreshes, commits, quits := 0, 0, 0
 
 		runInstallServiceAction(testGateSingleton, func() { refreshes++ },
-			func(*desktopHandover) bool { commits++; return true },
+			func(*desktopHandover, serviceAction, handoverRelaunch) bool { commits++; return true },
 			func() { quits++ })
 
 		if refreshes != 1 {
@@ -836,7 +852,7 @@ func TestInstallRouteCatchesTheMenuUpAfterEveryOutcome(t *testing.T) {
 		refreshes, commits, quits := 0, 0, 0
 
 		runInstallServiceAction(testGateSingleton, func() { refreshes++ },
-			func(handover *desktopHandover) bool {
+			func(handover *desktopHandover, _ serviceAction, _ handoverRelaunch) bool {
 				commits++
 				handover.close()
 				return true
@@ -868,7 +884,7 @@ func TestInstallRouteCatchesTheMenuUpAfterEveryOutcome(t *testing.T) {
 		refreshes, commits, quits := 0, 0, 0
 
 		runInstallServiceAction(testGateSingleton, func() { refreshes++ },
-			func(*desktopHandover) bool { commits++; return false },
+			func(*desktopHandover, serviceAction, handoverRelaunch) bool { commits++; return false },
 			func() { quits++ })
 
 		if refreshes != 1 {
@@ -883,64 +899,18 @@ func TestInstallRouteCatchesTheMenuUpAfterEveryOutcome(t *testing.T) {
 	})
 }
 
-// TestServiceItemRouteCatchesTheMenuUpAfterTheDialog pins the catch-up of
-// the Service... item: the refresh runs right after the dialog — after an
-// answer and after the early return of a machine whose registration is gone
-// alike — so deleting the refresh() call in runServiceItemAction fails both
-// subtests.
-func TestServiceItemRouteCatchesTheMenuUpAfterTheDialog(t *testing.T) {
-	t.Run("the dialog answers: the menu catches up", func(t *testing.T) {
-		freshServiceInstallGuard(t)
-		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
-			return registeredStoppedService(), nil
-		})
-		choices := 0
-		replaceSeam(t, &showServiceChoice, func(serviceChoicePrompt) serviceChoice {
-			choices++
-			return serviceChoiceCancel
-		})
-		replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
-			t.Error("a cancelled dialog launched an elevated helper")
-			return 0, nil
-		})
-		refreshes := 0
-
-		runServiceItemAction(testGateSingleton, func() { refreshes++ })
-
-		if choices != 1 {
-			t.Fatalf("the route opened the dialog %d times, want one question", choices)
-		}
-		if refreshes != 1 {
-			t.Errorf("the route asked for the menu catch-up %d times after the dialog, want exactly once", refreshes)
-		}
-	})
-
-	t.Run("no registration: the menu still catches up", func(t *testing.T) {
-		freshServiceInstallGuard(t)
-		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
-			return service.Status{State: service.StateNotInstalled}, nil
-		})
-		replaceSeam(t, &showServiceChoice, func(serviceChoicePrompt) serviceChoice {
-			t.Error("the route opened a dialog although no registration exists")
-			return serviceChoiceCancel
-		})
-		refreshes := 0
-
-		runServiceItemAction(testGateSingleton, func() { refreshes++ })
-
-		if refreshes != 1 {
-			t.Errorf("the route asked for the menu catch-up %d times after the early return, want exactly once", refreshes)
-		}
-	})
-}
-
 // TestStartAndUpdateRoutesAskForNoConfirmation pins the confirmation-free
 // behavior of start and update DIRECTLY, on every surface that can launch
-// them: the lifecycle menu items, the registered-service dialog and the
-// launch gate. Each step also proves it really reached the helper — the
-// zero-confirmation assert only discriminates when the action ran — and any
-// confirmation added to these routes (the install box or the new one) fails
-// the step that grew it.
+// them without a handover: the lifecycle menu items, the registered-service
+// dialog and the launch gate, each beside a desktop that does not serve the
+// address (the claim of this test is not live), which is the only state in
+// which these two actions reach the elevated helper directly. Each step also
+// proves it really reached the helper — the zero-confirmation assert only
+// discriminates when the action ran — and any confirmation added to those
+// direct routes (the install box or a new one) fails the step that grew it.
+// The handover route of a desktop host that DOES serve the address asks its
+// own confirmation of the closing window first, and is pinned by
+// TestTrayServiceAnswersHandOverOnlyWhenThisDesktopServes.
 func TestStartAndUpdateRoutesAskForNoConfirmation(t *testing.T) {
 	freshServiceInstallGuard(t)
 	confirmations := &atomic.Int32{}

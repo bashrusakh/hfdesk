@@ -109,7 +109,6 @@ func TestDesktopTrayHostBecomesReady(t *testing.T) {
 			stop:    func() {},
 			update:  func() {},
 			delete:  func() {},
-			service: func() {},
 			quit:    func() {},
 		}, serviceView, ready)
 	}()

@@ -41,13 +41,6 @@ type trayActions struct {
 	update func()
 	// delete removes the registration of the registered service.
 	delete func()
-	// service opens the registered-service dialog of an installed
-	// service: the open/start/update choices the gate asks. No item of
-	// the current plans is wired to it — the Service entry became the
-	// submenu, and the dialog itself stays reachable through the
-	// install recheck — so the desktop host's write below reaches no
-	// item until a plan carries the dialog again.
-	service func()
 	// quit stops the host: the desktop host stops its server, the
 	// companion closes the tray and its window — the Windows service is
 	// not touched by either.

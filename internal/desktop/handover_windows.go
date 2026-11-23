@@ -38,29 +38,68 @@ type desktopHandover struct {
 	helper *elevatedProcess
 }
 
+// handoverRelaunch names the launch the host continues in AFTER a committed
+// handover settled.
+//
+// The departing host decides it — it knows which action it handed over — and
+// it travels with the handover through the shutdown coordinator, because the
+// relaunch runs from the shutdown path and not from the click that committed.
+// Only one handover can ever be committed (the single service-action guard
+// spans the whole action), so the value belongs to that one handover.
+type handoverRelaunch int
+
+const (
+	// handoverRelaunchCompanion continues the host as a tray companion:
+	// the installation, and the start and the update, whose end state
+	// leaves the host beside the service — the companion binds no
+	// address, so the service keeps it alone.
+	handoverRelaunchCompanion handoverRelaunch = iota
+	// handoverRelaunchDesktop continues the host through the ordinary
+	// launch flow: the removal of the registration leaves the address
+	// free, so the launch gate finds a machine without a registration and
+	// the launch takes the desktop mode again.
+	handoverRelaunchDesktop
+)
+
+// committedHandover is what a commit hands to the shutdown path: the ready
+// helper, the action it performs and the launch this host continues in once
+// that action settled. The action travels with them so the report of a
+// handover that could not finish names the action that did not finish —
+// never the installation beside a start or a removal.
+type committedHandover struct {
+	handover *desktopHandover
+	action   serviceAction
+	relaunch handoverRelaunch
+}
+
 type desktopShutdownCoordinator struct {
 	mu        sync.Mutex
 	started   bool
 	committed bool
-	handover  *desktopHandover
+	plan      committedHandover
 }
 
-func (c *desktopShutdownCoordinator) commit(handover *desktopHandover) bool {
+// commit takes a ready handover over, with the action and the launch the host
+// continues in once the handover settled. All three are written under the
+// same lock beginShutdown reads them with, so a shutdown that begins between
+// the two calls never observes a handover whose action or relaunch is not
+// decided yet.
+func (c *desktopShutdownCoordinator) commit(handover *desktopHandover, action serviceAction, relaunch handoverRelaunch) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.started || c.committed || handover == nil {
 		return false
 	}
 	c.committed = true
-	c.handover = handover
+	c.plan = committedHandover{handover: handover, action: action, relaunch: relaunch}
 	return true
 }
 
-func (c *desktopShutdownCoordinator) beginShutdown() (*desktopHandover, bool) {
+func (c *desktopShutdownCoordinator) beginShutdown() (committedHandover, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.started = true
-	return c.handover, c.committed
+	return c.plan, c.committed
 }
 
 func newHandoverEvents() (*handoverEvents, error) {
@@ -381,25 +420,26 @@ func completeHandoverWithNotice(handover *desktopHandover, waitForCompletion fun
 	return authorizeHandoverCompletion(waitForCompletion, handover.helper.handle, handover.events.success, handover.events.confirmed)
 }
 
-// completeInstallHandover joins the completion evidence of a COMMITTED
-// installation handover with the two end paths of the desktop: it shows the
-// native waiting state, waits for the graceful stop and the acknowledgment
-// of the helper, closes the handover — twice, exactly as the shutdown did
-// before this function owned the sequence, so the handles are dropped on
-// every path — and hands the outcome to finishInstallHandover.
+// completeHandover joins the completion evidence of a COMMITTED handover
+// with the two end paths of the desktop: it shows the native waiting state,
+// waits for the graceful stop and the acknowledgment of the helper, closes
+// the handover — twice, exactly as the shutdown did before this function
+// owned the sequence, so the handles are dropped on every path — and hands
+// the outcome to finishHandover together with the plan the host committed.
 //
-// The order is the contract: the relaunch of the tray companion runs only
+// The order is the contract: the relaunch runs only
 // AFTER the authorization settled (the success signal stands and the helper
 // acknowledged it — from that moment the helper waits solely for the exit
 // of this process, so the spawn is quick and this process then exits), and
 // a failed authorization is reported like every other handover failure and
 // relaunches nothing. The test of this function pins both branches at the
 // very event handles the real protocol uses.
-func completeInstallHandover(handover *desktopHandover, waitForCompletion func() error) {
+func completeHandover(plan committedHandover, waitForCompletion func() error) {
+	handover := plan.handover
 	defer handover.close()
 	err := completeHandoverWithNotice(handover, waitForCompletion)
 	handover.close()
-	finishInstallHandover(err)
+	finishHandover(err, plan)
 }
 
 func stopDesktopServer(shutdown func(), coordinator *desktopShutdownCoordinator) {

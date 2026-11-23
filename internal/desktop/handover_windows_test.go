@@ -428,18 +428,26 @@ func TestShutdownCoordinatorDoesNotLetQuitRaceCommit(t *testing.T) {
 	if _, committed := coordinator.beginShutdown(); committed {
 		t.Fatal("ordinary shutdown unexpectedly found a handover")
 	}
-	if coordinator.commit(&desktopHandover{}) {
+	if coordinator.commit(&desktopHandover{}, serviceActionInstall, handoverRelaunchCompanion) {
 		t.Fatal("an install committed after ordinary shutdown had already begun")
 	}
 
 	var handoverCoordinator desktopShutdownCoordinator
 	handover := &desktopHandover{}
-	if !handoverCoordinator.commit(handover) {
+	if !handoverCoordinator.commit(handover, serviceActionUninstall, handoverRelaunchDesktop) {
 		t.Fatal("a ready helper could not commit before shutdown")
 	}
 	got, committed := handoverCoordinator.beginShutdown()
-	if !committed || got != handover {
-		t.Fatalf("shutdown snapshot = (%p, %t), want (%p, true)", got, committed, handover)
+	if !committed || got.handover != handover {
+		t.Fatalf("shutdown snapshot = (%p, %t), want (%p, true)", got.handover, committed, handover)
+	}
+	// The action and the launch the host continues in travel with the
+	// handover: the report of a handover that could not finish names the
+	// action that did not finish, and the relaunch is the one this commit
+	// decided — never a default the shutdown path could invent.
+	if got.action != serviceActionUninstall || got.relaunch != handoverRelaunchDesktop {
+		t.Errorf("the committed plan is action=%q relaunch=%d, want the removal on the desktop relaunch",
+			got.action, got.relaunch)
 	}
 }
 

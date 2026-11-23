@@ -344,7 +344,7 @@ func TestServiceGatePendingTextNamesTheTransitionAndTheUnchangedLaunch(t *testin
 // route its user can actually reach.
 func TestServiceUpdatedTextKeepsAStoppedServiceStopped(t *testing.T) {
 	const address = "http://127.0.0.1:8080"
-	text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, false, service.StateStopped, launchSurfaceDesktop)
+	text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, false, service.StateStopped, launchSurfaceDesktop, "")
 
 	assertNames(t, text, "the report", []string{
 		"HFDesk 1.3.0",
@@ -372,7 +372,7 @@ func TestServiceUpdatedTextKeepsAStoppedServiceStopped(t *testing.T) {
 func TestServiceUpdatedTextNamesTheCompanionsOwnStartItem(t *testing.T) {
 	const address = "http://127.0.0.1:8080"
 	for _, before := range []service.State{service.StateStopped, service.StateFailed} {
-		text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, false, before, launchSurfaceCompanion)
+		text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, false, before, launchSurfaceCompanion, "")
 
 		assertNames(t, text, "the companion report", []string{
 			"Nothing serves HFDesk right now",
@@ -393,7 +393,7 @@ func TestServiceUpdatedTextNamesTheCompanionsOwnStartItem(t *testing.T) {
 // desktop app is not needed to use the service.
 func TestServiceUpdatedTextReportsARunningService(t *testing.T) {
 	const address = "http://127.0.0.1:8080"
-	text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, true, service.StateRunning, launchSurfaceDesktop)
+	text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, true, service.StateRunning, launchSurfaceDesktop, "")
 
 	assertNames(t, text, "the report", []string{address, "not needed to use the service", `C:\portable\hfdesk.exe`, "keeps the settings"})
 }
@@ -428,7 +428,7 @@ func TestServiceUpdatedTextNamesTheObservedPriorState(t *testing.T) {
 		{name: "broken", before: service.StateBroken, quote: `it was "broken" before the update`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, false, tc.before, launchSurfaceDesktop)
+			text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, false, tc.before, launchSurfaceDesktop, "")
 
 			assertNames(t, text, "the report", []string{
 				tc.quote,
@@ -567,9 +567,9 @@ func TestServiceInstalledTextCarriesTheAuthorizedTrayFallbackOnce(t *testing.T) 
 	// The line belongs to this report alone: the update (in both of its
 	// states) and the start report carry neither it nor any tray wording.
 	for name, text := range map[string]string{
-		"the update of a running service":                          serviceUpdatedText("1.3.0", console, dataDir, address, true, service.StateRunning, launchSurfaceDesktop),
-		"the update of a stopped service":                          serviceUpdatedText("1.3.0", console, dataDir, address, false, service.StateStopped, launchSurfaceDesktop),
-		"the update of a stopped service on the companion surface": serviceUpdatedText("1.3.0", console, dataDir, address, false, service.StateStopped, launchSurfaceCompanion),
+		"the update of a running service":                          serviceUpdatedText("1.3.0", console, dataDir, address, true, service.StateRunning, launchSurfaceDesktop, ""),
+		"the update of a stopped service":                          serviceUpdatedText("1.3.0", console, dataDir, address, false, service.StateStopped, launchSurfaceDesktop, ""),
+		"the update of a stopped service on the companion surface": serviceUpdatedText("1.3.0", console, dataDir, address, false, service.StateStopped, launchSurfaceCompanion, ""),
 		"the start report":                                         serviceStartedText(console, address),
 	} {
 		if strings.Contains(text, serviceInstalledTrayFallbackLine) || strings.Contains(text, "tray icon") {
@@ -1896,7 +1896,7 @@ func TestStopAndRemoveConfirmationsStateTheActionAndTheOneFact(t *testing.T) {
 		"service control manager", "SCM", "registry", "is running", "was running",
 	})
 
-	remove := removeServiceConfirmText()
+	remove := removeServiceConfirmText(false)
 	assertNames(t, remove, "the removal confirmation", []string{
 		"removes the Windows service registration of HFDesk",
 		"administrator rights",
@@ -2188,7 +2188,7 @@ func TestFailureWindowsNameTheLogFileOfThisLaunch(t *testing.T) {
 		"the launch-failure report":             serviceLaunchFailedText(serviceActionInstall, cause),
 		"the unknown-action report":             unknownServiceActionText(errors.New("unknown service action")),
 		"the preparation refusal":               serviceHandoverRefusedText(cause),
-		"the unfinished-install report":         serviceHandoverFailureText(cause),
+		"the unfinished-install report":         serviceHandoverFailureText(serviceActionInstall, cause),
 		"the unreadable gate notice":            serviceGateUnreadableText(cause),
 		"the changed gate notice":               serviceGateChangedText(serviceChoicePrompt{State: service.StateRunning}),
 		"the download failure":                  consoleDownloadFailedText(downloadNotice, cause),
@@ -2330,7 +2330,7 @@ func TestGateAndReportsCarryNoInternalMechanism(t *testing.T) {
 		"the installation confirmation":                      installServiceText(dataDir, false),
 		"the installation confirmation on a removable drive": installServiceText(dataDir, true),
 		"the stop confirmation":                              stopServiceConfirmText(),
-		"the removal confirmation":                           removeServiceConfirmText(),
+		"the removal confirmation":                           removeServiceConfirmText(false),
 		"the service-log open failure":                       serviceLogOpenFailedText(`C:\ProgramData\HFDesk\logs\hfdesk.log`, cause),
 		"the service-log missing report":                     serviceLogMissingText(`C:\ProgramData\HFDesk\logs\hfdesk.log`),
 		"the installation failure":                           serviceActionFailureText(serviceActionInstall, cause, program),
@@ -2346,7 +2346,7 @@ func TestGateAndReportsCarryNoInternalMechanism(t *testing.T) {
 			&helperNotReadyError{cause: cause}),
 		"the launch-failure report":     serviceLaunchFailedText(serviceActionStart, cause),
 		"the preparation refusal":       serviceHandoverRefusedText(cause),
-		"the unfinished-install report": serviceHandoverFailureText(cause),
+		"the unfinished-install report": serviceHandoverFailureText(serviceActionInstall, cause),
 		"the serving-desktop refusal":   serviceServingDesktopRefusedText(serviceActionStart),
 		"the unreadable-state refusal": serviceUnreadableClaimRefusedText(serviceActionStart,
 			`C:\Users\ada\AppData\Roaming\HFDesk\desktop-state.json`),
@@ -2356,8 +2356,8 @@ func TestGateAndReportsCarryNoInternalMechanism(t *testing.T) {
 		"the unknown-action report":                              unknownServiceActionText(cause),
 		"the stopped report":                                     serviceStoppedText(launchSurfaceDesktop),
 		"the stopped report of the companion surface":            serviceStoppedText(launchSurfaceCompanion),
-		"the not-running update report":                          serviceUpdatedText("1.3.0", program, dataDir, "", false, service.StateStopped, launchSurfaceDesktop),
-		"the not-running update report of the companion surface": serviceUpdatedText("1.3.0", program, dataDir, "", false, service.StateStopped, launchSurfaceCompanion),
+		"the not-running update report":                          serviceUpdatedText("1.3.0", program, dataDir, "", false, service.StateStopped, launchSurfaceDesktop, ""),
+		"the not-running update report of the companion surface": serviceUpdatedText("1.3.0", program, dataDir, "", false, service.StateStopped, launchSurfaceCompanion, ""),
 		"the removed report":                                     serviceRegistrationRemovedText(),
 		"the no-registration report":                             serviceNoRegistrationText(),
 		"the missing-program notice":                             siblingMissingManualNoticeText(notice),

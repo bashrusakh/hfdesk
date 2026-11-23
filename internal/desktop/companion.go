@@ -30,11 +30,22 @@ const (
 	companionModeFlag = "--tray-companion"
 	// companionWaitFlag names how long this companion launch may wait
 	// for the single instance lock of the session. It is passed only by
-	// the relaunch of an installation, whose child is started while the
-	// exiting host and the elevated helper still hold that lock. A
-	// companion launch without it never waits: it reports the running
-	// instance exactly like every ordinary second launch.
+	// the relaunch child of a handover — the installation, and every
+	// action whose end state leaves the host beside the service — whose
+	// child is started while the exiting host and the elevated helper
+	// still hold that lock. A companion launch without it never waits: it
+	// reports the running instance exactly like every ordinary second
+	// launch.
 	companionWaitFlag = "--companion-wait"
+	// relaunchWaitFlag names the same bounded wait for a relaunch child
+	// that comes back as an ORDINARY launch instead of a companion: the
+	// removal of the registration ends its handover in desktop mode, and
+	// that child is started while the exiting host and the elevated helper
+	// still hold the lock exactly like the companion child is. The wait is
+	// deliberately separate from companionWaitFlag: the mode of the child
+	// is chosen by --tray-companion alone, so a wait that does not carry
+	// that flag is a desktop relaunch and never half of one protocol.
+	relaunchWaitFlag = "--relaunch-wait"
 )
 
 // companionLaunch is the companion part of a desktop command line.
@@ -42,7 +53,7 @@ type companionLaunch struct {
 	// Enabled reports that the launch asked to be a tray companion.
 	Enabled bool
 	// Wait is the bounded wait for the single instance lock, zero for
-	// every launch but the relaunch of an installation.
+	// every launch but the relaunch child of a handover.
 	Wait time.Duration
 }
 
@@ -53,12 +64,14 @@ type companionLaunch struct {
 // slice when no companion flag is present, so an ordinary launch passes
 // its arguments on byte for byte). An argument list that carries
 // --companion-wait without --tray-companion, or a wait value that is not
-// a duration, is an error: the flags name one relaunch protocol, and a
-// half of it is reported instead of guessed.
+// a duration, is an error: those two flags name one relaunch protocol,
+// and a half of it is reported instead of guessed. The mode-neutral
+// --relaunch-wait of the desktop-mode relaunch carries no mode of its own
+// on purpose: it is the whole of that child's protocol.
 func SplitCompanionArgs(args []string) (companionLaunch, []string, error) {
 	var launch companionLaunch
 	waitValue := ""
-	waitSeen := false
+	waitSeen := ""
 	rest := make([]string, 0, len(args))
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
@@ -72,31 +85,45 @@ func SplitCompanionArgs(args []string) (companionLaunch, []string, error) {
 			}
 			index++
 			waitValue = args[index]
-			waitSeen = true
+			waitSeen = companionWaitFlag
 		case strings.HasPrefix(arg, companionWaitFlag+"="):
 			waitValue = strings.TrimPrefix(arg, companionWaitFlag+"=")
-			waitSeen = true
+			waitSeen = companionWaitFlag
 		case strings.HasPrefix(arg, "-companion-wait="):
 			waitValue = strings.TrimPrefix(arg, "-companion-wait=")
-			waitSeen = true
+			waitSeen = companionWaitFlag
+		case arg == relaunchWaitFlag || arg == "-relaunch-wait":
+			if index+1 >= len(args) {
+				return companionLaunch{}, rest, fmt.Errorf(
+					"%s needs a duration as its value (for example %s 2m30s)", relaunchWaitFlag, relaunchWaitFlag)
+			}
+			index++
+			waitValue = args[index]
+			waitSeen = relaunchWaitFlag
+		case strings.HasPrefix(arg, relaunchWaitFlag+"="):
+			waitValue = strings.TrimPrefix(arg, relaunchWaitFlag+"=")
+			waitSeen = relaunchWaitFlag
+		case strings.HasPrefix(arg, "-relaunch-wait="):
+			waitValue = strings.TrimPrefix(arg, "-relaunch-wait=")
+			waitSeen = relaunchWaitFlag
 		default:
 			rest = append(rest, arg)
 		}
 	}
-	if !launch.Enabled && !waitSeen {
+	if !launch.Enabled && waitSeen == "" {
 		// An ordinary launch: the caller keeps its own slice, so
 		// nothing about its command line changes.
 		return companionLaunch{}, args, nil
 	}
-	if !launch.Enabled {
+	if !launch.Enabled && waitSeen == companionWaitFlag {
 		return companionLaunch{}, rest, fmt.Errorf(
 			"%s is only part of a tray companion launch: it needs %s as well", companionWaitFlag, companionModeFlag)
 	}
-	if waitSeen {
+	if waitSeen != "" {
 		wait, err := time.ParseDuration(waitValue)
 		if err != nil || wait < 0 {
 			return companionLaunch{}, rest, fmt.Errorf(
-				"%s %q is not a non-negative duration (for example %s)", companionWaitFlag, waitValue, companionWaitFlag)
+				"%s %q is not a non-negative duration (for example %s)", waitSeen, waitValue, waitSeen)
 		}
 		launch.Wait = wait
 	}
@@ -111,6 +138,19 @@ func companionRelaunchArgs(argv []string, wait time.Duration) []string {
 	relaunch := make([]string, 0, len(argv)+4)
 	relaunch = append(relaunch, argv...)
 	return append(relaunch, companionModeFlag, companionWaitFlag, wait.String())
+}
+
+// desktopRelaunchArgs returns the command line of the child a handover
+// relaunches as an ORDINARY launch: the arguments of THIS launch — so the
+// log settings of the host travel with it — plus the mode-neutral bounded
+// lock wait and no mode flag, so the child runs the ordinary startup and its
+// own service gate decides how it continues. That is the end state of the
+// removal of the registration: with the registration gone the gate reports
+// the machine without one and the launch takes the desktop mode again.
+func desktopRelaunchArgs(argv []string, wait time.Duration) []string {
+	relaunch := make([]string, 0, len(argv)+3)
+	relaunch = append(relaunch, argv...)
+	return append(relaunch, relaunchWaitFlag, wait.String())
 }
 
 // The fixed action names the document of the Logs window can call on the
@@ -273,14 +313,15 @@ const logFolderOpenFailedCaption = "HFDesk - the log folder could not be opened"
 //
 // The report is the state (another HFDesk process of this session still
 // holds the session — usually the elevated helper that is finishing the
-// installation) and the one action that resolves it (start the desktop
-// app again once that process finished). It carries no log-path line: the
+// service action this child was relaunched for) and the one action that
+// resolves it (start the desktop app again once that process finished). It
+// carries no log-path line: the
 // lock is taken before the log file is opened, so this launch has no log
 // file of its own yet — the established rule of the lock reports (a
 // launch that ends here names no log, because there is none).
 func companionRelaunchWaitTimeoutText() string {
 	return "HFDesk could not take over the desktop session: another HFDesk process of this Windows session still holds the single-instance object.\n\n" +
-		"That is usually the elevated helper finishing the service installation. Start the desktop app again in a moment."
+		"That is usually the elevated helper finishing the service action. Start the desktop app again in a moment."
 }
 
 // companionWebView2MissingText returns the report of a tray companion

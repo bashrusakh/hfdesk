@@ -805,3 +805,37 @@ func TestRuntimeAssetsNameTheBoundWindowActions(t *testing.T) {
 		"Open the log file",
 	})
 }
+
+// TestDesktopRelaunchArgsReturnToTheOrdinaryLaunch pins the other end state
+// of a handover at the command line that produces it: the removal's relaunch
+// child carries the bounded lock wait and NO companion flag, so it parses
+// back as an ordinary launch — the one whose own service gate finds the
+// machine without a registration and takes the desktop mode again — while the
+// companion relaunch keeps asking for its mode explicitly.
+func TestDesktopRelaunchArgsReturnToTheOrdinaryLaunch(t *testing.T) {
+	argv := []string{"--log-file", `C:\Users\First Last\hfdesk.log`, "--no-open"}
+
+	removal := desktopRelaunchArgs(argv, 150*time.Second)
+	launch, rest, err := SplitCompanionArgs(removal)
+	if err != nil {
+		t.Fatalf("the removal relaunch command line %q does not parse: %v", removal, err)
+	}
+	if launch.Enabled {
+		t.Error("the removal relaunch starts a tray companion, want the ordinary launch the gate decides for")
+	}
+	if launch.Wait != 150*time.Second {
+		t.Errorf("the removal relaunch wait = %s, want 2m30s", launch.Wait)
+	}
+	if !reflect.DeepEqual(rest, argv) {
+		t.Errorf("the host arguments = %q, want them unchanged %q", rest, argv)
+	}
+
+	companion := companionRelaunchArgs(argv, 150*time.Second)
+	companionLaunch, _, err := SplitCompanionArgs(companion)
+	if err != nil {
+		t.Fatalf("the companion relaunch command line %q does not parse: %v", companion, err)
+	}
+	if !companionLaunch.Enabled {
+		t.Error("the companion relaunch does not start a tray companion")
+	}
+}
