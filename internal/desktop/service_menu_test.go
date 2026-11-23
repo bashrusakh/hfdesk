@@ -132,6 +132,76 @@ func TestServiceMenuForOneRead(t *testing.T) {
 	}
 }
 
+// TestServiceMenuOpenItemFollowsRegistrationAndRunningFact pins the map of
+// the Open HFDesk item: it belongs into the menu only beside a PROVEN
+// registration (a proven absence and an unsettled read hide it — an item
+// that would open nothing never sits there), and inside a registration it
+// acts only while the service serves the address — the supervisor's running
+// fact, the same classification the stop item follows — and stays grey for
+// a registered service that does not run. The desktop host opens the
+// address of its OWN server, so apply leaves its open item out of this
+// mapping (openFollowsService is the companion's flag, pinned by the apply
+// test of the companion menu).
+func TestServiceMenuOpenItemFollowsRegistrationAndRunningFact(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  service.Status
+		readErr error
+		visible bool
+		enabled bool
+	}{
+		{
+			name:    "registered and running: visible and enabled",
+			status:  service.Status{State: service.StateRunning, Running: true},
+			visible: true, enabled: true,
+		},
+		{
+			name:    "registered and stopped: visible but grey — nothing serves the address yet",
+			status:  service.Status{State: service.StateStopped},
+			visible: true, enabled: false,
+		},
+		{
+			// The supervisor's running fact decides: a pending
+			// start counts as running, the very classification
+			// every other surface (the stop item included) uses
+			// for "the service runs".
+			name:    "a pending start counts as running: the established running fact enables it",
+			status:  service.Status{State: service.StateStarting},
+			visible: true, enabled: true,
+		},
+		{
+			name:    "proven absence: hidden",
+			status:  service.Status{State: service.StateNotInstalled},
+			visible: false, enabled: false,
+		},
+		{
+			name:    "unsettled read: hidden — no address was proven",
+			readErr: errors.New("the service control manager did not answer"),
+			visible: false, enabled: false,
+		},
+		{
+			name:    "state the supervisor could not report: hidden",
+			status:  service.Status{State: service.StateUnknown},
+			visible: false, enabled: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := serviceMenuFor(tc.status, tc.readErr)
+			if state.OpenVisible != tc.visible {
+				t.Errorf("Open HFDesk visible = %t, want %t", state.OpenVisible, tc.visible)
+			}
+			if state.OpenEnabled != tc.enabled {
+				t.Errorf("Open HFDesk enabled = %t, want %t", state.OpenEnabled, tc.enabled)
+			}
+			// An enabled open item always sits behind a proven
+			// registration: the two claims can never disagree.
+			if state.OpenEnabled && !state.OpenVisible {
+				t.Errorf("Open HFDesk is enabled although it is hidden: %+v", state)
+			}
+		})
+	}
+}
+
 // TestServiceMenuLifecycleItemsPerState pins the enablement map of the four
 // lifecycle items of the tray menu (start, stop, update, delete): which of
 // them are visible and enabled for every class of read, on the
