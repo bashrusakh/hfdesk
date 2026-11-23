@@ -89,11 +89,13 @@ the same folder.
 The desktop app wraps the same server in a small shell:
 
 - an icon in the notification area (the system tray); a left click opens the
-  **Runtime / Logs** window,
-- **Runtime / Logs** shows server status, active jobs, and live log records,
-- the tray menu offers **Open HFDesk**, **Runtime / Logs**, the Windows service
-  state, **Install service…**, **Start service**, **Stop service**,
-  **Update service**, **Delete service**, **Service…**, and **Quit HFDesk**.
+  **Logs** window,
+- **Logs** shows server status, active jobs, and live log records — or, when
+  the address it loads does not answer, an honest state with actions to take,
+- the tray menu offers **Open HFDesk**, **Logs**, a **Service** submenu with
+  the Windows service state and the service actions of that state
+  (**Install service…**, **Start service**, **Stop service**,
+  **Update service**, **Delete service**), and **Quit HFDesk**.
 
 **Service.** **Install service…** can install the Windows service (it asks
 first, then requests administrator rights). The service is a second HFDesk
@@ -109,14 +111,14 @@ restarts exactly like that.
 missing paired console program, from its own official release, on request and
 after checksum verification.
 
-**Requirements.** The Runtime / Logs window needs the
+**Requirements.** The Logs window needs the
 [Microsoft Edge WebView2 Evergreen runtime](https://developer.microsoft.com/microsoft-edge/webview2/);
 when it is missing, HFDesk says so, and the server, tray icon, and web UI all
 keep working. A second launch detects the running instance and opens its web
 UI instead of starting another server.
 
 The desktop app writes a rotating log to
-`%LocalAppData%\HFDesk\logs\hfdesk.log`, shown live in Runtime / Logs. Both
+`%LocalAppData%\HFDesk\logs\hfdesk.log`, shown live in the Logs window. Both
 builds accept the logging options:
 
 ```bash
