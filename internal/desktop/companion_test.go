@@ -258,22 +258,161 @@ func assertPageReachesOutNowhere(t *testing.T, page, context string) {
 	}
 }
 
+// The header action strips of the fallback document, verbatim: the step of
+// the state leads, the open of the log file follows, the retry comes last,
+// and a state that proves no step leaves the header to the two buttons it
+// has always had. The classes are part of the pin: beside a step the ONE
+// primary button of the header is that step, and the open of the log file
+// takes the secondary place — without a step it keeps the primary place it
+// has always had.
+const (
+	logsHeaderStepStart = `<div class="actions">` +
+		`<button class="btn btn-primary" id="start-service" type="button">Start service</button>` +
+		`<button class="btn" id="open-log-file" type="button">Open the log file</button>` +
+		`<button class="btn" id="try-again" type="button">Try again</button>` +
+		`</div>` + "\n"
+	logsHeaderStepInstall = `<div class="actions">` +
+		`<button class="btn btn-primary" id="install-service" type="button">Install service...</button>` +
+		`<button class="btn" id="open-log-file" type="button">Open the log file</button>` +
+		`<button class="btn" id="try-again" type="button">Try again</button>` +
+		`</div>` + "\n"
+	logsHeaderNoStep = `<div class="actions">` +
+		`<button class="btn btn-primary" id="open-log-file" type="button">Open the log file</button>` +
+		`<button class="btn" id="try-again" type="button">Try again</button>` +
+		`</div>` + "\n"
+)
+
+// headerActions returns the header action strip of a rendered fallback
+// document — its buttons verbatim, in their order — and fails the test
+// when the document carries no header at all.
+func headerActions(t *testing.T, page string) string {
+	t.Helper()
+	start := strings.Index(page, `<div class="actions">`)
+	end := strings.Index(page, "</header>")
+	if start < 0 || end < start {
+		t.Fatalf("the document carries no header action strip:\n%s", page)
+	}
+	return page[start:end]
+}
+
+// TestLogsFallbackPageOffersTheServiceActionOfItsState pins the header of
+// every shape of the model: the step of the state leads as the ONE primary
+// button, the open of the log file follows in its secondary place and the
+// retry comes last — a stopped registration offers Start service and never
+// the installation, a machine without a registration offers Install
+// service... and never the start, and a state that proves no step keeps
+// the header exactly as it has always been. Every shape still carries one
+// local script, no link and nothing that reaches out of the document, and
+// a document without a log path offers its step beside the retry alone.
+func TestLogsFallbackPageOffersTheServiceActionOfItsState(t *testing.T) {
+	const logPath = `C:\ProgramData\HFDesk\logs\hfdesk.log`
+
+	for _, tc := range []struct {
+		name   string
+		state  string
+		action logsServiceAction
+		header string
+		// forbidden is the OTHER step — and its button — that this
+		// state must never show beside its own.
+		forbidden []string
+	}{
+		{
+			name:      "a stopped registration offers the start",
+			state:     "The HFDesk service is stopped.",
+			action:    logsServiceActionStart,
+			header:    logsHeaderStepStart,
+			forbidden: []string{"Install service", `id="install-service"`},
+		},
+		{
+			name:      "a machine without a registration offers the installation",
+			state:     "HFDesk is not registered as a Windows service.",
+			action:    logsServiceActionInstall,
+			header:    logsHeaderStepInstall,
+			forbidden: []string{"Start service", `id="start-service"`},
+		},
+		{
+			name:   "a state that proves no step keeps the header as it was",
+			state:  "The state of the Windows service could not be read.",
+			action: logsServiceActionNone,
+			header: logsHeaderNoStep,
+			forbidden: []string{
+				"Start service", "Install service",
+				`id="start-service"`, `id="install-service"`,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			page := logsFallbackPage(logsFallbackState{
+				State:         tc.state,
+				Address:       "http://127.0.0.1:18080",
+				LogPath:       logPath,
+				Log:           serviceLogSection{Path: logPath, Tail: "newest line"},
+				ServiceAction: tc.action,
+			})
+			if got := headerActions(t, page); got != tc.header {
+				t.Errorf("the header =\n%s\nwant:\n%s", got, tc.header)
+			}
+			for _, unwanted := range tc.forbidden {
+				if strings.Contains(page, unwanted) {
+					t.Errorf("the document carries %q beside the one step of its state:\n%s", unwanted, page)
+				}
+			}
+			if count := strings.Count(page, "<script"); count != 1 {
+				t.Errorf("the document carries %d script elements, want exactly the one local script", count)
+			}
+			assertPageReachesOutNowhere(t, page, "the fallback with a step")
+			assertNamesWithout(t, page, "the fallback with a step", nil, []string{"<a ", "href="})
+		})
+	}
+
+	t.Run("a document without a log path offers the step and the retry alone", func(t *testing.T) {
+		page := logsFallbackPage(logsFallbackState{
+			State:         "The HFDesk service is stopped.",
+			Note:          "The address of the web UI is not known.",
+			ServiceAction: logsServiceActionStart,
+		})
+		want := `<div class="actions">` +
+			`<button class="btn btn-primary" id="start-service" type="button">Start service</button>` +
+			`<button class="btn" id="try-again" type="button">Try again</button>` +
+			`</div>` + "\n"
+		if got := headerActions(t, page); got != want {
+			t.Errorf("the pathless header =\n%s\nwant:\n%s", got, want)
+		}
+		assertNamesWithout(t, page, "the pathless document with a step", nil,
+			[]string{`id="open-log-file"`, "Open the log file"})
+		assertPageReachesOutNowhere(t, page, "the pathless document with a step")
+	})
+}
+
 // TestLogsFallbackPageScriptCallsOnlyBoundActionNames pins the source of
 // truth of the bridge names: the document's script may reference ONLY the
-// names substituted from openLogFileAction and logsTryAgainAction — the
-// very constants companionWindowActions binds as its map keys — so
-// renaming a constant without the script (or the script without the
-// constant) cannot pass: the template derives the names at generation
-// time, and this test fails outright if any other literal name reaches
-// the script, if a substitution placeholder leaks into the document, or
-// if a constant stops being a usable JavaScript identifier.
+// names substituted from openLogFileAction, logsTryAgainAction,
+// logsStartServiceAction and logsInstallServiceAction — the very
+// constants companionWindowActions binds as its map keys — so renaming a
+// constant without the script (or the script without the constant) cannot
+// pass: the template derives the names at generation time, and this test
+// fails outright if any other literal name reaches the script, if a
+// substitution placeholder leaks into the document, or if a constant stops
+// being a usable JavaScript identifier.
 //
 // It also pins the element ids the script looks up by: an id renamed in
 // one of its two places is a dead button, and the click would silently do
-// nothing.
+// nothing. Each state renders its OWN service button — the start document
+// carries no install button and the install document no start button —
+// while the script of every document wires both, because the guarded
+// wiring of an element that is not there is a no-op.
 func TestLogsFallbackPageScriptCallsOnlyBoundActionNames(t *testing.T) {
 	identifier := regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
-	for _, name := range []string{openLogFileAction, logsTryAgainAction} {
+	bound := map[string]bool{
+		openLogFileAction:        true,
+		logsTryAgainAction:       true,
+		logsStartServiceAction:   true,
+		logsInstallServiceAction: true,
+	}
+	for _, name := range []string{
+		openLogFileAction, logsTryAgainAction,
+		logsStartServiceAction, logsInstallServiceAction,
+	} {
 		if !identifier.MatchString(name) {
 			t.Fatalf("%q is not a JavaScript identifier: "+
 				"substituting it would produce a script that cannot parse", name)
@@ -281,35 +420,46 @@ func TestLogsFallbackPageScriptCallsOnlyBoundActionNames(t *testing.T) {
 	}
 
 	page := logsFallbackPage(logsFallbackState{
-		State:   "The HFDesk service is stopped.",
-		Address: "http://127.0.0.1:18080",
-		LogPath: `C:\ProgramData\HFDesk\logs\hfdesk.log`,
+		State:         "The HFDesk service is stopped.",
+		Address:       "http://127.0.0.1:18080",
+		LogPath:       `C:\ProgramData\HFDesk\logs\hfdesk.log`,
+		ServiceAction: logsServiceActionStart,
+	})
+	installPage := logsFallbackPage(logsFallbackState{
+		State:         "HFDesk is not registered as a Windows service.",
+		Note:          "The registration names no address, so there is nothing to open.",
+		ServiceAction: logsServiceActionInstall,
 	})
 
 	// Every window.<name> reference of the document is one of THE bound
 	// actions: no foreign name may sit beside them, and each one carries
 	// its guard and its call (twice).
-	bound := map[string]bool{openLogFileAction: true, logsTryAgainAction: true}
 	counts := map[string]int{}
 	refs := regexp.MustCompile(`window\.[A-Za-z_$][A-Za-z0-9_$]*`).FindAllString(page, -1)
-	if len(refs) < 4 {
+	if len(refs) < 8 {
 		t.Errorf("the script references bound actions %d time(s), want the guard and the call of each: %v",
 			len(refs), refs)
 	}
 	for _, ref := range refs {
 		name := strings.TrimPrefix(ref, "window.")
 		if !bound[name] {
-			t.Errorf("the document calls %q, want only %q and %q: a foreign name is a dead button",
-				ref, openLogFileAction, logsTryAgainAction)
+			t.Errorf("the document calls %q, want only the four bound service and window actions: "+
+				"a foreign name is a dead button", ref)
 		}
 		counts[name]++
 	}
-	for _, name := range []string{openLogFileAction, logsTryAgainAction} {
+	for _, name := range []string{
+		openLogFileAction, logsTryAgainAction,
+		logsStartServiceAction, logsInstallServiceAction,
+	} {
 		if counts[name] < 2 {
 			t.Errorf("the script references %q %d time(s), want its guard and its call", name, counts[name])
 		}
 	}
-	for _, placeholder := range []string{logsFallbackOpenPlaceholder, logsFallbackTryPlaceholder} {
+	for _, placeholder := range []string{
+		logsFallbackOpenPlaceholder, logsFallbackTryPlaceholder,
+		logsFallbackStartPlaceholder, logsFallbackInstallPlaceholder,
+	} {
 		if strings.Contains(page, placeholder) {
 			t.Errorf("the document carries the unsubstituted placeholder %q: the generation step is broken:\n%s",
 				placeholder, page)
@@ -326,16 +476,27 @@ func TestLogsFallbackPageScriptCallsOnlyBoundActionNames(t *testing.T) {
 	}
 	for _, name := range regexp.MustCompile(`hfdesk[A-Za-z0-9_$]*`).FindAllString(script, -1) {
 		if !bound[name] {
-			t.Errorf("the script carries the literal %q, want only openLogFileAction %q and logsTryAgainAction %q: "+
-				"a hardcoded name is a dead button", name, openLogFileAction, logsTryAgainAction)
+			t.Errorf("the script carries the literal %q, want only the four bound action names: "+
+				"a hardcoded name is a dead button", name)
 		}
 	}
 
-	// The buttons are looked up by the very ids the markup carries.
+	// The buttons are looked up by the very ids the markup carries: the
+	// document of the stopped state carries the start button and no
+	// install button, the document of the machine without a registration
+	// the other way round.
 	assertNames(t, page, "the bridge elements", []string{
 		`id="open-log-file"`, `getElementById("open-log-file")`,
 		`id="try-again"`, `getElementById("try-again")`,
+		`id="start-service"`, `getElementById("start-service")`,
+		`getElementById("install-service")`,
 	})
+	assertNamesWithout(t, page, "the stopped document", nil, []string{`id="install-service"`})
+	assertNames(t, installPage, "the bridge elements of the install document", []string{
+		`id="install-service"`, `getElementById("install-service")`,
+		`getElementById("start-service")`,
+	})
+	assertNamesWithout(t, installPage, "the install document", nil, []string{`id="start-service"`})
 }
 
 // TestLogsFallbackPageHonestShapesAndEscapesEverything proves the honest
