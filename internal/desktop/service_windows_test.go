@@ -943,10 +943,10 @@ func TestLaunchServiceHelperResolvesTheConsoleLookupOnlyWhenUpdating(t *testing.
 			})
 			messages := recordMessages(t)
 
-			pid, err := launchServiceHelper(tc.action, 0, testGateSingleton)
+			launch, err := launchServiceHelper(tc.action, 0, testGateSingleton)
 			assertNoError(t, err, "launch the %s helper: %v", tc.action, err)
-			if pid != 4242 {
-				t.Errorf("the %s helper reports the process %d, want 4242", tc.action, pid)
+			if !launch.started || launch.pid != 4242 {
+				t.Errorf("the %s helper reports %+v, want a started helper of the process 4242", tc.action, launch)
 			}
 			if lookups != tc.wantLookups {
 				t.Errorf("the %s consulted the console lookup %d times, want %d", tc.action, lookups, tc.wantLookups)
@@ -3231,6 +3231,61 @@ func TestServiceHelperStartRejectsAVanishedRegistration(t *testing.T) {
 	}
 	if len(*messages) != 1 || !strings.Contains((*messages)[0].text, "registration of the service is gone") {
 		t.Fatalf("the helper showed %v, want the report of the vanished registration", *messages)
+	}
+}
+
+// TestServiceHelperReportsNameNoLogFileUnlessThisRunHasOne proves the honest
+// exception of the log-path rule for the helper itself: a hand-typed helper
+// command line — --service-action WITHOUT --log-file — starts a run that
+// installs no logging pipeline and writes no log file of its own, so NONE of
+// its reports may name a log path. A path line would name a file this run
+// never writes and that may not exist, which is the very dishonesty the rule
+// forbids. A host launch passes --log-file, and its reports name that file
+// exactly once: the host records the action and the exit of its helper there.
+//
+// Two failure classes of the same run are driven per case — an action the
+// helper does not know and an action that needs a missing registration —
+// because the path line is the standard line of the whole failure family
+// (failureWindowText) and must follow the run's log file, not the report.
+// The established map of the windows that DO carry the line stays pinned in
+// TestFailureWindowsNameTheLogFileOfThisLaunch; this test pins the new
+// exception explicitly.
+func TestServiceHelperReportsNameNoLogFileUnlessThisRunHasOne(t *testing.T) {
+	const hostLog = `C:\Users\ada\AppData\Local\HFDesk\logs\hfdesk.log`
+	for _, tc := range []struct {
+		name    string
+		logFile string
+		want    int
+	}{
+		{name: "a hand-typed command line names no file", logFile: "", want: 0},
+		{name: "a host launch names its log exactly once", logFile: hostLog, want: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := &fakeServiceManager{statuses: []service.Status{{State: service.StateNotInstalled}}}
+			replaceSeam(t, &newServiceManager, func(service.Scope) (service.Manager, error) {
+				return manager, nil
+			})
+			messages := recordMessages(t)
+
+			if err := RunServiceAction(ServiceActionOptions{Action: "reboot", LogFile: tc.logFile}); err == nil {
+				t.Error("the helper accepted an action it does not know")
+			}
+			if err := RunServiceAction(ServiceActionOptions{Action: "stop", LogFile: tc.logFile}); err == nil {
+				t.Error("the stop of a machine without a registration reported success")
+			}
+
+			if len(*messages) != 2 {
+				t.Fatalf("the helper showed %d reports, want the two failures: %v", len(*messages), *messages)
+			}
+			for _, message := range *messages {
+				if got := strings.Count(message.text, "The log file is at"); got != tc.want {
+					t.Errorf("the report names the log file %d times, want %d:\n%s", got, tc.want, message.text)
+				}
+				if tc.want == 1 && !strings.Contains(message.text, hostLog) {
+					t.Errorf("the report does not name the log file of the launching host %q:\n%s", hostLog, message.text)
+				}
+			}
+		})
 	}
 }
 

@@ -15,13 +15,14 @@ import (
 //
 // The host assigns it when its logging pipeline is installed, so a window of
 // a launch that has no log file of its own — the single instance refusal, a
-// command line error, a log that could not be opened, a second launch — names
-// no file, because there is none to name. The elevated helper assigns the
-// path the launching host passed to it (ServiceActionOptions.LogFile,
-// falling back to the default per-user path for a hand-typed command line),
-// so a report the helper shows names the log the host of this session writes:
-// the host records every service action it launches and the exit of its
-// helper there.
+// command line error, a log that could not be opened, a second launch, and a
+// helper run of a hand-typed command line — names no file, because there is
+// none to name: such a run writes nothing to any log. The elevated helper
+// assigns exactly the path the launching host passed to it
+// (ServiceActionOptions.LogFile) and none when the command line carries
+// none, so a report the helper shows names the log the host of this session
+// writes: the host records every service action it launches and the exit of
+// its helper there.
 var runLogPath string
 
 // logFileLine returns the one standard line every failure window carries:

@@ -356,6 +356,149 @@ func TestTrayServiceActionsRefreshTheMenuAfterEveryUnsuccessfulOutcome(t *testin
 	}
 }
 
+// TestTrayServiceActionHoldsTheGuardForAHelperWithoutAProcessRecord proves
+// the guard policy for the launch outcome the process id used to hide: the
+// shell started the helper but named no process for it, so nothing can wait
+// for its exit while it may still move the registration. The single
+// service-action guard is held for the bounded hold instead of being
+// released silently at the launch, every second request of ANY action in
+// that window is refused with the honest busy report and launches nothing,
+// and the hold ends like the run of a waited-for helper: the guard is
+// released and the menu catches up.
+//
+// Deleting the bounded hold fails this test at the guard check right after
+// the launch; releasing the guard at the launch fails it at the same check;
+// a second action that slips through fails the launch count or the caption
+// check of the refusals.
+func TestTrayServiceActionHoldsTheGuardForAHelperWithoutAProcessRecord(t *testing.T) {
+	freshServiceInstallGuard(t)
+	replaceSeam(t, &untrackedHelperHoldBudget, 2*time.Second)
+	var refreshes atomic.Int32
+	replaceSeam(t, &serviceMenuRefresh, func() { refreshes.Add(1) })
+	replaceSeam(t, &waitForServiceActionHelper, func(pid uint32) {
+		t.Errorf("a helper without a process record was waited for by the process id %d", pid)
+	})
+	replaceSeam(t, &confirmServiceAction, func(string, string) bool { return true })
+	launches := 0
+	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+		launches++
+		// The branch under test: the shell started the helper and named
+		// no process for it.
+		return 0, nil
+	})
+	messages := recordMessages(t)
+
+	performServiceActionFromTray(serviceActionUninstall, testGateSingleton)
+
+	if launches != 1 {
+		t.Fatalf("the action launched %d helpers, want exactly one", launches)
+	}
+	if !serviceActionRunning.Load() {
+		t.Fatal("the guard was released at a launch whose helper may still perform its mutation")
+	}
+	if got := refreshes.Load(); got != 0 {
+		t.Fatalf("the launch itself asked for the menu catch-up %d times, want the hold to ask when it ends", got)
+	}
+
+	// The second request of every surface is refused with the busy report
+	// in the hold window — no state read, no confirmation, no dialog and
+	// above all no second helper beside the possibly live one.
+	if handover := installServiceFromTray(testGateSingleton); handover != nil {
+		handover.close()
+		t.Error("the install item handed over during the bounded hold of another action")
+	}
+	openRegisteredServiceFromTray(testGateSingleton)
+	for _, action := range []serviceAction{
+		serviceActionStart, serviceActionStop, serviceActionUpdate, serviceActionUninstall,
+	} {
+		performServiceActionFromTray(action, testGateSingleton)
+	}
+	if launches != 1 {
+		t.Fatalf("the refused requests launched %d new helpers, want none: %d launches in total",
+			launches-1, launches)
+	}
+	if len(*messages) != 6 {
+		t.Fatalf("the refused requests showed %d message boxes, want one per request: %v",
+			len(*messages), *messages)
+	}
+	for _, message := range *messages {
+		if message.caption != serviceActionBusyCaption {
+			t.Errorf("the refusal is captioned %q, want %q", message.caption, serviceActionBusyCaption)
+		}
+	}
+
+	// The bounded hold ends like a finished action: the guard is released
+	// and the menu is re-read exactly once.
+	waitForTrayCondition(t, "the bounded hold to end with the guard release and the menu catch-up",
+		func() bool {
+			return !serviceActionRunning.Load() && refreshes.Load() == 1
+		})
+}
+
+// TestTrayServiceActionReleasesTheGuardWhenTheLaunchStartedNothing proves
+// the other launch outcome keeps the end path it always had: a launch that
+// started NO helper — here the declined console-program notice of an update,
+// whose decline stays quiet — releases the guard immediately and asks for the
+// menu catch-up at once, and no busy state survives: the next request runs
+// its ordinary flow instead of being refused.
+//
+// Together with the bounded-hold case above this pins that the two launch
+// outcomes stay apart: conflating them either releases the guard beside a
+// possibly live helper or holds it for a launch that never happened.
+func TestTrayServiceActionReleasesTheGuardWhenTheLaunchStartedNothing(t *testing.T) {
+	freshServiceInstallGuard(t)
+	var refreshes atomic.Int32
+	replaceSeam(t, &serviceMenuRefresh, func() { refreshes.Add(1) })
+	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+		return registeredStoppedService(), nil
+	})
+	replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+		return "", errors.New("the pair of this release is missing")
+	})
+	replaceSeam(t, &consoleDownloadOfferFor, func(string) (*consoleDownloadOffer, error) {
+		return nil, nil
+	})
+	replaceSeam(t, &showSiblingMissingNotice, func(siblingMissingNotice) siblingMissingAnswer {
+		return siblingMissingDismiss
+	})
+	replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+		t.Error("the declined console-program notice launched an elevated helper")
+		return 0, nil
+	})
+	messages := recordMessages(t)
+
+	performServiceActionFromTray(serviceActionUpdate, testGateSingleton)
+
+	if serviceActionRunning.Load() {
+		t.Error("a launch that started nothing kept the service-action guard")
+	}
+	if got := refreshes.Load(); got != 1 {
+		t.Errorf("the menu catch-up was asked %d times, want exactly once after the declined notice", got)
+	}
+	if len(*messages) != 0 {
+		t.Errorf("the declined notice showed %v, want the decline to stay quiet", *messages)
+	}
+
+	// No busy state survives the decline: the next action enters its
+	// ordinary flow — it asks its confirmation instead of being refused.
+	confirmations := 0
+	replaceSeam(t, &confirmServiceAction, func(string, string) bool {
+		confirmations++
+		return false
+	})
+	performServiceActionFromTray(serviceActionStop, testGateSingleton)
+
+	if confirmations != 1 {
+		t.Errorf("the next action reached its confirmation %d times, want its ordinary flow beside a free guard",
+			confirmations)
+	}
+	for _, message := range *messages {
+		if message.caption == serviceActionBusyCaption {
+			t.Errorf("the next action was refused as busy after a launch that started nothing: %v", *messages)
+		}
+	}
+}
+
 // TestServiceHelperStopStopsTheService proves the helper action itself: the
 // state is read before the stop, the stop runs, the state is read until it
 // settled, and the report is the state plus the one way back — with no
