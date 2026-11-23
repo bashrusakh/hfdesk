@@ -658,6 +658,15 @@ func serviceNotInstalledText(action serviceAction) string {
 		// not ask. The state is settled, so the report names it alone.
 		return failureWindowText("HFDesk is not installed as a Windows service.\n\n" +
 			"There is no service to stop.")
+	case serviceActionUninstall:
+		// The removal gets its own honest form instead of the start of
+		// the default branch: the state plus the absent object — there
+		// is no registration to remove — and no next action either,
+		// with the same settled-absence reasoning as the stop: sending
+		// a user who asked to remove a registration to its installation
+		// would answer a different question.
+		return failureWindowText("HFDesk is not installed as a Windows service.\n\n" +
+			"There is no service registration to remove.")
 	default:
 		there = "There is no service to start."
 	}
@@ -873,14 +882,18 @@ func serviceActionFailureBody(action serviceAction, err error, program string) s
 // could not be verified — and an error no site classified gets the honest
 // state of a start that did not finish. No headline of this family ever
 // claims a "could not confirm" vagueness again, not even the legacy shape.
-// Every classified class keeps its one observed line below the headline, and
-// the not-ready class is the only one whose report names a budget — the one
-// the failing wait actually applied. The kept-registration branch states the
-// uncertainty the cleanup actually left — the registration may remain — and
-// names the one action that resolves it: the read of the state. The removed
-// branch never shares its wording with a machine that never had a
-// registration: it says what this attempt removed, not that HFDesk was never
-// installed.
+//
+// The report keeps the compressed form decided on 2026-11-23: the headline
+// carries the class — and for the not-ready class the budget the failing
+// wait actually applied, the only place any budget is spoken — while the
+// ONE line below carries only the cause facts of the detail chain (the
+// state word, the exit code and the like). The class is never repeated
+// under its headline, so the class and the budget each occur exactly once.
+// The kept-registration branch states the uncertainty the cleanup actually
+// left — the registration may remain — and names the one action that
+// resolves it: the read of the state. The removed branch never shares its
+// wording with a machine that never had a registration: it says what this
+// attempt removed, not that HFDesk was never installed.
 //
 // The cleanup fact itself is stated exactly once: the detail carries the
 // cause and the one line the cleanup observed as a reason, never the
@@ -890,11 +903,7 @@ func serviceActionFailureBody(action serviceAction, err error, program string) s
 func serviceInstallStartFailureText(err error, program string, cleanup *service.InstallStartError) string {
 	detail := installStartDetail(err, cleanup)
 	removed := cleanup != nil && cleanup.RegistrationRemoved
-	text := serviceInstallStartHeadline(cleanup) + "\n\n"
-	if outcome := serviceStartOutcomeText(cleanup); outcome != "" {
-		text += outcome + "\n\n"
-	}
-	text += detail + "\n\n"
+	text := serviceInstallStartHeadline(cleanup) + "\n\n" + detail + "\n\n"
 	if removed {
 		return failureWindowText(text + "The failed instance was settled and the registration created by this attempt was removed: this installation attempt left no registration behind, so start the desktop app normally again.")
 	}
@@ -913,13 +922,13 @@ func serviceInstallStartFailureText(err error, program string, cleanup *service.
 }
 
 // serviceInstallStartHeadline returns the headline of a failed first start:
-// every classified class names itself, so the reader sees the class before
-// the observed line below it. An error that no site classified — the empty
-// Outcome of a record built without one, or a value no class owns — gets the
-// honest state of a start that did not finish, with the cause following as
-// the detail. The budget is read only for the not-ready class and only from
-// the field the failing wait stamped; a not-ready record without one names
-// no number.
+// every classified class names itself, so the class — and for the not-ready
+// class the budget — is spoken exactly once, in this headline. An error that
+// no site classified — the empty Outcome of a record built without one, or a
+// value no class owns — gets the honest state of a start that did not finish,
+// with the cause following as the one line below. The budget is read only for
+// the not-ready class and only from the field the failing wait stamped; a
+// not-ready record without one names no number.
 func serviceInstallStartHeadline(cleanup *service.InstallStartError) string {
 	if cleanup != nil {
 		switch cleanup.Outcome {
@@ -959,32 +968,6 @@ func installStartDetail(err error, cleanup *service.InstallStartError) string {
 		detail += " — " + cleanup.CleanupError.Error()
 	}
 	return detail
-}
-
-// serviceStartOutcomeText returns the one-line class of the start failure a
-// report carries: the started process ended before it came up, the started
-// service did not come up within the budget that actually elapsed (named with
-// that very value), or the started service could not be verified. A start that
-// was not performed states its class in the headline itself and adds no second
-// line, and an error classified by no site carries no class line at all: its
-// headline states the honest unfinished start and the cause stays the detail.
-func serviceStartOutcomeText(cleanup *service.InstallStartError) string {
-	if cleanup == nil {
-		return ""
-	}
-	switch cleanup.Outcome {
-	case service.StartOutcomeEnded:
-		return "The start ran, but the service process ended before it came up."
-	case service.StartOutcomeNotReady:
-		if cleanup.Budget > 0 {
-			return fmt.Sprintf("The start ran, but the service did not come up within %s.", cleanup.Budget)
-		}
-		return "The start ran, but the service did not come up within the readiness budget."
-	case service.StartOutcomeUnverified:
-		return "The start ran, but the installation could not verify the started service."
-	default:
-		return ""
-	}
 }
 
 // helperNotReadyError reports that the elevated helper was started but never
