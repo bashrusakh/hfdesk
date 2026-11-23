@@ -286,6 +286,19 @@ falls back to the console sink alone, reports the failure on the standard
 error of the process and keeps serving. The failure of the log file never
 changes the exit code of the host.
 
+On Windows the owner-only rule is completed by one grant for exactly this
+log: the restrictive descriptor the installation gives the directories it
+creates would otherwise leave the interactive user without read access to
+the very file the Logs window names. At every start the instance adds read
+access for interactive users to its log directory and to the active log
+file — but only when their access list is still exactly the instance's own
+restrictive list (SYSTEM, the administrators and the account of the
+instance, nothing else). A directory the user named, a descriptor somebody
+else widened or locked down, and the state and config descriptors are never
+changed, and nothing is removed from any list. The rotated generations keep
+the descriptor they carried as the active file. A log that still cannot be
+read reports its one-line reason in the window, as before.
+
 The records of the instance also reach the supervisor through the standard
 error of the process: the systemd journal on Linux. On macOS the property
 list sets **no** `StandardOutPath` and **no** `StandardErrorPath`: launchd
@@ -791,8 +804,12 @@ same service at the same time.
   control manager moves it outside what HFDesk updates keep: every update of
   that registration is refused until the supported identity is restored (see
   [Upgrading to a binary in another folder](#upgrading-to-a-binary-in-another-folder)).
-- The service-owned state under `%ProgramData%\HFDesk` is ACL-restricted. The
-  service does **not** recursively re-ACL or re-own an existing model or cache
+- The service-owned state under `%ProgramData%\HFDesk` is ACL-restricted —
+  with one exception for the log: the log directory and the active log file
+  also grant interactive users read at every start of the instance, so the
+  log the Logs window names is readable from outside the window (see
+  [Logs](#logs)). The service does **not** recursively re-ACL or re-own an
+  existing model or cache
   tree: changing the ownership of a large, possibly shared tree is an explicit
   decision of an administrator, not a side effect of an install.
 
@@ -875,7 +892,9 @@ replaces the other.
   single service-action guard refuses a second service action while one is
   in flight, whichever surface or item started it. When that address does
   not answer (or names none), the window shows an honest local page
-  instead: the state of the service, the address that did not answer stated
+  instead: the state of the service, with the step that fits it as the
+  first action (**Start service** for a registered service that does not
+  run, **Install service…** when none is installed), the address that did not answer stated
   as plain text, the path of the service log file with the action **Open
   the log file** that opens it, the bounded tail of that same log under the
   heading **Service log**, and **Try again** to re-read the live page.
