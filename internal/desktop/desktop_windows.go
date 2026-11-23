@@ -872,12 +872,12 @@ func showRuntimeWindow(window *runtimeWindow, url string, webview2Ready bool) {
 // not available.
 //
 // The host keeps running: the server and the tray keep working, and the
-// action shows the same message again.
+// action shows the same message again. The report carries the standard
+// log-path line of every failure window of a launch that has a log, like
+// the tray companion's mirror of it.
 func reportWebView2Missing(url string) {
 	showMessage("HFDesk - the Runtime / Logs window is not available",
-		"The Microsoft Edge WebView2 runtime is not installed, so the Runtime / Logs window cannot be shown.\n\n"+
-			"Install the Evergreen runtime from\nhttps://developer.microsoft.com/microsoft-edge/webview2/\n\n"+
-			"HFDesk keeps running in the notification area. The web UI is still available at "+url+".",
+		runtimeWindowUnavailableText(url),
 		windows.MB_ICONWARNING)
 }
 

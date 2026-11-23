@@ -461,6 +461,93 @@ func TestServiceInstalledTextNamesTheProgramTheAddressAndTheData(t *testing.T) {
 	}
 }
 
+// TestServiceInstalledTextCarriesTheAuthorizedTrayFallbackOnce pins the one
+// conditional instruction the user authorized for the report of a finished
+// installation (decision of 2026-11-23): the line appears exactly once in this
+// report, it states the state plus one human action and names no mechanism,
+// and it belongs to this report alone — the update and the start reports never
+// carry it.
+//
+// The report's rule of at most one next step stays intact with the line in
+// place: the address instruction remains the only unconditional action, no
+// other route sits beside it, and the tray line is not counted as a second
+// step because it is conditional — it speaks only for the rare restart that
+// left no tray icon. That conditional form is the acknowledged exception this
+// report carries by the same authorization, so a second UNCONDITIONAL step
+// still fails here while the conditional line itself must stay exactly once.
+func TestServiceInstalledTextCarriesTheAuthorizedTrayFallbackOnce(t *testing.T) {
+	const (
+		console = `C:\portable\hfdesk.exe`
+		dataDir = `C:\ProgramData\HFDesk`
+		address = "http://127.0.0.1:8080"
+	)
+	install := serviceInstalledText("1.3.0", console, dataDir, address)
+
+	// The line is present exactly once — a duplicated fallback would read
+	// as a second instruction of the same report.
+	if got := strings.Count(install, serviceInstalledTrayFallbackLine); got != 1 {
+		t.Errorf("the report carries the tray fallback %d times, want exactly once:\n%s", got, install)
+	}
+	// The report keeps its shape: the state comes first, the conditional
+	// line sits right after the consequence it qualifies and before the
+	// closing fact about the data of the service.
+	if !strings.HasPrefix(install, "HFDesk 1.3.0 is installed as a Windows service.") {
+		t.Errorf("the report %q does not open with its state", install)
+	}
+	if !strings.Contains(install, "open the address above.\n\n"+serviceInstalledTrayFallbackLine) {
+		t.Errorf("the report %q does not carry the fallback right after the address consequence:\n%s", install, install)
+	}
+	if !strings.HasSuffix(install, "do not appear in the service.") {
+		t.Errorf("the report %q does not end with the data fact:\n%s", install, install)
+	}
+
+	// The conditional form IS the exception: the line opens with its own
+	// condition, so it prescribes an action only for the rare failure it
+	// names and never counts as a second next step of the report.
+	if !strings.HasPrefix(serviceInstalledTrayFallbackLine, "If the tray icon does not appear") {
+		t.Errorf("the tray line %q does not open with its condition", serviceInstalledTrayFallbackLine)
+	}
+	// The one next step stays exactly one: the address instruction is the
+	// only unconditional action, and no alternative route sits beside it.
+	if got := strings.Count(install, "open the address above"); got != 1 {
+		t.Errorf("the report carries the address instruction %d times, want exactly once:\n%s", got, install)
+	}
+	for _, route := range []string{
+		"hfdesk service", "Start the desktop app again", "Quit HFDesk",
+		"choose Start service", "Install the service again", "Run \"",
+	} {
+		if strings.Contains(install, route) {
+			t.Errorf("the report carries a second route %q:\n%s", route, install)
+		}
+	}
+
+	// The line names no mechanism: no account, no right, no code path.
+	lower := strings.ToLower(serviceInstalledTrayFallbackLine)
+	for _, mechanism := range []string{
+		"nt authority", "localservice", "localsystem", "account", "permission", "administrator",
+		"elevated", "execute", "traverse", "read access", "write access",
+		`c:\`, ".exe", "hfdesk service", "path", "%",
+		"flag", "guard", "mutex", "singleton", "claim", "handover",
+		"registry", "service control manager", "scm",
+	} {
+		if strings.Contains(lower, mechanism) {
+			t.Errorf("the tray line names the mechanism %q: %q", mechanism, serviceInstalledTrayFallbackLine)
+		}
+	}
+
+	// The line belongs to this report alone: the update (in both of its
+	// states) and the start report carry neither it nor any tray wording.
+	for name, text := range map[string]string{
+		"the update of a running service": serviceUpdatedText("1.3.0", console, dataDir, address, true, service.StateRunning),
+		"the update of a stopped service": serviceUpdatedText("1.3.0", console, dataDir, address, false, service.StateStopped),
+		"the start report":                serviceStartedText(console, address),
+	} {
+		if strings.Contains(text, serviceInstalledTrayFallbackLine) || strings.Contains(text, "tray icon") {
+			t.Errorf("the %s carries the tray fallback:\n%s", name, text)
+		}
+	}
+}
+
 // TestServiceActionFailureTextOfAnAlreadyRegisteredFirstInstall proves that a
 // first-install refusal of an existing registration is reported as the
 // unchanged state it left: this attempt wrote no registration, so the report
@@ -505,8 +592,8 @@ func TestServiceActionFailureTextOfAnAlreadyRegisteredFirstInstall(t *testing.T)
 			// installation command beside it would be a second route.
 			`"hfdesk service install"`,
 			"elevated shell",
-			// The folder guidance is the guidance of a failure whose cause is
-			// unknown: the refusal states its own cause.
+			// No account or folder mechanism beside the report: the
+			// refusal states its own cause.
 			program,
 			`NT AUTHORITY\LocalService`,
 		})
@@ -607,38 +694,29 @@ func TestServiceActionFailureTextIsTheResultTheCauseAndOneAction(t *testing.T) {
 	assertNamesWithout(t, start, "the report of the start", nil, []string{"registration may remain", "hfdesk service uninstall", "were not touched"})
 }
 
-// TestServiceActionFailureTextNamesTheFolderOfTheProgram proves that the report of
-// a failed installation names the program the action could not put into service
-// and the access the folder of that program needs.
-//
-// The sentence states the requirement and does not tell the user to move the
-// program: the Windows service runs as LocalService, so that account must be able
-// to execute the program and to traverse its folder; read access is demanded only
-// where a handler genuinely needs it. An update and a start report
-// leave the folder out: they describe a registration that already ran, so the
-// folder of the program is not the likely cause there.
-func TestServiceActionFailureTextNamesTheFolderOfTheProgram(t *testing.T) {
+// TestServiceActionFailureTextNamesNoFolderAccessMechanism proves the
+// folder guidance stays out of every failure report: the sentence that named
+// the service account and its execute/traverse/read rights over the folder of
+// the program was internal mechanism, a justification and a legal hedge
+// beside the one action of the report — the rule of the sixth plan item
+// allows none of that. A failure report is result, cause and one action, so
+// no account identity, no access right and no program path returns to it.
+func TestServiceActionFailureTextNamesNoFolderAccessMechanism(t *testing.T) {
 	reason := errors.New("the service control manager refused the registration")
 	const program = `C:\portable\hfdesk.exe`
 
-	text := serviceActionFailureText(serviceActionInstall, reason, program)
-	assertNames(t, text, "the report of the installation is", []string{program, `NT AUTHORITY\LocalService`, "must be able to execute", "traverse the folder"})
-
-	for _, action := range []serviceAction{serviceActionUpdate, serviceActionStart} {
+	for _, action := range []serviceAction{serviceActionInstall, serviceActionUpdate, serviceActionStart} {
 		text := serviceActionFailureText(action, reason, program)
-		for _, unwanted := range []string{program, `NT AUTHORITY\LocalService`} {
-			if strings.Contains(text, unwanted) {
-				t.Errorf("the report of %q is %q, want no %q for a registration that already ran", action, text, unwanted)
-			}
-		}
+		assertNamesWithout(t, text, fmt.Sprintf("the report of %s", action), nil, []string{
+			program, `NT AUTHORITY\LocalService`, "must be able to execute", "traverse the folder", "read access",
+		})
 	}
 
-	// A caller that does not know the program still names the requirement: the
-	// guidance is not withheld because one path of the action has no program.
+	// A caller that does not know the program carries no general form of
+	// the retired guidance either.
 	unknown := serviceActionFailureText(serviceActionInstall, reason, "")
-	if !strings.Contains(unknown, "must be able to execute the program and to traverse the folder that holds it") {
-		t.Errorf("the report without a program is %q, want the general form of the guidance", unknown)
-	}
+	assertNamesWithout(t, unknown, "the report without a program", nil,
+		[]string{"must be able to execute the program and to traverse the folder that holds it"})
 }
 
 // TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft proves that
@@ -658,7 +736,9 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 	cleanupErr := errors.New("the service process identity changed")
 	cleanup := &service.InstallStartError{Cause: reason, CleanupError: cleanupErr}
 	kept := serviceInstallStartFailureText(cleanup, program, cleanup)
-	assertNames(t, kept, "the kept-install report", []string{reason.Error(), cleanupErr.Error(), "registration was kept", "could not prove", "hfdesk service status", program})
+	assertNamesWithout(t, kept, "the kept-install report",
+		[]string{reason.Error(), cleanupErr.Error(), "registration was kept", "could not prove", "hfdesk service status"},
+		[]string{program, `NT AUTHORITY\LocalService`})
 	if strings.Contains(kept, "the service does not run") {
 		t.Errorf("the kept-install report %q claims more than the cleanup established", kept)
 	}
@@ -1676,19 +1756,21 @@ func TestFailureWindowsNameTheLogFileOfThisLaunch(t *testing.T) {
 		"the busy refusal":         serviceActionBusyText(),
 		"the not-ready report": serviceHelperNotReadyText(serviceActionInstall,
 			&helperNotReadyError{cause: errors.New("the service helper exited before it became ready")}),
-		"the launch-failure report":      serviceLaunchFailedText(serviceActionInstall, cause),
-		"the unknown-action report":      unknownServiceActionText(errors.New("unknown service action")),
-		"the preparation refusal":        serviceHandoverRefusedText(cause),
-		"the unfinished-install report":  serviceHandoverFailureText(cause),
-		"the unreadable gate notice":     serviceGateUnreadableText(cause),
-		"the changed gate notice":        serviceGateChangedText(serviceChoicePrompt{State: service.StateRunning}),
-		"the download failure":           consoleDownloadFailedText(downloadNotice, cause),
-		"the missing-program notice":     siblingMissingManualNoticeText(notice),
-		"the browser failure":            browserOpenFailedText("http://127.0.0.1:8080", cause),
-		"the tray-startup failure":       trayStartupFailureText(),
-		"the runtime-window failure":     runtimeWindowShowFailedText(errors.New("the window could not be shown")),
-		"the service-log open failure":   serviceLogOpenFailedText(`C:\ProgramData\HFDesk\logs\hfdesk.log`, cause),
-		"the service-log missing report": serviceLogMissingText(`C:\ProgramData\HFDesk\logs\hfdesk.log`),
+		"the launch-failure report":             serviceLaunchFailedText(serviceActionInstall, cause),
+		"the unknown-action report":             unknownServiceActionText(errors.New("unknown service action")),
+		"the preparation refusal":               serviceHandoverRefusedText(cause),
+		"the unfinished-install report":         serviceHandoverFailureText(cause),
+		"the unreadable gate notice":            serviceGateUnreadableText(cause),
+		"the changed gate notice":               serviceGateChangedText(serviceChoicePrompt{State: service.StateRunning}),
+		"the download failure":                  consoleDownloadFailedText(downloadNotice, cause),
+		"the missing-program notice":            siblingMissingManualNoticeText(notice),
+		"the browser failure":                   browserOpenFailedText("http://127.0.0.1:8080", cause),
+		"the tray-startup failure":              trayStartupFailureText(),
+		"the runtime-window failure":            runtimeWindowShowFailedText(errors.New("the window could not be shown")),
+		"the service-log open failure":          serviceLogOpenFailedText(`C:\ProgramData\HFDesk\logs\hfdesk.log`, cause),
+		"the service-log missing report":        serviceLogMissingText(`C:\ProgramData\HFDesk\logs\hfdesk.log`),
+		"the pending gate notice":               serviceGatePendingText(service.StateStarting),
+		"the runtime-window unavailable report": runtimeWindowUnavailableText("http://127.0.0.1:8080"),
 	}
 	for name, text := range windows {
 		if !strings.Contains(text, wantLine) {
@@ -1753,6 +1835,11 @@ func TestGateAndReportsCarryNoInternalMechanism(t *testing.T) {
 		"singleton", "mutex", "claim", "handover", "rotation",
 		// The two justifications the gate used to argue with.
 		"two instances never compete", "Update re-registers",
+		// The account/access mechanism class: a service account or an
+		// execute/traverse/read right named as the mechanism of a
+		// failure — the folder guidance these reports used to carry.
+		"nt authority", "localservice", "account", "permission",
+		"must be able to", "execute", "traverse", "read access", "write access",
 	}
 	cause := errors.New("the state of the service could not be settled")
 	program := `C:\portable\hfdesk.exe`
@@ -1782,6 +1869,9 @@ func TestGateAndReportsCarryNoInternalMechanism(t *testing.T) {
 		"the kept-start failure": serviceInstallStartFailureText(
 			&service.InstallStartError{Cause: cause, CleanupError: errors.New("the process identity changed")}, program,
 			&service.InstallStartError{Cause: cause, CleanupError: errors.New("the process identity changed")}),
+		"the removed-start failure": serviceInstallStartFailureText(
+			&service.InstallStartError{Cause: cause, RegistrationRemoved: true}, program,
+			&service.InstallStartError{Cause: cause, RegistrationRemoved: true}),
 		"the already-registered refusal": serviceActionFailureText(serviceActionInstall,
 			fmt.Errorf("service: hfdesk is already registered%w", service.ErrAlreadyRegistered), program),
 		"the not-ready report": serviceHelperNotReadyText(serviceActionStart,
@@ -1807,6 +1897,24 @@ func TestGateAndReportsCarryNoInternalMechanism(t *testing.T) {
 				t.Errorf("the %s carries the internal word %q:\n%s", name, word, text)
 			}
 		}
+	}
+
+	// The stop-list really catches the sentence class it was extended
+	// for: the account/access sentence of the retired folder guidance.
+	// Without this control the class words could be dropped again and
+	// every text above would still pass.
+	mechanism := strings.ToLower(`The Windows service runs as NT AUTHORITY\LocalService, so that account ` +
+		`must be able to execute the program and to traverse the folder that holds it; ` +
+		`it needs read access to the program only where a handler genuinely needs it.`)
+	caught := false
+	for _, word := range banned {
+		if strings.Contains(mechanism, word) {
+			caught = true
+			break
+		}
+	}
+	if !caught {
+		t.Error("the stop-list does not catch the account/access mechanism sentence")
 	}
 }
 
@@ -1852,5 +1960,50 @@ func TestInstallStartFailureStatesTheCleanupFactOnce(t *testing.T) {
 		[]string{"HFDesk is not installed as a Windows service", "(the failed instance was settled"})
 	if got := strings.Count(removedText, "removed"); got != 1 {
 		t.Errorf("the removed report states the cleanup fact %d times, want once:\n%s", got, removedText)
+	}
+}
+
+// TestInstallFailureReportsStateTheCauseInOneLineAndOneAction proves the
+// shape rule of the sixth plan item for the reports of a failed
+// installation beside their classes: the cause of the error is ONE line —
+// the start cause and the one line its cleanup observed are one line of the
+// report, never two paragraphs the reader has to join — and the report
+// carries exactly one action.
+//
+// The count is taken over the action vocabulary of these reports (the state
+// command and the relaunch of the desktop app), so "exactly one" is a count
+// and not a hope: a second command or a second route fails here. The
+// account/access mechanism sentence cannot slip back beside the count —
+// that class fails the stop-list of
+// TestGateAndReportsCarryNoInternalMechanism.
+func TestInstallFailureReportsStateTheCauseInOneLineAndOneAction(t *testing.T) {
+	cause := errors.New("the first installation did not put the new executable into service")
+	reason := errors.New("the service process identity changed")
+	kept := &service.InstallStartError{Cause: cause, CleanupError: reason}
+	causeOnly := &service.InstallStartError{Cause: cause}
+	removed := &service.InstallStartError{Cause: cause, CleanupError: reason, RegistrationRemoved: true}
+	const program = `C:\portable\hfdesk.exe`
+
+	for name, detail := range map[string]string{
+		"cause and cleanup reason": installStartDetail(kept, kept),
+		"cause alone":              installStartDetail(causeOnly, causeOnly),
+	} {
+		if strings.ContainsAny(detail, "\r\n") {
+			t.Errorf("the %s is %q, want the whole cause on one line", name, detail)
+		}
+	}
+
+	const (
+		statusCommand = "hfdesk service"
+		relaunchAgain = "start the desktop app"
+	)
+	for name, text := range map[string]string{
+		"the installation failure":  serviceActionFailureText(serviceActionInstall, cause, program),
+		"the kept-start failure":    serviceInstallStartFailureText(kept, program, kept),
+		"the removed-start failure": serviceInstallStartFailureText(removed, program, removed),
+	} {
+		if got := strings.Count(text, statusCommand) + strings.Count(text, relaunchAgain); got != 1 {
+			t.Errorf("the %s carries %d actions, want exactly one:\n%s", name, got, text)
+		}
 	}
 }

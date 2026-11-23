@@ -455,9 +455,15 @@ func loadCompanionServiceLog() serviceLogSection {
 // and the tail the page shows speak about the same file — and a machine
 // without a readable registration falls back to the default of the
 // machine-wide scope.
+//
+// The read is a display read like every other one of this host, so it asks
+// the menu to catch up right after it ran — a failed read included — and a
+// result read can never stay invisible in the menu until the next tick.
 func companionServiceLogPath() string {
+	status, err := serviceState.readForDisplay()
+	requestServiceMenuCatchUp()
 	registered := ""
-	if status, err := serviceState.readForDisplay(); err == nil && status.Paths.LogDir != "" {
+	if err == nil && status.Paths.LogDir != "" {
 		registered = status.Paths.LogDir
 	}
 	return serviceLogPath(registered)

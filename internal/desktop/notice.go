@@ -80,6 +80,20 @@ func runtimeWindowShowFailedText(err error) string {
 	return failureWindowText(fmt.Sprintf("The Runtime / Logs window could not be shown.\n\n%v", err))
 }
 
+// runtimeWindowUnavailableText returns the text of the report of a Runtime /
+// Logs window that cannot be shown because the WebView2 runtime is missing.
+//
+// The host keeps running: the server and the tray keep working, and the
+// action shows the same message again. The report is a failure window of
+// this launch like every other — the state (the window cannot be shown) and
+// the one action (install the runtime) beside the standard log-path line,
+// in the words the tray companion's mirror of it already carries.
+func runtimeWindowUnavailableText(url string) string {
+	return failureWindowText("The Microsoft Edge WebView2 runtime is not installed, so the Runtime / Logs window cannot be shown.\n\n" +
+		"Install the Evergreen runtime from\nhttps://developer.microsoft.com/microsoft-edge/webview2/\n\n" +
+		"HFDesk keeps running in the notification area. The web UI is still available at " + url + ".")
+}
+
 // publishStateStartupText returns the report of a launch that could not
 // publish its effective URL and therefore stopped without serving.
 //
