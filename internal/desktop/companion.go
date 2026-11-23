@@ -9,6 +9,7 @@ import (
 	"html"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -209,6 +210,113 @@ func serviceLogPath(registeredLogDir string) string {
 	return filepath.Join(paths.LogDir, serviceLogFileName)
 }
 
+// The bounds of the service log tail the fallback document shows.
+//
+// The tail is the END of the file and it is read under both limits, so a
+// large log never reaches the document as a whole: the byte bound caps the
+// read itself — the file is seeked to its end and only the last
+// serviceLogTailBytes are read — and the line bound caps what a tail of
+// that size renders. The document states nothing of the limits; they are the
+// honest volume bound of this view, pinned by test.
+const (
+	serviceLogTailBytes = 64 * 1024
+	serviceLogTailLines = 200
+)
+
+// readServiceLogTail returns the tail of the log file at path under the
+// documented bounds: at most serviceLogTailBytes from the end of the file,
+// cut to whole lines, at most serviceLogTailLines of them, in file order and
+// ending with the newest line.
+//
+// A file that cannot be opened or read returns its error; a read that was
+// bound reports no error — the bound is the view, not a failure.
+func readServiceLogTail(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	// Only the end of the file is read: everything before the window is
+	// seeked over, never loaded.
+	var start int64
+	if info, statErr := file.Stat(); statErr == nil && info.Size() > serviceLogTailBytes {
+		start = info.Size() - serviceLogTailBytes
+	}
+	if start > 0 {
+		if _, err := file.Seek(start, io.SeekStart); err != nil {
+			return "", err
+		}
+	}
+	data, err := io.ReadAll(io.LimitReader(file, serviceLogTailBytes))
+	if err != nil {
+		return "", err
+	}
+	text := string(data)
+	if start > 0 {
+		// The bound cut a line in half at its start: that fragment is
+		// dropped, so the tail begins with a whole line.
+		if newline := strings.IndexByte(text, '\n'); newline >= 0 {
+			text = text[newline+1:]
+		} else {
+			text = ""
+		}
+	}
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimSuffix(line, "\r")
+	}
+	if last := len(lines) - 1; last >= 0 && lines[last] == "" {
+		lines = lines[:last]
+	}
+	if len(lines) > serviceLogTailLines {
+		lines = lines[len(lines)-serviceLogTailLines:]
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+// serviceLogSection is the service-log part of the fallback document of the
+// Logs window: the path of the file, and exactly one of the honest shapes the
+// section shows — the bounded tail of a readable file, the fact that the
+// file does not exist yet, or the one-line reason it could not be read. An
+// empty section (no path) claims nothing and renders no content.
+type serviceLogSection struct {
+	// Path is the service log file this section speaks about — the very
+	// file the open-the-log-file action opens. Empty when no path could
+	// be resolved.
+	Path string
+	// Missing reports the file does not exist: the service has not
+	// written a log yet.
+	Missing bool
+	// ReadError is the one-line reason the file could not be read
+	// (permissions and the like), empty when it could.
+	ReadError string
+	// Tail is the bounded tail of the file, newest line last.
+	Tail string
+}
+
+// serviceLogSectionAt reads the service-log section from the file at path.
+//
+// The states are the honest ones: a file that is not there is missing, a
+// file that cannot be read carries its reason as a single line, and a
+// readable file carries its bounded tail.
+func serviceLogSectionAt(path string) serviceLogSection {
+	section := serviceLogSection{Path: path}
+	if path == "" {
+		return section
+	}
+	tail, err := readServiceLogTail(path)
+	switch {
+	case err == nil:
+		section.Tail = tail
+	case os.IsNotExist(err):
+		section.Missing = true
+	default:
+		section.ReadError = oneLine(err.Error())
+	}
+	return section
+}
+
 // oneLine collapses a multi-line machine message into the one line the
 // window shows it on.
 func oneLine(message string) string {
@@ -401,7 +509,8 @@ func resolveLogsWindow(resolve func() string, fallback func() string) (string, s
 // nothing and listens to nothing — the invariant of the companion is that
 // nothing of it listens, and a local document honors that by having no
 // channel to any server. Its single script only forwards the fixed
-// host-bound actions to the functions the window bound.
+// host-bound actions to the functions the window bound and scrolls the
+// tail box to its end.
 type logsFallbackState struct {
 	// State is the honest one-line state of the service, the heading of
 	// the document.
@@ -418,6 +527,11 @@ type logsFallbackState struct {
 	// file. Empty when none could be resolved: the document then states
 	// that fact and offers no action with nothing to open.
 	LogPath string
+	// Log is the service-log section: the bounded tail of that same log
+	// file, or the honest state of a file that does not exist yet or
+	// could not be read. The zero value claims nothing and renders no
+	// section content.
+	Log serviceLogSection
 }
 
 // The placeholders of the script template the page builder replaces with
@@ -435,17 +549,21 @@ const (
 )
 
 // logsFallbackScriptTemplate is the only script of the fallback document,
-// and it performs exactly one local operation with no channel of any kind:
-// it forwards the two fixed action names to the functions the window
-// bound on the host side — open the log file, and retry the live page.
+// and it performs exactly two local operations with no channel of any kind:
+// it forwards the two fixed action names to the functions the window bound
+// on the host side — open the log file, and retry the live page — and
+// scrolls the service-log tail box to its end, so the document shows the
+// END of that log.
 //
 // Nothing here fetches, listens or carries data out of the document: the
 // paths never travel through the page (the host owns them), and the
 // invariant of the companion — nothing of it listens — is unchanged.
-// Both wirings guard their element, so a document without one of the
-// buttons runs the script as a no-op.
+// Every wiring guards its element, so a document without one of the
+// elements runs that part as a no-op.
 const logsFallbackScriptTemplate = `<script>
 (function () {
+	var tail = document.getElementById("service-log-tail");
+	if (tail) { tail.scrollTop = tail.scrollHeight; }
 	var open = document.getElementById("open-log-file");
 	if (open && window.` + logsFallbackOpenPlaceholder + `) {
 		open.addEventListener("click", function () { window.` + logsFallbackOpenPlaceholder + `(); });
@@ -475,9 +593,11 @@ func logsFallbackScript() string {
 // stylesheet from; that is exactly why it is a document and not a page.
 // It states the honest state of the service, the address that did not
 // answer (or the honest reason there is none), the path of the service log
-// file with the action that opens it, and the one action that retries the
-// live page. Everything the model carries is escaped, so a value from the
-// machine can never become markup.
+// file with the action that opens it, the bounded tail of that same log
+// under its own **Service log** section — or the honest state of a file
+// that is not there or could not be read — and the one action that retries
+// the live page. Everything the model carries is escaped, so a value from
+// the machine can never become markup.
 func logsFallbackPage(state logsFallbackState) string {
 	var page strings.Builder
 	page.WriteString(`<!doctype html>
@@ -520,6 +640,7 @@ body { margin: 0; background: var(--color-bg); color: var(--color-text); font-fa
 .stat-label { font-size: 11px; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
 .stat-empty { font-size: 13px; color: var(--color-text-muted); }
 code { font-family: var(--font-mono); font-size: 12px; background: var(--color-bg-tertiary); border: 1px solid var(--color-border); border-radius: var(--radius-sm); padding: 3px 8px; overflow-wrap: anywhere; color: var(--color-text-secondary); }
+pre { font-family: var(--font-mono); font-size: 12px; background: var(--color-bg-tertiary); border: 1px solid var(--color-border); border-radius: var(--radius-sm); padding: 8px 10px; margin: 0; max-height: 340px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--color-text-secondary); }
 .btn { font: inherit; font-size: 13px; padding: 7px 14px; border: 1px solid var(--color-border-light); border-radius: var(--radius-sm); background: var(--color-surface); color: var(--color-text); cursor: pointer; }
 .btn:hover { background: var(--color-surface-hover); }
 .btn-primary { background: var(--color-primary); border-color: var(--color-primary); color: #fff; }
@@ -560,7 +681,28 @@ code { font-family: var(--font-mono); font-size: 12px; background: var(--color-b
 	} else {
 		page.WriteString("<span class=\"stat-empty\">The log file is not known.</span>")
 	}
-	page.WriteString("</div>\n</section>\n</div>\n")
+	page.WriteString("</div>\n</section>\n")
+
+	section := state.Log
+	if section.Path != "" || section.Missing || section.ReadError != "" || section.Tail != "" {
+		// The service-log section speaks only when the model carries
+		// a source: one heading and exactly one of the honest shapes
+		// of that file — the bounded tail ending with the newest
+		// line, the fact that the file is not there yet, or the
+		// one-line reason it could not be read.
+		page.WriteString("<section class=\"strip\">\n<div class=\"stat\"><div class=\"stat-label\">Service log</div>")
+		switch {
+		case section.Missing:
+			page.WriteString("<span class=\"stat-empty\">The service log file has not been created yet.</span>")
+		case section.ReadError != "":
+			reason := html.EscapeString(strings.TrimSuffix(section.ReadError, "."))
+			page.WriteString("<span class=\"stat-empty\">The service log file could not be read: " + reason + ".</span>")
+		case section.Tail != "":
+			page.WriteString("<pre id=\"service-log-tail\">" + html.EscapeString(section.Tail) + "</pre>")
+		}
+		page.WriteString("</div>\n</section>\n")
+	}
+	page.WriteString("</div>\n")
 	page.WriteString(logsFallbackScript())
 	page.WriteString("</body>\n</html>\n")
 	return page.String()

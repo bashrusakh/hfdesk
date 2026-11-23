@@ -18,9 +18,11 @@ import (
 // confirmation of the installation carries the facts the user has to know
 // before a machine-wide registration is written.
 //
-// The registration survives the desktop app, it needs administrator rights, and
-// its data is not the data of the desktop. A confirmation that left one of them
-// out would let the user agree to something they did not read.
+// The registration survives the desktop app and its data is not the data of
+// the desktop. A confirmation that left one of them out would let the user
+// agree to something they did not read. No administrator-rights or
+// Windows-prompt sentence appears anywhere in it (decision of 2026-11-24):
+// the Windows prompt that follows states that itself.
 func TestInstallServiceTextStatesWhatTheRegistrationChanges(t *testing.T) {
 	const dataDir = `C:\ProgramData\HFDesk`
 	text := installServiceText(dataDir, false)
@@ -28,8 +30,6 @@ func TestInstallServiceTextStatesWhatTheRegistrationChanges(t *testing.T) {
 	assertNames(t, text, "the confirmation", []string{
 		"starts at boot",
 		"keeps running after this window closes",
-		"administrator rights",
-		"Windows prompt",
 		"The one file HFDesk can download",
 		"only after its SHA-256 is verified",
 		"nothing else is downloaded or copied",
@@ -38,6 +38,8 @@ func TestInstallServiceTextStatesWhatTheRegistrationChanges(t *testing.T) {
 		dataDir,
 		"are not there",
 	})
+	assertNamesWithout(t, text, "the confirmation", nil,
+		[]string{"administrator", "Windows prompt"})
 	// The narrowed rule must not read as the old blanket claim: the
 	// desktop app CAN download one file now, so "nothing is downloaded or
 	// copied" without the qualifier is the wording that must be gone.
@@ -395,7 +397,10 @@ func TestServiceUpdatedTextReportsARunningService(t *testing.T) {
 	const address = "http://127.0.0.1:8080"
 	text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, true, service.StateRunning, launchSurfaceDesktop, "")
 
-	assertNames(t, text, "the report", []string{address, "not needed to use the service", `C:\portable\hfdesk.exe`, "keeps the settings"})
+	// The settings fact stays pinned in the wording of the prescribed
+	// report line — "The registration now runs … — settings and data
+	// kept." (decision of 2026-11-24).
+	assertNames(t, text, "the report", []string{address, "not needed to use the service", `C:\portable\hfdesk.exe`, "settings and data kept"})
 }
 
 // TestServiceUpdatedTextNamesTheObservedPriorState proves that the report of a
@@ -1327,10 +1332,16 @@ func TestNewSiblingMissingNoticeNamesFileFolderAndOneAction(t *testing.T) {
 
 	// The labels of the links and the note of the download command link
 	// are the approved copy; the note states size, release, the check and
-	// what follows it.
-	assertNames(t, siblingMissingDownloadLabel, "the primary label", []string{"Download it and continue"})
+	// what follows it, and the manual route opens the release page its
+	// instruction text names.
+	assertNames(t, siblingMissingDownloadLabel, "the primary label", []string{"Download and install now"})
 	assertNames(t, siblingMissingDismissLabel, "the dismiss label", []string{"Not now"})
-	assertNames(t, siblingMissingManualLabel, "the manual label", []string{"Install it manually instead"})
+	assertNames(t, siblingMissingManualLabel, "the manual label", []string{"Open the release page"})
+	assertNames(t, siblingMissingManualNote, "the manual note", []string{
+		"Download the file there",
+		"put it next to hfdesk-desktop.exe",
+		"run the action again",
+	})
 	assertNames(t, siblingMissingRetryLabel, "the retry label", []string{"Try again"})
 	assertNames(t, siblingMissingDetailsLabel, "the details label", []string{"Details"})
 	assertNames(t, logFileOpenLabel, "the log label", []string{"Open the log file"})
@@ -1340,6 +1351,17 @@ func TestNewSiblingMissingNoticeNamesFileFolderAndOneAction(t *testing.T) {
 		"SHA-256 checked",
 		"then the usual install steps",
 	})
+	// The page the manual route opens is ONE URL: the same string the
+	// manual instruction text names, both derived from the release of
+	// this build's own name.
+	if notice.ReleaseURL != releaseTagPagePrefix+testReleaseTag {
+		t.Errorf("the release page is %q, want the URL of this build's release %q",
+			notice.ReleaseURL, releaseTagPagePrefix+testReleaseTag)
+	}
+	if !strings.Contains(notice.Manual, notice.ReleaseURL) {
+		t.Errorf("the manual text %q does not carry the release page %q the route opens",
+			notice.Manual, notice.ReleaseURL)
+	}
 
 	// The claim the feature falsified must be gone from every surface of
 	// the notice.
@@ -1392,6 +1414,12 @@ func TestNewSiblingMissingNoticeWithoutAReleaseKeepsManualInstructionsOnly(t *te
 	})
 	if strings.Contains(notice.Manual, "Get release") {
 		t.Errorf("the manual text %q names a release for a local build", notice.Manual)
+	}
+	// A local build names no release page: there is nothing the manual
+	// route could open, so the notice carries no URL beside its
+	// instructions.
+	if notice.ReleaseURL != "" {
+		t.Errorf("the notice of a local build carries the release page %q, want none", notice.ReleaseURL)
 	}
 }
 
@@ -1495,8 +1523,10 @@ func TestSiblingMissingNoticeStatesTheReasonOfAnUnavailableDownload(t *testing.T
 			}
 			// The reason never leaves the notice silent: the manual
 			// route and the way to ask the release again are the
-			// approved labels the links carry.
-			assertNames(t, siblingMissingManualLabel, "the manual label", []string{"Install it manually instead"})
+			// approved labels the links carry — for these notices the
+			// desktop name carries a release, so the manual route is
+			// the page-opening item.
+			assertNames(t, siblingMissingManualLabel, "the manual label", []string{"Open the release page"})
 			assertNames(t, siblingMissingRetryLabel, "the retry label", []string{"Try again"})
 		})
 	}
@@ -1877,33 +1907,38 @@ var deletionClaimForms = []string{
 // TestStopAndRemoveConfirmationsStateTheActionAndTheOneFact proves that the
 // two confirmations that guard the new machine-wide changes follow the shape
 // of the installation confirmation and the text rule of the reports: what the
-// action does, the administrator rights it needs, the one fact the user has
-// to see before agreeing, and the question — with no internal mechanism and
-// no claim about a state the confirmation did not read.
+// action does, the one fact the user has to see before agreeing, and the
+// question — with no internal mechanism and no claim about a state the
+// confirmation did not read. Neither of them carries the rights sentence any
+// more (decision of 2026-11-24), pinned for every action confirmation in
+// TestServiceActionConfirmationsCarryNoAdministratorPhrase.
 func TestStopAndRemoveConfirmationsStateTheActionAndTheOneFact(t *testing.T) {
 	stop := stopServiceConfirmText()
 	assertNames(t, stop, "the stop confirmation", []string{
 		"This stops the HFDesk service.",
-		"administrator rights",
-		"Windows prompt follows",
 		"Nothing serves the address of the service until you start it again.",
 		"Do you want to stop the service?",
 	})
 	// The confirmation names no state of its own: the state the menu item
 	// was enabled by can be stale by the time the box is read, and no
-	// mechanism of the stop is the user's business.
+	// mechanism of the stop is the user's business — and it repeats no
+	// rights sentence.
 	assertNamesWithout(t, stop, "the stop confirmation", nil, []string{
 		"service control manager", "SCM", "registry", "is running", "was running",
+		"administrator", "Windows prompt",
 	})
 
 	remove := removeServiceConfirmText(false)
 	assertNames(t, remove, "the removal confirmation", []string{
 		"removes the Windows service registration of HFDesk",
-		"administrator rights",
-		"Windows prompt follows",
 		"settings, jobs, models, cache, history and logs stay untouched",
 		"Do you want to remove the registration?",
 	})
+	// The rights sentence is gone from this confirmation entirely — the
+	// Windows prompt that follows states it itself (decision of
+	// 2026-11-24).
+	assertNamesWithout(t, remove, "the removal confirmation", nil,
+		[]string{"administrator", "Windows prompt"})
 	// The invariant of the removal is stated as what stays, and the
 	// confirmation never claims that any data is deleted — in any of the
 	// singular or plural, past or perfect shapes of such a claim.
@@ -1918,6 +1953,53 @@ func TestStopAndRemoveConfirmationsStateTheActionAndTheOneFact(t *testing.T) {
 		t.Errorf("the confirmations share a caption: %q, %q, %q",
 			stopServiceConfirmCaption, removeServiceConfirmCaption, installServiceCaption)
 	}
+}
+
+// TestServiceActionConfirmationsCarryNoAdministratorPhrase pins the
+// decision of 2026-11-24 over EVERY confirmation of a service action: the
+// install (in both of its shapes), the stop, the start, the update and the
+// removal (in both of its variants) never repeat the administrator-rights or
+// Windows-prompt sentence — the Windows prompt that follows states that
+// itself — and each keeps its exact prescribed form.
+func TestServiceActionConfirmationsCarryNoAdministratorPhrase(t *testing.T) {
+	const dataDir = `C:\ProgramData\HFDesk`
+	for name, text := range map[string]string{
+		"the installation confirmation":                installServiceText(dataDir, false),
+		"the installation confirmation on a bad drive": installServiceText(dataDir, true),
+		"the stop confirmation":                        stopServiceConfirmText(),
+		"the start confirmation":                       startServiceConfirmText(),
+		"the update confirmation":                      updateServiceConfirmText(),
+		"the removal confirmation with a handover":     removeServiceConfirmText(true),
+		"the removal confirmation without a handover":  removeServiceConfirmText(false),
+	} {
+		lower := strings.ToLower(text)
+		for _, phrase := range []string{"administrator", "windows prompt"} {
+			if strings.Contains(lower, phrase) {
+				t.Errorf("the %s carries %q, want no rights sentence:\n%s", name, phrase, text)
+			}
+		}
+	}
+
+	// The exact forms of the decision: the question, then the one line
+	// of facts — nothing else.
+	assertNames(t, startServiceConfirmText(), "the start confirmation", []string{
+		"Start the HFDesk service?",
+		"This window closes into the tray and stays there.",
+	})
+	assertNames(t, updateServiceConfirmText(), "the update confirmation", []string{
+		"Update the HFDesk service?",
+		"This window closes into the tray and stays there.",
+	})
+	assertNames(t, removeServiceConfirmText(true), "the removal confirmation with a handover", []string{
+		"Remove the HFDesk service registration?",
+		"Your data stays untouched.",
+		"HFDesk starts again in desktop mode.",
+	})
+	assertNames(t, removeServiceConfirmText(false), "the removal confirmation without a handover", []string{
+		"This removes the Windows service registration of HFDesk.",
+		"Your settings, jobs, models, cache, history and logs stay untouched.",
+		"Do you want to remove the registration?",
+	})
 }
 
 // TestServiceStoppedTextNamesTheStateTheFactAndOneWayBack proves that the
@@ -2331,6 +2413,9 @@ func TestGateAndReportsCarryNoInternalMechanism(t *testing.T) {
 		"the installation confirmation on a removable drive": installServiceText(dataDir, true),
 		"the stop confirmation":                              stopServiceConfirmText(),
 		"the removal confirmation":                           removeServiceConfirmText(false),
+		"the start confirmation with a handover":             startServiceConfirmText(),
+		"the update confirmation with a handover":            updateServiceConfirmText(),
+		"the removal confirmation with a handover":           removeServiceConfirmText(true),
 		"the service-log open failure":                       serviceLogOpenFailedText(`C:\ProgramData\HFDesk\logs\hfdesk.log`, cause),
 		"the service-log missing report":                     serviceLogMissingText(`C:\ProgramData\HFDesk\logs\hfdesk.log`),
 		"the installation failure":                           serviceActionFailureText(serviceActionInstall, cause, program),

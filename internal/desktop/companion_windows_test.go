@@ -902,8 +902,12 @@ func TestCompanionInstallRunsThroughTheCommonServiceFlow(t *testing.T) {
 		confirmations := 0
 		replaceSeam(t, &confirmServiceInstall, func(text string) bool {
 			confirmations++
-			if !strings.Contains(text, "administrator rights") {
-				t.Errorf("the confirmation %q lacks the administrator-rights sentence of the common flow", text)
+			// No rights sentence in the confirmation (decision of
+			// 2026-11-24): the Windows prompt that follows states
+			// that itself.
+			if strings.Contains(strings.ToLower(text), "administrator") ||
+				strings.Contains(text, "Windows prompt") {
+				t.Errorf("the confirmation %q carries the rights sentence, want none", text)
 			}
 			return false
 		})

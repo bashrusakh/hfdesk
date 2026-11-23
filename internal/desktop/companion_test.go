@@ -5,6 +5,7 @@ package desktop
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -401,6 +402,130 @@ func TestLogsFallbackPageHonestShapesAndEscapesEverything(t *testing.T) {
 			"&lt;b&gt;log&lt;/b&gt;",
 		})
 	})
+}
+
+// TestLogsFallbackPageCarriesTheServiceLogTail proves variant A of the
+// fallback (decision of 2026-11-24): the document carries the bounded tail
+// of the service log under its own **Service log** section beside the
+// action that opens the whole file, in every honest shape of that file —
+// the tail, the file that does not exist yet, the file that could not be
+// read — and it still reaches out of nowhere: one local script, no fetch,
+// no link, nothing listening.
+func TestLogsFallbackPageCarriesTheServiceLogTail(t *testing.T) {
+	const logPath = `C:\ProgramData\HFDesk\logs\hfdesk.log`
+
+	t.Run("a readable file shows its tail beside the open action", func(t *testing.T) {
+		page := logsFallbackPage(logsFallbackState{
+			State:   "The HFDesk service is stopped.",
+			Address: "http://127.0.0.1:18080",
+			LogPath: logPath,
+			Log:     serviceLogSection{Path: logPath, Tail: "first line\nnewest line"},
+		})
+		assertNames(t, page, "the fallback with a tail", []string{
+			`<div class="stat-label">Service log</div>`,
+			`id="service-log-tail"`,
+			"first line\nnewest line",
+			// The action that opens the whole file stays the one
+			// action of the header.
+			`id="open-log-file"`,
+			"Open the log file",
+			// The script looks the tail box up by the very id the
+			// markup carries: an id renamed in one of its two
+			// places would leave the scroll dead.
+			`getElementById("service-log-tail")`,
+		})
+		if count := strings.Count(page, "<script"); count != 1 {
+			t.Errorf("the document carries %d script elements, want exactly the one local script", count)
+		}
+		assertPageReachesOutNowhere(t, page, "the fallback with a tail")
+		assertNamesWithout(t, page, "the fallback with a tail", nil, []string{"<a ", "href="})
+	})
+
+	t.Run("a file that does not exist yet says so", func(t *testing.T) {
+		page := logsFallbackPage(logsFallbackState{
+			State:   "The HFDesk service is stopped.",
+			LogPath: logPath,
+			Log:     serviceLogSection{Path: logPath, Missing: true},
+		})
+		assertNames(t, page, "the missing shape", []string{
+			`<div class="stat-label">Service log</div>`,
+			"The service log file has not been created yet.",
+		})
+		assertNamesWithout(t, page, "the missing shape", nil, []string{`id="service-log-tail"`})
+		assertPageReachesOutNowhere(t, page, "the fallback with a missing file")
+	})
+
+	t.Run("a file that could not be read names the reason alone", func(t *testing.T) {
+		page := logsFallbackPage(logsFallbackState{
+			State:   "The HFDesk service is stopped.",
+			LogPath: logPath,
+			Log:     serviceLogSection{Path: logPath, ReadError: "access is denied."},
+		})
+		assertNames(t, page, "the unreadable shape", []string{
+			"The service log file could not be read: access is denied.",
+		})
+		assertNamesWithout(t, page, "the unreadable shape", nil, []string{`id="service-log-tail"`})
+	})
+
+	t.Run("a model without a log source claims nothing", func(t *testing.T) {
+		page := logsFallbackPage(logsFallbackState{
+			State: "The HFDesk service is stopped.",
+			Note:  "The address of the web UI is not known.",
+		})
+		assertNamesWithout(t, page, "the sectionless document", nil,
+			[]string{`<div class="stat-label">Service log</div>`, `id="service-log-tail"`})
+		assertPageReachesOutNowhere(t, page, "the sectionless document")
+	})
+}
+
+// TestReadServiceLogTailBoundsTheRead pins the mechanics the section reads
+// with: a small file is shown whole in file order ending with the newest
+// line, a file past the byte bound is read only at its end — cut to whole
+// lines and capped at the line bound — and a missing file reports the
+// not-exist error, which is the state the section turns into its honest
+// "not created yet" shape. The bound is the view, never a failure.
+func TestReadServiceLogTailBoundsTheRead(t *testing.T) {
+	small := filepath.Join(t.TempDir(), "hfdesk.log")
+	if err := os.WriteFile(small, []byte("one\ntwo\r\nthree\n"), 0o644); err != nil {
+		t.Fatalf("write the small log: %v", err)
+	}
+	tail, err := readServiceLogTail(small)
+	if err != nil {
+		t.Fatalf("readServiceLogTail(%q) failed: %v", small, err)
+	}
+	if tail != "one\ntwo\nthree" {
+		t.Errorf("the tail = %q, want the whole file in file order with the line endings normalized", tail)
+	}
+
+	big := filepath.Join(t.TempDir(), "big.log")
+	var buffer strings.Builder
+	for i := 0; i < 400; i++ {
+		fmt.Fprintf(&buffer, "line %04d %s\n", i, strings.Repeat("x", 200))
+	}
+	if err := os.WriteFile(big, []byte(buffer.String()), 0o644); err != nil {
+		t.Fatalf("write the big log: %v", err)
+	}
+	tail, err = readServiceLogTail(big)
+	if err != nil {
+		t.Fatalf("readServiceLogTail(%q) failed: %v", big, err)
+	}
+	lines := strings.Split(tail, "\n")
+	if len(lines) != serviceLogTailLines {
+		t.Errorf("the tail has %d lines, want the line bound %d", len(lines), serviceLogTailLines)
+	}
+	if len(tail) > serviceLogTailBytes {
+		t.Errorf("the tail is %d bytes, want at most the byte bound %d", len(tail), serviceLogTailBytes)
+	}
+	if !strings.HasPrefix(lines[0], "line ") || strings.HasPrefix(lines[0], "line 0000") {
+		t.Errorf("the tail starts with %q, want a whole line beyond the seeked-over prefix", lines[0])
+	}
+	if !strings.HasPrefix(lines[len(lines)-1], "line 0399") {
+		t.Errorf("the tail ends with %q, want the newest line", lines[len(lines)-1])
+	}
+
+	if _, err := readServiceLogTail(filepath.Join(t.TempDir(), "gone.log")); !os.IsNotExist(err) {
+		t.Errorf("a missing file reported %v, want the not-exist error", err)
+	}
 }
 
 // TestServiceLogPathFollowsTheRegistrationOrTheDefault pins the source of

@@ -129,7 +129,7 @@ func TestUpdateReportOffersTheOldFileCommandOnlyForAMove(t *testing.T) {
 					t.Fatalf("the report showed %v, want the plain update window alone", *messages)
 				}
 				assertNamesWithout(t, (*messages)[0].text, "the plain report", nil,
-					[]string{"before this update", "still there", deleteOldFileLabel})
+					[]string{"Old file still on disk", "may belong", deleteOldFileLabel})
 				return
 			}
 			if len(*messages) != 0 {
@@ -148,13 +148,21 @@ func TestUpdateReportOffersTheOldFileCommandOnlyForAMove(t *testing.T) {
 			}
 			assertNames(t, commands[0].text, "the command report", []string{
 				"The registration now runs " + tc.current,
-				"The registration ran " + tc.previous + " before this update, and that file is still there.",
-				"It may belong to the pair of its old folder",
+				"Old file still on disk: " + tc.previous + ".",
 				// The block sits above the way back of THIS surface,
 				// so the surface dimension really varied while the
 				// block stayed.
 				wayBack,
 			})
+			// The report states the file and nothing behind it: the
+			// cancelled pair-assumption must not come back in any
+			// spelling (decision of 2026-11-24), and the command
+			// keeps its exact label.
+			assertNamesWithout(t, commands[0].text, "the command report", nil,
+				[]string{"may belong", "old folder", "pair of"})
+			if deleteOldFileLabel != "Delete the old file" {
+				t.Errorf("the command is labelled %q, want %q", deleteOldFileLabel, "Delete the old file")
+			}
 		})
 	}
 }

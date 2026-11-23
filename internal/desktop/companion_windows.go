@@ -533,12 +533,16 @@ func companionRuntimePageURL() string {
 // completes it: the very file the open action opens, resolved fresh on
 // every render (a second display read with its own catch-up), so the path
 // the document shows and the file the action hands to the default handler
-// are always one and the same file.
+// are always one and the same file. The bounded tail of that same file is
+// read for the same render (serviceLogSectionAt — a file read, no
+// registration read), so the document shows the end of the log beside the
+// action that opens the whole file.
 func companionWindowPage() string {
 	status, err := serviceState.readForDisplay()
 	requestServiceMenuCatchUp()
 
 	state := logsFallbackState{LogPath: companionServiceLogPath()}
+	state.Log = serviceLogSectionAt(state.LogPath)
 	switch {
 	case err != nil:
 		state.State = "The state of the Windows service could not be read."

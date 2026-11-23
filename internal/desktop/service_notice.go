@@ -158,7 +158,7 @@ const (
 	// startServiceConfirmCaption is the caption of the confirmation of a
 	// start that hands this host over: the one start that closes the
 	// window the user clicked in, so the fact is read before the
-	// administrator prompt follows. A start that does not hand over has
+	// elevation prompt follows. A start that does not hand over has
 	// no confirmation and never shows this caption.
 	startServiceConfirmCaption = "HFDesk - start the Windows service"
 
@@ -240,21 +240,20 @@ const serviceProgramDriveWarningLine = "HFDesk is on a removable or network driv
 //
 // The confirmation states the facts the user has to know before a
 // machine-wide registration is written — the service starts at boot and
-// survives this window, the registration needs administrator rights, the
-// narrowed download rule, and the one surprising fact (the separate data) as
-// its single line — then asks the one question. dataDir is the state
-// directory of the service, so the text names the directory it will really
-// own.
+// survives this window, the narrowed download rule, and the one surprising
+// fact (the separate data) as its single line — then asks the one question.
+// It carries no administrator-rights or prompt sentence: the Windows prompt
+// that follows states that itself (decision of 2026-11-24). dataDir is the
+// state directory of the service, so the text names the directory it will
+// really own.
 //
 // unusualDrive adds the B2 warning as its own single line right before that
 // surprising fact: it is present exactly when the program the registration
 // runs sits on a removable or network drive, and a program on an ordinary
-// drive changes nothing — with the flag false the text is byte for byte the
-// confirmation this family has always shown.
+// drive changes nothing.
 func installServiceText(dataDir string, unusualDrive bool) string {
 	text := "This registers HFDesk as a Windows service.\n\n" +
-		"The service starts at boot and keeps running after this window closes.\n" +
-		"Installing it needs administrator rights, so a Windows prompt follows.\n\n" +
+		"The service starts at boot and keeps running after this window closes.\n\n" +
 		"HFDesk stays portable: the service runs the hfdesk program that sits next to this desktop app. The one file HFDesk can download is that missing program from its own release — only when you ask for it, and only after its SHA-256 is verified; nothing else is downloaded or copied.\n\n"
 	if unusualDrive {
 		text += serviceProgramDriveWarningLine + "\n\n"
@@ -267,88 +266,65 @@ func installServiceText(dataDir string, unusualDrive bool) string {
 // Windows service before the administrator prompt follows.
 //
 // The confirmation follows the shape of the installation confirmation: what
-// the action does, the administrator rights it needs, the one fact the user
-// has to see before agreeing — nothing serves the address of the service
-// afterwards — and the question. It names no state of its own: the state the
-// menu item was enabled by can be stale by the time the box is read, and a
-// confirmation that claimed a state the machine no longer has would ask the
-// user to agree to something that is not there. The helper reads the state
-// again and reports what it really found.
+// the action does, the one fact the user has to see before agreeing —
+// nothing serves the address of the service afterwards — and the question,
+// with no administrator-rights or prompt sentence (decision of 2026-11-24:
+// the Windows prompt that follows states that itself). It names no state of
+// its own: the state the menu item was enabled by can be stale by the time
+// the box is read, and a confirmation that claimed a state the machine no
+// longer has would ask the user to agree to something that is not there. The
+// helper reads the state again and reports what it really found.
 func stopServiceConfirmText() string {
 	return "This stops the HFDesk service.\n\n" +
-		"Stopping it needs administrator rights, so a Windows prompt follows.\n" +
 		"Nothing serves the address of the service until you start it again.\n\n" +
 		"Do you want to stop the service?"
 }
-
-// serviceHandoverCloseLine is the one fact the confirmations of a handover
-// state beside the administrator-rights sentence: this window serves HFDesk's
-// own local server, so it closes while the elevated helper acts. The two
-// lines differ because the two end states differ, and each says where the
-// host comes back — never a mechanism behind that.
-const (
-	// serviceHandoverCompanionLine is the fact of a handover whose end
-	// state leaves the host beside the service: the host comes back as a
-	// tray companion, which binds no address and therefore keeps the
-	// service's address alone.
-	serviceHandoverCompanionLine = "HFDesk serves its own local server in this window, so it closes into the tray while the administrator helper acts, and it stays in the tray afterwards."
-	// serviceHandoverReturnLine is the fact of the removal's handover: the
-	// registration is gone when the host comes back, so the address is
-	// free and the launch takes the desktop mode again.
-	serviceHandoverReturnLine = "HFDesk serves its own local server in this window, so it closes while the administrator helper acts, and it starts again in desktop mode once the registration is gone."
-)
 
 // startServiceConfirmText returns the text of the confirmation of a start
 // that hands this host over — the start of a desktop host that serves its own
 // local server, which has to close before the service can take the address.
 //
-// The shape is the one every confirmation of this family follows: what the
-// action does, the administrator rights it needs, the one fact the user has
-// to see before agreeing — this window closes and where the host comes back —
-// and the question. It names no state of the service for the same reason the
+// The text is the question and the one fact the user has to read before
+// agreeing — this window closes into the tray and stays there — and nothing
+// else: it repeats no administrator-rights or prompt sentence, because the
+// Windows prompt that follows states that itself (decision of
+// 2026-11-24). It names no state of the service for the same reason the
 // stop confirmation names none: the state the menu item was enabled by can be
 // stale by the time the box is read, and the helper reads it again.
 func startServiceConfirmText() string {
-	return "This starts the HFDesk service.\n\n" +
-		"Starting it needs administrator rights, so a Windows prompt follows.\n" +
-		serviceHandoverCompanionLine + "\n\n" +
-		"Do you want to start the service?"
+	return "Start the HFDesk service?\n\n" +
+		"This window closes into the tray and stays there."
 }
 
 // updateServiceConfirmText returns the text of the confirmation of an update
 // that hands this host over. Its shape and its honesty boundary are the ones
 // startServiceConfirmText documents.
 func updateServiceConfirmText() string {
-	return "This re-registers the HFDesk Windows service from the folder of this app.\n\n" +
-		"Updating it needs administrator rights, so a Windows prompt follows.\n" +
-		serviceHandoverCompanionLine + "\n\n" +
-		"Do you want to update the service?"
+	return "Update the HFDesk service?\n\n" +
+		"This window closes into the tray and stays there."
 }
 
 // removeServiceConfirmText returns the text of the confirmation that removes
 // the Windows service registration before the administrator prompt follows.
 //
-// The confirmation states the one invariant the removal has: only the
-// registration goes, and the data stays. That is the surprising fact of this
-// action — the fact a user has to read before agreeing — so it is the one
-// line beside the administrator-rights sentence and the question. The
+// The text carries no administrator-rights or prompt sentence — the Windows
+// prompt that follows states that itself (decision of 2026-11-24) — and the
 // confirmation claims nothing about the state of the instance: a running one
 // is stopped inside the removal, which the user does not have to orchestrate.
 //
-// handover adds the fact of the handover a desktop host that serves its own
-// local server takes — this window closes, and the host comes back in desktop
-// mode once the registration is gone — between the administrator-rights
-// sentence and the invariant. With the flag false the text is byte for byte
-// the confirmation this family has always shown, which is what every surface
-// that does not hand over (the stop's sibling, and a removal beside a host
-// that serves no address) reads.
+// handover picks between the two forms of that decision: the handover form is
+// the question plus the two facts of this action — the data stays, and this
+// window closes and comes back in desktop mode once the registration is gone
+// — while every surface that does not hand over (the stop's sibling, and a
+// removal beside a host that serves no address) reads the previous minimum
+// of the family without the rights sentence, byte for byte.
 func removeServiceConfirmText(handover bool) string {
-	text := "This removes the Windows service registration of HFDesk.\n\n" +
-		"Removing it needs administrator rights, so a Windows prompt follows.\n"
 	if handover {
-		text += serviceHandoverReturnLine + "\n"
+		return "Remove the HFDesk service registration?\n\n" +
+			"Your data stays untouched. This window closes, and HFDesk starts again in desktop mode."
 	}
-	return text + "Your settings, jobs, models, cache, history and logs stay untouched.\n\n" +
+	return "This removes the Windows service registration of HFDesk.\n\n" +
+		"Your settings, jobs, models, cache, history and logs stay untouched.\n\n" +
 		"Do you want to remove the registration?"
 }
 
@@ -628,17 +604,18 @@ func serviceInstalledText(version, console, dataDir, address string) string {
 // oldFile is the program the registration ran BEFORE this update, and only
 // when that file still exists somewhere else: an update that moved the
 // registration to another file then states the fact right after the program
-// the registration runs now — the old file is still there, and it may belong
-// to the pair of its old folder — and its window carries the one command that
-// deletes exactly that file on a deliberate press (deleteOldFileLabel). An
-// update that kept the same path, one whose old file is already gone and one
-// that failed (a rollback puts the registration back on the previous program)
-// pass the empty string, and their report is byte for byte the report this
-// function always built.
+// the registration runs now — the old file is still on the disk, stated as
+// the single fact line of serviceUpdateOldFileLines and nothing behind it,
+// with no assumption about the file — and its window carries the one command
+// that deletes exactly that file on a deliberate press (deleteOldFileLabel).
+// An update that kept the same path, one whose old file is already gone and
+// one that failed (a rollback puts the registration back on the previous
+// program) pass the empty string, and their report is byte for byte the
+// report this function always built.
 func serviceUpdatedText(version, console, dataDir, address string, running bool, before service.State,
 	surface launchSurface, oldFile string) string {
 	text := serviceVersionName(version) + " is updated as a Windows service.\n\n" +
-		"The registration now runs " + console + " and keeps the settings of the service and its data.\n\n"
+		"The registration now runs " + console + " — settings and data kept.\n\n"
 	if oldFile != "" {
 		text += serviceUpdateOldFileLines(oldFile) + "\n\n"
 	}
@@ -658,20 +635,17 @@ func serviceUpdatedText(version, console, dataDir, address string, running bool,
 	return text
 }
 
-// serviceUpdateOldFileLines returns the two lines the report of a finished
+// serviceUpdateOldFileLines returns the one line the report of a finished
 // update states beside the program the registration runs now when the
-// registration MOVED to another file and the old one is still there: the
-// fact (which file, and that it is still on the disk), and the warning the
-// user needs before deleting it — the file may belong to the pair of its old
-// folder, where its hfdesk-desktop program sits next to it, and deleting it
-// would break that pair.
+// registration MOVED to another file and the old one is still there: exactly
+// that file and the fact that it is still on the disk.
 //
-// The lines state the file and nothing behind it: no mechanism, no
-// instruction — the command that acts on the fact is the button of the
-// window, not a sentence in this text.
+// The line states the fact and nothing behind it: no assumption about the
+// file, no mechanism, no instruction — the command that acts on the fact is
+// the button of the window, not a sentence in this text (decisions of
+// 2026-11-24: reports carry facts, never guesses).
 func serviceUpdateOldFileLines(oldFile string) string {
-	return "The registration ran " + oldFile + " before this update, and that file is still there.\n" +
-		"It may belong to the pair of its old folder, where its hfdesk-desktop program sits next to it."
+	return "Old file still on disk: " + oldFile + "."
 }
 
 // serviceUpdateOldFile decides what the report of a finished update says
@@ -1297,17 +1271,27 @@ func serviceLaunchFailedText(action serviceAction, err error) string {
 // The labels of the missing-program notice.
 const (
 	// siblingMissingDownloadLabel is the primary action: the command
-	// link that fetches the paired console program and continues the
-	// service action the user invoked.
-	siblingMissingDownloadLabel = "Download it and continue"
+	// link that fetches the paired console program, puts it in place
+	// and continues the service action the user invoked.
+	siblingMissingDownloadLabel = "Download and install now"
 	// siblingMissingDismissLabel dismisses the notice and changes
 	// nothing.
 	siblingMissingDismissLabel = "Not now"
-	// siblingMissingManualLabel is the visible item that carries the
-	// instructions for putting the file in place by hand — the way the
-	// notice offered before there was a download, now a choice of its own
-	// instead of a fold.
-	siblingMissingManualLabel = "Install it manually instead"
+	// siblingMissingManualLabel is the visible item of the manual route
+	// for a desktop program that names its release: the press opens
+	// that release page in the default browser — the way to get the
+	// file by hand — instead of a fold.
+	siblingMissingManualLabel = "Open the release page"
+	// siblingMissingNoReleaseManualLabel is the label of the same route
+	// for a local build, whose name carries no release version: there
+	// is no release page to open, so the item keeps the instructions
+	// themselves instead of promising a page that does not exist.
+	siblingMissingNoReleaseManualLabel = "Install it manually instead"
+	// siblingMissingManualNote is the note under siblingMissingManualLabel:
+	// what to do on the page the press opens — download the file there,
+	// put it beside hfdesk-desktop.exe, run the action again. The URL
+	// itself never becomes text here: the press opens it.
+	siblingMissingManualNote = "Download the file there, put it next to hfdesk-desktop.exe, and run the action again."
 	// siblingMissingRetryLabel re-reads the release: it is the item that
 	// replaces the download button whenever no download can be offered,
 	// so the button never disappears without a way back.
@@ -1375,8 +1359,18 @@ type siblingMissingNotice struct {
 	// Download is the resolved offer of the paired release asset, or nil
 	// when only the manual route is shown.
 	Download *consoleDownloadOffer
-	// Manual is the text of the manual path.
+	// Manual is the text of the manual path: how to get the file
+	// without a download, ending in the URL of the release page for a
+	// desktop program that names its release. It is the text the manual
+	// link carried before that link opened the page itself, and it stays
+	// the instruction of the message box fallback and of the report of a
+	// failed download.
 	Manual string
+	// ReleaseURL is the release page of this build — the very URL the
+	// manual text names (both derive from consoleReleaseFor) — the page
+	// the manual route opens. Empty for a local build, whose name
+	// carries no release version and therefore names no page.
+	ReleaseURL string
 	// Reason is the one line that states why no download is offered, and
 	// empty when one is.
 	Reason string
@@ -1427,6 +1421,10 @@ func newSiblingMissingNotice(action serviceAction, folder, desktop string, findE
 	if missing == "" {
 		missing = consoleExecutableName + executableSuffix
 	}
+	releaseURL := ""
+	if release, namesRelease := consoleReleaseFor(desktop); namesRelease {
+		releaseURL = releaseTagPagePrefix + release.Tag
+	}
 	return siblingMissingNotice{
 		Action:      action,
 		Title:       serviceSiblingMissingCaption,
@@ -1435,6 +1433,7 @@ func newSiblingMissingNotice(action serviceAction, folder, desktop string, findE
 		Folder:      folder,
 		Download:    offer,
 		Manual:      siblingMissingManualText(folder, desktop, missing),
+		ReleaseURL:  releaseURL,
 		Reason:      siblingMissingOfferReason(offer, offerErr),
 		Details:     siblingMissingDetails(desktop, missing, findErr, offerErr),
 		LogFile:     runLogPath,
@@ -1534,12 +1533,13 @@ func siblingMissingBody(notice siblingMissingNotice) string {
 // siblingMissingManualText returns the text of the manual path: how to get
 // the file without a download and where to put it.
 //
-// A desktop program that names its release gets the release to fetch; a local
-// build names no release, so its text only states where the file goes. Both
-// end with the one action that follows: run the action again. The pairing
-// rule beside these steps is not part of them — it lives in the folded
-// details of the dialog (siblingMissingDetails), where it belongs with the
-// other cause a first glance leaves out.
+// A desktop program that names its release gets the release to fetch, with
+// the URL of its release page — the very page the manual route of the dialog
+// opens (notice.ReleaseURL); a local build names no release, so its text only
+// states where the file goes. Both end with the one action that follows: run
+// the action again. The pairing rule beside these steps is not part of them —
+// it lives in the folded details of the dialog (siblingMissingDetails), where
+// it belongs with the other cause a first glance leaves out.
 func siblingMissingManualText(folder, desktop, missing string) string {
 	where := missingProgramFolder(folder)
 	release, namesRelease := consoleReleaseFor(desktop)

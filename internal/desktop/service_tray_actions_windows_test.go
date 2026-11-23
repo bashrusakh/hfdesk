@@ -150,9 +150,15 @@ func TestNewTrayLifecycleActionsConfirmBeforeTheElevation(t *testing.T) {
 			if askedCaption != tc.confirmCaption {
 				t.Errorf("the confirmation is captioned %q, want %q", askedCaption, tc.confirmCaption)
 			}
-			if !strings.Contains(askedText, tc.confirmContains) ||
-				!strings.Contains(askedText, "administrator rights") {
-				t.Errorf("the confirmation %q does not carry its question and the administrator-rights sentence", askedText)
+			if !strings.Contains(askedText, tc.confirmContains) {
+				t.Errorf("the confirmation %q does not carry its question", askedText)
+			}
+			// No rights sentence in any action confirmation
+			// (decision of 2026-11-24): the Windows prompt that
+			// follows states that itself.
+			if strings.Contains(strings.ToLower(askedText), "administrator") ||
+				strings.Contains(askedText, "Windows prompt") {
+				t.Errorf("the confirmation %q carries the rights sentence, want none", askedText)
 			}
 			if len(*messages) != 0 {
 				t.Errorf("a declined confirmation showed %v, want no report: nothing was attempted", *messages)

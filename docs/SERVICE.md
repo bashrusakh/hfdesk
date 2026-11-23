@@ -860,9 +860,8 @@ replaces the other.
   handover that cannot be established refuses, with a report that says so.
 
   An update that moved the registration to another program file names the
-  old file in its report when that file is still on the disk, warns that it
-  may belong with the pair of its old folder, and offers its deletion as one
-  press — nothing is deleted automatically.
+  old file in its report when that file is still on the disk and offers its
+  deletion as one press — nothing is deleted automatically.
 - **Logs window.** One window — titled `HFDesk - Logs` — covers the desktop
   app and the tray companion alike. It loads the live log page of the
   address it knows: the desktop app's own server, or the registered address
@@ -878,7 +877,8 @@ replaces the other.
   not answer (or names none), the window shows an honest local page
   instead: the state of the service, the address that did not answer stated
   as plain text, the path of the service log file with the action **Open
-  the log file** that opens it, and **Try again** to re-read the live page.
+  the log file** that opens it, the bounded tail of that same log under the
+  heading **Service log**, and **Try again** to re-read the live page.
 - **Install service…** asks for confirmation first, because the registration is
   a machine-wide change that outlives the app: the service starts at boot, keeps
   running without the desktop app, needs administrator rights, and keeps its own
@@ -893,8 +893,9 @@ replaces the other.
   that folder. A desktop program whose name carries a version has no other
   candidate: a missing pair is reported in a notice that leads with one short
   line — the missing file and that the service needs it — then what the
-  program is for and the folder it is expected in, and offers to download
-  exactly that console program from the official release of this name. The
+  program is for and the folder it is expected in, and offers **Download and
+  install now** to fetch exactly that console program from the official
+  release of this name. The
   offer exists only for that versioned name; the release lookup accepts
   either spelling of that version (with or without its `v`, in any case),
   while another version or another program never matches;
@@ -905,8 +906,9 @@ replaces the other.
   it did not place, and reports the reason beside the manual steps, and after a
   verified download the very same service action continues through the usual
   confirmation and administrator prompt. The manual route is one of the
-  visible actions of the notice — **Install it manually instead**, beside the
-  download — while the pairing rule and the raw cause of a failed lookup stay
+  visible actions of the notice — **Open the release page** beside the
+  download, and pressing it opens that release page in the browser — while
+  the pairing rule and the raw cause of a failed lookup stay
   in the folded **Details**; and when no download can be offered (a build
   whose name carries no release version, a release page that could not be
   reached, a release that publishes no verified file), the notice states that

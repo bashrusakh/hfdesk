@@ -5,7 +5,7 @@
 ### Added
 
 - The Windows desktop can work as a tray companion beside an installed service — without running its own server — and after an installation it restarts as exactly that.
-- The service update report names the old program file left behind when the registration moved to another file and offers to delete it with one press, warning it may still belong with its old folder; nothing is removed automatically.
+- The service update report names the old program file left behind when the registration moved to another file and offers to delete it with one press; nothing is removed automatically.
 
 ### Changed
 
