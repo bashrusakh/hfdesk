@@ -802,22 +802,22 @@ func TestServiceInstallFailureTextStatesWhatTheFailedInstallationLeft(t *testing
 	}
 }
 
-// TestServiceInstallStartFailureTextSplitsTheStartOutcomeClasses proves that
-// every classified class of a failed first start carries its OWN headline —
-// the class the reader must see first — instead of a generic "could not
-// confirm", and that the not-ready class names the budget that actually
-// elapsed.
+// TestServiceInstallStartFailureTextSplitsTheStartOutcomeClasses proves the
+// compressed form decided on 2026-11-23: every classified class of a failed
+// first start carries its OWN headline instead of a generic "could not
+// confirm", the class and the budget are spoken exactly once — in that
+// headline — and the ONE line below carries only the cause facts of the
+// detail chain, never a repeat of the class.
 //
-// A start that was not performed states that in its headline and never claims
-// a start could not be confirmed; a start that ran carries the one observed
-// line beside its class headline — the process ended before it came up, the
-// service did not come up within the applied budget, or the started service
-// could not be verified. The budget shown is the value the failing wait
-// applied, so a different applied budget must show a different number, and no
-// class but the not-ready one may name a budget at all. An error classified by
-// no site gets the honest state of a start that did not finish plus its cause.
+// The not-ready headline names the budget the failing wait actually applied,
+// so a different applied budget must show a different number, and no class
+// but the not-ready one may name a budget at all. An error classified by no
+// site gets the honest state of a start that did not finish plus its cause.
 // The vague phrase "could not confirm" is forbidden in EVERY report of the
-// family, the legacy shape included.
+// family, the legacy shape included, and so is the old observation line: a
+// duplicate of the class under its headline fails the prefix shape check and
+// the "The start ran, but" ban at once — the mutation discrimination of
+// this form.
 func TestServiceInstallStartFailureTextSplitsTheStartOutcomeClasses(t *testing.T) {
 	program := `C:\portable\hfdesk.exe`
 	cause := errors.New("the first installation did not put the new executable into service")
@@ -829,62 +829,108 @@ func TestServiceInstallStartFailureTextSplitsTheStartOutcomeClasses(t *testing.T
 			CleanupError: errors.New("the registration was kept"),
 		}
 	}
+	causeLine := cause.Error() + " — the registration was kept"
 
+	// assertCompressedForm pins the form itself: headline, then ONE line
+	// of cause facts, then the outcome. Re-adding the old observation
+	// line breaks the prefix shape, reappears in the class-repeat ban and
+	// doubles the headline count.
+	assertCompressedForm := func(t *testing.T, text, headline, line string) {
+		t.Helper()
+		if !strings.HasPrefix(text, headline+"\n\n"+line+"\n\n") {
+			t.Errorf("the report is not headline + one cause line + outcome:\n%s", text)
+		}
+		if strings.Contains(text, "The start ran, but") {
+			t.Errorf("the report repeats the class in an observation line:\n%s", text)
+		}
+		if got := strings.Count(text, headline); got != 1 {
+			t.Errorf("the class headline appears %d times, want exactly once:\n%s", got, text)
+		}
+	}
+
+	notPerformedHeadline := "HFDesk registered the service but did not start it."
 	notPerformed := serviceInstallStartFailureText(cause, program, kept(service.StartOutcomeNotPerformed, 0))
+	assertCompressedForm(t, notPerformed, notPerformedHeadline, causeLine)
 	assertNamesWithout(t, notPerformed, "the not-performed report",
-		[]string{"HFDesk registered the service but did not start it.", cause.Error(), "registration was kept"},
+		[]string{cause.Error(), "registration was kept"},
 		[]string{"could not confirm"})
 
+	endedHeadline := "HFDesk registered the service, but the service program ended before it was ready."
 	ended := serviceInstallStartFailureText(cause, program, kept(service.StartOutcomeEnded, 0))
+	assertCompressedForm(t, ended, endedHeadline, causeLine)
 	assertNamesWithout(t, ended, "the ended report",
-		[]string{
-			"HFDesk registered the service, but the service program ended before it was ready.",
-			"ended before it came up", "registration was kept",
-		},
-		[]string{"could not confirm"})
+		[]string{endedHeadline, "registration was kept"},
+		[]string{"could not confirm", "The start ran, but", "ended before it came up"})
 
+	notReadyHeadline := "HFDesk registered the service, but the service did not come up within 45s."
 	notReady := serviceInstallStartFailureText(cause, program, kept(service.StartOutcomeNotReady, 45*time.Second))
-	assertNames(t, notReady, "the not-ready report",
-		[]string{"HFDesk registered the service, but the service did not come up within 45s.", "did not come up within 45s"})
-	assertNamesWithout(t, notReady, "the not-ready report", nil, []string{"could not confirm"})
+	assertCompressedForm(t, notReady, notReadyHeadline, causeLine)
+	// The budget is spoken exactly once — in the headline.
+	if got := strings.Count(notReady, "45s"); got != 1 {
+		t.Errorf("the budget appears %d times in the not-ready report, want exactly once:\n%s", got, notReady)
+	}
+	assertNamesWithout(t, notReady, "the not-ready report", nil,
+		[]string{"could not confirm", "The start ran, but"})
+
+	otherBudgetHeadline := "HFDesk registered the service, but the service did not come up within 48s."
 	otherBudget := serviceInstallStartFailureText(cause, program, kept(service.StartOutcomeNotReady, 48*time.Second))
+	assertCompressedForm(t, otherBudget, otherBudgetHeadline, causeLine)
+	if got := strings.Count(otherBudget, "48s"); got != 1 {
+		t.Errorf("the applied budget appears %d times, want exactly once:\n%s", got, otherBudget)
+	}
 	assertNamesWithout(t, otherBudget, "the not-ready report with another applied budget",
-		[]string{"did not come up within 48s"}, []string{"45s"})
+		nil, []string{"45s"})
 
 	// Even a mis-stamped budget never renders for another class: only the
 	// not-ready report may name a budget, so an interrupted or unverifiable
-	// wait can never claim "within <budget>" at the text layer.
+	// wait can never claim a budget at the text layer.
+	unverifiedHeadline := "HFDesk registered the service, but the started service could not be verified."
 	unverified := serviceInstallStartFailureText(cause, program, kept(service.StartOutcomeUnverified, 45*time.Second))
+	assertCompressedForm(t, unverified, unverifiedHeadline, causeLine)
 	assertNamesWithout(t, unverified, "the unverified report",
-		[]string{
-			"HFDesk registered the service, but the started service could not be verified.",
-			"could not verify the started service",
-		},
-		[]string{"did not come up within", "within 45s", "could not confirm"})
+		[]string{unverifiedHeadline},
+		[]string{"did not come up within", "45s", "could not confirm", "The start ran, but"})
 
+	legacyHeadline := "HFDesk registered the service, but its start did not finish."
 	legacyErr := &service.InstallStartError{Cause: cause, CleanupError: errors.New("ownership unproven")}
 	legacy := serviceInstallStartFailureText(legacyErr, program, legacyErr)
+	assertCompressedForm(t, legacy, legacyHeadline, cause.Error()+" — ownership unproven")
 	assertNamesWithout(t, legacy, "the unclassified report",
-		[]string{
-			"HFDesk registered the service, but its start did not finish.",
-			cause.Error(), "ownership unproven",
-		},
-		[]string{"ended before", "did not come up", "could not verify the started service", "did not start it", "could not confirm"})
+		[]string{cause.Error(), "ownership unproven"},
+		[]string{"ended before", "did not come up", "could not verify the started service", "did not start it",
+			"could not confirm", "The start ran"})
 
-	// The vague phrase is gone from the WHOLE family — every class, the
-	// removed shape and the legacy shape included. Without this sweep a
-	// single report could keep it while the per-class pins above pass.
+	// The cause line carries the reason facts as the detail chain reports
+	// them — the state word and the exit code of the control manager —
+	// and nothing of the class: the class lives in the headline alone.
+	stateCause := errors.New(`the service control manager reports the state "stopped" with the exit code 1`)
+	stateReport := serviceInstallStartFailureText(stateCause, program, &service.InstallStartError{
+		Cause: stateCause, Outcome: service.StartOutcomeEnded, CleanupError: errors.New("the registration was kept"),
+	})
+	assertCompressedForm(t, stateReport, endedHeadline, stateCause.Error()+" — the registration was kept")
+	if strings.Contains(stateReport, "The start ran, but") || strings.Count(stateReport, stateCause.Error()) != 1 {
+		t.Errorf("the state-fact report does not carry its cause exactly once without a class repeat:\n%s", stateReport)
+	}
+
+	// The vague phrase and the duplicated class line are gone from the
+	// WHOLE family — every class, the removed shape and the legacy shape
+	// included. Without this sweep a single report could carry either
+	// while the per-class pins above pass.
 	for name, text := range map[string]string{
 		"the not-performed report": notPerformed,
 		"the ended report":         ended,
 		"the not-ready report":     notReady,
 		"the unverified report":    unverified,
 		"the unclassified report":  legacy,
+		"the state-fact report":    stateReport,
 		"the removed report": serviceInstallStartFailureText(cause, program,
 			&service.InstallStartError{Cause: cause, RegistrationRemoved: true, Outcome: service.StartOutcomeEnded}),
 	} {
 		if strings.Contains(text, "could not confirm") {
 			t.Errorf("the %s carries the forbidden vague phrase:\n%s", name, text)
+		}
+		if strings.Contains(text, "The start ran, but") {
+			t.Errorf("the %s repeats the class below its headline:\n%s", name, text)
 		}
 	}
 }
@@ -908,7 +954,13 @@ func TestServiceInstallStartFailureTextDistinguishesRemovedFromNeverInstalled(t 
 	assertNamesWithout(t, removed, "the removed-after-failure report",
 		[]string{"HFDesk registered the service but did not start it.", "registration created by this attempt was removed",
 			"left no registration behind", "start the desktop app normally again"},
-		[]string{"HFDesk is not installed as a Windows service", "There is no service", "could not confirm"})
+		[]string{"HFDesk is not installed as a Windows service", "There is no service", "could not confirm",
+			"The start ran, but"})
+	// The compressed form holds on the removed branch too: headline, one
+	// cause line, then the removal sentence — the class is never repeated.
+	if !strings.HasPrefix(removed, "HFDesk registered the service but did not start it.\n\n"+cause.Error()+"\n\n") {
+		t.Errorf("the removed report is not headline + one cause line + outcome:\n%s", removed)
+	}
 
 	never := serviceNotInstalledText(serviceActionStart)
 	assertNames(t, never, "the never-installed report",
@@ -928,7 +980,17 @@ func TestServiceInstallStartFailureTextDistinguishesRemovedFromNeverInstalled(t 
 		[]string{"HFDesk registered the service, but the service did not come up within 45s.",
 			"did not come up within 45s", "registration created by this attempt was removed",
 			"start the desktop app normally again"},
-		[]string{"HFDesk is not installed as a Windows service", "could not confirm"})
+		[]string{"HFDesk is not installed as a Windows service", "could not confirm", "The start ran, but"})
+	// Headline with the applied budget, one cause line, removal sentence:
+	// the budget is spoken exactly once, in the headline.
+	if !strings.HasPrefix(removedNotReady,
+		"HFDesk registered the service, but the service did not come up within 45s.\n\n"+cause.Error()+"\n\n") {
+		t.Errorf("the removed not-ready report is not headline + one cause line + outcome:\n%s", removedNotReady)
+	}
+	if got := strings.Count(removedNotReady, "45s"); got != 1 {
+		t.Errorf("the budget appears %d times in the removed not-ready report, want exactly once:\n%s",
+			got, removedNotReady)
+	}
 }
 
 // TestServiceGateUnreadableTextStatesWhatTheLaunchDid proves that the notice of
@@ -1764,6 +1826,20 @@ func TestNewServiceActionReportClasses(t *testing.T) {
 		"There is no service to start.", "Install it from the tray of the desktop app first.",
 	})
 
+	// The removal has its own honest form: the state plus the absent
+	// object, never the "start" of the default branch — the latent
+	// branch of this function. Like the stop it stays a settled absence
+	// with no next action: sending a user who asked to remove a
+	// registration to its installation would answer a different
+	// question, and the form never claims a deletion either.
+	removal := serviceNotInstalledText(serviceActionUninstall)
+	assertNames(t, removal, "the not-installed report of the removal", []string{
+		"HFDesk is not installed as a Windows service.",
+		"There is no service registration to remove.",
+	})
+	assertNamesWithout(t, removal, "the not-installed report of the removal", nil,
+		[]string{"start", "Install it from the tray", "is removed", "was removed", "stay untouched"})
+
 	// The failure of each new action is the headline, the cause of the
 	// manager on its line and the single state command — it never claims
 	// an outcome the action did not observe.
@@ -1993,6 +2069,7 @@ func TestGateAndReportsCarryNoInternalMechanism(t *testing.T) {
 		"the unreadable-state refusal": serviceUnreadableClaimRefusedText(serviceActionStart,
 			`C:\Users\ada\AppData\Roaming\HFDesk\desktop-state.json`),
 		"the not-installed report":                               serviceNotInstalledText(serviceActionStart),
+		"the not-installed report of the removal":                serviceNotInstalledText(serviceActionUninstall),
 		"the busy refusal":                                       serviceActionBusyText(),
 		"the unknown-action report":                              unknownServiceActionText(cause),
 		"the stopped report":                                     serviceStoppedText(launchSurfaceDesktop),
