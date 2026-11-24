@@ -581,7 +581,9 @@ func TestServiceHelperStopStopsTheService(t *testing.T) {
 	assertNames(t, (*messages)[0].text, "the report", []string{
 		"The HFDesk service is stopped.",
 		"Nothing serves the address of the service right now.",
-		"Quit HFDesk from the tray icon",
+	})
+	assertNamesWithout(t, (*messages)[0].text, "the report", nil, []string{
+		"Quit HFDesk", "choose Start service", "Start HFDesk again", "Open the address",
 	})
 }
 
@@ -637,7 +639,6 @@ func TestServiceHelperUninstallRemovesOnlyTheRegistration(t *testing.T) {
 			wantText: []string{
 				"The Windows service registration of HFDesk is removed.",
 				"Your data stays untouched.",
-				"Install the service again from the tray menu of the desktop app.",
 			},
 		},
 		{
@@ -686,6 +687,11 @@ func TestServiceHelperUninstallRemovesOnlyTheRegistration(t *testing.T) {
 			// of the singular or plural, past or perfect shapes of
 			// such a claim (the shared stop list of the text layer).
 			assertNamesWithout(t, (*messages)[0].text, "the report", nil, deletionClaimForms)
+			// No way back either: a success report carries the result
+			// and its facts.
+			assertNamesWithout(t, (*messages)[0].text, "the report", nil, []string{
+				"Install the service again", "Open the address", "Start HFDesk again",
+			})
 		})
 	}
 }
