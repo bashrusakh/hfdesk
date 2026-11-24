@@ -116,6 +116,16 @@ func runInstance(ctx context.Context, opts RunOptions, listening chan<- struct{}
 		server.Version = version
 	}
 
+	// The Logs page of a service instance is served by the instance itself,
+	// and its service badge reads GET /api/runtime. No desktop host is
+	// present here, so the host registers the state read of its own
+	// registration: the page then reports the service it was started from
+	// instead of the unknown state, which reads as a state that could not be
+	// settled. The install action stays nil — a service cannot install
+	// itself, and the page disables the button on the 404 that answers the
+	// missing action.
+	installRuntimeServiceSurface()
+
 	// The server owns the graceful shutdown path (quiesce, HTTP drain, job
 	// manager close); the host only waits for it. The bind happens here
 	// first so the host can report its own listener before it serves.

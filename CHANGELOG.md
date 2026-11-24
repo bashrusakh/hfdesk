@@ -25,6 +25,7 @@
 
 ### Fixed
 
+- The Logs page a browser loads from a running Windows service now reports `Service: installed` instead of `Service: unknown`: the page served by the instance reads the state of the registration the instance runs from, and its install action stays unavailable.
 - The service log under `%ProgramData%` can be read from the Logs window again: at every start the instance grants interactive users read access to its own log directory and active log file, and touches no other descriptor.
 - A start, a delete or an update of a service that is not stopped switches the app from desktop mode to the tray and performs instead of asking the user to quit HFDesk.
 - Deleting the service in that switch returns the app to desktop mode.
