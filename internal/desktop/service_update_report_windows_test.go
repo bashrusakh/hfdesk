@@ -62,8 +62,8 @@ func TestFinishHandoverPicksTheRelaunchOfItsAction(t *testing.T) {
 //
 // The moved case is driven on BOTH launch surfaces — the desktop host and the
 // tray companion — because the block follows the MOVE, never the route: the
-// gate's direct update and the handover's update build this very window, and
-// the surface only picks the way back under the block.
+// gate's direct update and the handover's update build this very window, so
+// both carry it.
 func TestUpdateReportOffersTheOldFileCommandOnlyForAMove(t *testing.T) {
 	existing := filepath.Join(t.TempDir(), "hfdesk-old.exe")
 	if err := os.WriteFile(existing, []byte("old"), 0o644); err != nil {
@@ -142,18 +142,13 @@ func TestUpdateReportOffersTheOldFileCommandOnlyForAMove(t *testing.T) {
 				t.Errorf("the command names %q, want exactly the previously registered program %q",
 					commands[0].oldFile, tc.previous)
 			}
-			wayBack := "Start the desktop app again and choose Start service."
-			if tc.companionSurface {
-				wayBack = "Choose Start service from the tray menu."
-			}
 			assertNames(t, commands[0].text, "the command report", []string{
 				"The registration now runs " + tc.current,
 				"Old file still on disk: " + tc.previous + ".",
-				// The block sits above the way back of THIS surface,
-				// so the surface dimension really varied while the
-				// block stayed.
-				wayBack,
 			})
+			assertNamesWithout(t, commands[0].text, "the command report", nil,
+				[]string{"Open the address", "Start HFDesk again", "choose Start service",
+					"Start the desktop app again", "Install the service again", "Quit HFDesk"})
 			// The report states the file and nothing behind it: the
 			// cancelled pair-assumption must not come back in any
 			// spelling (decision of 2026-11-24), and the command

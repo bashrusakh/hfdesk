@@ -1971,7 +1971,8 @@ func TestServiceHelperUpdateKeepsARunningServiceRunning(t *testing.T) {
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the report of the update", len(*messages))
 	}
-	assertNames(t, (*messages)[0].text, "the report", []string{"http://127.0.0.1:18080", "Open the address above"})
+	assertNames(t, (*messages)[0].text, "the report", []string{"The web UI is at http://127.0.0.1:18080."})
+	assertNamesWithout(t, (*messages)[0].text, "the report", nil, []string{"Open the address", "Start HFDesk again", "Install the service again"})
 }
 
 // TestServiceHelperRendersOnlyTheManagerVersionResult checks the desktop
@@ -2163,7 +2164,8 @@ func TestServiceHelperInstallStartsTheServiceAndReportsTheAddress(t *testing.T) 
 	if len(manager.steps) != 1 || manager.steps[0] != "install-start" {
 		t.Errorf("the helper steps are %v, want one service-owned install/start call", manager.steps)
 	}
-	assertNames(t, (*messages)[0].text, "the report", []string{`C:\portable\hfdesk.exe`, "http://127.0.0.1:18080", "Open the address above"})
+	assertNames(t, (*messages)[0].text, "the report", []string{`C:\portable\hfdesk.exe`, "The web UI is at http://127.0.0.1:18080."})
+	assertNamesWithout(t, (*messages)[0].text, "the report", nil, []string{"Open the address", "If the tray icon", "Start HFDesk again", "Install the service again"})
 }
 
 func TestServiceHelperInstallReportsTheServiceOwnedCleanupResult(t *testing.T) {
@@ -2871,7 +2873,8 @@ func TestServiceHelperStartReportsTheAddress(t *testing.T) {
 	if caption := serviceStartedCaption; (*messages)[0].caption != caption {
 		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 	}
-	assertNames(t, (*messages)[0].text, "the report", []string{"http://127.0.0.1:18080", `C:\portable\hfdesk.exe`, "Open the address above"})
+	assertNames(t, (*messages)[0].text, "the report", []string{"The web UI is at http://127.0.0.1:18080.", `C:\portable\hfdesk.exe`})
+	assertNamesWithout(t, (*messages)[0].text, "the report", nil, []string{"Open the address", "Start HFDesk again", "Install the service again"})
 }
 
 // TestServiceHelperSingletonArgumentRules proves the helper accepts exactly

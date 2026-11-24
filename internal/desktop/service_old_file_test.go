@@ -66,74 +66,59 @@ func TestServiceUpdateOldFileNamesOnlyARealMoveToAnotherFile(t *testing.T) {
 // a finished update in both shapes: with an old file it states exactly that
 // file as the one fact line — still on the disk, and nothing behind it: no
 // assumption about the file (decision of 2026-11-24: reports carry facts,
-// never guesses) — while the established state and its single way back of the
-// report stay what they are; without one the report is the report this family
-// has always shown, with no mention of an old file anywhere in it.
+// never guesses) — while the state of the report stays what it is; without one
+// the report is the report this family has always shown, with no mention of an
+// old file anywhere in it. Neither shape names a way back: a success report
+// carries the result and its facts and no instruction (decision of
+// 2026-11-25).
 //
-// The block follows the MOVE and never the route: the direct and the handover
-// surface build the report through this one function, so both carry it, and
-// the surface only ever picks the way back — which each subtest asserts, so
-// the surface dimension really varies.
+// The block follows the MOVE and never the launch surface: the direct and the
+// handover update build the report through this one function, so both carry
+// it.
 func TestServiceUpdatedTextCarriesTheOldFileBlockOnlyForAMove(t *testing.T) {
 	const (
 		oldFile = `C:\old\hfdesk.exe`
 		newFile = `C:\new\hfdesk.exe`
 	)
-	build := func(surface launchSurface, oldFile string) string {
+	build := func(oldFile string) string {
 		return serviceUpdatedText("1.3.0", newFile, `C:\ProgramData\HFDesk`, "",
-			false, service.StateStopped, surface, oldFile)
+			false, service.StateStopped, launchSurfaceDesktop, oldFile)
 	}
 
-	for _, tc := range []struct {
-		name    string
-		surface launchSurface
-		wayBack string
-	}{
-		{name: "the desktop surface", surface: launchSurfaceDesktop,
-			wayBack: "Start the desktop app again and choose Start service."},
-		{name: "the companion surface", surface: launchSurfaceCompanion,
-			wayBack: "Choose Start service from the tray menu."},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			withOld := build(tc.surface, oldFile)
-			assertNames(t, withOld, "the report with an old file", []string{
-				// The new program, then the old file as the one
-				// fact line beside it.
-				"The registration now runs " + newFile,
-				"Old file still on disk: " + oldFile + ".",
-				// The established state and its single way back
-				// survive the block: the report still says what
-				// the update left and names exactly one route back —
-				// the route of THIS surface.
-				"The service stays stopped.",
-				"Nothing serves the address of the service right now.",
-				tc.wayBack,
-			})
-			if got := strings.Count(withOld, "Start service"); got != 1 {
-				t.Errorf("the report names Start service %d times, want exactly one:\n%s", got, withOld)
-			}
-			// The block states the file and nothing behind it: no
-			// assumption about the file, never a second object, and
-			// never a deletion the report performed itself.
-			assertNamesWithout(t, withOld, "the report with an old file", nil,
-				[]string{"hfdesk-desktop.exe", "may belong", "old folder", "pair of",
-					"was deleted", "could not be deleted"})
+	withOld := build(oldFile)
+	assertNames(t, withOld, "the report with an old file", []string{
+		// The new program, then the old file as the one
+		// fact line beside it.
+		"The registration now runs " + newFile,
+		"Old file still on disk: " + oldFile + ".",
+		// The established state survives the block: the report
+		// still says what the update left, with no way back.
+		"The service stays stopped.",
+		"Nothing serves the address of the service right now.",
+	})
+	if got := strings.Count(withOld, "Start service"); got != 0 {
+		t.Errorf("the report names Start service %d times, want no way back:\n%s", got, withOld)
+	}
+	// The block states the file and nothing behind it: no
+	// assumption about the file, never a second object, and
+	// never a deletion the report performed itself.
+	assertNamesWithout(t, withOld, "the report with an old file", nil,
+		[]string{"hfdesk-desktop.exe", "may belong", "old folder", "pair of",
+			"was deleted", "could not be deleted",
+			"Open the address", "Start HFDesk again", "Install the service again", "Quit HFDesk"})
 
-			without := build(tc.surface, "")
-			if strings.Contains(without, oldFile) || strings.Contains(without, "Old file still on disk") {
-				t.Errorf("the report without an old file mentions one:\n%s", without)
-			}
-			// The same report the family always built: the addition is
-			// exactly the block above and nothing else.
-			assertNames(t, without, "the plain report", []string{
-				"The registration now runs " + newFile,
-				"The service stays stopped.",
-				tc.wayBack,
-			})
-			if without == withOld {
-				t.Error("the two shapes of the report are identical: the old-file block never reached the text")
-			}
-		})
+	without := build("")
+	if strings.Contains(without, oldFile) || strings.Contains(without, "Old file still on disk") {
+		t.Errorf("the report without an old file mentions one:\n%s", without)
+	}
+	// The same report the family always built: the addition is
+	// exactly the block above and nothing else.
+	assertNames(t, without, "the plain report", []string{
+		"The registration now runs " + newFile,
+		"The service stays stopped.",
+	})
+	if without == withOld {
+		t.Error("the two shapes of the report are identical: the old-file block never reached the text")
 	}
 }
 

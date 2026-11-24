@@ -638,32 +638,20 @@ func serviceVersionName(version string) string {
 	return "HFDesk " + version
 }
 
-// serviceInstalledTrayFallbackLine is the one conditional instruction of the
-// report of a finished installation: the host of this session restarts as a
-// tray companion, and one that leaves no tray icon is answered by this single
-// human action. The user authorized exactly this one line (decision of
-// 2026-11-23) for this report alone — the update and start reports never carry
-// it — as the acknowledged exception to the report's one-next-step rule: it is
-// conditional, so it is not a second next step beside the address instruction,
-// and it names no mechanism behind the rare failure it covers.
-const serviceInstalledTrayFallbackLine = "If the tray icon does not appear, start HFDesk manually."
-
 // serviceInstalledText returns the report of a finished installation.
 //
 // The report is three short blocks and no argument: what was installed and
-// what it runs, the address and its one action, and the directory the service
-// keeps its own data in. Right after the address action follows the one
-// authorized conditional instruction (serviceInstalledTrayFallbackLine), which
-// belongs to this report alone because only this action restarts the host as a
-// tray companion. The lifetime of the service is stated once, in the
-// confirmation that asked for the installation; this report does not repeat
-// it. The helper runs only after the desktop process ended, so the report never
-// tells the user to quit an app that is gone.
+// what it runs, the address it serves, and the directory the service keeps its
+// own data in. It carries no instruction: a success report states the result
+// and its facts and names nothing to do next (decision of 2026-11-25). The
+// lifetime of the service is stated once, in the confirmation that asked for
+// the installation; this report does not repeat it. The helper runs only after
+// the desktop process ended, so the report never tells the user to quit an app
+// that is gone.
 func serviceInstalledText(version, console, dataDir, address string) string {
 	text := serviceVersionName(version) + " is installed as a Windows service.\n" +
 		"The service runs " + console + " and starts at boot.\n\n" +
-		serviceAddressText(address) + "\n" +
-		serviceInstalledTrayFallbackLine
+		serviceAddressText(address)
 	if dataDir != "" {
 		text += "\n\nThe service keeps its own data in " + dataDir + "."
 	}
@@ -680,20 +668,13 @@ func serviceInstalledText(version, console, dataDir, address string) string {
 // restated as stopped — a report claiming a state the machine did not have
 // would send the user to a cause that is not there. Either way nothing serves
 // the address of the service after such an update, and a message that claimed
-// otherwise would send the user to a dead address.
+// otherwise would send the user to a dead address. The report names no way back
+// to a serving service: a success report carries the result and its facts and
+// no instruction (decision of 2026-11-25).
 //
-// The not-running case names the way back to a serving service, and that way
-// back depends on the surface the helper was launched from. An update is
-// reachable from the menu and the dialog of a running desktop host, from the
-// tray companion and from the launch gate: a menu, dialog or companion update
-// leaves that host running, while a gate update runs after the launch that
-// carried the gate already ended. Each surface is therefore told the route
-// its user can actually reach — the tray companion gets its own Start service
-// item (the companion serves no address, so that item starts the service
-// immediately), and the desktop surface keeps the established route of this
-// report (the relaunch of the desktop app and its Start service) byte for
-// byte, as decided on 2026-11-23. A hand-typed helper command line carries
-// no surface marker and gets the desktop route (launchSurfaceOf).
+// surface is the launch surface the helper was started from. It stays in the
+// signature with the launch-surface plumbing that carries it to the helper and
+// no longer changes this report, which names no surface-dependent route.
 //
 // oldFile is the program the registration ran BEFORE this update, and only
 // when that file still exists somewhere else: an update that moved the
@@ -716,11 +697,7 @@ func serviceUpdatedText(version, console, dataDir, address string, running bool,
 	if running {
 		text += "\n" + serviceAddressText(address)
 	} else {
-		wayBack := "Start the desktop app again and choose Start service."
-		if surface == launchSurfaceCompanion {
-			wayBack = serviceCompanionStartWayBack
-		}
-		text += "\n" + serviceUpdateNotRunningReport(before) + "\n\n" + wayBack
+		text += "\n" + serviceUpdateNotRunningReport(before)
 	}
 	if dataDir != "" {
 		text += "\n\nThe service keeps its own data in " + dataDir + "."
@@ -848,8 +825,8 @@ func serviceUpdateNotRunningReport(before service.State) string {
 
 // serviceStartedText returns the report of a started service.
 //
-// Two short blocks: the state and the program it runs, then the address and
-// its one action.
+// Two short blocks: the state and the program it runs, then the address it
+// serves. It carries no instruction (decision of 2026-11-25).
 func serviceStartedText(console, address string) string {
 	text := "The HFDesk service is running.\n"
 	if console != "" {
@@ -858,53 +835,34 @@ func serviceStartedText(console, address string) string {
 	return text + "\n" + serviceAddressText(address)
 }
 
-// serviceCompanionStartWayBack is the one step back to a serving service
-// both not-running reports name on the companion surface: the companion's
-// own Start service item — the current menu item of that tray. The claim is
-// true for this surface alone: the companion serves no address of its own,
-// so the guard of the helper never refuses a start beside it and the item
-// runs the start immediately. The sentence names no mechanism behind the
-// state, like every way back of these reports.
-const serviceCompanionStartWayBack = "Choose Start service from the tray menu."
-
 // serviceStoppedText returns the report of a stopped service.
 //
-// The report is the state (stopped), the one fact the user did not ask for
-// and has to see — nothing serves the address of the service right now — and
-// the single way back. The way back depends on the surface the helper was launched from. The
-// desktop route names the quit of this desktop and the startup gate of its next
-// launch, because a start beside the desktop that serves its own address is
-// refused by the established guard of the helper: a report that pointed at that
-// start would send the user into that refusal in a circle. The companion route
-// names the companion's own Start service item directly
-// (serviceCompanionStartWayBack), and that is true for its surface: the
-// companion serves no address of its own, so the guard of the helper never
-// refuses that item and it starts the service immediately. A hand-typed helper
-// command line carries no surface marker and gets the desktop route
-// (launchSurfaceOf).
+// The report is the state (stopped) and the one fact the user did not ask for
+// and has to see — nothing serves the address of the service right now. It
+// names no way back: a success report carries the result and its facts and no
+// instruction (decision of 2026-11-25). surface is the launch surface the
+// helper was started from; it stays in the signature with the launch-surface
+// plumbing and no longer changes this report.
 func serviceStoppedText(surface launchSurface) string {
-	wayBack := "Quit HFDesk from the tray icon. Start HFDesk again and choose Start service."
-	if surface == launchSurfaceCompanion {
-		wayBack = serviceCompanionStartWayBack
-	}
 	return "The HFDesk service is stopped.\n" +
-		"Nothing serves the address of the service right now.\n\n" + wayBack
+		"Nothing serves the address of the service right now."
 }
 
 // serviceRegistrationRemovedText returns the report of a removed service
 // registration.
 //
-// The report is the state (the registration is gone), the invariant of the
+// The report is the state (the registration is gone) and the invariant of the
 // removal as its one line — the data stays, which is the surprising fact of
-// this action — and one way back. It never claims, hints or implies that any
-// data was deleted: the removal writes no file, deletes no directory and reads
-// no configuration beyond the registration itself. The data fact is stated
-// without a list of the directories and files it covers: the list named more
-// than the window needed and is not what the user acts on.
+// this action. It names no way back: a success report carries the result and
+// its facts and no instruction (decision of 2026-11-25). It never claims,
+// hints or implies that any data was deleted: the removal writes no file,
+// deletes no directory and reads no configuration beyond the registration
+// itself. The data fact is stated without a list of the directories and files
+// it covers: the list named more than the window needed and is not what the
+// user acts on.
 func serviceRegistrationRemovedText() string {
 	return "The Windows service registration of HFDesk is removed.\n" +
-		"Your data stays untouched.\n\n" +
-		"Install the service again from the tray menu of the desktop app."
+		"Your data stays untouched."
 }
 
 // serviceNoRegistrationText returns the report of a removal that found no
@@ -920,17 +878,17 @@ func serviceNoRegistrationText() string {
 }
 
 // serviceAddressText returns the address block of a report: the address as one
-// fact and, directly under it, its one action.
+// fact.
 //
 // A registration whose listen address cannot be read as a URL still has an
 // address, and naming it is better than leaving the report without one. A
-// registration without any address is reported as such and gets no action: the
-// report never tells the user to open an address it just called unknown.
+// registration without any address is reported as such: the report never
+// invites the user to open an address it just called unknown.
 func serviceAddressText(address string) string {
 	if address == "" {
 		return "The web UI address is not known: the registration names no listen address."
 	}
-	return "The web UI is at " + address + ".\nOpen the address above."
+	return "The web UI is at " + address + "."
 }
 
 // serviceNotInstalledText returns the error of an action that needs a
