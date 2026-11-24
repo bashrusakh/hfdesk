@@ -64,22 +64,25 @@ func scmTestGrantACEs(t *testing.T, path string) []scmTestGrantACE {
 	return aces
 }
 
-// scmTestAssertAppendedGrant checks that the list of the path is the list it
-// held plus exactly the one expected entry, in that order: the grant appends
-// and never rewrites.
+// scmTestAssertAppendedGrant checks that the list of the path holds every
+// entry it held before, unchanged, plus exactly the one expected entry: the
+// grant appends and never rewrites. The platform canonicalises a written
+// list — an explicit entry is placed before an inherited one — so the
+// position of an entry carries no meaning and only the entries themselves
+// are compared.
 func scmTestAssertAppendedGrant(t *testing.T, path string, before []scmTestGrantACE, want scmTestGrantACE) {
 	t.Helper()
 	got := scmTestGrantACEs(t, path)
-	if len(got) != len(before)+1 {
-		t.Fatalf("the entries of %q = %d, want %d: exactly the one appended grant", path, len(got), len(before)+1)
-	}
-	for i, entry := range before {
-		if got[i] != entry {
-			t.Fatalf("the entry %d of %q = %+v, want %+v: the grant appends and never rewrites", i, path, got[i], entry)
+	remaining := slices.Clone(got)
+	for _, entry := range before {
+		i := slices.Index(remaining, entry)
+		if i < 0 {
+			t.Fatalf("the entry %+v of %q is no longer in its list after the grant: the grant appends and never rewrites", entry, path)
 		}
+		remaining = slices.Delete(remaining, i, i+1)
 	}
-	if got[len(got)-1] != want {
-		t.Errorf("the appended entry of %q = %+v, want %+v", path, got[len(got)-1], want)
+	if len(remaining) != 1 || remaining[0] != want {
+		t.Errorf("the entries of %q beyond the list it held before = %+v, want exactly the appended %+v", path, remaining, want)
 	}
 }
 
@@ -247,7 +250,9 @@ func TestSCMImageGrantRefusalsCarryTheAction(t *testing.T) {
 		if err == nil {
 			t.Fatal("grantServiceImageAccess() = nil, want the refusal")
 		}
-		if !scmTestNamesPath(err.Error(), `"`+wantPath+`"`) {
+		// The refusal quotes the path with %q, so the message names its
+		// quoted form: scmTestNamesPath accepts that form of the path.
+		if !scmTestNamesPath(err.Error(), wantPath) {
 			t.Errorf("the refusal = %v, want it to name %q on its own", err, wantPath)
 		}
 		for _, want := range []string{scmServiceIdentityName, "Move the HFDesk pair", "hfdesk service install"} {
@@ -321,7 +326,7 @@ func TestSCMImageGrantRefusalsCarryTheAction(t *testing.T) {
 
 		err := grantServiceImageAccess(executable)
 		assertRefusal(t, err, chain[0])
-		if !strings.Contains(err.Error(), "remains") || !strings.Contains(err.Error(), executable) {
+		if !strings.Contains(err.Error(), "remains") || !scmTestNamesPath(err.Error(), executable) {
 			t.Errorf("the refusal = %v, want the entry already written for the program named as what remains", err)
 		}
 		if strings.Join(writes, "\n") != strings.Join([]string{executable, chain[0]}, "\n") {

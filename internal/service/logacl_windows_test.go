@@ -105,7 +105,7 @@ func TestTheInteractiveLogGrantLeavesForeignDescriptorsAlone(t *testing.T) {
 		},
 		{
 			name: "a list of the right shape but another trustee in it",
-			sddl: "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;LS)(A;OICI;;;" + user + ")",
+			sddl: "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;LS)(A;OICI;FA;;;" + user + ")",
 		},
 		{
 			name: "a list with a deny entry in the place of an allow",
