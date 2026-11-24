@@ -58,6 +58,14 @@ type trayServiceView struct {
 	// refresh wakes the menu. A send is dropped when one is already
 	// pending, so an action can request a refresh without blocking.
 	refresh <-chan struct{}
+	// follow carries ONE read of the registration to the open Logs window
+	// of a tray companion, so the window follows the state beside it on
+	// the very cadence of the line and the two surfaces never state
+	// different moments: the pass reads once, the menu applies that read
+	// and the window decides from it. Nil for the desktop host, whose
+	// window shows the page of its own server and has no other kind of
+	// content to switch to.
+	follow func(service.Status, error)
 }
 
 // trayMenuItem is one item of the tray menu as the service section uses it.
@@ -224,7 +232,9 @@ func writeItem(item trayMenuItem, visible, enabled, wasVisible bool) {
 // cadence, whenever an action asks for a refresh, and after every display
 // read made elsewhere — the state reads of the Logs window ask for
 // the same catch-up, so no read result can stay invisible in the menu until
-// the next tick. The goroutine owns the items after the menu was built and
+// the next tick. The read of every pass also reaches the open Logs window
+// through view.follow, so the window follows the same state on the same
+// cadence. The goroutine owns the items after the menu was built and
 // ends when the tray loop closes
 // stopped — yet an update already in flight when that happens still applies
 // its result, and each pass through the select may pick a queued tick or
@@ -241,7 +251,16 @@ func (m *trayServiceMenu) keepFresh(view trayServiceView, stopped <-chan struct{
 		case <-ticker.C:
 		case <-view.refresh:
 		}
-		m.apply(readServiceMenuState(view))
+		// The pass reads the registration once: the line is built from
+		// that read, and the Logs window decides from the very same one
+		// — one state, read once, carried to both surfaces. The menu is
+		// applied first, so the window neither delays nor orders the
+		// line the user reads.
+		status, readErr := view.read()
+		m.apply(serviceMenuFor(status, readErr))
+		if view.follow != nil {
+			view.follow(status, readErr)
+		}
 	}
 }
 
