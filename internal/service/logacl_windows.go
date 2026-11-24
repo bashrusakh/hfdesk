@@ -89,11 +89,7 @@ func grantLogReadToInteractiveUsers(path string, container bool) error {
 	if dacl == nil || !instanceStateDACLIsUnchanged(dacl) {
 		return nil
 	}
-	sddl := "(A;;FR;;;IU)"
-	if container {
-		sddl = "(A;OICI;FR;;;IU)"
-	}
-	grant, err := windows.SecurityDescriptorFromString(sddl)
+	grant, err := windows.SecurityDescriptorFromString(scmLogReadGrantSDDL(container))
 	if err != nil {
 		return fmt.Errorf("service: build the log access entry: %w", err)
 	}
