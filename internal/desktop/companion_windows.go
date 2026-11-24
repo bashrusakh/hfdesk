@@ -465,6 +465,18 @@ func runCompanion(lock *instanceLock, guard panicGuard,
 	}, trayServiceView{
 		read:    serviceState.readForDisplay,
 		refresh: serviceRefresh,
+		// The open Logs window follows the very read the menu applies, on
+		// the menu's own cadence: the state beside the window can change
+		// while the window exists — the service is stopped, fails, or comes
+		// back — and a window that kept the page of a server that is gone
+		// would show the error of the browser instead of the state and the
+		// actions of the fallback document. The follow costs one probe of
+		// the address per pass, only while the window is open, and it loads
+		// nothing new when the kind of the content and the address stay the
+		// same.
+		follow: func(status service.Status, readErr error) {
+			window.follow(companionPageURL(status, readErr))
+		},
 	}, ready)
 
 	// The tray loop ended (a signal, or a loop that died): the shutdown
@@ -514,7 +526,22 @@ func showCompanionRuntimeWindow(window *runtimeWindow, webview2Ready bool) {
 func companionRuntimePageURL() string {
 	status, err := serviceState.readForDisplay()
 	requestServiceMenuCatchUp()
-	if err != nil {
+	return companionPageURL(status, err)
+}
+
+// companionPageURL maps ONE display read of the registration onto the runtime
+// page of the registered service address.
+//
+// It is the single rule both reads of the Logs window follow — the read of an
+// open (companionRuntimePageURL) and the read of the tray tick that keeps an
+// open window following the state (trayServiceView.follow) — so the address a
+// show loads and the address a tick probes are resolved the same way. It
+// returns "" — no address to navigate to — beside a failed read, a machine
+// without a registration, and an address that cannot be read as a URL. A
+// registered address that simply does not answer is NOT decided here: the
+// window probes it and decides from the answer.
+func companionPageURL(status service.Status, readErr error) string {
+	if readErr != nil {
 		return ""
 	}
 	url, urlErr := serviceURL(status.Listen)

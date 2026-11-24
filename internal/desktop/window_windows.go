@@ -68,7 +68,11 @@ type webView interface {
 // actual state: in URL mode the page of the own server is (re)loaded, and
 // beside a tray companion the registered service address is probed and the
 // live runtime page is loaded when it answers, the fallback document when
-// it does not.
+// it does not. A window that stays open follows that state as well: on the
+// tick of the tray menu it switches its content when the KIND of the
+// content changed, so a service that stops under an open window reaches
+// the state and the actions of the fallback document, and a service that
+// comes back reaches its live page (see follow).
 type runtimeWindow struct {
 	// mu guards the current instance.
 	mu sync.Mutex
@@ -77,6 +81,12 @@ type runtimeWindow struct {
 	// createMu serializes the creation of a window, so two actions cannot
 	// create two windows.
 	createMu sync.Mutex
+	// navMu serializes the content decisions of the window and guards the
+	// shown record of its instance: the show of the user and the follow of
+	// the tray tick decide one at a time, so the record always states what
+	// the window actually loaded and no decision is taken from a state
+	// another decision has already replaced.
+	navMu sync.Mutex
 	// url is the page the window loads on every show in URL mode: the
 	// runtime page of the running own server (the desktop host). It is
 	// only used when live is nil.
@@ -115,6 +125,45 @@ type windowInstance struct {
 	// icons are the icon handles of the window. They are released
 	// together with the window.
 	icons windowIcons
+	// shown is what the window currently loads. It is written and read
+	// under the navMu of the window that owns this instance, and it is the
+	// record the follow of the tray tick decides on: the same kind at the
+	// same address has nothing to switch.
+	shown shownContent
+}
+
+// contentKind is the kind of the content the Logs window loads.
+type contentKind int
+
+const (
+	// contentUndecided is a window that was created but not navigated
+	// yet. Show decides the content right after the creation, so this is
+	// the state of the moments in between — and of a window whose first
+	// decision still has to be taken by a follow.
+	contentUndecided contentKind = iota
+	// contentLive is the live runtime page of a server: the own server of
+	// the desktop host, or the server of the registered service beside a
+	// tray companion.
+	contentLive
+	// contentFallback is the self-contained fallback document of a tray
+	// companion, shown beside an address that does not answer or names
+	// none.
+	contentFallback
+)
+
+// shownContent records what the window was last navigated to: the kind of
+// that content and, for the live page, the address it was loaded from.
+//
+// The address matters as much as the kind: a registration that moves to
+// another address is a change the window has to follow, while a page that
+// still answers at the very same address is not — reloading it would only
+// reset the scroll position of the user in the live log.
+type shownContent struct {
+	// kind is the kind of the content the window loads.
+	kind contentKind
+	// url is the address of the live page the window loads. Empty beside
+	// the fallback document.
+	url string
 }
 
 // newRuntimeWindow builds the owner of the Logs window that shows the
@@ -155,11 +204,7 @@ func (w *runtimeWindow) Show() error {
 		if err != nil {
 			return err
 		}
-		if target, document := w.resolve(); document != "" {
-			instance.view.NavigateDocument(document)
-		} else {
-			instance.view.Navigate(target)
-		}
+		w.load(instance)
 		if err := instance.view.Show(); err != nil {
 			// The window was closed while the action was on its way:
 			// try again with a new one.
@@ -181,6 +226,97 @@ func (w *runtimeWindow) resolve() (string, string) {
 	return resolveLogsWindow(w.live, w.content)
 }
 
+// load decides what the window shows and loads it, recording the decision so
+// the follow of the tray tick can tell whether the kind of the content or its
+// address changed.
+//
+// A show always loads its content, even the content the window already shows:
+// a show is the user asking for the actual state, so a repeated open of a live
+// page reloads it. Only the follow of the tick leaves an unchanged content
+// alone (see follow).
+func (w *runtimeWindow) load(instance *windowInstance) {
+	w.navMu.Lock()
+	defer w.navMu.Unlock()
+	target, document := w.resolve()
+	if document != "" {
+		instance.view.NavigateDocument(document)
+		instance.shown = shownContent{kind: contentFallback}
+		return
+	}
+	instance.view.Navigate(target)
+	instance.shown = shownContent{kind: contentLive, url: target}
+}
+
+// follow re-checks the content of the open window against the state of the
+// service beside it and switches it when its KIND changed: the live page of
+// the registered address becomes the fallback document when the address stops
+// answering, and the fallback document becomes the live page when the address
+// answers again. Without it a window left open beside a service that stops
+// would keep a page whose server is gone — the error of the browser instead of
+// the state and the actions of the fallback — until the user closed and opened
+// it again.
+//
+// page is the runtime page of the registered address as ONE display read — the
+// very read the tray menu just made — resolved it: empty beside a failed read,
+// a machine without a registration and an address that cannot be read as a URL.
+//
+// The window follows the established tick of the tray menu (the cadence of the
+// service status line, see keepFresh): it owns no timer of its own, so an open
+// window follows the machine at the speed the menu already follows it. One
+// pass costs at most one probe of the address, and only while the window
+// exists — a closed window costs nothing — and a window that already shows the
+// content of the state is left alone: the same kind at the same address is not
+// a change, so the live log of the user keeps its scroll position instead of
+// reloading on every tick.
+//
+// URL mode has no fallback kind to switch to — the page of the own server of
+// the desktop host is the only content of that window — so the follow ends
+// there and never touches a window of the desktop host. The same holds for a
+// window wired without a fallback builder: there is no document to switch to.
+func (w *runtimeWindow) follow(page string) {
+	if w.live == nil || w.content == nil {
+		return
+	}
+	instance := w.open()
+	if instance == nil {
+		// No window is open: there is nothing to follow, and the tick
+		// costs no probe.
+		return
+	}
+
+	w.navMu.Lock()
+	defer w.navMu.Unlock()
+	if instance.closed() {
+		// The window was closed between the two checks: the actions of a
+		// window that is gone are dropped with it.
+		return
+	}
+	if page != "" && runtimePageAnswers(page) {
+		if instance.shown.kind == contentLive && instance.shown.url == page {
+			// The live page answers at the very address it was
+			// loaded from: the window shows what the state is.
+			return
+		}
+		instance.view.Navigate(page)
+		instance.shown = shownContent{kind: contentLive, url: page}
+		return
+	}
+	if instance.shown.kind == contentFallback {
+		// The window already shows the fallback document: the state it
+		// reports is rendered fresh whenever it is loaded, and reloading
+		// it on every pass would only reset the tail of the log the user
+		// scrolled.
+		return
+	}
+	// The document is rendered now, from the state of this moment, so it
+	// states the state the window switches to and not the one it left.
+	// Rendering it is a display read like every other: it asks the menu to
+	// catch up, so this switch costs one more pass, which finds the same
+	// kind and loads nothing.
+	instance.view.NavigateDocument(w.content())
+	instance.shown = shownContent{kind: contentFallback}
+}
+
 // Close destroys the runtime window.
 //
 // The application keeps running: the window is only a view of the running
@@ -195,13 +331,24 @@ func (w *runtimeWindow) Close() {
 	instance.view.Close()
 }
 
-// active returns the window that is currently open, creating it when it
-// does not exist.
-func (w *runtimeWindow) active() (*windowInstance, error) {
+// open returns the window that is currently open, without creating one.
+//
+// The follow of the tray tick asks this question: a window the user closed is
+// no window to follow, and no one but a show may create one.
+func (w *runtimeWindow) open() *windowInstance {
 	w.mu.Lock()
 	current := w.instance
 	w.mu.Unlock()
-	if current != nil && !current.closed() {
+	if current == nil || current.closed() {
+		return nil
+	}
+	return current
+}
+
+// active returns the window that is currently open, creating it when it
+// does not exist.
+func (w *runtimeWindow) active() (*windowInstance, error) {
+	if current := w.open(); current != nil {
 		return current, nil
 	}
 
@@ -209,10 +356,7 @@ func (w *runtimeWindow) active() (*windowInstance, error) {
 	defer w.createMu.Unlock()
 
 	// Another action may have created the window in the meantime.
-	w.mu.Lock()
-	current = w.instance
-	w.mu.Unlock()
-	if current != nil && !current.closed() {
+	if current := w.open(); current != nil {
 		return current, nil
 	}
 	return w.create()
