@@ -435,12 +435,15 @@ func scmTestInstallOptions(t *testing.T, root string) InstallOptions {
 		t.Skipf("the test program %s is not available: %v", executable, err)
 	}
 	// The ACL of the system program is not the subject of the tests that
-	// install it: the access check has tests of its own.
+	// install it: the access check and the grant have tests of their own.
 	previousAccess := scmCheckExecutableAccess
 	scmCheckExecutableAccess = func(string, scmPathAccess) (scmExecutableAccess, string) {
 		return scmExecutableAccessAllowed, ""
 	}
 	t.Cleanup(func() { scmCheckExecutableAccess = previousAccess })
+	previousGrant := scmGrantExecutableAccess
+	scmGrantExecutableAccess = func(string) error { return nil }
+	t.Cleanup(func() { scmGrantExecutableAccess = previousGrant })
 	return InstallOptions{
 		Scope:      ScopeSystem,
 		Executable: executable,

@@ -344,6 +344,13 @@ func TestSCMLifecycle(t *testing.T) {
 			LogDir:     filepath.Join(root, "var", "logs"),
 		},
 	}
+	// The access list of the system program is not the subject of this
+	// test: the installation must not write an access entry to the program
+	// of the operating system or to the directories above it. The grant has
+	// tests of its own.
+	previousGrant := scmGrantExecutableAccess
+	scmGrantExecutableAccess = func(string) error { return nil }
+	t.Cleanup(func() { scmGrantExecutableAccess = previousGrant })
 	service := &scmManager{scope: ScopeSystem}
 
 	// The registration never survives the test.
