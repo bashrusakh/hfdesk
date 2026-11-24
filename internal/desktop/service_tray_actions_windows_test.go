@@ -1019,12 +1019,13 @@ func TestServiceConfirmationsDefaultToNo(t *testing.T) {
 			serviceConfirmMessageBoxFlags&defaultButtonMask, windows.MB_DEFBUTTON2)
 	}
 
-	// No other button set or icon may join the composition unnoticed.
-	extra := windows.MB_OKCANCEL | windows.MB_YESNOCANCEL |
-		windows.MB_ICONERROR | windows.MB_ICONWARNING | windows.MB_ICONINFORMATION |
-		windows.MB_DEFBUTTON3 | windows.MB_DEFBUTTON4
-	if serviceConfirmMessageBoxFlags&extra != 0 {
-		t.Errorf("the confirmation flags carry %#x beside the intended composition",
-			serviceConfirmMessageBoxFlags&extra)
+	// No other button set or icon may join the composition unnoticed. The
+	// check is a bit test against the whole wanted composition, not against
+	// a mask of composite constants: MB_ICONWARNING (0x30) shares its 0x20
+	// bit with MB_ICONQUESTION (0x20), so an "extra" mask containing the
+	// warning icon also matches the question icon the composition rightly
+	// carries.
+	if leftover := serviceConfirmMessageBoxFlags &^ want; leftover != 0 {
+		t.Errorf("the confirmation flags carry %#x beside the intended composition", leftover)
 	}
 }
