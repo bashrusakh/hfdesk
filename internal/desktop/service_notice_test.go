@@ -755,20 +755,32 @@ func TestServiceActionFailureTextIsTheResultTheCauseAndOneAction(t *testing.T) {
 
 // TestServiceActionFailureTextNamesNoFolderAccessMechanism proves the
 // folder guidance stays out of every failure report: the sentence that named
-// the service account and its execute/traverse/read rights over the folder of
-// the program was internal mechanism, a justification and a legal hedge
-// beside the one action of the report — the rule of the sixth plan item
-// allows none of that. A failure report is result, cause and one action, so
-// no account identity, no access right and no program path returns to it.
+// the service account's execute/traverse/read rights over the folder of the
+// program was internal mechanism, a justification and a legal hedge beside
+// the one action of the report — the rule of the sixth plan item allows none
+// of that.
+//
+// The installation window is the one exception, and it is a fact, never the
+// retired mechanism: a failed installation names the program it was asked to
+// run and the built-in account it was asked to run as, so the user can check
+// both facts of the request. No access right, no folder sentence and no
+// command returns with them.
 func TestServiceActionFailureTextNamesNoFolderAccessMechanism(t *testing.T) {
 	reason := errors.New("the service control manager refused the registration")
 	const program = `C:\portable\hfdesk.exe`
 
 	for _, action := range []serviceAction{serviceActionInstall, serviceActionUpdate, serviceActionStart} {
 		text := serviceActionFailureText(action, reason, program)
-		assertNamesWithout(t, text, fmt.Sprintf("the report of %s", action), nil, []string{
-			program, `NT AUTHORITY\LocalService`, "must be able to execute", "traverse the folder", "read access",
-		})
+		forbidden := []string{"must be able to execute", "traverse the folder", "read access"}
+		if action == serviceActionInstall {
+			// The exception is a fact and is stated: the request the failed
+			// attempt carried, both halves of it, so the user can check the
+			// folder and the identity without reading the registration.
+			assertNames(t, text, "the report of the installation", []string{program, serviceInstanceAccountName})
+		} else {
+			forbidden = append(forbidden, program, serviceInstanceAccountName)
+		}
+		assertNamesWithout(t, text, fmt.Sprintf("the report of %s", action), nil, forbidden)
 	}
 
 	// A caller that does not know the program carries no general form of
@@ -776,6 +788,63 @@ func TestServiceActionFailureTextNamesNoFolderAccessMechanism(t *testing.T) {
 	unknown := serviceActionFailureText(serviceActionInstall, reason, "")
 	assertNamesWithout(t, unknown, "the report without a program", nil,
 		[]string{"must be able to execute the program and to traverse the folder that holds it"})
+}
+
+// TestServiceCauseFormsStateTheFactOfTheirReportClass proves the rule the two
+// cause forms divide between them: a report whose cause IS the observed reason
+// keeps the reason the service layer introduced after a colon, while the
+// primary-fact form stops at that colon — and both drop the structural markers
+// of the layer and every instruction the layer appends beside the fact.
+func TestServiceCauseFormsStateTheFactOfTheirReportClass(t *testing.T) {
+	// The image preflight: the verdict and the reason it observed.
+	image := `service: executable "C:\HFDesk\hfdesk.exe" is not a Windows executable: ` +
+		`no MZ signature. Use the Windows build of the hfdesk program, then run ` +
+		`"hfdesk service install" from an elevated shell again`
+	if got, want := serviceReasonLine(image),
+		`executable "C:\HFDesk\hfdesk.exe" is not a Windows executable: no MZ signature`; got != want {
+		t.Errorf("serviceReasonLine of the image refusal = %q, want %q: the observed reason stays beside the verdict", got, want)
+	}
+	// The primary-fact form keeps its own rule: there a colon introduces the
+	// layer's argument, so the report of that class stops at it.
+	if got, want := serviceCauseLine(image),
+		`executable "C:\HFDesk\hfdesk.exe" is not a Windows executable`; got != want {
+		t.Errorf("serviceCauseLine of the image refusal = %q, want %q", got, want)
+	}
+
+	// A reason introduced after a colon survives; an instruction the layer
+	// appends after another colon does not.
+	grant := `service: executable "C:\HFDesk\hfdesk.exe" is not usable by the account the ` +
+		`instance runs as (NT AUTHORITY\LocalService): it cannot be executed: grant the ` +
+		`account execute access to the program, then run "hfdesk service install" from ` +
+		`an elevated shell again`
+	if got, want := serviceReasonLine(grant),
+		`executable "C:\HFDesk\hfdesk.exe" is not usable by the account the instance `+
+			`runs as (NT AUTHORITY\LocalService): it cannot be executed`; got != want {
+		t.Errorf("serviceReasonLine of the preflight refusal = %q, want the reason without the instruction %q", got, want)
+	}
+
+	// The missing console program is a reason too: the window names the file
+	// and the folder the attempt looked for.
+	missing := `the console program of the service is missing: there is no hfdesk.exe in C:\Portable`
+	if got := serviceReasonLine(missing); got != missing {
+		t.Errorf("serviceReasonLine of the missing console program = %q, want the whole reason %q", got, missing)
+	}
+
+	// Both forms drop the structural markers of the layer, so no report
+	// prints one as window text.
+	for _, detail := range []string{
+		"desktop: the service helper exited before it became ready",
+		"service: desktop: the state of the service cannot be read",
+	} {
+		for name, line := range map[string]string{
+			"serviceCauseLine":  serviceCauseLine(detail),
+			"serviceReasonLine": serviceReasonLine(detail),
+		} {
+			if strings.Contains(line, "service: ") || strings.Contains(line, "desktop: ") {
+				t.Errorf("%s of %q kept an internal marker: %q", name, detail, line)
+			}
+		}
+	}
 }
 
 // TestServiceActionFailureTextOfAnUnrepairedImageGrant pins the window of an
@@ -2477,10 +2546,13 @@ func TestGateAndReportsCarryNoInternalMechanism(t *testing.T) {
 		"singleton", "mutex", "claim", "handover", "rotation",
 		// The two justifications the gate used to argue with.
 		"two instances never compete", "Update re-registers",
-		// The account/access mechanism class: a service account or an
-		// execute/traverse/read right named as the mechanism of a
-		// failure — the folder guidance these reports used to carry.
-		"nt authority", "localservice", "account", "permission",
+		// The account/access mechanism class: the execute/traverse/read
+		// right and the folder guidance these reports used to carry. The
+		// identity itself (the built-in account of a system-scope
+		// instance) is a fact the installation window names beside the
+		// program, so it is not on this list; the mechanism built on it
+		// stays out.
+		"account", "permission",
 		"must be able to", "execute", "traverse", "read access", "write access",
 	}
 	cause := errors.New("the state of the service could not be settled")

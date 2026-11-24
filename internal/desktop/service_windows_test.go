@@ -441,8 +441,8 @@ func TestLaunchWithAnUnreadableServiceStartsNoServer(t *testing.T) {
 	if len(notices) != 1 {
 		t.Fatalf("the launch showed %v, want the notice of the unreadable registration", *messages)
 	}
-	if !strings.Contains(notices[0].text, "started no server") {
-		t.Errorf("the notice %q does not say that the launch started no server", notices[0].text)
+	if !strings.Contains(notices[0].text, "starts no server") {
+		t.Errorf("the notice %q does not say that the launch starts no server", notices[0].text)
 	}
 }
 
@@ -1604,7 +1604,10 @@ func TestServiceHandoverFailureReportNamesTheStateCommand(t *testing.T) {
 		t.Run(string(tc.action), func(t *testing.T) {
 			messages := recordMessages(t)
 
-			reason := errors.New("the completion signal was never confirmed")
+			// The reason is the fact the desktop observed, stated in plain
+			// words: the report carries it, and no internal phrase of the
+			// coordination protocol may reach the window.
+			reason := errors.New("the desktop did not shut down in time")
 			reportServiceHandoverFailure(tc.action, reason)
 
 			if len(*messages) != 1 {
@@ -2682,7 +2685,10 @@ func TestServiceHelperRejectsAnUnknownAction(t *testing.T) {
 	})
 	messages := recordMessages(t)
 
-	if err := RunServiceAction(ServiceActionOptions{Action: "uninstall"}); err == nil {
+	// The value is deliberately outside the five actions the helper knows:
+	// uninstall is one of them now (the tray removal launches it), so only a
+	// value no action owns can prove that the helper refuses to guess.
+	if err := RunServiceAction(ServiceActionOptions{Action: "not-a-service-action"}); err == nil {
 		t.Fatal("the helper accepted an action it does not know")
 	}
 	if len(*messages) != 1 || !strings.Contains((*messages)[0].text, "does not know") {
@@ -3240,7 +3246,7 @@ func TestServiceHelperRefusesAnIdentityThatCannotAccessTheSingleton(t *testing.T
 		t.Fatalf("the helper showed %d message boxes, want the refusal of the action", len(*messages))
 	}
 	text := (*messages)[0].text
-	assertNames(t, text, "the report", []string{"No service action was performed", "end that process and try again"})
+	assertNames(t, text, "the report", []string{"No service action was performed", "End that process and try again."})
 	if strings.Contains(text, "hfdesk service status") {
 		t.Errorf("the report %q carries a second next action next to the step of the identity refusal", text)
 	}

@@ -317,6 +317,13 @@ func TestCompleteInstallHandoverRelaunchesOnlyAfterSettledAuthorization(t *testi
 			events: &handoverEvents{success: success, confirmed: confirmed},
 			helper: &elevatedProcess{handle: helper},
 		}
+		// The sequence closes the handover's handles before it relaunches
+		// (it is done with them). These duplicates name the SAME kernel
+		// events, so the spawn can still observe the signals the protocol
+		// left standing without the test relying on a handle the sequence
+		// already released.
+		observedSuccess := duplicateTestHandle(t, success)
+		observedConfirmed := duplicateTestHandle(t, confirmed)
 		spawns := 0
 		replaceSeam(t, &startCompanionRelaunch, func() {
 			spawns++
@@ -324,10 +331,10 @@ func TestCompleteInstallHandoverRelaunchesOnlyAfterSettledAuthorization(t *testi
 			// stands and the helper's acknowledgment arrived — the
 			// exact moment the helper waits only for this process's
 			// exit.
-			if result, err := windows.WaitForSingleObject(success, 0); err != nil || result != windows.WAIT_OBJECT_0 {
+			if result, err := windows.WaitForSingleObject(observedSuccess, 0); err != nil || result != windows.WAIT_OBJECT_0 {
 				t.Errorf("the relaunch ran before the success signal stood (result %#x, err %v)", result, err)
 			}
-			if result, err := windows.WaitForSingleObject(confirmed, 0); err != nil || result != windows.WAIT_OBJECT_0 {
+			if result, err := windows.WaitForSingleObject(observedConfirmed, 0); err != nil || result != windows.WAIT_OBJECT_0 {
 				t.Errorf("the relaunch ran before the helper acknowledged the authorization (result %#x, err %v)", result, err)
 			}
 		})
@@ -362,6 +369,10 @@ func TestCompleteInstallHandoverRelaunchesOnlyAfterSettledAuthorization(t *testi
 			events: &handoverEvents{success: success, confirmed: confirmed},
 			helper: &elevatedProcess{handle: helper},
 		}
+		// The sequence closes its own handles before it reports; the
+		// duplicate names the same success event, so the test can still
+		// prove that the failed authorization was withdrawn.
+		observedSuccess := duplicateTestHandle(t, success)
 		replaceSeam(t, &startCompanionRelaunch, func() {
 			t.Error("a handover that was not authorized relaunched the companion: the installation did not run")
 		})
@@ -387,7 +398,7 @@ func TestCompleteInstallHandoverRelaunchesOnlyAfterSettledAuthorization(t *testi
 		if !found {
 			t.Error("the failed handover showed no report of the failed installation")
 		}
-		if result, err := windows.WaitForSingleObject(success, 0); err != nil || result != uint32(windows.WAIT_TIMEOUT) {
+		if result, err := windows.WaitForSingleObject(observedSuccess, 0); err != nil || result != uint32(windows.WAIT_TIMEOUT) {
 			t.Errorf("the failed handover left the success signal standing (result %#x, err %v): a helper could install on it", result, err)
 		}
 	})

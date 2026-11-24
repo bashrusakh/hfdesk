@@ -82,10 +82,68 @@ func failureWindowText(text string) string {
 
 // serviceCauseLine returns the one factual line a failure window states as the
 // cause of a service-level failure: the message of the service layer with its
-// internal "service: " marker cut off, reduced to its first line and cut
-// before the first clause that appends an instruction, an argument or an
-// internal command. The whole message stays in the log the window names.
+// internal markers cut off (see serviceCauseFirstLine), reduced to its first
+// line and cut before the first clause that appends an instruction, an
+// argument or an internal command. The whole message stays in the log the
+// window names.
+//
+// This is the primary-fact form: it keeps the fact the report class states
+// about itself (the singleton cannot be named, the registration runs as another
+// account) and drops everything the service layer appends to explain or repair
+// it. A report whose cause IS the observed reason uses serviceReasonLine, which
+// keeps the colon that names that reason.
 func serviceCauseLine(detail string) string {
+	detail = serviceCauseFirstLine(detail)
+	if detail == "" {
+		return ""
+	}
+	for _, separator := range []string{"; ", ". ", ": "} {
+		if index := strings.Index(detail, separator); index >= 0 {
+			detail = detail[:index]
+		}
+	}
+	return strings.TrimSpace(strings.TrimRight(detail, " \t.,;:"))
+}
+
+// serviceReasonLine returns the cause line of a report whose one cause IS the
+// observed reason the service layer wrapped: an image the host cannot execute,
+// the console program that is missing, the wait that ended.
+//
+// It strips the same internal prefixes and keeps the message to one line, but
+// it drops only a second sentence and a clause that appends an instruction —
+// the service layer's repair step, often introduced by a colon — so the
+// observed reason itself survives. A colon is kept: in these messages it
+// introduces that reason — "is not a Windows executable: no MZ signature",
+// "the console program ... is missing: there is no hfdesk.exe in ...",
+// "shutdown HTTP server: context deadline exceeded" — and that reason is the
+// fact the window exists for. The whole message stays in the log the window
+// names.
+func serviceReasonLine(detail string) string {
+	detail = serviceCauseFirstLine(detail)
+	if detail == "" {
+		return ""
+	}
+	for _, separator := range []string{
+		"; ", ". ",
+		// Instruction clauses the service layer appends with a colon
+		// instead of a sentence: "…: grant the account execute access,
+		// then run …". The reason before the clause stays.
+		": grant the account ", ": run ", ": use ", ": move ", ": restore ",
+		", then run ", ", run ",
+	} {
+		if index := strings.Index(detail, separator); index >= 0 {
+			detail = detail[:index]
+		}
+	}
+	return strings.TrimSpace(strings.TrimRight(detail, " \t.,;:"))
+}
+
+// serviceCauseFirstLine reduces a service-layer message to its first line with
+// the internal prefixes of the layer removed. Both prefixes are structural
+// markers ("service: " of the manager, "desktop: " of the host's own errors),
+// never user-facing text, so every cause form drops them before it decides
+// where the fact ends.
+func serviceCauseFirstLine(detail string) string {
 	detail = strings.TrimSpace(detail)
 	if detail == "" {
 		return ""
@@ -93,13 +151,15 @@ func serviceCauseLine(detail string) string {
 	if index := strings.IndexByte(detail, '\n'); index >= 0 {
 		detail = detail[:index]
 	}
-	detail = strings.TrimPrefix(detail, "service: ")
-	for _, separator := range []string{"; ", ". ", ": "} {
-		if index := strings.Index(detail, separator); index >= 0 {
-			detail = detail[:index]
+	for {
+		previous := detail
+		for _, prefix := range []string{"service: ", "desktop: "} {
+			detail = strings.TrimPrefix(detail, prefix)
+		}
+		if detail == previous {
+			return detail
 		}
 	}
-	return strings.TrimSpace(strings.TrimRight(detail, " \t.,;:"))
 }
 
 // serviceFailureReport joins the parts of a failure report — the headline, the
@@ -989,8 +1049,9 @@ func serviceActionFailureHeadline(action serviceAction) string {
 // before the first change, so a failed hold touched nothing — and the one
 // factual cause line of the failed hold. A refusal because another Windows
 // identity owns the object is stated as that fact, with the one step that
-// ends the hold (end that process and try again); every other cause ends with
-// the command that reads the state, and no report carries both actions.
+// ends the hold (End that process and try again.); every other cause ends
+// with the command that reads the state, and no report carries both
+// actions.
 func serviceSingletonHoldRefusedText(action serviceAction, err error) string {
 	detail := ""
 	if err != nil {
@@ -1016,12 +1077,13 @@ func serviceSingletonHoldRefusedText(action serviceAction, err error) string {
 // serviceUnreadableClaimRefusedText returns the report of a mutation that
 // refused over a published claim it could not read: the result (no service
 // action was performed) and the cause (the state file that would tell whether
-// a desktop serves cannot be read). The report carries no next action: no
-// single step clears a file the guard cannot inspect, so it stays an honest
-// terminal.
+// a desktop serves cannot be read). That the question stays undetermined is
+// the fact that makes the refusal terminal: no single step clears a file the
+// guard cannot inspect, so the report names no next action.
 func serviceUnreadableClaimRefusedText(action serviceAction, claim string) string {
 	return failureWindowText(serviceFailureReport(serviceActionFailureHeadline(action),
-		`No service action was performed: the state file of the desktop at "`+claim+`" cannot be read.`))
+		`No service action was performed: the state file of the desktop at "`+claim+
+			`" cannot be read, so whether a desktop of this session serves its local server cannot be determined.`))
 }
 
 // serviceServingDesktopRefusedText returns the report of a mutation that
@@ -1082,6 +1144,23 @@ func serviceActionFailureBody(action serviceAction, err error, program string) s
 		if isAlreadyRegisteredRefusal(err) {
 			return serviceAlreadyRegisteredText()
 		}
+		// An installation reports the reason the attempt observed — the
+		// image the host cannot execute, the console program that is
+		// missing — rather than the verdict alone, because that reason is
+		// the fact the user acts on (serviceReasonLine).
+		cause = serviceReasonLine(detail)
+		if cause != "" && !service.HasNamedAction(cause) {
+			nextAction = serviceStatusCommandText
+		}
+		// The registration is asked for one program and one account, and
+		// the window names both: the user can then check the folder and the
+		// identity the failed attempt tried to register. The line states
+		// the request, never a registration the attempt may not have
+		// written; a caller that knows no program states none.
+		request := ""
+		if program != "" {
+			request = "The installation was asked to run " + program + " as " + serviceInstanceAccountName + "."
+		}
 		// The installation may have written a registration or not, and
 		// the report does not know which: reading the state resolves
 		// that uncertainty, so the state command is the one next action.
@@ -1091,7 +1170,7 @@ func serviceActionFailureBody(action serviceAction, err error, program string) s
 		if program == "" {
 			outcome = ""
 		}
-		return serviceFailureReport(serviceActionFailureHeadline(action), cause, outcome, nextAction)
+		return serviceFailureReport(serviceActionFailureHeadline(action), cause, request, outcome, nextAction)
 	case serviceActionUpdate:
 		// The refusal of a changed account states the fact it observed:
 		// the account the registration runs as. It names no next action
@@ -1105,6 +1184,13 @@ func serviceActionFailureBody(action serviceAction, err error, program string) s
 		return serviceFailureReport(serviceActionFailureHeadline(action), cause, nextAction)
 	}
 }
+
+// serviceInstanceAccountName is the account a machine-wide HFDesk service runs
+// as, as Windows spells it. The service layer registers the instance under
+// this built-in identity; the installation window names it beside the program
+// the attempt was asked to run, so the user can check both facts of the
+// request instead of guessing which identity the registration would use.
+const serviceInstanceAccountName = `NT AUTHORITY\LocalService`
 
 // serviceImageAccessFailedText returns the window of an installation that
 // could not give the account of the instance access to its program: the
@@ -1749,7 +1835,7 @@ func serviceHandoverRefusedText(err error) string {
 	if err != nil {
 		detail = err.Error()
 	}
-	cause := serviceCauseLine(detail)
+	cause := serviceReasonLine(detail)
 	nextAction := ""
 	if !service.HasNamedAction(cause) {
 		nextAction = serviceStatusCommandText
@@ -1785,7 +1871,7 @@ func serviceHandoverFailureText(action serviceAction, err error) string {
 	if err != nil {
 		detail = err.Error()
 	}
-	cause := serviceCauseLine(detail)
+	cause := serviceReasonLine(detail)
 	nextAction := ""
 	if !service.HasNamedAction(cause) {
 		nextAction = serviceStatusCommandText

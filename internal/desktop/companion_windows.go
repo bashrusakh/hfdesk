@@ -350,7 +350,12 @@ func runCompanion(lock *instanceLock, guard panicGuard,
 	// dead end).
 	dispatchInstallService := func() {
 		go guard.runBackground(func() {
-			runInstallServiceAction(lock.name, requestServiceMenuRefresh,
+			// The published catch-up of the host, not a copy captured at
+			// wiring: every surface reads the one owner (the lifecycle
+			// items and the windows already do), so the install route
+			// cannot ask a different menu to catch up than the host
+			// installed for this launch.
+			runInstallServiceAction(lock.name, requestServiceMenuCatchUp,
 				coordinator.commit, requestQuit)
 		})
 	}
