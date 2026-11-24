@@ -118,11 +118,14 @@ in the state vocabulary of the service layer: `not-installed`, `running`,
 `stopped`, `starting`, `stopping`, `failed`, `broken`, `masked`,
 `masked-runtime` or `unknown`. It is `unknown` whenever this process could
 not settle the state — no host of the process provides the service surface
-(the console and service hosts), the read failed, or the supervisor reported
+(the console host), the read failed, or the supervisor reported
 no usable state — and it is never `not-installed` for a state that could not
 be read, so a client can enable an installation only on a proven absence. The
 desktop host fills it from the same read its tray menu status line shows, so
-the Runtime window and the tray report the same status.
+the Runtime window and the tray report the same status. The Windows service
+host also provides the read — of its own machine-wide registration — so the
+page the service itself serves reports the state it runs from; its
+install-service action stays unavailable and answers 404.
 
 `runId` identifies the run of the server: it is generated once per server
 and it never changes afterwards, so it is stable for the whole life of the
