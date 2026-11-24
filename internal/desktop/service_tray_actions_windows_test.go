@@ -581,7 +581,7 @@ func TestServiceHelperStopStopsTheService(t *testing.T) {
 	assertNames(t, (*messages)[0].text, "the report", []string{
 		"The HFDesk service is stopped.",
 		"Nothing serves the address of the service right now.",
-		"Quit HFDesk from the notification-area icon",
+		"Quit HFDesk from the tray icon",
 	})
 }
 
@@ -636,8 +636,8 @@ func TestServiceHelperUninstallRemovesOnlyTheRegistration(t *testing.T) {
 			wantCaption: serviceRegistrationRemovedCaption,
 			wantText: []string{
 				"The Windows service registration of HFDesk is removed.",
-				"settings, jobs, models, cache, history and logs stay untouched",
-				"Install the service again from the tray of the desktop app",
+				"Your data stays untouched.",
+				"Install the service again from the tray menu of the desktop app.",
 			},
 		},
 		{
@@ -646,7 +646,7 @@ func TestServiceHelperUninstallRemovesOnlyTheRegistration(t *testing.T) {
 			wantCaption: serviceNoRegistrationCaption,
 			wantText: []string{
 				"HFDesk is not registered as a Windows service.",
-				"nothing was changed",
+				"There was no registration to remove.",
 			},
 		},
 	} {

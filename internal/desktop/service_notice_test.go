@@ -176,7 +176,7 @@ func TestServiceGateTextAsksToStartAStoppedService(t *testing.T) {
 	if !strings.Contains(text, "installed, but it is not running") {
 		t.Errorf("the dialog %q does not say that the service is stopped", text)
 	}
-	if strings.Contains(text, "The web UI of the service is at") {
+	if strings.Contains(text, "Web UI") {
 		t.Errorf("the dialog %q claims an address of a service that is stopped", text)
 	}
 	if got, want := serviceGateOpenLabel(prompt), "Start service"; got != want {
@@ -207,7 +207,7 @@ func TestServiceGateTextOffersTheDesktopModeForAStoppedService(t *testing.T) {
 	})
 	assertNamesWithout(t, text, "the dialog", nil, []string{
 		// The service does not serve, so no address is offered.
-		"The web UI of the service is at",
+		"Web UI",
 		// This dialog can continue the launch, so the sentence of the
 		// dialogs that always end it does not belong to it, and the
 		// text argues with no mechanism beside the one continuing
@@ -372,7 +372,7 @@ func TestServiceUpdatedTextKeepsAStoppedServiceStopped(t *testing.T) {
 		"HFDesk 1.3.0",
 		`C:\portable\hfdesk.exe`,
 		"stays stopped",
-		"Nothing serves HFDesk right now",
+		"Nothing serves the address of the service right now",
 		"Start the desktop app again and choose Start service",
 	})
 	// One report, one route: the relaunch of the desktop app is the single
@@ -397,7 +397,7 @@ func TestServiceUpdatedTextNamesTheCompanionsOwnStartItem(t *testing.T) {
 		text := serviceUpdatedText("1.3.0", `C:\portable\hfdesk.exe`, `C:\ProgramData\HFDesk`, address, false, before, launchSurfaceCompanion, "")
 
 		assertNames(t, text, "the companion report", []string{
-			"Nothing serves HFDesk right now",
+			"Nothing serves the address of the service right now",
 			"Choose Start service from the tray menu.",
 		})
 		// The way back is ONE step, the current menu item of this tray.
@@ -458,7 +458,7 @@ func TestServiceUpdatedTextNamesTheObservedPriorState(t *testing.T) {
 				tc.quote,
 				"is not running after the update",
 				"stays stopped",
-				"Nothing serves HFDesk right now",
+				"Nothing serves the address of the service right now",
 				"Start the desktop app again and choose Start service",
 			})
 			// One report, one route: no elevated command line and no
@@ -498,8 +498,7 @@ func TestServiceInstalledTextNamesTheProgramTheAddressAndTheData(t *testing.T) {
 		"starts at boot",
 		address,
 		"Open the address above",
-		dataDir,
-		"do not appear in the service",
+		"keeps its own data in " + dataDir,
 	})
 
 	// A local build carries no release version: it is named without one
@@ -508,9 +507,13 @@ func TestServiceInstalledTextNamesTheProgramTheAddressAndTheData(t *testing.T) {
 		t.Errorf("the report %q reports the build placeholder as a version", text)
 	}
 	// A registration without a readable address is reported as such, and the
-	// report never leaves a sentence without an address.
-	if text := serviceInstalledText("1.3.0", console, "", ""); !strings.Contains(text, "names no listen address") {
-		t.Errorf("the report %q does not report the missing address", text)
+	// report never tells the user to open an address it just called unknown.
+	noAddress := serviceInstalledText("1.3.0", console, "", "")
+	if !strings.Contains(noAddress, "names no listen address") {
+		t.Errorf("the report %q does not report the missing address", noAddress)
+	}
+	if strings.Contains(noAddress, "Open the address above") {
+		t.Errorf("the report %q tells the user to open an address it does not know", noAddress)
 	}
 }
 
@@ -542,15 +545,15 @@ func TestServiceInstalledTextCarriesTheAuthorizedTrayFallbackOnce(t *testing.T) 
 		t.Errorf("the report carries the tray fallback %d times, want exactly once:\n%s", got, install)
 	}
 	// The report keeps its shape: the state comes first, the conditional
-	// line sits right after the consequence it qualifies and before the
+	// line sits right after the address action it qualifies and before the
 	// closing fact about the data of the service.
 	if !strings.HasPrefix(install, "HFDesk 1.3.0 is installed as a Windows service.") {
 		t.Errorf("the report %q does not open with its state", install)
 	}
-	if !strings.Contains(install, "Open the address above.\n\n"+serviceInstalledTrayFallbackLine) {
+	if !strings.Contains(install, "Open the address above.\n"+serviceInstalledTrayFallbackLine) {
 		t.Errorf("the report %q does not carry the fallback right after the address action:\n%s", install, install)
 	}
-	if !strings.HasSuffix(install, "do not appear in the service.") {
+	if !strings.HasSuffix(install, "keeps its own data in "+dataDir+".") {
 		t.Errorf("the report %q does not end with the data fact:\n%s", install, install)
 	}
 
@@ -600,6 +603,54 @@ func TestServiceInstalledTextCarriesTheAuthorizedTrayFallbackOnce(t *testing.T) 
 			t.Errorf("the %s carries the tray fallback:\n%s", name, text)
 		}
 	}
+}
+
+// TestServiceReportsAreFactsWithoutArgument pins the shortened shape of the
+// success reports (decision of 2026-11-25): the report states what happened,
+// the address when the service serves, the data directory when the report
+// belongs to a registration, and at most one action. It carries no
+// justification, no assumption, no repetition of the lifetime the installation
+// confirmation already stated, and no list of the data kinds the service does
+// not share.
+//
+// The block counts are part of the shape: the installation report is three
+// short blocks (what was installed, how to open it, where the data lives) and
+// the start report is two (what runs, how to open it), so neither window grows
+// a paragraph back.
+func TestServiceReportsAreFactsWithoutArgument(t *testing.T) {
+	const (
+		console = `C:\portable\hfdesk.exe`
+		dataDir = `C:\ProgramData\HFDesk`
+		address = "http://127.0.0.1:8080"
+	)
+	install := serviceInstalledText("1.3.0", console, dataDir, address)
+	assertNamesWithout(t, install, "the installation report", nil, []string{
+		"desktop app is not needed",
+		"so ",
+		"may ",
+		"settings, jobs, models, cache, history and logs",
+		"keeps running after this window closes",
+	})
+	if got := strings.Count(install, "\n\n"); got != 2 {
+		t.Errorf("the installation report has %d paragraph breaks, want two (three blocks):\n%s", got, install)
+	}
+
+	start := serviceStartedText(console, address)
+	assertNamesWithout(t, start, "the start report", nil, []string{
+		"desktop app is not needed", "so ", "may ",
+		"settings, jobs, models, cache, history and logs",
+	})
+	if got := strings.Count(start, "\n\n"); got != 1 {
+		t.Errorf("the start report has %d paragraph breaks, want one (two blocks):\n%s", got, start)
+	}
+
+	// The removed registration states the data invariant without naming the
+	// data kinds, and names one way back.
+	removed := serviceRegistrationRemovedText()
+	assertNamesWithout(t, removed, "the removal report", nil, []string{
+		"settings, jobs, models, cache, history and logs", "whenever you want it back", "so ",
+	})
+	assertNames(t, removed, "the removal report", []string{"Your data stays untouched."})
 }
 
 // TestServiceActionFailureTextOfAnAlreadyRegisteredFirstInstall proves that a
@@ -2165,20 +2216,20 @@ func TestServiceActionConfirmationsCarryNoAdministratorPhrase(t *testing.T) {
 
 // TestServiceStoppedTextNamesTheStateTheFactAndOneWayBack proves that the
 // report of a stopped service is the state, the one fact the user did not
-// ask for — nothing serves the address of the service right now — and
-// exactly one way back. On the desktop surface that way back goes through
-// the quit and the startup gate, and it stays byte for byte the established
-// route: a start beside the desktop that serves its own address is refused
-// by the established guard of the helper, so a report that pointed at that
-// start would send the user into the refusal in a circle. The companion
-// surface gets its own route instead
+// ask for — nothing serves the address of the service right now — and exactly
+// one way back.
+// On the desktop surface that way back goes through the quit and the startup
+// gate of the next launch, the established route: a start beside the desktop
+// that serves its own address is refused by the established guard of the
+// helper, so a report that pointed at that start would send the user into the
+// refusal in a circle. The companion surface gets its own route instead
 // (TestServiceStoppedTextNamesTheCompanionsOwnStartItem).
 func TestServiceStoppedTextNamesTheStateTheFactAndOneWayBack(t *testing.T) {
 	text := serviceStoppedText(launchSurfaceDesktop)
 	assertNames(t, text, "the report", []string{
 		"The HFDesk service is stopped.",
 		"Nothing serves the address of the service right now.",
-		"Quit HFDesk from the notification-area icon",
+		"Quit HFDesk from the tray icon",
 		"choose Start service",
 	})
 	// One report, one route: no elevated command line and no alternative
@@ -2223,7 +2274,7 @@ func TestLaunchSurfaceOfKeepsTheDesktopDefaultForAHandTypedHelper(t *testing.T) 
 		t.Errorf("launchSurfaceOf with the marker = %q, want %q", got, launchSurfaceCompanion)
 	}
 	if got, want := serviceStoppedText(launchSurfaceOf(false)),
-		"Quit HFDesk from the notification-area icon and choose Start service when you start the desktop app again."; !strings.HasSuffix(got, want) {
+		"Quit HFDesk from the tray icon. Start HFDesk again and choose Start service."; !strings.HasSuffix(got, want) {
 		t.Errorf("the report of a marker-less helper run does not end with the established desktop way back %q:\n%s", want, got)
 	}
 }
@@ -2237,12 +2288,12 @@ func TestServiceRegistrationRemovedTextNeverClaimsDataDeletion(t *testing.T) {
 	text := serviceRegistrationRemovedText()
 	assertNames(t, text, "the report", []string{
 		"The Windows service registration of HFDesk is removed.",
-		"settings, jobs, models, cache, history and logs stay untouched",
-		"Install the service again from the tray of the desktop app",
+		"Your data stays untouched.",
+		"Install the service again from the tray menu of the desktop app.",
 	})
-	// Every data noun appears only in the "stay untouched" sentence: the
-	// report never pairs any of them with a deletion — in any of the
-	// singular or plural, past or perfect shapes of such a claim.
+	// The data fact is the only place the report speaks about the data: it
+	// never pairs it with a deletion — in any of the singular or plural,
+	// past or perfect shapes of such a claim.
 	assertNamesWithout(t, text, "the report", nil, deletionClaimForms)
 	// One report, one route: the installation is the single named action.
 	if got := strings.Count(text, "Install the service again"); got != 1 {
@@ -2260,7 +2311,7 @@ func TestServiceNoRegistrationTextStatesTheCleanOutcome(t *testing.T) {
 	text := serviceNoRegistrationText()
 	assertNames(t, text, "the report", []string{
 		"HFDesk is not registered as a Windows service.",
-		"There was no registration to remove, so nothing was changed.",
+		"There was no registration to remove.",
 	})
 	assertNamesWithout(t, text, "the report", nil, []string{
 		"registration of HFDesk is removed", "stay untouched",
