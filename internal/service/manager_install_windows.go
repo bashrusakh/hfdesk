@@ -68,6 +68,18 @@ func (m *scmManager) install(ctx context.Context, opts InstallOptions, startFirs
 	if pathAccess != nil {
 		defer pathAccess.Close()
 	}
+	// The account of the instance opens the program image itself when the
+	// service control manager starts it, and a program in the profile of a
+	// user carries no access for that account: the installation grants the
+	// minimal access a start needs — read and execute on the program and
+	// traversal of the route above it — before the access check below, so
+	// the first start finds the program usable and the check verifies the
+	// granted state against the running token when one is available. A
+	// grant the machine refuses refuses the installation here, before a
+	// directory is created or the registration is written.
+	if err := scmGrantExecutableAccess(opts.Executable); err != nil {
+		return opts, Status{}, err
+	}
 	// The program is checked before the first write, so a refused program leaves
 	// the instance unchanged. Only AccessCheck with the running LocalService
 	// token can establish a denial; an unavailable token remains inconclusive.
