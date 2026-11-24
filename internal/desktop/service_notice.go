@@ -80,6 +80,41 @@ func failureWindowText(text string) string {
 	return text + logFileLine(runLogPath)
 }
 
+// serviceCauseLine returns the one factual line a failure window states as the
+// cause of a service-level failure: the message of the service layer with its
+// internal "service: " marker cut off, reduced to its first line and cut
+// before the first clause that appends an instruction, an argument or an
+// internal command. The whole message stays in the log the window names.
+func serviceCauseLine(detail string) string {
+	detail = strings.TrimSpace(detail)
+	if detail == "" {
+		return ""
+	}
+	if index := strings.IndexByte(detail, '\n'); index >= 0 {
+		detail = detail[:index]
+	}
+	detail = strings.TrimPrefix(detail, "service: ")
+	for _, separator := range []string{"; ", ". ", ": "} {
+		if index := strings.Index(detail, separator); index >= 0 {
+			detail = detail[:index]
+		}
+	}
+	return strings.TrimSpace(strings.TrimRight(detail, " \t.,;:"))
+}
+
+// serviceFailureReport joins the parts of a failure report — the headline, the
+// cause, an outcome line and at most one action — and drops the empty ones, so
+// a report without a cause never prints a blank paragraph.
+func serviceFailureReport(parts ...string) string {
+	kept := parts[:0]
+	for _, part := range parts {
+		if strings.TrimSpace(part) != "" {
+			kept = append(kept, part)
+		}
+	}
+	return strings.Join(kept, "\n\n")
+}
+
 // The captions of the message boxes of the service actions.
 //
 // Every box of the service flow is captioned here, so the tray, the service
@@ -329,7 +364,7 @@ func removeServiceConfirmText(handover bool) string {
 			"Your data stays untouched. This window closes, and HFDesk starts again in desktop mode."
 	}
 	return "This removes the Windows service registration of HFDesk.\n\n" +
-		"Your settings, jobs, models, cache, history and logs stay untouched.\n\n" +
+		"Your data stays untouched.\n\n" +
 		"Do you want to remove the registration?"
 }
 
@@ -390,35 +425,29 @@ func serviceGatePendingText(state service.State) string {
 		transition = "stopping"
 	}
 	return failureWindowText("The HFDesk service is still " + transition + " and did not reach a settled state in time.\n\n" +
-		"This launch changes nothing: it starts no server.\n\n" +
+		"This launch starts no server.\n\n" +
 		"Start the desktop app again when the service has settled.")
 }
 
 // serviceGateDiagnosticAction is the one action of the two notices that
-// could not settle the state: the read of the state from an elevated shell,
-// with its honesty boundary in the same sentence — a read that fails leaves
-// the state unknown and this launch never guesses it, so the notice promises
-// no relaunch that could show it again.
-const serviceGateDiagnosticAction = `Run "hfdesk service status" from an elevated shell: ` +
-	`a successful read settles the state and the desktop app can then be started again; ` +
-	`a failed read leaves the state unknown and HFDesk will not guess it.`
+// could not settle the state: the read of the state from an elevated shell.
+const serviceGateDiagnosticAction = `Run "hfdesk service status" from an elevated shell.`
 
 // serviceGateUnreadableText returns the text of the notice of a launch that
 // could not read the registration of the Windows service.
 //
 // The launch cannot tell a machine without a service from one whose service
 // is installed, so it decides on neither: the notice is the state (the read
-// failed), the one risk the user has to see (a service may be running, so
-// this launch started no server), the cause on its own line and the one
-// action that resolves the uncertainty — the read of the state — with the
-// boundary of that promise in the same sentence.
+// failed), the result (this launch started no server), the cause on its own
+// line and the one action that resolves the uncertainty — the read of the
+// state.
 func serviceGateUnreadableText(err error) string {
 	text := "HFDesk could not read the state of the Windows service.\n\n"
 	if err != nil {
 		text += err.Error() + "\n\n"
 	}
 	return failureWindowText(text +
-		"An HFDesk service may be installed and running on this machine, so this launch started no server.\n\n" +
+		"This launch starts no server.\n\n" +
 		serviceGateDiagnosticAction)
 }
 
@@ -429,11 +458,11 @@ func serviceGateUnreadableText(err error) string {
 // The dialog is modal and can outlive the snapshot it was built from, so the
 // launch does not continue. The text is the state (the change and the state
 // the re-read reported), the result (no server was started) and the same one
-// action the unreadable notice carries, with the same boundary.
+// action the unreadable notice carries.
 func serviceGateChangedText(prompt serviceChoicePrompt) string {
 	return failureWindowText(
 		"The state of the HFDesk service changed while the dialog was open.\n\n" +
-			"It is " + serviceGateStatePhrase(prompt) + " now, so this launch did not continue into desktop mode; it started no server.\n\n" +
+			"It is " + serviceGateStatePhrase(prompt) + " now. This launch starts no server.\n\n" +
 			serviceGateDiagnosticAction)
 }
 
@@ -562,18 +591,17 @@ const serviceInstalledTrayFallbackLine = "If the tray icon does not appear, star
 // serviceInstalledText returns the report of a finished installation.
 //
 // The report names the program the registration runs, the address the service
-// serves and the data directory it owns. The last sentence tells the user the
-// consequence they need: the desktop app is not needed to use the service, and
-// its own data stays where it is. Right after that consequence follows the one
-// authorized conditional instruction (serviceInstalledTrayFallbackLine), which
-// belongs to this report alone because only this action restarts the host as a
-// tray companion. The helper runs only after the desktop process ended,
-// so the report never tells the user to quit an app that is gone.
+// serves and the data directory it owns. Its one action is open the address.
+// Right after that action follows the one authorized conditional instruction
+// (serviceInstalledTrayFallbackLine), which belongs to this report alone
+// because only this action restarts the host as a tray companion. The helper
+// runs only after the desktop process ended, so the report never tells the
+// user to quit an app that is gone.
 func serviceInstalledText(version, console, dataDir, address string) string {
 	text := serviceVersionName(version) + " is installed as a Windows service.\n\n" +
 		"The service runs " + console + ", starts at boot and keeps running after this window closes.\n\n"
 	text += serviceAddressText(address)
-	text += "The desktop app is not needed to use the service: open the address above.\n\n" +
+	text += "Open the address above.\n\n" +
 		serviceInstalledTrayFallbackLine
 	if dataDir != "" {
 		text += "\n\nThe service keeps its own data in " + dataDir + ". The settings, jobs and models of the desktop app do not appear in the service."
@@ -626,7 +654,7 @@ func serviceUpdatedText(version, console, dataDir, address string, running bool,
 	}
 	if running {
 		text += serviceAddressText(address)
-		text += "The desktop app is not needed to use the service: open the address above."
+		text += "Open the address above."
 	} else {
 		wayBack := "Start the desktop app again and choose Start service."
 		if surface == launchSurfaceCompanion {
@@ -765,7 +793,7 @@ func serviceStartedText(console, address string) string {
 		text += "It runs " + console + ".\n\n"
 	}
 	text += serviceAddressText(address)
-	text += "The desktop app is not needed to use the service: open the address above."
+	text += "Open the address above."
 	return text
 }
 
@@ -879,20 +907,8 @@ const (
 	// serviceStatusCommandText is the next action of a report that cannot
 	// say which state the action left: the state of the service has to be
 	// read before anything else is decided.
-	serviceStatusCommandText = `Run "hfdesk service status" from an elevated shell to read the current state of the service.`
+	serviceStatusCommandText = `Run "hfdesk service status" from an elevated shell.`
 )
-
-// statusIfUnnamed returns the state command for a report whose detail does
-// not name an action yet, and nothing when the detail already carries one —
-// in whatever shape the service layer printed it: a report states one
-// action, never the same route twice. The marker rule itself lives with the
-// service layer (service.HasNamedAction), so both surfaces share it.
-func statusIfUnnamed(detail string) string {
-	if service.HasNamedAction(detail) {
-		return ""
-	}
-	return "\n\n" + serviceStatusCommandText
-}
 
 // serviceActionBusyText returns the refusal of a second service action while
 // one is already running.
@@ -903,7 +919,8 @@ func statusIfUnnamed(detail string) string {
 // running action is the one that moves it, and a state read beside it would
 // describe a machine that is already changing.
 func serviceActionBusyText() string {
-	return failureWindowText("Another HFDesk service action is already running, so this action was not started.\n\n" +
+	return failureWindowText("Another HFDesk service action is already running.\n\n" +
+		"This action was not started.\n\n" +
 		"Wait for the running action to finish, then try again.")
 }
 
@@ -936,14 +953,14 @@ func isServiceAccountRefusal(err error) bool {
 // the registration already exists and that this attempt changed none of it: it
 // never says that a registration may remain and never offers the removal of a
 // registration this attempt never touched, because removing it would take away
-// a service the user did not ask to remove here. The next action is the one
-// this state offers: the startup gate of the next launch of the desktop app,
-// whose choices cover opening or starting the service and updating the
-// registration to the program this app runs from.
-func serviceAlreadyRegisteredText(detail string) string {
-	return "HFDesk could not install the Windows service.\n\n" + detail + "\n\n" +
-		"The service registration already exists, and this attempt did not create, change or start it.\n\n" +
-		"Start HFDesk again: its startup gate offers to open or start the service and to update it."
+// a service the user did not ask to remove here. The next action is the launch
+// of the desktop app, whose startup gate offers to open, start or update the
+// service.
+func serviceAlreadyRegisteredText() string {
+	return serviceFailureReport(
+		serviceActionFailureHeadline(serviceActionInstall),
+		"The service registration already exists, and this attempt did not create, change or start it.",
+		"Start HFDesk again.")
 }
 
 // serviceActionFailureHeadline returns the first line of the report of a
@@ -969,34 +986,42 @@ func serviceActionFailureHeadline(action serviceAction) string {
 // singleton could not be held.
 //
 // The report states that no service action was performed — the hold is taken
-// before the first change, so a failed hold touched nothing — and names the
-// cause of the failed hold as its next part. A refusal because another
-// Windows identity owns the object already names the step that ends that
-// hold, so it carries the only next action of this report; every other cause
-// ends with the command that reads the state, and no report carries both
-// commands.
+// before the first change, so a failed hold touched nothing — and the one
+// factual cause line of the failed hold. A refusal because another Windows
+// identity owns the object is stated as that fact, with the one step that
+// ends the hold (end that process and try again); every other cause ends with
+// the command that reads the state, and no report carries both actions.
 func serviceSingletonHoldRefusedText(action serviceAction, err error) string {
 	detail := ""
 	if err != nil {
 		detail = err.Error()
 	}
-	text := serviceActionFailureHeadline(action) + "\n\n" +
-		"No service action was performed: " + detail
-	if !errors.Is(err, service.ErrSingletonAccessDenied) {
-		text += statusIfUnnamed(detail)
+	if errors.Is(err, service.ErrSingletonAccessDenied) {
+		return failureWindowText(serviceFailureReport(serviceActionFailureHeadline(action),
+			"No service action was performed: another Windows account holds the HFDesk desktop session.",
+			"End that process and try again."))
 	}
-	return failureWindowText(text)
+	cause := serviceCauseLine(detail)
+	result := "No service action was performed."
+	if cause != "" {
+		result = "No service action was performed: " + cause + "."
+	}
+	nextAction := ""
+	if !service.HasNamedAction(cause) {
+		nextAction = serviceStatusCommandText
+	}
+	return failureWindowText(serviceFailureReport(serviceActionFailureHeadline(action), result, nextAction))
 }
 
 // serviceUnreadableClaimRefusedText returns the report of a mutation that
 // refused over a published claim it could not read: the result (no service
-// action was performed) and the cause (the state file that would tell
-// whether a desktop serves cannot be read, so that question stays
-// undetermined). The report carries no next action: no single step clears a
-// file the guard cannot inspect, so it stays an honest terminal.
+// action was performed) and the cause (the state file that would tell whether
+// a desktop serves cannot be read). The report carries no next action: no
+// single step clears a file the guard cannot inspect, so it stays an honest
+// terminal.
 func serviceUnreadableClaimRefusedText(action serviceAction, claim string) string {
-	return failureWindowText(serviceActionFailureHeadline(action) + "\n\n" +
-		fmt.Sprintf("No service action was performed: the state file of the desktop at %q cannot be read, so whether a desktop of this session serves its local server cannot be determined.", claim))
+	return failureWindowText(serviceFailureReport(serviceActionFailureHeadline(action),
+		`No service action was performed: the state file of the desktop at "`+claim+`" cannot be read.`))
 }
 
 // serviceServingDesktopRefusedText returns the report of a mutation that
@@ -1012,16 +1037,21 @@ func serviceServingDesktopRefusedText(action serviceAction) string {
 }
 
 // serviceActionFailureText returns the report of a failed service action: the
-// action that failed, the error of the service control manager and the one next
-// action of the state the attempt left.
+// action that failed, the one factual cause line of the service control
+// manager and the one next action of the state the attempt left.
 //
 // It never claims that a registration was restored: a failure can happen after
-// the registration was written, so an installation report names a registration
-// that may remain. An installation whose service-owned first start failed is
-// reported from the cleanup facts returned by the service manager instead. A
-// first installation that refused an existing registration is reported as the
-// unchanged state it left instead: that registration was never written by this
-// attempt, so neither the may-remain warning nor the removal belongs to it.
+// the registration was written, so an installation report states that the
+// installation did not confirm a registration. An installation whose
+// service-owned first start failed is reported from the cleanup facts returned
+// by the service manager instead. A first installation that refused an
+// existing registration is reported as the unchanged state it left instead:
+// that registration was never written by this attempt, so neither the
+// registration line nor the removal belongs to it. An installation that could
+// not give the account of the instance access to its program is reported by
+// serviceImageAccessFailedText, which states the path and the one action and
+// never a registration: that refusal happens before any registration is
+// written.
 func serviceActionFailureText(action serviceAction, err error, program string) string {
 	return failureWindowText(serviceActionFailureBody(action, err, program))
 }
@@ -1033,41 +1063,71 @@ func serviceActionFailureBody(action serviceAction, err error, program string) s
 	if err != nil {
 		detail = err.Error()
 	}
+	cause := serviceCauseLine(detail)
+	nextAction := ""
+	if cause != "" && !service.HasNamedAction(cause) {
+		nextAction = serviceStatusCommandText
+	}
+
+	// The refusal that could not give the account of the instance access to
+	// its program happens before any registration is written, so it states
+	// the path and the one action alone: a registration report would be false
+	// here.
+	if errors.Is(err, service.ErrServiceImageAccessUnrepaired) {
+		return serviceImageAccessFailedText(action, program)
+	}
 
 	switch action {
 	case serviceActionInstall:
 		if isAlreadyRegisteredRefusal(err) {
-			return serviceAlreadyRegisteredText(detail)
+			return serviceAlreadyRegisteredText()
 		}
 		// The installation may have written a registration or not, and
 		// the report does not know which: reading the state resolves
-		// that uncertainty, so the state command is the one next action
-		// — no conditional removal sits beside it, because whether there
-		// is anything to remove is exactly what the read decides. A
-		// manager text that already names the command keeps it as the
-		// single action.
-		return serviceActionFailureHeadline(action) + "\n\n" + detail + "\n\n" +
-			"A registration may remain." + statusIfUnnamed(detail)
-	case serviceActionUpdate:
-		// The refusal of a changed account states its own report: the
-		// result (nothing was changed), the cause (the account the
-		// registration runs as) and the command that restores the
-		// supported identity. Adding the state command here would give
-		// the report a second next action.
-		if isServiceAccountRefusal(err) {
-			return serviceActionFailureHeadline(action) + "\n\n" + detail
+		// that uncertainty, so the state command is the one next action.
+		// A failure the helper reports without a program happened before
+		// the registration was attempted, so the window states none.
+		outcome := "The installation did not confirm whether it created a registration."
+		if program == "" {
+			outcome = ""
 		}
-		return serviceActionFailureHeadline(action) + "\n\n" + detail + statusIfUnnamed(detail)
-	case serviceActionStop, serviceActionUninstall:
-		// The headline is the result, the manager text is the cause on
-		// its single line, and the state command resolves what the
-		// failure left — the shape of the update report, so no report of
-		// these actions ever claims a state its action did not observe.
-		return serviceActionFailureHeadline(action) + "\n\n" + detail + statusIfUnnamed(detail)
+		return serviceFailureReport(serviceActionFailureHeadline(action), cause, outcome, nextAction)
+	case serviceActionUpdate:
+		// The refusal of a changed account states the fact it observed:
+		// the account the registration runs as. It names no next action
+		// in this window — the route that restores the supported
+		// identity stays in the log.
+		if isServiceAccountRefusal(err) {
+			return serviceFailureReport(serviceActionFailureHeadline(action), cause)
+		}
+		return serviceFailureReport(serviceActionFailureHeadline(action), cause, nextAction)
 	default:
-		return serviceActionFailureHeadline(action) + "\n\n" + detail + "\n\n" +
-			"The start was not confirmed." + statusIfUnnamed(detail)
+		return serviceFailureReport(serviceActionFailureHeadline(action), cause, nextAction)
 	}
+}
+
+// serviceImageAccessFailedText returns the window of an installation that
+// could not give the account of the instance access to its program: the
+// action that failed, the one fact — the account cannot read the registered
+// program — and the one action that resolves it. The refusal happens before
+// any registration is written, so the window states no registration at all.
+//
+// The path is the program the caller passed, never a path read back out of the
+// refusal message: the refusal of a directory of the program's route names
+// that directory, and a text parse would then call it the program (and break
+// silently on any rewording of the service layer). A caller that knows no
+// program states the fact without a path.
+func serviceImageAccessFailedText(action serviceAction, program string) string {
+	cause := "The service account cannot read the HFDesk program."
+	if program != "" {
+		cause = "The service account cannot read the program at " + program + "."
+	}
+	retry := "install the service again"
+	if action != serviceActionInstall {
+		retry = "run the action again"
+	}
+	return serviceFailureReport(serviceActionFailureHeadline(action), cause,
+		"Move the HFDesk pair into a folder the service account can read, then "+retry+".")
 }
 
 // serviceInstallStartFailureText reports a first-install start failure from
@@ -1088,13 +1148,14 @@ func serviceActionFailureBody(action serviceAction, err error, program string) s
 // recorded its clean observation beside its deadline wrapper, that
 // observation is the line (InstallStartError.Observation), so the service
 // wrapper that would restate the program and the budget never reaches the
-// report; every other cause keeps its chain as the detail it always was.
-// The class is never repeated under its headline, so the class and the
-// budget each occur exactly once. The kept-registration branch states the
-// left — the registration may remain — and names the one action that
-// resolves it: the read of the state. The removed branch never shares its
-// wording with a machine that never had a registration: it says what this
-// attempt removed, not that HFDesk was never installed.
+// report; every other cause is reduced to its one factual line
+// (serviceCauseLine), so the service layer's argument and command never
+// become window text. The class is never repeated under its headline, so the
+// class and the budget each occur exactly once. The kept-registration branch
+// states that the registration stayed and names the one action that reads its
+// state. The removed branch never shares its wording with a machine that
+// never had a registration: it says what this attempt removed, not that
+// HFDesk was never installed.
 //
 // The cleanup fact itself is stated exactly once: the detail carries the
 // cause and the one line the cleanup observed as a reason, never the
@@ -1103,23 +1164,31 @@ func serviceActionFailureBody(action serviceAction, err error, program string) s
 // report states it once.
 func serviceInstallStartFailureText(err error, program string, cleanup *service.InstallStartError) string {
 	detail := installStartDetail(err, cleanup)
-	removed := cleanup != nil && cleanup.RegistrationRemoved
-	text := serviceInstallStartHeadline(cleanup) + "\n\n" + detail + "\n\n"
-	if removed {
-		return failureWindowText(text + "The failed instance was settled and the registration created by this attempt was removed: this installation attempt left no registration behind, so start the desktop app normally again.")
+	if cleanup == nil || strings.TrimSpace(cleanup.Observation) == "" {
+		detail = serviceCauseLine(detail)
 	}
-	outcome := "The registration was kept because cleanup could not prove that it was still owned by this attempt."
+	removed := cleanup != nil && cleanup.RegistrationRemoved
+	headline := serviceInstallStartHeadline(cleanup)
+	if removed {
+		return failureWindowText(serviceFailureReport(headline, detail,
+			"The registration created by this attempt was removed.",
+			"Start the desktop app normally again."))
+	}
+	outcome := "The registration was kept: cleanup could not prove that this attempt still owned it."
 	if cleanup != nil && cleanup.RegistrationOwned {
 		if cleanup.ProcessStopped {
 			outcome = "The failed process was proven stopped, but the registration created by this attempt could not be removed."
 		} else {
-			outcome = "The registration created by this attempt was kept because its process was not proven stopped."
+			outcome = "The registration created by this attempt was kept: its process was not proven stopped."
 		}
 	} else if cleanup != nil && cleanup.ProcessStopped {
 		outcome = "The failed process was proven stopped, but the registration changed and was kept."
 	}
-	text += outcome
-	return failureWindowText(text + statusIfUnnamed(detail))
+	nextAction := ""
+	if !service.HasNamedAction(detail) {
+		nextAction = serviceStatusCommandText
+	}
+	return failureWindowText(serviceFailureReport(headline, detail, outcome, nextAction))
 }
 
 // serviceInstallStartHeadline returns the headline of a failed first start:
@@ -1673,17 +1742,20 @@ func consoleDownloadFailedText(notice siblingMissingNotice, downloadErr error) s
 // serviceHandoverRefusedText returns the report of a helper that could not
 // prepare its coordination with the launching desktop: the result (no
 // service action was performed), the observed cause on its own line and the
-// one command that reads the state — kept as the single action by the same
-// rule every report follows (a cause that already names the command keeps it
-// as the only one). The standard log-path line of every failure window closes
-// it.
+// one command that reads the state. The standard log-path line of every
+// failure window closes it.
 func serviceHandoverRefusedText(err error) string {
 	detail := ""
 	if err != nil {
 		detail = err.Error()
 	}
-	return failureWindowText("HFDesk could not prepare the service action.\n\n" +
-		"No service action was performed.\n\n" + detail + statusIfUnnamed(detail))
+	cause := serviceCauseLine(detail)
+	nextAction := ""
+	if !service.HasNamedAction(cause) {
+		nextAction = serviceStatusCommandText
+	}
+	return failureWindowText(serviceFailureReport("HFDesk could not prepare the service action.",
+		"No service action was performed.", cause, nextAction))
 }
 
 // serviceHandoverFailureHeadline returns the first line of the report of a
@@ -1713,8 +1785,12 @@ func serviceHandoverFailureText(action serviceAction, err error) string {
 	if err != nil {
 		detail = err.Error()
 	}
-	return failureWindowText(serviceHandoverFailureHeadline(action) + "\n\n" +
-		detail + "\n\n" + serviceStatusCommandText)
+	cause := serviceCauseLine(detail)
+	nextAction := ""
+	if !service.HasNamedAction(cause) {
+		nextAction = serviceStatusCommandText
+	}
+	return failureWindowText(serviceFailureReport(serviceHandoverFailureHeadline(action), cause, nextAction))
 }
 
 // unknownServiceActionText returns the report of an action the helper does not

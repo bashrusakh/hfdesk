@@ -489,12 +489,9 @@ func TestServiceGateEndsTheLaunchWhenTheRegistrationCannotBeRead(t *testing.T) {
 	}
 	assertNames(t, (*messages)[0].text, "the notice", []string{
 		"the service control manager did not answer",
-		"may be installed and running",
-		"started no server",
+		"starts no server",
 		"hfdesk service status",
 		"elevated shell",
-		"can then be started again",
-		"leaves the state unknown",
 	})
 	// The read is the single action: the notice promises no relaunch that
 	// would show the same notice again when the read fails persistently.
@@ -849,8 +846,8 @@ func TestServiceGateEndsAPendingLaunchWithoutAChoice(t *testing.T) {
 	if !strings.Contains((*messages)[0].text, "still stopping") {
 		t.Errorf("the notice %q does not name the transition", (*messages)[0].text)
 	}
-	if !strings.Contains((*messages)[0].text, "changes nothing") {
-		t.Errorf("the notice %q does not say that the launch changed nothing", (*messages)[0].text)
+	if !strings.Contains((*messages)[0].text, "starts no server") {
+		t.Errorf("the notice %q does not say that the launch serves nothing", (*messages)[0].text)
 	}
 }
 
@@ -1971,7 +1968,7 @@ func TestServiceHelperUpdateKeepsARunningServiceRunning(t *testing.T) {
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the report of the update", len(*messages))
 	}
-	assertNames(t, (*messages)[0].text, "the report", []string{"http://127.0.0.1:18080", "not needed to use the service"})
+	assertNames(t, (*messages)[0].text, "the report", []string{"http://127.0.0.1:18080", "Open the address above"})
 }
 
 // TestServiceHelperRendersOnlyTheManagerVersionResult checks the desktop
@@ -2163,7 +2160,7 @@ func TestServiceHelperInstallStartsTheServiceAndReportsTheAddress(t *testing.T) 
 	if len(manager.steps) != 1 || manager.steps[0] != "install-start" {
 		t.Errorf("the helper steps are %v, want one service-owned install/start call", manager.steps)
 	}
-	assertNames(t, (*messages)[0].text, "the report", []string{`C:\portable\hfdesk.exe`, "http://127.0.0.1:18080", "not needed to use the service"})
+	assertNames(t, (*messages)[0].text, "the report", []string{`C:\portable\hfdesk.exe`, "http://127.0.0.1:18080", "Open the address above"})
 }
 
 func TestServiceHelperInstallReportsTheServiceOwnedCleanupResult(t *testing.T) {
@@ -2172,7 +2169,7 @@ func TestServiceHelperInstallReportsTheServiceOwnedCleanupResult(t *testing.T) {
 		cleanup *service.InstallStartError
 		want    []string
 	}{
-		{"removed", &service.InstallStartError{Cause: errors.New("another version was reported"), RegistrationRemoved: true}, []string{"another version was reported", "registration created by this attempt was removed", "start the desktop app normally again"}},
+		{"removed", &service.InstallStartError{Cause: errors.New("another version was reported"), RegistrationRemoved: true}, []string{"another version was reported", "registration created by this attempt was removed", "Start the desktop app normally again"}},
 		{"kept when ownership is unknown", &service.InstallStartError{Cause: errors.New("another version was reported"), CleanupError: errors.New("process identity changed")}, []string{"another version was reported", "registration was kept", "could not prove", "hfdesk service status"}},
 	}
 	for _, tc := range cases {
@@ -2213,8 +2210,8 @@ func TestServiceHelperInstallDoesNotCleanAConcurrentRegistrationByName(t *testin
 	if len(manager.steps) != 1 || manager.steps[0] != "install-start" || manager.reads != 0 {
 		t.Errorf("the helper used steps %v and read status %d times, want no by-name cleanup", manager.steps, manager.reads)
 	}
-	if len(*messages) != 1 || !strings.Contains((*messages)[0].text, "appeared during the first installation") {
-		t.Errorf("the helper report is %v, want the concurrent-registration error", *messages)
+	if len(*messages) != 1 || !strings.Contains((*messages)[0].text, "The service registration already exists") {
+		t.Errorf("the helper report is %v, want the unchanged-registration refusal", *messages)
 	}
 	// The attempt changed no registration, so the report offers no removal
 	// of a registration it never touched.
@@ -2245,12 +2242,12 @@ func TestServiceHelperInstallReportsARegistrationConflictWithoutStatusLookup(t *
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the refusal of the existing registration", len(*messages))
 	}
-	assertNames(t, (*messages)[0].text, "the report", []string{"already registered", "did not create, change or start it", "startup gate"})
+	assertNames(t, (*messages)[0].text, "the report", []string{"did not create, change or start it", "Start HFDesk again."})
 	assertNamesWithout(t, (*messages)[0].text, "the report", nil, []string{
 		"A registration may remain",
 		`"hfdesk service uninstall"`,
-		// The startup gate is the single next action: the elevated
-		// installation command beside it would be a second route.
+		// The launch of the desktop app is the single next action: the
+		// elevated installation command beside it would be a second route.
 		`"hfdesk service install"`,
 		"elevated shell",
 	})
@@ -2280,14 +2277,18 @@ func TestHandoverFailureCarriesTheStateCommand(t *testing.T) {
 		t.Errorf("the report %q names the state command %d times, want exactly one", shown, got)
 	}
 
-	// Input-independent dedup: a cause that already names the state
-	// command carries it as the single action — without the dedup the
-	// unconditional append made the report name it twice.
+	// A cause that names the state command is reduced to its fact and the
+	// standard action of the report is the one command: the manager's own
+	// command never becomes window text, and the state command is named
+	// exactly once.
 	shown = ""
 	namedCause := errors.New(`service: the handover was not confirmed; run "hfdesk service status" to read the current state of the service`)
 	reporter.handoverFailure(namedCause)
-	if !strings.Contains(shown, namedCause.Error()) {
+	if !strings.Contains(shown, "the handover was not confirmed") {
 		t.Errorf("the report %q does not carry the cause of the manager", shown)
+	}
+	if strings.Contains(shown, "service: ") {
+		t.Errorf("the report %q carries the internal marker of the manager", shown)
 	}
 	if got := strings.Count(shown, "hfdesk service status"); got != 1 {
 		t.Errorf("the report %q names the state command %d times, want exactly one", shown, got)
@@ -2617,7 +2618,8 @@ func TestServiceHelperStartReportsTheRefusedStartAndTheStatusCommand(t *testing.
 	if len(*messages) != 1 {
 		t.Fatalf("the helper showed %d message boxes, want the failure of the start", len(*messages))
 	}
-	assertNames(t, (*messages)[0].text, "the report", []string{"the service control manager refused the start", "The start was not confirmed.", "hfdesk service status"})
+	assertNames(t, (*messages)[0].text, "the report", []string{"the service control manager refused the start", "hfdesk service status"})
+	assertNamesWithout(t, (*messages)[0].text, "the report", nil, []string{"The start was not confirmed.", "service: "})
 	assertNamesWithout(t, (*messages)[0].text, "the report", nil, []string{status.Executable, `NT AUTHORITY\LocalService`})
 }
 
@@ -2863,7 +2865,7 @@ func TestServiceHelperStartReportsTheAddress(t *testing.T) {
 	if caption := serviceStartedCaption; (*messages)[0].caption != caption {
 		t.Errorf("the caption is %q, want %q", (*messages)[0].caption, caption)
 	}
-	assertNames(t, (*messages)[0].text, "the report", []string{"http://127.0.0.1:18080", `C:\portable\hfdesk.exe`, "not needed to use the service"})
+	assertNames(t, (*messages)[0].text, "the report", []string{"http://127.0.0.1:18080", `C:\portable\hfdesk.exe`, "Open the address above"})
 }
 
 // TestServiceHelperSingletonArgumentRules proves the helper accepts exactly
@@ -3601,10 +3603,8 @@ func TestServiceGateRechecksTheStateBeforeDesktopMode(t *testing.T) {
 	assertNames(t, (*messages)[0].text, "the notice", []string{
 		"changed while the dialog was open",
 		"running now",
-		"started no server",
+		"starts no server",
 		"hfdesk service status",
-		"can then be started again",
-		"leaves the state unknown",
 	})
 	// The read is the single action of the changed-state notice as well:
 	// no imperative relaunch may promise a retry that shows this notice

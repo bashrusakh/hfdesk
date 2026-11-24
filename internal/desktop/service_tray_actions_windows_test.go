@@ -90,7 +90,7 @@ func TestTrayServiceActionsRefuseASecondActionOfAnyType(t *testing.T) {
 		}
 		assertNames(t, message.text, "the refusal", []string{
 			"Another HFDesk service action is already running",
-			"this action was not started",
+			"This action was not started",
 		})
 	}
 	if !serviceActionRunning.Load() {
