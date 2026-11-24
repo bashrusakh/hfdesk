@@ -320,3 +320,133 @@ func TestSCMFirstInstallRequestComparisonRefusesAnotherAccount(t *testing.T) {
 		t.Error("scmSameOwnedConfig() = true between two reads over a changed account")
 	}
 }
+
+// TestSCMFirstInstallGuardIgnoresAChangedDisplayNameAndDescription is the probe
+// for the field refusal that broke a clean first start on a real machine: the
+// registration the installation had just created reported DISPLAY_NAME
+// `hfdesk` — the service name, which is the value the service control manager
+// reports for a registration stored without a display name — while the request
+// asked for `HFDesk`. Every field that selects the running program matched; the
+// guard still refused, and the kept registration was never started.
+//
+// A display name and a description name and explain a registration; they select
+// no program, its vector, its type, its start or its account. Site №1 therefore
+// accepts a read-back that differs from the request in exactly those fields.
+func TestSCMFirstInstallGuardIgnoresAChangedDisplayNameAndDescription(t *testing.T) {
+	opts := scmTestOptions()
+	requested := buildSCMConfig(opts)
+	stored := scmStorageOfTheInstallationWriteSequence(opts)
+
+	cases := []struct {
+		name  string
+		apply func(*mgr.Config)
+	}{
+		{"the service name the control manager reports when no display name was stored",
+			func(c *mgr.Config) { c.DisplayName = ServiceName }},
+		{"a display name an administrator chose",
+			func(c *mgr.Config) { c.DisplayName = "Operator label" }},
+		{"no description at all",
+			func(c *mgr.Config) { c.Description = "" }},
+		{"a description an administrator chose",
+			func(c *mgr.Config) { c.Description = "another description" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			readBack := stored
+			tc.apply(&readBack)
+			if !firstInstallRequestComparison(readBack, requested) {
+				t.Errorf("site №1 refused an intact registration over display data: %v",
+					scmOwnedConfigDifferences(readBack, requested))
+			}
+		})
+	}
+}
+
+// TestSCMFirstInstallGuardStillRefusesAChangedRuntimeIdentity pins that the
+// narrowing above takes nothing out of the guard that decides what is started:
+// a command line that names another program or carries another argument vector,
+// another service type, start type, error control or account is still refused
+// at site №1.
+func TestSCMFirstInstallGuardStillRefusesAChangedRuntimeIdentity(t *testing.T) {
+	// The spelling of an account belongs to the machine a test runs on, so
+	// the identity comparison is driven through its seam.
+	replaceSCMTestSeam(t, &scmAccountSecurityIdentifier, func(account string) (string, error) {
+		return "", fmt.Errorf("the test knows no account %q", account)
+	})
+	opts := scmTestOptions()
+	requested := buildSCMConfig(opts)
+	stored := scmStorageOfTheInstallationWriteSequence(opts)
+
+	otherProgram := opts
+	otherProgram.Executable = filepath.Join("C:\\Windows", "System32", "notepad.exe")
+	otherArguments := opts
+	otherArguments.Listen = "127.0.0.1:1"
+
+	cases := []struct {
+		name  string
+		apply func(*mgr.Config)
+	}{
+		{"another program",
+			func(c *mgr.Config) { c.BinaryPathName = scmCommandLine(otherProgram) }},
+		{"another argument vector",
+			func(c *mgr.Config) { c.BinaryPathName = scmCommandLine(otherArguments) }},
+		{"another service type",
+			func(c *mgr.Config) { c.ServiceType = windows.SERVICE_WIN32_SHARE_PROCESS }},
+		{"another start type",
+			func(c *mgr.Config) { c.StartType = mgr.StartManual }},
+		{"another error control",
+			func(c *mgr.Config) { c.ErrorControl = mgr.ErrorSevere }},
+		{"another account",
+			func(c *mgr.Config) { c.ServiceStartName = `CONTOSO\svc-other` }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			readBack := stored
+			tc.apply(&readBack)
+			if firstInstallRequestComparison(readBack, requested) {
+				t.Errorf("site №1 accepted a registration whose runtime identity changed: %v",
+					scmOwnedConfigDifferences(readBack, requested))
+			}
+			if scmSameOwnedConfig(readBack, stored) {
+				t.Error("scmSameOwnedConfig() = true between two reads over a changed runtime identity")
+			}
+		})
+	}
+}
+
+// TestSCMFirstInstallFullGuardStillRefusesAChangedDisplayName is the control of
+// the narrowing: the full read-against-read comparison is not weakened. The same
+// display data that site №1 now accepts between a request and its read-back is
+// an external change between two reads, and the ownership guard that holds the
+// creation across the first start — and that cleanup consults before it removes
+// anything — still refuses it.
+func TestSCMFirstInstallFullGuardStillRefusesAChangedDisplayName(t *testing.T) {
+	opts := scmTestOptions()
+	stored := scmStorageOfTheInstallationWriteSequence(opts)
+
+	cases := []struct {
+		name  string
+		apply func(*mgr.Config)
+	}{
+		{"the display name changed between two reads",
+			func(c *mgr.Config) { c.DisplayName = ServiceName }},
+		{"the description changed between two reads",
+			func(c *mgr.Config) { c.Description = "another description" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			altered := stored
+			tc.apply(&altered)
+			if scmSameOwnedConfig(altered, stored) {
+				t.Error("scmSameOwnedConfig() = true between two reads over changed display data")
+			}
+			replaceSCMTestSeam(t, &scmQueryServiceConfig, func(*mgr.Service) (mgr.Config, error) {
+				return altered, nil
+			})
+			target := scmServiceRecoveryTarget{manager: &scmManager{scope: ScopeSystem}, handle: &mgr.Service{}}
+			if scmFirstInstallRegistrationStillOwned(target, stored) {
+				t.Error("scmFirstInstallRegistrationStillOwned() = true, want the changed registration no longer owned by this attempt")
+			}
+		})
+	}
+}

@@ -425,11 +425,15 @@ func (m *scmManager) register(ctx context.Context, manager *mgr.Mgr, opts Instal
 			return result, &InstallStartError{Cause: cause, Outcome: StartOutcomeNotPerformed,
 				CleanupError: errors.New("the registration configuration could not be proven unchanged; it was not started or removed")}
 		}
-		// Only what this write established is compared here: the program
-		// and its vector, the type and start it registered, the display
-		// data and the identity of the account. The full read-against-read
-		// comparison stays where both sides are reads — in
-		// startFirstRegistration and in cleanup below.
+		// Only what this write established about the program the service
+		// control manager runs is compared here: the program and its
+		// vector, the service type, the start type, the error control and
+		// the identity of the account. The display data is not part of
+		// it: a name or a description the platform stored differently
+		// changes no program, and their storage depends on the platform
+		// and on values a previous registration carried. The full
+		// read-against-read comparison stays where both sides are reads —
+		// in startFirstRegistration and in cleanup below.
 		if !scmSameRequestedConfig(ownedConfig, config) {
 			cause := errors.New("service: the newly created registration changed before its first start")
 			return result, &InstallStartError{Cause: cause, Outcome: StartOutcomeNotPerformed,
@@ -675,18 +679,33 @@ func scmSameOwnedConfig(current, expected mgr.Config) bool {
 }
 
 // scmSameRequestedConfig reports whether a read-back of the registration this
-// installation created still holds what its write established.
+// installation created still holds what its write established about the
+// program the service control manager runs.
 //
 // The first install compares the configuration it asked for with what the
-// platform reports, so only a field the write set has an expectation to
-// compare against. A value this attempt never wrote — a SID type CreateService
-// skips when it is SERVICE_SID_TYPE_NONE, a delayed auto start it skips when it
-// is false, a tag that needs a load order group, a password QueryServiceConfig
-// never returns, a dependency list the platform decodes in its own shape — has
-// no expectation here: its zero in the request is an assumption about a
-// platform default, and comparing against that assumption reports our own
-// registration as changed. Those fields are read-against-read questions and
-// stay with scmSameOwnedConfig, which compares two reads of the same platform.
+// platform reports, so only a field that determines what is started — and that
+// this write established — has an expectation to compare against.
+//
+// The display name and the description are not compared. They name and explain
+// the registration; they do not select the program, its vector, its type, its
+// start or its account, so a registration that carries different display data
+// runs exactly what this installation wrote. Their storage is also not a fact
+// of this write: the service control manager reports the service name when a
+// registration was stored without a display name, and an updated registration
+// inherits the display data it carried (scmConfigForUpdate), so a comparison
+// against the constant the request asked for reports an intact registration as
+// changed. That is the shape that refused a clean first start in the field
+// (`hfdesk` read back against `HFDesk`).
+//
+// A value this attempt never wrote — a SID type CreateService skips when it is
+// SERVICE_SID_TYPE_NONE, a delayed auto start it skips when it is false, a tag
+// that needs a load order group, a password QueryServiceConfig never returns, a
+// dependency list the platform decodes in its own shape — has no expectation
+// here either: its zero in the request is an assumption about a platform
+// default, and comparing against that assumption reports our own registration
+// as changed. Those fields are read-against-read questions and stay with
+// scmSameOwnedConfig, which compares two reads of the same platform and still
+// refuses changed display data.
 //
 // The program and its vector stay guarded exactly as before: a command line
 // that names another program or another argument vector is refused first.
@@ -705,9 +724,7 @@ func scmSameRequestedConfig(current, expected mgr.Config) bool {
 	}
 	return current.ServiceType == expected.ServiceType &&
 		current.StartType == expected.StartType &&
-		current.ErrorControl == expected.ErrorControl &&
-		current.DisplayName == expected.DisplayName &&
-		current.Description == expected.Description
+		current.ErrorControl == expected.ErrorControl
 }
 
 func (m *scmManager) cleanupFailedFirstRegistration(ctx context.Context, target scmFirstInstallTarget, ownedConfig mgr.Config, processID uint32, cause error) error {
