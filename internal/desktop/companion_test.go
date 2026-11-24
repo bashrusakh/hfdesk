@@ -773,7 +773,7 @@ func TestCompanionReportsFollowTheWindowRule(t *testing.T) {
 			text: companionRelaunchWaitTimeoutText(),
 			want: []string{
 				// The state: the session is still held.
-				"still holds the single-instance object",
+				"is still running",
 				// The one action: start again in a moment.
 				relaunchAction,
 			},

@@ -454,17 +454,15 @@ const logFolderOpenFailedCaption = "HFDesk - the log folder could not be opened"
 // that could not take the single instance lock of the session within its
 // bounded wait.
 //
-// The report is the state (another HFDesk process of this session still
-// holds the session — usually the elevated helper that is finishing the
-// service action this child was relaunched for) and the one action that
-// resolves it (start the desktop app again once that process finished). It
-// carries no log-path line: the
+// The report is the state (another HFDesk process of this session still runs)
+// and the one action that resolves it (start the desktop app again once that
+// process finished). It carries no log-path line: the
 // lock is taken before the log file is opened, so this launch has no log
 // file of its own yet — the established rule of the lock reports (a
 // launch that ends here names no log, because there is none).
 func companionRelaunchWaitTimeoutText() string {
-	return "HFDesk could not take over the desktop session: another HFDesk process of this Windows session still holds the single-instance object.\n\n" +
-		"That is usually the elevated helper finishing the service action. Start the desktop app again in a moment."
+	return "HFDesk could not take over the desktop session: another HFDesk process of this Windows session is still running.\n\n" +
+		"Start the desktop app again in a moment."
 }
 
 // companionWebView2MissingText returns the report of a tray companion

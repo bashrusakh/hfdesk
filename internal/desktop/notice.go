@@ -69,7 +69,7 @@ func alreadyRunningOpenFailedText(url string, openErr error) string {
 // names really carries it.
 func trayStartupFailureText() string {
 	return failureWindowText("HFDesk could not create its icon in the notification area.\n\n" +
-		"The desktop host needs the icon in the notification area to be reachable, so it stops.")
+		"HFDesk stops.")
 }
 
 // runtimeWindowShowFailedText returns the text of the report of a Logs
