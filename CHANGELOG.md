@@ -37,6 +37,7 @@
 - Installation and service actions now work while the Logs window or the web UI is open, without waiting for the open log view to end.
 - A service action that fails during the switch to the tray now shows one error window with the cause instead of two in a row.
 - A first installation no longer reports that the just-created registration changed before its first start when nothing else touched it: the check now compares only what the installation itself wrote.
+- The service starts from any folder now, a user profile included: the installation gives the service account access to its own program, and refuses with instructions to move the pair instead of registering a service that cannot start.
 
 ## [1.3.0-beta.9] - 2026-11-19
 

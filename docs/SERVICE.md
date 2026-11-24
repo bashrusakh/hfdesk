@@ -947,9 +947,13 @@ replaces the other.
   program without a version — a local build such as `hfdesk-desktop.exe` —
   keeps the fallbacks: `hfdesk.exe` next, then exactly one `hfdesk*.exe` of a
   release in the folder, with the notice offering manual instructions only.
-  Install the service from a folder that only
-  administrators can modify: the service runs that program as `LocalService`,
-  and HFDesk never changes the permissions of a user folder. Windows shows its
+  Install the service from any folder, including the profile of a user:
+  the service account needs read and execute access to the program, and
+  the installation gives it exactly that on its own program and the route
+  to it before anything is registered. If the machine refuses that access,
+  the installation refuses too — before the registration is written — and
+  names the fix: move the HFDesk pair into a folder the service account can
+  read, then run the installation again from an elevated shell. Windows shows its
   standard administrator prompt, the elevated helper installs the service,
   starts it and verifies that it runs — that the server on the registered
   address answers as HFDesk, with the health document of the instance or, for a
