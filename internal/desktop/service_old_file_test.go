@@ -106,7 +106,7 @@ func TestServiceUpdatedTextCarriesTheOldFileBlockOnlyForAMove(t *testing.T) {
 				// the update left and names exactly one route back —
 				// the route of THIS surface.
 				"The service stays stopped.",
-				"Nothing serves HFDesk right now.",
+				"Nothing serves the address of the service right now.",
 				tc.wayBack,
 			})
 			if got := strings.Count(withOld, "Start service"); got != 1 {
@@ -175,7 +175,7 @@ func TestTheOldFileCommandTouchesExactlyTheNamedFileAndOnlyWhenItRuns(t *testing
 	if caption != oldFileDeletedCaption {
 		t.Errorf("the outcome is captioned %q, want %q", caption, oldFileDeletedCaption)
 	}
-	assertNames(t, text, "the outcome", []string{"The old file was deleted.", target})
+	assertNames(t, text, "the outcome", []string{"The old file was deleted: " + target + "."})
 
 	// A refusal is reported as the fact it is: the cause on its own line
 	// beside the very file that could not be deleted, and never as a
