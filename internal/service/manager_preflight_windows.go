@@ -100,10 +100,10 @@ func scmParentDirs(path string) []string {
 	}
 }
 
-const (
-	scmServiceIdentitySID  = "S-1-5-19"
-	scmServiceIdentityName = `NT AUTHORITY\LocalService`
-)
+// scmServiceIdentityName is the account a machine-wide instance runs as, as
+// the platform spells it. Its identifier (scmServiceIdentitySID) is declared
+// beside the shared descriptor string that names it (imagegrant.go).
+const scmServiceIdentityName = `NT AUTHORITY\LocalService`
 
 // preflightDataPaths checks the directories an installation reuses: the
 // cache root, the hub directory and the local output directory.

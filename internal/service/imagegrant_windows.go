@@ -232,7 +232,7 @@ func scmAppendImageGrant(dacl *windows.ACL, mask uint32) (*windows.ACL, error) {
 	if dacl == nil {
 		return nil, errors.New("the path carries no access list to append the grant to")
 	}
-	sddl := fmt.Sprintf("(A;;0x%08X;;;%s)", mask, scmServiceIdentitySID)
+	sddl := scmImageGrantSDDL(mask)
 	grant, err := windows.SecurityDescriptorFromString(sddl)
 	if err != nil {
 		return nil, fmt.Errorf("build the access entry of the account of the instance: %w", err)
@@ -316,11 +316,10 @@ func scmGrantMaskCovers(mask, bit uint32) bool {
 // already left behind, when there is one, and the single action that
 // resolves the cause — a pair the account can read. The action names the
 // command, so the surfaces append no second route to the report.
+//
+// The text and the class of the refusal are shared with the platforms that
+// build the package but not this grant (imagegrant.go); the name of the
+// account of the instance is the fact of this platform.
 func scmImageGrantRefusal(path string, cause error, residue string) error {
-	if residue != "" {
-		return fmt.Errorf("service: the account the instance runs as (%s) cannot be given the access it needs on %q: %w: the installation refuses instead of registering a program the service cannot start (%s). Move the HFDesk pair into a folder the service account can read, then run %q from an elevated shell again",
-			scmServiceIdentityName, path, cause, residue, "hfdesk service install")
-	}
-	return fmt.Errorf("service: the account the instance runs as (%s) cannot be given the access it needs on %q: %w: the installation refuses instead of registering a program the service cannot start. Move the HFDesk pair into a folder the service account can read, then run %q from an elevated shell again",
-		scmServiceIdentityName, path, cause, "hfdesk service install")
+	return serviceImageAccessRefusal(scmServiceIdentityName, path, cause, residue)
 }
