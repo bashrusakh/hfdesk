@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [1.3.0-beta.10] - 2026-11-25
+
+Beta build of the upcoming `v1.3.0`; the artifacts are pre-release builds for testing and are not marked as the latest stable release.
+
+Long-form notes: [docs/releases/1.3.0-beta.10.md](docs/releases/1.3.0-beta.10.md).
+
 ### Added
 
 - The Windows desktop can work as a tray companion beside an installed service — without running its own server — and after an installation it restarts as exactly that.
@@ -19,7 +25,7 @@
 - When the address does not answer, the Logs window also offers the step that fits the state — **Start service** for a registered service that does not run, **Install service…** when none is installed.
 - The notice about the missing service program says in one short line which file is needed and where, and keeps its actions — the download and the manual route — visible side by side.
 - Error reports now name the log file of the launch they belong to.
-- Window and report texts are now short and plain: the state and what to do next.
+- Window texts are now short and plain: the facts of what happened, and a next step only where a failed action has to name one.
 - Installing from a removable or network drive now warns that Windows may start the service before the drive is ready.
 - The install confirmation is cut to the question and two short fact lines — the service starts at boot and keeps running, and its data is separate — with the removable-drive warning as its own line.
 
