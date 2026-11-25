@@ -97,42 +97,96 @@ func (f *fakeTrayItem) operations() []string {
 	return append([]string(nil), f.ops...)
 }
 
-// waitForServiceMenuItem polls until the items of the submenu show the
-// expected state, and fails the test when they never do. The install item
-// is probed by VISIBILITY (a hidden item keeps the enabled value it had
-// when it was hidden), the lifecycle group by the visibility of its start
-// item.
-func waitForServiceMenuItem(t *testing.T, what string, line, install, group *fakeTrayItem,
-	wantLine string, wantInstallVisible, wantActionsVisible bool,
-) {
+// submenuFakes is the fake Service submenu of a test: every item the plan
+// can show, plus the menu the refresh logic writes them through.
+type submenuFakes struct {
+	line    *fakeTrayItem
+	open    *fakeTrayItem
+	install *fakeTrayItem
+	start   *fakeTrayItem
+	stop    *fakeTrayItem
+	update  *fakeTrayItem
+	delete  *fakeTrayItem
+	menu    *trayServiceMenu
+}
+
+// newSubmenuFakes builds a submenu whose items start in the state the runner
+// creates them: visible, and grey until the menu enables them.
+func newSubmenuFakes(openFollowsService bool) *submenuFakes {
+	f := &submenuFakes{
+		line:    newFakeTrayItem(),
+		open:    newFakeTrayItem(),
+		install: newFakeTrayItem(),
+		start:   newFakeTrayItem(),
+		stop:    newFakeTrayItem(),
+		update:  newFakeTrayItem(),
+		delete:  newFakeTrayItem(),
+	}
+	f.menu = &trayServiceMenu{
+		line: f.line, open: f.open, install: f.install,
+		start: f.start, stop: f.stop, update: f.update, delete: f.delete,
+		openFollowsService: openFollowsService,
+	}
+	return f
+}
+
+// menuView is what the fake submenu shows at one moment.
+type menuView struct {
+	line           string
+	lineVisible    bool
+	installVisible bool
+	actionsVisible bool
+	startVisible   bool
+	startEnabled   bool
+	stopEnabled    bool
+	updateEnabled  bool
+	deleteEnabled  bool
+	openVisible    bool
+	openEnabled    bool
+}
+
+// view reads the fake items.
+func (f *submenuFakes) view() menuView {
+	var v menuView
+	v.line, _, v.lineVisible, _ = f.line.snapshot()
+	_, _, v.installVisible, _ = f.install.snapshot()
+	_, v.startEnabled, v.startVisible, _ = f.start.snapshot()
+	_, v.stopEnabled, v.actionsVisible, _ = f.stop.snapshot()
+	_, v.updateEnabled, _, _ = f.update.snapshot()
+	_, v.deleteEnabled, _, _ = f.delete.snapshot()
+	_, v.openEnabled, v.openVisible, _ = f.open.snapshot()
+	return v
+}
+
+// waitFor polls until the submenu satisfies the expectation and fails the
+// test when it never does, reporting the values it last read.
+func (f *submenuFakes) waitFor(t *testing.T, what string, want func(menuView) bool) menuView {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
-	var gotLine string
-	var gotInstallVisible, gotActionsVisible bool
+	var got menuView
 	for time.Now().Before(deadline) {
-		gotLine, _, _, _ = line.snapshot()
-		_, _, gotInstallVisible, _ = install.snapshot()
-		_, _, gotActionsVisible, _ = group.snapshot()
-		if gotLine == wantLine && gotInstallVisible == wantInstallVisible && gotActionsVisible == wantActionsVisible {
-			return
+		got = f.view()
+		if want(got) {
+			return got
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("the menu did not show %s: line=%q installVisible=%t actionsVisible=%t",
-		what, gotLine, gotInstallVisible, gotActionsVisible)
+	t.Fatalf("the menu did not show %s: %+v", what, got)
+	return got
 }
 
 // TestMenuRedrawsAfterEveryWindowRead proves the end of the redraw seam: a
 // display read made for the Logs window ends with the refresh request,
 // keepFresh re-reads through the same display policy and applies the
-// result — including the honest unknown state of a read that failed, so
-// no read made for the window can stay invisible in the menu until the next
-// tick.
+// result — including the unsettled read of a failed one, whose submenu is
+// empty (no line, no item), so no read made for the window can
+// stay invisible in the menu until the next tick.
 //
 // The cadence itself is not part of this test: the tray keeps its own 30
 // second tick, and the request travels the existing non-blocking refresh
 // signal.
 func TestMenuRedrawsAfterEveryWindowRead(t *testing.T) {
+	replaceSeam(t, &serviceReadRetryDelay, time.Millisecond)
 	var mu sync.Mutex
 	current := service.Status{State: service.StateRunning, Running: true}
 	var readErr error
@@ -148,21 +202,12 @@ func TestMenuRedrawsAfterEveryWindowRead(t *testing.T) {
 		readErr = err
 	}
 
-	line := newFakeTrayItem()
-	install := newFakeTrayItem()
-	startItem := newFakeTrayItem()
-	stopItem := newFakeTrayItem()
-	updateItem := newFakeTrayItem()
-	deleteItem := newFakeTrayItem()
-	menu := &trayServiceMenu{
-		line: line, install: install,
-		start: startItem, stop: stopItem, update: updateItem, delete: deleteItem,
-	}
+	fakes := newSubmenuFakes(false)
 
 	refresh := make(chan struct{}, 1)
 	view := trayServiceView{read: serviceState.readForDisplay, refresh: refresh}
 	stopped := make(chan struct{})
-	go menu.keepFresh(view, stopped)
+	go fakes.menu.keepFresh(view, stopped)
 	t.Cleanup(func() { close(stopped) })
 
 	// The window's own read posts exactly the request the host posts.
@@ -178,8 +223,10 @@ func TestMenuRedrawsAfterEveryWindowRead(t *testing.T) {
 	if state, err := readRuntimeServiceState(requestRefresh); err != nil || state != "running" {
 		t.Fatalf("the window read answered (%q, %v), want the running state", state, err)
 	}
-	waitForServiceMenuItem(t, "the running service", line, install, startItem,
-		"Service: running", false, true)
+	fakes.waitFor(t, "the running service", func(v menuView) bool {
+		return v.line == "Service: running" && v.lineVisible &&
+			!v.installVisible && v.actionsVisible
+	})
 
 	// The registration is gone between the two window polls: the second
 	// read must reach the menu as well, not wait for the next tick.
@@ -187,19 +234,34 @@ func TestMenuRedrawsAfterEveryWindowRead(t *testing.T) {
 	if state, err := readRuntimeServiceState(requestRefresh); err != nil || state != "not-installed" {
 		t.Fatalf("the window read answered (%q, %v), want the not-installed state", state, err)
 	}
-	waitForServiceMenuItem(t, "the machine without a registration", line, install, startItem,
-		"Service: not installed", true, false)
+	fakes.waitFor(t, "the machine without a registration", func(v menuView) bool {
+		return v.line == "Service: not installed" && v.lineVisible &&
+			v.installVisible && !v.actionsVisible
+	})
 
-	// A read that fails must reach the menu as the honest unknown state —
-	// it asks for the catch-up as any other read does.
+	// A read that fails must reach the menu as the empty submenu — no
+	// line and no item, never a claimed absence — because it asks for the
+	// catch-up as any other read does.
 	setCurrent(service.Status{}, errors.New("the service control manager did not answer"))
 	if state, err := readRuntimeServiceState(requestRefresh); err == nil {
 		t.Fatal("the window read answered no error although the read failed")
 	} else if state != "" {
 		t.Errorf("the failed window read answered the state %q, want no state beside the error", state)
 	}
-	waitForServiceMenuItem(t, "the state that could not be read", line, install, startItem,
-		"Service: unknown", false, false)
+	fakes.waitFor(t, "the state that could not be read", func(v menuView) bool {
+		return !v.lineVisible && !v.installVisible && !v.actionsVisible && !v.startVisible
+	})
+
+	// The next successful read brings the line and the items back by
+	// itself: nothing of the menu was latched by the failure.
+	setCurrent(service.Status{State: service.StateStopped}, nil)
+	if state, err := readRuntimeServiceState(requestRefresh); err != nil || state != "stopped" {
+		t.Fatalf("the window read after the failure answered (%q, %v), want the stopped state", state, err)
+	}
+	fakes.waitFor(t, "the registration the read after the failure proved", func(v menuView) bool {
+		return v.line == "Service: stopped" && v.lineVisible &&
+			!v.installVisible && v.actionsVisible && v.startVisible && v.startEnabled
+	})
 }
 
 // TestTrayMenuApplyDeduplicatesAndRecordsTransitions proves the two rules of
@@ -222,18 +284,21 @@ func TestTrayMenuApplyDeduplicatesAndRecordsTransitions(t *testing.T) {
 		delete: newFakeTrayItem(),
 	}
 
-	installed := serviceMenuState{Line: "Service: installed", ActionsVisible: true, StartEnabled: true}
-	notInstalled := serviceMenuState{Line: "Service: not installed", InstallVisible: true}
+	registered := serviceMenuState{
+		Line: "Service: stopped", LineVisible: true,
+		ActionsVisible: true, StartVisible: true, StartEnabled: true,
+	}
+	notInstalled := serviceMenuState{Line: "Service: not installed", LineVisible: true, InstallVisible: true}
 
-	menu.apply(installed)
-	if title, _, _, _ := line.snapshot(); title != installed.Line {
-		t.Errorf("the line shows %q, want %q", title, installed.Line)
+	menu.apply(registered)
+	if title, _, visible, _ := line.snapshot(); title != registered.Line || !visible {
+		t.Errorf("the line shows %q (visible=%t), want %q and visible", title, visible, registered.Line)
 	}
 	if _, _, visible, _ := install.snapshot(); visible {
-		t.Error("the install item is visible beside an installed service")
+		t.Error("the install item is visible beside a registration")
 	}
 	if _, _, visible, _ := start.snapshot(); !visible {
-		t.Error("the lifecycle group is hidden beside an installed service")
+		t.Error("the start item is hidden beside a registration")
 	}
 	writesAfterFirst := totalItemWrites(line, install, start)
 	if got := len(records.all()); got != 1 {
@@ -243,7 +308,7 @@ func TestTrayMenuApplyDeduplicatesAndRecordsTransitions(t *testing.T) {
 
 	// The identical state is dropped: no item is touched and no update is
 	// recorded for a change the menu did not perform.
-	menu.apply(installed)
+	menu.apply(registered)
 	if got := totalItemWrites(line, install, start); got != writesAfterFirst {
 		t.Errorf("the identical state wrote %d item updates, want none: the result is already visible",
 			got-writesAfterFirst)
@@ -263,7 +328,7 @@ func TestTrayMenuApplyDeduplicatesAndRecordsTransitions(t *testing.T) {
 		t.Error("the install item stayed hidden although the read proved no registration")
 	}
 	if _, _, visible, _ := start.snapshot(); visible {
-		t.Error("the lifecycle group stayed visible although the read proved no registration")
+		t.Error("the start item stayed visible although the read proved no registration")
 	}
 	transitioned := 0
 	for _, record := range records.all() {
@@ -286,10 +351,12 @@ func TestTrayMenuApplyDeduplicatesAndRecordsTransitions(t *testing.T) {
 //
 // The walk applies one state per edge: an absence, a running
 // registration (both groups swap), a transition (the line changes while
-// the visibility does not), an unsettled read (everything that acts
-// hides), a settled stop (everything shows again), a running-fact state
-// (only the line changes — the already hidden install item must receive
-// nothing at all) and the absence again (install returns through Show).
+// the visibility does not), an unsettled read (the line and every item
+// hide), a settled stop (the line and the items show again), a broken
+// registration (the start hides, the update and the delete stay), a
+// running-fact state (only the line changes — the already hidden install
+// item must receive nothing at all) and the absence again (install returns
+// through Show).
 // The assertion is on the recorded operation ORDER of each item: between
 // a hide and the next show only nothing may happen. On the former write
 // order (hide, then disable, in one pass) this test fails; on the
@@ -314,6 +381,7 @@ func TestMenuNeverUpdatesAnItemAfterHidingIt(t *testing.T) {
 		serviceMenuFor(service.Status{State: service.StateStarting}, nil),
 		serviceMenuFor(service.Status{}, errors.New("the service control manager did not answer")),
 		serviceMenuFor(service.Status{State: service.StateStopped}, nil),
+		serviceMenuFor(service.Status{State: service.StateBroken}, nil),
 		serviceMenuFor(service.Status{State: service.StateStopped, Running: true}, nil),
 		// The absence again: the install item — hidden since the
 		// running registration — must come back through Show, and the
@@ -325,7 +393,7 @@ func TestMenuNeverUpdatesAnItemAfterHidingIt(t *testing.T) {
 	}
 
 	managed := map[string]*fakeTrayItem{
-		"open": open, "install": install, "start": start,
+		"line": line, "open": open, "install": install, "start": start,
 		"stop": stop, "update": update, "delete": del,
 	}
 	for name, item := range managed {
@@ -369,6 +437,7 @@ func TestMenuNeverUpdatesAnItemAfterHidingIt(t *testing.T) {
 	requireOps("install", install, "hide", "show")
 	requireOps("start", start, "hide", "show")
 	requireOps("open", open, "hide", "show")
+	requireOps("line", line, "hide", "show")
 }
 
 // totalItemWrites returns how many item updates the given items received.

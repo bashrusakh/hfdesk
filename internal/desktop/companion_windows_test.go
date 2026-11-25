@@ -621,8 +621,10 @@ func TestCompanionWindowPageReportsStateAndRegistrationAddress(t *testing.T) {
 // stay invisible in the menu until the next tick.
 //
 // The counts are the pin: removing the catch-up of either read leaves reads
-// ahead of catch-ups, and an extra read — with or without its own catch-up —
-// breaks the exact count of a render.
+// ahead of catch-ups, and an extra read PASS — with or without its own
+// catch-up — breaks the exact count of a render. One display read is one
+// pass of the display policy, and a failing pass retries inside its own
+// budget without asking for a second catch-up.
 func TestCompanionWindowReadsEachAskTheMenuToCatchUp(t *testing.T) {
 	status := runningServiceStatus(service.StateRunning, "127.0.0.1:18080")
 
@@ -644,15 +646,21 @@ func TestCompanionWindowReadsEachAskTheMenuToCatchUp(t *testing.T) {
 
 			companionWindowContent()
 
-			// The render reads the registration twice — the state
-			// line and the service-log path of the same page — and
-			// every read is reflected exactly once.
-			if got := reads.Load(); got != 2 {
-				t.Errorf("the render read the registration %d time(s), want its two reads", got)
+			// The render makes two display passes — the state line and
+			// the service-log path of the same page — and each pass is
+			// reflected exactly once. A failing pass retries inside the
+			// display budget, so it makes more than one attempt but
+			// still one catch-up request.
+			wantAttempts := int32(2)
+			if tc.readErr != nil {
+				wantAttempts = 2 * serviceReadAttempts
 			}
-			if got := refreshes.Load(); got != reads.Load() {
-				t.Errorf("%d display read(s) asked for the menu catch-up %d time(s), want one request per read",
-					reads.Load(), got)
+			if got := reads.Load(); got != wantAttempts {
+				t.Errorf("the render read the registration %d time(s), want its two display passes (%d attempt(s))",
+					got, wantAttempts)
+			}
+			if got := refreshes.Load(); got != 2 {
+				t.Errorf("the render's two display passes asked for the menu catch-up %d time(s), want one per pass (2)", got)
 			}
 		})
 	}
@@ -706,9 +714,10 @@ func TestCompanionWindowReadsEachAskTheMenuToCatchUp(t *testing.T) {
 // whole Service submenu of the companion menu per read — the absence rule
 // beside the shared mapping everything else follows:
 //
-//   - beside a proven REGISTRATION the four lifecycle actions show and
-//     enable per state, the install item HIDES (the submenu then reads
-//     status line + four actions — one action group, never two), and
+//   - beside a proven REGISTRATION the lifecycle items show and enable per
+//     state (the start hides beside a broken registration, whose start
+//     would fail), the install item HIDES (the submenu then reads status
+//     line + the lifecycle items — one action group, never two), and
 //     Open HFDesk shows — enabled while the service serves the address,
 //     grey beside a registered service that does not run;
 //   - beside a TRANSITION the group stays on screen — the registration
@@ -719,8 +728,9 @@ func TestCompanionWindowReadsEachAskTheMenuToCatchUp(t *testing.T) {
 //     nothing never sits there) — the shape a catch-up reaches after
 //     Delete from the companion and the shape the relaunched child finds
 //     on a machine whose installation failed: no dead end;
-//   - an UNSETTLED read offers neither group and no Open HFDesk — the
-//     honest unknown line alone — because neither claim was proven;
+//   - an UNSETTLED read offers nothing at all: no line, no lifecycle item,
+//     no install item and no Open HFDesk — neither claim and no state was
+//     proven (the read retries by itself);
 //   - every write follows the hide rule (no update after Hide, pinned by
 //     its own order test): an already hidden item receives nothing.
 func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
@@ -797,8 +807,8 @@ func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
 	// proven, but nothing answers it yet; the install item stays hidden
 	// — the registration is proven.
 	menu.apply(serviceMenuFor(service.Status{State: service.StateStopped}, nil))
-	if title, _, _, _ := line.snapshot(); title != "Service: installed" {
-		t.Errorf("the status line = %q, want the honest installed line", title)
+	if title, _, visible, _ := line.snapshot(); title != "Service: stopped" || !visible {
+		t.Errorf("the status line = %q (visible=%t), want the honest stopped line", title, visible)
 	}
 	requireInstallHidden(t, "a stopped registration")
 	if _, enabled, visible, _ := open.snapshot(); !visible || enabled {
@@ -830,12 +840,14 @@ func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
 		t.Errorf("Open HFDesk visible=%t enabled=%t, want it following the running fact of the pending start", visible, enabled)
 	}
 
-	// An UNSETTLED read offers neither group: the honest unknown line
-	// alone, no lifecycle item, and no install item — an item that
-	// cannot act never clutters this menu.
+	// An UNSETTLED read offers nothing: no line, no lifecycle item, no
+	// install item and no Open HFDesk — the submenu is empty, because
+	// neither claim and no state was proven. The read policy retries by
+	// itself and the tick brings the state back, so the user has nothing
+	// to do about the failure.
 	menu.apply(serviceMenuFor(service.Status{}, errors.New("the service control manager did not answer")))
-	if title, _, _, _ := line.snapshot(); title != "Service: unknown" {
-		t.Errorf("the status line = %q, want the honest unknown state", title)
+	if title, _, visible, _ := line.snapshot(); visible {
+		t.Errorf("the status line shows %q at an unsettled read, want no line at all", title)
 	}
 	requireInstallHidden(t, "an unsettled read")
 	requireLifecycleHidden(t, "an unsettled read")

@@ -258,9 +258,11 @@ const (
 	startServiceConfirmCaption = "HFDesk - start the Windows service"
 
 	// updateServiceConfirmCaption is the caption of the confirmation of
-	// an update that hands this host over — the counterpart of the start
-	// caption above, for the same reason. An update that does not hand
-	// over has no confirmation and never shows this caption.
+	// an update: the handover form — the counterpart of the start
+	// caption above, for the same reason — and the form of an update
+	// that stops and starts a running service. An update over a settled
+	// registration that does not run has no confirmation and never
+	// shows this caption.
 	updateServiceConfirmCaption = "HFDesk - update the Windows service"
 
 	// serviceStoppedCaption is the caption of the report of a stopped
@@ -402,6 +404,18 @@ func startServiceConfirmText() string {
 func updateServiceConfirmText() string {
 	return "Update the HFDesk service?\n\n" +
 		"This window closes into the tray and stays there."
+}
+
+// updateRunningServiceConfirmText returns the text of the confirmation of an
+// update that does not hand this host over but moves a running instance: the
+// helper stops the service and starts it again, so the user reads that
+// interruption before agreeing. It follows the shape of the family — the
+// question, then the one line of facts and nothing else — and it repeats no
+// administrator-rights or prompt sentence, because the Windows prompt that
+// follows states that itself (decision of 2026-11-24).
+func updateRunningServiceConfirmText() string {
+	return "Update the Windows service?\n\n" +
+		"The service is stopped and started again. Running downloads are interrupted."
 }
 
 // removeServiceConfirmText returns the text of the confirmation that removes

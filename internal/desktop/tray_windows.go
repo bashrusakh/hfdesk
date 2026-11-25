@@ -93,7 +93,8 @@ type trayMenuItem interface {
 // line and the items that act on the state the line reports — both live
 // INSIDE the Service submenu, with the lifecycle items (start, stop,
 // update, delete) beside the install item; each group belongs to the
-// submenu only for the state that proved it.
+// submenu only for the state that proved it (serviceMenuFor), and a read
+// that proves nothing shows none of them.
 type trayServiceMenu struct {
 	line    trayMenuItem
 	open    trayMenuItem
@@ -128,12 +129,14 @@ type trayServiceMenu struct {
 // apply writes one read of the registration into the menu.
 //
 // Every item follows the mode-times-state mapping of serviceMenuFor: the
-// install item belongs to a proven absence only, the four lifecycle
-// items belong to a proven registration only (inside it they enable per
-// state — start and stop on the settled running fact, update and delete
-// on the settled registration), so exactly one action group is ever on
-// screen beside the status line, and an unsettled read shows the honest
-// unknown line with no action at all.
+// line names the state of a read that settled one and hides on a read that
+// did not, the install item belongs to a proven absence only, the
+// lifecycle items belong to a proven registration only (inside it they
+// enable per state — start and stop on the settled running fact, start
+// hidden beside a broken registration, update and delete on the settled
+// registration), and an unsettled read hides the line AND every item, so
+// exactly one group is ever on screen beside a state that was read — and
+// nothing at all beside a state that was not.
 //
 // The Open HFDesk item is written only where its style says so
 // (openFollowsService): the companion's item follows the registration and
@@ -159,12 +162,21 @@ func (m *trayServiceMenu) apply(state serviceMenuState) {
 	}
 	desktopLog.Info("the tray service menu updated",
 		"line", state.Line,
+		"lineVisible", state.LineVisible,
 		"installVisible", state.InstallVisible,
 		"actionsVisible", state.ActionsVisible,
+		"startVisible", state.StartVisible,
 		"startEnabled", state.StartEnabled,
 		"stopEnabled", state.StopEnabled)
-	m.line.SetTitle(state.Line)
 	wasShown := m.shownSet
+	// The status line reports the state of a read that settled one, and
+	// disappears on a read that did not: the title is written AFTER the
+	// visibility (never beside a hidden item — an update would
+	// re-insert it), so the line returns with the state that proves it.
+	writeItem(m.line, state.LineVisible, false, !wasShown || m.shown.LineVisible)
+	if state.LineVisible {
+		m.line.SetTitle(state.Line)
+	}
 	if m.openFollowsService {
 		// The companion rule of Open HFDesk: the item acts on the
 		// address of the registration, so it shows beside a proven
@@ -178,11 +190,13 @@ func (m *trayServiceMenu) apply(state serviceMenuState) {
 	// group of the service actions is ever on screen.
 	writeItem(m.install, state.InstallVisible, state.InstallVisible,
 		!wasShown || m.shown.InstallVisible)
-	// The lifecycle group follows its own visibility claim: it appears
-	// and disappears together beside a proven registration, and inside
-	// it each item enables per state.
+	// The lifecycle items follow their own visibility claims: the start
+	// item hides beside a broken registration, the other three appear
+	// and disappear together beside a proven registration, and inside it
+	// each item enables per state.
+	writeItem(m.start, state.StartVisible, state.StartEnabled,
+		!wasShown || m.shown.StartVisible)
 	wasActions := !wasShown || m.shown.ActionsVisible
-	writeItem(m.start, state.ActionsVisible, state.StartEnabled, wasActions)
 	writeItem(m.stop, state.ActionsVisible, state.StopEnabled, wasActions)
 	writeItem(m.update, state.ActionsVisible, state.UpdateEnabled, wasActions)
 	writeItem(m.delete, state.ActionsVisible, state.DeleteEnabled, wasActions)
@@ -265,9 +279,9 @@ func (m *trayServiceMenu) keepFresh(view trayServiceView, stopped <-chan struct{
 }
 
 // readServiceMenuState reads the registration for the menu. A read that
-// fails classifies as unknown, so the menu greys the install item and
-// shows the line that is honest about the failure instead of claiming a
-// machine without a service.
+// fails classifies as unknown, so the menu shows nothing at all — no line,
+// no item — instead of claiming a machine without a service; the read
+// policy retries, and the tick brings the state back by itself.
 func readServiceMenuState(view trayServiceView) serviceMenuState {
 	status, err := view.read()
 	return serviceMenuFor(status, err)
@@ -328,10 +342,10 @@ func runTray(iconBytes []byte, tooltip string, style trayMenuStyle, actions tray
 		// and the style's end item. The Service entry carries the
 		// submenu both styles share — the status line first, created
 		// from the first read and disabled (it reports, it does not
-		// act), then the install and lifecycle actions with the same
-		// click wiring everywhere; the shell draws the submenu marker
-		// itself. Which of the submenu items are on screen for one
-		// read is apply's mode-times-state decision.
+		// act), then the install item and the lifecycle actions with
+		// the same click wiring everywhere; the shell draws the submenu
+		// marker itself. Which of the submenu items are on screen for
+		// one read is apply's mode-times-state decision.
 		menu := &trayServiceMenu{
 			openFollowsService: style == trayMenuCompanion,
 		}

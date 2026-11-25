@@ -102,7 +102,8 @@ func TestTrayMenuPlanRootsPinBothCompositions(t *testing.T) {
 // nothing else: no dialog item, no separator, no end item inside the
 // submenu. WHICH of these items are on screen for one read is apply's
 // mode-times-state decision (pinned by the apply tests); the plan lists
-// every item the submenu can show at all.
+// every item the submenu can show at all, and a read that proves nothing
+// shows none of them.
 func TestServiceSubmenuPlanPinsTheSharedServiceSection(t *testing.T) {
 	plan := serviceSubmenuPlan()
 

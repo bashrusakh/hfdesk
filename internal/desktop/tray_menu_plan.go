@@ -103,6 +103,11 @@ func trayMenuPlan(style trayMenuStyle) []trayMenuItemSpec {
 // the four lifecycle actions. Which of them are on screen for one read is
 // apply's mode-times-state decision; the plan lists every item the
 // submenu can show at all.
+//
+// A read that proves nothing shows none of these items: the submenu is
+// empty until a read settles a class of machine, so no action is ever
+// offered on a state that was not read — and the user is not asked to
+// care about a failed read, which the policy retries by itself.
 func serviceSubmenuPlan() []trayMenuItemSpec {
 	return []trayMenuItemSpec{
 		{Kind: trayItemLine, Tooltip: trayServiceStatusTooltip},
