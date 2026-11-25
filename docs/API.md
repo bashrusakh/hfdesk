@@ -148,6 +148,9 @@ from one read of the same table the tray menu uses:
   `enabled`: a hidden item is not clickable. A transition greys every
   lifecycle action, a broken registration hides `start`, and `unknown`
   offers nothing at all — a state that was not read may not be acted on.
+  `install` is offered only where the host provides the installation: a host
+  that registered none reports it invisible and inactive, because its
+  endpoint could only answer `404`.
 
 `serviceState` is the raw lifecycle state word of the platform service
 registration, in the state vocabulary of the service layer: `not-installed`,
