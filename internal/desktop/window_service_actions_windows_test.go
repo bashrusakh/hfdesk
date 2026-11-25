@@ -7,12 +7,43 @@ package desktop
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/service"
 )
+
+// waitForShownCaption waits until the message box has shown the report with
+// the given caption and returns every report recorded so far, in order.
+//
+// The caption of the report ends the wait, never the count of everything
+// shown: a window host also re-shows its window around a service action, and
+// whether that re-show (of the refused press, or of the action that was
+// still running) has landed yet must not decide whether the refusal was
+// reported at all.
+func waitForShownCaption(t *testing.T, shown chan shownMessage, caption, what string) []shownMessage {
+	t.Helper()
+	var messages []shownMessage
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for drained := false; !drained; {
+			select {
+			case message := <-shown:
+				messages = append(messages, message)
+				if message.caption == caption {
+					return messages
+				}
+			default:
+				drained = true
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+	return messages
+}
 
 // TestDesktopWindowActionsCarryTheFixedActionNames pins the bridge of the
 // desktop host's Logs window: the window binds exactly the eight fixed
@@ -303,6 +334,13 @@ func TestDesktopWindowActionsBindTheFiveServiceActions(t *testing.T) {
 // read, no second elevated helper — while the guard of the running action
 // survives it.
 func TestWindowServiceActionsRefuseASecondClick(t *testing.T) {
+	// A report still in flight when a subtest ends must never reach the
+	// native box of this machine: each subtest records the reports of its
+	// own presses, and this sink only catches what a press goroutine still
+	// holds after that subtest's recorder was restored. The native box
+	// returns when the whole test ends.
+	replaceSeam(t, &showMessage, func(string, string, uint32) {})
+
 	for _, windowHost := range []string{"companion", "desktop"} {
 		t.Run(windowHost, func(t *testing.T) {
 			freshServiceInstallGuard(t)
@@ -313,6 +351,19 @@ func TestWindowServiceActionsRefuseASecondClick(t *testing.T) {
 			})
 			waiterCalled := make(chan uint32, 1)
 			releaseWaiter := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseHelperWait := func() { releaseOnce.Do(func() { close(releaseWaiter) }) }
+			// The first action waits for its helper on this channel. A
+			// check below that ends the subtest early must still let
+			// that action end, or its goroutine would stay blocked in
+			// the helper wait into the next subtest.
+			t.Cleanup(func() {
+				releaseHelperWait()
+				deadline := time.Now().Add(5 * time.Second)
+				for time.Now().Before(deadline) && serviceActionRunning.Load() {
+					time.Sleep(10 * time.Millisecond)
+				}
+			})
 			replaceSeam(t, &waitForServiceActionHelper, func(pid uint32) {
 				waiterCalled <- pid
 				<-releaseWaiter
@@ -346,31 +397,14 @@ func TestWindowServiceActionsRefuseASecondClick(t *testing.T) {
 			// helper — and the guard of the running action survives.
 			actions[logsStopServiceAction]()
 
-			wantShown := 1
-			if windowHost == "companion" {
-				// The companion re-shows its window after a
-				// service action, the refused one included: the
-				// busy report is followed by the established
-				// re-read report.
-				wantShown = 2
-			}
-			waitForTrayCondition(t, "the busy report of the refused press", func() bool {
-				return len(shown) == wantShown
-			})
-			busy := 0
-			for _, message := range drainMessages(shown) {
-				switch message.caption {
-				case serviceActionBusyCaption:
-					busy++
-				case companionWindowUnavailableCaption:
-				default:
-					t.Errorf("the refused press showed %q (%q), want only the busy report of the guard",
-						message.caption, message.text)
-				}
-			}
-			if busy != 1 {
-				t.Errorf("the refused press showed %d busy report(s), want exactly one", busy)
-			}
+			// The refusal is proven by its own report, by caption: the
+			// companion re-shows its window around every service
+			// action — the refused one and the one still running
+			// included — so the busy report may arrive before or after
+			// either re-show report, and no count of everything shown
+			// can stand for "the refusal was reported".
+			messages := waitForShownCaption(t, shown, serviceActionBusyCaption,
+				"the busy report of the refused press")
 			select {
 			case second := <-launched:
 				t.Errorf("the refused press launched a second helper %q", second.Action)
@@ -383,10 +417,37 @@ func TestWindowServiceActionsRefuseASecondClick(t *testing.T) {
 			if pid := <-waiterCalled; pid != 7791 {
 				t.Errorf("the waiter waits for the process %d, want the launched helper 7791", pid)
 			}
-			close(releaseWaiter)
+			// Release the first action and let it end, so nothing of
+			// this subtest outlives it (the cleanup above takes the
+			// same path when a check failed earlier).
+			releaseHelperWait()
 			waitForTrayCondition(t, "the guard release after the helper ended", func() bool {
 				return !serviceActionRunning.Load()
 			})
+
+			// Every report of both presses has been shown by now: the
+			// busy report exactly once, and, beside it, only the
+			// companion window's own re-show report — the re-show of
+			// either press, whichever the companion ran last, and
+			// whether it ran before or after the busy report. The
+			// desktop host's window re-reads its live page itself, so
+			// its presses have no such report, but a press goroutine
+			// still in flight must not turn into a false failure.
+			messages = append(messages, drainMessages(shown)...)
+			busy := 0
+			for _, message := range messages {
+				switch message.caption {
+				case serviceActionBusyCaption:
+					busy++
+				case companionWindowUnavailableCaption:
+				default:
+					t.Errorf("the refused press showed %q (%q), want only the busy report of the guard",
+						message.caption, message.text)
+				}
+			}
+			if busy != 1 {
+				t.Errorf("the refused press showed %d busy report(s), want exactly one", busy)
+			}
 		})
 	}
 }
