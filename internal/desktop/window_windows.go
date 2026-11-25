@@ -23,6 +23,15 @@ import (
 // the caller creates a new window.
 const activateTimeout = 3 * time.Second
 
+// windowShutdownTimeout bounds the wait for a window that is destroyed by the
+// shutdown of its host.
+//
+// The window ends its message loop when it is destroyed, so the wait is the
+// moment between the request and the end of that loop. The budget only covers
+// a window whose runtime does not answer: a shutdown that waited longer would
+// have to keep a server alive for a window nobody can see.
+const windowShutdownTimeout = activateTimeout
+
 // webView is the small interface the desktop host drives the runtime window
 // with.
 //
@@ -354,13 +363,46 @@ func (w *runtimeWindow) follow(page, key string, document func() string) {
 // The application keeps running: the window is only a view of the running
 // server.
 func (w *runtimeWindow) Close() {
+	w.close()
+}
+
+// CloseAndWait destroys the runtime window and waits, up to budget, for its
+// message loop to end.
+//
+// It is the close of a host that stops the server it shows: the page of the
+// window is a page of that server, and it paints its own error state — the
+// red error banner and the red status indicators — as soon as the server
+// stops answering. Destroying the window BEFORE the server stops, and waiting
+// for the end of its loop, is what keeps a committed handover (and every
+// ordinary quit) from flashing that state: there is no page left to paint it,
+// while a server that fails WITHOUT this shutdown leaves the window open and
+// its errors visible.
+//
+// A window that does not answer within the budget is left to the process
+// exit: the shutdown of the host is never held by a window nobody can see.
+func (w *runtimeWindow) CloseAndWait(budget time.Duration) {
+	instance := w.close()
+	if instance == nil {
+		return
+	}
+
+	select {
+	case <-instance.done:
+	case <-time.After(budget):
+	}
+}
+
+// close destroys the window that is currently open and returns its instance,
+// or nil when no window is open.
+func (w *runtimeWindow) close() *windowInstance {
 	w.mu.Lock()
 	instance := w.instance
 	w.mu.Unlock()
 	if instance == nil {
-		return
+		return nil
 	}
 	instance.view.Close()
+	return instance
 }
 
 // open returns the window that is currently open, without creating one.
