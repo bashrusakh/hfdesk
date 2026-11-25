@@ -916,10 +916,12 @@ replaces the other.
   administrator prompt, the same handover and the same reports — and the
   host's single service-action guard refuses a second service action while
   one is in flight, whichever surface or item started it. The desktop app's
-  own window binds the same five actions. In a plain browser the actions
-  have no owner, so the control is a static chip with the same line and no
-  menu where it has actions to show; a state with none, and a host that
-  does not offer the installation, shows no control at all.
+  own window binds the same five actions. In a plain browser only an action
+  the server itself performs has an executor: where none of the available
+  actions has one, the line stays a static chip without a menu, while an
+  installation the host can perform is still offered from the menu — a
+  desktop host's page with no service installed shows **Install service…**
+  — and the service's own page, whose server cannot install, keeps the chip.
 
   When that address does not answer (or names none), the window keeps the
   same frame and replaces only the centre: the same header with the icon,
