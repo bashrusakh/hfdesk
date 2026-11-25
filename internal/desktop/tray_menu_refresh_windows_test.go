@@ -396,13 +396,21 @@ func TestMenuNeverUpdatesAnItemAfterHidingIt(t *testing.T) {
 		// group hides once more.
 		serviceMenuFor(service.Status{State: service.StateNotInstalled}, nil),
 	}
-	for _, state := range states {
-		menu.apply(state)
-	}
-
 	managed := map[string]*fakeTrayItem{
 		"service": entry, "line": line, "open": open, "install": install, "start": start,
 		"stop": stop, "update": update, "delete": del,
+	}
+	for _, state := range states {
+		menu.apply(state)
+		// Every pass leaves a HIDDEN item inert: the tray library keeps
+		// the enabled state of an item it removes, and a hidden Start
+		// that stayed enabled was the false promise this rule removes.
+		for name, item := range managed {
+			if _, enabled, visible, _ := item.snapshot(); !visible && enabled {
+				t.Errorf("the %s item is hidden but still enabled after the state %+v: a hidden item promises nothing",
+					name, state)
+			}
+		}
 	}
 	for name, item := range managed {
 		ops := item.operations()
