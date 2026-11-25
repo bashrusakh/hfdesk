@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/server"
+	"github.com/bashrusakh/hfdesk/internal/serviceview"
 )
 
 // boundAddrTimeout bounds the wait for the server to report its bound
@@ -229,7 +230,7 @@ func (a *App) URL() string {
 // and the elevated helper of an installation — so it is handed in instead
 // of being built into the shared server. A host that never calls this
 // reports the state as unknown and answers the action with 404.
-func (a *App) SetRuntimeService(read func() (string, error), install func()) {
+func (a *App) SetRuntimeService(read func() (serviceview.Snapshot, error), install func()) {
 	server.SetRuntimeService(read, install)
 }
 

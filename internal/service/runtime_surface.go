@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/server"
+	"github.com/bashrusakh/hfdesk/internal/serviceview"
 )
 
 // runtimeServiceStateTimeout bounds one read of the service registration
@@ -28,29 +29,32 @@ const runtimeServiceStateTimeout = 5 * time.Second
 // surface produces.
 var errNoHostServiceSurface = errors.New("service: this host has no service registration to read")
 
-// readServiceRegistrationState returns the state word of the service
+// readServiceRegistrationState returns the classified view of the service
 // registration the host serves from, or the failure of that read.
 //
-// The word is the state vocabulary of the service layer. An empty word is
-// passed through as it is: the runtime status turns it into its own unknown
-// state, so this read never guesses a state the supervisor did not report.
-func readServiceRegistrationState() (string, error) {
+// The view is the one shared table (serviceview.From), built from the state
+// word and the supervisor's running fact of the same read. An empty state is
+// passed through as it is and classifies as unknown, so this read never
+// guesses a state the supervisor did not report. A failing read returns an
+// empty view beside its error: the runtime status turns it into the unknown
+// view, and the caller reports the failure as before.
+func readServiceRegistrationState() (serviceview.Snapshot, error) {
 	open := openHostServiceManager
 	if open == nil {
-		return "", errNoHostServiceSurface
+		return serviceview.Snapshot{}, errNoHostServiceSurface
 	}
 	manager, err := open()
 	if err != nil {
-		return "", err
+		return serviceview.Snapshot{}, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), runtimeServiceStateTimeout)
 	defer cancel()
 	status, err := manager.Status(ctx)
 	if err != nil {
-		return "", err
+		return serviceview.Snapshot{}, err
 	}
-	return string(status.State), nil
+	return serviceview.From(string(status.State), status.Running, false), nil
 }
 
 // installRuntimeServiceSurface registers the registration read of the host

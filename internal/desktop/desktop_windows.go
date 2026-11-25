@@ -19,6 +19,7 @@ import (
 	"github.com/bashrusakh/hfdesk/internal/app"
 	"github.com/bashrusakh/hfdesk/internal/logging"
 	"github.com/bashrusakh/hfdesk/internal/service"
+	"github.com/bashrusakh/hfdesk/internal/serviceview"
 	"github.com/energye/systray"
 	"golang.org/x/sys/windows"
 )
@@ -504,8 +505,8 @@ func run(o Options, logPath string) (err error) {
 		go guard.runBackground(installService)
 	}
 	application.SetRuntimeService(
-		func() (string, error) {
-			return readRuntimeServiceState(requestServiceMenuRefresh)
+		func() (serviceview.Snapshot, error) {
+			return readRuntimeServiceSnapshot(requestServiceMenuRefresh)
 		},
 		dispatchInstallService,
 	)
