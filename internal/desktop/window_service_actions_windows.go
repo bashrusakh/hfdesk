@@ -26,15 +26,17 @@ package desktop
 // with the busy report of the tray: no second confirmation, no second
 // elevated helper, and no surface has a guard of its own.
 //
-// reread is the host's own way to re-read the state after the action ended:
-// the tray companion passes the window re-show its Try again button runs —
-// the same display reads the tray tick's fallback reload makes — so a
-// document whose state moved under its own action catches up instead of
-// offering a stale step. The desktop host passes nil: its window shows the
-// live page of its own server, which re-reads itself, while the action path
-// above already asks the menu to catch up on every end path, and reloading
-// that live page would only reset the scroll position of the log the user is
-// reading.
+// reread is the host's own way to re-read the state after the action
+// returned — for an action that only launched its helper, that is the moment
+// it was dispatched, while the settled state arrives through the menu
+// catch-up and the next tick: the tray companion passes the window re-show
+// its Try again button runs — the same display reads the tray tick's
+// fallback reload makes — so a document whose state moved under its own
+// action catches up instead of offering a stale step. The desktop host
+// passes nil: its window shows the live page of its own server, which
+// re-reads itself, while the action path above already asks the menu to
+// catch up on every end path, and reloading that live page would only reset
+// the scroll position of the log the user is reading.
 func windowServiceActions(guard panicGuard, instanceMutex string, reread func()) map[string]func() {
 	lifecycle := func(action serviceAction) func() {
 		return func() {
