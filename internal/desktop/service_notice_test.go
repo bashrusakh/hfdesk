@@ -2102,7 +2102,8 @@ func TestStopAndRemoveConfirmationsStateTheActionAndTheOneFact(t *testing.T) {
 
 // TestServiceActionConfirmationsCarryNoAdministratorPhrase pins the
 // decision of 2026-11-24 over EVERY confirmation of a service action: the
-// install (in both of its shapes), the stop, the start, the update and the
+// install (in both of its shapes), the stop, the start, the update (both of
+// its shapes — the handover one and the one of a running service) and the
 // removal (in both of its variants) never repeat the administrator-rights or
 // Windows-prompt sentence — the Windows prompt that follows states that
 // itself — and each keeps its exact prescribed form.
@@ -2114,6 +2115,7 @@ func TestServiceActionConfirmationsCarryNoAdministratorPhrase(t *testing.T) {
 		"the stop confirmation":                        stopServiceConfirmText(),
 		"the start confirmation":                       startServiceConfirmText(),
 		"the update confirmation":                      updateServiceConfirmText(),
+		"the update confirmation of a running service": updateRunningServiceConfirmText(),
 		"the removal confirmation with a handover":     removeServiceConfirmText(true),
 		"the removal confirmation without a handover":  removeServiceConfirmText(false),
 	} {
@@ -2135,6 +2137,19 @@ func TestServiceActionConfirmationsCarryNoAdministratorPhrase(t *testing.T) {
 		"Update the HFDesk service?",
 		"This window closes into the tray and stays there.",
 	})
+	assertNames(t, updateRunningServiceConfirmText(), "the update confirmation of a running service", []string{
+		"Update the Windows service?",
+		"The service is stopped and started again. Running downloads are interrupted.",
+	})
+	// The two forms of an update say different things because they are
+	// different situations: the handover closes the window, the running
+	// update interrupts the instance. Neither may drift into the other.
+	if strings.Contains(updateRunningServiceConfirmText(), "window closes") {
+		t.Error("the update confirmation of a running service claims a window closes: that is the handover form")
+	}
+	if strings.Contains(updateServiceConfirmText(), "downloads are interrupted") {
+		t.Error("the handover update confirmation claims the downloads are interrupted: that is the running form")
+	}
 	assertNames(t, removeServiceConfirmText(true), "the removal confirmation with a handover", []string{
 		"Remove the HFDesk service registration?",
 		"A running service is stopped first.",
@@ -2532,6 +2547,7 @@ func TestGateAndReportsCarryNoInternalMechanism(t *testing.T) {
 		"the removal confirmation":                           removeServiceConfirmText(false),
 		"the start confirmation with a handover":             startServiceConfirmText(),
 		"the update confirmation with a handover":            updateServiceConfirmText(),
+		"the update confirmation of a running service":       updateRunningServiceConfirmText(),
 		"the removal confirmation with a handover":           removeServiceConfirmText(true),
 		"the service-log open failure":                       serviceLogOpenFailedText(`C:\ProgramData\HFDesk\logs\hfdesk.log`, cause),
 		"the service-log missing report":                     serviceLogMissingText(`C:\ProgramData\HFDesk\logs\hfdesk.log`),

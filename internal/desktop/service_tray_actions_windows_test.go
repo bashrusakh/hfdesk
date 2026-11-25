@@ -697,9 +697,11 @@ func TestServiceHelperUninstallRemovesOnlyTheRegistration(t *testing.T) {
 }
 
 // TestTrayMenuAppliesLifecycleItems proves the write side of the menu map:
-// one read is applied to all the submenu items — the four lifecycle items
-// appear beside the registration and enable per state, and a machine
-// without one hides the whole group while the install item becomes the
+// one read is applied to all the submenu items — the lifecycle items appear
+// beside the registration and enable per state, the start hides beside a
+// broken registration, an unsettled read hides the line and every item (the
+// submenu is empty until a read proves a state), and a machine without a
+// registration hides the whole group while the install item becomes the
 // only active action.
 func TestTrayMenuAppliesLifecycleItems(t *testing.T) {
 	line := newFakeTrayItem()
@@ -785,6 +787,49 @@ func TestTrayMenuAppliesLifecycleItems(t *testing.T) {
 	}
 	if _, enabled, visible, _ := install.snapshot(); !visible || !enabled {
 		t.Errorf("the install item visible=%t enabled=%t beside a proven absence, want it visible and enabled", visible, enabled)
+	}
+
+	// A failed registration: its program is there, so start returns and
+	// the update stays beside it.
+	menu.apply(serviceMenuFor(service.Status{State: service.StateFailed}, nil))
+	startVisible, startEnabled, stopEnabled, updateEnabled, delEnabled, installVisible = snapshot()
+	if !startVisible || !startEnabled || stopEnabled || !updateEnabled || !delEnabled {
+		t.Errorf("the failed registration produced startVisible=%t start=%t stop=%t update=%t delete=%t, want the visible start and the update",
+			startVisible, startEnabled, stopEnabled, updateEnabled, delEnabled)
+	}
+	if installVisible {
+		t.Error("the install item is visible beside a failed registration")
+	}
+
+	// A broken registration: its program is gone, so the start item is
+	// not on screen at all (a grey start would still promise a step that
+	// fails), and the update is the one repair.
+	menu.apply(serviceMenuFor(service.Status{State: service.StateBroken}, nil))
+	startVisible, startEnabled, stopEnabled, updateEnabled, delEnabled, _ = snapshot()
+	if startVisible || startEnabled {
+		t.Errorf("the broken registration shows startVisible=%t start=%t, want the start hidden: its start would fail on the missing program",
+			startVisible, startEnabled)
+	}
+	if stopEnabled || !updateEnabled || !delEnabled {
+		t.Errorf("the broken registration produced stop=%t update=%t delete=%t, want the update and the delete",
+			stopEnabled, updateEnabled, delEnabled)
+	}
+	if _, _, itemVisible, _ := stop.snapshot(); !itemVisible {
+		t.Error("the stop item is hidden beside a broken registration: the item stays on screen, grey")
+	}
+
+	// An unsettled read: no line and no item at all — the submenu is
+	// empty until a read proves a state.
+	menu.apply(serviceMenuFor(service.Status{}, errors.New("the service control manager did not answer")))
+	for name, item := range map[string]*fakeTrayItem{
+		"start": start, "stop": stop, "update": update, "delete": del, "install": install,
+	} {
+		if _, _, itemVisible, _ := item.snapshot(); itemVisible {
+			t.Errorf("the %s item stayed visible beside an unsettled read", name)
+		}
+	}
+	if _, _, lineVisible, _ := line.snapshot(); lineVisible {
+		t.Error("the status line is visible beside an unsettled read: the read proved no state to name")
 	}
 }
 
@@ -911,16 +956,164 @@ func TestInstallRouteCatchesTheMenuUpAfterEveryOutcome(t *testing.T) {
 	})
 }
 
+// TestTrayUpdateOfARunningServiceConfirmsBeforeTheElevation proves the
+// confirmation an update owes a service it INTERRUPTS: beside a running
+// service — and beside no desktop of this session that serves the address,
+// the only state in which the update reaches the elevated helper directly —
+// the user reads the question and the one fact (the service is stopped and
+// started again, running downloads are interrupted) before the administrator
+// prompt follows, under the caption of an update. A declined answer launches
+// nothing, releases the guard and asks for the menu catch-up; an accepted one
+// launches exactly that update helper.
+//
+// Deleting the confirmation fails the declined case at its launch check;
+// asking it for a service that does not run fails the sibling test below.
+func TestTrayUpdateOfARunningServiceConfirmsBeforeTheElevation(t *testing.T) {
+	setupRunningUpdate := func(t *testing.T) *atomic.Int32 {
+		t.Helper()
+		freshServiceInstallGuard(t)
+		replaceSeam(t, &service.PublishedStateLive, func() (bool, bool) { return false, false })
+		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+			return service.Status{State: service.StateRunning, Running: true, Listen: "127.0.0.1:18080"}, nil
+		})
+		replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+			return `C:\portable\hfdesk.exe`, nil
+		})
+		var refreshes atomic.Int32
+		replaceSeam(t, &serviceMenuRefresh, func() { refreshes.Add(1) })
+		return &refreshes
+	}
+
+	t.Run("a declined confirmation launches nothing", func(t *testing.T) {
+		refreshes := setupRunningUpdate(t)
+		var askedCaption, askedText string
+		confirmations := 0
+		replaceSeam(t, &confirmServiceAction, func(caption, text string) bool {
+			confirmations++
+			askedCaption, askedText = caption, text
+			return false
+		})
+		replaceSeam(t, &launchElevated, func(elevatedLaunch) (uint32, error) {
+			t.Error("a declined confirmation launched an elevated helper")
+			return 0, nil
+		})
+		messages := recordMessages(t)
+
+		performServiceActionFromTray(serviceActionUpdate, testGateSingleton)
+
+		if confirmations != 1 {
+			t.Fatalf("the update of a running service asked %d confirmations, want exactly one question", confirmations)
+		}
+		if askedCaption != updateServiceConfirmCaption {
+			t.Errorf("the confirmation is captioned %q, want %q", askedCaption, updateServiceConfirmCaption)
+		}
+		assertNames(t, askedText, "the update confirmation of a running service", []string{
+			"Update the Windows service?",
+			"The service is stopped and started again.",
+			"Running downloads are interrupted.",
+		})
+		assertNamesWithout(t, askedText, "the update confirmation of a running service", nil,
+			[]string{"administrator", "Windows prompt", "this window closes"})
+		if serviceActionRunning.Load() {
+			t.Error("a declined confirmation kept the service-action guard")
+		}
+		if got := refreshes.Load(); got != 1 {
+			t.Errorf("a declined confirmation asked for the menu catch-up %d times, want exactly once", got)
+		}
+		if len(*messages) != 0 {
+			t.Errorf("a declined confirmation showed %v, want no report: nothing was attempted", *messages)
+		}
+	})
+
+	t.Run("an accepted confirmation launches the update", func(t *testing.T) {
+		refreshes := setupRunningUpdate(t)
+		replaceSeam(t, &confirmServiceAction, func(caption, text string) bool { return true })
+		var launches []elevatedLaunch
+		replaceSeam(t, &launchElevated, func(l elevatedLaunch) (uint32, error) {
+			launches = append(launches, l)
+			return 5151, nil
+		})
+		waitForServiceActionHelperDone := make(chan struct{})
+		replaceSeam(t, &waitForServiceActionHelper, func(uint32) { <-waitForServiceActionHelperDone })
+		messages := recordMessages(t)
+
+		performServiceActionFromTray(serviceActionUpdate, testGateSingleton)
+
+		if len(launches) != 1 || launches[0].Action != serviceActionUpdate {
+			t.Fatalf("the update launched %d helpers (%v), want exactly one update helper", len(launches), launches)
+		}
+		if len(*messages) != 0 {
+			t.Errorf("the launched update showed %v, want the helper to report the outcome", *messages)
+		}
+		close(waitForServiceActionHelperDone)
+		waitForTrayCondition(t, "the guard release and the menu catch-up after the update helper ended",
+			func() bool { return !serviceActionRunning.Load() && refreshes.Load() == 1 })
+	})
+}
+
+// TestTrayUpdateOfAServiceThatDoesNotRunAsksNoQuestion pins the other side of
+// the confirmation: an update over a positively stopped (or failed) service
+// starts nothing, so it keeps its confirmation-free flow and reaches the
+// helper directly. The two states are the halves of one decision — the
+// question exists exactly where an instance is interrupted.
+func TestTrayUpdateOfAServiceThatDoesNotRunAsksNoQuestion(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status service.Status
+	}{
+		{name: "stopped", status: registeredStoppedService()},
+		{name: "failed", status: service.Status{State: service.StateFailed}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			freshServiceInstallGuard(t)
+			replaceSeam(t, &service.PublishedStateLive, func() (bool, bool) { return false, false })
+			replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+				return tc.status, nil
+			})
+			replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+				return `C:\portable\hfdesk.exe`, nil
+			})
+			replaceSeam(t, &serviceMenuRefresh, func() {})
+			replaceSeam(t, &confirmServiceAction, func(caption, text string) bool {
+				t.Errorf("the update of a service that does not run asked the confirmation %q: nothing is interrupted", caption)
+				return false
+			})
+			replaceSeam(t, &waitForServiceActionHelper, func(uint32) {})
+			var launches []elevatedLaunch
+			replaceSeam(t, &launchElevated, func(l elevatedLaunch) (uint32, error) {
+				launches = append(launches, l)
+				return 6161, nil
+			})
+			messages := recordMessages(t)
+
+			performServiceActionFromTray(serviceActionUpdate, testGateSingleton)
+
+			if len(launches) != 1 || launches[0].Action != serviceActionUpdate {
+				t.Fatalf("the update launched %d helpers (%v), want exactly one update helper", len(launches), launches)
+			}
+			if len(*messages) != 0 {
+				t.Errorf("the update showed %v, want the helper to report the outcome", *messages)
+			}
+			waitForTrayCondition(t, "the guard release after the update helper ended",
+				func() bool { return !serviceActionRunning.Load() })
+		})
+	}
+}
+
 // TestStartAndUpdateRoutesAskForNoConfirmation pins the confirmation-free
-// behavior of start and update DIRECTLY, on every surface that can launch
-// them without a handover: the lifecycle menu items, the registered-service
-// dialog and the launch gate, each beside a desktop that does not serve the
-// address (the claim of this test is not live), which is the only state in
-// which these two actions reach the elevated helper directly. Each step also
+// behavior of start and of an update over a POSITIVELY STOPPED registration
+// DIRECTLY, on every surface that can launch them without a handover: the
+// lifecycle menu items, the registered-service dialog and the launch gate,
+// each beside a desktop that does not serve the address (the claim of this
+// test is not live), which is the only state in which these two actions reach
+// the elevated helper directly. Each step also
 // proves it really reached the helper — the zero-confirmation assert only
 // discriminates when the action ran — and any confirmation added to those
 // direct routes (the install box or a new one) fails the step that grew it.
-// The handover route of a desktop host that DOES serve the address asks its
+// The update of a RUNNING service asks its own interruption question on the
+// same direct route, pinned by
+// TestTrayUpdateOfARunningServiceConfirmsBeforeTheElevation; the handover
+// route of a desktop host that DOES serve the address asks its
 // own confirmation of the closing window first, and is pinned by
 // TestTrayServiceAnswersHandOverOnlyWhenThisDesktopServes.
 func TestStartAndUpdateRoutesAskForNoConfirmation(t *testing.T) {

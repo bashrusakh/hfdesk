@@ -533,6 +533,20 @@ func TestServiceMenuTickCarriesItsReadToTheLogsWindow(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the tick did not carry its read to the Logs window")
 	}
-	waitForServiceMenuItem(t, "the running service", line, install, start,
-		"Service: running", false, true)
+	// The tick carried the read and the menu applied the same one: the
+	// line names the running service, the lifecycle items are on screen
+	// and the install item is gone.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		title, _, lineVisible, _ := line.snapshot()
+		_, _, installVisible, _ := install.snapshot()
+		if title == "Service: running" && lineVisible && !installVisible {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the menu did not show the running service the window followed: line=%q visible=%t installVisible=%t",
+				title, lineVisible, installVisible)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

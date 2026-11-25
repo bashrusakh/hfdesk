@@ -107,12 +107,89 @@ func TestDisplayReadPolicyReportsHonestUnknownWhenTheReadRunsOut(t *testing.T) {
 	}
 
 	state := serviceMenuFor(status, err)
-	if state.Line != "Service: unknown" {
-		t.Errorf("the menu shows %q for the timed-out read, want the honest unknown state", state.Line)
+	if state.Line != "" || state.LineVisible {
+		t.Errorf("the menu shows the line %q (visible=%t) for the timed-out read, want no line: "+
+			"an unsettled read has no state to name", state.Line, state.LineVisible)
 	}
-	if state.InstallVisible || state.ActionsVisible {
-		t.Errorf("the timed-out read produced installVisible=%t actionsVisible=%t: neither claim was proven by it",
-			state.InstallVisible, state.ActionsVisible)
+	if state.InstallVisible || state.ActionsVisible || state.StartVisible || state.OpenVisible {
+		t.Errorf("the timed-out read produced installVisible=%t actionsVisible=%t startVisible=%t openVisible=%t: "+
+			"no claim was proven by it", state.InstallVisible, state.ActionsVisible, state.StartVisible, state.OpenVisible)
+	}
+}
+
+// TestDisplayReadPolicyRetriesAMomentaryFailure proves the retry of one
+// display pass: a read that fails once is tried again inside the same pass,
+// and the pass reports the read that succeeded — so a momentary failure of
+// the service control manager never surfaces as an empty tray submenu.
+//
+// It also pins the budget of the pass: the attempts and their pause stay
+// inside serviceDisplayStatusTimeout, so the menu refresh and the window
+// handler are never held longer than the budget they name.
+func TestDisplayReadPolicyRetriesAMomentaryFailure(t *testing.T) {
+	replaceSeam(t, &serviceDisplayStatusTimeout, 200*time.Millisecond)
+	replaceSeam(t, &serviceReadRetryDelay, 5*time.Millisecond)
+	attempts := 0
+	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+		attempts++
+		if attempts < 2 {
+			return service.Status{}, errors.New("the service control manager did not answer")
+		}
+		return service.Status{State: service.StateRunning, Running: true}, nil
+	})
+
+	started := time.Now()
+	status, err := serviceState.readForDisplay()
+	elapsed := time.Since(started)
+
+	assertNoError(t, err, "the display read of a momentary failure failed: %v", err)
+	if status.State != service.StateRunning {
+		t.Errorf("the display read reported %q, want the running service the second attempt read", status.State)
+	}
+	if attempts != 2 {
+		t.Errorf("the display pass made %d attempts, want exactly two: the second one succeeded", attempts)
+	}
+	if elapsed > serviceDisplayStatusTimeout+2*time.Second {
+		t.Errorf("the display pass took %s, want it bounded by its budget %s", elapsed, serviceDisplayStatusTimeout)
+	}
+	if state := serviceMenuFor(status, nil); !state.LineVisible || state.Line != "Service: running" {
+		t.Errorf("the menu shows %+v after the recovered read, want the running line and its items", state)
+	}
+}
+
+// TestDisplayReadPolicyBoundsTheAttemptsOfAFailingPass proves the other end
+// of the retry: a read that keeps failing is tried at most
+// serviceReadAttempts times in one pass, the pass reports the failure, and
+// the menu it feeds shows nothing — no line, no item, and never a claim of
+// "not installed". The pass stays inside the display budget, so the retries
+// can never hold the menu or the window longer than the policy allows.
+func TestDisplayReadPolicyBoundsTheAttemptsOfAFailingPass(t *testing.T) {
+	replaceSeam(t, &serviceDisplayStatusTimeout, 200*time.Millisecond)
+	replaceSeam(t, &serviceReadRetryDelay, 5*time.Millisecond)
+	attempts := 0
+	replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+		attempts++
+		return service.Status{}, errors.New("the service control manager did not answer")
+	})
+
+	started := time.Now()
+	status, err := serviceState.readForDisplay()
+	elapsed := time.Since(started)
+
+	if err == nil {
+		t.Fatal("the display read of a permanent failure reported no error")
+	}
+	if attempts != serviceReadAttempts {
+		t.Errorf("the display pass made %d attempts, want the %d attempts of one pass", attempts, serviceReadAttempts)
+	}
+	if elapsed > serviceDisplayStatusTimeout+2*time.Second {
+		t.Errorf("the display pass took %s, want it bounded by its budget %s", elapsed, serviceDisplayStatusTimeout)
+	}
+	state := serviceMenuFor(status, err)
+	if state != (serviceMenuState{}) {
+		t.Errorf("the menu shows %+v for a failing read, want nothing at all", state)
+	}
+	if state.Line == "Service: not installed" {
+		t.Error("a failing read produced the absence line: an unread machine is not a machine without a service")
 	}
 }
 
@@ -353,9 +430,9 @@ func TestDataDirAndDisplayReadsKeepTheirOwnBudgets(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("the display read returned (%q, %v), want the deadline of the display budget", status.State, err)
 	}
-	if state := serviceMenuFor(status, err); state.Line != "Service: unknown" {
-		t.Errorf("the menu shows %q for the display read that ran out of budget, want the honest unknown state",
-			state.Line)
+	if state := serviceMenuFor(status, err); state != (serviceMenuState{}) {
+		t.Errorf("the menu shows %+v for the display read that ran out of budget, want the empty state: "+
+			"no line and no item", state)
 	}
 
 	// A read that fails keeps the fallback to the default of the scope,

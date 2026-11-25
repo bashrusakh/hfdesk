@@ -87,13 +87,15 @@ var serviceStatus = lookupServiceStatus
 //   - Single reads without settle run through readSingle under the budget
 //     their caller names:
 //   - the display surfaces (the tray line, the Logs window) name
-//     serviceDisplayStatusTimeout (2s): the read is bounded, never waits
-//     for a pending state to settle and never holds its caller longer than
-//     that budget — it runs behind a menu refresh and behind the HTTP
-//     handler of the window, never in front of either. A read that fails or
-//     runs out of budget reports the error, and every consumer classifies
-//     that as the honest unknown state: a timeout is never proof of a
-//     machine without a service.
+//     serviceDisplayStatusTimeout (2s): one display pass is bounded, never
+//     waits for a pending state to settle and never holds its caller longer
+//     than that budget — it runs behind a menu refresh and behind the HTTP
+//     handler of the window, never in front of either. The pass retries a
+//     failed read a few times inside that budget (serviceReadAttempts), so
+//     a momentary failure of the manager does not surface; a pass that keeps
+//     failing reports the error, and every consumer treats that as the
+//     unsettled state and shows nothing at all: a timeout is never proof of
+//     a machine without a service.
 //   - the data-directory read of the installation confirmation names
 //     serviceStatusTimeout (10s — the budget this read had before it joined
 //     this owner), so the confirmation text names the registered directory
@@ -119,13 +121,41 @@ var serviceState serviceStateReader
 // and the Runtime window with its own status refresh — so the read ends
 // before the next one is due instead of stacking reads behind a service
 // control manager that does not answer. A read that runs out of budget is
-// not a machine without a service: the caller reports the unknown state.
+// not a machine without a service: the caller reports the unsettled state.
+//
+// The budget is the budget of ONE display pass, retries included: a pass
+// makes at most serviceReadAttempts attempts and never holds its caller
+// longer than this.
 var serviceDisplayStatusTimeout = 2 * time.Second
 
-// readForDisplay reads the registration for the display surfaces: the
-// single read without settle under their own named budget,
-// serviceDisplayStatusTimeout. It is the zero-argument reader the tray menu
-// and the Runtime window seam take.
+// serviceReadAttempts is how many attempts one display read makes before it
+// reports the failure.
+//
+// A failed read of the service control manager is usually momentary — a
+// busy machine, a manager that is just coming up — and the display surfaces
+// show nothing at all for it (the tray submenu empties), so a brief hiccup
+// must not surface to the user: the pass tries again before it gives up.
+const serviceReadAttempts = 3
+
+// serviceReadRetryDelay is the pause between two attempts of one display
+// read.
+//
+// It is short on purpose: the attempts share one pass, so the pause only
+// has to let a momentary condition clear, and the whole pass stays inside
+// serviceDisplayStatusTimeout. It is a variable so the tests can shorten it.
+var serviceReadRetryDelay = 150 * time.Millisecond
+
+// readForDisplay reads the registration for the display surfaces: one pass
+// under their own named budget, serviceDisplayStatusTimeout.
+//
+// A pass makes at most serviceReadAttempts reads with a short pause between
+// them, all of it inside that one budget: the first attempt receives the
+// budget the caller named, and every later attempt receives what is left of
+// it, so the pass never outlives the budget and a read that needs the whole
+// budget still gets it. A pass that keeps failing reports the last error —
+// the surfaces treat that as the unsettled state and show nothing, and the
+// ordinary cadence and the catch-up after every action read again on their
+// own.
 //
 // Unlike the action policy it does not wait for a pending state to settle:
 // a status surface only reports what the machine has right now ("starting"
@@ -133,7 +163,31 @@ var serviceDisplayStatusTimeout = 2 * time.Second
 // registration again — through the settle wait of readForAction — before it
 // decides anything on the state.
 func (serviceStateReader) readForDisplay() (service.Status, error) {
-	return serviceState.readSingle(serviceDisplayStatusTimeout)
+	deadline := time.Now().Add(serviceDisplayStatusTimeout)
+	var status service.Status
+	var readErr error
+	for attempt := 0; attempt < serviceReadAttempts; attempt++ {
+		if attempt > 0 {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			pause := serviceReadRetryDelay
+			if pause > remaining {
+				pause = remaining
+			}
+			time.Sleep(pause)
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		status, readErr = serviceState.readSingle(remaining)
+		if readErr == nil {
+			return status, nil
+		}
+	}
+	return status, readErr
 }
 
 // serviceReadStamp is what one state read reported: the state word, the
@@ -692,11 +746,23 @@ func startRegisteredServiceFromSurface(instanceMutex string) bool {
 // starts nothing: it is a pure rewrite that succeeds beside this desktop
 // exactly as it always did, so it reaches the elevated helper directly, with
 // no confirmation and without closing this window — no refusal ever existed
-// for it to replace. Every other state beside a desktop that serves the
-// address hands over instead: the console program is settled first — like
-// every other update entry, and always before anything asks the user — then
-// the confirmation states that this window closes into the tray, and only
-// then does the host leave desktop mode. Everywhere else the update reaches
+// for it to replace.
+//
+// An update over an instance that RUNS is the other kind of change: the
+// helper stops that instance and starts it again, so the user confirms that
+// interruption before the administrator prompt follows
+// (confirmRunningServiceUpdate) — the confirmation states the stopped and
+// restarted service and the interrupted downloads, and a declined answer
+// launches nothing. Every state that does not run starts nothing either and
+// keeps the confirmation-free flow.
+//
+// Every state beside a desktop that serves the address hands over instead:
+// the console program is settled first — like every other update entry, and
+// always before anything asks the user — then the confirmation states that
+// this window closes into the tray, and only then does the host leave
+// desktop mode. The running-update confirmation of the direct route is not
+// shown on top of that one: the handover has its own question, and one
+// confirmation per update is the rule. Everywhere else the update reaches
 // the elevated helper directly, where the guard of the helper decides again.
 //
 // The result reports whether a helper was launched, with the same meaning
@@ -707,6 +773,9 @@ func updateRegisteredServiceFromSurface(status service.Status, instanceMutex str
 		return launchTrayServiceAction(serviceActionUpdate, instanceMutex)
 	}
 	if !servingDesktopRefusesMutation(instanceMutex) {
+		if serviceStatusRunning(status) && !confirmRunningServiceUpdate() {
+			return false
+		}
 		return launchTrayServiceAction(serviceActionUpdate, instanceMutex)
 	}
 	if !serviceActionCanHandOver() {
@@ -726,6 +795,37 @@ func updateRegisteredServiceFromSurface(status service.Status, instanceMutex str
 		return false
 	}
 	return serviceActionHandover(serviceActionUpdate, instanceMutex)
+}
+
+// confirmRunningServiceUpdate settles the console program of an update and
+// asks the user to confirm the interruption a running instance pays for,
+// before the administrator prompt of the update follows.
+//
+// The order is the one every update entry follows: the program the action
+// will run is settled first, so a folder without it is never discovered
+// after the elevation prompt; only then does the question about the
+// instance follow. No is the default button of that question (the shared
+// service confirmation), because the answer that changes nothing is the one
+// a stray Enter selects beside a running service.
+//
+// It reports whether the update may go on. false covers a declined console
+// program notice (which reports itself and keeps the decline quiet) and a
+// declined confirmation (which changes nothing): the caller launches no
+// helper in either case.
+func confirmRunningServiceUpdate() bool {
+	executable, err := desktopExecutable()
+	if err != nil {
+		reportServiceLaunchFailure(serviceActionUpdate, err)
+		return false
+	}
+	if _, ok := offerMissingConsoleProgram(serviceActionUpdate, executable); !ok {
+		return false
+	}
+	if !confirmServiceAction(updateServiceConfirmCaption, updateRunningServiceConfirmText()) {
+		desktopLog.Info("the update of the running service was not confirmed")
+		return false
+	}
+	return true
 }
 
 // readServiceStateForAction reads the registration under the action policy
@@ -790,14 +890,16 @@ func serviceActionSurface(action serviceAction) string {
 // The flow of every item is the established one: take the guard (a second
 // request during any of these steps is refused with its own report), ask the
 // confirmation the machine-wide change needs before the administrator prompt
-// follows (the stop and the removal always; the start and the update only
-// where they hand this host over, because there the confirmation states the
-// fact that this window closes), decide whether this desktop serves
+// follows (the stop and the removal always; the update of a running service
+// because it stops and restarts that instance; the start and the update where
+// they hand this host over, because there the confirmation states the fact
+// that this window closes), decide whether this desktop serves
 // the address, then act: a serving desktop hands the action over through the
 // established handover — this host leaves desktop mode and the elevated
 // helper acts beside a host that is already gone — and every other surface
-// launches the elevated helper directly. The helper
-// reports the outcome of the action itself, in a native message box.
+// launches the elevated helper directly. One update asks one question: the
+// handover confirmation and the running-update confirmation never stack. The
+// helper reports the outcome of the action itself, in a native message box.
 //
 // The guard covers the whole action: a launched helper inherits it through
 // the waiter and releases it when it ends, together with the menu refresh —
