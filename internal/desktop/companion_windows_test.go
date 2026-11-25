@@ -1091,9 +1091,9 @@ func TestCompanionExitEndsTheHostWithoutTouchingTheService(t *testing.T) {
 
 // TestCompanionWindowActionsCarryTheOpenLogActions pins the bridge of
 // the fallback document and the live page: the window binds exactly the
-// six fixed action names the documents call (open the file, open the
-// folder, open the web UI, retry, and — for the two states that prove a
-// step — start and install), the open-file action opens EXACTLY the service log
+// seven fixed action names the documents call (open the file, open the
+// folder, open the web UI, retry, and — for the three states that prove a
+// step — start, update and install), the open-file action opens EXACTLY the service log
 // file the document's path speaks about (the same resolver, so the path
 // the document shows and the file the default handler receives can never
 // be different files), the open-folder action opens that file's folder —
@@ -1105,16 +1105,16 @@ func TestCompanionWindowActionsCarryTheOpenLogActions(t *testing.T) {
 	actions := companionWindowActions(panicGuard{},
 		func() *runtimeWindow { return nil },
 		func() bool { return false }, testGateSingleton)
-	if len(actions) != 6 {
+	if len(actions) != 7 {
 		keys := make([]string, 0, len(actions))
 		for name := range actions {
 			keys = append(keys, name)
 		}
-		t.Fatalf("the window actions = %v, want exactly the six fixed names", keys)
+		t.Fatalf("the window actions = %v, want exactly the seven fixed names", keys)
 	}
 	for _, name := range []string{
 		openLogFileAction, openLogFolderAction, openUiAction, logsTryAgainAction,
-		logsStartServiceAction, logsInstallServiceAction,
+		logsStartServiceAction, logsUpdateServiceAction, logsInstallServiceAction,
 	} {
 		if actions[name] == nil {
 			t.Fatalf("the window action %q is not bound: its button would find no function", name)
