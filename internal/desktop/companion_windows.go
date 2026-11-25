@@ -379,7 +379,8 @@ func runCompanion(lock *instanceLock, guard panicGuard,
 	windowActions := companionWindowActions(guard,
 		func() *runtimeWindow { return window },
 		func() bool { return webview2Ready }, lock.name)
-	window = newCompanionWindow(companionRuntimePageURL, companionWindowPage, iconBytes, windowActions)
+	window = newCompanionWindow(companionRuntimePageURL, companionWindowContent,
+		requestServiceMenuCatchUp, iconBytes, windowActions)
 	if !webview2Ready {
 		desktopLog.Warn("the WebView2 runtime is not installed", "mode", "tray companion")
 		showMessage(companionWindowUnavailableCaption, companionWebView2MissingText(), windows.MB_ICONWARNING)
@@ -467,15 +468,18 @@ func runCompanion(lock *instanceLock, guard panicGuard,
 		refresh: serviceRefresh,
 		// The open Logs window follows the very read the menu applies, on
 		// the menu's own cadence: the state beside the window can change
-		// while the window exists — the service is stopped, fails, or comes
-		// back — and a window that kept the page of a server that is gone
-		// would show the error of the browser instead of the state and the
-		// actions of the fallback document. The follow costs one probe of
-		// the address per pass, only while the window is open, and it loads
-		// nothing new when the kind of the content and the address stay the
-		// same.
+		// while the window exists — the service is stopped, fails, is
+		// removed, or comes back — and a window that kept the page of a
+		// server that is gone, or a document of a state it left, would show
+		// the wrong state and the wrong actions. The follow costs one probe
+		// of the address per pass, only while the window is open, a document
+		// is rendered only when the state it was built from changed, and it
+		// loads nothing new while the kind of the content, the address and
+		// that state stay the same.
 		follow: func(status service.Status, readErr error) {
-			window.follow(companionPageURL(status, readErr))
+			window.follow(companionPageURL(status, readErr),
+				companionStateKey(status, readErr),
+				func() string { return companionWindowPageFor(status, readErr) })
 		},
 	}, ready)
 
@@ -551,23 +555,24 @@ func companionPageURL(status service.Status, readErr error) string {
 	return runtimePageURL(url)
 }
 
-// companionWindowPage builds the fallback document of the Logs window:
-// the state the window shows when the registered address does not answer
-// (or names none), in the visual language of the runtime page the live
-// window would have loaded.
+// companionWindowContent builds the fallback document of the Logs window and
+// reports the key of the state it was built from: the state the window shows
+// when the registered address does not answer (or names none), in the visual
+// language of the runtime page the live window would have loaded.
 //
 // The read runs under the display policy of the one owner of every state
 // read (serviceState.readForDisplay), and it ends with the menu
 // catch-up request exactly like every other display read: a result read
 // for the window must never stay invisible in the menu until the next
 // tick, and a failed read — the honest unknown state — asks for the
-// catch-up as well.
+// catch-up as well. The key and the document come from that ONE read, so the
+// record of the window always states the state its document was built from.
 //
 // The document states the honest state of the service, the address that
 // did not answer as a FACT — never a link: the address just proved it
 // does not answer, so a link would be a dead path — and the honest reason
 // when there is no address to name. The step that state proves leads the
-// header of the document (the two bound service actions and their common
+// header of the document (the bound service actions and their common
 // flow are companionWindowActions). The path of the service log file
 // completes it: the very file the open action opens, resolved fresh on
 // every render (a second display read with its own catch-up), so the path
@@ -576,14 +581,38 @@ func companionPageURL(status service.Status, readErr error) string {
 // read for the same render (serviceLogSectionAt — a file read, no
 // registration read), so the document shows the end of the log beside the
 // action that opens the whole file.
-func companionWindowPage() string {
-	status, err := serviceState.readForDisplay()
+func companionWindowContent() (key string, document string) {
+	status, readErr := serviceState.readForDisplay()
 	requestServiceMenuCatchUp()
+	return companionStateKey(status, readErr), companionWindowPageFor(status, readErr)
+}
 
+// companionStateKey identifies the state one display read proves, for the
+// window that shows the read's fallback document: two reads of the same
+// machine return the same key, and the document is re-rendered only when the
+// key changes.
+//
+// The key carries what the document says ABOUT THE SERVICE — whether the read
+// could be made, the state, the running fact and the registered address. The
+// log path and the log tail are deliberately not part of it: they are the
+// render-time view of the file, and a growing log would otherwise re-render
+// the document on every pass. A failed read says the same thing whatever the
+// error was, so its presence, not its text, is the key.
+func companionStateKey(status service.Status, readErr error) string {
+	if readErr != nil {
+		return "unreadable"
+	}
+	return fmt.Sprintf("%s\x00%t\x00%s", status.State, status.Running, status.Listen)
+}
+
+// companionWindowPageFor builds the fallback document from one already-made
+// display read, so the document and the key that records it describe the very
+// same state.
+func companionWindowPageFor(status service.Status, readErr error) string {
 	state := logsFallbackState{LogPath: companionServiceLogPath()}
 	state.Log = serviceLogSectionAt(state.LogPath)
 	switch {
-	case err != nil:
+	case readErr != nil:
 		state.State = "The state of the Windows service could not be read."
 		state.Note = "The address of the web UI could not be read."
 	case status.State == service.StateNotInstalled:
@@ -613,14 +642,22 @@ func companionWindowPage() string {
 		// The settled registration that does not run is the state the
 		// Start service item of the menu acts on — the same two
 		// predicates, so the window and the menu can never disagree
-		// about which state starts. Every other state offers no step
-		// here: a running service needs none, a transition is not a
-		// state to decide on, and the state the supervisor could not
-		// report (settled by its own definition) proves nothing to act
-		// on — the menu shows no action for it either.
+		// about which state starts. A BROKEN registration is the
+		// exception: its program is gone, so a start would fail on
+		// exactly that fact, and the one step that repairs it is the
+		// update — the very item the menu leaves enabled there.
+		// Every other state offers no step here: a running service
+		// needs none, a transition is not a state to decide on, and the
+		// state the supervisor could not report (settled by its own
+		// definition) proves nothing to act on — the menu shows no
+		// action for it either.
 		if status.State != service.StateUnknown &&
 			serviceStateSettled(status.State) && !serviceStatusRunning(status) {
-			state.ServiceAction = logsServiceActionStart
+			if status.State == service.StateBroken {
+				state.ServiceAction = logsServiceActionUpdate
+			} else {
+				state.ServiceAction = logsServiceActionStart
+			}
 		}
 	}
 	return logsFallbackPage(state)
@@ -654,8 +691,8 @@ func companionServiceLogPath() string {
 // registration on the click), retry the live page (logsTryAgainAction)
 // and — one per state of the fallback document — the service action its
 // own button names: the start of the registration
-// (logsStartServiceAction) and its installation
-// (logsInstallServiceAction).
+// (logsStartServiceAction), its update (logsUpdateServiceAction) and its
+// installation (logsInstallServiceAction).
 //
 // The handlers run on a goroutine of its own under the panic guard, like
 // every other action of this host: each one resolves its target on the
@@ -664,8 +701,8 @@ func companionServiceLogPath() string {
 // a browser, a window or a service action on the user's desktop — and the
 // page carries no path and no logic beyond naming these fixed actions.
 //
-// The two service actions run the VERY flow the matching menu item runs —
-// performServiceActionFromTray with the start action, and
+// The service actions run the VERY flow the matching menu item runs —
+// performServiceActionFromTray with the start action, the update action, and
 // runInstallServiceAction with this host's published handover endpoints
 // and catch-up signal (serviceHandoverCommit, serviceHandoverQuit and
 // requestServiceMenuCatchUp — the pair every surface reads) — one call
@@ -702,6 +739,12 @@ func companionWindowActions(guard panicGuard, current func() *runtimeWindow,
 		logsStartServiceAction: func() {
 			go guard.runBackground(func() {
 				performServiceActionFromTray(serviceActionStart, instanceMutex)
+				retry()
+			})
+		},
+		logsUpdateServiceAction: func() {
+			go guard.runBackground(func() {
+				performServiceActionFromTray(serviceActionUpdate, instanceMutex)
 				retry()
 			})
 		},

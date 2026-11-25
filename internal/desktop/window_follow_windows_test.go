@@ -70,8 +70,8 @@ func (v *fakeWindowView) navigations() (urls, documents []string) {
 // openTestWindow wires a companion window around the fake view and publishes an
 // open instance for it, the way a show does — without a message loop, so the
 // follow of the tick can be driven directly.
-func openTestWindow(view *fakeWindowView, live func() string, content func() string) *runtimeWindow {
-	window := newCompanionWindow(live, content, nil, nil)
+func openTestWindow(view *fakeWindowView, live func() string, content func() (string, string)) *runtimeWindow {
+	window := newCompanionWindow(live, content, nil, nil, nil)
 	window.instance = &windowInstance{view: view, done: make(chan struct{})}
 	return window
 }
@@ -122,10 +122,14 @@ func TestWindowFollowSwitchesToTheFallbackWhenTheAddressStopsAnswering(t *testin
 
 	renders := 0
 	view := &fakeWindowView{}
-	window := openTestWindow(view, func() string { return page }, func() string {
+	window := openTestWindow(view, func() string { return page }, func() (string, string) {
+		renders++
+		return "stopped", document
+	})
+	render := func() string {
 		renders++
 		return document
-	})
+	}
 
 	// The window was opened beside a service that answered: the live page.
 	if err := window.Show(); err != nil {
@@ -138,7 +142,7 @@ func TestWindowFollowSwitchesToTheFallbackWhenTheAddressStopsAnswering(t *testin
 	// The service stops under the open window: the next pass of the tick
 	// switches the KIND of the content to the fallback document.
 	answers.set(false)
-	window.follow(page)
+	window.follow(page, "stopped", render)
 	urls, documents := view.navigations()
 	if len(urls) != 1 {
 		t.Errorf("the window loaded %d pages, want the one page of the show and no navigation of the follow", len(urls))
@@ -150,15 +154,15 @@ func TestWindowFollowSwitchesToTheFallbackWhenTheAddressStopsAnswering(t *testin
 		t.Errorf("the document was rendered %d time(s), want exactly one per switch", renders)
 	}
 
-	// The following passes see the same kind: nothing is reloaded, so the
+	// The following passes see the same state: nothing is reloaded, so the
 	// tail of the log the user scrolled keeps its position.
-	window.follow(page)
-	window.follow(page)
+	window.follow(page, "stopped", render)
+	window.follow(page, "stopped", render)
 	if _, documents := view.navigations(); len(documents) != 1 {
 		t.Errorf("the window loaded %d documents, want the one of the switch and no reload of an unchanged state", len(documents))
 	}
 	if renders != 1 {
-		t.Errorf("the document was rendered %d time(s) beside an unchanged state, want no render at all", renders)
+		t.Errorf("the document was rendered %d time(s) beside an unchanged state, want no render after the switch", renders)
 	}
 	if probes := answers.probeCount(); probes != 4 {
 		t.Errorf("the passes probed %d time(s), want exactly one per pass (the show and three follows)", probes)
@@ -176,16 +180,19 @@ func TestWindowFollowLeavesTheLivePageAloneWhileItAnswers(t *testing.T) {
 	answers.install(t)
 
 	view := &fakeWindowView{}
-	window := openTestWindow(view, func() string { return page }, func() string {
+	window := openTestWindow(view, func() string { return page }, func() (string, string) {
 		t.Error("the fallback document was rendered beside an answering address")
-		return "<!doctype html>fallback"
+		return "stopped", "<!doctype html>fallback"
 	})
 	if err := window.Show(); err != nil {
 		t.Fatalf("Show() = %v, want the live page", err)
 	}
 
 	for pass := 0; pass < 3; pass++ {
-		window.follow(page)
+		window.follow(page, "stopped", func() string {
+			t.Error("the fallback document was rendered beside an answering address")
+			return "<!doctype html>fallback"
+		})
 	}
 	urls, documents := view.navigations()
 	if len(urls) != 1 || urls[0] != page {
@@ -209,9 +216,13 @@ func TestWindowFollowSwitchesBackToTheLivePageWhenTheServiceReturns(t *testing.T
 	answers.install(t)
 
 	view := &fakeWindowView{}
-	window := openTestWindow(view, func() string { return page }, func() string {
-		return "<!doctype html>fallback: the service is stopped"
+	window := openTestWindow(view, func() string { return page }, func() (string, string) {
+		return "stopped", "<!doctype html>fallback: the service is stopped"
 	})
+	render := func() string {
+		t.Error("the fallback document was reloaded beside an unchanged state")
+		return "<!doctype html>fallback: the service is stopped"
+	}
 
 	// The window was opened beside a service that did not answer.
 	if err := window.Show(); err != nil {
@@ -222,14 +233,14 @@ func TestWindowFollowSwitchesBackToTheLivePageWhenTheServiceReturns(t *testing.T
 	}
 
 	// A pass beside the still silent address changes nothing.
-	window.follow(page)
+	window.follow(page, "stopped", render)
 	if _, documents := view.navigations(); len(documents) != 1 {
 		t.Fatalf("the follow reloaded the fallback document beside an unchanged state, want no navigation")
 	}
 
 	// The service comes back: the live page is loaded once.
 	answers.set(true)
-	window.follow(page)
+	window.follow(page, "stopped", render)
 	urls, documents := view.navigations()
 	if len(urls) != 1 || urls[0] != page {
 		t.Fatalf("the follow loaded (%q), want exactly the live page of the returned service", urls)
@@ -239,8 +250,8 @@ func TestWindowFollowSwitchesBackToTheLivePageWhenTheServiceReturns(t *testing.T
 	}
 
 	// The page answers from here on: the following passes reload nothing.
-	window.follow(page)
-	window.follow(page)
+	window.follow(page, "stopped", render)
+	window.follow(page, "stopped", render)
 	if urls, _ := view.navigations(); len(urls) != 1 {
 		t.Errorf("the window loaded %d page(s), want the one of the switch and no reload of an unchanged live page", len(urls))
 	}
@@ -257,12 +268,15 @@ func TestWindowFollowDoesNothingWhileTheWindowIsClosed(t *testing.T) {
 
 	t.Run("no window was ever opened", func(t *testing.T) {
 		view := &fakeWindowView{}
-		window := newCompanionWindow(func() string { return page }, func() string {
+		window := newCompanionWindow(func() string { return page }, func() (string, string) {
+			t.Error("the fallback document was rendered beside a closed window")
+			return "stopped", "<!doctype html>fallback"
+		}, nil, nil, nil)
+
+		window.follow(page, "stopped", func() string {
 			t.Error("the fallback document was rendered beside a closed window")
 			return "<!doctype html>fallback"
-		}, nil, nil)
-
-		window.follow(page)
+		})
 		if probes := answers.probeCount(); probes != 0 {
 			t.Errorf("the pass probed %d time(s) beside a window that was never opened, want none", probes)
 		}
@@ -273,15 +287,18 @@ func TestWindowFollowDoesNothingWhileTheWindowIsClosed(t *testing.T) {
 
 	t.Run("the window was closed", func(t *testing.T) {
 		view := &fakeWindowView{}
-		window := openTestWindow(view, func() string { return page }, func() string {
+		window := openTestWindow(view, func() string { return page }, func() (string, string) {
 			t.Error("the fallback document was rendered beside a closed window")
-			return "<!doctype html>fallback"
+			return "stopped", "<!doctype html>fallback"
 		})
 		done := make(chan struct{})
 		close(done)
 		window.instance = &windowInstance{view: view, done: done}
 
-		window.follow(page)
+		window.follow(page, "stopped", func() string {
+			t.Error("the fallback document was rendered beside a closed window")
+			return "<!doctype html>fallback"
+		})
 		if probes := answers.probeCount(); probes != 0 {
 			t.Errorf("the pass probed %d time(s) beside a closed window, want none", probes)
 		}
@@ -310,7 +327,10 @@ func TestWindowFollowLeavesUrlModeAlone(t *testing.T) {
 		t.Fatalf("Show() = %v, want the page of the own server", err)
 	}
 
-	window.follow(otherPage)
+	window.follow(otherPage, "stopped", func() string {
+		t.Error("the fallback document was rendered in URL mode")
+		return "<!doctype html>fallback"
+	})
 	urls, documents := view.navigations()
 	if len(urls) != 1 || urls[0] != ownPage {
 		t.Errorf("the window loaded (%q), want only the page of the own server", urls)
@@ -337,23 +357,130 @@ func TestWindowFollowLoadsTheNewAddressOfAMovedRegistration(t *testing.T) {
 	answers.install(t)
 
 	view := &fakeWindowView{}
-	window := openTestWindow(view, func() string { return oldPage }, func() string {
-		return "<!doctype html>fallback"
+	window := openTestWindow(view, func() string { return oldPage }, func() (string, string) {
+		t.Error("the fallback document was rendered beside an answering address")
+		return "stopped", "<!doctype html>fallback"
 	})
 	if err := window.Show(); err != nil {
 		t.Fatalf("Show() = %v, want the live page", err)
 	}
 
-	window.follow(newPage)
+	window.follow(newPage, "stopped", func() string {
+		t.Error("the fallback document was rendered beside an answering address")
+		return "<!doctype html>fallback"
+	})
 	urls, _ := view.navigations()
 	if len(urls) != 2 || urls[0] != oldPage || urls[1] != newPage {
 		t.Fatalf("the window loaded (%q), want the old page of the show and then the new address", urls)
 	}
 
 	// From here on the new address is the one that answers: no more loads.
-	window.follow(newPage)
+	window.follow(newPage, "stopped", func() string {
+		t.Error("the fallback document was rendered beside an answering address")
+		return "<!doctype html>fallback"
+	})
 	if urls, _ := view.navigations(); len(urls) != 2 {
 		t.Errorf("the window loaded %d page(s), want no reload of the unchanged new address", len(urls))
+	}
+}
+
+// TestWindowFollowRendersTheDocumentWhenItsStateChanges pins the half of the
+// follow rule the kind of the content alone could not see: a fallback document
+// is re-rendered when the STATE it was built from changed, exactly once per
+// change, while a pass of the same state loads nothing. A window of a stopped
+// service that fails under it must not keep "stopped" and its Start button, a
+// removal must reach the document, and a start that turned into a starting
+// state must reach it too — the document follows the state, not only the kind.
+func TestWindowFollowRendersTheDocumentWhenItsStateChanges(t *testing.T) {
+	const page = "http://127.0.0.1:18080/runtime.html"
+	answers := &answerSwitch{answers: false}
+	answers.install(t)
+
+	const (
+		stoppedDocument = "<!doctype html>the service is stopped"
+		failedDocument  = "<!doctype html>the service failed"
+	)
+
+	renders := map[string]int{}
+	view := &fakeWindowView{}
+	window := openTestWindow(view, func() string { return page }, func() (string, string) {
+		return "stopped", stoppedDocument
+	})
+	document := func(key, text string) func() string {
+		return func() string {
+			renders[key]++
+			return text
+		}
+	}
+
+	// The window was opened beside a registration whose address did not
+	// answer: the fallback of the stopped state.
+	if err := window.Show(); err != nil {
+		t.Fatalf("Show() = %v, want the fallback document", err)
+	}
+	if urls, documents := view.navigations(); len(urls) != 0 || len(documents) != 1 {
+		t.Fatalf("Show() loaded (%q, %q), want the fallback document and no page", urls, documents)
+	}
+
+	// The same state costs no navigation and no render at all.
+	window.follow(page, "stopped", document("stopped", stoppedDocument))
+	window.follow(page, "stopped", document("stopped", stoppedDocument))
+	if renders["stopped"] != 0 {
+		t.Errorf("the unchanged state rendered the document %d time(s), want none", renders["stopped"])
+	}
+	if _, documents := view.navigations(); len(documents) != 1 {
+		t.Errorf("the unchanged state loaded %d document(s), want the one of the show", len(documents))
+	}
+
+	// The state changed inside the same kind — stopped became failed — so
+	// the document is re-rendered once, from the new state.
+	window.follow(page, "failed", document("failed", failedDocument))
+	_, documents := view.navigations()
+	if len(documents) != 2 || documents[1] != failedDocument {
+		t.Fatalf("the changed state loaded (%q), want exactly the document of the new state", documents)
+	}
+	if renders["failed"] != 1 {
+		t.Errorf("the changed state rendered the document %d time(s), want exactly one", renders["failed"])
+	}
+
+	// And the state that follows the change is not re-rendered again.
+	window.follow(page, "failed", document("failed", failedDocument))
+	window.follow(page, "failed", document("failed", failedDocument))
+	if renders["failed"] != 1 {
+		t.Errorf("the unchanged new state rendered the document %d time(s), want no second render", renders["failed"])
+	}
+	if _, documents := view.navigations(); len(documents) != 2 {
+		t.Errorf("the unchanged new state loaded %d document(s), want no second load", len(documents))
+	}
+
+	// One probe per pass, the show and the five follows.
+	if probes := answers.probeCount(); probes != 6 {
+		t.Errorf("the passes probed %d time(s), want exactly one per pass (the show and five follows)", probes)
+	}
+}
+
+// TestWindowActivationRequestsRefresh pins what counts as coming back to the
+// window: only wmActivate with a wParam other than waInactive asks the host
+// for the state re-read — the loss of the focus does not, and no other message
+// does.
+func TestWindowActivationRequestsRefresh(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  uintptr
+		wp   uintptr
+		want bool
+	}{
+		{name: "the window gets the focus", msg: wmActivate, wp: 1, want: true},
+		{name: "the window gets the focus by a click", msg: wmActivate, wp: 2, want: true},
+		{name: "the window loses the focus", msg: wmActivate, wp: waInactive, want: false},
+		{name: "another message", msg: 0x0001, wp: 1, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := windowActivationRequestsRefresh(tc.msg, tc.wp); got != tc.want {
+				t.Errorf("windowActivationRequestsRefresh(%#x, %#x) = %t, want %t",
+					tc.msg, tc.wp, got, tc.want)
+			}
+		})
 	}
 }
 

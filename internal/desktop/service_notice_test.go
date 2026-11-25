@@ -2075,6 +2075,7 @@ func TestStopAndRemoveConfirmationsStateTheActionAndTheOneFact(t *testing.T) {
 	remove := removeServiceConfirmText(false)
 	assertNames(t, remove, "the removal confirmation", []string{
 		"removes the Windows service registration of HFDesk",
+		"A running service is stopped first.",
 		"Your data stays untouched.",
 		"Do you want to remove the registration?",
 	})
@@ -2136,11 +2137,13 @@ func TestServiceActionConfirmationsCarryNoAdministratorPhrase(t *testing.T) {
 	})
 	assertNames(t, removeServiceConfirmText(true), "the removal confirmation with a handover", []string{
 		"Remove the HFDesk service registration?",
+		"A running service is stopped first.",
 		"Your data stays untouched.",
 		"HFDesk starts again in desktop mode.",
 	})
 	assertNames(t, removeServiceConfirmText(false), "the removal confirmation without a handover", []string{
 		"This removes the Windows service registration of HFDesk.",
+		"A running service is stopped first.",
 		"Your data stays untouched.",
 		"Do you want to remove the registration?",
 	})

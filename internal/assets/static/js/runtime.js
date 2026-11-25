@@ -512,14 +512,18 @@
   // serviceStatusView maps the service state the server reports onto the
   // badge of the header and the enable rule of the install button.
   //
-  // The wording is the one the tray menu shows for the same state: the
-  // badge answers only whether a service is installed, never the state
-  // word that follows it, and it never claims "not installed" for a
-  // state that could not be settled: an unknown state — no host surface,
-  // a failed read, or a state the supervisor did not report — keeps the
-  // badge on "unknown" and the button disabled, so a click can never
-  // start an installation beside a registration the read did not rule
-  // out. A build that reports no state at all is read the same way.
+  // The badge answers only whether a registration exists, never which state
+  // it is in: "not installed" is a proven absence, "unknown" is a state the
+  // read could not settle, and every other state — running, stopped,
+  // starting, stopping, failed, broken — reads "installed". It is therefore
+  // NOT the wording of the tray menu line, which names the live state
+  // ("Service: running", "Service: starting") and reserves "Service:
+  // installed" for a registration that does not run. The badge never claims
+  // "not installed" for a state that could not be settled: an unknown state —
+  // no host surface, a failed read, or a state the supervisor did not report —
+  // keeps the badge on "unknown" and the button disabled, so a click can never
+  // start an installation beside a registration the read did not rule out. A
+  // build that reports no state at all is read the same way.
   function serviceStatusView(state) {
     if (state === 'not-installed') {
       return { label: 'Service: not installed', tone: 'badge-secondary', install: false };

@@ -162,11 +162,12 @@ func desktopRelaunchArgs(argv []string, wait time.Duration) []string {
 // the server calls the open actions, the fallback document calls the open
 // action, the retry and — in the state its own button shows — ONE service
 // action: the start beside a registration the read found settled without a
-// running instance, the installation beside a proven absence of one. Every
+// running instance, the update beside a broken registration whose program is
+// gone, the installation beside a proven absence of one. Every
 // name has ONE source of truth — these constants — and the pages reference
 // them through the substituted template or through the pinned literals of
 // runtime.js, so the page and the host binding cannot drift apart into a
-// dead button. The two service actions belong to the companion window
+// dead button. The service actions belong to the companion window
 // alone: the fallback document only ever loads beside a tray companion
 // (the desktop host always loads the page of its own server), so
 // companionWindowActions is the one binding they have.
@@ -198,6 +199,12 @@ const (
 	// instance — the button of that state, and the very flow the Start
 	// service item of the menu runs.
 	logsStartServiceAction = "hfdeskStartService"
+	// logsUpdateServiceAction re-registers the service the state read of
+	// the fallback document found BROKEN without a running instance: a
+	// start of that state would fail on the missing program, so the
+	// document offers the update that repairs the registration — the very
+	// flow the Update service item of the menu runs.
+	logsUpdateServiceAction = "hfdeskUpdateService"
 	// logsInstallServiceAction registers the service on the machine
 	// the state read proved WITHOUT a registration — the button of that
 	// state, and the very flow the Install service item of the menu
@@ -222,6 +229,10 @@ const (
 	// logsServiceActionInstall registers the service on a machine the
 	// read proved without a registration.
 	logsServiceActionInstall
+	// logsServiceActionUpdate re-registers the service the read found
+	// BROKEN without a running instance: the state whose start would fail
+	// on the missing program, and whose one repairing step is the update.
+	logsServiceActionUpdate
 )
 
 // serviceLogFileName is the name of the active log file of a service
@@ -519,18 +530,20 @@ func probeRuntimePage(url string) bool {
 
 // resolveLogsWindow decides what the Logs window shows on an open: the
 // runtime page of the registered address when that address answers, the
-// fallback document otherwise.
+// fallback document otherwise, together with the key of the read it was
+// rendered from.
 //
 // The probe runs on every open, so the window shows the actual state at
 // the moment the user asks for it: a service that stopped since the last
 // open meets the honest fallback instead of a hanging navigation, and a
 // service that came back meets the live log instead of a stale state
 // page. An empty address skips the probe — there is nothing to ask.
-func resolveLogsWindow(resolve func() string, fallback func() string) (string, string) {
+func resolveLogsWindow(resolve func() string, fallback func() (string, string)) (target, key, document string) {
 	if url := resolve(); url != "" && runtimePageAnswers(url) {
-		return url, ""
+		return url, "", ""
 	}
-	return "", fallback()
+	key, document = fallback()
+	return "", key, document
 }
 
 // logsFallbackState is the model of the fallback document of the Logs
@@ -567,10 +580,11 @@ type logsFallbackState struct {
 	Log serviceLogSection
 	// ServiceAction is the primary action of the header — the step this
 	// state proves: the start of the registration beside a settled state
-	// that does not run, the installation beside a proven absence, and no
-	// step beside a state that proves neither. It leads the header, the
-	// open of the log file follows it, and the retry comes last; without
-	// it the header is the one it has always been.
+	// that does not run, the update beside a broken registration whose
+	// start would fail on its missing program, the installation beside a
+	// proven absence, and no step beside a state that proves none. It leads
+	// the header, the open of the log file follows it, and the retry comes
+	// last; without it the header is the one it has always been.
 	ServiceAction logsServiceAction
 }
 
@@ -578,8 +592,8 @@ type logsFallbackState struct {
 // the bound action names.
 //
 // The action names have ONE source of truth: the openLogFileAction,
-// logsTryAgainAction, logsStartServiceAction and logsInstallServiceAction
-// constants, which are also the keys the host binds
+// logsTryAgainAction, logsStartServiceAction, logsUpdateServiceAction and
+// logsInstallServiceAction constants, which are also the keys the host binds
 // (companionWindowActions). The template never names them — the names are
 // substituted while the page is generated — so the page and the host
 // binding cannot drift apart, and a literal name that reaches the page
@@ -588,6 +602,7 @@ const (
 	logsFallbackOpenPlaceholder    = "{{open}}"
 	logsFallbackTryPlaceholder     = "{{try}}"
 	logsFallbackStartPlaceholder   = "{{start}}"
+	logsFallbackUpdatePlaceholder  = "{{update}}"
 	logsFallbackInstallPlaceholder = "{{install}}"
 )
 
@@ -595,10 +610,10 @@ const (
 // and it performs exactly two local operations with no channel of any kind:
 // it forwards the fixed action names to the functions the window bound
 // on the host side — open the log file, the service action this document's
-// state button names (start beside a settled registration that does not
-// run, installation beside a proven absence), and retry the live page —
-// and scrolls the service-log tail box to its end, so the document shows
-// the END of that log.
+// state button names (start beside a settled registration that does not run,
+// update beside a broken one, installation beside a proven absence), and
+// retry the live page — and scrolls the service-log tail box to its end, so
+// the document shows the END of that log.
 //
 // Nothing here fetches, listens or carries data out of the document: the
 // paths never travel through the page (the host owns them), and the
@@ -617,6 +632,10 @@ const logsFallbackScriptTemplate = `<script>
 	var start = document.getElementById("start-service");
 	if (start && window.` + logsFallbackStartPlaceholder + `) {
 		start.addEventListener("click", function () { window.` + logsFallbackStartPlaceholder + `(); });
+	}
+	var update = document.getElementById("update-service");
+	if (update && window.` + logsFallbackUpdatePlaceholder + `) {
+		update.addEventListener("click", function () { window.` + logsFallbackUpdatePlaceholder + `(); });
 	}
 	var install = document.getElementById("install-service");
 	if (install && window.` + logsFallbackInstallPlaceholder + `) {
@@ -637,6 +656,7 @@ func logsFallbackScript() string {
 	script := strings.ReplaceAll(logsFallbackScriptTemplate, logsFallbackOpenPlaceholder, openLogFileAction)
 	script = strings.ReplaceAll(script, logsFallbackTryPlaceholder, logsTryAgainAction)
 	script = strings.ReplaceAll(script, logsFallbackStartPlaceholder, logsStartServiceAction)
+	script = strings.ReplaceAll(script, logsFallbackUpdatePlaceholder, logsUpdateServiceAction)
 	return strings.ReplaceAll(script, logsFallbackInstallPlaceholder, logsInstallServiceAction)
 }
 
@@ -650,9 +670,10 @@ func logsFallbackScript() string {
 // It states the honest state of the service, the address that did not
 // answer (or the honest reason there is none), the step that state proves
 // as the primary action of the header — the start of the registration
-// beside a settled state that does not run, the installation beside a
-// proven absence, and no step beside a state that proves neither, so the
-// window-diagnosis always offers its treatment step when one exists — the
+// beside a settled state that does not run, the update beside a broken
+// registration, the installation beside a proven absence, and no step
+// beside a state that proves none, so the window-diagnosis always offers its
+// treatment step when one exists — the
 // path of the service log file with the action that opens it, the bounded
 // tail of that same log under its own **Service log** section — or the
 // honest state of a file that is not there or could not be read — and the
@@ -730,6 +751,9 @@ pre { font-family: var(--font-mono); font-size: 12px; background: var(--color-bg
 	case logsServiceActionStart:
 		openClass = "btn"
 		page.WriteString("<button class=\"btn btn-primary\" id=\"start-service\" type=\"button\">Start service</button>")
+	case logsServiceActionUpdate:
+		openClass = "btn"
+		page.WriteString("<button class=\"btn btn-primary\" id=\"update-service\" type=\"button\">Update service</button>")
 	case logsServiceActionInstall:
 		openClass = "btn"
 		page.WriteString("<button class=\"btn btn-primary\" id=\"install-service\" type=\"button\">Install service...</button>")

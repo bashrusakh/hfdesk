@@ -411,19 +411,25 @@ func updateServiceConfirmText() string {
 // prompt that follows states that itself (decision of 2026-11-24) — and the
 // confirmation claims nothing about the state of the instance: a running one
 // is stopped inside the removal, which the user does not have to orchestrate.
+// The one line that states that action says it as the fact it is — a running
+// service is stopped first — without claiming the instance runs now: the
+// state the menu item was enabled by can be stale by the time the box is read.
 //
 // handover picks between the two forms of that decision: the handover form is
-// the question plus the two facts of this action — the data stays, and this
-// window closes and comes back in desktop mode once the registration is gone
-// — while every surface that does not hand over (the stop's sibling, and a
-// removal beside a host that serves no address) reads the previous minimum
-// of the family without the rights sentence, byte for byte.
+// the question plus the facts of this action — the running service is stopped
+// first, the data stays, and this window closes and comes back in desktop mode
+// once the registration is gone — while every surface that does not hand over
+// (the stop's sibling, and a removal beside a host that serves no address)
+// reads the shorter question of the family, with the same fact lines and no
+// rights sentence.
 func removeServiceConfirmText(handover bool) string {
 	if handover {
 		return "Remove the HFDesk service registration?\n\n" +
+			"A running service is stopped first.\n" +
 			"Your data stays untouched. This window closes, and HFDesk starts again in desktop mode."
 	}
 	return "This removes the Windows service registration of HFDesk.\n\n" +
+		"A running service is stopped first.\n" +
 		"Your data stays untouched.\n\n" +
 		"Do you want to remove the registration?"
 }
@@ -527,10 +533,16 @@ func serviceGateChangedText(prompt serviceChoicePrompt) string {
 }
 
 // serviceGateStatePhrase describes the state of a prompt for a notice of the
-// gate. A prompt that is not the positively confirmed stopped one is named by
-// the fact that decides it: the running fact first, then the diagnosed state.
+// gate. A pending state is named by the transition it is in — a window that
+// shows it beside an address that did not answer must not claim it runs —
+// and every other prompt is named by the fact that decides it: the running
+// fact first, then the diagnosed state.
 func serviceGateStatePhrase(prompt serviceChoicePrompt) string {
 	switch {
+	case prompt.State == service.StateStarting:
+		return "starting"
+	case prompt.State == service.StateStopping:
+		return "stopping"
 	case servicePromptRunning(prompt):
 		return "running"
 	case prompt.State == service.StateNotInstalled:
