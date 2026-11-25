@@ -89,13 +89,14 @@ type trayMenuItem interface {
 	Click(func())
 }
 
-// trayServiceMenu is the service section of the tray menu: the status
-// line and the items that act on the state the line reports — both live
-// INSIDE the Service submenu, with the lifecycle items (start, stop,
-// update, delete) beside the install item; each group belongs to the
+// trayServiceMenu is the service section of the tray menu: the ROOT entry
+// that opens the submenu, and inside it the status line and the items that
+// act on the state the line reports — with the lifecycle items (start,
+// stop, update, delete) beside the install item; each group belongs to the
 // submenu only for the state that proved it (serviceMenuFor), and a read
-// that proves nothing shows none of them.
+// that proves nothing hides the submenu items and the root entry itself.
 type trayServiceMenu struct {
+	service trayMenuItem
 	line    trayMenuItem
 	open    trayMenuItem
 	install trayMenuItem
@@ -134,9 +135,10 @@ type trayServiceMenu struct {
 // lifecycle items belong to a proven registration only (inside it they
 // enable per state — start and stop on the settled running fact, start
 // hidden beside a broken registration, update and delete on the settled
-// registration), and an unsettled read hides the line AND every item, so
-// exactly one group is ever on screen beside a state that was read — and
-// nothing at all beside a state that was not.
+// registration), and an unsettled read hides the line, every item AND the
+// root entry that opens the submenu, so exactly one group is ever on screen
+// beside a state that was read — and nothing at all beside a state that was
+// not.
 //
 // The Open HFDesk item is written only where its style says so
 // (openFollowsService): the companion's item follows the registration and
@@ -169,6 +171,16 @@ func (m *trayServiceMenu) apply(state serviceMenuState) {
 		"startEnabled", state.StartEnabled,
 		"stopEnabled", state.StopEnabled)
 	wasShown := m.shownSet
+	// The ROOT entry that opens the submenu follows the read as a whole:
+	// a read that proved nothing leaves the menu without a Service entry
+	// at all — an EMPTY submenu is the same dead surface as the retired
+	// "unknown" row — and the first read that proves a state brings the
+	// entry back with its line and its items. It is written before its
+	// children, so a returning entry is on screen again before the items
+	// inside it are shown, and it is never greyed: a disabled parent would
+	// block the submenu it opens.
+	serviceVisible := state.showsSomething()
+	writeItem(m.service, serviceVisible, serviceVisible, !wasShown || m.shown.showsSomething())
 	// The status line reports the state of a read that settled one, and
 	// disappears on a read that did not: the title is written AFTER the
 	// visibility (never beside a hidden item — an update would
@@ -357,6 +369,10 @@ func runTray(iconBytes []byte, tooltip string, style trayMenuStyle, actions tray
 			item := systray.AddMenuItem(spec.Title, spec.Tooltip)
 			switch spec.Kind {
 			case trayItemService:
+				// The ROOT entry of the service section: apply hides it
+				// when the read proves nothing, so the menu carries no
+				// empty submenu.
+				menu.service = item
 				for _, child := range serviceSubmenuPlan() {
 					title := child.Title
 					if child.Kind == trayItemLine {

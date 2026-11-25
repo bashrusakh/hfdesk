@@ -97,9 +97,11 @@ func (f *fakeTrayItem) operations() []string {
 	return append([]string(nil), f.ops...)
 }
 
-// submenuFakes is the fake Service submenu of a test: every item the plan
-// can show, plus the menu the refresh logic writes them through.
+// submenuFakes is the fake Service section of a test: the ROOT entry, every
+// item the plan can show inside it, plus the menu the refresh logic writes
+// them through.
 type submenuFakes struct {
+	service *fakeTrayItem
 	line    *fakeTrayItem
 	open    *fakeTrayItem
 	install *fakeTrayItem
@@ -110,10 +112,11 @@ type submenuFakes struct {
 	menu    *trayServiceMenu
 }
 
-// newSubmenuFakes builds a submenu whose items start in the state the runner
-// creates them: visible, and grey until the menu enables them.
+// newSubmenuFakes builds a service section whose items start in the state the
+// runner creates them: visible, and grey until the menu enables them.
 func newSubmenuFakes(openFollowsService bool) *submenuFakes {
 	f := &submenuFakes{
+		service: newFakeTrayItem(),
 		line:    newFakeTrayItem(),
 		open:    newFakeTrayItem(),
 		install: newFakeTrayItem(),
@@ -123,7 +126,7 @@ func newSubmenuFakes(openFollowsService bool) *submenuFakes {
 		delete:  newFakeTrayItem(),
 	}
 	f.menu = &trayServiceMenu{
-		line: f.line, open: f.open, install: f.install,
+		service: f.service, line: f.line, open: f.open, install: f.install,
 		start: f.start, stop: f.stop, update: f.update, delete: f.delete,
 		openFollowsService: openFollowsService,
 	}
@@ -132,6 +135,7 @@ func newSubmenuFakes(openFollowsService bool) *submenuFakes {
 
 // menuView is what the fake submenu shows at one moment.
 type menuView struct {
+	serviceVisible bool
 	line           string
 	lineVisible    bool
 	installVisible bool
@@ -148,6 +152,7 @@ type menuView struct {
 // view reads the fake items.
 func (f *submenuFakes) view() menuView {
 	var v menuView
+	_, _, v.serviceVisible, _ = f.service.snapshot()
 	v.line, _, v.lineVisible, _ = f.line.snapshot()
 	_, _, v.installVisible, _ = f.install.snapshot()
 	_, v.startEnabled, v.startVisible, _ = f.start.snapshot()
@@ -178,8 +183,9 @@ func (f *submenuFakes) waitFor(t *testing.T, what string, want func(menuView) bo
 // TestMenuRedrawsAfterEveryWindowRead proves the end of the redraw seam: a
 // display read made for the Logs window ends with the refresh request,
 // keepFresh re-reads through the same display policy and applies the
-// result — including the unsettled read of a failed one, whose submenu is
-// empty (no line, no item), so no read made for the window can
+// result — including the unsettled read of a failed one, which leaves the
+// menu without a Service entry at all (no line, no item, no empty submenu),
+// so no read made for the window can
 // stay invisible in the menu until the next tick.
 //
 // The cadence itself is not part of this test: the tray keeps its own 30
@@ -224,7 +230,7 @@ func TestMenuRedrawsAfterEveryWindowRead(t *testing.T) {
 		t.Fatalf("the window read answered (%q, %v), want the running state", state, err)
 	}
 	fakes.waitFor(t, "the running service", func(v menuView) bool {
-		return v.line == "Service: running" && v.lineVisible &&
+		return v.serviceVisible && v.line == "Service: running" && v.lineVisible &&
 			!v.installVisible && v.actionsVisible
 	})
 
@@ -249,7 +255,8 @@ func TestMenuRedrawsAfterEveryWindowRead(t *testing.T) {
 		t.Errorf("the failed window read answered the state %q, want no state beside the error", state)
 	}
 	fakes.waitFor(t, "the state that could not be read", func(v menuView) bool {
-		return !v.lineVisible && !v.installVisible && !v.actionsVisible && !v.startVisible
+		return !v.serviceVisible && !v.lineVisible && !v.installVisible &&
+			!v.actionsVisible && !v.startVisible
 	})
 
 	// The next successful read brings the line and the items back by
@@ -259,7 +266,7 @@ func TestMenuRedrawsAfterEveryWindowRead(t *testing.T) {
 		t.Fatalf("the window read after the failure answered (%q, %v), want the stopped state", state, err)
 	}
 	fakes.waitFor(t, "the registration the read after the failure proved", func(v menuView) bool {
-		return v.line == "Service: stopped" && v.lineVisible &&
+		return v.serviceVisible && v.line == "Service: stopped" && v.lineVisible &&
 			!v.installVisible && v.actionsVisible && v.startVisible && v.startEnabled
 	})
 }
@@ -362,6 +369,7 @@ func TestTrayMenuApplyDeduplicatesAndRecordsTransitions(t *testing.T) {
 // order (hide, then disable, in one pass) this test fails; on the
 // current order it passes.
 func TestMenuNeverUpdatesAnItemAfterHidingIt(t *testing.T) {
+	entry := newFakeTrayItem()
 	line := newFakeTrayItem()
 	open := newFakeTrayItem()
 	install := newFakeTrayItem()
@@ -370,7 +378,7 @@ func TestMenuNeverUpdatesAnItemAfterHidingIt(t *testing.T) {
 	update := newFakeTrayItem()
 	del := newFakeTrayItem()
 	menu := &trayServiceMenu{
-		line: line, open: open, install: install,
+		service: entry, line: line, open: open, install: install,
 		start: start, stop: stop, update: update, delete: del,
 		openFollowsService: true,
 	}
@@ -393,7 +401,7 @@ func TestMenuNeverUpdatesAnItemAfterHidingIt(t *testing.T) {
 	}
 
 	managed := map[string]*fakeTrayItem{
-		"line": line, "open": open, "install": install, "start": start,
+		"service": entry, "line": line, "open": open, "install": install, "start": start,
 		"stop": stop, "update": update, "delete": del,
 	}
 	for name, item := range managed {
@@ -438,6 +446,49 @@ func TestMenuNeverUpdatesAnItemAfterHidingIt(t *testing.T) {
 	requireOps("start", start, "hide", "show")
 	requireOps("open", open, "hide", "show")
 	requireOps("line", line, "hide", "show")
+	requireOps("service", entry, "hide", "show")
+}
+
+// TestRootServiceEntryFollowsTheRead pins the root consequence of an
+// unsettled read: the entry that opens the Service submenu is GONE from the
+// root menu — an empty submenu is the same dead surface as the retired
+// "unknown" row — and the first read that proves a state brings the entry
+// back with its line and its items.
+//
+// The rest of the root is the plan's business and stays what it is (Open
+// HFDesk, Logs, the separator and the end item, pinned by
+// TestTrayMenuPlanRootsPinBothCompositions): apply owns the service section
+// alone, so hiding its entry can never take another root item with it.
+func TestRootServiceEntryFollowsTheRead(t *testing.T) {
+	fakes := newSubmenuFakes(true)
+	fakes.menu.apply(serviceMenuFor(service.Status{}, errors.New("the service control manager did not answer")))
+
+	visible := func(item *fakeTrayItem) bool {
+		_, _, shown, _ := item.snapshot()
+		return shown
+	}
+	if visible(fakes.service) {
+		t.Error("the root Service entry is on screen at an unsettled read: it would open an empty submenu")
+	}
+	if visible(fakes.line) || visible(fakes.install) || visible(fakes.start) ||
+		visible(fakes.stop) || visible(fakes.update) || visible(fakes.delete) || visible(fakes.open) {
+		t.Error("an item of the service section is on screen at an unsettled read")
+	}
+
+	// The successful read restores the entry beside its line and items.
+	fakes.menu.apply(serviceMenuFor(service.Status{State: service.StateRunning, Running: true}, nil))
+	if !visible(fakes.service) {
+		t.Error("the root Service entry did not return after a read proved a state")
+	}
+	if !visible(fakes.line) || !visible(fakes.stop) || !visible(fakes.open) {
+		t.Error("the service section did not return with the entry that opens it")
+	}
+
+	// The entry is never greyed: a disabled parent would block the submenu
+	// it opens, so it acts whenever it is on screen.
+	if _, enabled, _, _ := fakes.service.snapshot(); !enabled {
+		t.Error("the root Service entry is grey, want it acting beside the state that proved it")
+	}
 }
 
 // totalItemWrites returns how many item updates the given items received.
