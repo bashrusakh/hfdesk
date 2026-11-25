@@ -524,7 +524,7 @@ func run(o Options, logPath string) (err error) {
 		if err := application.OpenBrowser(); err != nil {
 			reportBrowserFailure(url, err)
 		}
-	}))
+	}, lock.name))
 	webview2Ready, webview2Version := webview2Available()
 	if !webview2Ready {
 		desktopLog.Warn("the WebView2 runtime is not installed", "url", url)
@@ -924,28 +924,35 @@ func reportWebView2Missing(url string) {
 
 // desktopWindowActions returns the host handlers the runtime page of the
 // own server can call from the Logs window: open the folder of the log of
-// this launch, open the log file itself, and open the web UI in the
-// default browser (openUI — the very function the tray's Open HFDesk
-// item runs).
+// this launch, open the log file itself, open the web UI in the default
+// browser (openUI — the very function the tray's Open HFDesk item runs)
+// and the five service actions (windowServiceActions) — start, stop,
+// update, delete and install, each one the very flow of the matching tray
+// item.
 //
 // The page is served by the own server, but the actions do NOT reach the
 // server: the window host owns them and performs them in the process of
 // the window, so the runtime page has exactly one owner for these actions
 // beside every host — the same fixed names the tray companion's window
-// binds (openLogFolderAction, openLogFileAction, openUiAction), and the
-// same rule: the page names the action, the host owns the path.
-func desktopWindowActions(guard panicGuard, openUI func()) map[string]func() {
-	return map[string]func(){
-		openLogFolderAction: func() {
-			go guard.runBackground(openDesktopLogFolder)
-		},
-		openLogFileAction: func() {
-			go guard.runBackground(openDesktopLogFile)
-		},
-		openUiAction: func() {
-			go guard.runBackground(openUI)
-		},
+// binds (openLogFolderAction, openLogFileAction, openUiAction and the five
+// service names), and the same rule: the page names the action, the host
+// owns the path. instanceMutex is the singleton of this launch, the very
+// name the tray items pass. The window passes no window re-read
+// (windowServiceActions): its content is the live page of this host's
+// server, which re-reads itself, while the action path already asks the
+// menu to catch up.
+func desktopWindowActions(guard panicGuard, openUI func(), instanceMutex string) map[string]func() {
+	actions := windowServiceActions(guard, instanceMutex, nil)
+	actions[openLogFolderAction] = func() {
+		go guard.runBackground(openDesktopLogFolder)
 	}
+	actions[openLogFileAction] = func() {
+		go guard.runBackground(openDesktopLogFile)
+	}
+	actions[openUiAction] = func() {
+		go guard.runBackground(openUI)
+	}
+	return actions
 }
 
 // openDesktopLogFile opens the log file of this launch with the default

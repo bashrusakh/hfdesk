@@ -689,10 +689,10 @@ func companionServiceLogPath() string {
 // open the web UI in the default browser (openUiAction — the very
 // address the link of the old static window carried, re-read from the
 // registration on the click), retry the live page (logsTryAgainAction)
-// and — one per state of the fallback document — the service action its
-// own button names: the start of the registration
-// (logsStartServiceAction), its update (logsUpdateServiceAction) and its
-// installation (logsInstallServiceAction).
+// and the five service actions (windowServiceActions): the start, the stop,
+// the update and the delete of the registration (logsStartServiceAction,
+// logsStopServiceAction, logsUpdateServiceAction, logsDeleteServiceAction)
+// and its installation (logsInstallServiceAction).
 //
 // The handlers run on a goroutine of its own under the panic guard, like
 // every other action of this host: each one resolves its target on the
@@ -701,17 +701,16 @@ func companionServiceLogPath() string {
 // a browser, a window or a service action on the user's desktop — and the
 // page carries no path and no logic beyond naming these fixed actions.
 //
-// The service actions run the VERY flow the matching menu item runs —
-// performServiceActionFromTray with the start action, the update action, and
+// The service actions are the shared construction of both window hosts
+// (windowServiceActions): each press runs the VERY flow the matching menu
+// item runs — performServiceActionFromTray with the action of that item,
 // runInstallServiceAction with this host's published handover endpoints
-// and catch-up signal (serviceHandoverCommit, serviceHandoverQuit and
-// requestServiceMenuCatchUp — the pair every surface reads) — one call
-// per press, behind the one service-action guard both surfaces share, and
-// instanceMutex is the singleton of THIS launch, the very name the menu
-// items pass. They then re-read the window's state through the very
-// retry the Try again button runs (retry below), so a document whose
-// state moved under its own action catches up instead of offering a
-// stale step.
+// and catch-up signal — one call per press, behind the one service-action
+// guard both surfaces share, and instanceMutex is the singleton of THIS
+// launch, the very name the menu items pass. They then re-read the window's
+// state through the very retry the Try again button runs (retry below), so
+// a document whose state moved under its own action catches up instead of
+// offering a stale step.
 //
 // The retry re-runs the show the tray item runs, through the getters the
 // caller passes: the window itself exists only after this function
@@ -723,39 +722,20 @@ func companionWindowActions(guard panicGuard, current func() *runtimeWindow,
 			showCompanionRuntimeWindow(window, webview2Ready())
 		}
 	}
-	return map[string]func(){
-		openLogFileAction: func() {
-			go guard.runBackground(openCompanionServiceLog)
-		},
-		openLogFolderAction: func() {
-			go guard.runBackground(openCompanionServiceLogFolder)
-		},
-		openUiAction: func() {
-			go guard.runBackground(openCompanionServiceURL)
-		},
-		logsTryAgainAction: func() {
-			go guard.runBackground(retry)
-		},
-		logsStartServiceAction: func() {
-			go guard.runBackground(func() {
-				performServiceActionFromTray(serviceActionStart, instanceMutex)
-				retry()
-			})
-		},
-		logsUpdateServiceAction: func() {
-			go guard.runBackground(func() {
-				performServiceActionFromTray(serviceActionUpdate, instanceMutex)
-				retry()
-			})
-		},
-		logsInstallServiceAction: func() {
-			go guard.runBackground(func() {
-				runInstallServiceAction(instanceMutex, requestServiceMenuCatchUp,
-					serviceHandoverCommit, serviceHandoverQuit)
-				retry()
-			})
-		},
+	actions := windowServiceActions(guard, instanceMutex, retry)
+	actions[openLogFileAction] = func() {
+		go guard.runBackground(openCompanionServiceLog)
 	}
+	actions[openLogFolderAction] = func() {
+		go guard.runBackground(openCompanionServiceLogFolder)
+	}
+	actions[openUiAction] = func() {
+		go guard.runBackground(openCompanionServiceURL)
+	}
+	actions[logsTryAgainAction] = func() {
+		go guard.runBackground(retry)
+	}
+	return actions
 }
 
 // openCompanionServiceLog opens the full service log file with the default
