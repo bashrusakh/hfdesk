@@ -20,6 +20,7 @@ import (
 
 	"github.com/bashrusakh/hfdesk/internal/logging"
 	"github.com/bashrusakh/hfdesk/internal/opener"
+	"github.com/bashrusakh/hfdesk/internal/serviceview"
 )
 
 // Bounds of the log page size.
@@ -74,13 +75,20 @@ type RuntimeStatusResponse struct {
 	// LogFile is the path of the rotating log file. It is empty when the
 	// application does not write a log file.
 	LogFile string `json:"logFile"`
-	// ServiceState is the lifecycle state of the platform service
-	// registration: the state word of the service layer ("not-installed",
-	// "running", "stopped", …), or runtimeServiceStateUnknown when no host
-	// of this process provides the service surface or the state could not
-	// be read. It never reads "not-installed" for a state that could not be
-	// settled, so a client can enable an installation only on a proven
-	// absence.
+	// Service is what the last read of the platform service registration
+	// proved: the class, the status line and every action the window may
+	// offer, from the one shared table (serviceview.From) the tray menu
+	// reads too. An unknown read carries no label, no tone and no action.
+	Service serviceview.Snapshot `json:"service"`
+	// ServiceState is the raw lifecycle state word of the platform
+	// service registration ("not-installed", "running", "stopped", …), or
+	// runtimeServiceStateUnknown when no host of this process provides the
+	// service surface or the state could not be read.
+	//
+	// The field is kept for compatibility with clients that read the word
+	// directly; the new service object carries the classified view. It
+	// never reads "not-installed" for a state that could not be settled, so
+	// a client can enable an installation only on a proven absence.
 	ServiceState string `json:"serviceState"`
 }
 
@@ -138,22 +146,23 @@ var (
 	// while the server may already answer, so the handlers read the two
 	// values under the lock.
 	runtimeServiceMu sync.RWMutex
-	// runtimeServiceStateRead reads the state word of the registration,
-	// or its failure.
-	runtimeServiceStateRead func() (string, error)
+	// runtimeServiceStateRead reads the classified view of the
+	// registration (with the raw state word for the compatible field), or
+	// the failure of that read.
+	runtimeServiceStateRead func() (serviceview.Snapshot, error)
 	// runtimeServiceInstall dispatches the host's install-service action.
 	runtimeServiceInstall func()
 )
 
 // SetRuntimeService registers the service surface of the host.
 //
-// read returns the state word of the platform service registration (the
-// vocabulary of the service layer) or the failure of that read; install
-// runs the host's install-service action and must return promptly, because
-// the action shows the dialogs of the flow on a goroutine of its own. Both
-// may be nil, and nil clears the surface again — the tests restore it that
-// way.
-func SetRuntimeService(read func() (string, error), install func()) {
+// read returns the classified view of the platform service registration (the
+// shared table of serviceview, which carries the raw state word beside it) or
+// the failure of that read; install runs the host's install-service action
+// and must return promptly, because the action shows the dialogs of the flow
+// on a goroutine of its own. Both may be nil, and nil clears the surface
+// again — the tests restore it that way.
+func SetRuntimeService(read func() (serviceview.Snapshot, error), install func()) {
 	runtimeServiceMu.Lock()
 	defer runtimeServiceMu.Unlock()
 	runtimeServiceStateRead = read
@@ -161,7 +170,7 @@ func SetRuntimeService(read func() (string, error), install func()) {
 }
 
 // currentRuntimeService returns the registered service surface of the host.
-func currentRuntimeService() (func() (string, error), func()) {
+func currentRuntimeService() (func() (serviceview.Snapshot, error), func()) {
 	runtimeServiceMu.RLock()
 	defer runtimeServiceMu.RUnlock()
 	return runtimeServiceStateRead, runtimeServiceInstall
@@ -260,35 +269,49 @@ func (s *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request) {
 		logFile = pipeline.FilePath()
 	}
 
+	snapshot := runtimeServiceSnapshot()
 	writeJSON(w, http.StatusOK, RuntimeStatusResponse{
-		Version:      Version,
-		Status:       "ok",
-		URL:          s.BrowserURL(),
-		Address:      address,
-		ActiveJobs:   RuntimeJobCounts{Running: running, Queued: queued},
-		RunID:        s.RunID(),
-		LogCursor:    cursor,
-		LogFile:      logFile,
-		ServiceState: runtimeServiceState(),
+		Version:    Version,
+		Status:     "ok",
+		URL:        s.BrowserURL(),
+		Address:    address,
+		ActiveJobs: RuntimeJobCounts{Running: running, Queued: queued},
+		RunID:      s.RunID(),
+		LogCursor:  cursor,
+		LogFile:    logFile,
+		Service:    snapshot,
+		// The raw word is kept for compatibility; the classified view
+		// travels in Service.
+		ServiceState: runtimeServiceStateWord(snapshot),
 	})
 }
 
-// runtimeServiceState answers the state word of the status endpoint.
+// runtimeServiceSnapshot answers the service view of the status endpoint.
 //
-// A surface that is not registered, a failing read and a read without a
-// state all answer the unknown state: the status line of a client then
-// reports what this process could not settle instead of claiming a machine
-// without a registration.
-func runtimeServiceState() string {
+// A surface that is not registered, a failing read and a Snapshot that names
+// no state all answer the unknown view: the window then reports what this
+// process could not settle instead of claiming a machine without a
+// registration, and it offers no action on a state that was never read.
+func runtimeServiceSnapshot() serviceview.Snapshot {
 	read, _ := currentRuntimeService()
 	if read == nil {
-		return runtimeServiceStateUnknown
+		return serviceview.From("", false, true)
 	}
-	state, err := read()
+	snapshot, err := read()
 	if err != nil {
-		return runtimeServiceStateUnknown
+		return serviceview.From("", false, true)
 	}
-	state = strings.TrimSpace(state)
+	return snapshot
+}
+
+// runtimeServiceStateWord answers the compatible serviceState field of the
+// status endpoint.
+//
+// It is the raw state word the snapshot carries, or the unknown word when the
+// read proved none: a client of the old field never sees an empty string and
+// never reads a state no read reported.
+func runtimeServiceStateWord(snapshot serviceview.Snapshot) string {
+	state := strings.TrimSpace(snapshot.State)
 	if state == "" {
 		return runtimeServiceStateUnknown
 	}

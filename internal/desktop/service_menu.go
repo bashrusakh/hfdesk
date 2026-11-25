@@ -5,41 +5,8 @@ package desktop
 
 import (
 	"github.com/bashrusakh/hfdesk/internal/service"
+	"github.com/bashrusakh/hfdesk/internal/serviceview"
 )
-
-// serviceRegistrationClass is how one read of the registration classifies
-// the machine for the Service submenu of the tray menu.
-type serviceRegistrationClass int
-
-const (
-	// registrationUnknown is a read that could not settle whether a
-	// registration exists: the read failed, or the supervisor reported no
-	// usable state.
-	registrationUnknown serviceRegistrationClass = iota
-	// registrationAbsent is a read that proved there is no registration.
-	registrationAbsent
-	// registrationPresent is a read that found a registration.
-	registrationPresent
-)
-
-// classifyRegistration decides what one read of the registration proves.
-//
-// A failed read and a state the supervisor could not report both stay
-// unknown: neither proves a machine without a service, and a menu that
-// guessed "absent" from them would offer an installation beside a
-// registration it simply could not see.
-func classifyRegistration(status service.Status, readErr error) serviceRegistrationClass {
-	switch {
-	case readErr != nil:
-		return registrationUnknown
-	case status.State == "" || status.State == service.StateUnknown:
-		return registrationUnknown
-	case status.State == service.StateNotInstalled:
-		return registrationAbsent
-	default:
-		return registrationPresent
-	}
-}
 
 // serviceMenuState is what the Service submenu of the tray menu shows
 // for one read of the registration.
@@ -106,7 +73,7 @@ type serviceMenuState struct {
 
 // serviceStatusLine returns the compact status line of a service read.
 //
-// The wording is one honest word per user status of the machine: a proven
+// The wording is the one table of the application (serviceview.From): a proven
 // absence is "Service: not installed", a registration in a transition names
 // the transition it is in ("Service: starting", "Service: stopping"), a
 // settled registration that serves reads "Service: running", a settled
@@ -122,23 +89,17 @@ type serviceMenuState struct {
 // retries itself before it reports (see serviceStateReader.readForDisplay),
 // so a momentary failure of the service control manager never surfaces.
 func serviceStatusLine(status service.Status, readErr error) string {
-	switch classifyRegistration(status, readErr) {
-	case registrationAbsent:
-		return "Service: not installed"
-	case registrationPresent:
-		if !serviceStateSettled(status.State) {
-			return "Service: " + string(status.State)
-		}
-		if serviceStatusRunning(status) {
-			return "Service: running"
-		}
-		if status.State == service.StateStopped {
-			return "Service: stopped"
-		}
-		return "Service: failed"
-	default:
-		return ""
-	}
+	return serviceMenuView(status, readErr).Label
+}
+
+// serviceMenuView is the one serviceview snapshot of a tray read.
+//
+// The tray keeps its own menu fields (they are the shape its apply consumes),
+// but every word and every availability comes from the shared table, so the
+// menu cannot describe a machine differently from the Runtime window that
+// reads the same registration.
+func serviceMenuView(status service.Status, readErr error) serviceview.Snapshot {
+	return serviceview.From(string(status.State), status.Running, readErr != nil)
 }
 
 // showsSomething reports whether one read has anything to put inside the
@@ -154,7 +115,8 @@ func (s serviceMenuState) showsSomething() bool {
 }
 
 // serviceMenuFor maps one read of the registration onto the submenu it
-// shows — the mode-times-state model both styles share:
+// shows — the mode-times-state model both styles share. The mapping is the
+// shared table (serviceview.From), translated into the menu fields:
 //
 //   - a proven ABSENCE shows the install item and nothing else that
 //     acts: a menu with no registration shows no dead lifecycle items,
@@ -185,24 +147,21 @@ func (s serviceMenuState) showsSomething() bool {
 // consumes; the desktop host opens its own address and leaves its item
 // out of this mapping.
 func serviceMenuFor(status service.Status, readErr error) serviceMenuState {
-	state := serviceMenuState{Line: serviceStatusLine(status, readErr)}
-	switch classifyRegistration(status, readErr) {
-	case registrationAbsent:
-		state.LineVisible = true
-		state.InstallVisible = true
-	case registrationPresent:
-		running := serviceStatusRunning(status)
-		settled := serviceStateSettled(status.State)
-		broken := status.State == service.StateBroken
-		state.LineVisible = true
-		state.ActionsVisible = true
-		state.OpenVisible = true
-		state.OpenEnabled = running
-		state.StartVisible = !broken
-		state.StartEnabled = settled && !running && !broken
-		state.StopEnabled = settled && running
-		state.UpdateEnabled = settled
-		state.DeleteEnabled = settled
+	view := serviceMenuView(status, readErr)
+	return serviceMenuState{
+		Line:           view.Label,
+		LineVisible:    view.Label != "",
+		InstallVisible: view.Actions.Install.Visible,
+		// The lifecycle group of the menu is the group the shared table
+		// shows as one: stop, update and delete appear and disappear
+		// together. The start item has its own visibility.
+		ActionsVisible: view.Actions.Stop.Visible,
+		OpenVisible:    view.Actions.Open.Visible,
+		OpenEnabled:    view.Actions.Open.Enabled,
+		StartVisible:   view.Actions.Start.Visible,
+		StartEnabled:   view.Actions.Start.Enabled,
+		StopEnabled:    view.Actions.Stop.Enabled,
+		UpdateEnabled:  view.Actions.Update.Enabled,
+		DeleteEnabled:  view.Actions.Delete.Enabled,
 	}
-	return state
 }

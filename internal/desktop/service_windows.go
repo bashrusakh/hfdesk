@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/service"
+	"github.com/bashrusakh/hfdesk/internal/serviceview"
 	"golang.org/x/sys/windows"
 )
 
@@ -271,23 +272,49 @@ func (serviceStateReader) readSingle(budget time.Duration) (service.Status, erro
 	return status, nil
 }
 
-// readRuntimeServiceState answers the state read of the Logs
-// window under the display policy.
+// readRuntimeServiceStatus is the one window read behind both shapes of the
+// runtime surface: it reads the registration under the display policy and
+// asks the tray menu to catch up right after the read finished.
 //
-// Every display read asks the tray menu to catch up right after it ran, so a
-// result read for the window can never stay invisible in the menu until the
-// next tick: the menu re-reads and applies on its own goroutine, and the
-// request is the host's non-blocking refresh signal, so this caller — the
-// HTTP handler of the window — is never held by the menu. The signal follows
-// a failed read as well: the honest unknown state a failed read classifies
-// as must reach the menu too.
-func readRuntimeServiceState(requestRefresh func()) (string, error) {
+// The catch-up signal is the host's non-blocking refresh request, so this
+// caller — the HTTP handler of the window — is never held by the menu. The
+// signal follows a failed read as well: the honest unknown state a failed
+// read classifies as must reach the menu too.
+func readRuntimeServiceStatus(requestRefresh func()) (service.Status, error) {
 	status, err := serviceState.readForDisplay()
 	requestRefresh()
+	return status, err
+}
+
+// readRuntimeServiceState answers the state read of the Logs window under the
+// display policy.
+//
+// It is the raw-state shape the runtime status used before the classified
+// view existed; the display tests pin it. The Runtime window reads the
+// classified view through readRuntimeServiceSnapshot.
+func readRuntimeServiceState(requestRefresh func()) (string, error) {
+	status, err := readRuntimeServiceStatus(requestRefresh)
 	if err != nil {
 		return "", err
 	}
 	return string(status.State), nil
+}
+
+// readRuntimeServiceSnapshot answers the classified service view of the Logs
+// window.
+//
+// It is the SAME read that feeds the tray menu line (readForDisplay), passed
+// through the one shared table (serviceview.From), so the window and the tray
+// report the same words and offer the same actions — no second budget and no
+// second classification. A failed read is the unknown view: the window then
+// claims nothing about the service, exactly like the menu, and the catch-up
+// request still goes out.
+func readRuntimeServiceSnapshot(requestRefresh func()) (serviceview.Snapshot, error) {
+	status, err := readRuntimeServiceStatus(requestRefresh)
+	if err != nil {
+		return serviceview.From("", false, true), err
+	}
+	return serviceview.From(string(status.State), status.Running, false), nil
 }
 
 // lookupServiceStatus reads the registration of the Windows service with the

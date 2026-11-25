@@ -102,7 +102,20 @@ requests of the runtime endpoints.
   "runId": "3f8a1c06b27d4e59a0c1d8b47e2f6095",
   "logCursor": 42,
   "logFile": "/home/user/.cache/HFDesk/logs/hfdesk.log",
-  "serviceState": "unknown"
+  "service": {
+    "class": "present",
+    "label": "Service: running",
+    "tone": "success",
+    "actions": {
+      "install": { "visible": false, "enabled": false },
+      "start": { "visible": true, "enabled": false },
+      "stop": { "visible": true, "enabled": true },
+      "update": { "visible": true, "enabled": true },
+      "delete": { "visible": true, "enabled": true },
+      "open": { "visible": true, "enabled": true }
+    }
+  },
+  "serviceState": "running"
 }
 ```
 
@@ -113,19 +126,44 @@ cursor a client sends to read the records emitted after it. `logFile` is the
 path of the rotating log file; it is an empty string when the application does
 not write a log file.
 
-`serviceState` is the lifecycle state of the platform service registration,
-in the state vocabulary of the service layer: `not-installed`, `running`,
-`stopped`, `starting`, `stopping`, `failed`, `broken`, `masked`,
-`masked-runtime` or `unknown`. It is `unknown` whenever this process could
+`service` is the classified view of the platform service registration, built
+from one read of the same table the tray menu uses:
+
+- `class` is what the read proved about the machine: `absent` (no
+  registration), `present` (a registration) or `unknown` (the read failed or
+  the supervisor reported no usable state). An `unknown` view carries no
+  label, no tone and no action.
+- `label` is the status line of the service ("`Service: not installed`",
+  "`Service: starting`", "`Service: running`", "`Service: stopped`",
+  "`Service: failed`"). It is empty for `unknown`. A transition shows its
+  own word; a broken registration whose process still serves shows
+  "`Service: running`", while a broken registration without one shows
+  "`Service: failed`" (its start stays hidden; the update repairs it).
+- `tone` is the presentation of the line: `success` (running), `warning` (a
+  transition), `error` (failed) or `muted` (not installed or stopped). It is
+  empty for `unknown`.
+- `actions` holds one `{ "visible", "enabled" }` pair for `install`, `start`,
+  `stop`, `update`, `delete` and `open`. The window renders these; it must
+  not derive availability itself. An action that is not `visible` is never
+  `enabled`: a hidden item is not clickable. A transition greys every
+  lifecycle action, a broken registration hides `start`, and `unknown`
+  offers nothing at all — a state that was not read may not be acted on.
+
+`serviceState` is the raw lifecycle state word of the platform service
+registration, in the state vocabulary of the service layer: `not-installed`,
+`running`, `stopped`, `starting`, `stopping`, `failed`, `broken`, `masked`,
+`masked-runtime` or `unknown`. The field is kept for compatibility with
+clients that read the word directly; new clients use `service`, which carries
+the classified view. `serviceState` is `unknown` whenever this process could
 not settle the state — no host of the process provides the service surface
-(the console host), the read failed, or the supervisor reported
-no usable state — and it is never `not-installed` for a state that could not
-be read, so a client can enable an installation only on a proven absence. The
-desktop host fills it from the same read its tray menu status line shows, so
-the Runtime window and the tray report the same status. The Windows service
-host also provides the read — of its own machine-wide registration — so the
-page the service itself serves reports the state it runs from; its
-install-service action stays unavailable and answers 404.
+(the console host), the read failed, or the supervisor reported no usable
+state — and it is never `not-installed` for a state that could not be read, so
+a client can enable an installation only on a proven absence. The desktop host
+fills both fields from the same read its tray menu status line shows, so the
+Runtime window and the tray report the same status. The Windows service host
+also provides the read — of its own machine-wide registration — so the page the
+service itself serves reports the state it runs from; its install-service
+action stays unavailable and answers 404.
 
 `runId` identifies the run of the server: it is generated once per server
 and it never changes afterwards, so it is stable for the whole life of the

@@ -10,14 +10,16 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/bashrusakh/hfdesk/internal/serviceview"
 )
 
 // runtimeServiceStub records what the host surface of a test reported.
 type runtimeServiceStub struct {
 	// reads counts the reads of the state.
 	reads int
-	// state is the state word every read reports.
-	state string
+	// snapshot is the view every read reports.
+	snapshot serviceview.Snapshot
 	// err is the failure every read reports.
 	err error
 	// installs counts the dispatched install actions.
@@ -27,7 +29,7 @@ type runtimeServiceStub struct {
 // stubRuntimeService registers a service surface for the duration of the
 // test and restores the empty surface when the test ends, so a test never
 // reaches a real registration or a real installation.
-func stubRuntimeService(t *testing.T, read func() (string, error), install func()) {
+func stubRuntimeService(t *testing.T, read func() (serviceview.Snapshot, error), install func()) {
 	t.Helper()
 	SetRuntimeService(read, install)
 	t.Cleanup(func() { SetRuntimeService(nil, nil) })
@@ -38,11 +40,12 @@ func stubRuntimeService(t *testing.T, read func() (string, error), install func(
 // Runtime window can show the same status the tray menu shows.
 func TestRuntimeStatusReportsTheServiceState(t *testing.T) {
 	pipeline, _ := newRuntimeTestPipeline(t, 16)
-	stub := &runtimeServiceStub{state: "running"}
+	want := serviceview.From("running", true, false)
+	stub := &runtimeServiceStub{snapshot: want}
 	stubRuntimeService(t,
-		func() (string, error) {
+		func() (serviceview.Snapshot, error) {
 			stub.reads++
-			return stub.state, stub.err
+			return stub.snapshot, stub.err
 		}, nil)
 	handler := newRuntimeTestServer(pipeline).handler()
 
@@ -58,6 +61,11 @@ func TestRuntimeStatusReportsTheServiceState(t *testing.T) {
 	}
 	if status.ServiceState != "running" {
 		t.Errorf("service state = %q, want %q", status.ServiceState, "running")
+	}
+	wantWire := want
+	wantWire.State = "" // the raw word is never serialized in the view
+	if status.Service != wantWire {
+		t.Errorf("service view = %+v, want %+v", status.Service, wantWire)
 	}
 	if stub.reads != 1 {
 		t.Errorf("the status read the registration %d times, want once per request", stub.reads)
@@ -86,16 +94,16 @@ func TestRuntimeStatusReportsAnUnknownServiceState(t *testing.T) {
 		{
 			name: "the read fails",
 			setup: func(t *testing.T) {
-				stubRuntimeService(t, func() (string, error) {
-					return "", errors.New("the service control manager did not answer")
+				stubRuntimeService(t, func() (serviceview.Snapshot, error) {
+					return serviceview.Snapshot{}, errors.New("the service control manager did not answer")
 				}, nil)
 			},
 		},
 		{
 			name: "the read reports no state",
 			setup: func(t *testing.T) {
-				stubRuntimeService(t, func() (string, error) {
-					return "   ", nil
+				stubRuntimeService(t, func() (serviceview.Snapshot, error) {
+					return serviceview.From("   ", false, false), nil
 				}, nil)
 			},
 		},
@@ -118,6 +126,98 @@ func TestRuntimeStatusReportsAnUnknownServiceState(t *testing.T) {
 			}
 			if status.ServiceState == "not-installed" {
 				t.Error("an unsettled read reported a machine without a service")
+			}
+			if want := serviceview.From("", false, true); status.Service != want {
+				t.Errorf("service view = %+v, want the unknown view %+v", status.Service, want)
+			}
+		})
+	}
+}
+
+// wantWithStateCleared is the wire shape of a snapshot: the raw state word
+// is kept out of the serialized view (json:"-") and travels in serviceState.
+func wantWithStateCleared(snapshot serviceview.Snapshot) serviceview.Snapshot {
+	snapshot.State = ""
+	return snapshot
+}
+
+// TestRuntimeStatusServiceView proves that the status carries the classified
+// view and the compatible raw word of the same read, and that the view is
+// exactly the shared table of the application.
+func TestRuntimeStatusServiceView(t *testing.T) {
+	pipeline, _ := newRuntimeTestPipeline(t, 16)
+
+	for _, tc := range []struct {
+		name     string
+		state    string
+		running  bool
+		readErr  bool
+		wantWord string
+	}{
+		{name: "absent", state: "not-installed", wantWord: "not-installed"},
+		{name: "running", state: "running", running: true, wantWord: "running"},
+		{name: "stopped", state: "stopped", wantWord: "stopped"},
+		{name: "failed", state: "failed", wantWord: "failed"},
+		{name: "broken", state: "broken", wantWord: "broken"},
+		{name: "broken with a running instance", state: "broken", running: true, wantWord: "broken"},
+		{name: "starting", state: "starting", wantWord: "starting"},
+		{name: "stopping", state: "stopping", wantWord: "stopping"},
+		{name: "the unknown word", state: "unknown", wantWord: "unknown"},
+		{name: "no state", state: "   ", wantWord: "unknown"},
+		{name: "failed read", state: "running", running: true, readErr: true, wantWord: "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := serviceview.From(tc.state, tc.running, tc.readErr)
+			stubRuntimeService(t, func() (serviceview.Snapshot, error) {
+				if tc.readErr {
+					return serviceview.Snapshot{}, errors.New("the service control manager did not answer")
+				}
+				return want, nil
+			}, nil)
+
+			recorder := httptest.NewRecorder()
+			newRuntimeTestServer(pipeline).handler().ServeHTTP(recorder,
+				runtimeRequest(http.MethodGet, "/api/runtime", "127.0.0.1:5555"))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+			}
+
+			var status RuntimeStatusResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &status); err != nil {
+				t.Fatalf("decode status response: %v", err)
+			}
+			if status.Service != wantWithStateCleared(want) {
+				t.Errorf("service view = %+v, want %+v", status.Service, wantWithStateCleared(want))
+			}
+			if status.ServiceState != tc.wantWord {
+				t.Errorf("serviceState = %q, want %q", status.ServiceState, tc.wantWord)
+			}
+
+			// The wire shape of the view: the classified fields and the
+			// six actions, and never the raw state word (which the
+			// compatible field carries).
+			var payload struct {
+				Service map[string]json.RawMessage `json:"service"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode raw status response: %v", err)
+			}
+			for _, key := range []string{"class", "label", "tone", "actions"} {
+				if _, ok := payload.Service[key]; !ok {
+					t.Errorf("the service object %v does not carry %q", payload.Service, key)
+				}
+			}
+			if _, ok := payload.Service["state"]; ok {
+				t.Error("the service object carries a raw state word, want the classified view only")
+			}
+			var actions map[string]json.RawMessage
+			if err := json.Unmarshal(payload.Service["actions"], &actions); err != nil {
+				t.Fatalf("decode actions %q: %v", payload.Service["actions"], err)
+			}
+			for _, key := range []string{"install", "start", "stop", "update", "delete", "open"} {
+				if _, ok := actions[key]; !ok {
+					t.Errorf("the actions object %v does not carry %q", actions, key)
+				}
 			}
 		})
 	}
@@ -146,9 +246,9 @@ func runtimeInstallServiceRequest(remoteAddr, origin, body string) *http.Request
 // rejected, and neither of them reaches the host.
 func TestRuntimeInstallServiceRejectsNonLocalClients(t *testing.T) {
 	pipeline, _ := newRuntimeTestPipeline(t, 16)
-	stub := &runtimeServiceStub{state: "not-installed"}
+	stub := &runtimeServiceStub{snapshot: serviceview.From("not-installed", false, false)}
 	stubRuntimeService(t,
-		func() (string, error) { return stub.state, nil },
+		func() (serviceview.Snapshot, error) { return stub.snapshot, nil },
 		func() { stub.installs++ })
 	handler := newRuntimeTestServer(pipeline).handler()
 
@@ -184,9 +284,9 @@ func TestRuntimeInstallServiceRejectsNonLocalClients(t *testing.T) {
 // own action and nothing else.
 func TestRuntimeInstallServiceDispatchesToTheHostOnce(t *testing.T) {
 	pipeline, _ := newRuntimeTestPipeline(t, 16)
-	stub := &runtimeServiceStub{state: "not-installed"}
+	stub := &runtimeServiceStub{snapshot: serviceview.From("not-installed", false, false)}
 	stubRuntimeService(t,
-		func() (string, error) { return stub.state, nil },
+		func() (serviceview.Snapshot, error) { return stub.snapshot, nil },
 		func() { stub.installs++ })
 	handler := newRuntimeTestServer(pipeline).handler()
 
@@ -217,8 +317,8 @@ func TestRuntimeInstallServiceDispatchesToTheHostOnce(t *testing.T) {
 // button instead of failing on every click.
 func TestRuntimeInstallServiceWithoutAHostAction(t *testing.T) {
 	pipeline, _ := newRuntimeTestPipeline(t, 16)
-	stubRuntimeService(t, func() (string, error) {
-		return "running", nil
+	stubRuntimeService(t, func() (serviceview.Snapshot, error) {
+		return serviceview.From("running", true, false), nil
 	}, nil)
 	handler := newRuntimeTestServer(pipeline).handler()
 

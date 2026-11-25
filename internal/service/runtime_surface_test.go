@@ -16,6 +16,7 @@ import (
 
 	"github.com/bashrusakh/hfdesk/internal/runtimepaths"
 	"github.com/bashrusakh/hfdesk/internal/server"
+	"github.com/bashrusakh/hfdesk/internal/serviceview"
 )
 
 // hostServiceManagerStub is the manager of a test. Only Status is reachable:
@@ -50,10 +51,10 @@ func stubHostServiceManager(t *testing.T, open func() (Manager, error)) {
 
 // TestReadServiceRegistrationState proves the contract of the registration
 // read the service host exposes on its runtime page: the read returns the
-// state word of the manager, passes an empty word through, and reports every
-// failure as an error. The runtime status turns both an empty word and an
-// error into the unknown state, so the page never claims a state no read
-// reported.
+// shared classified view of the manager's status, classifies an empty state
+// as unknown, and reports every failure as an error. The runtime status turns
+// both an empty view and an error into the unknown view, so the page never
+// claims a state no read reported.
 func TestReadServiceRegistrationState(t *testing.T) {
 	readFailure := errors.New("the supervisor did not answer")
 	managerFailure := errors.New("the registration cannot be read")
@@ -61,7 +62,7 @@ func TestReadServiceRegistrationState(t *testing.T) {
 	tests := []struct {
 		name    string
 		open    func() (Manager, error)
-		want    string
+		want    serviceview.Snapshot
 		wantErr error
 	}{
 		{
@@ -69,21 +70,28 @@ func TestReadServiceRegistrationState(t *testing.T) {
 			open: func() (Manager, error) {
 				return &hostServiceManagerStub{status: Status{State: StateRunning}}, nil
 			},
-			want: string(StateRunning),
+			want: serviceview.From(string(StateRunning), false, false),
 		},
 		{
 			name: "the stopped word of the registration",
 			open: func() (Manager, error) {
 				return &hostServiceManagerStub{status: Status{State: StateStopped}}, nil
 			},
-			want: string(StateStopped),
+			want: serviceview.From(string(StateStopped), false, false),
 		},
 		{
-			name: "an empty state stays empty",
+			name: "the running fact of the status travels with it",
+			open: func() (Manager, error) {
+				return &hostServiceManagerStub{status: Status{State: StateBroken, Running: true}}, nil
+			},
+			want: serviceview.From(string(StateBroken), true, false),
+		},
+		{
+			name: "an empty state classifies as unknown",
 			open: func() (Manager, error) {
 				return &hostServiceManagerStub{}, nil
 			},
-			want: "",
+			want: serviceview.From("", false, false),
 		},
 		{
 			name: "a failing read is an error",
@@ -115,8 +123,8 @@ func TestReadServiceRegistrationState(t *testing.T) {
 				if !errors.Is(err, tc.wantErr) {
 					t.Fatalf("readServiceRegistrationState() error = %v, want %v", err, tc.wantErr)
 				}
-				if got != "" {
-					t.Errorf("readServiceRegistrationState() = %q with an error, want an empty word", got)
+				if got != (serviceview.Snapshot{}) {
+					t.Errorf("readServiceRegistrationState() = %+v with an error, want an empty view", got)
 				}
 				return
 			}
@@ -124,7 +132,7 @@ func TestReadServiceRegistrationState(t *testing.T) {
 				t.Fatalf("readServiceRegistrationState() error = %v, want nil", err)
 			}
 			if got != tc.want {
-				t.Errorf("readServiceRegistrationState() = %q, want %q", got, tc.want)
+				t.Errorf("readServiceRegistrationState() = %+v, want %+v", got, tc.want)
 			}
 		})
 	}
@@ -195,6 +203,10 @@ func TestRunRegistersTheServiceStateOnItsRuntimePage(t *testing.T) {
 		default:
 			var payload struct {
 				ServiceState string `json:"serviceState"`
+				Service      struct {
+					Class string `json:"class"`
+					Label string `json:"label"`
+				} `json:"service"`
 			}
 			if err := json.Unmarshal([]byte(body), &payload); err != nil {
 				stop()
@@ -203,6 +215,10 @@ func TestRunRegistersTheServiceStateOnItsRuntimePage(t *testing.T) {
 			if payload.ServiceState != string(StateRunning) {
 				stop()
 				t.Fatalf("serviceState = %q, want %q", payload.ServiceState, StateRunning)
+			}
+			if payload.Service.Class != string(serviceview.ClassPresent) || payload.Service.Label != "Service: running" {
+				stop()
+				t.Fatalf("service = %+v, want the present view with the running line", payload.Service)
 			}
 			stop()
 			return
