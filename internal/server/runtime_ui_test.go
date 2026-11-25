@@ -176,19 +176,89 @@ func TestRuntimeUIRunID(t *testing.T) {
 	runRuntimeUIHarness(t, "run")
 }
 
-// TestRuntimeUIServiceStatusAndInstallAction proves that the Runtime /
-// Logs view shows the status of the platform service with the words the
-// tray menu shows for the same state, and that its install button follows
-// the one rule the surface promises: enabled only while the status
-// positively reports that no service is installed, flipped by the status
-// refresh once one exists, and never dispatching a second installation
-// while one is in flight.
+// TestRuntimeUIServiceMenuFollowsActions proves that the service control of
+// the header renders the classified view the server sends and nothing else:
+// the line is the server's label, the tone colors the dot, and every item is
+// exactly the visibility and availability of its action.
+//
+// The page adds no rule about a state of its own — no Start beside a broken
+// registration, no enabled item in a transition — and a read that proves
+// nothing has no control at all.
 //
 // Node's built-in VM drives the shipped runtime.js with DOM and fetch
 // stubs, so the harness exercises the view itself and not a copy of its
 // rules.
-func TestRuntimeUIServiceStatusAndInstallAction(t *testing.T) {
+func TestRuntimeUIServiceMenuFollowsActions(t *testing.T) {
 	runRuntimeUIHarness(t, "service")
+}
+
+// TestRuntimeUIServiceMenuOwnerless proves that a document that owns none of
+// the actions — the plain browser on the page of a service host — shows the
+// same line as a static chip instead of a dead menu.
+//
+// Node's built-in VM drives the shipped runtime.js with DOM and fetch
+// stubs, so the harness exercises the view itself and not a copy of its
+// rules.
+func TestRuntimeUIServiceMenuOwnerless(t *testing.T) {
+	runRuntimeUIHarness(t, "serviceChip")
+}
+
+// TestRuntimeUIServiceMenuAction proves that one activation of a menu item
+// reaches the host exactly once: the menu closes, the trigger waits for the
+// answer, the status is read again right away, no success report is added
+// beside the host's own, and a disabled item never calls anybody.
+//
+// Node's built-in VM drives the shipped runtime.js with DOM and fetch
+// stubs, so the harness exercises the view itself and not a copy of its
+// rules.
+func TestRuntimeUIServiceMenuAction(t *testing.T) {
+	runRuntimeUIHarness(t, "serviceAction")
+}
+
+// TestRuntimeUIServiceMenuKeyboard proves that the menu is a menu for the
+// keyboard: ArrowDown/ArrowUp/Home/End move over the items the user can act
+// on, Escape closes the menu and returns the focus, and a click outside
+// closes it.
+//
+// Node's built-in VM drives the shipped runtime.js with DOM and fetch
+// stubs, so the harness exercises the view itself and not a copy of its
+// rules.
+func TestRuntimeUIServiceMenuKeyboard(t *testing.T) {
+	runRuntimeUIHarness(t, "serviceKeys")
+}
+
+// TestRuntimeUIServiceMenuInstallEndpoint proves that the installation is
+// offered as the one action the server performs itself: a browser on the
+// page of a desktop host performs it over the endpoint, and a build without
+// the endpoint says so once and withdraws the item.
+//
+// Node's built-in VM drives the shipped runtime.js with DOM and fetch
+// stubs, so the harness exercises the view itself and not a copy of its
+// rules.
+func TestRuntimeUIServiceMenuInstallEndpoint(t *testing.T) {
+	runRuntimeUIHarness(t, "serviceInstall")
+}
+
+// TestRuntimeUIServiceStatusOffline proves that a status that cannot be
+// read does not leave the service control behind with the claim of its last
+// render.
+//
+// Node's built-in VM drives the shipped runtime.js with DOM and fetch
+// stubs, so the harness exercises the view itself and not a copy of its
+// rules.
+func TestRuntimeUIServiceStatusOffline(t *testing.T) {
+	runRuntimeUIHarness(t, "serviceOffline")
+}
+
+// TestRuntimeUILogViewRenderer proves that the renderer of one record is a
+// unit of its own: it loads without touching the page, exposes exactly one
+// global, and normalizes, filters, builds the row and the copy line the
+// view has always used.
+//
+// Node's built-in VM loads the shipped logview.js and runtime.js, so the
+// harness exercises the shipped renderer and not a copy of its rules.
+func TestRuntimeUILogViewRenderer(t *testing.T) {
+	runRuntimeUIHarness(t, "logview")
 }
 
 // TestRuntimeUIOpenLogActions proves that the log open actions of the
