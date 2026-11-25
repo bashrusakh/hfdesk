@@ -26,5 +26,16 @@ notes=$(extract_release_notes 1.3.0-beta.1 "$SCRIPT_DIR/../../CHANGELOG.md")
 [[ "$notes" == *'## [1.3.0-beta.1] - 2026-10-15'* ]]
 [[ "$notes" == *'Beta limitations and compatibility'* ]]
 [[ "$notes" != *'## [1.2.2]'* ]]
-[[ $(extract_release_notes 1.3.0-beta.10 "$SCRIPT_DIR/../../CHANGELOG.md") == '' ]]
+while IFS= read -r version; do
+  notes=$(extract_release_notes "$version" "$SCRIPT_DIR/../../CHANGELOG.md")
+  [[ "$notes" == "## [$version]"* ]] || {
+    echo "$version: release notes do not start with the section header" >&2
+    exit 1
+  }
+  section_headers=$(printf '%s\n' "$notes" | grep -c '^## \[')
+  [[ "$section_headers" -eq 1 ]] || {
+    echo "$version: release notes bleed into the following section" >&2
+    exit 1
+  }
+done < <(grep -oE '^## \[1\.3\.0-beta\.[0-9]+\]' "$SCRIPT_DIR/../../CHANGELOG.md" | sed -E 's/^## \[(.*)\]$/\1/')
 echo 'release version and changelog checks passed'
