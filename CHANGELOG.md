@@ -2,19 +2,123 @@
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-25
+
+Long-form notes: [docs/releases/1.3.0.md](docs/releases/1.3.0.md).
+
+### Added
+
+- HFDesk can run as a supervised background service: `hfdesk service install`, `uninstall`, `start`, `stop`, `restart` and `status` register it with systemd, launchd or the Windows Service Control Manager, the instance runs headless on its own config, state and log paths, and it binds loopback unless `--listen` names another address; `status` reports persistent and runtime masks separately with exit code 0 (#142).
+- A second Windows download, `hfdesk-desktop_windows_amd64_v1.3.0.exe`, runs the same server in a GUI process without a console window, with an icon in the notification area, one **Logs** window and a single instance per user and session; a missing WebView2 runtime is reported while the server, the tray icon and the web UI keep working (#141).
+- Structured logging adds `--log-file` and `--log-level` with a rotating file sink, and local-only runtime endpoints report the version, address, job counts, run id and log records to the desktop windows (#141).
+- The desktop app and the tray companion show one **Logs** window with one frame: the live log page of the address it knows while that address answers — icon, version, facts strip and a filterable log table — and, when it does not, the same frame with the centre replaced by the address that did not answer, **Try again**, the log file's folder and file actions, and the tail of the same log (200 lines, at most the last 64 KiB) in the same table; error reports name the log file of their launch.
+- Everything about the service sits in one tray **Service** submenu whose line names a single state — `Service: not installed`, `Service: stopped`, `Service: starting`, `Service: running`, `Service: stopping` or `Service: failed` — with no `installed` or `unknown` word; a read that settled nothing shows no line, no items and no submenu until the next reading succeeds, and the line is re-read after every action and every 30 seconds so the tray and the window keep the state of the machine.
+- The **Logs** window header carries that line and its actions as one **Service ▾** control — **Install service…**, **Start service**, **Stop service**, **Update service** and **Delete service…**, with the state on the trigger and not repeated in the menu; the desktop app's own window binds the same five actions, and in a plain browser the line stays a static chip without a menu only where no available action has an executor, while an installation the host itself performs is still offered.
+- Service items follow the state they prove: **Install service…** appears only where nothing is registered and only where that host can install, a registration whose program is gone reads as `failed` and offers **Update service** with no start, a crashed `failed` registration offers the start beside that update, a transition greys all four lifecycle items, and one service action runs at a time from either surface.
+- Installing asks with the question and two short fact lines — the service starts at boot and keeps running, and its data is separate — adding the removable-drive warning when the program sits on such a drive; updating a running service asks first and states that the service is stopped and started again with running downloads interrupted, a stopped service updates without a question, and a desktop app that hands over asks its own question once; deleting states that a running service is stopped first and removes only the registration, keeping data, cache, config, history and logs.
+- The Windows desktop can work as a tray companion beside an installed service: no server of its own, **Open HFDesk** for the service's address, the same **Logs** window, and **Exit**, which closes only the companion; a finished installation restarts the desktop as exactly that.
+- When the paired console program is missing, the notice names the file and its folder and can download this release's copy from the official release, verify it against the published checksum and continue the service action, with the manual route beside it; the program is found under either spelling of its version, a build without a version or a release without a checksum file gets no offer, and a download that cannot be offered states the reason with **Try again** (#219).
+- The report of a service update names the old program file left behind when the registration moved to another file and offers its deletion with one press; nothing is removed automatically.
+- New Windows registrations, and existing ones whose action list is proven empty, get three restarts, a one-day reset and non-crash recovery, while a custom action list and its non-crash flag stay as they are.
+- Whole-model **Delete** in Repository Details covers `Local` and `Friendly view` models — the complete folder for a local model, the complete cache presence for a friendly view — and refuses a folder shared with other files (#63).
+- Analysis adds **Weight Format** rows for ONNX, TFLite, Flax and OpenVINO weights, recognizes `fp8`, `compressed-tensors` and `mlx` quantization methods and nested MLX configs, and adds a **Recommended quant RAM budget** setting that keeps the recommended GGUF artifact within the budget.
+- **Dataset Configs** lists one preset per config folder that downloads the whole config, and a manual filter that matches nothing is reported as a `filters_unmatched` notice in the plan and as a warning on the job instead of disappearing.
+- Plan and download accept shard ranges and an exact-list file selection, and Model Details gains a **Files** tab with a directory tree, tri-state checkboxes, sizes and LFS badges that downloads exactly the checked paths.
+- EXL2/EXL3 bitrate branch quantizations are analyzed, recommended and downloadable as whole-branch variants, stored with per-commit snapshots and without writing the shared friendly view (#100).
+- Downloads can be routed into optional per-type folders — LLM/GGUF, LLM/Safetensors, LLM, Audio, Diffusion, Embedding (#62).
+- The Hugging Face token resolves as `--token`, then `HF_TOKEN`, then the config file (#72).
+- Docker supports `PUID`, `PGID` and `UMASK`, runs as an arbitrary numeric UID/GID through `--user` without a named user or an `/etc/passwd` entry, drops privileges after the entrypoint's setup, and starts non-root on a read-only root filesystem with all capabilities dropped (#61, #71).
+- The cache browser selects a location and a GGUF group for deletion and reports partial-failure details (#111, #125).
+- Windows binaries embed the HFDesk icon, and Linux gets desktop integration (#54, #56).
+- Numeric settings use custom stepper controls (#58).
+- GGUF recognition adds the PrismML `PTQ1_0` and `PQ2_0` ternary quantizations, which require the PrismML llama.cpp fork and are never auto-recommended.
+- A read-only **Community** tab lists Discussions and Pull Requests with threads, sanitized comments and event summaries, and repository links — including links to a repository root — open in Model Details with Back/Forward history instead of the browser (#135, #136).
+- Gated repositories report a dedicated access state with token and agreement guidance instead of a partial analysis.
+
 ### Changed
 
-- The tray menu's service line names one state — `Service: not installed`, `Service: stopped`, `Service: starting`, `Service: running`, `Service: stopping` or `Service: failed` — instead of also saying `installed` and `unknown`; a state that could not be read shows nothing about the service at all, and it reappears with the next reading that succeeds.
-- The Logs window and its offline view now use one frame — the same header with the icon and version, the same facts strip and the same log panel — and offline only the centre changes: the address that did not answer, and the tail of the same log in the same table, limited to the last lines and 64 KiB.
-- The Logs window now carries the service actions in one **Service ▾** control — the state line plus a menu of **Install service…**, **Start service**, **Stop service**, **Update service** and **Delete service…**, with the state not repeated in the menu. The rules and confirmations are the tray's, the desktop app's own window has the same control, and in a plain browser the line stays a static chip without a menu only where no available action has an executor — an installation the server can perform is still offered from the menu.
-- Updating a running service asks first and states that the service is stopped and started again with running downloads interrupted; a stopped service updates without a question, and a desktop app that hands over asks its own question once.
-- Deleting the service states that a running service is stopped first.
-- A registration whose program is gone reads as `failed` and offers **Update service** instead of **Start service**.
+- Plan validates the repository before the route key, matching download requests; plan paths stay repository-relative, `appendFilterSubdir` now applies over HTTP so a real download lands under the filter directory, and a path-shaped filter with the flag is rejected at the request boundary.
+- Diffusers component rows download exactly their recommended weight set — fp16 safetensors over default safetensors over pytorch bin, every shard of one family, conversions excluded — instead of dragging every conversion copy behind a folder filter.
+- Dataset split membership has one precedence rule, with ambiguous overlapping shapes still refused.
+- A download holds one destination ownership scope from the authoritative skip decision through publication and cancel cleanup, and every per-file URL is pinned to the resolved commit (#140).
+- Staged multipart data is reused only under a proven identity pinned on both sides, and unpinned planning is limited to proven branch-only endpoints (#140).
+- Verification settings now also govern LFS files: `size` is the default and does not reread a file on the normal path, while `sha256` and `etag` run at most one pre-publication hash pass (#140).
+- Mirror, rebuild and cache mutations share the destination ownership admission used by downloads (#151).
+- Metadata fetches are time-bounded per request, and duplicate-download detection uses one shared identity comparison (#151).
+- EXL branch discovery reads branch configs instead of guessing from the main tree, and nested quantization configs are recognized (#100).
+- README rendering and Hub link classification have a single implementation (#135, #147).
+- Remote tree paths must use canonical spelling instead of being normalized.
+- Repository Details is a sectioned, resizable card: a two-line identity whose title opens the repository, a **This copy** facts header, compact GGUF rows with facts, location choice in the contents heading, and whole-copy deletion fixed above the footer with a target path; the dialog remembers its size per browser (#213).
+- The selected GGUF group deletion confirmation names the quantization in its title and shows a one-sentence scope, left-aligned facts and right-aligned file sizes; the whole-copy confirmation is unchanged (#207).
+- Cancelling a download, or cleaning a paused job's leftover part files, in local-folder mode removes the directories its removed partials leave completely empty, walking up to but never including the output root (#218).
+- Hub error handling keeps the existing messages while using the actual HTTP status for namespace detection: 401 and 404 can fall back between model and dataset, 403 stays terminal, and a transport failure keeps its diagnostics (#125).
+- `GET /api/runtime` serves the classified service view as `service` — class, label, tone and per-action `visible`/`enabled` — beside the raw `serviceState` kept for existing clients.
+- The version shown by the UI and embedded in Docker images comes from the release tag instead of a hardcoded number (#64, #69).
+- A service installation merges with an existing registration, keeping settings and running state the command does not name; a running instance is restarted on the new program and a stopped one stays stopped.
+- Docker keeps all writable state — settings, jobs, history, HF cache and local models — under one `/data` root by default, with `HOME`, `XDG_CONFIG_HOME`, `HF_HOME` and the working directory following it (#61).
 
 ### Fixed
 
-- Installing the service from the desktop app no longer flashes a red error in the Logs window: the window closes before the app's own server stops, while a server that fails on its own still shows the error.
-- The Logs window follows the service while it stays open: a service that stops, fails or loses its registration redraws the window, a missing program offers its update, and returning the focus to the window re-reads the state.
+- GGUF quantization selections stay matched-only when README file names contain the selected quant token, and dataset split filters use inferred membership and fail clearly on ambiguity (#124).
+- Quantization metadata is read from Git-LFS-backed config files instead of pointer stubs, quantization-only repositories show their precision, and the panel distinguishes proven uniform precision, observed variation and unknown precision (#123).
+- Analyzer metadata is read completely within the 10 MiB cap, completed leading quantization fields are recovered from oversized configs, and unrecoverable overflow is reported (#105).
+- Analysis and plan/download previews honor the configured proxy and report proxy construction failures instead of falling back to direct requests (#104).
+- Stalled downloads are recovered and transport waits bounded: `429` and every `5xx` retry, non-retryable file responses fail without retrying, and optional verification metadata failures stay non-fatal (#97).
+- Exact `HF_HUB_CACHE` storage stays consistent across downloads, cache operations, mirror, rebuild scripts, cleanup and disk previews, and complete job destinations are frozen across restart (#76).
+- Settings updates preserve active and stored Hugging Face credentials, keep redacted token values preserve-only, save config files owner-only and keep the previous file when persistence fails (#74).
+- Download destination and cache paths are contained at their join boundaries, remote hash values must be canonical SHA-256, size HEAD requests honor `Retry-After`, and a stalled transfer is an explicit stall error instead of `context canceled` (#117).
+- Repository trees are listed recursively with `Link` pagination, bounded context-cancellable retries and a loud failure instead of silent truncation, so repositories with more than 1,000 entries per directory analyze and plan completely (#96).
+- HF cache snapshot and friendly-view entries fall back from symlink to hardlink to copy where symlinks are unavailable, rebuild recreates missing snapshot entries from the download manifest, one notice per root names the fallback, and selected-GGUF deletion treats those entries like symlinks (#99).
+- Selected-GGUF deletion stays durable across rebuild when tombstones are recorded, reports a recording failure while the deletion proceeds, and restores quant status after cache deletion (#99, #59).
+- Job state is persisted ordered and atomically (#80).
+- Malformed repositories and the colon/filter shorthand are rejected consistently, and an empty filtered scan fails with a no-match error.
+- Cache-mode concurrency no longer collapses behind bootstrap locks, and large deletions avoid file-descriptor exhaustion (#151).
+- Flat-mode ownership keys are realm-relative, so shared mounts survive a common-prefix move (#151).
+- A download no longer reports success while a busy ownership scope leaves a requested file missing (#140).
+- Publication asserts a complete range layout and the exact payload length after flush, and an unproven staging record is preserved and refused instead of published (#140).
+- Cancelling during a digest proof releases the partial handle, and shared staging requires the OS lock (#140).
+- A macOS update no longer unloads an already scheduled launchd start, and a reinstall keeps `--flag=value` settings.
+- Windows installs verify the registered image or reject unreadable registrations, accept execute-only programs, and keep cache paths, settings and autostart.
+- Linux updates respect administrator drop-ins, runtime-only enablement and masked units, and wrapper prefixes no longer confuse flag parsing.
+- Updates restart a running instance on the new program, refuse disabled, removed or partial registrations, and verify readiness from the started instance.
+- Desktop and service coordination uses one liveness model, publishes URLs safely, checks first-install readiness, and bounds the handover's wait for jobs-state saves and settings writes.
+- Proxy failures no longer leak credentials into logs or API errors (#141).
+- mmproj companions are deletable groups and share one artifact-role rule across the picker, cache metadata and selection (#138).
+- Analysis accepts an explicit model/dataset selector, and the Hub link uses the effective endpoint (#135).
+- Download warnings are retained in job state, with repo-wide resume warnings reported once.
+- Local Cache dates ignore staging artifacts and interrupted-publication residue (#175).
+- Excludes and path filters fold separators and case identically on every platform.
+- A large download names a preparing phase while its staging file is created and preallocated, reports `writing` only while file creation, preallocation or a payload write is in flight, and takes speed and ETA from network reads, so a silent 0 B/s window and a phase held by a finished write are gone (#209).
+- Ranged downloads mark their staging payload sparse before sizing it, removing the disk-speed zero-fill window on Windows; filesystems without sparse support keep the previous behaviour (#212).
+- The systemd D-Bus client no longer crashes when a socket deadline or close lands mid-message (godbus v5.2.4) (#215).
+- README rendering uses a patched `golang.org/x/net` (GO-2026-6866, GO-2026-6860), and the build toolchain is Go 1.26.11 (#216).
+- Whole-folder deletion treats every recognized mmproj companion spelling as part of its model.
+- A GGUF vision-encoder row is recommended only together with a recommended quantization.
+- Model Details keeps Overview as the default tab for every recognized repository; only an unrecognized repository opens on Files.
+- Community links to a repository root open it in Model Details instead of the browser.
+- The page a browser loads from a running Windows service reports the state of the registration that instance runs from instead of `unknown`, and its install action stays unavailable.
+- The service log under `%ProgramData%` is readable from the Logs window: each start grants interactive users read access to the instance's own log directory and active log file and touches no other descriptor.
+- Starting, updating or deleting a service that is not stopped switches the desktop app to the tray and performs the action instead of asking the user to quit HFDesk; deleting returns it to desktop mode, and updating a stopped service keeps the window open.
+- A failed installation names the cause — the start did not run, the program ended too early, the service did not come up in time, or the started service could not be verified — and a registration removed after a failed attempt no longer reads as never registered.
+- Installation and service actions work while the Logs window or the web UI is open, without waiting for the open log view to end.
+- A service action that fails during the switch to the tray shows one error window with its cause instead of two.
+- A first installation no longer reports that the just-created registration changed before its first start when nothing else touched it.
+- The service starts from any folder, a user profile included: the installation grants the service account access to its own program or refuses with instructions to move the pair.
+- The log records state changes and actions instead of every state reading while nothing changes.
+- Installing from the desktop app no longer flashes a red error in the Logs window: the window closes before the app's own server stops, while a server that fails on its own still shows the error.
+- The Logs window follows the service while it stays open: a service that stops, fails or loses its registration redraws it, a missing program offers its update, and returning focus re-reads the state.
+
+### Removed
+
+- The unused invalid-repository sentinel, the obsolete stale-timeout settings and the staging-record heartbeat are gone (#140).
+- The 20-file analysis preview and the non-selectable per-file download list are gone; the **Files** tab covers both.
+
+### Compatibility
+
+- Docker keeps its writable state under `/data` by default. An existing deployment must move its persisted volume to `/data`, or settings, jobs/history, the HF cache and local models are not persisted; files already in a mounted directory keep their ownership, and changing `PUID`/`PGID` does not recursively chown existing data (#61).
+- The container no longer creates a named user or group and takes no `UID`/`GID` build arguments; the runtime identity is numeric through `PUID`/`PGID` or `--user`, with the entrypoint default `1000:1000` (#61, #71).
+- Building from source requires Go 1.26 (`go.mod`); the release builds use Go 1.26.11.
+- The default verification level is `size`, and it now also governs LFS files; a whole-file hash pass runs only with `sha256` or `etag` (#140).
 
 ## [1.3.0-beta.10] - 2026-11-25
 
