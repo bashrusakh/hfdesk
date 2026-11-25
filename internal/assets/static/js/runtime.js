@@ -15,6 +15,11 @@
 (function () {
   'use strict';
 
+  // logView renders one record: the row, the filter and the text of the
+  // copy action. It lives in its own file because the fallback document of
+  // the window host inlines that file on its own.
+  const logView = window.HFDeskLogView;
+
   // =========================================
   // Constants
   // =========================================
@@ -59,20 +64,6 @@
   // RESTART_MESSAGE is the message of the re-sync that follows a restart of
   // the server.
   const RESTART_MESSAGE = 'The server restarted, the log was re-synced';
-
-  // LEVEL_RANK maps a level onto its severity. The level filter is a
-  // minimum severity, so a filter of "warn" shows the warn and the error
-  // records.
-  const LEVEL_RANK = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 };
-  const FILTER_RANK = { debug: 0, info: 1, warn: 2, error: 3 };
-
-  // LEVEL_BADGE maps a level onto the badge modifier of the design system.
-  const LEVEL_BADGE = {
-    DEBUG: 'badge-secondary',
-    INFO: 'badge-info',
-    WARN: 'badge-warning',
-    ERROR: 'runtime-level-error'
-  };
 
   // STORAGE_KEY holds the view state of the window. The state is a
   // convenience only: the page works the same when the storage is not
@@ -147,11 +138,15 @@
     renderTimer: null,
     // statusTimer is the status refresh interval.
     statusTimer: null,
-    // serviceInstall marks the install-service action while its request is
-    // in flight, so a second click never reaches the host beside the first
-    // one. The host's own single-action guard refuses the clicks that get
-    // through anyway, exactly like a second tray click.
-    serviceInstall: false,
+    // serviceBusy marks a service action while its call is in flight, so a
+    // second activation never reaches the host beside the first one.
+    serviceBusy: false,
+    // serviceMenuOpen marks the open menu of the service control.
+    serviceMenuOpen: false,
+    // serviceActions is the action map of the last rendered view.
+    serviceActions: {},
+    // serviceInstallMissing marks an install endpoint this build lacks.
+    serviceInstallMissing: false,
     // statusError and logError hold the current failures. They are shown in
     // the error banner, which never blocks the view.
     statusError: '',
@@ -171,8 +166,20 @@
     statusDot: $('statusDot'),
     statusLabel: $('statusLabel'),
     versionLabel: $('versionLabel'),
-    serviceBadge: $('serviceBadge'),
-    installServiceButton: $('installServiceButton'),
+    serviceControl: $('serviceControl'),
+    serviceTrigger: $('serviceTrigger'),
+    serviceDot: $('serviceDot'),
+    serviceLabel: $('serviceLabel'),
+    serviceMenu: $('serviceMenu'),
+    serviceInstallItem: $('serviceInstallItem'),
+    serviceStartItem: $('serviceStartItem'),
+    serviceStopItem: $('serviceStopItem'),
+    serviceUpdateItem: $('serviceUpdateItem'),
+    serviceDeleteItem: $('serviceDeleteItem'),
+    serviceSeparator: $('serviceSeparator'),
+    serviceChip: $('serviceChip'),
+    serviceChipDot: $('serviceChipDot'),
+    serviceChipLabel: $('serviceChipLabel'),
     serverUrl: $('serverUrl'),
     activeJobs: $('activeJobs'),
     queuedJobs: $('queuedJobs'),
@@ -200,6 +207,16 @@
     liveRegion: $('liveRegion'),
     toastContainer: $('toastContainer')
   };
+
+  // SERVICE_ITEMS lists the menu items in markup order: each names the
+  // element the markup carries and the window action that performs it.
+  const SERVICE_ITEMS = [
+    { key: 'install', item: el.serviceInstallItem, action: 'hfdeskInstallService' },
+    { key: 'start', item: el.serviceStartItem, action: 'hfdeskStartService' },
+    { key: 'stop', item: el.serviceStopItem, action: 'hfdeskStopService' },
+    { key: 'update', item: el.serviceUpdateItem, action: 'hfdeskUpdateService' },
+    { key: 'delete', item: el.serviceDeleteItem, action: 'hfdeskDeleteService' }
+  ];
 
   // =========================================
   // Small helpers
@@ -233,67 +250,6 @@
     return data;
   }
 
-  // formatTime renders the timestamp of a record as a local clock time.
-  // The raw timestamp stays available as the tooltip of the cell.
-  function formatTime(value) {
-    if (!value) return '--:--:--';
-
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) {
-      const raw = String(value);
-      const sliced = raw.slice(11, 19);
-      return sliced || raw;
-    }
-
-    const pad = (n) => String(n).padStart(2, '0');
-    return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-  }
-
-  // formatAttrValue renders the value of an attribute as text.
-  function formatAttrValue(value) {
-    if (value === null || value === undefined) return '';
-    if (typeof value === 'string') return value;
-    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-    try {
-      return JSON.stringify(value);
-    } catch (err) {
-      return String(value);
-    }
-  }
-
-  // attrEntries returns the attributes of a record as key/value pairs.
-  function attrEntries(attrs) {
-    if (!attrs || typeof attrs !== 'object') return [];
-    return Object.keys(attrs).map((key) => [key, formatAttrValue(attrs[key])]);
-  }
-
-  // normalizeRecord turns a wire record into the shape the view uses.
-  function normalizeRecord(raw) {
-    if (!raw || typeof raw !== 'object') return null;
-
-    const seq = Number(raw.seq);
-    if (!Number.isFinite(seq)) return null;
-
-    const level = String(raw.level || '').toUpperCase();
-    const component = String(raw.component || '');
-    const message = String(raw.message || '');
-    const attrs = raw.attrs && typeof raw.attrs === 'object' ? raw.attrs : {};
-    const attrsText = attrEntries(attrs).map(([key, value]) => `${key}=${value}`).join(' ');
-
-    return {
-      seq,
-      time: String(raw.time || ''),
-      level,
-      component,
-      message,
-      attrs,
-      attrsText,
-      // searchable holds the text the search matches against: the message,
-      // the component and the attributes.
-      searchable: `${message}\n${component}\n${attrsText}`.toLowerCase()
-    };
-  }
-
   // =========================================
   // View state
   // =========================================
@@ -307,7 +263,7 @@
       const saved = JSON.parse(raw);
       if (!saved || typeof saved !== 'object') return;
 
-      if (typeof saved.level === 'string' && (saved.level === 'all' || FILTER_RANK[saved.level] !== undefined)) {
+      if (logView.isFilter(saved.level)) {
         state.level = saved.level;
       }
       if (typeof saved.search === 'string') {
@@ -492,62 +448,242 @@
       ? (logFile ? `Open the file ${logFile}` : 'The application does not write a log file')
       : 'Open the log file from the HFDesk window, where the action runs on this desktop';
 
-    applyServiceView(status.serviceState);
+    applyServiceView(status.service);
   }
 
-  // applyServiceView writes the service badge of the header and the enable
-  // rule of the install button from one service state, so the success path
-  // and the failure path share exactly one rule.
-  function applyServiceView(serviceState) {
-    const service = serviceStatusView(serviceState);
-    el.serviceBadge.textContent = service.label;
-    el.serviceBadge.classList.remove('badge-success', 'badge-warning', 'badge-secondary');
-    el.serviceBadge.classList.add(service.tone);
-    // The button is enabled only while the state positively reports that
-    // no service is installed; a click that is already in flight keeps it
-    // disabled as well.
-    el.installServiceButton.disabled = state.serviceInstall || service.install !== false;
+  // applyServiceView renders the service control from the view the server
+  // reports: the page copies the line, the tone and every action and adds no
+  // rule about a state of its own. Only the owner is local knowledge — a
+  // control whose every action is ownerless is the static chip.
+  function applyServiceView(service) {
+    if (!service || typeof service !== 'object' || service.class === 'unknown' || !service.label) {
+      hideServiceControl();
+      return;
+    }
+
+    const actions = service.actions && typeof service.actions === 'object' ? service.actions : {};
+    state.serviceActions = actions;
+
+    let shown = 0;
+    let owned = 0;
+
+    for (const entry of SERVICE_ITEMS) {
+      const action = readServiceAction(actions, entry.key);
+      const visible = action.visible && !(entry.key === 'install' && state.serviceInstallMissing);
+      entry.item.hidden = !visible;
+      if (!visible) continue;
+
+      const provider = serviceProvider(entry, action);
+      entry.item.disabled = !action.enabled || !provider;
+      shown += 1;
+      if (provider) owned += 1;
+    }
+
+    if (!shown) {
+      hideServiceControl();
+      return;
+    }
+
+    el.serviceControl.hidden = false;
+    setServiceLabel(service.label, service.tone);
+
+    const deleteShown = !el.serviceDeleteItem.hidden;
+    const earlierShown = SERVICE_ITEMS.some((entry) => entry.key !== 'delete' && !entry.item.hidden);
+    el.serviceSeparator.hidden = !(deleteShown && earlierShown);
+
+    if (!owned) {
+      // Ownerless actions are a fact about the machine, not a menu.
+      closeServiceMenu();
+      el.serviceTrigger.hidden = true;
+      el.serviceChip.hidden = false;
+      el.serviceChip.title = 'Service actions run in the HFDesk application';
+      return;
+    }
+
+    el.serviceChip.hidden = true;
+    el.serviceTrigger.hidden = false;
+    el.serviceTrigger.disabled = state.serviceBusy;
   }
 
-  // serviceStatusView maps the service state the server reports onto the
-  // badge of the header and the enable rule of the install button.
-  //
-  // The badge answers only whether a registration exists, never which state
-  // it is in: "not installed" is a proven absence, "unknown" is a state the
-  // read could not settle, and every other state — running, stopped,
-  // starting, stopping, failed, broken — reads "installed". It is therefore
-  // NOT the wording of the tray menu line, which names the live state
-  // ("Service: running", "Service: starting") and reserves "Service:
-  // installed" for a registration that does not run. The badge never claims
-  // "not installed" for a state that could not be settled: an unknown state —
-  // no host surface, a failed read, or a state the supervisor did not report —
-  // keeps the badge on "unknown" and the button disabled, so a click can never
-  // start an installation beside a registration the read did not rule out. A
-  // build that reports no state at all is read the same way.
-  function serviceStatusView(state) {
-    if (state === 'not-installed') {
-      return { label: 'Service: not installed', tone: 'badge-secondary', install: false };
+  // setServiceLabel writes the line and colors the dot of both shapes.
+  function setServiceLabel(label, tone) {
+    el.serviceLabel.textContent = label;
+    el.serviceChipLabel.textContent = label;
+
+    const dotTone = tone ? `is-${tone}` : '';
+    for (const dot of [el.serviceDot, el.serviceChipDot]) {
+      dot.classList.remove('is-success', 'is-warning', 'is-error', 'is-muted');
+      if (dotTone) dot.classList.add(dotTone);
     }
-    if (typeof state !== 'string' || state === '' || state === 'unknown') {
-      return { label: 'Service: unknown', tone: 'badge-warning', install: null };
+  }
+
+  // hideServiceControl removes the control: a read that proved nothing and
+  // a view whose every action is withdrawn both leave nothing behind.
+  function hideServiceControl() {
+    closeServiceMenu();
+    el.serviceControl.hidden = true;
+  }
+
+  // readServiceAction answers one action; only an explicit true counts.
+  function readServiceAction(actions, key) {
+    const action = actions[key];
+    if (!action || typeof action !== 'object') return { visible: false, enabled: false };
+    return { visible: action.visible === true, enabled: action.enabled === true };
+  }
+
+  // serviceProvider answers how the page performs one item, or null when
+  // nothing here owns it. Every action but the installation belongs to the
+  // window host; the installation is the one action the server performs
+  // itself, so a browser on the page of a desktop host calls the endpoint.
+  function serviceProvider(entry, action) {
+    if (entry.key === 'install') {
+      if (state.serviceInstallMissing) return null;
+      if (typeof window.hfdeskInstallService === 'function') {
+        return () => window.hfdeskInstallService();
+      }
+      return action.visible && action.enabled ? installServiceEndpoint : null;
     }
-    return { label: 'Service: installed', tone: 'badge-success', install: true };
+    if (typeof window[entry.action] === 'function') {
+      return () => window[entry.action]();
+    }
+    return null;
+  }
+
+  // enabledServiceItems answers the items the user can activate.
+  function enabledServiceItems() {
+    return SERVICE_ITEMS.filter((entry) => !entry.item.hidden && !entry.item.disabled);
+  }
+
+  // focusServiceItemEdge moves the focus to the first or last enabled item.
+  function focusServiceItemEdge(edge) {
+    const items = enabledServiceItems();
+    if (!items.length) return;
+    const entry = edge === 'last' ? items[items.length - 1] : items[0];
+    entry.item.focus();
+  }
+
+  // focusServiceItem moves the focus by one enabled item, wrapping at both
+  // ends.
+  function focusServiceItem(step) {
+    const items = enabledServiceItems();
+    if (!items.length) return;
+    const current = items.findIndex((entry) => entry.item === document.activeElement);
+    const next = current === -1
+      ? (step > 0 ? 0 : items.length - 1)
+      : (current + step + items.length) % items.length;
+    items[next].item.focus();
+  }
+
+  // toggleServiceMenu opens or closes the menu of the service control.
+  function toggleServiceMenu() {
+    if (state.serviceBusy) return;
+    if (state.serviceMenuOpen) {
+      closeServiceMenu(true);
+      return;
+    }
+    openServiceMenu('first');
+  }
+
+  // placeServiceMenu puts the menu below the trigger and inside the
+  // viewport: the shell clips its overflow, so the trigger's viewport
+  // coordinate is the reliable anchor and the clamp keeps a narrow window
+  // from cutting the menu off.
+  function placeServiceMenu() {
+    if (typeof el.serviceTrigger.getBoundingClientRect !== 'function') return;
+
+    const rect = el.serviceTrigger.getBoundingClientRect();
+    const viewport = window.innerWidth || 0;
+    if (!viewport) return;
+
+    const width = el.serviceMenu.offsetWidth || 0;
+    const margin = 8;
+    const left = Math.min(Math.max(rect.left, margin), Math.max(viewport - width - margin, margin));
+
+    el.serviceMenu.style.left = `${Math.round(left)}px`;
+    el.serviceMenu.style.top = `${Math.round(rect.bottom + 6)}px`;
+  }
+
+  // openServiceMenu shows the menu and focuses its first or last enabled
+  // item.
+  function openServiceMenu(edge) {
+    if (state.serviceBusy) return;
+    if (!SERVICE_ITEMS.some((entry) => !entry.item.hidden)) return;
+
+    state.serviceMenuOpen = true;
+    el.serviceMenu.hidden = false;
+    placeServiceMenu();
+    el.serviceTrigger.setAttribute('aria-expanded', 'true');
+    if (edge) focusServiceItemEdge(edge);
+  }
+
+  // closeServiceMenu hides the menu. focusTrigger returns the focus to the
+  // trigger, the place the menu was opened from.
+  function closeServiceMenu(focusTrigger = false) {
+    state.serviceMenuOpen = false;
+    el.serviceMenu.hidden = true;
+    el.serviceTrigger.setAttribute('aria-expanded', 'false');
+    if (focusTrigger) el.serviceTrigger.focus();
+  }
+
+  // runServiceAction performs one item: one activation reaches one owner,
+  // the trigger waits for the call, and the status is read again right away.
+  // The host reports its own outcome, so the page adds no success report.
+  async function runServiceAction(entry) {
+    if (state.serviceBusy || entry.item.hidden || entry.item.disabled) return;
+
+    const provider = serviceProvider(entry, readServiceAction(state.serviceActions, entry.key));
+    if (!provider) return;
+
+    closeServiceMenu(true);
+    state.serviceBusy = true;
+    el.serviceTrigger.disabled = true;
+
+    try {
+      await provider();
+    } catch (err) {
+      logErrorOnce(`The ${entry.key} service action of the window host failed: ${(err && err.message) || err}`);
+    } finally {
+      state.serviceBusy = false;
+      el.serviceTrigger.disabled = false;
+      await refreshStatus();
+    }
+  }
+
+  // installServiceEndpoint asks the server to run the installation of the
+  // tray menu, the one service action the page performs itself.
+  async function installServiceEndpoint() {
+    try {
+      await fetchJSON('/api/runtime/install-service', { method: 'POST' });
+    } catch (err) {
+      if (err.status === 404) {
+        // The endpoint is not part of this build: the item is not offered
+        // again on this page, and the page says why once instead of
+        // failing on every activation.
+        state.serviceInstallMissing = true;
+        showToast('Installing the service is not available in this build', 'error');
+        announce('Installing the service is not available in this build');
+        return;
+      }
+      if (err.status) {
+        showToast(`The service installation could not be started: ${err.message}`, 'error');
+        return;
+      }
+      // The server stopped answering: a committed handover shuts the host
+      // down right after this response, and the native flow has already
+      // reported its outcome there — the window stays quiet instead of
+      // reporting a failure beside that report.
+      logErrorOnce(`The install-service request ended without an answer: ${err.message}`);
+    }
   }
 
   // applyStatusFailure renders the state of a server that did not answer.
-  //
-  // The service state could not be read either, so the badge must not keep
-  // the claim its last successful render wrote: beside an Offline dot a
-  // "Service: not installed" badge would assert an absence no read proved.
-  // The window shows the unknown state instead — the wording and tone the
-  // badge already uses for a state that could not be settled — and the
-  // install button is disabled with it, because that action is enabled only
-  // while the state proves absence: the rule the tray menu follows for the
-  // same unsettled read.
+  // The service could not be read either, so its control disappears instead
+  // of keeping the claim of its last render, the way the tray hides its
+  // entry until a read settles.
   function applyStatusFailure() {
     setIndicator(el.statusDot, 'error');
     el.statusLabel.textContent = 'Offline';
-    applyServiceView('unknown');
+    applyServiceView(null);
   }
 
   // setIndicator colors a status dot of the design system.
@@ -573,7 +709,7 @@
     let added = 0;
 
     for (const raw of list) {
-      const record = normalizeRecord(raw);
+      const record = logView.normalizeRecord(raw);
       if (!record) continue;
 
       // A replay after a reconnect sends the records the client already
@@ -603,56 +739,7 @@
 
   // matchesFilter tells whether a record belongs to the current view.
   function matchesFilter(record) {
-    if (!levelPasses(record.level)) return false;
-    if (!state.searchLower) return true;
-    return record.searchable.includes(state.searchLower);
-  }
-
-  // levelPasses applies the level filter. The filter is a minimum
-  // severity: "warn" shows the warn and the error records.
-  function levelPasses(level) {
-    if (state.level === 'all') return true;
-
-    const rank = LEVEL_RANK[level];
-    if (rank === undefined) return true;
-
-    return rank >= FILTER_RANK[state.level];
-  }
-
-  // buildRow builds the row of a record.
-  function buildRow(record) {
-    const row = document.createElement('div');
-    row.className = 'runtime-log-row';
-    row.dataset.seq = String(record.seq);
-
-    const time = document.createElement('span');
-    time.className = 'runtime-time';
-    time.textContent = formatTime(record.time);
-    if (record.time) time.title = record.time;
-
-    const level = document.createElement('span');
-    level.className = `runtime-level badge ${LEVEL_BADGE[record.level] || 'badge-secondary'}`;
-    level.textContent = record.level || 'INFO';
-
-    const component = document.createElement('span');
-    component.className = 'runtime-component';
-    component.textContent = record.component || '-';
-
-    const message = document.createElement('span');
-    message.className = 'runtime-message';
-    message.textContent = record.message || '';
-
-    const attrs = document.createElement('span');
-    attrs.className = 'runtime-attrs';
-    for (const [key, value] of attrEntries(record.attrs)) {
-      const chip = document.createElement('span');
-      chip.className = 'job-chip';
-      chip.textContent = `${key}=${value}`;
-      attrs.appendChild(chip);
-    }
-
-    row.append(time, level, component, message, attrs);
-    return row;
+    return logView.matches(record, state);
   }
 
   // scheduleFlush batches the DOM updates.
@@ -712,7 +799,7 @@
         break;
       }
 
-      fragment.appendChild(buildRow(record));
+      fragment.appendChild(logView.buildRow(record));
       rendered = record.seq;
       added += 1;
     }
@@ -752,7 +839,7 @@
     const fragment = document.createDocumentFragment();
     for (const record of records) {
       if (!matchesFilter(record)) continue;
-      fragment.appendChild(buildRow(record));
+      fragment.appendChild(logView.buildRow(record));
     }
 
     el.logBody.textContent = '';
@@ -1217,18 +1304,6 @@
     showToast('Cleared the log view. Nothing was deleted on disk.', 'success');
   }
 
-  // formatLine renders a record as one line of text.
-  function formatLine(record) {
-    const parts = [
-      formatTime(record.time),
-      (record.level || '').padEnd(5, ' '),
-      (record.component || '-').padEnd(10, ' '),
-      record.message || ''
-    ];
-    if (record.attrsText) parts.push(record.attrsText);
-    return parts.join('  ');
-  }
-
   // copyView copies the visible rows to the clipboard.
   async function copyView() {
     const lines = [];
@@ -1238,7 +1313,7 @@
       // holds the rows the user sees.
       if (record.seq > state.renderedSeq) break;
       if (!matchesFilter(record)) continue;
-      lines.push(formatLine(record));
+      lines.push(logView.formatLine(record));
     }
 
     if (!lines.length) {
@@ -1398,53 +1473,6 @@
     el.openLogFileButton.disabled = !(state.status?.logFile);
   }
 
-  // installService hands the installation of the Windows service to the
-  // host.
-  //
-  // The window performs no step of the flow itself: the host runs the very
-  // function its tray menu runs — the missing-console notice, the
-  // confirmation, the administrator prompt, the handover — and reports its
-  // own outcome there, so the window adds no second report beside those
-  // dialogs. While the request is in flight the button stays disabled, so a
-  // second click never reaches the host; a click that still gets through
-  // while the flow runs (one started from the tray, or one after the
-  // request returned) is refused by the host's single-action guard, exactly
-  // like a second tray click.
-  async function installService() {
-    if (state.serviceInstall) return;
-    state.serviceInstall = true;
-    el.installServiceButton.disabled = true;
-
-    try {
-      await fetchJSON('/api/runtime/install-service', { method: 'POST' });
-    } catch (err) {
-      if (err.status === 404) {
-        // The endpoint is not part of this build: what this click
-        // leaves behind is the tooltip that names the missing endpoint,
-        // and the window says so, instead of failing on every click.
-        // The disabled state is only the one the click itself set —
-        // the next status refresh decides the button again, and only
-        // the service state keeps it disabled then.
-        el.installServiceButton.title = 'This build of HFDesk does not provide the install-service endpoint.';
-        showToast('Installing the service is not available in this build', 'error');
-        announce('Installing the service is not available in this build');
-      } else if (err.status) {
-        showToast(`The service installation could not be started: ${err.message}`, 'error');
-      } else {
-        // The server stopped answering: a committed handover shuts the
-        // host down right after this response, and the native flow has
-        // already reported its outcome there — the window stays quiet
-        // instead of reporting a failure beside that report.
-        logErrorOnce(`The install-service request ended without an answer: ${err.message}`);
-      }
-    } finally {
-      state.serviceInstall = false;
-      // The button does not come back here: the next status refresh is
-      // what decides it, and only while the service is still not
-      // installed.
-    }
-  }
-
   // =========================================
   // Feedback
   // =========================================
@@ -1527,7 +1555,52 @@
     el.openUiButton.addEventListener('click', openUi);
     el.openLogsButton.addEventListener('click', openLogs);
     el.openLogFileButton.addEventListener('click', openLogFile);
-    el.installServiceButton.addEventListener('click', installService);
+
+    el.serviceTrigger.addEventListener('click', toggleServiceMenu);
+    el.serviceTrigger.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        openServiceMenu(event.key === 'ArrowDown' ? 'first' : 'last');
+      } else if (event.key === 'Escape') {
+        closeServiceMenu();
+      }
+    });
+
+    el.serviceMenu.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        focusServiceItem(1);
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        focusServiceItem(-1);
+      } else if (event.key === 'Home') {
+        event.preventDefault();
+        focusServiceItemEdge('first');
+      } else if (event.key === 'End') {
+        event.preventDefault();
+        focusServiceItemEdge('last');
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        closeServiceMenu(true);
+      } else if (event.key === 'Tab') {
+        // The menu is not a dialog: the next tab stop belongs to the page.
+        closeServiceMenu();
+      }
+    });
+
+    for (const entry of SERVICE_ITEMS) {
+      entry.item.addEventListener('click', () => runServiceAction(entry));
+    }
+
+    // A click outside the control closes the menu; its own clicks never do.
+    document.addEventListener('click', (event) => {
+      if (!state.serviceMenuOpen) return;
+      if (el.serviceControl.contains(event.target)) return;
+      closeServiceMenu();
+    });
+
+    // A resized viewport moves the anchor of the open menu.
+    window.addEventListener('resize', () => closeServiceMenu());
 
     window.addEventListener('pagehide', () => {
       // The view remembers the live source it used, so it can resume the
@@ -1538,6 +1611,7 @@
 
       closeStream();
       stopPolling();
+      closeServiceMenu();
 
       // The handles are released with the timers they belong to. A handle
       // that outlives its timer makes the view skip its next batch, so the

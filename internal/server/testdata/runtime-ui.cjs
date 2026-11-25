@@ -26,6 +26,7 @@ if (typeof fixture.clientCursor !== 'number' ||
 let assertions = 0;
 function ok(value, message) { assertions++; assert.ok(value, message); }
 function eq(actual, expected, message) { assertions++; assert.equal(actual, expected, message); }
+function deepEq(actual, expected, message) { assertions++; assert.deepEqual(actual, expected, message); }
 
 // =========================================
 // DOM stubs
@@ -54,6 +55,7 @@ function makeNode(extra = {}) {
     title: '',
     style: {},
     dataset: {},
+    attrs: {},
     classList: makeClassList(),
     handlers: {},
     children: [],
@@ -63,15 +65,19 @@ function makeNode(extra = {}) {
     scrollTop: 0,
     scrollHeight: 0,
     clientHeight: 0,
+    offsetWidth: 0,
+    offsetHeight: 0,
+    rect: { left: 0, right: 0, top: 0, bottom: 0, width: 0, height: 0 },
+    getBoundingClientRect() { return this.rect; },
     _text: '',
     get textContent() { return this._text; },
     set textContent(value) {
       this._text = String(value);
       if (this._text === '') this.replaceChildren();
     },
-    setAttribute() {},
-    removeAttribute() {},
-    getAttribute() { return null; },
+    setAttribute(name, value) { this.attrs[name] = String(value); },
+    removeAttribute(name) { delete this.attrs[name]; },
+    getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null; },
     addEventListener(type, fn) { (this.handlers[type] ||= []).push(fn); },
     removeEventListener() {},
     appendChild(child) {
@@ -94,10 +100,16 @@ function makeNode(extra = {}) {
       this.firstChild = null;
       nodes.forEach(node => this.appendChild(node));
     },
+    contains(other) {
+      for (let node = other; node; node = node.parentNode) {
+        if (node === this) return true;
+      }
+      return false;
+    },
     remove() {
       if (this.parentNode) this.parentNode.removeChild(this);
     },
-    focus() {},
+    focus() { document.activeElement = this; },
     scrollTo() {}
   };
   return Object.assign(node, extra);
@@ -105,7 +117,10 @@ function makeNode(extra = {}) {
 
 const nodes = new Map();
 for (const id of [
-  'statusDot', 'statusLabel', 'versionLabel', 'serviceBadge', 'installServiceButton',
+  'statusDot', 'statusLabel', 'versionLabel',
+  'serviceControl', 'serviceTrigger', 'serviceDot', 'serviceLabel', 'serviceMenu',
+  'serviceInstallItem', 'serviceStartItem', 'serviceStopItem', 'serviceUpdateItem',
+  'serviceDeleteItem', 'serviceSeparator', 'serviceChip', 'serviceChipDot', 'serviceChipLabel',
   'serverUrl', 'activeJobs',
   'queuedJobs', 'logFile', 'errorBanner', 'errorTitle', 'errorText',
   'openUiButton', 'openUiNote', 'openLogsButton', 'openLogFileButton', 'copyButton', 'clearButton',
@@ -116,9 +131,28 @@ for (const id of [
   nodes.set('#' + id, makeNode());
 }
 
+// The service control is one subtree in the document: the trigger, the
+// menu with its items and the chip live inside it, the way the markup
+// nests them. The outside click of the menu is decided by that subtree.
+const serviceControl = nodes.get('#serviceControl');
+const serviceMenu = nodes.get('#serviceMenu');
+for (const id of [
+  'serviceInstallItem', 'serviceStartItem', 'serviceStopItem', 'serviceUpdateItem',
+  'serviceSeparator', 'serviceDeleteItem'
+]) {
+  serviceMenu.appendChild(nodes.get('#' + id));
+}
+for (const id of [
+  'serviceTrigger', 'serviceDot', 'serviceLabel', 'serviceMenu',
+  'serviceChip', 'serviceChipDot', 'serviceChipLabel'
+]) {
+  serviceControl.appendChild(nodes.get('#' + id));
+}
+
 const document = {
   readyState: 'loading',
   body: makeNode(),
+  activeElement: null,
   handlers: {},
   addEventListener(type, fn) { (this.handlers[type] ||= []).push(fn); },
   createElement() { return makeNode(); },
@@ -176,10 +210,10 @@ const server = {
   // server does. A null value means that the server does not report a run
   // id at all, the way an older build answers.
   runId: 'run-1',
-  // serviceState is the state word of the platform service registration.
-  // A null value means that the server reports no state at all, the way an
-  // older build answers.
-  serviceState: 'not-installed'
+  // service is the classified service view of the runtime status, exactly
+  // as internal/serviceview builds it. A null value means that the server
+  // reports no service view at all.
+  service: null
 };
 
 // installs is the install-service action of the host behind the endpoint:
@@ -304,10 +338,10 @@ const context = {
       if (server.runId !== null && server.runId !== undefined) {
         status.runId = server.runId;
       }
-      // A server that does not report the service state leaves the field
+      // A server that does not report the service view leaves the field
       // out, the way an older build answers.
-      if (server.serviceState !== null && server.serviceState !== undefined) {
-        status.serviceState = server.serviceState;
+      if (server.service !== null && server.service !== undefined) {
+        status.service = server.service;
       }
       return jsonResponse(status);
     }
@@ -356,6 +390,14 @@ const context = {
 // =========================================
 // The shipped view
 // =========================================
+
+// The renderer of one record is a file of its own: the page loads it first,
+// and the fallback document of the window host inlines it on its own. The
+// harness loads it in the same context, so the view talks to the shipped
+// renderer and not to a copy of it.
+const logviewSource = fs.readFileSync(
+  path.join(__dirname, '..', '..', 'assets', 'static', 'js', 'logview.js'), 'utf8');
+vm.runInNewContext(logviewSource, context);
 
 let source = fs.readFileSync(path.join(__dirname, '..', '..', 'assets', 'static', 'js', 'runtime.js'), 'utf8');
 const marker = '  // Start\n';
@@ -526,7 +568,10 @@ function resetView() {
   ui.state.logError = '';
   ui.state.statusError = '';
   ui.state.loggedErrors = new Set();
-  ui.state.serviceInstall = false;
+  ui.state.serviceBusy = false;
+  ui.state.serviceMenuOpen = false;
+  ui.state.serviceActions = {};
+  ui.state.serviceInstallMissing = false;
 
   // The live source of the previous scenario is closed, so the scenarios do
   // not share a stream.
@@ -558,7 +603,7 @@ function resetView() {
   server.version = 'test';
   server.logFile = '';
   server.runId = 'run-1';
-  server.serviceState = 'not-installed';
+  server.service = null;
 
   // The install-service action of the previous scenario is reset, so the
   // scenarios do not share its dispatches, and a pending answer of the
@@ -570,14 +615,44 @@ function resetView() {
   // The endpoint count of the previous scenario is reset with it.
   openLogsPosts.posts = 0;
 
-  // The service badge and the install button start from the state the
-  // shipped markup carries, so a scenario reads them from a known place.
-  const serviceBadge = nodes.get('#serviceBadge');
-  serviceBadge.textContent = 'Service —';
-  serviceBadge.classList.remove('badge-success', 'badge-warning');
-  serviceBadge.classList.add('badge-secondary');
-  nodes.get('#installServiceButton').disabled = false;
-  nodes.get('#installServiceButton').title = 'Register HFDesk as a Windows service that starts at boot';
+  // The service control starts from the state the shipped markup carries,
+  // so a scenario reads it from a known place: the wrapper is hidden, both
+  // shapes are hidden, the menu is closed and every item waits.
+  const control = nodes.get('#serviceControl');
+  control.hidden = true;
+  const trigger = nodes.get('#serviceTrigger');
+  trigger.hidden = false;
+  trigger.disabled = false;
+  trigger.setAttribute('aria-expanded', 'false');
+  nodes.get('#serviceMenu').hidden = true;
+  nodes.get('#serviceMenu').style = {};
+  nodes.get('#serviceMenu').offsetWidth = 190;
+  nodes.get('#serviceTrigger').rect = { left: 352, right: 505, top: 14, bottom: 45, width: 153, height: 31 };
+  window.innerWidth = 760;
+  window.innerHeight = 800;
+  nodes.get('#serviceChip').hidden = true;
+  nodes.get('#serviceChip').title = '';
+  nodes.get('#serviceLabel').textContent = 'Service —';
+  nodes.get('#serviceChipLabel').textContent = 'Service —';
+  for (const id of [
+    'serviceDot', 'serviceChipDot'
+  ]) {
+    nodes.get('#' + id).classList.remove('is-success', 'is-warning', 'is-error', 'is-muted');
+    nodes.get('#' + id).classList.add('is-muted');
+  }
+  for (const id of [
+    'serviceInstallItem', 'serviceStartItem', 'serviceStopItem', 'serviceUpdateItem',
+    'serviceDeleteItem', 'serviceSeparator'
+  ]) {
+    nodes.get('#' + id).hidden = true;
+    nodes.get('#' + id).disabled = false;
+  }
+  document.activeElement = null;
+
+  // No scenario inherits the window bindings or the calls of the previous
+  // one.
+  unbindServiceProviders();
+  resetServiceCalls();
 
   nodes.get('#toastContainer').replaceChildren();
   nodes.get('#liveRegion').textContent = '';
@@ -1096,184 +1171,591 @@ async function scenarioHiddenPagePoll() {
   eq(reads, 1, 'the view reads the log once per tick after the page was shown again');
 }
 
-// fireClick clicks a button the way the page does: it runs the handlers
-// the view registered for the click event.
+// fireClick clicks a node the way the page does: it runs the handlers the
+// view registered for the click event, with the clicked node as the target
+// so the document-level handler of the service menu decides like a browser.
 function fireClick(node) {
-  for (const handler of node.handlers.click || []) handler({});
+  for (const handler of node.handlers.click || []) handler({ target: node });
 }
 
-// The status of the platform service in the header: the badge says what the
-// machine has — in the words the tray menu shows for the same state — and
-// the install button is enabled only while the status positively reports
-// that no service is installed. A state that could not be settled is never
-// read as "not installed".
-async function scenarioServiceStatus() {
-  resetView();
-
-  for (const tc of [
-    {
-      name: 'a machine without a registration',
-      state: 'not-installed',
-      label: 'Service: not installed',
-      tone: 'badge-secondary',
-      enabled: true
-    },
-    {
-      name: 'a running service',
-      state: 'running',
-      label: 'Service: installed',
-      tone: 'badge-success',
-      enabled: false
-    },
-    {
-      name: 'a stopped service',
-      state: 'stopped',
-      label: 'Service: installed',
-      tone: 'badge-success',
-      enabled: false
-    },
-    {
-      name: 'a state the supervisor could not report',
-      state: 'unknown',
-      label: 'Service: unknown',
-      tone: 'badge-warning',
-      enabled: false
-    },
-    {
-      // An older build reports no state at all: the window must not
-      // read the absence of the field as a machine without a service.
-      name: 'a build that reports no state',
-      state: null,
-      label: 'Service: unknown',
-      tone: 'badge-warning',
-      enabled: false
-    }
-  ]) {
-    server.serviceState = tc.state;
-    await ui.refreshStatus();
-    await settle();
-
-    const badge = nodes.get('#serviceBadge');
-    eq(badge.textContent, tc.label, `the badge of ${tc.name} reads "${tc.label}"`);
-    ok(badge.classList.contains(tc.tone),
-      `the badge of ${tc.name} carries the ${tc.tone} chip`);
-    eq(nodes.get('#installServiceButton').disabled, !tc.enabled,
-      `the install button of ${tc.name} is ${tc.enabled ? 'enabled' : 'disabled'}`);
+// fireKey presses a key on a node the way the page does.
+function fireKey(node, key) {
+  for (const handler of node.handlers.keydown || []) {
+    handler({ key, target: node, preventDefault() {} });
   }
 }
 
-// One click on the install button reaches the host exactly once: a second
-// click while the request is in flight never reaches it, the button comes
-// back only with the next status refresh, and only while the service is
-// still not installed. A build without the endpoint says so instead of
-// failing on every click.
-async function scenarioInstallServiceAction() {
+// dispatchDocumentClick hands a click to the document, the way a click
+// outside the service control reaches it.
+function dispatchDocumentClick(node) {
+  for (const handler of document.handlers.click || []) handler({ target: node });
+}
+
+// serviceActions answers one action map of the runtime status. Every action
+// starts hidden, so a scenario names exactly the actions its state carries.
+function serviceActions(actions) {
+  return Object.assign({
+    install: { visible: false, enabled: false },
+    start: { visible: false, enabled: false },
+    stop: { visible: false, enabled: false },
+    update: { visible: false, enabled: false },
+    delete: { visible: false, enabled: false },
+    open: { visible: false, enabled: false }
+  }, actions);
+}
+
+// serviceSnapshot builds the classified service view internal/serviceview
+// returns for one state: the line, the tone and the actions of that state.
+function serviceSnapshot(label, tone, actions, className = 'present') {
+  return { class: className, label, tone, actions: serviceActions(actions) };
+}
+
+// The calls of the window host. A scenario binds the five actions the host
+// owns, counts the calls, and can hold or refuse the answer of one call.
+const serviceCalls = {
+  counts: {},
+  pending: false,
+  release: null,
+  fail: false
+};
+
+const SERVICE_PROVIDERS = ['Start', 'Stop', 'Update', 'Delete', 'Install'];
+
+// bindServiceProviders binds the five service actions the window host binds
+// in the Logs window.
+function bindServiceProviders() {
+  resetServiceCalls();
+  for (const name of SERVICE_PROVIDERS) {
+    const key = name.toLowerCase();
+    serviceCalls.counts[key] = 0;
+    window['hfdesk' + name + 'Service'] = async () => {
+      serviceCalls.counts[key] += 1;
+      if (serviceCalls.pending) {
+        await new Promise((resolve) => { serviceCalls.release = resolve; });
+      }
+      if (serviceCalls.fail) throw new Error('the host refused the action');
+    };
+  }
+}
+
+// unbindServiceProviders removes the bindings again, so no scenario inherits
+// the window state of another one.
+function unbindServiceProviders() {
+  for (const name of SERVICE_PROVIDERS) delete window['hfdesk' + name + 'Service'];
+}
+
+function resetServiceCalls() {
+  serviceCalls.counts = {};
+  serviceCalls.pending = false;
+  serviceCalls.release = null;
+  serviceCalls.fail = false;
+}
+
+function serviceCallsTotal() {
+  return Object.values(serviceCalls.counts).reduce((total, count) => total + count, 0);
+}
+
+const SERVICE_ITEM_IDS = {
+  install: 'serviceInstallItem',
+  start: 'serviceStartItem',
+  stop: 'serviceStopItem',
+  update: 'serviceUpdateItem',
+  delete: 'serviceDeleteItem'
+};
+
+// serviceItemState answers one word per menu item: "hidden" when the markup
+// keeps it out of the menu, "disabled" when it is shown but cannot act, and
+// "enabled" when it can.
+function serviceItemState() {
+  const state = {};
+  for (const [key, id] of Object.entries(SERVICE_ITEM_IDS)) {
+    const node = nodes.get('#' + id);
+    state[key] = node.hidden ? 'hidden' : (node.disabled ? 'disabled' : 'enabled');
+  }
+  return state;
+}
+
+// The service control of the header renders the classified view the server
+// sends — the line, the tone and every action — and adds no rule about a
+// state of its own. A state that proves nothing has no control at all.
+async function scenarioServiceMenuFollowsActions() {
   resetView();
-  server.serviceState = 'not-installed';
+  bindServiceProviders();
+
+  const cases = [
+    {
+      name: 'a machine without a registration',
+      service: serviceSnapshot('Service: not installed', 'muted', {
+        install: { visible: true, enabled: true }
+      }),
+      control: true,
+      items: { install: 'enabled', start: 'hidden', stop: 'hidden', update: 'hidden', delete: 'hidden' }
+    },
+    {
+      name: 'a running service',
+      service: serviceSnapshot('Service: running', 'success', {
+        start: { visible: true, enabled: false },
+        stop: { visible: true, enabled: true },
+        update: { visible: true, enabled: true },
+        delete: { visible: true, enabled: true },
+        open: { visible: true, enabled: true }
+      }),
+      control: true,
+      items: { install: 'hidden', start: 'disabled', stop: 'enabled', update: 'enabled', delete: 'enabled' }
+    },
+    {
+      name: 'a stopped service',
+      service: serviceSnapshot('Service: stopped', 'muted', {
+        start: { visible: true, enabled: true },
+        stop: { visible: true, enabled: false },
+        update: { visible: true, enabled: true },
+        delete: { visible: true, enabled: true }
+      }),
+      control: true,
+      items: { install: 'hidden', start: 'enabled', stop: 'disabled', update: 'enabled', delete: 'enabled' }
+    },
+    {
+      // A broken registration cannot start: its program is gone, and the
+      // update is the action that repairs it.
+      name: 'a broken registration',
+      service: serviceSnapshot('Service: failed', 'error', {
+        start: { visible: false, enabled: false },
+        stop: { visible: true, enabled: false },
+        update: { visible: true, enabled: true },
+        delete: { visible: true, enabled: true }
+      }),
+      control: true,
+      items: { install: 'hidden', start: 'hidden', stop: 'disabled', update: 'enabled', delete: 'enabled' }
+    },
+    {
+      name: 'a service that is starting',
+      service: serviceSnapshot('Service: starting', 'warning', {
+        start: { visible: true, enabled: false },
+        stop: { visible: true, enabled: false },
+        update: { visible: true, enabled: false },
+        delete: { visible: true, enabled: false }
+      }),
+      control: true,
+      items: { install: 'hidden', start: 'disabled', stop: 'disabled', update: 'disabled', delete: 'disabled' }
+    },
+    {
+      name: 'a service that is stopping',
+      service: serviceSnapshot('Service: stopping', 'warning', {
+        start: { visible: true, enabled: false },
+        stop: { visible: true, enabled: false },
+        update: { visible: true, enabled: false },
+        delete: { visible: true, enabled: false }
+      }),
+      control: true,
+      items: { install: 'hidden', start: 'disabled', stop: 'disabled', update: 'disabled', delete: 'disabled' }
+    },
+    {
+      // A read that proved nothing names no line and carries no action.
+      name: 'a state the read could not settle',
+      service: serviceSnapshot('', '', {}, 'unknown'),
+      control: false
+    },
+    {
+      name: 'a state that names no line',
+      service: serviceSnapshot('', '', {}),
+      control: false
+    }
+  ];
+
+  for (const tc of cases) {
+    server.service = tc.service;
+    await ui.refreshStatus();
+    await settle();
+
+    const control = nodes.get('#serviceControl');
+    eq(control.hidden, !tc.control,
+      `the control of ${tc.name} is ${tc.control ? 'on screen' : 'gone'}`);
+
+    if (!tc.control) {
+      eq(nodes.get('#serviceMenu').hidden, true, `the menu of ${tc.name} is not drawn`);
+      eq(nodes.get('#serviceTrigger').getAttribute('aria-expanded'), 'false',
+        `the trigger of ${tc.name} claims no open menu`);
+      continue;
+    }
+
+    eq(nodes.get('#serviceTrigger').hidden, false,
+      `the trigger of ${tc.name} is the visible control`);
+    eq(nodes.get('#serviceChip').hidden, true,
+      `the chip of ${tc.name} is not drawn beside a menu`);
+    eq(nodes.get('#serviceLabel').textContent, tc.service.label,
+      `the trigger of ${tc.name} carries the line of the server`);
+    ok(nodes.get('#serviceDot').classList.contains(`is-${tc.service.tone}`),
+      `the dot of ${tc.name} carries the ${tc.service.tone} tone`);
+    deepEq(serviceItemState(), tc.items,
+      `the items of ${tc.name} follow the actions of the server`);
+
+    const othersShown = Object.entries(tc.items)
+      .some(([key, value]) => key !== 'delete' && value !== 'hidden');
+    eq(nodes.get('#serviceSeparator').hidden, !(tc.items.delete !== 'hidden' && othersShown),
+      `the separator of ${tc.name} stands only before a visible Delete`);
+  }
+
+  unbindServiceProviders();
+}
+
+// A document that owns none of the service actions — the plain browser on
+// the page of a service host — shows the same line as a static chip: a fact
+// about the machine, not a menu.
+async function scenarioServiceMenuOwnerless() {
+  resetView();
+
+  server.service = serviceSnapshot('Service: running', 'success', {
+    stop: { visible: true, enabled: true },
+    update: { visible: true, enabled: true },
+    delete: { visible: true, enabled: true }
+  });
+
   await ui.refreshStatus();
   await settle();
 
-  const button = nodes.get('#installServiceButton');
-  eq(installs.posts, 0, 'the view starts without a dispatch');
-  eq(button.disabled, false, 'the install button is enabled for a machine without a service');
+  eq(nodes.get('#serviceControl').hidden, false,
+    'the control stays as a fact about the machine');
+  eq(nodes.get('#serviceTrigger').hidden, true,
+    'a document without an owner draws no menu button');
+  eq(nodes.get('#serviceChip').hidden, false, 'the chip is the whole control');
+  eq(nodes.get('#serviceChipLabel').textContent, 'Service: running',
+    'the chip carries the same line as the menu');
+  eq(nodes.get('#serviceMenu').hidden, true, 'no menu is drawn');
+  ok(nodes.get('#serviceChip').title.includes('HFDesk application'),
+    `the chip says where the actions run (${nodes.get('#serviceChip').title})`);
+
+  // The chip is a fact, not a control: a click opens nothing.
+  fireClick(nodes.get('#serviceChip'));
+  await settle();
+  eq(nodes.get('#serviceMenu').hidden, true, 'the chip opens no menu');
+  eq(nodes.get('#serviceTrigger').getAttribute('aria-expanded'), 'false',
+    'no menu claims to be open');
+}
+
+// One activation reaches one owner exactly once. The menu closes with it,
+// the trigger waits for the answer, and the status is read again right away;
+// the page adds no success report beside the host's own.
+async function scenarioServiceMenuAction() {
+  resetView();
+  bindServiceProviders();
+
+  server.service = serviceSnapshot('Service: running', 'success', {
+    start: { visible: true, enabled: false },
+    stop: { visible: true, enabled: true },
+    update: { visible: true, enabled: true },
+    delete: { visible: true, enabled: true }
+  });
+
+  await ui.refreshStatus();
+  await settle();
+
+  const trigger = nodes.get('#serviceTrigger');
+  const start = nodes.get('#serviceStartItem');
+  const stop = nodes.get('#serviceStopItem');
+
+  fireClick(trigger);
+  await settle();
+  eq(nodes.get('#serviceMenu').hidden, false, 'the trigger opens the menu');
+  eq(trigger.getAttribute('aria-expanded'), 'true', 'the open menu says so');
+  eq(start.hidden, false, 'the start item of a running service is shown greyed');
+  eq(start.disabled, true, 'the start item of a running service cannot act');
+
+  // A disabled item never reaches the host.
+  fireClick(start);
+  await settle();
+  eq(serviceCallsTotal(), 0, 'a disabled item calls nobody');
+
+  // One activation reaches the host once, even when the item is clicked
+  // again while the call is in flight.
+  serviceCalls.pending = true;
+  const statusReads = countStatusReads();
+  fireClick(stop);
+  eq(serviceCalls.counts.stop, 1, 'the stop item called the host once');
+  eq(nodes.get('#serviceMenu').hidden, true, 'the menu closes with the activation');
+  eq(trigger.getAttribute('aria-expanded'), 'false', 'the closed menu says so');
+  eq(trigger.disabled, true, 'the trigger waits while the action is in flight');
+
+  fireClick(stop);
+  fireClick(stop);
+  eq(serviceCalls.counts.stop, 1, 'the clicks beside the first never reach the host');
+
+  serviceCalls.release();
+  await settle();
+  eq(trigger.disabled, false, 'the trigger comes back when the action settled');
+  ok(countStatusReads() > statusReads, 'the status is read again right away');
+  eq(toastMessages().length, 0, "the page adds no success report beside the host's own");
+
+  // A refused host action is not reported as a success either.
+  server.service = serviceSnapshot('Service: stopped', 'muted', {
+    start: { visible: true, enabled: true },
+    stop: { visible: true, enabled: false },
+    update: { visible: true, enabled: true },
+    delete: { visible: true, enabled: true }
+  });
+  await ui.refreshStatus();
+  await settle();
+
+  serviceCalls.pending = false;
+  serviceCalls.fail = true;
+  fireClick(trigger);
+  fireClick(nodes.get('#serviceStartItem'));
+  await settle();
+  eq(serviceCalls.counts.start, 1, 'the start item called the host once');
+  eq(toastMessages().length, 0, 'a refused host action shows no report of the page');
+  eq(trigger.disabled, false, 'the trigger comes back after a refused action');
+
+  unbindServiceProviders();
+}
+
+// The menu is a menu for the keyboard as well: it opens from the trigger,
+// moves over the items the user can act on, closes on Escape and returns
+// the focus, and a click outside closes it.
+async function scenarioServiceMenuKeyboard() {
+  resetView();
+  bindServiceProviders();
+
+  server.service = serviceSnapshot('Service: running', 'success', {
+    start: { visible: true, enabled: false },
+    stop: { visible: true, enabled: true },
+    update: { visible: true, enabled: true },
+    delete: { visible: true, enabled: true }
+  });
+
+  await ui.refreshStatus();
+  await settle();
+
+  const trigger = nodes.get('#serviceTrigger');
+  const menu = nodes.get('#serviceMenu');
+  const stop = nodes.get('#serviceStopItem');
+  const update = nodes.get('#serviceUpdateItem');
+  const del = nodes.get('#serviceDeleteItem');
+
+  // The start of this state is greyed, so the focus lands on the first item
+  // the user can act on.
+  fireKey(trigger, 'ArrowDown');
+  await settle();
+  eq(menu.hidden, false, 'ArrowDown opens the menu');
+  eq(trigger.getAttribute('aria-expanded'), 'true', 'the open menu says so');
+  eq(document.activeElement, stop, 'ArrowDown focuses the first enabled item');
+
+  fireKey(menu, 'ArrowDown');
+  eq(document.activeElement, update, 'ArrowDown moves to the next enabled item');
+
+  fireKey(menu, 'ArrowUp');
+  eq(document.activeElement, stop, 'ArrowUp moves back');
+
+  fireKey(menu, 'End');
+  eq(document.activeElement, del, 'End jumps to the last enabled item');
+
+  fireKey(menu, 'Home');
+  eq(document.activeElement, stop, 'Home jumps to the first enabled item');
+
+  fireKey(menu, 'Escape');
+  eq(menu.hidden, true, 'Escape closes the menu');
+  eq(trigger.getAttribute('aria-expanded'), 'false', 'the closed menu says so');
+  eq(document.activeElement, trigger, 'Escape returns the focus to the trigger');
+
+  fireKey(trigger, 'ArrowUp');
+  eq(menu.hidden, false, 'ArrowUp opens the menu');
+  eq(document.activeElement, del, 'ArrowUp opens the menu on the last enabled item');
+
+  // The open menu is anchored at the trigger, inside the viewport: the
+  // narrow window and the hidden overflow of the shell never cut it off.
+  eq(menu.style.left, '352px', 'the menu starts at the trigger');
+  eq(menu.style.top, '51px', 'the menu hangs below the trigger');
+
+  window.innerWidth = 360;
+  trigger.rect = { left: 300, right: 453, top: 14, bottom: 45, width: 153, height: 31 };
+  fireKey(menu, 'Escape');
+  fireKey(trigger, 'ArrowDown');
+  eq(menu.style.left, '162px', 'a narrow viewport clamps the menu inside itself');
+
+  trigger.rect = { left: 14, right: 167, top: 60, bottom: 91, width: 153, height: 31 };
+  fireKey(menu, 'Escape');
+  fireKey(trigger, 'ArrowDown');
+  eq(menu.style.left, '14px', 'the menu of a wrapped trigger stays inside the narrow viewport');
+  eq(menu.style.top, '97px', 'the menu follows the wrapped trigger');
+
+  dispatchDocumentClick(nodes.get('#openUiButton'));
+  eq(menu.hidden, true, 'a click outside closes the menu');
+
+  // A click inside the control does not close the menu before its own
+  // handler runs.
+  fireClick(trigger);
+  eq(menu.hidden, false, 'the trigger opens the menu again');
+  dispatchDocumentClick(menu);
+  eq(menu.hidden, false, 'a click inside the control keeps the menu open');
+  fireClick(trigger);
+  eq(menu.hidden, true, 'the trigger closes the menu again');
+
+  // The menu is anchored to the trigger, so a viewport that changes size
+  // closes it instead of leaving it beside an element that moved.
+  fireClick(trigger);
+  eq(menu.hidden, false, 'the trigger opens the menu again');
+  dispatchWindow('resize');
+  eq(menu.hidden, true, 'a resized viewport closes the open menu');
+
+  unbindServiceProviders();
+}
+
+// The installation is the one service action the server performs itself, so
+// a browser on the page of a desktop host performs it over the endpoint —
+// and a build without the endpoint withdraws the item instead of failing on
+// every activation.
+async function scenarioServiceInstallEndpoint() {
+  resetView();
+
+  server.service = serviceSnapshot('Service: not installed', 'muted', {
+    install: { visible: true, enabled: true }
+  });
+  await ui.refreshStatus();
+  await settle();
+
+  const control = nodes.get('#serviceControl');
+  const trigger = nodes.get('#serviceTrigger');
+  const install = nodes.get('#serviceInstallItem');
+
+  eq(control.hidden, false, 'the machine without a registration has a control');
+  eq(trigger.hidden, false, 'the install action is a menu, not a chip');
+  eq(nodes.get('#serviceChip').hidden, true, 'the chip is not drawn beside the menu');
+  eq(install.hidden, false, 'the install item is offered');
+  eq(install.disabled, false, 'the install item can act through the endpoint');
+
+  fireClick(trigger);
+  eq(nodes.get('#serviceMenu').hidden, false, 'the trigger opens the menu');
+  eq(nodes.get('#serviceStartItem').hidden, true,
+    'the menu carries no action the state does not have');
 
   installs.mode = 'pending';
-  fireClick(button);
-  eq(button.disabled, true,
-    'the button disables itself while the action is in flight');
-  fireClick(button);
-  fireClick(button);
-  eq(installs.posts, 1,
-    'one click reaches the host exactly once: the clicks beside the first are ignored');
+  fireClick(install);
+  eq(installs.posts, 1, 'the install item reached the endpoint once');
+  eq(trigger.disabled, true, 'the trigger waits while the request is in flight');
+  eq(nodes.get('#serviceMenu').hidden, true, 'the menu closes with the activation');
+
+  fireClick(install);
+  eq(installs.posts, 1, 'the clicks beside the first never reach the endpoint');
 
   installs.mode = 'ok';
   installs.release();
   await settle();
-  eq(button.disabled, true,
-    'the button does not come back before the status refresh decides again');
+  ok(countStatusReads() >= 2, 'the status is read again right away');
+  eq(toastMessages().length, 0, 'the page adds no success report');
 
-  await ui.refreshStatus();
-  await settle();
-  eq(button.disabled, false,
-    'the status refresh enables the button while no service is installed');
-
-  // The service is installed under the window: the refresh flips the
-  // button, exactly like the badge.
-  server.serviceState = 'running';
-  await ui.refreshStatus();
-  await settle();
-  eq(button.disabled, true,
-    'the status refresh disables the button once the service is installed');
-  eq(nodes.get('#serviceBadge').textContent, 'Service: installed',
-    'the badge reports the installed service with the same words');
-
-  // A build without the endpoint reports it once instead of failing on
-  // every click. What the click leaves behind is the tooltip that names
-  // the missing endpoint; the disabled state is only the one the click
-  // set, because the next status refresh decides the button again — and
-  // only the service state keeps it disabled then.
-  server.serviceState = 'not-installed';
-  await ui.refreshStatus();
-  await settle();
+  // The endpoint is not part of this build: the page says so once, and the
+  // item is not offered again.
   installs.mode = 'missing';
-  fireClick(button);
+  fireClick(trigger);
+  fireClick(install);
   await settle();
-  eq(installs.posts, 2, 'the click on the missing endpoint still reached the host once');
+  eq(installs.posts, 2, 'the click on the missing endpoint still reached the server once');
   ok(toastMessages().some(message => /not available in this build/.test(message)),
-    `the view reports that the endpoint is missing (${JSON.stringify(toastMessages())})`);
-  ok(button.title.includes('install-service'),
-    'the button names the missing endpoint in its tooltip');
-  eq(button.disabled, true,
-    'the button is still the one the click disabled, because no status refresh decided it again');
+    `the page reports the missing endpoint (${JSON.stringify(toastMessages())})`);
+  eq(control.hidden, true,
+    'a state whose every action is withdrawn has no control');
+  eq(nodes.get('#serviceMenu').hidden, true, 'no menu is left open');
 
-  await ui.refreshStatus();
-  await settle();
-  eq(button.disabled, false,
-    'the next status refresh decides the button again while no service is installed');
-  ok(button.title.includes('install-service'),
-    'the tooltip of the missing endpoint outlives the refresh');
   installs.mode = 'ok';
 }
 
-// A status request that fails leaves the window offline, and the service
-// badge must not keep the claim its last successful render wrote: a badge
-// that still read "Service: not installed" beside the Offline dot would
-// assert an absence no read proved — a restart or a shutdown after a
-// committed handover is enough to stop the answers. The window shows the
-// unknown state instead, in the wording and tone the badge already uses for
-// a state that could not be settled, and the install button is disabled
-// with it: that action is enabled only while the state proves absence, the
-// rule the tray menu follows for the same unsettled read.
+// A status that cannot be read proves nothing about the service either, so
+// the control must not keep the claim of its last render.
 async function scenarioServiceStatusOffline() {
   resetView();
+  bindServiceProviders();
 
-  // The last status the window read proves there is no service.
-  server.serviceState = 'not-installed';
+  server.service = serviceSnapshot('Service: running', 'success', {
+    start: { visible: true, enabled: false },
+    stop: { visible: true, enabled: true },
+    update: { visible: true, enabled: true },
+    delete: { visible: true, enabled: true }
+  });
   await ui.refreshStatus();
   await settle();
+  eq(nodes.get('#serviceControl').hidden, false,
+    'the control reports the running service');
 
-  const badge = nodes.get('#serviceBadge');
-  const button = nodes.get('#installServiceButton');
-  eq(badge.textContent, 'Service: not installed',
-    'the badge reports the machine without a service');
-  eq(button.disabled, false,
-    'the install button is enabled for a machine without a service');
-
-  // The server stops answering: the read of the state fails with it.
+  // The server stops answering: the service view could not be read.
   server.statusFails = true;
   await ui.refreshStatus();
   await settle();
 
   eq(nodes.get('#statusLabel').textContent, 'Offline',
     'the connection dot reports the server that did not answer');
-  eq(badge.textContent, 'Service: unknown',
-    'the badge drops the claim of absence: the state cannot be read');
-  ok(badge.classList.contains('badge-warning'),
-    'the badge carries the unknown chip, the tone the badge uses for unknown');
-  eq(button.disabled, true,
-    'the install action is disabled while the state cannot prove absence');
+  eq(nodes.get('#serviceControl').hidden, true,
+    'the service control disappears with the read that could not settle it');
 
+  // A build that reports no service view at all is read the same way.
   server.statusFails = false;
+  server.service = null;
+  await ui.refreshStatus();
+  await settle();
+  eq(nodes.get('#serviceControl').hidden, true,
+    'a build that reports no service view has no control');
+
+  unbindServiceProviders();
+}
+
+// The renderer of one record is a unit of its own: it loads without
+// touching the page, exposes exactly one global, and builds the row, the
+// filter and the copy line the view has always used.
+async function scenarioLogViewRenderer() {
+  resetView();
+
+  const logView = window.HFDeskLogView;
+  ok(logView, 'logview.js exposes one renderer object');
+  for (const name of [
+    'normalizeRecord', 'buildRow', 'matches', 'levelPasses', 'isFilter',
+    'formatTime', 'formatAttrValue', 'attrEntries', 'formatLine'
+  ]) {
+    eq(typeof logView[name], 'function', `the renderer carries ${name}`);
+  }
+
+  const record = logView.normalizeRecord({
+    seq: 7,
+    time: '2026-10-21T10:00:00Z',
+    level: 'warn',
+    component: 'jobs',
+    message: 'Slow queue',
+    attrs: { queued: 2, note: 'x' }
+  });
+  eq(record.seq, 7, 'the renderer keeps the sequence number');
+  eq(record.level, 'WARN', 'the renderer folds the level');
+  eq(record.attrsText, 'queued=2 note=x', 'the renderer renders the attributes once');
+  ok(record.searchable.includes('slow queue'), 'the searchable text carries the message');
+  eq(logView.normalizeRecord({ seq: 'no number' }), null,
+    'a record without a sequence number is not a record');
+
+  // The filter is a minimum severity, and the search reads the message, the
+  // component and the attributes.
+  eq(logView.matches(record, { level: 'warn', searchLower: '' }), true,
+    'a warn record passes a warn filter');
+  eq(logView.matches(record, { level: 'error', searchLower: '' }), false,
+    'a warn record does not pass an error filter');
+  eq(logView.matches(record, { level: 'all', searchLower: 'jobs' }), true,
+    'the search reads the component');
+  eq(logView.matches(record, { level: 'all', searchLower: 'queued=2' }), true,
+    'the search reads the attributes');
+  eq(logView.matches(record, { level: 'all', searchLower: 'absent' }), false,
+    'the search misses what is not there');
+  eq(logView.isFilter('warn'), true, 'the renderer knows the level filters');
+  eq(logView.isFilter('installed'), false, 'the renderer rejects a word that is no filter');
+
+  // The row is the row of the log view.
+  const row = logView.buildRow(record);
+  eq(row.className, 'runtime-log-row', 'the renderer builds the row of the log');
+  eq(row.dataset.seq, '7', 'the row carries its sequence number');
+  eq(row.children.length, 5, 'the row carries the five cells of the view');
+
+  // The copy line is the line of the view.
+  eq(logView.formatLine(record),
+    `${logView.formatTime(record.time)}  WARN   jobs        Slow queue  queued=2 note=x`,
+    'the copy line is the line of the view');
+
+  // The renderer loads on its own: one global, and no page code runs.
+  const fresh = { window: {} };
+  vm.runInNewContext(logviewSource, fresh);
+  eq(Object.keys(fresh.window).join(','), 'HFDeskLogView',
+    'loading the renderer adds exactly one global');
 }
 
 // The log open actions belong to the right owner in the right context:
@@ -1395,9 +1877,25 @@ const scenarioGroups = {
     scenarioHiddenPagePoll
   ],
   service: [
-    scenarioServiceStatus,
-    scenarioInstallServiceAction,
+    scenarioServiceMenuFollowsActions
+  ],
+  serviceChip: [
+    scenarioServiceMenuOwnerless
+  ],
+  serviceAction: [
+    scenarioServiceMenuAction
+  ],
+  serviceKeys: [
+    scenarioServiceMenuKeyboard
+  ],
+  serviceInstall: [
+    scenarioServiceInstallEndpoint
+  ],
+  serviceOffline: [
     scenarioServiceStatusOffline
+  ],
+  logview: [
+    scenarioLogViewRenderer
   ],
   open: [
     scenarioOpenLogActions

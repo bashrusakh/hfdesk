@@ -1071,21 +1071,27 @@ func TestTheOpenReportsOfTheWindowFollowTheWindowRule(t *testing.T) {
 
 // TestRuntimeAssetsNameTheBoundWindowActions pins the JavaScript side of
 // the bridge against the Go constants: the shipped runtime.js may only
-// reference the two bound action names (plus the plain product prefix of
-// its storage key), and it must reference both of them — a rename on
-// either side that leaves the other behind is a dead button in the live
-// window, and this test fails outright. The shipped runtime.html must
-// carry both buttons the view drives, under the ids the view looks up.
+// reference the bound action names (plus the plain product prefix of its
+// storage key), and it must reference the open actions and the five service
+// actions — a rename on either side that leaves the other behind is a dead
+// button or a dead menu item in the live window, and this test fails
+// outright. The shipped runtime.html must carry both buttons the view drives,
+// under the ids the view looks up, and the service control with its menu.
 func TestRuntimeAssetsNameTheBoundWindowActions(t *testing.T) {
 	view, err := os.ReadFile(filepath.Join("..", "assets", "static", "js", "runtime.js"))
 	if err != nil {
 		t.Fatalf("read the shipped runtime.js: %v", err)
 	}
 	allowed := map[string]bool{
-		openLogFileAction:   true,
-		openLogFolderAction: true,
-		openUiAction:        true,
-		"hfdesk":            true, // the plain prefix of the storage key
+		openLogFileAction:        true,
+		openLogFolderAction:      true,
+		openUiAction:             true,
+		logsStartServiceAction:   true,
+		logsStopServiceAction:    true,
+		logsUpdateServiceAction:  true,
+		logsDeleteServiceAction:  true,
+		logsInstallServiceAction: true,
+		"hfdesk":                 true, // the plain prefix of the storage key
 	}
 	for _, token := range regexp.MustCompile(`hfdesk[A-Za-z0-9_$]*`).FindAllString(string(view), -1) {
 		if !allowed[token] {
@@ -1093,7 +1099,11 @@ func TestRuntimeAssetsNameTheBoundWindowActions(t *testing.T) {
 				token)
 		}
 	}
-	for _, name := range []string{openLogFolderAction, openLogFileAction, openUiAction} {
+	for _, name := range []string{
+		openLogFolderAction, openLogFileAction, openUiAction,
+		logsStartServiceAction, logsStopServiceAction, logsUpdateServiceAction,
+		logsDeleteServiceAction, logsInstallServiceAction,
+	} {
 		if !strings.Contains(string(view), name) {
 			t.Errorf("runtime.js never references %q: the window host binds it, so the view must call it", name)
 		}
@@ -1108,6 +1118,12 @@ func TestRuntimeAssetsNameTheBoundWindowActions(t *testing.T) {
 		"Open log folder",
 		`id="openLogFileButton"`,
 		"Open the log file",
+		`id="serviceTrigger"`,
+		`id="serviceMenu"`,
+		"Start service",
+		"Stop service",
+		"Update service",
+		"Delete service",
 	})
 }
 
