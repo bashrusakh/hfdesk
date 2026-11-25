@@ -70,9 +70,11 @@ type webView interface {
 // live runtime page is loaded when it answers, the fallback document when
 // it does not. A window that stays open follows that state as well: on the
 // tick of the tray menu it switches its content when the KIND of the
-// content changed, so a service that stops under an open window reaches
-// the state and the actions of the fallback document, and a service that
-// comes back reaches its live page (see follow).
+// content changed, and it re-renders the fallback document when the STATE
+// that document was built from changed, so a service that stops under an
+// open window reaches the state and the actions of the fallback document,
+// too, and every later state of that window is the state of its own read
+// (see follow).
 type runtimeWindow struct {
 	// mu guards the current instance.
 	mu sync.Mutex
@@ -97,12 +99,18 @@ type runtimeWindow struct {
 	// that does not answer both lead to the fallback document in
 	// content. Nil for the desktop host.
 	live func() string
-	// content builds the fallback document of the window: the honest
-	// state beside an address that does not answer, rendered fresh on
-	// every show that reaches it, because the state it reports can
-	// change while the window exists. Nil for the desktop host, whose
-	// own server always answers.
-	content func() string
+	// content builds the fallback document of the window and reports the
+	// key of the read it rendered: the state beside an address that does
+	// not answer, so the record of the window always states what the
+	// document was built from. Nil for the desktop host, whose own server
+	// always answers.
+	content func() (key string, document string)
+	// activate asks the host to re-read the state when the user comes back
+	// to the window: the established refresh signal, which runs the same
+	// read and the same follow as the tray tick. It only posts a signal and
+	// never blocks the message loop. Nil for the desktop host, which
+	// follows no service.
+	activate func()
 	// actions are the host handlers the loaded document can call by
 	// name: they are bound when the window is created, before any
 	// document loads — the live runtime page and the fallback document
@@ -125,10 +133,20 @@ type windowInstance struct {
 	// icons are the icon handles of the window. They are released
 	// together with the window.
 	icons windowIcons
+	// hwnd is the native handle of the window.
+	hwnd windows.HWND
+	// previousProc and windowProc are the window procedure the window had
+	// before this owner subscribed it to the return of the focus, and the
+	// callback of that subscription. Zero when nothing is subscribed.
+	previousProc uintptr
+	windowProc   uintptr
+	// requestRefresh asks the host to re-read the state, on the thread of
+	// the window, through the established refresh signal.
+	requestRefresh func()
 	// shown is what the window currently loads. It is written and read
 	// under the navMu of the window that owns this instance, and it is the
 	// record the follow of the tray tick decides on: the same kind at the
-	// same address has nothing to switch.
+	// same address — or the same fallback state — has nothing to switch.
 	shown shownContent
 }
 
@@ -152,18 +170,26 @@ const (
 )
 
 // shownContent records what the window was last navigated to: the kind of
-// that content and, for the live page, the address it was loaded from.
+// that content, the address of the live page, and the key of the read the
+// fallback document was rendered from.
 //
 // The address matters as much as the kind: a registration that moves to
 // another address is a change the window has to follow, while a page that
 // still answers at the very same address is not — reloading it would only
 // reset the scroll position of the user in the live log.
+//
+// The key is what the document SAYS, not what kind it is: a document rendered
+// from one read stays while the next read of the same state comes back with
+// the same key, and it is re-rendered when that state changed.
 type shownContent struct {
 	// kind is the kind of the content the window loads.
 	kind contentKind
 	// url is the address of the live page the window loads. Empty beside
 	// the fallback document.
 	url string
+	// key identifies the state the fallback document was rendered from.
+	// Empty beside the live page.
+	key string
 }
 
 // newRuntimeWindow builds the owner of the Logs window that shows the
@@ -180,10 +206,12 @@ func newRuntimeWindow(url string, iconBytes []byte, actions map[string]func()) *
 // the REGISTERED service address through live and loads its runtime page
 // when the address answers — the same live log, filters and search the
 // desktop window shows — or renders the fallback document content builds
-// when it does not, and it binds the host handlers the documents call.
-func newCompanionWindow(live func() string, content func() string,
+// from that same read when it does not, and it binds the host handlers the
+// documents call. activate is the established refresh signal of the host,
+// which the window posts when the user comes back to it.
+func newCompanionWindow(live func() string, content func() (string, string), activate func(),
 	iconBytes []byte, actions map[string]func()) *runtimeWindow {
-	return &runtimeWindow{live: live, content: content, actions: actions, iconBytes: iconBytes}
+	return &runtimeWindow{live: live, content: content, activate: activate, actions: actions, iconBytes: iconBytes}
 }
 
 // Show makes the Logs window visible.
@@ -217,18 +245,18 @@ func (w *runtimeWindow) Show() error {
 
 // resolve decides what this show loads: the URL of the own server in URL
 // mode, and beside a tray companion the live runtime page of the
-// registered address when it answers, its fallback document when it does
-// not (see resolveLogsWindow).
-func (w *runtimeWindow) resolve() (string, string) {
+// registered address when it answers, or the key and the document of the
+// read that proves it does not (see resolveLogsWindow).
+func (w *runtimeWindow) resolve() (target, key, document string) {
 	if w.live == nil {
-		return w.url, ""
+		return w.url, "", ""
 	}
 	return resolveLogsWindow(w.live, w.content)
 }
 
 // load decides what the window shows and loads it, recording the decision so
-// the follow of the tray tick can tell whether the kind of the content or its
-// address changed.
+// the follow of the tray tick can tell whether the kind of the content, its
+// address, or the state the fallback document was rendered from changed.
 //
 // A show always loads its content, even the content the window already shows:
 // a show is the user asking for the actual state, so a repeated open of a live
@@ -237,10 +265,10 @@ func (w *runtimeWindow) resolve() (string, string) {
 func (w *runtimeWindow) load(instance *windowInstance) {
 	w.navMu.Lock()
 	defer w.navMu.Unlock()
-	target, document := w.resolve()
+	target, key, document := w.resolve()
 	if document != "" {
 		instance.view.NavigateDocument(document)
-		instance.shown = shownContent{kind: contentFallback}
+		instance.shown = shownContent{kind: contentFallback, key: key}
 		return
 	}
 	instance.view.Navigate(target)
@@ -248,32 +276,37 @@ func (w *runtimeWindow) load(instance *windowInstance) {
 }
 
 // follow re-checks the content of the open window against the state of the
-// service beside it and switches it when its KIND changed: the live page of
-// the registered address becomes the fallback document when the address stops
-// answering, and the fallback document becomes the live page when the address
-// answers again. Without it a window left open beside a service that stops
-// would keep a page whose server is gone — the error of the browser instead of
-// the state and the actions of the fallback — until the user closed and opened
-// it again.
+// service beside it and switches it when the content or its state changed:
+// the live page of the registered address becomes the fallback document when
+// the address stops answering, the fallback document becomes the live page
+// when the address answers again, and a fallback document is re-rendered when
+// the STATE it was rendered from changed. Without it a window left open beside
+// a service that stops would keep a page whose server is gone, and a fallback
+// document would keep the state and the action of a service that moved on
+// under it, until the user closed and opened it again.
 //
-// page is the runtime page of the registered address as ONE display read — the
-// very read the tray menu just made — resolved it: empty beside a failed read,
-// a machine without a registration and an address that cannot be read as a URL.
+// page, key and document are ONE display read — the very read the tray menu
+// just made: the runtime page of the registered address (empty beside a failed
+// read, a machine without a registration and an address that cannot be read as
+// a URL), the key of the state that read proves, and the fallback document
+// rendered from that same read. The document is built only when the window
+// really has to switch, so an unchanged state costs no render.
 //
 // The window follows the established tick of the tray menu (the cadence of the
 // service status line, see keepFresh): it owns no timer of its own, so an open
 // window follows the machine at the speed the menu already follows it. One
 // pass costs at most one probe of the address, and only while the window
 // exists — a closed window costs nothing — and a window that already shows the
-// content of the state is left alone: the same kind at the same address is not
-// a change, so the live log of the user keeps its scroll position instead of
-// reloading on every tick.
+// content of the state is left alone: the same kind at the same address, and
+// the same key beside the fallback document, is not a change, so the live log
+// of the user keeps its scroll position and an unchanged fallback document is
+// not reloaded under the user.
 //
 // URL mode has no fallback kind to switch to — the page of the own server of
 // the desktop host is the only content of that window — so the follow ends
 // there and never touches a window of the desktop host. The same holds for a
 // window wired without a fallback builder: there is no document to switch to.
-func (w *runtimeWindow) follow(page string) {
+func (w *runtimeWindow) follow(page, key string, document func() string) {
 	if w.live == nil || w.content == nil {
 		return
 	}
@@ -301,20 +334,19 @@ func (w *runtimeWindow) follow(page string) {
 		instance.shown = shownContent{kind: contentLive, url: page}
 		return
 	}
-	if instance.shown.kind == contentFallback {
-		// The window already shows the fallback document: the state it
-		// reports is rendered fresh whenever it is loaded, and reloading
-		// it on every pass would only reset the tail of the log the user
-		// scrolled.
+	if instance.shown.kind == contentFallback && instance.shown.key == key {
+		// The window already shows the document of this very state:
+		// nothing it says changed, and reloading it would only reset
+		// the tail of the log the user scrolled.
 		return
 	}
 	// The document is rendered now, from the state of this moment, so it
 	// states the state the window switches to and not the one it left.
 	// Rendering it is a display read like every other: it asks the menu to
 	// catch up, so this switch costs one more pass, which finds the same
-	// kind and loads nothing.
-	instance.view.NavigateDocument(w.content())
-	instance.shown = shownContent{kind: contentFallback}
+	// kind and key and loads nothing.
+	instance.view.NavigateDocument(document())
+	instance.shown = shownContent{kind: contentFallback, key: key}
 }
 
 // Close destroys the runtime window.
@@ -412,7 +444,12 @@ func (w *runtimeWindow) create() (*windowInstance, error) {
 		for name, handler := range w.actions {
 			driver.BindAction(name, handler)
 		}
-		instance := &windowInstance{view: driver, done: done, icons: icons}
+		instance := &windowInstance{view: driver, done: done, icons: icons, hwnd: hwnd}
+		// The focus is followed before the first message of the loop: a
+		// window the user comes back to re-reads its state through the
+		// established refresh signal of the host instead of keeping a
+		// page whose server is gone until the next tick.
+		instance.followActivation(w.activate)
 
 		w.mu.Lock()
 		w.instance = instance
@@ -452,6 +489,62 @@ func (i *windowInstance) closed() bool {
 	default:
 		return false
 	}
+}
+
+// The message and index of the focus subscription of the Logs window.
+const (
+	// wmActivate is the message Windows sends when a window gains or
+	// loses the activation.
+	wmActivate = 0x0006
+	// waInactive is the wParam of wmActivate that reports the LOSS of the
+	// focus; every other value reports that the window got it.
+	waInactive = 0
+	// gwlpWndProc is the index of the window procedure of a window.
+	gwlpWndProc = ^uintptr(3)
+)
+
+var (
+	// procSetWindowLongPtrW replaces the window procedure of a window.
+	procSetWindowLongPtrW = user32.NewProc("SetWindowLongPtrW")
+	// procCallWindowProcW calls the window procedure a window had.
+	procCallWindowProcW = user32.NewProc("CallWindowProcW")
+)
+
+// windowActivationRequestsRefresh reports whether one window message is the
+// return of the focus to the window: wmActivate with any wParam but
+// waInactive.
+func windowActivationRequestsRefresh(msg, wp uintptr) bool {
+	return msg == wmActivate && wp != waInactive
+}
+
+// followActivation subscribes the window to the return of the focus, so an
+// open window asks the host to re-read its state through the very path of the
+// tray tick instead of keeping a page whose server is gone until the next
+// tick — with no timer of the window's own.
+//
+// request runs on the thread of the window and only posts the established
+// refresh signal: it never blocks the message loop. A nil request — the
+// desktop host, which follows no service — installs nothing, and a window
+// procedure that cannot be replaced leaves the window as it is.
+func (i *windowInstance) followActivation(request func()) {
+	if request == nil || i.hwnd == 0 {
+		return
+	}
+	i.requestRefresh = request
+	i.windowProc = windows.NewCallback(func(hwnd, msg, wp, lp uintptr) uintptr {
+		if windowActivationRequestsRefresh(msg, wp) {
+			i.requestRefresh()
+		}
+		answer, _, _ := procCallWindowProcW.Call(i.previousProc, hwnd, msg, wp, lp)
+		return answer
+	})
+	previous, _, callErr := procSetWindowLongPtrW.Call(uintptr(i.hwnd), gwlpWndProc, i.windowProc)
+	if previous == 0 {
+		desktopLog.Warn("could not follow the focus of the logs window", "error", callErr)
+		i.requestRefresh = nil
+		return
+	}
+	i.previousProc = previous
 }
 
 // webview2Driver drives a WebView2 window.

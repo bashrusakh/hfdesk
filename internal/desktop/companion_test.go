@@ -271,6 +271,11 @@ const (
 		`<button class="btn" id="open-log-file" type="button">Open the log file</button>` +
 		`<button class="btn" id="try-again" type="button">Try again</button>` +
 		`</div>` + "\n"
+	logsHeaderStepUpdate = `<div class="actions">` +
+		`<button class="btn btn-primary" id="update-service" type="button">Update service</button>` +
+		`<button class="btn" id="open-log-file" type="button">Open the log file</button>` +
+		`<button class="btn" id="try-again" type="button">Try again</button>` +
+		`</div>` + "\n"
 	logsHeaderStepInstall = `<div class="actions">` +
 		`<button class="btn btn-primary" id="install-service" type="button">Install service...</button>` +
 		`<button class="btn" id="open-log-file" type="button">Open the log file</button>` +
@@ -298,11 +303,11 @@ func headerActions(t *testing.T, page string) string {
 // TestLogsFallbackPageOffersTheServiceActionOfItsState pins the header of
 // every shape of the model: the step of the state leads as the ONE primary
 // button, the open of the log file follows in its secondary place and the
-// retry comes last — a stopped registration offers Start service and never
-// the installation, a machine without a registration offers Install
-// service... and never the start, and a state that proves no step keeps
-// the header exactly as it has always been. Every shape still carries one
-// local script, no link and nothing that reaches out of the document, and
+// retry comes last — a stopped registration offers Start service, a broken
+// one the update that repairs it, a machine without a registration offers
+// Install service... and never the start, and a state that proves no step
+// keeps the header exactly as it has always been. Every shape still carries
+// one local script, no link and nothing that reaches out of the document, and
 // a document without a log path offers its step beside the retry alone.
 func TestLogsFallbackPageOffersTheServiceActionOfItsState(t *testing.T) {
 	const logPath = `C:\ProgramData\HFDesk\logs\hfdesk.log`
@@ -322,6 +327,13 @@ func TestLogsFallbackPageOffersTheServiceActionOfItsState(t *testing.T) {
 			action:    logsServiceActionStart,
 			header:    logsHeaderStepStart,
 			forbidden: []string{"Install service", `id="install-service"`},
+		},
+		{
+			name:      "a broken registration offers the update",
+			state:     "The HFDesk service is reported as broken.",
+			action:    logsServiceActionUpdate,
+			header:    logsHeaderStepUpdate,
+			forbidden: []string{"Start service", "Install service", `id="start-service"`, `id="install-service"`},
 		},
 		{
 			name:      "a machine without a registration offers the installation",
@@ -387,11 +399,11 @@ func TestLogsFallbackPageOffersTheServiceActionOfItsState(t *testing.T) {
 // TestLogsFallbackPageScriptCallsOnlyBoundActionNames pins the source of
 // truth of the bridge names: the document's script may reference ONLY the
 // names substituted from openLogFileAction, logsTryAgainAction,
-// logsStartServiceAction and logsInstallServiceAction — the very
-// constants companionWindowActions binds as its map keys — so renaming a
-// constant without the script (or the script without the constant) cannot
-// pass: the template derives the names at generation time, and this test
-// fails outright if any other literal name reaches the script, if a
+// logsStartServiceAction, logsUpdateServiceAction and logsInstallServiceAction
+// — the very constants companionWindowActions binds as its map keys — so
+// renaming a constant without the script (or the script without the constant)
+// cannot pass: the template derives the names at generation time, and this
+// test fails outright if any other literal name reaches the script, if a
 // substitution placeholder leaks into the document, or if a constant stops
 // being a usable JavaScript identifier.
 //
@@ -399,7 +411,7 @@ func TestLogsFallbackPageOffersTheServiceActionOfItsState(t *testing.T) {
 // one of its two places is a dead button, and the click would silently do
 // nothing. Each state renders its OWN service button — the start document
 // carries no install button and the install document no start button —
-// while the script of every document wires both, because the guarded
+// while the script of every document wires all of them, because the guarded
 // wiring of an element that is not there is a no-op.
 func TestLogsFallbackPageScriptCallsOnlyBoundActionNames(t *testing.T) {
 	identifier := regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
@@ -407,11 +419,12 @@ func TestLogsFallbackPageScriptCallsOnlyBoundActionNames(t *testing.T) {
 		openLogFileAction:        true,
 		logsTryAgainAction:       true,
 		logsStartServiceAction:   true,
+		logsUpdateServiceAction:  true,
 		logsInstallServiceAction: true,
 	}
 	for _, name := range []string{
 		openLogFileAction, logsTryAgainAction,
-		logsStartServiceAction, logsInstallServiceAction,
+		logsStartServiceAction, logsUpdateServiceAction, logsInstallServiceAction,
 	} {
 		if !identifier.MatchString(name) {
 			t.Fatalf("%q is not a JavaScript identifier: "+
@@ -443,14 +456,14 @@ func TestLogsFallbackPageScriptCallsOnlyBoundActionNames(t *testing.T) {
 	for _, ref := range refs {
 		name := strings.TrimPrefix(ref, "window.")
 		if !bound[name] {
-			t.Errorf("the document calls %q, want only the four bound service and window actions: "+
+			t.Errorf("the document calls %q, want only the bound window and service actions: "+
 				"a foreign name is a dead button", ref)
 		}
 		counts[name]++
 	}
 	for _, name := range []string{
 		openLogFileAction, logsTryAgainAction,
-		logsStartServiceAction, logsInstallServiceAction,
+		logsStartServiceAction, logsUpdateServiceAction, logsInstallServiceAction,
 	} {
 		if counts[name] < 2 {
 			t.Errorf("the script references %q %d time(s), want its guard and its call", name, counts[name])
@@ -458,7 +471,8 @@ func TestLogsFallbackPageScriptCallsOnlyBoundActionNames(t *testing.T) {
 	}
 	for _, placeholder := range []string{
 		logsFallbackOpenPlaceholder, logsFallbackTryPlaceholder,
-		logsFallbackStartPlaceholder, logsFallbackInstallPlaceholder,
+		logsFallbackStartPlaceholder, logsFallbackUpdatePlaceholder,
+		logsFallbackInstallPlaceholder,
 	} {
 		if strings.Contains(page, placeholder) {
 			t.Errorf("the document carries the unsubstituted placeholder %q: the generation step is broken:\n%s",
@@ -476,7 +490,7 @@ func TestLogsFallbackPageScriptCallsOnlyBoundActionNames(t *testing.T) {
 	}
 	for _, name := range regexp.MustCompile(`hfdesk[A-Za-z0-9_$]*`).FindAllString(script, -1) {
 		if !bound[name] {
-			t.Errorf("the script carries the literal %q, want only the four bound action names: "+
+			t.Errorf("the script carries the literal %q, want only the bound action names: "+
 				"a hardcoded name is a dead button", name)
 		}
 	}
@@ -484,19 +498,21 @@ func TestLogsFallbackPageScriptCallsOnlyBoundActionNames(t *testing.T) {
 	// The buttons are looked up by the very ids the markup carries: the
 	// document of the stopped state carries the start button and no
 	// install button, the document of the machine without a registration
-	// the other way round.
+	// the other way round, and the broken document the update button.
 	assertNames(t, page, "the bridge elements", []string{
 		`id="open-log-file"`, `getElementById("open-log-file")`,
 		`id="try-again"`, `getElementById("try-again")`,
 		`id="start-service"`, `getElementById("start-service")`,
+		`getElementById("update-service")`,
 		`getElementById("install-service")`,
 	})
-	assertNamesWithout(t, page, "the stopped document", nil, []string{`id="install-service"`})
+	assertNamesWithout(t, page, "the stopped document", nil, []string{`id="install-service"`, `id="update-service"`})
 	assertNames(t, installPage, "the bridge elements of the install document", []string{
 		`id="install-service"`, `getElementById("install-service")`,
-		`getElementById("start-service")`,
+		`getElementById("start-service")`, `getElementById("update-service")`,
 	})
-	assertNamesWithout(t, installPage, "the install document", nil, []string{`id="start-service"`})
+	assertNamesWithout(t, installPage, "the install document", nil,
+		[]string{`id="start-service"`, `id="update-service"`})
 }
 
 // TestLogsFallbackPageHonestShapesAndEscapesEverything proves the honest
@@ -906,11 +922,12 @@ func TestRuntimePageAnswersProbesTheAddressHonestly(t *testing.T) {
 // TestResolveLogsWindowPicksTheLivePageOrTheFallback pins the decision of
 // one open of the companion window: an address that answers yields the
 // live runtime page and no fallback document, an address that does not
-// answer yields the fallback document and no URL, and a registration that
-// names no address yields the fallback WITHOUT probing — there is nothing
-// to ask, and a probe of an empty URL would be a defect.
+// answer yields the fallback document together with the key of the read it
+// was rendered from and no URL, and a registration that names no address
+// yields the fallback WITHOUT probing — there is nothing to ask, and a probe
+// of an empty URL would be a defect.
 func TestResolveLogsWindowPicksTheLivePageOrTheFallback(t *testing.T) {
-	fallback := func() string { return "<!doctype html>fallback" }
+	fallback := func() (string, string) { return "stopped", "<!doctype html>fallback" }
 	probeCalls := 0
 	previous := runtimePageAnswers
 	t.Cleanup(func() { runtimePageAnswers = previous })
@@ -921,10 +938,10 @@ func TestResolveLogsWindowPicksTheLivePageOrTheFallback(t *testing.T) {
 			probeCalls++
 			return url == "http://127.0.0.1:18080/runtime.html"
 		}
-		target, document := resolveLogsWindow(
+		target, key, document := resolveLogsWindow(
 			func() string { return "http://127.0.0.1:18080/runtime.html" }, fallback)
-		if target != "http://127.0.0.1:18080/runtime.html" || document != "" {
-			t.Errorf("resolveLogsWindow = (%q, %q), want the live page and no document", target, document)
+		if target != "http://127.0.0.1:18080/runtime.html" || key != "" || document != "" {
+			t.Errorf("resolveLogsWindow = (%q, %q, %q), want the live page and no document", target, key, document)
 		}
 		if probeCalls != 1 {
 			t.Errorf("the probe ran %d time(s), want exactly one per open", probeCalls)
@@ -933,10 +950,11 @@ func TestResolveLogsWindowPicksTheLivePageOrTheFallback(t *testing.T) {
 
 	t.Run("an address that does not answer yields the fallback", func(t *testing.T) {
 		runtimePageAnswers = func(string) bool { return false }
-		target, document := resolveLogsWindow(
+		target, key, document := resolveLogsWindow(
 			func() string { return "http://127.0.0.1:18080/runtime.html" }, fallback)
-		if target != "" || document != "<!doctype html>fallback" {
-			t.Errorf("resolveLogsWindow = (%q, %q), want no URL and the fallback document", target, document)
+		if target != "" || key != "stopped" || document != "<!doctype html>fallback" {
+			t.Errorf("resolveLogsWindow = (%q, %q, %q), want no URL and the fallback document of the read",
+				target, key, document)
 		}
 	})
 
@@ -946,9 +964,10 @@ func TestResolveLogsWindowPicksTheLivePageOrTheFallback(t *testing.T) {
 			probeCalls++
 			return true
 		}
-		target, document := resolveLogsWindow(func() string { return "" }, fallback)
-		if target != "" || document != "<!doctype html>fallback" {
-			t.Errorf("resolveLogsWindow = (%q, %q), want no URL and the fallback document", target, document)
+		target, key, document := resolveLogsWindow(func() string { return "" }, fallback)
+		if target != "" || key != "stopped" || document != "<!doctype html>fallback" {
+			t.Errorf("resolveLogsWindow = (%q, %q, %q), want no URL and the fallback document of the read",
+				target, key, document)
 		}
 		if probeCalls != 0 {
 			t.Errorf("the probe ran %d time(s) beside an empty address, want no probe at all", probeCalls)

@@ -592,7 +592,7 @@ func TestCompanionWindowPageReportsStateAndRegistrationAddress(t *testing.T) {
 			var refreshes atomic.Int32
 			replaceSeam(t, &serviceMenuRefresh, func() { refreshes.Add(1) })
 
-			page := companionWindowPage()
+			_, page := companionWindowContent()
 
 			assertNames(t, page, "the fallback document", []string{"<h1>" + tc.wantState + "</h1>"})
 			if tc.noAddr {
@@ -642,7 +642,7 @@ func TestCompanionWindowReadsEachAskTheMenuToCatchUp(t *testing.T) {
 			var refreshes atomic.Int32
 			replaceSeam(t, &serviceMenuRefresh, func() { refreshes.Add(1) })
 
-			companionWindowPage()
+			companionWindowContent()
 
 			// The render reads the registration twice — the state
 			// line and the service-log path of the same page — and
@@ -1277,9 +1277,10 @@ func TestCompanionWindowActionsCarryTheOpenLogActions(t *testing.T) {
 // the fallback document offers for one read of the registration — the
 // header of every state, verbatim and in its order:
 //
-//   - a settled registration that does not run (stopped, failed, broken
-//     without an instance) leads with Start service — the state the Start
-//     service item of the menu acts on;
+//   - a settled registration that does not run leads with Start service —
+//     the state the Start service item of the menu acts on — except a BROKEN
+//     one, whose start would fail on the missing program and which leads with
+//     Update service, the one step that repairs it;
 //   - a machine the read proved WITHOUT a registration leads with
 //     Install service... — the state the Install service item acts on;
 //   - every other state — a running service, a transition, a state the
@@ -1308,13 +1309,13 @@ func TestCompanionWindowPageOffersTheServiceActionOfTheState(t *testing.T) {
 			name:      "a failed registration offers the start",
 			status:    runningServiceStatus(service.StateFailed, "127.0.0.1:18080"),
 			header:    logsHeaderStepStart,
-			forbidden: []string{"Install service..."},
+			forbidden: []string{"Install service...", "Update service", `id="update-service"`},
 		},
 		{
-			name:      "a broken registration without an instance offers the start",
+			name:      "a broken registration without an instance offers the update",
 			status:    runningServiceStatus(service.StateBroken, "127.0.0.1:18080"),
-			header:    logsHeaderStepStart,
-			forbidden: []string{"Install service..."},
+			header:    logsHeaderStepUpdate,
+			forbidden: []string{"Start service", "Install service...", `id="start-service"`, `id="install-service"`},
 		},
 		{
 			name:      "a machine without a registration offers the installation",
@@ -1364,7 +1365,7 @@ func TestCompanionWindowPageOffersTheServiceActionOfTheState(t *testing.T) {
 				return tc.status, tc.readErr
 			})
 
-			page := companionWindowPage()
+			_, page := companionWindowContent()
 
 			if got := headerActions(t, page); got != tc.header {
 				t.Errorf("the header =\n%s\nwant:\n%s", got, tc.header)
@@ -1379,12 +1380,46 @@ func TestCompanionWindowPageOffersTheServiceActionOfTheState(t *testing.T) {
 	}
 }
 
+// TestCompanionWindowPageNamesTheTransitionOfTheRead pins the state line of
+// the fallback document against the classification that decides the actions:
+// a service on its way up or down is named by its transition, never as
+// "running" — the address that did not answer must not sit beside a claim the
+// service runs — and neither transition offers a step. A service that really
+// runs is the one state that says so.
+func TestCompanionWindowPageNamesTheTransitionOfTheRead(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state service.State
+		want  string
+	}{
+		{name: "a service on its way up", state: service.StateStarting, want: "The HFDesk service is starting."},
+		{name: "a service on its way down", state: service.StateStopping, want: "The HFDesk service is stopping."},
+		{name: "a running service", state: service.StateRunning, want: "The HFDesk service is running."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status := service.Status{State: tc.state, Listen: "127.0.0.1:18080"}
+			replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+				return status, nil
+			})
+
+			_, page := companionWindowContent()
+
+			assertNames(t, page, "the state line", []string{"<h1>" + tc.want + "</h1>"})
+			assertNamesWithout(t, page, "the document of the transition", nil, []string{
+				"Start service", "Update service", "Install service...",
+				`id="start-service"`, `id="update-service"`, `id="install-service"`,
+			})
+			assertNamesWithout(t, page, "the state line", nil, []string{"<a ", "href="})
+		})
+	}
+}
+
 // TestCompanionWindowServiceActionRunsTheMenuItemFlow proves the bridge
 // of the service action of the fallback document end to end: a press runs
 // the VERY flow the matching menu item runs — performServiceActionFromTray
-// with the start action, runInstallServiceAction with the install —
-// exactly ONCE, behind the one service-action guard both surfaces share,
-// and it ends with the very re-read the Try again button runs.
+// with the start or the update action, runInstallServiceAction with the
+// install — exactly ONCE, behind the one service-action guard both surfaces
+// share, and it ends with the very re-read the Try again button runs.
 //
 // The re-read is observed through the established report of that path:
 // the window of this test reports no runtime, so the show every retry
@@ -1454,6 +1489,71 @@ func TestCompanionWindowServiceActionRunsTheMenuItemFlow(t *testing.T) {
 			func() bool {
 				return !serviceActionRunning.Load() && refreshes.Load() == 1
 			})
+	})
+
+	t.Run("the update button runs the menu's update flow once and re-reads after it", func(t *testing.T) {
+		freshServiceInstallGuard(t)
+		// The update re-reads the registration under the action policy
+		// before it acts; a positively stopped registration is the pure
+		// rewrite that launches the helper directly.
+		replaceSeam(t, &serviceStatus, func(context.Context) (service.Status, error) {
+			return service.Status{State: service.StateStopped}, nil
+		})
+		// The update registers from the console program of this folder, so
+		// the launch passes the precheck: the lookup finds the program and
+		// no notice is shown before the elevation.
+		replaceSeam(t, &findSiblingExecutable, func(string, string) (string, error) {
+			return `C:\portable\hfdesk.exe`, nil
+		})
+		launched := make(chan elevatedLaunch, 2)
+		replaceSeam(t, &launchElevated, func(launch elevatedLaunch) (uint32, error) {
+			launched <- launch
+			return 7773, nil
+		})
+		waiterCalled := make(chan uint32, 1)
+		releaseWaiter := make(chan struct{})
+		replaceSeam(t, &waitForServiceActionHelper, func(pid uint32) {
+			waiterCalled <- pid
+			<-releaseWaiter
+		})
+		var refreshes atomic.Int32
+		replaceSeam(t, &serviceMenuRefresh, func() { refreshes.Add(1) })
+		shown := recordMessagesChannel(t)
+		actions := companionWindowActions(panicGuard{},
+			func() *runtimeWindow { return &runtimeWindow{} },
+			func() bool { return false }, testGateSingleton)
+
+		actions[logsUpdateServiceAction]()
+
+		var launch elevatedLaunch
+		select {
+		case launch = <-launched:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the update button never reached the menu's update flow")
+		}
+		if launch.Action != serviceActionUpdate {
+			t.Errorf("the helper performs %q, want the action of the menu's update item %q",
+				launch.Action, serviceActionUpdate)
+		}
+		if !serviceActionRunning.Load() {
+			t.Error("the guard was released although the helper of the update is still running")
+		}
+		// The action re-reads the window afterwards — the path the
+		// Try again button runs.
+		waitForTrayCondition(t, "the re-read of the window after the update", func() bool {
+			return len(shown) == 1
+		})
+		if messages := drainMessages(shown); len(messages) != 1 ||
+			messages[0].caption != companionWindowUnavailableCaption {
+			t.Errorf("the reports after the update = %v, want the one report of the window re-read", messages)
+		}
+		if pid := <-waiterCalled; pid != 7773 {
+			t.Errorf("the waiter waits for the process %d, want the launched helper 7773", pid)
+		}
+		close(releaseWaiter)
+		waitForTrayCondition(t, "the guard release after the update helper ended", func() bool {
+			return !serviceActionRunning.Load() && refreshes.Load() == 1
+		})
 	})
 
 	t.Run("the install button runs the menu's install flow once", func(t *testing.T) {
