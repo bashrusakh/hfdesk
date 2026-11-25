@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bashrusakh/hfdesk/internal/logging"
 	"github.com/bashrusakh/hfdesk/internal/serviceview"
 )
 
@@ -143,7 +144,8 @@ func wantWithStateCleared(snapshot serviceview.Snapshot) serviceview.Snapshot {
 
 // TestRuntimeStatusServiceView proves that the status carries the classified
 // view and the compatible raw word of the same read, and that the view is
-// exactly the shared table of the application.
+// exactly the shared table of the application — for a host that provides the
+// installation, so the table's install action reaches the page unmasked.
 func TestRuntimeStatusServiceView(t *testing.T) {
 	pipeline, _ := newRuntimeTestPipeline(t, 16)
 
@@ -173,7 +175,7 @@ func TestRuntimeStatusServiceView(t *testing.T) {
 					return serviceview.Snapshot{}, errors.New("the service control manager did not answer")
 				}
 				return want, nil
-			}, nil)
+			}, func() {})
 
 			recorder := httptest.NewRecorder()
 			newRuntimeTestServer(pipeline).handler().ServeHTTP(recorder,
@@ -218,6 +220,129 @@ func TestRuntimeStatusServiceView(t *testing.T) {
 				if _, ok := actions[key]; !ok {
 					t.Errorf("the actions object %v does not carry %q", actions, key)
 				}
+			}
+		})
+	}
+}
+
+// runtimeStatusOf performs one GET /api/runtime of a test server and decodes
+// the status it answers.
+func runtimeStatusOf(t *testing.T, pipeline *logging.Pipeline) RuntimeStatusResponse {
+	t.Helper()
+
+	recorder := httptest.NewRecorder()
+	newRuntimeTestServer(pipeline).handler().ServeHTTP(recorder,
+		runtimeRequest(http.MethodGet, "/api/runtime", "127.0.0.1:5555"))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var status RuntimeStatusResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode status response: %v", err)
+	}
+	return status
+}
+
+// TestRuntimeStatusWithdrawsTheInstallActionWithoutAHostInstallation proves
+// the rule of the status beside a host that registered no installation: the
+// install action is withdrawn from the view the page reads — invisible and
+// therefore inactive — because POST /api/runtime/install-service could only
+// answer 404 there. The proven absence is the case the button is offered in,
+// so it is pinned beside the two states the table hides it in anyway; every
+// other action keeps the table's answer, the raw state word travels
+// unchanged, and the snapshot the host returned is not touched: the
+// withdrawal belongs to the copy this request answers with.
+func TestRuntimeStatusWithdrawsTheInstallActionWithoutAHostInstallation(t *testing.T) {
+	pipeline, _ := newRuntimeTestPipeline(t, 16)
+
+	for _, tc := range []struct {
+		name    string
+		state   string
+		running bool
+	}{
+		{name: "a proven absence offers no installation", state: "not-installed"},
+		{name: "a stopped registration offers no installation", state: "stopped"},
+		{name: "a running registration hides it as before", state: "running", running: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			read := serviceview.From(tc.state, tc.running, false)
+			stub := &runtimeServiceStub{snapshot: read}
+			// No installation is registered beside the read.
+			stubRuntimeService(t,
+				func() (serviceview.Snapshot, error) { return stub.snapshot, nil }, nil)
+
+			status := runtimeStatusOf(t, pipeline)
+
+			if status.Service.Actions.Install != (serviceview.Action{}) {
+				t.Errorf("the install action = %+v, want it withdrawn: this host registers no installation",
+					status.Service.Actions.Install)
+			}
+			want := read
+			want.Actions.Install = serviceview.Action{}
+			if status.Service != wantWithStateCleared(want) {
+				t.Errorf("service view = %+v, want the table's answer without the install action %+v",
+					status.Service, wantWithStateCleared(want))
+			}
+			if status.ServiceState != tc.state {
+				t.Errorf("serviceState = %q, want the raw word of the read %q", status.ServiceState, tc.state)
+			}
+			if stub.snapshot != read {
+				t.Errorf("the read's snapshot became %+v, want the value the host returned %+v: "+
+					"the withdrawal belongs to the copy of the response", stub.snapshot, read)
+			}
+		})
+	}
+}
+
+// TestRuntimeStatusKeepsTheInstallActionOfAHostThatProvidesIt proves the
+// other direction: a host that registered the installation keeps the table's
+// answer — visible and enabled beside a proven absence, hidden beside a
+// running service — and a state the read could not settle still offers
+// nothing at all.
+func TestRuntimeStatusKeepsTheInstallActionOfAHostThatProvidesIt(t *testing.T) {
+	pipeline, _ := newRuntimeTestPipeline(t, 16)
+
+	for _, tc := range []struct {
+		name    string
+		state   string
+		running bool
+		want    serviceview.Action
+	}{
+		{
+			name:  "a proven absence offers the installation",
+			state: "not-installed",
+			want:  serviceview.Action{Visible: true, Enabled: true},
+		},
+		{
+			name:    "a running service hides it",
+			state:   "running",
+			running: true,
+			want:    serviceview.Action{},
+		},
+		{
+			name:  "an unsettled read offers nothing",
+			state: "unknown",
+			want:  serviceview.Action{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubRuntimeService(t, func() (serviceview.Snapshot, error) {
+				return serviceview.From(tc.state, tc.running, false), nil
+			}, func() {})
+
+			status := runtimeStatusOf(t, pipeline)
+
+			if status.Service.Actions.Install != tc.want {
+				t.Errorf("the install action = %+v, want the table's answer %+v",
+					status.Service.Actions.Install, tc.want)
+			}
+			want := serviceview.From(tc.state, tc.running, false)
+			if status.Service != wantWithStateCleared(want) {
+				t.Errorf("service view = %+v, want the table's answer %+v",
+					status.Service, wantWithStateCleared(want))
+			}
+			if status.ServiceState != tc.state {
+				t.Errorf("serviceState = %q, want the raw word of the read %q", status.ServiceState, tc.state)
 			}
 		})
 	}

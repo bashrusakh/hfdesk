@@ -79,6 +79,10 @@ type RuntimeStatusResponse struct {
 	// proved: the class, the status line and every action the window may
 	// offer, from the one shared table (serviceview.From) the tray menu
 	// reads too. An unknown read carries no label, no tone and no action.
+	//
+	// The install action is withdrawn (invisible, and therefore inactive)
+	// when this host registered no installation, because the endpoint
+	// behind it could only answer 404 (see runtimeServiceSnapshot).
 	Service serviceview.Snapshot `json:"service"`
 	// ServiceState is the raw lifecycle state word of the platform
 	// service registration ("not-installed", "running", "stopped", …), or
@@ -292,14 +296,28 @@ func (s *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request) {
 // no state all answer the unknown view: the window then reports what this
 // process could not settle instead of claiming a machine without a
 // registration, and it offers no action on a state that was never read.
+//
+// The installation is the ONE service action the server itself performs:
+// POST /api/runtime/install-service dispatches the host's installation and
+// answers 404 on a host that registered none (handleRuntimeInstallService).
+// A snapshot of a proven state is therefore returned with the install action
+// withdrawn when no installation is registered, so a page that runs outside
+// the host bindings — an ordinary browser — is never offered a step that
+// could only fail. The withdrawn action is set on the read's own copy: the
+// snapshot the host returned is a value, and nothing of it is mutated in
+// place. Every other action keeps the table's answer, because performing
+// them is the job of the window's host bindings, not of the server.
 func runtimeServiceSnapshot() serviceview.Snapshot {
-	read, _ := currentRuntimeService()
+	read, install := currentRuntimeService()
 	if read == nil {
 		return serviceview.From("", false, true)
 	}
 	snapshot, err := read()
 	if err != nil {
 		return serviceview.From("", false, true)
+	}
+	if install == nil {
+		snapshot.Actions.Install = serviceview.Action{}
 	}
 	return snapshot
 }
