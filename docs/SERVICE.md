@@ -833,8 +833,8 @@ replaces the other.
   acts; a proven registration shows **Start service**, **Stop service**,
   **Update service** and **Delete service** instead, so the install item
   is on screen only where there is nothing to install and no grey
-  install item remains. The line never says `installed` (that word belongs
-  to the badge of the Logs window) and never says `unknown`: a read that
+  install item remains. The line never says `installed` (no surface uses
+  that word any more) and never says `unknown`: a read that
   settled nothing is not a state of the machine, so it shows nothing about
   the service at all — no line, no item, and no **Service** entry that
   would open the submenu — and it repeats itself, up to three quick
@@ -848,8 +848,9 @@ replaces the other.
   after every service action, after every reading the tray and the window
   make, and every 30 seconds, so both surfaces keep the real state of the
   machine.
-- **Service actions.** **Install service…** (in the tray and as the window
-  button) and the four lifecycle items run one flow. The lifecycle items
+- **Service actions.** **Install service…** (in the tray and in the
+  **Service ▾** menu of the Logs window) and the four lifecycle items run
+  one flow. The lifecycle items
   appear beside a proven registration and each is enabled only for a
   settled read it can act on: **Start service** for a settled state that
   does not run — except a registration whose program is gone, which reads
@@ -880,7 +881,8 @@ replaces the other.
 
   Starting, updating or deleting the service from a desktop app that serves
   its own address performs the action after the app leaves desktop mode: the
-  window closes, the elevated helper acts beside a
+  window closes before the app's own server stops — so a successful handover
+  never flashes a server error — the elevated helper acts beside a
   host that is already gone, and the app comes back as the tray companion —
   the confirmation states that fact before the prompt, instead of a refusal
   that asked the user to quit HFDesk. **Delete service** is the answer that
@@ -893,25 +895,46 @@ replaces the other.
   old file in its report when that file is still on the disk and offers its
   deletion as one press — nothing is deleted automatically.
 - **Logs window.** One window — titled `HFDesk - Logs` — covers the desktop
-  app and the tray companion alike. It loads the live log page of the
-  address it knows: the desktop app's own server, or the registered address
-  of the service. That page takes the service state from the server it is
-  loaded from and shows it as a badge that answers only whether a service
-  is installed, and an
-  **Install service…** button that is enabled only while no service is
-  installed — the status refresh flips it once one exists. The button runs the exact installation flow of the tray item (the
-  notice, the confirmation, the administrator prompt, the handover and the
-  existing reports), and the host's
-  single service-action guard refuses a second service action while one is
-  in flight, whichever surface or item started it. When that address does
-  not answer (or names none), the window shows an honest local page
-  instead: the state of the service, with the step that fits it as the
-  first action (**Start service** for a registered service that does not
-  run, **Update service** when the program at the registered path is gone,
-  **Install service…** when none is installed), the address that did not answer stated
-  as plain text, the path of the service log file with the action **Open
-  the log file** that opens it, the bounded tail of that same log under the
-  heading **Service log**, and **Try again** to re-read the live page.
+  app and the tray companion alike, and one frame covers both of its
+  states. While the address it knows answers (the desktop app's own server,
+  or the registered address of the service), it shows the live page of that
+  server: the icon and the version, the facts strip, and the log of the
+  instance in a table with level and search filters.
+
+  The header carries the tray's service section as one **Service ▾**
+  control: a status dot and the line `Service: not installed`,
+  `Service: stopped`, `Service: starting`, `Service: running`,
+  `Service: stopping` or `Service: failed`, and a menu of **Install
+  service…**, **Start service**, **Stop service**, **Update service** and
+  **Delete service…**. The state stays on the trigger and is not repeated
+  inside the menu. The items follow the tray's rules: a proven absence
+  offers only the installation, a registration whose program is gone offers
+  **Update service** and no start, a failed one offers the start beside
+  that update, a transition shows its items disabled, and a read that
+  proves nothing shows no control at all. Every action runs the exact flow
+  of the matching tray item — the same confirmations, the same
+  administrator prompt, the same handover and the same reports — and the
+  host's single service-action guard refuses a second service action while
+  one is in flight, whichever surface or item started it. The desktop app's
+  own window binds the same five actions. In a plain browser the actions
+  have no owner, so the control is a static chip with the same line and no
+  menu where it has actions to show; a state with none, and a host that
+  does not offer the installation, shows no control at all.
+
+  When that address does not answer (or names none), the window keeps the
+  same frame and replaces only the centre: the same header with the icon,
+  the version and the **Service ▾** control, the same facts strip, and the
+  same log panel. The banner states the address that did not answer as a
+  fact (never a link) with **Try again** to re-read the live page; the
+  strip states the registered address, the unknown job count, and the path
+  of the service log file, whose folder and file open with the two toolbar
+  actions. The panel shows the tail of that same file — at most 200 lines,
+  read from at most the last 64 KiB — in the same table as the live log
+  (time, level, component, message and attributes), with the last line
+  count and those bounds stated beside it; a line the service wrote that is
+  not a log record keeps its text. A file that does not exist yet, cannot
+  be read or is empty states its one-line reason in the panel, and a status
+  that could not be read shows no service control instead of inventing one.
 - **Install service…** asks for confirmation first: a headline question —
   **Install HFDesk as a Windows service?** — and exactly two short fact
   lines: it starts at boot and keeps running after this window closes, and
@@ -1092,10 +1115,12 @@ replaces the other.
   proven absence and an unsettled or unreadable read. Its **Logs** window is
   the same window the desktop app opens: on every show it probes the
   registered address and loads the live log page while the service answers
-  it, and otherwise shows the honest state, the address that did not answer,
-  and the path of the service log file (from the registered log directory,
-  see [Where the state lives](#where-the-state-lives)) with the action that
-  opens it and **Try again** to retry.
+  it, and otherwise keeps the same frame with the centre replaced — the
+  address that did not answer with **Try again**, the **Service ▾** control
+  with the actions of the state, and the tail of the service log (from the
+  registered log directory, see
+  [Where the state lives](#where-the-state-lives)) in the same table as the
+  live log.
 - **The dialog** is a Windows task dialog, which needs the common controls
   version 6 that the embedded application manifest declares. A locally built
   binary without that resource still works: it falls back to message boxes that
@@ -1201,9 +1226,10 @@ The **command line** never elevates: `hfdesk service …` invokes no `sudo`, `su
 fails with a permission error instead of escalating on its own.
 
 The **Windows desktop host** is the exception, and only on an explicit choice of
-the user: **Install service…** in its tray or in the Logs window, the
-**Start service**, **Stop service**, **Update service** and **Delete service**
-items of the tray (of the desktop host and of the tray companion alike), and
+the user: **Install service…** in its tray or in the **Service ▾** menu of the
+Logs window, the **Start service**, **Stop service**, **Update service** and
+**Delete service** items of the tray and of that menu (of the desktop host and
+of the tray companion alike), and
 **Update service** or **Start service** in its startup dialog, ask Windows for
 administrator rights through the standard prompt before an elevated helper
 performs the action (see

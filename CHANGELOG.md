@@ -5,12 +5,15 @@
 ### Changed
 
 - The tray menu's service line names one state — `Service: not installed`, `Service: stopped`, `Service: starting`, `Service: running`, `Service: stopping` or `Service: failed` — instead of also saying `installed` and `unknown`; a state that could not be read shows nothing about the service at all, and it reappears with the next reading that succeeds.
+- The Logs window and its offline view now use one frame — the same header with the icon and version, the same facts strip and the same log panel — and offline only the centre changes: the address that did not answer, and the tail of the same log in the same table, limited to the last lines and 64 KiB.
+- The Logs window now carries the service actions in one **Service ▾** control — the state line plus a menu of **Install service…**, **Start service**, **Stop service**, **Update service** and **Delete service…**, with the state not repeated in the menu. The rules and confirmations are the tray's, the desktop app's own window has the same control, and a plain browser shows a static chip without a menu.
 - Updating a running service asks first and states that the service is stopped and started again with running downloads interrupted; a stopped service updates without a question, and a desktop app that hands over asks its own question once.
 - Deleting the service states that a running service is stopped first.
 - A registration whose program is gone reads as `failed` and offers **Update service** instead of **Start service**.
 
 ### Fixed
 
+- Installing the service from the desktop app no longer flashes a red error in the Logs window: the window closes before the app's own server stops, while a server that fails on its own still shows the error.
 - The Logs window follows the service while it stays open: a service that stops, fails or loses its registration redraws the window, a missing program offers its update, and returning the focus to the window re-reads the state.
 
 ## [1.3.0-beta.10] - 2026-11-25
