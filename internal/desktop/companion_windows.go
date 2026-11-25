@@ -20,6 +20,7 @@ import (
 
 	"github.com/bashrusakh/hfdesk/internal/opener"
 	"github.com/bashrusakh/hfdesk/internal/service"
+	"github.com/bashrusakh/hfdesk/internal/serviceview"
 	"github.com/energye/systray"
 	"golang.org/x/sys/windows"
 )
@@ -571,16 +572,16 @@ func companionPageURL(status service.Status, readErr error) string {
 // The document states the honest state of the service, the address that
 // did not answer as a FACT — never a link: the address just proved it
 // does not answer, so a link would be a dead path — and the honest reason
-// when there is no address to name. The step that state proves leads the
-// header of the document (the bound service actions and their common
-// flow are companionWindowActions). The path of the service log file
+// when there is no address to name. The service control of the header is
+// the ONE state table (internal/serviceview): the line, the tone and the
+// actions its state proves, through the bound service actions and their
+// common flow (companionWindowActions). The path of the service log file
 // completes it: the very file the open action opens, resolved fresh on
 // every render (a second display read with its own catch-up), so the path
 // the document shows and the file the action hands to the default handler
 // are always one and the same file. The bounded tail of that same file is
 // read for the same render (serviceLogSectionAt — a file read, no
-// registration read), so the document shows the end of the log beside the
-// action that opens the whole file.
+// registration read) and shown in the table of the live page.
 func companionWindowContent() (key string, document string) {
 	status, readErr := serviceState.readForDisplay()
 	requestServiceMenuCatchUp()
@@ -593,42 +594,44 @@ func companionWindowContent() (key string, document string) {
 // key changes.
 //
 // The key carries what the document says ABOUT THE SERVICE — whether the read
-// could be made, the state, the running fact and the registered address. The
-// log path and the log tail are deliberately not part of it: they are the
-// render-time view of the file, and a growing log would otherwise re-render
-// the document on every pass. A failed read says the same thing whatever the
-// error was, so its presence, not its text, is the key.
+// could be made, the state, the running fact and the registered address — and
+// the build version the header states, so a version change is a new document
+// as well. The log path and the log tail are deliberately not part of it: they
+// are the render-time view of the file, and a growing log would otherwise
+// re-render the document on every pass. A failed read says the same thing
+// whatever the error was, so its presence, not its text, is the key.
 func companionStateKey(status service.Status, readErr error) string {
 	if readErr != nil {
-		return "unreadable"
+		return "unreadable\x00" + companionVersion
 	}
-	return fmt.Sprintf("%s\x00%t\x00%s", status.State, status.Running, status.Listen)
+	return fmt.Sprintf("%s\x00%t\x00%s\x00%s", status.State, status.Running, status.Listen, companionVersion)
 }
 
 // companionWindowPageFor builds the fallback document from one already-made
 // display read, so the document and the key that records it describe the very
 // same state.
 func companionWindowPageFor(status service.Status, readErr error) string {
-	state := logsFallbackState{LogPath: companionServiceLogPath()}
+	state := logsFallbackState{
+		Version: companionVersion,
+		LogPath: companionServiceLogPath(),
+	}
 	state.Log = serviceLogSectionAt(state.LogPath)
 	switch {
 	case readErr != nil:
-		state.State = "The state of the Windows service could not be read."
+		// A read that failed proves nothing: the control is absent
+		// instead of claiming the state of the last good read.
+		state.Service = serviceview.Snapshot{Class: serviceview.ClassUnknown}
 		state.Note = "The address of the web UI could not be read."
 	case status.State == service.StateNotInstalled:
-		state.State = "HFDesk is not registered as a Windows service."
+		// The proven absence is the state the Install service item of
+		// the menu acts on, and the one table says so.
+		state.Service = serviceview.From(string(status.State), status.Running, false)
 		state.Note = "The registration names no address, so there is nothing to open."
-		// The proven absence is the state the Install service item
-		// of the menu acts on, so it is the step this document
-		// offers — the very same flow, through the bound action of
-		// the same name.
-		state.ServiceAction = logsServiceActionInstall
 	case status.State == "":
-		state.State = "The state of the Windows service is unknown."
+		state.Service = serviceview.Snapshot{Class: serviceview.ClassUnknown}
 		state.Note = "The address of the web UI is not known."
 	default:
-		prompt := serviceChoicePrompt{State: status.State, Running: status.Running}
-		state.State = "The HFDesk service is " + serviceGateStatePhrase(prompt) + "."
+		state.Service = serviceview.From(string(status.State), status.Running, false)
 		if url, urlErr := serviceURL(status.Listen); urlErr == nil {
 			state.Address = url
 		} else if raw := strings.TrimSpace(status.Listen); raw != "" {
@@ -638,26 +641,6 @@ func companionWindowPageFor(status service.Status, readErr error) string {
 			state.Address = raw
 		} else {
 			state.Note = "The registration names no address, so there is nothing to open."
-		}
-		// The settled registration that does not run is the state the
-		// Start service item of the menu acts on — the same two
-		// predicates, so the window and the menu can never disagree
-		// about which state starts. A BROKEN registration is the
-		// exception: its program is gone, so a start would fail on
-		// exactly that fact, and the one step that repairs it is the
-		// update — the very item the menu leaves enabled there.
-		// Every other state offers no step here: a running service
-		// needs none, a transition is not a state to decide on, and the
-		// state the supervisor could not report (settled by its own
-		// definition) proves nothing to act on — the menu shows no
-		// action for it either.
-		if status.State != service.StateUnknown &&
-			serviceStateSettled(status.State) && !serviceStatusRunning(status) {
-			if status.State == service.StateBroken {
-				state.ServiceAction = logsServiceActionUpdate
-			} else {
-				state.ServiceAction = logsServiceActionStart
-			}
 		}
 	}
 	return logsFallbackPage(state)

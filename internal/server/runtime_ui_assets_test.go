@@ -28,8 +28,9 @@ func runtimeAssetText(t *testing.T, name string) string {
 
 // TestRuntimeUIRuntimeAssetsShareTheCard pins the split of the Runtime view:
 // the layout lives in css/runtime.css, which the page loads after the design
-// system, and the renderer of one record lives in js/logview.js, which the
-// page loads before the view.
+// system, the renderer of one record lives in js/logview.js, and the
+// interaction of the service menu lives in js/servicecontrol.js. The renderer
+// and the menu control load before the view that drives them.
 func TestRuntimeUIRuntimeAssetsShareTheCard(t *testing.T) {
 	markup := runtimeAssetText(t, "runtime.html")
 
@@ -46,12 +47,16 @@ func TestRuntimeUIRuntimeAssetsShareTheCard(t *testing.T) {
 	}
 
 	logviewScript := strings.Index(markup, `src="js/logview.js"`)
+	controlScript := strings.Index(markup, `src="js/servicecontrol.js"`)
 	viewScript := strings.Index(markup, `src="js/runtime.js"`)
-	if logviewScript < 0 || viewScript < 0 {
-		t.Fatal("runtime.html does not load the renderer and the view")
+	if logviewScript < 0 || controlScript < 0 || viewScript < 0 {
+		t.Fatal("runtime.html does not load the renderer, the service menu and the view")
 	}
-	if viewScript < logviewScript {
-		t.Error("js/logview.js must load before js/runtime.js: the view uses the renderer")
+	if controlScript < logviewScript {
+		t.Error("js/servicecontrol.js must load after js/logview.js")
+	}
+	if viewScript < controlScript {
+		t.Error("js/servicecontrol.js must load before js/runtime.js: the view drives the menu it wires")
 	}
 }
 
@@ -102,6 +107,13 @@ func TestRuntimeUIServiceControlMarkup(t *testing.T) {
 	}
 	if got := strings.Count(menu, `role="menuitem"`); got != len(want) {
 		t.Errorf("the menu carries %d menu items, want %d", got, len(want))
+	}
+	// Every item names its action: the control unit forwards the name and
+	// never guesses it from an id.
+	for _, action := range []string{"install", "start", "stop", "update", "delete"} {
+		if !strings.Contains(menu, `data-service-action="`+action+`"`) {
+			t.Errorf("the menu does not carry the action %q", action)
+		}
 	}
 	if !strings.Contains(menu, `role="separator"`) {
 		t.Error("the menu carries no separator before the destructive item")
@@ -154,21 +166,28 @@ func TestRuntimeUIServiceMenuStyles(t *testing.T) {
 	if !strings.Contains(css, ":focus-visible") {
 		t.Error("css/runtime.css carries no visible focus for the control")
 	}
-	// The menu is anchored to the trigger by the view: a fixed menu without
-	// a coordinate would sit in the corner of the viewport.
-	if !strings.Contains(runtimeAssetText(t, "js/runtime.js"), "getBoundingClientRect()") {
-		t.Error("js/runtime.js does not anchor the menu at its trigger")
+	// The menu is anchored to the trigger by the control unit: a fixed menu
+	// without a coordinate would sit in the corner of the viewport.
+	if !strings.Contains(runtimeAssetText(t, "js/servicecontrol.js"), "getBoundingClientRect()") {
+		t.Error("js/servicecontrol.js does not anchor the menu at its trigger")
 	}
 }
 
-// TestRuntimeUIAssetsAreSelfContained pins the two files the fallback
-// document of the window host inlines: neither may name an external
-// resource, open a connection of its own or import anything.
+// TestRuntimeUIAssetsAreSelfContained pins the files the fallback document
+// of the window host inlines: none may name an external resource, open a
+// connection of its own or import anything.
 func TestRuntimeUIAssetsAreSelfContained(t *testing.T) {
 	cases := []struct {
 		name      string
 		forbidden []string
 	}{
+		{
+			name: "css/style.css",
+			forbidden: []string{
+				"url(", "@import", "http://", "https://",
+				"<img", "<link", "<script", "<iframe", "@font-face",
+			},
+		},
 		{
 			name: "css/runtime.css",
 			forbidden: []string{
@@ -183,6 +202,16 @@ func TestRuntimeUIAssetsAreSelfContained(t *testing.T) {
 				"import ", "import(", "require(",
 				"url(", "http://", "https://",
 				"<img", "<link", "<script", "<iframe", "src=",
+			},
+		},
+		{
+			name: "js/servicecontrol.js",
+			forbidden: []string{
+				"fetch(", "EventSource", "XMLHttpRequest", "WebSocket",
+				"import ", "import(", "require(",
+				"url(", "http://", "https://",
+				"<img", "<link", "<script", "<iframe", "src=",
+				"innerHTML",
 			},
 		},
 	}
@@ -225,13 +254,31 @@ func TestRuntimeUIViewCarriesNoServiceStateTable(t *testing.T) {
 		"'stopping'",
 		`"stopping"`,
 	}
-	for _, name := range []string{"js/runtime.js", "js/logview.js"} {
+	for _, name := range []string{"js/runtime.js", "js/logview.js", "js/servicecontrol.js"} {
 		text := runtimeAssetText(t, name)
 		for _, token := range forbidden {
 			if strings.Contains(text, token) {
 				t.Errorf("%s carries %q: the service rules belong to internal/serviceview", name, token)
 			}
 		}
+	}
+}
+
+// TestRuntimeUIServiceControlUnitIsOneGlobal pins the unit of the menu as a
+// file of its own: it exposes exactly one global, carries no bound action
+// name of its own (the caller supplies what an activation means) and no
+// state vocabulary (the server classifies the state).
+func TestRuntimeUIServiceControlUnitIsOneGlobal(t *testing.T) {
+	unit := runtimeAssetText(t, "js/servicecontrol.js")
+
+	if got := strings.Count(unit, "global.HFDesk"); got != 1 {
+		t.Errorf("js/servicecontrol.js assigns %d globals, want exactly one", got)
+	}
+	if !strings.Contains(unit, "global.HFDeskServiceControl = { wire: wire };") {
+		t.Error("js/servicecontrol.js does not expose window.HFDeskServiceControl.wire")
+	}
+	for _, token := range regexp.MustCompile(`hfdesk[A-Za-z0-9_$]*`).FindAllString(unit, -1) {
+		t.Errorf("js/servicecontrol.js carries the bound action name %q: the caller owns the actions", token)
 	}
 }
 

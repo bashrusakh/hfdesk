@@ -5,16 +5,21 @@ package desktop
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"html"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/bashrusakh/hfdesk/internal/assets"
 	"github.com/bashrusakh/hfdesk/internal/service"
+	"github.com/bashrusakh/hfdesk/internal/serviceview"
 )
 
 // The private launch flags of the tray companion.
@@ -225,29 +230,6 @@ const (
 	logsDeleteServiceAction = "hfdeskDeleteService"
 )
 
-// logsServiceAction is the primary action the fallback document of the
-// Logs window offers for one read of the state — the step of the state,
-// in the vocabulary of the menu item it mirrors. The zero value offers no
-// step: a state that cannot prove one keeps the document to the two
-// buttons it has always had.
-type logsServiceAction int
-
-const (
-	// logsServiceActionNone offers no step: a running service, a
-	// transition, and a state the read could not settle or report.
-	logsServiceActionNone logsServiceAction = iota
-	// logsServiceActionStart starts the registered service the read
-	// found settled without a running instance.
-	logsServiceActionStart
-	// logsServiceActionInstall registers the service on a machine the
-	// read proved without a registration.
-	logsServiceActionInstall
-	// logsServiceActionUpdate re-registers the service the read found
-	// BROKEN without a running instance: the state whose start would fail
-	// on the missing program, and whose one repairing step is the update.
-	logsServiceActionUpdate
-)
-
 // serviceLogFileName is the name of the active log file of a service
 // instance, next to its rotated generations (documented in docs/SERVICE.md).
 const serviceLogFileName = "hfdesk.log"
@@ -275,8 +257,8 @@ func serviceLogPath(registeredLogDir string) string {
 // large log never reaches the document as a whole: the byte bound caps the
 // read itself — the file is seeked to its end and only the last
 // serviceLogTailBytes are read — and the line bound caps what a tail of
-// that size renders. The document states nothing of the limits; they are the
-// honest volume bound of this view, pinned by test.
+// that size renders. The document states both bounds in the meta of its log
+// panel, so the view never presents a bounded tail as the whole file.
 const (
 	serviceLogTailBytes = 64 * 1024
 	serviceLogTailLines = 200
@@ -559,21 +541,26 @@ func resolveLogsWindow(resolve func() string, fallback func() (string, string)) 
 	return "", key, document
 }
 
+// companionVersion is the build version the fallback document of the Logs
+// window states in its header. The desktop host assigns it once at startup
+// from its Options; a build without a version leaves it empty and the header
+// states the honest dash.
+var companionVersion string
+
 // logsFallbackState is the model of the fallback document of the Logs
-// window — the state the window shows when the registered address does
-// not answer (or names none), in the visual language of the runtime page
-// the live window would have loaded.
+// window — the document the window shows when the registered address does
+// not answer (or names none), in the frame of the runtime page the live
+// window would have loaded.
 //
 // The document is self-contained and reaches out of nowhere: it fetches
-// nothing and listens to nothing — the invariant of the companion is that
-// nothing of it listens, and a local document honors that by having no
-// channel to any server. Its single script only forwards the fixed
-// host-bound actions to the functions the window bound and scrolls the
-// tail box to its end.
+// nothing and listens to nothing. It inlines the very stylesheets and the
+// very units of the live page, so the fallback wears the same frame instead
+// of a second one, and its one script only renders the records Go read and
+// forwards the fixed host-bound actions.
 type logsFallbackState struct {
-	// State is the honest one-line state of the service, the heading of
-	// the document.
-	State string
+	// Version is the build version shown in the header. Empty states the
+	// honest dash.
+	Version string
 	// Address is the registered web-UI address that did not answer,
 	// stated as a fact (never linked — a link to a dead address would
 	// be a dead path). Empty when the registration names none.
@@ -581,118 +568,393 @@ type logsFallbackState struct {
 	// Note is the honest one-line reason there is no address to state,
 	// used when Address is empty. Empty when Address is set.
 	Note string
+	// Service is the ONE table of the service state: its line, its tone
+	// and the actions it proves. The unknown class carries no control at
+	// all — a read that proved nothing may not invent one.
+	Service serviceview.Snapshot
 	// LogPath is the path of the service log file — the very file the
 	// open action opens, so the path and the action always name one
-	// file. Empty when none could be resolved: the document then states
-	// that fact and offers no action with nothing to open.
+	// file. Empty when none could be resolved.
 	LogPath string
 	// Log is the service-log section: the bounded tail of that same log
 	// file, or the honest state of a file that does not exist yet or
-	// could not be read. The zero value claims nothing and renders no
-	// section content.
+	// could not be read.
 	Log serviceLogSection
-	// ServiceAction is the primary action of the header — the step this
-	// state proves: the start of the registration beside a settled state
-	// that does not run, the update beside a broken registration whose
-	// start would fail on its missing program, the installation beside a
-	// proven absence, and no step beside a state that proves none. It leads
-	// the header, the open of the log file follows it, and the retry comes
-	// last; without it the header is the one it has always been.
-	ServiceAction logsServiceAction
 }
 
-// The placeholders of the script template the page builder replaces with
-// the bound action names.
-//
-// The action names have ONE source of truth: the openLogFileAction,
-// logsTryAgainAction, logsStartServiceAction, logsUpdateServiceAction and
-// logsInstallServiceAction constants, which are also the keys the host binds
-// (companionWindowActions). The template never names them — the names are
-// substituted while the page is generated — so the page and the host
-// binding cannot drift apart, and a literal name that reaches the page
-// from anywhere else fails the test that pins the rendered document.
-const (
-	logsFallbackOpenPlaceholder    = "{{open}}"
-	logsFallbackTryPlaceholder     = "{{try}}"
-	logsFallbackStartPlaceholder   = "{{start}}"
-	logsFallbackUpdatePlaceholder  = "{{update}}"
-	logsFallbackInstallPlaceholder = "{{install}}"
-)
+// fallbackLogRecord is one record of the tail as the document's wiring
+// renders it. A line the service wrote is the wire record of the runtime
+// log; a line it did not write — a rotated banner, a panic dump — keeps its
+// own text under Raw and is never parsed into fields it does not have.
+type fallbackLogRecord struct {
+	Seq       uint64         `json:"seq,omitempty"`
+	Time      string         `json:"time,omitempty"`
+	Level     string         `json:"level,omitempty"`
+	Component string         `json:"component,omitempty"`
+	Message   string         `json:"message,omitempty"`
+	Attrs     map[string]any `json:"attrs,omitempty"`
+	// Raw is the text of a line that is not a record. It is a pointer so
+	// an empty line keeps its discriminator in the JSON: a plain string
+	// with omitempty would drop the key and the view would mistake the
+	// line for a parsed record with no fields.
+	Raw *string `json:"raw,omitempty"`
+}
 
-// logsFallbackScriptTemplate is the only script of the fallback document,
-// and it performs exactly two local operations with no channel of any kind:
-// it forwards the fixed action names to the functions the window bound
-// on the host side — open the log file, the service action this document's
-// state button names (start beside a settled registration that does not run,
-// update beside a broken one, installation beside a proven absence), and
-// retry the live page — and scrolls the service-log tail box to its end, so
-// the document shows the END of that log.
-//
-// Nothing here fetches, listens or carries data out of the document: the
-// paths never travel through the page (the host owns them), and the
-// invariant of the companion — nothing of it listens — is unchanged.
-// Every wiring guards its element, so a document without one of the
-// elements — a state whose button is not on screen — runs that part as a
-// no-op.
-const logsFallbackScriptTemplate = `<script>
-(function () {
-	var tail = document.getElementById("service-log-tail");
-	if (tail) { tail.scrollTop = tail.scrollHeight; }
-	var open = document.getElementById("open-log-file");
-	if (open && window.` + logsFallbackOpenPlaceholder + `) {
-		open.addEventListener("click", function () { window.` + logsFallbackOpenPlaceholder + `(); });
+// logsFallbackScriptConfig is the data the single inline script of the
+// document consumes: the records of the tail and the names the window host
+// bound. The names come from the same constants companionWindowActions
+// binds, so the page and the host cannot drift apart.
+type logsFallbackScriptConfig struct {
+	Records       []fallbackLogRecord `json:"records"`
+	Actions       map[string]string   `json:"actions"`
+	OpenLogFile   string              `json:"openLogFile"`
+	OpenLogFolder string              `json:"openLogFolder"`
+	TryAgain      string              `json:"tryAgain"`
+}
+
+// parseServiceLogTail turns the bounded tail into the records of the
+// document. Every line is the wire record of the runtime log when it parses
+// as one; any other line — invalid JSON, or JSON that is not a record —
+// keeps its text verbatim under Raw, so the view can never drop it or
+// invent fields for it.
+func parseServiceLogTail(tail string) []fallbackLogRecord {
+	records := make([]fallbackLogRecord, 0)
+	if tail == "" {
+		return records
 	}
-	var start = document.getElementById("start-service");
-	if (start && window.` + logsFallbackStartPlaceholder + `) {
-		start.addEventListener("click", function () { window.` + logsFallbackStartPlaceholder + `(); });
+	for _, line := range strings.Split(tail, "\n") {
+		var record fallbackLogRecord
+		if err := json.Unmarshal([]byte(line), &record); err != nil || record.Seq == 0 {
+			raw := line
+			record = fallbackLogRecord{Raw: &raw}
+		}
+		records = append(records, record)
 	}
-	var update = document.getElementById("update-service");
-	if (update && window.` + logsFallbackUpdatePlaceholder + `) {
-		update.addEventListener("click", function () { window.` + logsFallbackUpdatePlaceholder + `(); });
+	return records
+}
+
+// logsFallbackScriptConfigFor builds the data of the inline script for one
+// document.
+func logsFallbackScriptConfigFor(state logsFallbackState) logsFallbackScriptConfig {
+	return logsFallbackScriptConfig{
+		Records: parseServiceLogTail(state.Log.Tail),
+		Actions: map[string]string{
+			"install": logsInstallServiceAction,
+			"start":   logsStartServiceAction,
+			"stop":    logsStopServiceAction,
+			"update":  logsUpdateServiceAction,
+			"delete":  logsDeleteServiceAction,
+		},
+		OpenLogFile:   openLogFileAction,
+		OpenLogFolder: openLogFolderAction,
+		TryAgain:      logsTryAgainAction,
 	}
-	var install = document.getElementById("install-service");
-	if (install && window.` + logsFallbackInstallPlaceholder + `) {
-		install.addEventListener("click", function () { window.` + logsFallbackInstallPlaceholder + `(); });
+}
+
+// scriptJSON encodes data for the one inline script of the document. The
+// encoding escapes <, >, & and the JavaScript line separators, so a value
+// from the machine — a log message that names </script>, an address with an
+// ampersand — can never close the element or change the parse of the
+// script.
+func scriptJSON(data any) string {
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return "null"
 	}
-	var again = document.getElementById("try-again");
-	if (again && window.` + logsFallbackTryPlaceholder + `) {
-		again.addEventListener("click", function () { window.` + logsFallbackTryPlaceholder + `(); });
+	return strings.NewReplacer(
+		"&", `\u0026`,
+		"<", `\u003c`,
+		">", `\u003e`,
+		"\u2028", `\u2028`,
+		"\u2029", `\u2029`,
+	).Replace(string(encoded))
+}
+
+// fallbackAsset reads one shipped asset of the live page. The embedded tree
+// is a build-time dependency of this document: a read that fails leaves the
+// frame without that part instead of taking the whole fallback down.
+func fallbackAsset(name string) string {
+	data, err := fs.ReadFile(assets.StaticFS(), name)
+	if err != nil {
+		return ""
 	}
+	return string(data)
+}
+
+// logsFallbackWiring is the local wiring of the fallback document: it
+// renders the records Go read through the shipped renderer, filters them,
+// copies them, forwards the open actions and the service items to the
+// functions the window host bound, and scrolls the view to the end of the
+// tail. It fetches nothing, listens to nothing and carries no data out of
+// the document; every value reaches the DOM through textContent.
+const logsFallbackWiring = `(function () {
+  'use strict';
+
+  var config = window.HFDeskFallbackConfig;
+  var logView = window.HFDeskLogView;
+  var body = document.getElementById('logBody');
+  var emptyState = document.getElementById('emptyState');
+  var emptyTitle = document.getElementById('emptyTitle');
+  var emptyText = document.getElementById('emptyText');
+  var logPanel = document.getElementById('logView');
+  var levelFilter = document.getElementById('levelFilter');
+  var searchInput = document.getElementById('searchInput');
+  var copyButton = document.getElementById('copyButton');
+  var view = { level: 'all', searchLower: '' };
+  var items = [];
+
+  for (var i = 0; i < config.records.length; i++) {
+    var record = config.records[i];
+    if (typeof record.raw === 'string') {
+      items.push({ raw: record.raw });
+      continue;
+    }
+    var normalized = logView.normalizeRecord(record);
+    if (normalized) items.push({ record: normalized });
+  }
+
+  function matches(item) {
+    if (item.raw !== undefined) {
+      if (!view.searchLower) return true;
+      return item.raw.toLowerCase().indexOf(view.searchLower) !== -1;
+    }
+    return logView.matches(item.record, view);
+  }
+
+  function render() {
+    var visible = [];
+    for (var i = 0; i < items.length; i++) {
+      if (matches(items[i])) visible.push(items[i]);
+    }
+
+    body.replaceChildren();
+    for (var j = 0; j < visible.length; j++) {
+      body.appendChild(visible[j].raw !== undefined
+        ? logView.buildRawRow(visible[j].raw)
+        : logView.buildRow(visible[j].record));
+    }
+
+    if (items.length === 0) {
+      emptyState.hidden = false;
+    } else if (visible.length === 0) {
+      emptyState.hidden = false;
+      emptyTitle.textContent = 'No log records match';
+      emptyText.textContent = 'The level filter and the search hide every record of the tail.';
+    } else {
+      emptyState.hidden = true;
+    }
+
+    logPanel.scrollTop = logPanel.scrollHeight;
+  }
+
+  levelFilter.addEventListener('change', function () {
+    view.level = levelFilter.value;
+    render();
+  });
+
+  searchInput.addEventListener('input', function () {
+    view.searchLower = searchInput.value.toLowerCase();
+    render();
+  });
+
+  copyButton.addEventListener('click', function () {
+    var lines = [];
+    for (var i = 0; i < items.length; i++) {
+      if (!matches(items[i])) continue;
+      lines.push(items[i].raw !== undefined ? items[i].raw : logView.formatLine(items[i].record));
+    }
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(lines.join('\n')).catch(function () {});
+    }
+  });
+
+  function bindOpen(id, name) {
+    var button = document.getElementById(id);
+    if (!button) return;
+    button.addEventListener('click', function () {
+      var owner = window[name];
+      if (typeof owner === 'function') owner();
+    });
+  }
+
+  bindOpen('openLogsButton', config.openLogFolder);
+  bindOpen('openLogFileButton', config.openLogFile);
+  bindOpen('try-again', config.tryAgain);
+
+  window.HFDeskServiceControl.wire({
+    trigger: document.getElementById('serviceTrigger'),
+    menu: document.getElementById('serviceMenu'),
+    onAction: function (name) {
+      var owner = window[config.actions[name]];
+      if (typeof owner !== 'function') return;
+      return owner();
+    }
+  });
+
+  render();
 })();
-</script>
 `
 
-// logsFallbackScript renders the script template of the document with the
-// action names of this build substituted in — the same constants the host
-// binds, so the two can never name different functions.
-func logsFallbackScript() string {
-	script := strings.ReplaceAll(logsFallbackScriptTemplate, logsFallbackOpenPlaceholder, openLogFileAction)
-	script = strings.ReplaceAll(script, logsFallbackTryPlaceholder, logsTryAgainAction)
-	script = strings.ReplaceAll(script, logsFallbackStartPlaceholder, logsStartServiceAction)
-	script = strings.ReplaceAll(script, logsFallbackUpdatePlaceholder, logsUpdateServiceAction)
-	return strings.ReplaceAll(script, logsFallbackInstallPlaceholder, logsInstallServiceAction)
+// logsFallbackScript renders the only script of the document: the shipped
+// renderer, the shipped menu control and the local wiring, followed by the
+// data of this document. The data is encoded with scriptJSON, so no value
+// of the machine can close the element.
+func logsFallbackScript(state logsFallbackState) string {
+	var script strings.Builder
+	script.WriteString("<script>\n")
+	script.WriteString(fallbackAsset("js/logview.js"))
+	script.WriteString("\n")
+	script.WriteString(fallbackAsset("js/servicecontrol.js"))
+	script.WriteString("\nwindow.HFDeskFallbackConfig = ")
+	script.WriteString(scriptJSON(logsFallbackScriptConfigFor(state)))
+	script.WriteString(";\n")
+	script.WriteString(logsFallbackWiring)
+	script.WriteString("</script>\n")
+	return script.String()
 }
 
-// logsFallbackPage renders the model into the fallback document of the
-// Logs window.
+// logsFallbackTone is the class of the status dot of the one table's tone.
+func logsFallbackTone(tone string) string {
+	if tone == "" {
+		return "is-muted"
+	}
+	return "is-" + tone
+}
+
+// logsFallbackServiceControl writes the service control of the header —
+// the very markup of runtime.html, with the items of this state. The
+// control is the state line and the actions that state proves; a read that
+// proved nothing renders no control at all.
+func logsFallbackServiceControl(page *strings.Builder, snapshot serviceview.Snapshot) {
+	actions := snapshot.Actions
+	shown := snapshot.Class != serviceview.ClassUnknown &&
+		(actions.Install.Visible || actions.Start.Visible || actions.Stop.Visible ||
+			actions.Update.Visible || actions.Delete.Visible)
+
+	label := snapshot.Label
+	if label == "" {
+		label = "Service &mdash;"
+	} else {
+		label = html.EscapeString(label)
+	}
+
+	hidden := ""
+	if !shown {
+		hidden = " hidden"
+	}
+
+	page.WriteString(`<div class="runtime-service" id="serviceControl"` + hidden + `>
+<button class="btn btn-outline btn-sm runtime-service-trigger" id="serviceTrigger" type="button"
+        aria-haspopup="menu" aria-expanded="false" aria-controls="serviceMenu"
+        title="The service registration of this machine">
+<span class="status-indicator runtime-service-dot ` + logsFallbackTone(snapshot.Tone) + `" id="serviceDot"></span>
+<span class="runtime-service-label" id="serviceLabel">` + label + `</span>
+<svg class="runtime-service-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+     stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
+  <path d="m6 9 6 6 6-6"/>
+</svg>
+</button>
+<div class="runtime-service-menu" id="serviceMenu" role="menu" aria-labelledby="serviceTrigger" hidden>
+`)
+	page.WriteString(fallbackServiceItem("serviceInstallItem", "install", "Install service&hellip;", "runtime-service-item", actions.Install))
+	page.WriteString(fallbackServiceItem("serviceStartItem", "start", "Start service", "runtime-service-item", actions.Start))
+	page.WriteString(fallbackServiceItem("serviceStopItem", "stop", "Stop service", "runtime-service-item", actions.Stop))
+	page.WriteString(fallbackServiceItem("serviceUpdateItem", "update", "Update service", "runtime-service-item", actions.Update))
+
+	separator := true
+	if !actions.Delete.Visible || !(actions.Install.Visible || actions.Start.Visible ||
+		actions.Stop.Visible || actions.Update.Visible) {
+		separator = false
+	}
+	if separator {
+		page.WriteString(`<div class="runtime-service-separator" id="serviceSeparator" role="separator"></div>` + "\n")
+	} else {
+		page.WriteString(`<div class="runtime-service-separator" id="serviceSeparator" role="separator" hidden></div>` + "\n")
+	}
+	page.WriteString(fallbackServiceItem("serviceDeleteItem", "delete", "Delete service&hellip;", "runtime-service-item runtime-service-item-danger", actions.Delete))
+
+	page.WriteString(`</div>
+<span class="badge badge-secondary runtime-service-chip" id="serviceChip" hidden>
+  <span class="status-indicator runtime-service-dot is-muted" id="serviceChipDot"></span>
+  <span id="serviceChipLabel">` + label + `</span>
+</span>
+</div>
+`)
+}
+
+// fallbackServiceItem writes one item of the service menu. The action map of
+// the one table decides both the presence and the availability: a hidden
+// item is never clickable behind the scenes.
+func fallbackServiceItem(id, action, label, class string, act serviceview.Action) string {
+	attrs := ""
+	if !act.Visible {
+		attrs += " hidden"
+	}
+	if !act.Enabled {
+		attrs += " disabled"
+	}
+	return fmt.Sprintf(
+		`<button class="%s" id="%s" type="button" role="menuitem" data-service-action="%s"%s>%s</button>`+"\n",
+		class, id, action, attrs, label)
+}
+
+// logsFallbackEmptyState answers the honest empty state of the panel: the
+// missing file, the unreadable file, the log that names no path and the
+// empty file. A readable tail with records shows no empty state.
+func logsFallbackEmptyState(section serviceLogSection) (title, text string, show bool) {
+	switch {
+	case section.Path == "":
+		return "The log file is not known.", "The registration names no log directory, so there is no service log to show.", true
+	case section.Missing:
+		return "The service log file has not been created yet.", "The service writes the file when it runs.", true
+	case section.ReadError != "":
+		reason := strings.TrimSuffix(section.ReadError, ".")
+		return "The service log file could not be read: " + reason + ".", "The reason above is the answer of the file system.", true
+	case section.Tail == "":
+		return "The service log is empty.", "The service has not written a record yet.", true
+	}
+	return "", "", false
+}
+
+// logsFallbackPage renders the model into the fallback document of the Logs
+// window.
 //
-// The document wears the visual language of the runtime page — the same
-// header with the status line, the same fact strip, the same design token
-// values — inlined, because a fallback document has no server to load a
-// stylesheet from; that is exactly why it is a document and not a page.
-// It states the honest state of the service, the address that did not
-// answer (or the honest reason there is none), the step that state proves
-// as the primary action of the header — the start of the registration
-// beside a settled state that does not run, the update beside a broken
-// registration, the installation beside a proven absence, and no step
-// beside a state that proves none, so the window-diagnosis always offers its
-// treatment step when one exists — the
-// path of the service log file with the action that opens it, the bounded
-// tail of that same log under its own **Service log** section — or the
-// honest state of a file that is not there or could not be read — and the
-// one action that retries the live page. Everything the model carries is
+// The document wears the frame of the runtime page — the same header, the
+// same fact banner, the same status strip and the same log panel — from the
+// very stylesheets and the very units of that page, inlined because a
+// fallback document has no server to load them from. It states the address
+// that did not answer (or the honest reason there is none), the service
+// control of the one table with the actions of its state, the path of the
+// service log with the actions that open it, and the bounded tail of that
+// same log as the table of the live page. Everything the model carries is
 // escaped, so a value from the machine can never become markup.
 func logsFallbackPage(state logsFallbackState) string {
+	records := parseServiceLogTail(state.Log.Tail)
+	emptyTitle, emptyText, emptyShown := logsFallbackEmptyState(state.Log)
+	emptyHidden := " hidden"
+	if emptyShown {
+		emptyHidden = ""
+	}
+
+	logFile := "&mdash;"
+	if state.LogPath != "" {
+		logFile = html.EscapeString(state.LogPath)
+	}
+	openDisabled := " disabled"
+	if state.LogPath != "" {
+		openDisabled = ""
+	}
+	server := "&mdash;"
+	if state.Address != "" {
+		server = html.EscapeString(state.Address)
+	}
+	version := strings.TrimSpace(state.Version)
+	if version == "" {
+		version = "&mdash;"
+	} else {
+		version = html.EscapeString(version)
+	}
+
 	var page strings.Builder
 	page.WriteString(`<!doctype html>
 <html lang="en">
@@ -701,119 +963,135 @@ func logsFallbackPage(state logsFallbackState) string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>HFDesk - Logs</title>
 <style>
-:root {
-  --color-bg: #0a0a0f;
-  --color-bg-secondary: #12121a;
-  --color-bg-tertiary: #1a1a24;
-  --color-surface: #1e1e2a;
-  --color-surface-hover: #252532;
-  --color-border: #2a2a3a;
-  --color-border-light: #3a3a4a;
-  --color-text: #c8c8d0;
-  --color-text-secondary: #a0a0b0;
-  --color-text-muted: #6a6a7a;
-  --color-primary: #6366f1;
-  --color-primary-hover: #7c7ff7;
-  --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
-  --radius-sm: 6px;
-  --radius-full: 9999px;
-}
-* { box-sizing: border-box; }
-body { margin: 0; background: var(--color-bg); color: var(--color-text); font-family: var(--font-family); font-size: 14px; }
-.shell { display: flex; flex-direction: column; min-height: 100vh; }
-.header { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 20px; padding: 14px 20px; background: var(--color-bg-secondary); border-bottom: 1px solid var(--color-border); }
-.logo { font-size: 14px; font-weight: 600; }
-.status { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.dot { width: 8px; height: 8px; border-radius: var(--radius-full); background: var(--color-text-muted); flex-shrink: 0; }
-.status h1 { margin: 0; font-size: 13px; font-weight: 500; color: var(--color-text-secondary); }
-.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-left: auto; }
-.banner { padding: 10px 20px; background: rgba(239, 68, 68, 0.08); border-bottom: 1px solid rgba(239, 68, 68, 0.3); color: var(--color-text-secondary); font-size: 13px; }
-.strip { display: flex; flex-wrap: wrap; gap: 10px 32px; padding: 12px 20px; background: var(--color-bg-secondary); border-bottom: 1px solid var(--color-border); }
-.stat { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.stat-label { font-size: 11px; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
-.stat-empty { font-size: 13px; color: var(--color-text-muted); }
-code { font-family: var(--font-mono); font-size: 12px; background: var(--color-bg-tertiary); border: 1px solid var(--color-border); border-radius: var(--radius-sm); padding: 3px 8px; overflow-wrap: anywhere; color: var(--color-text-secondary); }
-pre { font-family: var(--font-mono); font-size: 12px; background: var(--color-bg-tertiary); border: 1px solid var(--color-border); border-radius: var(--radius-sm); padding: 8px 10px; margin: 0; max-height: 340px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--color-text-secondary); }
-.btn { font: inherit; font-size: 13px; padding: 7px 14px; border: 1px solid var(--color-border-light); border-radius: var(--radius-sm); background: var(--color-surface); color: var(--color-text); cursor: pointer; }
-.btn:hover { background: var(--color-surface-hover); }
-.btn-primary { background: var(--color-primary); border-color: var(--color-primary); color: #fff; }
-.btn-primary:hover { background: var(--color-primary-hover); }
-@media (max-width: 720px) {
-  .header, .banner, .strip { padding-left: 14px; padding-right: 14px; }
-  .actions { margin-left: 0; }
-}
+`)
+	page.WriteString(fallbackAsset("css/style.css"))
+	page.WriteString("\n")
+	page.WriteString(fallbackAsset("css/runtime.css"))
+	page.WriteString(`
 </style>
 </head>
 <body>
-<div class="shell">
-<header class="header">
-<div class="logo">HFDesk</div>
+<div class="runtime-shell">
+
+<header class="runtime-header">
+<div class="logo">
+<svg class="logo-icon" viewBox="0 0 512 512" aria-hidden="true">
+  <rect width="512" height="512" rx="108" fill="#12121a"/>
+  <rect x="5" y="5" width="502" height="502" rx="103" fill="none" stroke="#2a2a3a" stroke-width="4" opacity="0.6"/>
+  <rect x="112" y="96" width="88" height="320" rx="20" fill="#6366f1"/>
+  <rect x="312" y="96" width="88" height="320" rx="20" fill="#6366f1"/>
+  <rect x="112" y="216" width="288" height="80" rx="18" fill="#6366f1"/>
+</svg>
+<span class="logo-text">HFDesk</span>
+</div>
+<div class="runtime-header-status">
+<span class="connection-status">
+  <span class="status-indicator runtime-status-indicator is-error" id="statusDot"></span>
+  <span id="statusLabel">Offline</span>
+</span>
+<span class="runtime-version" id="versionLabel">Version `)
+	page.WriteString(version)
+	page.WriteString(`</span>
 `)
-	if state.State != "" {
-		page.WriteString("<div class=\"status\"><span class=\"dot\" aria-hidden=\"true\"></span><h1>" +
-			html.EscapeString(state.State) + "</h1></div>\n")
-	}
-	page.WriteString("<div class=\"actions\">")
-	// The step of the state leads the header, and it is the ONE primary
-	// button of that header: the open of the log file takes the
-	// secondary place beside it, and keeps the primary place it has
-	// always had when the state offers no step.
-	openClass := "btn btn-primary"
-	switch state.ServiceAction {
-	case logsServiceActionStart:
-		openClass = "btn"
-		page.WriteString("<button class=\"btn btn-primary\" id=\"start-service\" type=\"button\">Start service</button>")
-	case logsServiceActionUpdate:
-		openClass = "btn"
-		page.WriteString("<button class=\"btn btn-primary\" id=\"update-service\" type=\"button\">Update service</button>")
-	case logsServiceActionInstall:
-		openClass = "btn"
-		page.WriteString("<button class=\"btn btn-primary\" id=\"install-service\" type=\"button\">Install service...</button>")
-	}
-	if state.LogPath != "" {
-		page.WriteString("<button class=\"" + openClass + "\" id=\"open-log-file\" type=\"button\">Open the log file</button>")
-	}
-	page.WriteString("<button class=\"btn\" id=\"try-again\" type=\"button\">Try again</button>")
-	page.WriteString("</div>\n</header>\n")
+	logsFallbackServiceControl(&page, state.Service)
+	page.WriteString(`</div>
+</header>
 
-	switch {
-	case state.Address != "":
-		page.WriteString("<div class=\"banner\" role=\"status\">The web UI at <code>" +
-			html.EscapeString(state.Address) + "</code> does not answer.</div>\n")
-	case state.Note != "":
-		page.WriteString("<div class=\"banner\" role=\"status\">" + html.EscapeString(state.Note) + "</div>\n")
-	}
-
-	page.WriteString("<section class=\"strip\">\n<div class=\"stat\"><div class=\"stat-label\">Log file</div>")
-	if state.LogPath != "" {
-		page.WriteString("<code>" + html.EscapeString(state.LogPath) + "</code>")
+<div class="runtime-error" id="errorBanner" role="status">
+  <strong id="errorTitle">Cannot reach the HFDesk server</strong>
+  <span id="errorText">`)
+	if state.Address != "" {
+		page.WriteString("The web UI at <code>" + html.EscapeString(state.Address) + "</code> does not answer.")
 	} else {
-		page.WriteString("<span class=\"stat-empty\">The log file is not known.</span>")
-	}
-	page.WriteString("</div>\n</section>\n")
-
-	section := state.Log
-	if section.Path != "" || section.Missing || section.ReadError != "" || section.Tail != "" {
-		// The service-log section speaks only when the model carries
-		// a source: one heading and exactly one of the honest shapes
-		// of that file — the bounded tail ending with the newest
-		// line, the fact that the file is not there yet, or the
-		// one-line reason it could not be read.
-		page.WriteString("<section class=\"strip\">\n<div class=\"stat\"><div class=\"stat-label\">Service log</div>")
-		switch {
-		case section.Missing:
-			page.WriteString("<span class=\"stat-empty\">The service log file has not been created yet.</span>")
-		case section.ReadError != "":
-			reason := html.EscapeString(strings.TrimSuffix(section.ReadError, "."))
-			page.WriteString("<span class=\"stat-empty\">The service log file could not be read: " + reason + ".</span>")
-		case section.Tail != "":
-			page.WriteString("<pre id=\"service-log-tail\">" + html.EscapeString(section.Tail) + "</pre>")
+		note := state.Note
+		if note == "" {
+			note = "The address of the web UI is not known."
 		}
-		page.WriteString("</div>\n</section>\n")
+		page.WriteString(html.EscapeString(note))
 	}
-	page.WriteString("</div>\n")
-	page.WriteString(logsFallbackScript())
-	page.WriteString("</body>\n</html>\n")
+	page.WriteString(`</span>
+  <button class="btn btn-outline btn-sm" id="try-again" type="button">Try again</button>
+</div>
+
+<section class="runtime-strip" aria-label="Runtime status">
+  <div class="runtime-stat">
+    <span class="runtime-stat-label">Server</span>
+    <span class="runtime-stat-value"><code class="runtime-url" id="serverUrl">` + server + `</code></span>
+  </div>
+  <div class="runtime-stat">
+    <span class="runtime-stat-label">Active jobs</span>
+    <span class="runtime-stat-value"><span id="activeJobs">&mdash;</span></span>
+  </div>
+  <div class="runtime-stat">
+    <span class="runtime-stat-label">Log file</span>
+    <span class="runtime-stat-value"><span class="config-chip"><code id="logFile">` + logFile + `</code></span></span>
+  </div>
+</section>
+
+<section class="runtime-log-panel">
+  <div class="runtime-log-toolbar">
+    <div class="runtime-toolbar-group">
+      <label class="runtime-toolbar-label" for="levelFilter">Level</label>
+      <select class="search-select" id="levelFilter">
+        <option value="all">All levels</option>
+        <option value="debug">Debug</option>
+        <option value="info">Info</option>
+        <option value="warn">Warn</option>
+        <option value="error">Error</option>
+      </select>
+      <div class="search-input-wrap runtime-search">
+        <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18" aria-hidden="true">
+          <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+        </svg>
+        <input class="search-input" id="searchInput" type="text" placeholder="Search logs&hellip;" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+
+    <div class="runtime-toolbar-group">
+      <button class="btn btn-secondary btn-sm" id="copyButton" type="button"
+              title="Copy the rows that are currently visible to the clipboard">Copy</button>
+      <button class="btn btn-secondary btn-sm" id="openLogsButton" type="button"
+              title="Open the folder of the service log file"` + openDisabled + `>Open log folder</button>
+      <button class="btn btn-secondary btn-sm" id="openLogFileButton" type="button"
+              title="Open the service log file in the default program"` + openDisabled + `>Open log file</button>
+    </div>
+  </div>
+
+  <div class="runtime-log-meta">
+    <span class="connection-status">
+      <span class="status-indicator runtime-status-indicator is-error"></span>
+      <span id="streamLabel">Offline &mdash; last `)
+	page.WriteString(strconv.Itoa(len(records)))
+	page.WriteString(` lines</span>
+    </span>
+    <span id="recordCount">at most `)
+	page.WriteString(strconv.Itoa(serviceLogTailLines))
+	page.WriteString(` lines, `)
+	page.WriteString(strconv.Itoa(serviceLogTailBytes / 1024))
+	page.WriteString(` KiB</span>
+  </div>
+
+  <div class="runtime-log-view" id="logView" role="log" aria-live="off" tabindex="0">
+    <div class="runtime-log-head" aria-hidden="true">
+      <span class="runtime-time">Time</span>
+      <span class="runtime-level">Level</span>
+      <span class="runtime-component">Component</span>
+      <span class="runtime-message">Message</span>
+      <span class="runtime-attrs">Attributes</span>
+    </div>
+    <div class="runtime-log-body" id="logBody"></div>
+    <div class="empty-state" id="emptyState"` + emptyHidden + `>
+      <h3 id="emptyTitle">` + html.EscapeString(emptyTitle) + `</h3>
+      <p id="emptyText">` + html.EscapeString(emptyText) + `</p>
+    </div>
+  </div>
+</section>
+
+</div>
+`)
+	page.WriteString(logsFallbackScript(state))
+	page.WriteString(`</body>
+</html>
+`)
 	return page.String()
 }

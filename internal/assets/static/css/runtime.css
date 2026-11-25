@@ -326,6 +326,13 @@
   background: var(--color-surface-hover);
 }
 
+/* A line the service wrote that is not one of its records (a rotated
+   banner, a panic dump) has no columns of its own: it is one message. */
+.runtime-log-row-text {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "message";
+}
+
 .runtime-time {
   grid-area: time;
   color: var(--color-text-muted);
@@ -408,6 +415,11 @@
       "attrs attrs attrs";
     padding-left: 14px;
     padding-right: 14px;
+  }
+
+  .runtime-log-row-text {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "message";
   }
 }
 
