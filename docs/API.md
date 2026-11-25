@@ -134,9 +134,10 @@ from one read of the same table the tray menu uses:
   the supervisor reported no usable state). An `unknown` view carries no
   label, no tone and no action.
 - `label` is the status line of the service ("`Service: not installed`",
-  "`Service: starting`", "`Service: running`", "`Service: stopped`",
-  "`Service: failed`"). It is empty for `unknown`. A transition shows its
-  own word; a broken registration whose process still serves shows
+  "`Service: starting`", "`Service: stopping`", "`Service: running`",
+  "`Service: stopped`", "`Service: failed`"). It is empty for `unknown`. A
+  transition shows its own word; a broken registration whose process still
+  serves shows
   "`Service: running`", while a broken registration without one shows
   "`Service: failed`" (its start stays hidden; the update repairs it).
 - `tone` is the presentation of the line: `success` (running), `warning` (a
