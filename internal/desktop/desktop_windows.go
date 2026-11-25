@@ -316,7 +316,8 @@ func run(o Options, logPath string) (err error) {
 	defer cancel()
 
 	// The runtime window is created further down, before the signal
-	// watcher starts; the shutdown closes it when it exists.
+	// watcher starts; the shutdown destroys it when it exists — before the
+	// server stops, so its page never sees the server go away.
 	var window *runtimeWindow
 
 	// The shutdown stops the server and waits for the graceful shutdown
@@ -332,7 +333,16 @@ func run(o Options, logPath string) (err error) {
 	shutdown = func() {
 		shutdownOnce.Do(func() {
 			plan, committed := shutdownCoordinator.beginShutdown()
-			cancel()
+			// The Logs window shows a live page of THIS server. It is
+			// destroyed before the server stops: the page reacts to a
+			// server that stops answering with its own error state — the
+			// error banner and the red status indicators of the runtime
+			// page — and a window that outlived the stop would flash that
+			// state for the whole time between the stop and the close
+			// (the committed handover waits there for the helper). The
+			// wait for the destroyed window is bounded, so a window that
+			// does not answer cannot hold the shutdown.
+			closeWindowBeforeServerStop(window, windowShutdownTimeout, cancel)
 			if committed {
 				completeHandover(plan, func() error {
 					waitErr := application.Wait()
@@ -348,8 +358,13 @@ func run(o Options, logPath string) (err error) {
 			} else if err := application.Wait(); err != nil {
 				desktopLog.Error("the server did not stop cleanly", "error", err)
 			}
-			// The runtime window is closed after the server stopped, so
-			// it never shows a page of a server that is gone.
+			// A window that came up beside this shutdown — the user opened
+			// the Logs window in the very moment the host ended — was not
+			// there for the close above, so it is closed here, and the host
+			// keeps its old guarantee that it leaves no window behind. It
+			// is the plain close: the window that existed was already
+			// destroyed above, and a window created in between must not
+			// hold the end of the host.
 			if window != nil {
 				window.Close()
 			}
@@ -702,11 +717,37 @@ func endHostOnSignal(signalCtx context.Context, quit func()) {
 	quit()
 }
 
+// closeWindowBeforeServerStop destroys the Logs window, waits with a bound for
+// the end of its message loop, and then stops the server through cancel.
+//
+// The page of the window is a live page of the server that is being stopped:
+// it reads the runtime status and the log over the HTTP API, so the moment the
+// server stops answering it paints its own error state — the error banner and
+// the red status indicators of the runtime page. A window that outlives the
+// stop therefore flashes that state for the whole time between the stop and
+// the close, which is exactly what a committed service handover shows while it
+// waits for its helper and the graceful stop.
+//
+// Destroying the window first removes the page that could paint it, and the
+// wait makes the order a fact rather than a race: the server is not stopped
+// until the window loop ended. The budget only covers a window whose runtime
+// does not answer — the host still ends then.
+//
+// This is the close of a host that is ending, never a quieting of the page: a
+// server that fails while the host keeps running never reaches this function,
+// so its errors stay visible in the open window.
+func closeWindowBeforeServerStop(window *runtimeWindow, budget time.Duration, cancel func()) {
+	if window != nil {
+		window.CloseAndWait(budget)
+	}
+	cancel()
+}
+
 // stopServer runs the graceful shutdown and waits for it with a bound.
 //
-// The shutdown cancels the context of the application, waits for the server
-// to stop and closes the runtime window. The wait is bounded, so a server
-// that does not stop cannot keep the host from ending.
+// The shutdown destroys the runtime window before it stops the server, waits
+// for the server to stop and for the handover of a committed action. The wait
+// is bounded, so a server that does not stop cannot keep the host from ending.
 //
 // The shutdown runs in a goroutine of its own, so the caller waits with the
 // bound instead of blocking on the shutdown.
