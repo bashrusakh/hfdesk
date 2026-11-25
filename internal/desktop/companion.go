@@ -158,19 +158,24 @@ func desktopRelaunchArgs(argv []string, wait time.Duration) []string {
 // window host.
 //
 // The window binds these names on the host side (companionWindowActions,
-// desktopWindowActions) and the pages call them: the live runtime page of
-// the server calls the open actions, the fallback document calls the open
-// action, the retry and — in the state its own button shows — ONE service
-// action: the start beside a registration the read found settled without a
-// running instance, the update beside a broken registration whose program is
-// gone, the installation beside a proven absence of one. Every
-// name has ONE source of truth — these constants — and the pages reference
-// them through the substituted template or through the pinned literals of
-// runtime.js, so the page and the host binding cannot drift apart into a
-// dead button. The service actions belong to the companion window
-// alone: the fallback document only ever loads beside a tray companion
-// (the desktop host always loads the page of its own server), so
-// companionWindowActions is the one binding they have.
+// desktopWindowActions), and a document calls a name only through the
+// element it renders: the fallback document calls the open action, the
+// retry and — in the state its own button shows — ONE service action: the
+// start beside a registration the read found settled without a running
+// instance, the update beside a broken registration whose program is gone,
+// the installation beside a proven absence of one. The runtime page of the
+// server calls the open actions beside the ones it performs over its own
+// API. Every name has ONE source of truth — these constants — and the pages
+// reference them through the substituted template or through the pinned
+// literals of runtime.js, so the page and the host binding cannot drift
+// apart into a dead button.
+//
+// The five service actions are the very flows of the tray menu (see
+// windowServiceActions), and BOTH windows bind them: a desktop host has to
+// be able to do what its own tray does, and a tray companion whose
+// registered address answers shows the live page of the service. The
+// fallback document itself exists only beside a tray companion — the
+// desktop host always loads the page of its own server.
 //
 // The names carry no data: the host owns every path it acts on, and the
 // open actions run in the process of the WINDOW — in the user's session —
@@ -210,6 +215,14 @@ const (
 	// state, and the very flow the Install service item of the menu
 	// runs.
 	logsInstallServiceAction = "hfdeskInstallService"
+	// logsStopServiceAction stops the running service: the very flow the
+	// Stop service item of the menu runs, with its confirmation.
+	logsStopServiceAction = "hfdeskStopService"
+	// logsDeleteServiceAction removes the registration from the machine:
+	// the very flow the Delete service item of the menu runs, with its
+	// confirmation and — beside a desktop that serves the address — the
+	// handover it commits.
+	logsDeleteServiceAction = "hfdeskDeleteService"
 )
 
 // logsServiceAction is the primary action the fallback document of the
