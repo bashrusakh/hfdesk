@@ -217,13 +217,16 @@ func (m *trayServiceMenu) apply(state serviceMenuState) {
 }
 
 // writeItem writes one managed menu item for one read, owning the rule
-// that keeps a hidden item hidden:
+// that keeps a hidden item hidden — and inert:
 //
 //   - an item that shows is shown first when it was hidden, then enabled
 //     or greyed — both writes land on a VISIBLE item, which the tray
 //     library updates in place;
-//   - an item that hides receives exactly one write, Hide, and nothing
-//     after it in this pass;
+//   - an item that hides is greyed FIRST and then hidden, so Hide stays
+//     the last write of the pass: the tray library keeps the enabled
+//     state of an item it removes, and an item that comes back from the
+//     menu must never carry a promise it no longer shows — a hidden
+//     Start beside a broken registration was exactly such a leftover;
 //   - an item that is already hidden receives NO write at all: any
 //     update (Enable, Disable, SetTitle) re-inserts a hidden item into
 //     the menu in the tray library, which resurrected the grey install
@@ -250,6 +253,7 @@ func writeItem(item trayMenuItem, visible, enabled, wasVisible bool) {
 		return
 	}
 	if wasVisible {
+		item.Disable()
 		item.Hide()
 	}
 }
