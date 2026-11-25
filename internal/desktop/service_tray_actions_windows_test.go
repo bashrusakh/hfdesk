@@ -699,11 +699,12 @@ func TestServiceHelperUninstallRemovesOnlyTheRegistration(t *testing.T) {
 // TestTrayMenuAppliesLifecycleItems proves the write side of the menu map:
 // one read is applied to all the submenu items — the lifecycle items appear
 // beside the registration and enable per state, the start hides beside a
-// broken registration, an unsettled read hides the line and every item (the
-// submenu is empty until a read proves a state), and a machine without a
-// registration hides the whole group while the install item becomes the
-// only active action.
+// broken registration, an unsettled read hides the line, every item and the
+// root entry that opens them (the section disappears until a read proves a
+// state), and a machine without a registration hides the whole group while
+// the install item becomes the only active action.
 func TestTrayMenuAppliesLifecycleItems(t *testing.T) {
+	entry := newFakeTrayItem()
 	line := newFakeTrayItem()
 	install := newFakeTrayItem()
 	start := newFakeTrayItem()
@@ -711,7 +712,7 @@ func TestTrayMenuAppliesLifecycleItems(t *testing.T) {
 	update := newFakeTrayItem()
 	del := newFakeTrayItem()
 	menu := &trayServiceMenu{
-		line: line, install: install, start: start, stop: stop,
+		service: entry, line: line, install: install, start: start, stop: stop,
 		update: update, delete: del,
 	}
 	snapshot := func() (startVisible, startEnabled, stopEnabled, updateEnabled, delEnabled, installVisible bool) {
@@ -830,6 +831,9 @@ func TestTrayMenuAppliesLifecycleItems(t *testing.T) {
 	}
 	if _, _, lineVisible, _ := line.snapshot(); lineVisible {
 		t.Error("the status line is visible beside an unsettled read: the read proved no state to name")
+	}
+	if _, _, entryVisible, _ := entry.snapshot(); entryVisible {
+		t.Error("the root Service entry is visible beside an unsettled read: it would open an empty submenu")
 	}
 }
 

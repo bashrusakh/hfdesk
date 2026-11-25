@@ -734,6 +734,7 @@ func TestCompanionWindowReadsEachAskTheMenuToCatchUp(t *testing.T) {
 //   - every write follows the hide rule (no update after Hide, pinned by
 //     its own order test): an already hidden item receives nothing.
 func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
+	entry := newFakeTrayItem()
 	line := newFakeTrayItem()
 	open := newFakeTrayItem()
 	install := newFakeTrayItem()
@@ -742,7 +743,8 @@ func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
 	update := newFakeTrayItem()
 	del := newFakeTrayItem()
 	menu := &trayServiceMenu{
-		line: line, open: open, install: install, start: start, stop: stop, update: update, delete: del,
+		service: entry, line: line, open: open, install: install,
+		start: start, stop: stop, update: update, delete: del,
 		openFollowsService: true,
 	}
 	lifecycleItems := map[string]*fakeTrayItem{
@@ -841,13 +843,16 @@ func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
 	}
 
 	// An UNSETTLED read offers nothing: no line, no lifecycle item, no
-	// install item and no Open HFDesk — the submenu is empty, because
-	// neither claim and no state was proven. The read policy retries by
-	// itself and the tick brings the state back, so the user has nothing
-	// to do about the failure.
+	// install item, no Open HFDesk — AND no ROOT Service entry, because an
+	// empty submenu is the same dead surface as the retired "unknown" row.
+	// The read policy retries by itself and the tick brings the state
+	// back, so the user has nothing to do about the failure.
 	menu.apply(serviceMenuFor(service.Status{}, errors.New("the service control manager did not answer")))
 	if title, _, visible, _ := line.snapshot(); visible {
 		t.Errorf("the status line shows %q at an unsettled read, want no line at all", title)
+	}
+	if _, _, visible, _ := entry.snapshot(); visible {
+		t.Error("the root Service entry is on screen at an unsettled read: it would open an empty submenu")
 	}
 	requireInstallHidden(t, "an unsettled read")
 	requireLifecycleHidden(t, "an unsettled read")
@@ -862,6 +867,9 @@ func TestCompanionMenuAppliesTheAbsenceRuleAndTheSharedMapping(t *testing.T) {
 	menu.apply(serviceMenuFor(service.Status{State: service.StateNotInstalled}, nil))
 	if title, _, _, _ := line.snapshot(); title != "Service: not installed" {
 		t.Errorf("the status line = %q, want the honest absence line", title)
+	}
+	if _, _, visible, _ := entry.snapshot(); !visible {
+		t.Error("the root Service entry did not return after a read proved a machine without a registration")
 	}
 	if _, enabled, visible, _ := install.snapshot(); !visible || !enabled {
 		t.Errorf("the install item visible=%t enabled=%t beside a proven absence, want it visible and enabled: the menu must not be a dead end", visible, enabled)

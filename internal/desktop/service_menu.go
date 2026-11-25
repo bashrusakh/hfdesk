@@ -141,6 +141,18 @@ func serviceStatusLine(status service.Status, readErr error) string {
 	}
 }
 
+// showsSomething reports whether one read has anything to put inside the
+// Service submenu: a line, the install item, a lifecycle item or the open
+// item of the registration.
+//
+// An unsettled read has none of them, and an EMPTY submenu is the same dead
+// surface as the retired "unknown" row: the root entry that opens it hides
+// with it, so the tray shows no service section at all until a read proves a
+// state.
+func (s serviceMenuState) showsSomething() bool {
+	return s.LineVisible || s.InstallVisible || s.ActionsVisible || s.StartVisible || s.OpenVisible
+}
+
 // serviceMenuFor maps one read of the registration onto the submenu it
 // shows — the mode-times-state model both styles share:
 //
@@ -159,13 +171,14 @@ func serviceStatusLine(status service.Status, readErr error) string {
 //   - a TRANSITION (a pending start or stop) is not a state to decide
 //     on — the rule of the service gate applied to the group — so every
 //     lifecycle item goes grey until the reading settles again;
-//   - an UNSETTLED read claims nothing and shows nothing: no line and no
-//     item of the submenu at all, because "no service is installed" was
-//     not proven by a read that failed and no action may be offered on a
-//     state that was never read. The read retries itself before it
-//     reports (readForDisplay), and the ordinary tick and the catch-up
-//     after every action keep reading, so the line and the items come
-//     back by themselves as soon as a read proves a state.
+//   - an UNSETTLED read claims nothing and shows nothing: no line, no
+//     item of the submenu at all and no ROOT entry that would open it,
+//     because "no service is installed" was not proven by a read that
+//     failed and no action may be offered on a state that was never read.
+//     The read retries itself before it reports (readForDisplay), and the
+//     ordinary tick and the catch-up after every action keep reading, so
+//     the line, the items and the entry come back by themselves as soon
+//     as a read proves a state.
 //
 // The Open HFDesk item keeps its own two claims (visible beside a proven
 // registration, enabled on the running fact) — the companion rule apply

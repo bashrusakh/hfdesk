@@ -247,6 +247,11 @@ func TestServiceMenuUnsettledReadShowsNothing(t *testing.T) {
 		t.Errorf("the unsettled read offers install=%t actions=%t start=%t open=%t, want none",
 			state.InstallVisible, state.ActionsVisible, state.StartVisible, state.OpenVisible)
 	}
+	// Nothing to put inside the submenu means no ROOT entry either: an
+	// empty submenu is the same dead surface as an "unknown" row.
+	if state.showsSomething() {
+		t.Errorf("the unsettled read reports something to show (%+v), want nothing at all", state)
+	}
 }
 
 // TestServiceMenuReturnsWithTheFirstSuccessfulRead pins the other half of
@@ -275,6 +280,52 @@ func TestServiceMenuReturnsWithTheFirstSuccessfulRead(t *testing.T) {
 	absent := serviceMenuFor(service.Status{State: service.StateNotInstalled}, nil)
 	if !absent.LineVisible || !absent.InstallVisible || absent.ActionsVisible {
 		t.Errorf("an absence read after the failure produced %+v, want the absence line and the install item", absent)
+	}
+}
+
+// TestServiceMenuEntryHidesOnlyForAnUnsettledRead pins the claim behind the
+// ROOT Service entry: every read that settled a class of machine has
+// something to show inside the submenu (a line, the install item or the
+// lifecycle items), and only a read that proved nothing has none — that is
+// the one case in which the entry itself disappears from the menu, so an
+// empty submenu is never left behind.
+func TestServiceMenuEntryHidesOnlyForAnUnsettledRead(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  service.Status
+		readErr error
+	}{
+		{name: "no registration", status: service.Status{State: service.StateNotInstalled}},
+		{name: "stopped", status: service.Status{State: service.StateStopped}},
+		{name: "failed", status: service.Status{State: service.StateFailed}},
+		{name: "broken", status: service.Status{State: service.StateBroken}},
+		{name: "running", status: service.Status{State: service.StateRunning, Running: true}},
+		{name: "starting", status: service.Status{State: service.StateStarting}},
+		{name: "stopping", status: service.Status{State: service.StateStopping}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if state := serviceMenuFor(tc.status, tc.readErr); !state.showsSomething() {
+				t.Errorf("the %s read has nothing to show (%+v): the root entry would hide beside a state that was read",
+					tc.name, state)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name    string
+		status  service.Status
+		readErr error
+	}{
+		{name: "empty state", status: service.Status{}},
+		{name: "state the supervisor could not report", status: service.Status{State: service.StateUnknown}},
+		{name: "failed read", readErr: errors.New("the service control manager did not answer")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if state := serviceMenuFor(tc.status, tc.readErr); state.showsSomething() {
+				t.Errorf("the unsettled read (%s) reports something to show (%+v), want nothing: the entry hides",
+					tc.name, state)
+			}
+		})
 	}
 }
 
