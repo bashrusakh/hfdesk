@@ -824,20 +824,25 @@ replaces the other.
   instance in the default browser), **Logs** (the log window) and the
   **Service** submenu; a separator and **Quit HFDesk** (a graceful
   shutdown) close it. The whole service section lives inside that submenu:
-  a status line that names the state of the Windows service
-  registration — `Service: not installed`, `Service: installed`,
-  `Service: running`, `Service: starting`, `Service: stopping`, or
-  `Service: unknown` when the state could not be read, which never claims
-  a machine without a service — followed by exactly one group of
-  actions. A read that proves no registration shows **Install
-  service…** (registers the Windows service) and nothing else that acts;
-  a proven registration shows **Start service**, **Stop service**,
+  a status line that names one state of the Windows service —
+  `Service: not installed`, `Service: stopped`, `Service: starting`,
+  `Service: running`, `Service: stopping`, or `Service: failed`, which is
+  also the word for a registration whose program is gone — followed by
+  exactly one group of actions. A read that proves no registration shows
+  **Install service…** (registers the Windows service) and nothing else that
+  acts; a proven registration shows **Start service**, **Stop service**,
   **Update service** and **Delete service** instead, so the install item
   is on screen only where there is nothing to install and no grey
-  install item remains; a read that could settle neither shows the status
-  line alone with no action, so a destructive action is never offered
-  without a state that was read. The duplicate **Service…** item that
-  opened the registered-service dialog is gone; that dialog still belongs
+  install item remains. The line never says `installed` (that word belongs
+  to the badge of the Logs window) and never says `unknown`: a read that
+  settled nothing is not a state of the machine, so it shows nothing about
+  the service at all — no line, no item, and no **Service** entry that
+  would open the submenu — and it repeats itself, up to three quick
+  attempts in one pass, then with the ordinary tick, after every service
+  action and whenever the Logs window gets the focus again, so the whole
+  section comes back by itself on the first read that succeeds. The
+  duplicate **Service…** item that opened the registered-service dialog is
+  gone; that dialog still belongs
   to the install recheck. Each lifecycle item is enabled for the state it
   can act on (see **Service actions** below). The status line is re-read
   after every service action, after every reading the tray and the window
@@ -847,18 +852,26 @@ replaces the other.
   button) and the four lifecycle items run one flow. The lifecycle items
   appear beside a proven registration and each is enabled only for a
   settled read it can act on: **Start service** for a settled state that
-  does not run, **Stop service** for a settled state that runs, **Update
-  service** and **Delete service** for any settled registration — while
+  does not run — except a registration whose program is gone, which reads
+  as `failed` and shows no start at all, because the update is the one
+  action that repairs it, while a crashed `failed` registration offers the
+  start beside that update — **Stop service** for a settled state that
+  runs, **Update service** and **Delete service** for any settled
+  registration — while
   the service is starting or stopping, all four go grey, because a
   transition is not a state to decide on, and they light up again as soon
   as the reading settles. Installing, stopping and
   deleting ask for confirmation before Windows shows its administrator
-  prompt; a start or an update from the tray companion goes straight to
-  that prompt, while one from a desktop app that serves its own address
-  asks for confirmation first, and that confirmation names the window
-  closing and the switch to the tray (see below) — except an update of a
-  positively stopped service, which goes straight and keeps the window
-  open. One service
+  prompt, and the confirmation of a delete states that a running service
+  is stopped first; a start goes straight to that prompt, and so does an
+  update of a positively stopped service, which rewrites the registration
+  in place and keeps the window open. An update of a running service asks
+  first: its confirmation states that the service is stopped and started
+  again and that running downloads are interrupted. An update from a
+  desktop app that serves its own address asks the handover question
+  instead of that one — it names the window closing and the switch to the
+  tray (see below) — never both, and an update of a positively stopped
+  service asks nothing there either. One service
   action runs at a time: a second request while one is in flight is refused
   with its own report instead of raising a second prompt beside the first.
   **Delete service** removes only the registration — the data, the cache,
@@ -894,7 +907,8 @@ replaces the other.
   not answer (or names none), the window shows an honest local page
   instead: the state of the service, with the step that fits it as the
   first action (**Start service** for a registered service that does not
-  run, **Install service…** when none is installed), the address that did not answer stated
+  run, **Update service** when the program at the registered path is gone,
+  **Install service…** when none is installed), the address that did not answer stated
   as plain text, the path of the service log file with the action **Open
   the log file** that opens it, the bounded tail of that same log under the
   heading **Service log**, and **Try again** to re-read the live page.
