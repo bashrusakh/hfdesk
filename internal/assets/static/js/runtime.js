@@ -138,11 +138,6 @@
     renderTimer: null,
     // statusTimer is the status refresh interval.
     statusTimer: null,
-    // serviceBusy marks a service action while its call is in flight, so a
-    // second activation never reaches the host beside the first one.
-    serviceBusy: false,
-    // serviceMenuOpen marks the open menu of the service control.
-    serviceMenuOpen: false,
     // serviceActions is the action map of the last rendered view.
     serviceActions: {},
     // serviceInstallMissing marks an install endpoint this build lacks.
@@ -217,6 +212,17 @@
     { key: 'update', item: el.serviceUpdateItem, action: 'hfdeskUpdateService' },
     { key: 'delete', item: el.serviceDeleteItem, action: 'hfdeskDeleteService' }
   ];
+
+  // serviceControl is the interaction of the menu: the opening, the
+  // keyboard, the outside click, the viewport clamp and the waiting
+  // trigger. The page owns what an activation means - one provider of the
+  // window host, or the install endpoint - so the control only forwards
+  // the action name of the item and never decides which item is offered.
+  const serviceControl = window.HFDeskServiceControl.wire({
+    trigger: el.serviceTrigger,
+    menu: el.serviceMenu,
+    onAction: runServiceAction
+  });
 
   // =========================================
   // Small helpers
@@ -493,7 +499,7 @@
 
     if (!owned) {
       // Ownerless actions are a fact about the machine, not a menu.
-      closeServiceMenu();
+      serviceControl.close(false);
       el.serviceTrigger.hidden = true;
       el.serviceChip.hidden = false;
       el.serviceChip.title = 'Service actions run in the HFDesk application';
@@ -502,7 +508,6 @@
 
     el.serviceChip.hidden = true;
     el.serviceTrigger.hidden = false;
-    el.serviceTrigger.disabled = state.serviceBusy;
   }
 
   // setServiceLabel writes the line and colors the dot of both shapes.
@@ -520,7 +525,7 @@
   // hideServiceControl removes the control: a read that proved nothing and
   // a view whose every action is withdrawn both leave nothing behind.
   function hideServiceControl() {
-    closeServiceMenu();
+    serviceControl.close(false);
     el.serviceControl.hidden = true;
   }
 
@@ -549,102 +554,22 @@
     return null;
   }
 
-  // enabledServiceItems answers the items the user can activate.
-  function enabledServiceItems() {
-    return SERVICE_ITEMS.filter((entry) => !entry.item.hidden && !entry.item.disabled);
-  }
-
-  // focusServiceItemEdge moves the focus to the first or last enabled item.
-  function focusServiceItemEdge(edge) {
-    const items = enabledServiceItems();
-    if (!items.length) return;
-    const entry = edge === 'last' ? items[items.length - 1] : items[0];
-    entry.item.focus();
-  }
-
-  // focusServiceItem moves the focus by one enabled item, wrapping at both
-  // ends.
-  function focusServiceItem(step) {
-    const items = enabledServiceItems();
-    if (!items.length) return;
-    const current = items.findIndex((entry) => entry.item === document.activeElement);
-    const next = current === -1
-      ? (step > 0 ? 0 : items.length - 1)
-      : (current + step + items.length) % items.length;
-    items[next].item.focus();
-  }
-
-  // toggleServiceMenu opens or closes the menu of the service control.
-  function toggleServiceMenu() {
-    if (state.serviceBusy) return;
-    if (state.serviceMenuOpen) {
-      closeServiceMenu(true);
-      return;
-    }
-    openServiceMenu('first');
-  }
-
-  // placeServiceMenu puts the menu below the trigger and inside the
-  // viewport: the shell clips its overflow, so the trigger's viewport
-  // coordinate is the reliable anchor and the clamp keeps a narrow window
-  // from cutting the menu off.
-  function placeServiceMenu() {
-    if (typeof el.serviceTrigger.getBoundingClientRect !== 'function') return;
-
-    const rect = el.serviceTrigger.getBoundingClientRect();
-    const viewport = window.innerWidth || 0;
-    if (!viewport) return;
-
-    const width = el.serviceMenu.offsetWidth || 0;
-    const margin = 8;
-    const left = Math.min(Math.max(rect.left, margin), Math.max(viewport - width - margin, margin));
-
-    el.serviceMenu.style.left = `${Math.round(left)}px`;
-    el.serviceMenu.style.top = `${Math.round(rect.bottom + 6)}px`;
-  }
-
-  // openServiceMenu shows the menu and focuses its first or last enabled
-  // item.
-  function openServiceMenu(edge) {
-    if (state.serviceBusy) return;
-    if (!SERVICE_ITEMS.some((entry) => !entry.item.hidden)) return;
-
-    state.serviceMenuOpen = true;
-    el.serviceMenu.hidden = false;
-    placeServiceMenu();
-    el.serviceTrigger.setAttribute('aria-expanded', 'true');
-    if (edge) focusServiceItemEdge(edge);
-  }
-
-  // closeServiceMenu hides the menu. focusTrigger returns the focus to the
-  // trigger, the place the menu was opened from.
-  function closeServiceMenu(focusTrigger = false) {
-    state.serviceMenuOpen = false;
-    el.serviceMenu.hidden = true;
-    el.serviceTrigger.setAttribute('aria-expanded', 'false');
-    if (focusTrigger) el.serviceTrigger.focus();
-  }
-
   // runServiceAction performs one item: one activation reaches one owner,
-  // the trigger waits for the call, and the status is read again right away.
-  // The host reports its own outcome, so the page adds no success report.
-  async function runServiceAction(entry) {
-    if (state.serviceBusy || entry.item.hidden || entry.item.disabled) return;
+  // the trigger waits for the call (the control owns that wait), and the
+  // status is read again right away. The host reports its own outcome, so
+  // the page adds no success report.
+  async function runServiceAction(name) {
+    const entry = SERVICE_ITEMS.find((item) => item.key === name);
+    if (!entry) return;
 
     const provider = serviceProvider(entry, readServiceAction(state.serviceActions, entry.key));
     if (!provider) return;
-
-    closeServiceMenu(true);
-    state.serviceBusy = true;
-    el.serviceTrigger.disabled = true;
 
     try {
       await provider();
     } catch (err) {
       logErrorOnce(`The ${entry.key} service action of the window host failed: ${(err && err.message) || err}`);
     } finally {
-      state.serviceBusy = false;
-      el.serviceTrigger.disabled = false;
       await refreshStatus();
     }
   }
@@ -1556,51 +1481,10 @@
     el.openLogsButton.addEventListener('click', openLogs);
     el.openLogFileButton.addEventListener('click', openLogFile);
 
-    el.serviceTrigger.addEventListener('click', toggleServiceMenu);
-    el.serviceTrigger.addEventListener('keydown', (event) => {
-      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-        event.preventDefault();
-        openServiceMenu(event.key === 'ArrowDown' ? 'first' : 'last');
-      } else if (event.key === 'Escape') {
-        closeServiceMenu();
-      }
-    });
-
-    el.serviceMenu.addEventListener('keydown', (event) => {
-      if (event.key === 'ArrowDown') {
-        event.preventDefault();
-        focusServiceItem(1);
-      } else if (event.key === 'ArrowUp') {
-        event.preventDefault();
-        focusServiceItem(-1);
-      } else if (event.key === 'Home') {
-        event.preventDefault();
-        focusServiceItemEdge('first');
-      } else if (event.key === 'End') {
-        event.preventDefault();
-        focusServiceItemEdge('last');
-      } else if (event.key === 'Escape') {
-        event.preventDefault();
-        closeServiceMenu(true);
-      } else if (event.key === 'Tab') {
-        // The menu is not a dialog: the next tab stop belongs to the page.
-        closeServiceMenu();
-      }
-    });
-
-    for (const entry of SERVICE_ITEMS) {
-      entry.item.addEventListener('click', () => runServiceAction(entry));
-    }
-
-    // A click outside the control closes the menu; its own clicks never do.
-    document.addEventListener('click', (event) => {
-      if (!state.serviceMenuOpen) return;
-      if (el.serviceControl.contains(event.target)) return;
-      closeServiceMenu();
-    });
-
-    // A resized viewport moves the anchor of the open menu.
-    window.addEventListener('resize', () => closeServiceMenu());
+    // The interaction of the service menu - the opening, the keyboard, the
+    // outside click and the viewport clamp - belongs to the control unit,
+    // which wired itself where the page was loaded. The page closes the
+    // menu only when it hides the control or the page itself.
 
     window.addEventListener('pagehide', () => {
       // The view remembers the live source it used, so it can resume the
@@ -1611,7 +1495,7 @@
 
       closeStream();
       stopPolling();
-      closeServiceMenu();
+      serviceControl.close(false);
 
       // The handles are released with the timers they belong to. A handle
       // that outlives its timer makes the view skip its next batch, so the

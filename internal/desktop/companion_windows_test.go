@@ -10,6 +10,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -541,19 +542,18 @@ func TestAcquireInstanceLockForLaunchWaitsOnlyForTheRelaunch(t *testing.T) {
 }
 
 // TestCompanionWindowPageReportsStateAndRegistrationAddress proves the
-// fallback document of the Logs window: the honest state of the service —
-// including the STOPPED state, where the window works exactly the same —
-// the honest line that the registered address did not answer (or the
-// honest reason there is no address to name), with the menu catch-up
-// after every read like every other display read (failed reads
-// included). The address is stated as a fact and never linked: it just
-// proved it does not answer.
+// fallback document of the Logs window: the control line of the ONE state
+// table, the honest line that the registered address did not answer (or the
+// honest reason there is no address to name), with the menu catch-up after
+// every read like every other display read (failed reads included). The
+// address is stated as a fact and never linked: it just proved it does not
+// answer.
 func TestCompanionWindowPageReportsStateAndRegistrationAddress(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		status    service.Status
 		readErr   error
-		wantState string
+		wantLabel string
 		wantNote  string
 		wantAddr  string
 		noAddr    bool
@@ -561,28 +561,27 @@ func TestCompanionWindowPageReportsStateAndRegistrationAddress(t *testing.T) {
 		{
 			name:      "a stopped service names the address that did not answer",
 			status:    registeredStoppedService(),
-			wantState: "The HFDesk service is stopped.",
+			wantLabel: "Service: stopped",
 			wantAddr:  "http://127.0.0.1:18080",
 		},
 		{
 			name:      "a running service whose address did not answer",
 			status:    runningServiceStatus(service.StateRunning, "127.0.0.1:18080"),
-			wantState: "The HFDesk service is running.",
+			wantLabel: "Service: running",
 			wantAddr:  "http://127.0.0.1:18080",
 		},
 		{
 			name:      "a machine without a registration names no address",
 			status:    service.Status{State: service.StateNotInstalled},
-			wantState: "HFDesk is not registered as a Windows service.",
+			wantLabel: "Service: not installed",
 			wantNote:  "The registration names no address, so there is nothing to open.",
 			noAddr:    true,
 		},
 		{
-			name:      "a read that fails reports the honest unknown",
-			readErr:   errors.New("the service control manager did not answer"),
-			wantState: "The state of the Windows service could not be read.",
-			wantNote:  "The address of the web UI could not be read.",
-			noAddr:    true,
+			name:     "a read that fails reports the honest unknown and no control",
+			readErr:  errors.New("the service control manager did not answer"),
+			wantNote: "The address of the web UI could not be read.",
+			noAddr:   true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -594,7 +593,13 @@ func TestCompanionWindowPageReportsStateAndRegistrationAddress(t *testing.T) {
 
 			_, page := companionWindowContent()
 
-			assertNames(t, page, "the fallback document", []string{"<h1>" + tc.wantState + "</h1>"})
+			if tc.wantLabel != "" {
+				assertNames(t, page, "the control line", []string{
+					`id="serviceLabel">` + tc.wantLabel + `</span>`,
+				})
+			} else if fallbackControlShown(page) {
+				t.Error("a read that proved nothing draws a service control")
+			}
 			if tc.noAddr {
 				assertNamesWithout(t, page, "the honest reason", []string{tc.wantNote},
 					[]string{"does not answer.", "<a ", "href="})
@@ -1295,91 +1300,105 @@ func TestCompanionWindowActionsCarryTheOpenLogActions(t *testing.T) {
 	})
 }
 
-// TestCompanionWindowPageOffersTheServiceActionOfTheState pins the step
-// the fallback document offers for one read of the registration — the
-// header of every state, verbatim and in its order:
-//
-//   - a settled registration that does not run leads with Start service —
-//     the state the Start service item of the menu acts on — except a BROKEN
-//     one, whose start would fail on the missing program and which leads with
-//     Update service, the one step that repairs it;
-//   - a machine the read proved WITHOUT a registration leads with
-//     Install service... — the state the Install service item acts on;
-//   - every other state — a running service, a transition, a state the
-//     supervisor could not report, an empty state and a read that failed
-//     — proves no step, so the header keeps only the open of the log file
-//     and the retry, exactly as before.
-//
-// In every shape the step leads, the open follows, the retry comes last,
-// and the document still carries no link to the address that just proved
-// it does not answer.
-func TestCompanionWindowPageOffersTheServiceActionOfTheState(t *testing.T) {
+// TestCompanionWindowPageServiceMenuFollowsTheState pins the items of the
+// service control of the fallback document against the one state table of
+// internal/serviceview — the same table the tray menu and the live page
+// read: a broken registration never offers Start and offers Update, a failed
+// one offers Start and Update, a transition shows its items disabled, and a
+// state that proves nothing draws no control at all.
+func TestCompanionWindowPageServiceMenuFollowsTheState(t *testing.T) {
+	allHidden := map[string]string{
+		"install": "hidden", "start": "hidden", "stop": "hidden",
+		"update": "hidden", "delete": "hidden",
+	}
+
 	for _, tc := range []struct {
-		name      string
-		status    service.Status
-		readErr   error
-		header    string
-		forbidden []string
+		name    string
+		status  service.Status
+		readErr error
+		shown   bool
+		items   map[string]string
 	}{
 		{
-			name:      "a stopped registration offers the start",
-			status:    registeredStoppedService(),
-			header:    logsHeaderStepStart,
-			forbidden: []string{"Install service..."},
+			name:   "a stopped registration offers the start",
+			status: registeredStoppedService(),
+			shown:  true,
+			items: map[string]string{
+				"install": "hidden", "start": "enabled", "stop": "disabled",
+				"update": "enabled", "delete": "enabled",
+			},
 		},
 		{
-			name:      "a failed registration offers the start",
-			status:    runningServiceStatus(service.StateFailed, "127.0.0.1:18080"),
-			header:    logsHeaderStepStart,
-			forbidden: []string{"Install service...", "Update service", `id="update-service"`},
+			name:   "a failed registration offers the start and the update",
+			status: runningServiceStatus(service.StateFailed, "127.0.0.1:18080"),
+			shown:  true,
+			items: map[string]string{
+				"install": "hidden", "start": "enabled", "stop": "disabled",
+				"update": "enabled", "delete": "enabled",
+			},
 		},
 		{
-			name:      "a broken registration without an instance offers the update",
-			status:    runningServiceStatus(service.StateBroken, "127.0.0.1:18080"),
-			header:    logsHeaderStepUpdate,
-			forbidden: []string{"Start service", "Install service...", `id="start-service"`, `id="install-service"`},
+			name:   "a broken registration offers the update and never the start",
+			status: runningServiceStatus(service.StateBroken, "127.0.0.1:18080"),
+			shown:  true,
+			items: map[string]string{
+				"install": "hidden", "start": "hidden", "stop": "disabled",
+				"update": "enabled", "delete": "enabled",
+			},
 		},
 		{
-			name:      "a machine without a registration offers the installation",
-			status:    service.Status{State: service.StateNotInstalled},
-			header:    logsHeaderStepInstall,
-			forbidden: []string{"Start service"},
+			name:   "a machine without a registration offers the installation",
+			status: service.Status{State: service.StateNotInstalled},
+			shown:  true,
+			items: map[string]string{
+				"install": "enabled", "start": "hidden", "stop": "hidden",
+				"update": "hidden", "delete": "hidden",
+			},
 		},
 		{
-			name:      "a running service offers no step",
-			status:    runningServiceStatus(service.StateRunning, "127.0.0.1:18080"),
-			header:    logsHeaderNoStep,
-			forbidden: []string{"Start service", "Install service..."},
+			name:   "a running service offers the stop",
+			status: runningServiceStatus(service.StateRunning, "127.0.0.1:18080"),
+			shown:  true,
+			items: map[string]string{
+				"install": "hidden", "start": "disabled", "stop": "enabled",
+				"update": "enabled", "delete": "enabled",
+			},
 		},
 		{
-			name:      "a service on its way up offers no step",
-			status:    service.Status{State: service.StateStarting, Listen: "127.0.0.1:18080"},
-			header:    logsHeaderNoStep,
-			forbidden: []string{"Start service", "Install service..."},
+			name:   "a service on its way up shows every item disabled",
+			status: service.Status{State: service.StateStarting, Listen: "127.0.0.1:18080"},
+			shown:  true,
+			items: map[string]string{
+				"install": "hidden", "start": "disabled", "stop": "disabled",
+				"update": "disabled", "delete": "disabled",
+			},
 		},
 		{
-			name:      "a service on its way down offers no step",
-			status:    service.Status{State: service.StateStopping, Listen: "127.0.0.1:18080"},
-			header:    logsHeaderNoStep,
-			forbidden: []string{"Start service", "Install service..."},
+			name:   "a service on its way down shows every item disabled",
+			status: service.Status{State: service.StateStopping, Listen: "127.0.0.1:18080"},
+			shown:  true,
+			items: map[string]string{
+				"install": "hidden", "start": "disabled", "stop": "disabled",
+				"update": "disabled", "delete": "disabled",
+			},
 		},
 		{
-			name:      "a state the supervisor could not report offers no step",
-			status:    service.Status{State: service.StateUnknown, Listen: "127.0.0.1:18080"},
-			header:    logsHeaderNoStep,
-			forbidden: []string{"Start service", "Install service..."},
+			name:   "a state the supervisor could not report has no control",
+			status: service.Status{State: service.StateUnknown, Listen: "127.0.0.1:18080"},
+			shown:  false,
+			items:  allHidden,
 		},
 		{
-			name:      "an empty state offers no step",
-			status:    service.Status{},
-			header:    logsHeaderNoStep,
-			forbidden: []string{"Start service", "Install service..."},
+			name:   "an empty state has no control",
+			status: service.Status{},
+			shown:  false,
+			items:  allHidden,
 		},
 		{
-			name:      "a read that failed offers no step",
-			readErr:   errors.New("the service control manager did not answer"),
-			header:    logsHeaderNoStep,
-			forbidden: []string{"Start service", "Install service..."},
+			name:    "a read that failed has no control",
+			readErr: errors.New("the service control manager did not answer"),
+			shown:   false,
+			items:   allHidden,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1389,34 +1408,33 @@ func TestCompanionWindowPageOffersTheServiceActionOfTheState(t *testing.T) {
 
 			_, page := companionWindowContent()
 
-			if got := headerActions(t, page); got != tc.header {
-				t.Errorf("the header =\n%s\nwant:\n%s", got, tc.header)
+			if got := fallbackControlShown(page); got != tc.shown {
+				t.Errorf("the control is shown = %t, want %t", got, tc.shown)
 			}
-			for _, unwanted := range tc.forbidden {
-				if strings.Contains(page, unwanted) {
-					t.Errorf("the document of this state carries %q beside its own header:\n%s", unwanted, page)
-				}
+			if got := fallbackMenuItems(page); !reflect.DeepEqual(got, tc.items) {
+				t.Errorf("the menu items = %v, want %v", got, tc.items)
 			}
 			assertNamesWithout(t, page, "the fallback document", nil, []string{"<a ", "href="})
 		})
 	}
 }
 
-// TestCompanionWindowPageNamesTheTransitionOfTheRead pins the state line of
+// TestCompanionWindowPageNamesTheTransitionOfTheRead pins the control line of
 // the fallback document against the classification that decides the actions:
 // a service on its way up or down is named by its transition, never as
 // "running" — the address that did not answer must not sit beside a claim the
-// service runs — and neither transition offers a step. A service that really
-// runs is the one state that says so.
+// service runs — and neither transition offers an enabled step. A service
+// that really runs is the one state that says so.
 func TestCompanionWindowPageNamesTheTransitionOfTheRead(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		state service.State
 		want  string
+		tone  string
 	}{
-		{name: "a service on its way up", state: service.StateStarting, want: "The HFDesk service is starting."},
-		{name: "a service on its way down", state: service.StateStopping, want: "The HFDesk service is stopping."},
-		{name: "a running service", state: service.StateRunning, want: "The HFDesk service is running."},
+		{name: "a service on its way up", state: service.StateStarting, want: "Service: starting", tone: "is-warning"},
+		{name: "a service on its way down", state: service.StateStopping, want: "Service: stopping", tone: "is-warning"},
+		{name: "a running service", state: service.StateRunning, want: "Service: running", tone: "is-success"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			status := service.Status{State: tc.state, Listen: "127.0.0.1:18080"}
@@ -1426,12 +1444,11 @@ func TestCompanionWindowPageNamesTheTransitionOfTheRead(t *testing.T) {
 
 			_, page := companionWindowContent()
 
-			assertNames(t, page, "the state line", []string{"<h1>" + tc.want + "</h1>"})
-			assertNamesWithout(t, page, "the document of the transition", nil, []string{
-				"Start service", "Update service", "Install service...",
-				`id="start-service"`, `id="update-service"`, `id="install-service"`,
+			assertNames(t, page, "the control line", []string{
+				`id="serviceLabel">` + tc.want + `</span>`,
+				`runtime-service-dot ` + tc.tone + `" id="serviceDot"`,
 			})
-			assertNamesWithout(t, page, "the state line", nil, []string{"<a ", "href="})
+			assertNamesWithout(t, page, "the control line", nil, []string{"<a ", "href="})
 		})
 	}
 }
@@ -1684,4 +1701,26 @@ func TestCompanionWindowServiceActionRunsTheMenuItemFlow(t *testing.T) {
 			return !serviceActionRunning.Load()
 		})
 	})
+}
+
+// TestCompanionStateKeyCarriesTheBuildVersion proves that the redraw key of
+// the window includes the version the fallback header now states: two reads
+// of one machine under two builds are two documents, while the log path and
+// the growing tail stay out of the key.
+func TestCompanionStateKeyCarriesTheBuildVersion(t *testing.T) {
+	status := service.Status{State: service.StateStopped, Listen: "127.0.0.1:18080"}
+
+	previous := companionVersion
+	t.Cleanup(func() { companionVersion = previous })
+
+	companionVersion = "1.2.3"
+	first := companionStateKey(status, nil)
+	if again := companionStateKey(status, nil); again != first {
+		t.Errorf("the key of the same read = %q, want %q", again, first)
+	}
+
+	companionVersion = "1.3.0"
+	if second := companionStateKey(status, nil); second == first {
+		t.Errorf("the key %q does not change with the version", first)
+	}
 }

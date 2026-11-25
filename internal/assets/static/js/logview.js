@@ -148,6 +148,22 @@
     return row;
   }
 
+  // buildRawRow builds the row of a line the service wrote that is not one
+  // of its log records — a rotated banner, a panic dump. The line has no
+  // columns of its own, so it is one message cell and the text is the line
+  // itself; nothing is parsed into fields it does not have.
+  function buildRawRow(text) {
+    const row = document.createElement('div');
+    row.className = 'runtime-log-row runtime-log-row-text';
+
+    const message = document.createElement('span');
+    message.className = 'runtime-message';
+    message.textContent = String(text);
+
+    row.appendChild(message);
+    return row;
+  }
+
   // formatLine renders a record as one line of text.
   function formatLine(record) {
     const parts = [
@@ -163,6 +179,7 @@
   global.HFDeskLogView = {
     normalizeRecord,
     buildRow,
+    buildRawRow,
     matches,
     levelPasses,
     isFilter,

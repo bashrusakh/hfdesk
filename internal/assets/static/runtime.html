@@ -41,12 +41,12 @@
             </svg>
           </button>
           <div class="runtime-service-menu" id="serviceMenu" role="menu" aria-labelledby="serviceTrigger" hidden>
-            <button class="runtime-service-item" id="serviceInstallItem" type="button" role="menuitem" hidden>Install service&hellip;</button>
-            <button class="runtime-service-item" id="serviceStartItem" type="button" role="menuitem" hidden>Start service</button>
-            <button class="runtime-service-item" id="serviceStopItem" type="button" role="menuitem" hidden>Stop service</button>
-            <button class="runtime-service-item" id="serviceUpdateItem" type="button" role="menuitem" hidden>Update service</button>
+            <button class="runtime-service-item" id="serviceInstallItem" type="button" role="menuitem" data-service-action="install" hidden>Install service&hellip;</button>
+            <button class="runtime-service-item" id="serviceStartItem" type="button" role="menuitem" data-service-action="start" hidden>Start service</button>
+            <button class="runtime-service-item" id="serviceStopItem" type="button" role="menuitem" data-service-action="stop" hidden>Stop service</button>
+            <button class="runtime-service-item" id="serviceUpdateItem" type="button" role="menuitem" data-service-action="update" hidden>Update service</button>
             <div class="runtime-service-separator" id="serviceSeparator" role="separator" hidden></div>
-            <button class="runtime-service-item runtime-service-item-danger" id="serviceDeleteItem" type="button" role="menuitem" hidden>Delete service&hellip;</button>
+            <button class="runtime-service-item runtime-service-item-danger" id="serviceDeleteItem" type="button" role="menuitem" data-service-action="delete" hidden>Delete service&hellip;</button>
           </div>
           <span class="badge badge-secondary runtime-service-chip" id="serviceChip" hidden>
             <span class="status-indicator runtime-service-dot is-muted" id="serviceChipDot"></span>
@@ -151,6 +151,7 @@
   <div class="toast-container" id="toastContainer"></div>
 
   <script src="js/logview.js"></script>
+  <script src="js/servicecontrol.js"></script>
   <script src="js/runtime.js"></script>
 </body>
 </html>

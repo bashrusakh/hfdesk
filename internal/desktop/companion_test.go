@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/bashrusakh/hfdesk/internal/service"
+	"github.com/bashrusakh/hfdesk/internal/serviceview"
 )
 
 // TestSplitCompanionArgsLeavesAnOrdinaryCommandLineUntouched proves that an
@@ -166,57 +167,88 @@ func TestCompanionRelaunchArgsRoundTripThroughTheParser(t *testing.T) {
 	}
 }
 
-// TestLogsFallbackPageRendersStateAddressLogAndActions pins the fallback
-// document of the Logs window: the honest state as its heading, the
-// honest line that the registered address does not answer (stated as a
-// fact in a code chip, never linked — the address just proved it does not
-// answer), the path of the service log with the one action that opens
-// that very file, and the retry action. The window title is the short
-// one: "Logs", without internal names.
-//
-// The document fetches nothing: its one script carries no channel of any
-// kind, so the fallback beside a dead address reaches out of the document
-// just as little as the companion listened to nothing before — a model
-// without a log path still carries the retry and no open button (there is
-// nothing to open), pinned below.
-func TestLogsFallbackPageRendersStateAddressLogAndActions(t *testing.T) {
+// TestLogsFallbackPageRendersTheRuntimeFrame pins the fallback document of
+// the Logs window: the frame of the live page — the shell, the header with
+// the offline line and the build version, the service control, the fact
+// banner and the status strip — the log panel with its toolbar and the
+// table of the tail, and the one action that retries the live page. The
+// address is stated as a fact, never linked, and the document carries no
+// Open HFDesk button (the address just proved it is dead), no Follow and no
+// Clear view (nothing streams in an offline document) and no second
+// Service log strip.
+func TestLogsFallbackPageRendersTheRuntimeFrame(t *testing.T) {
+	const logPath = `C:\ProgramData\HFDesk\logs\hfdesk.log`
 	page := logsFallbackPage(logsFallbackState{
-		State:   "The HFDesk service is stopped.",
+		Version: "1.2.3",
 		Address: "http://127.0.0.1:18080",
-		LogPath: `C:\ProgramData\HFDesk\logs\hfdesk.log`,
+		Service: serviceview.From("stopped", false, false),
+		LogPath: logPath,
+		Log: serviceLogSection{
+			Path: logPath,
+			Tail: `{"seq":1,"time":"2026-11-25T10:00:00Z","level":"INFO","component":"server","message":"started","attrs":{}}`,
+		},
 	})
 
 	assertNames(t, page, "the fallback document", []string{
 		"<title>HFDesk - Logs</title>",
-		"<h1>The HFDesk service is stopped.</h1>",
-		"The web UI at <code>http://127.0.0.1:18080</code> does not answer.",
-		`<div class="stat-label">Log file</div>`,
-		`<code>C:\ProgramData\HFDesk\logs\hfdesk.log</code>`,
-		`id="open-log-file"`,
-		"Open the log file",
-		`id="try-again"`,
-		">Try again<",
+		`<div class="runtime-shell">`,
+		`<header class="runtime-header">`,
+		`<span class="logo-text">HFDesk</span>`,
+		`<span class="status-indicator runtime-status-indicator is-error" id="statusDot"></span>`,
+		`<span id="statusLabel">Offline</span>`,
+		`<span class="runtime-version" id="versionLabel">Version 1.2.3</span>`,
+		`id="serviceControl"`,
+		`id="serviceLabel">Service: stopped</span>`,
+		`The web UI at <code>http://127.0.0.1:18080</code> does not answer.`,
+		`id="try-again" type="button">Try again</button>`,
+		`<section class="runtime-strip" aria-label="Runtime status">`,
+		`<span class="runtime-stat-label">Server</span>`,
+		`<span class="runtime-stat-label">Active jobs</span>`,
+		`<span class="runtime-stat-label">Log file</span>`,
+		`<span class="config-chip"><code id="logFile">C:\ProgramData\HFDesk\logs\hfdesk.log</code></span>`,
+		`<section class="runtime-log-panel">`,
+		`id="levelFilter"`,
+		`id="searchInput"`,
+		`id="copyButton"`,
+		`id="openLogsButton"`,
+		`id="openLogFileButton"`,
+		`<div class="runtime-log-head" aria-hidden="true">`,
+		`<div class="runtime-log-body" id="logBody"></div>`,
+		`Offline &mdash; last 1 lines`,
+		`at most 200 lines, 64 KiB`,
+	})
+
+	// The frame is the runtime page's frame: no Open HFDesk button, no
+	// streaming controls, and no second strip that would present the
+	// service log as another section of facts.
+	assertNamesWithout(t, page, "the fallback frame", nil, []string{
+		"Open HFDesk",
+		`id="followToggle"`,
+		`id="clearButton"`,
+		`<span class="runtime-stat-label">Service log</span>`,
+		"<pre",
 	})
 	// The address is stated, never linked: a link to the address that
 	// just failed to answer would be a dead path in the window.
 	assertNamesWithout(t, page, "the address line", nil, []string{"<a ", "href="})
 
-	// The section order: the state leads, the honest line follows, the
-	// log fact and its action come last — the document reads top down
-	// from what is true to what can be done.
-	state := strings.Index(page, "<h1>")
-	address := strings.Index(page, "does not answer.")
-	logFact := strings.Index(page, `<code>C:\ProgramData\HFDesk\logs\hfdesk.log</code>`)
-	if !(state >= 0 && state < address && address < logFact) {
-		t.Errorf("the document order is state %d, address %d, log %d, want state < address < log:\n%s",
-			state, address, logFact, page)
+	// The section order: the header leads, the fact follows, the strip
+	// states the runtime, and the log panel comes last — the document
+	// reads top down from what is true to what can be done.
+	header := strings.Index(page, `<header class="runtime-header">`)
+	banner := strings.Index(page, `id="errorBanner"`)
+	strip := strings.Index(page, `<section class="runtime-strip"`)
+	panel := strings.Index(page, `<section class="runtime-log-panel">`)
+	if !(header >= 0 && header < banner && banner < strip && strip < panel) {
+		t.Errorf("the document order is header %d, banner %d, strip %d, panel %d, want header < banner < strip < panel",
+			header, banner, strip, panel)
 	}
 
-	// The only script of the document performs the two local operations
-	// and nothing else: no fetch, no socket, no remote resource, no data
-	// leaves the document — the fallback reaches nowhere.
 	if count := strings.Count(page, "<script"); count != 1 {
 		t.Errorf("the document carries %d script elements, want exactly the one local script", count)
+	}
+	if count := strings.Count(page, "<style"); count != 1 {
+		t.Errorf("the document carries %d style elements, want exactly the one inline stylesheet", count)
 	}
 	assertPageReachesOutNowhere(t, page, "the fallback document")
 	if !strings.HasPrefix(page, "<!doctype html>") {
@@ -230,11 +262,10 @@ func TestLogsFallbackPageRendersStateAddressLogAndActions(t *testing.T) {
 // fallback beside an address that does not answer, and the companion
 // itself listens to nothing — so ANY of these is a defect, not a style
 // choice: a document that starts reaching out fails here instead of
-// passing as "just one more attribute". Both shapes of the document (with
-// and without a log path) are pinned against it. (The LIVE page of the
-// window is a different mechanism: the window host navigates the WebView2
-// to the address of the service — an outgoing page load the host owns,
-// not a channel of any document.)
+// passing as "just one more attribute". (The LIVE page of the window is a
+// different mechanism: the window host navigates the WebView2 to the
+// address of the service — an outgoing page load the host owns, not a
+// channel of any document.)
 var pageExternalPins = []string{
 	// Network calls, sockets and beacons.
 	"fetch(", "XMLHttpRequest", "WebSocket", "EventSource", "sendBeacon",
@@ -258,275 +289,269 @@ func assertPageReachesOutNowhere(t *testing.T, page, context string) {
 	}
 }
 
-// The header action strips of the fallback document, verbatim: the step of
-// the state leads, the open of the log file follows, the retry comes last,
-// and a state that proves no step leaves the header to the two buttons it
-// has always had. The classes are part of the pin: beside a step the ONE
-// primary button of the header is that step, and the open of the log file
-// takes the secondary place — without a step it keeps the primary place it
-// has always had.
-const (
-	logsHeaderStepStart = `<div class="actions">` +
-		`<button class="btn btn-primary" id="start-service" type="button">Start service</button>` +
-		`<button class="btn" id="open-log-file" type="button">Open the log file</button>` +
-		`<button class="btn" id="try-again" type="button">Try again</button>` +
-		`</div>` + "\n"
-	logsHeaderStepUpdate = `<div class="actions">` +
-		`<button class="btn btn-primary" id="update-service" type="button">Update service</button>` +
-		`<button class="btn" id="open-log-file" type="button">Open the log file</button>` +
-		`<button class="btn" id="try-again" type="button">Try again</button>` +
-		`</div>` + "\n"
-	logsHeaderStepInstall = `<div class="actions">` +
-		`<button class="btn btn-primary" id="install-service" type="button">Install service...</button>` +
-		`<button class="btn" id="open-log-file" type="button">Open the log file</button>` +
-		`<button class="btn" id="try-again" type="button">Try again</button>` +
-		`</div>` + "\n"
-	logsHeaderNoStep = `<div class="actions">` +
-		`<button class="btn btn-primary" id="open-log-file" type="button">Open the log file</button>` +
-		`<button class="btn" id="try-again" type="button">Try again</button>` +
-		`</div>` + "\n"
-)
-
-// headerActions returns the header action strip of a rendered fallback
-// document — its buttons verbatim, in their order — and fails the test
-// when the document carries no header at all.
-func headerActions(t *testing.T, page string) string {
-	t.Helper()
-	start := strings.Index(page, `<div class="actions">`)
-	end := strings.Index(page, "</header>")
-	if start < 0 || end < start {
-		t.Fatalf("the document carries no header action strip:\n%s", page)
+// fallbackMenuItems answers the state of every item of the service menu of
+// a rendered fallback document: "hidden" when the markup keeps it out of
+// the menu, "disabled" when it is shown but cannot act, and "enabled" when
+// it can.
+func fallbackMenuItems(page string) map[string]string {
+	pattern := regexp.MustCompile(`<button class="[^"]*" id="service(Install|Start|Stop|Update|Delete)Item"[^>]*>`)
+	state := map[string]string{}
+	for _, match := range pattern.FindAllStringSubmatch(page, -1) {
+		key := strings.ToLower(match[1])
+		tag := match[0]
+		switch {
+		case strings.Contains(tag, " hidden"):
+			state[key] = "hidden"
+		case strings.Contains(tag, " disabled"):
+			state[key] = "disabled"
+		default:
+			state[key] = "enabled"
+		}
 	}
-	return page[start:end]
+	return state
 }
 
-// TestLogsFallbackPageOffersTheServiceActionOfItsState pins the header of
-// every shape of the model: the step of the state leads as the ONE primary
-// button, the open of the log file follows in its secondary place and the
-// retry comes last — a stopped registration offers Start service, a broken
-// one the update that repairs it, a machine without a registration offers
-// Install service... and never the start, and a state that proves no step
-// keeps the header exactly as it has always been. Every shape still carries
-// one local script, no link and nothing that reaches out of the document, and
-// a document without a log path offers its step beside the retry alone.
-func TestLogsFallbackPageOffersTheServiceActionOfItsState(t *testing.T) {
-	const logPath = `C:\ProgramData\HFDesk\logs\hfdesk.log`
+// fallbackControlShown tells whether the rendered document carries the
+// service control (the wrapper of runtime.html) outside its hidden state.
+func fallbackControlShown(page string) bool {
+	return strings.Contains(page, `<div class="runtime-service" id="serviceControl">`)
+}
+
+// TestLogsFallbackPageServiceMenuFollowsTheStateTable pins the service
+// control of the fallback document against the ONE table: the line, the
+// tone and the actions of internal/serviceview, and nothing else. A broken
+// registration never offers Start (its program is gone) and offers Update;
+// a failed one offers Start and Update; a transition shows its items
+// disabled; and a read that proved nothing has no control at all.
+func TestLogsFallbackPageServiceMenuFollowsTheStateTable(t *testing.T) {
+	allHidden := map[string]string{
+		"install": "hidden", "start": "hidden", "stop": "hidden",
+		"update": "hidden", "delete": "hidden",
+	}
+	settled := map[string]string{
+		"install": "hidden", "start": "disabled", "stop": "enabled",
+		"update": "enabled", "delete": "enabled",
+	}
 
 	for _, tc := range []struct {
-		name   string
-		state  string
-		action logsServiceAction
-		header string
-		// forbidden is the OTHER step — and its button — that this
-		// state must never show beside its own.
-		forbidden []string
+		name     string
+		snapshot serviceview.Snapshot
+		label    string
+		tone     string
+		shown    bool
+		items    map[string]string
 	}{
 		{
-			name:      "a stopped registration offers the start",
-			state:     "The HFDesk service is stopped.",
-			action:    logsServiceActionStart,
-			header:    logsHeaderStepStart,
-			forbidden: []string{"Install service", `id="install-service"`},
-		},
-		{
-			name:      "a broken registration offers the update",
-			state:     "The HFDesk service is reported as broken.",
-			action:    logsServiceActionUpdate,
-			header:    logsHeaderStepUpdate,
-			forbidden: []string{"Start service", "Install service", `id="start-service"`, `id="install-service"`},
-		},
-		{
-			name:      "a machine without a registration offers the installation",
-			state:     "HFDesk is not registered as a Windows service.",
-			action:    logsServiceActionInstall,
-			header:    logsHeaderStepInstall,
-			forbidden: []string{"Start service", `id="start-service"`},
-		},
-		{
-			name:   "a state that proves no step keeps the header as it was",
-			state:  "The state of the Windows service could not be read.",
-			action: logsServiceActionNone,
-			header: logsHeaderNoStep,
-			forbidden: []string{
-				"Start service", "Install service",
-				`id="start-service"`, `id="install-service"`,
+			name:     "a machine without a registration offers the installation",
+			snapshot: serviceview.From("not-installed", false, false),
+			label:    "Service: not installed",
+			tone:     "is-muted",
+			shown:    true,
+			items: map[string]string{
+				"install": "enabled", "start": "hidden", "stop": "hidden",
+				"update": "hidden", "delete": "hidden",
 			},
+		},
+		{
+			name:     "a running service offers the stop",
+			snapshot: serviceview.From("running", true, false),
+			label:    "Service: running",
+			tone:     "is-success",
+			shown:    true,
+			items:    settled,
+		},
+		{
+			name:     "a stopped service offers the start",
+			snapshot: serviceview.From("stopped", false, false),
+			label:    "Service: stopped",
+			tone:     "is-muted",
+			shown:    true,
+			items: map[string]string{
+				"install": "hidden", "start": "enabled", "stop": "disabled",
+				"update": "enabled", "delete": "enabled",
+			},
+		},
+		{
+			name:     "a failed service offers the start and the update",
+			snapshot: serviceview.From("failed", false, false),
+			label:    "Service: failed",
+			tone:     "is-error",
+			shown:    true,
+			items: map[string]string{
+				"install": "hidden", "start": "enabled", "stop": "disabled",
+				"update": "enabled", "delete": "enabled",
+			},
+		},
+		{
+			name:     "a broken registration offers the update and never the start",
+			snapshot: serviceview.From("broken", false, false),
+			label:    "Service: failed",
+			tone:     "is-error",
+			shown:    true,
+			items: map[string]string{
+				"install": "hidden", "start": "hidden", "stop": "disabled",
+				"update": "enabled", "delete": "enabled",
+			},
+		},
+		{
+			name:     "a service on its way up shows every lifecycle item disabled",
+			snapshot: serviceview.From("starting", false, false),
+			label:    "Service: starting",
+			tone:     "is-warning",
+			shown:    true,
+			items: map[string]string{
+				"install": "hidden", "start": "disabled", "stop": "disabled",
+				"update": "disabled", "delete": "disabled",
+			},
+		},
+		{
+			name:     "a service on its way down shows every lifecycle item disabled",
+			snapshot: serviceview.From("stopping", false, false),
+			label:    "Service: stopping",
+			tone:     "is-warning",
+			shown:    true,
+			items: map[string]string{
+				"install": "hidden", "start": "disabled", "stop": "disabled",
+				"update": "disabled", "delete": "disabled",
+			},
+		},
+		{
+			name:     "a state the supervisor could not report has no control",
+			snapshot: serviceview.From("unknown", false, false),
+			shown:    false,
+			items:    allHidden,
+		},
+		{
+			name:     "a read that failed has no control",
+			snapshot: serviceview.From("", false, true),
+			shown:    false,
+			items:    allHidden,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			page := logsFallbackPage(logsFallbackState{
-				State:         tc.state,
-				Address:       "http://127.0.0.1:18080",
-				LogPath:       logPath,
-				Log:           serviceLogSection{Path: logPath, Tail: "newest line"},
-				ServiceAction: tc.action,
+				Address: "http://127.0.0.1:18080",
+				Service: tc.snapshot,
 			})
-			if got := headerActions(t, page); got != tc.header {
-				t.Errorf("the header =\n%s\nwant:\n%s", got, tc.header)
+
+			if got := fallbackControlShown(page); got != tc.shown {
+				t.Errorf("the control is shown = %t, want %t:\n%s", got, tc.shown, page)
 			}
-			for _, unwanted := range tc.forbidden {
-				if strings.Contains(page, unwanted) {
-					t.Errorf("the document carries %q beside the one step of its state:\n%s", unwanted, page)
+			if got := fallbackMenuItems(page); !reflect.DeepEqual(got, tc.items) {
+				t.Errorf("the menu items = %v, want %v", got, tc.items)
+			}
+			if !tc.shown {
+				if strings.Contains(page, `<div class="runtime-service" id="serviceControl">`) {
+					t.Error("the document draws a control although the read proved nothing")
 				}
+				return
 			}
-			if count := strings.Count(page, "<script"); count != 1 {
-				t.Errorf("the document carries %d script elements, want exactly the one local script", count)
+
+			assertNames(t, page, "the service control", []string{
+				`id="serviceLabel">` + tc.label + `</span>`,
+				`runtime-service-dot ` + tc.tone + `" id="serviceDot"`,
+			})
+
+			// The separator stands only before a visible Delete beside
+			// another visible item.
+			earlier := tc.items["install"] != "hidden" || tc.items["start"] != "hidden" ||
+				tc.items["stop"] != "hidden" || tc.items["update"] != "hidden"
+			wantSeparator := tc.items["delete"] != "hidden" && earlier
+			gotSeparator := strings.Contains(page, `id="serviceSeparator" role="separator"></div>`)
+			if gotSeparator != wantSeparator {
+				t.Errorf("the separator is shown = %t, want %t", gotSeparator, wantSeparator)
 			}
-			assertPageReachesOutNowhere(t, page, "the fallback with a step")
-			assertNamesWithout(t, page, "the fallback with a step", nil, []string{"<a ", "href="})
 		})
 	}
-
-	t.Run("a document without a log path offers the step and the retry alone", func(t *testing.T) {
-		page := logsFallbackPage(logsFallbackState{
-			State:         "The HFDesk service is stopped.",
-			Note:          "The address of the web UI is not known.",
-			ServiceAction: logsServiceActionStart,
-		})
-		want := `<div class="actions">` +
-			`<button class="btn btn-primary" id="start-service" type="button">Start service</button>` +
-			`<button class="btn" id="try-again" type="button">Try again</button>` +
-			`</div>` + "\n"
-		if got := headerActions(t, page); got != want {
-			t.Errorf("the pathless header =\n%s\nwant:\n%s", got, want)
-		}
-		assertNamesWithout(t, page, "the pathless document with a step", nil,
-			[]string{`id="open-log-file"`, "Open the log file"})
-		assertPageReachesOutNowhere(t, page, "the pathless document with a step")
-	})
 }
 
-// TestLogsFallbackPageScriptCallsOnlyBoundActionNames pins the source of
-// truth of the bridge names: the document's script may reference ONLY the
-// names substituted from openLogFileAction, logsTryAgainAction,
-// logsStartServiceAction, logsUpdateServiceAction and logsInstallServiceAction
-// — the very constants companionWindowActions binds as its map keys — so
-// renaming a constant without the script (or the script without the constant)
-// cannot pass: the template derives the names at generation time, and this
-// test fails outright if any other literal name reaches the script, if a
-// substitution placeholder leaks into the document, or if a constant stops
-// being a usable JavaScript identifier.
-//
-// It also pins the element ids the script looks up by: an id renamed in
-// one of its two places is a dead button, and the click would silently do
-// nothing. Each state renders its OWN service button — the start document
-// carries no install button and the install document no start button —
-// while the script of every document wires all of them, because the guarded
-// wiring of an element that is not there is a no-op.
-func TestLogsFallbackPageScriptCallsOnlyBoundActionNames(t *testing.T) {
-	identifier := regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
-	bound := map[string]bool{
-		openLogFileAction:        true,
-		logsTryAgainAction:       true,
-		logsStartServiceAction:   true,
-		logsUpdateServiceAction:  true,
-		logsInstallServiceAction: true,
-	}
-	for _, name := range []string{
-		openLogFileAction, logsTryAgainAction,
-		logsStartServiceAction, logsUpdateServiceAction, logsInstallServiceAction,
-	} {
-		if !identifier.MatchString(name) {
-			t.Fatalf("%q is not a JavaScript identifier: "+
-				"substituting it would produce a script that cannot parse", name)
-		}
-	}
-
-	page := logsFallbackPage(logsFallbackState{
-		State:         "The HFDesk service is stopped.",
-		Address:       "http://127.0.0.1:18080",
-		LogPath:       `C:\ProgramData\HFDesk\logs\hfdesk.log`,
-		ServiceAction: logsServiceActionStart,
-	})
-	installPage := logsFallbackPage(logsFallbackState{
-		State:         "HFDesk is not registered as a Windows service.",
-		Note:          "The registration names no address, so there is nothing to open.",
-		ServiceAction: logsServiceActionInstall,
-	})
-
-	// Every window.<name> reference of the document is one of THE bound
-	// actions: no foreign name may sit beside them, and each one carries
-	// its guard and its call (twice).
-	counts := map[string]int{}
-	refs := regexp.MustCompile(`window\.[A-Za-z_$][A-Za-z0-9_$]*`).FindAllString(page, -1)
-	if len(refs) < 8 {
-		t.Errorf("the script references bound actions %d time(s), want the guard and the call of each: %v",
-			len(refs), refs)
-	}
-	for _, ref := range refs {
-		name := strings.TrimPrefix(ref, "window.")
-		if !bound[name] {
-			t.Errorf("the document calls %q, want only the bound window and service actions: "+
-				"a foreign name is a dead button", ref)
-		}
-		counts[name]++
-	}
-	for _, name := range []string{
-		openLogFileAction, logsTryAgainAction,
-		logsStartServiceAction, logsUpdateServiceAction, logsInstallServiceAction,
-	} {
-		if counts[name] < 2 {
-			t.Errorf("the script references %q %d time(s), want its guard and its call", name, counts[name])
-		}
-	}
-	for _, placeholder := range []string{
-		logsFallbackOpenPlaceholder, logsFallbackTryPlaceholder,
-		logsFallbackStartPlaceholder, logsFallbackUpdatePlaceholder,
-		logsFallbackInstallPlaceholder,
-	} {
-		if strings.Contains(page, placeholder) {
-			t.Errorf("the document carries the unsubstituted placeholder %q: the generation step is broken:\n%s",
-				placeholder, page)
-		}
-	}
-
-	// The bare names must not appear either: a call without the window.
-	// prefix is just as dead when a constant is renamed. The scan runs
-	// inside the script element only — the document legitimately prints
-	// the log file name (hfdesk.log) as text.
+// fallbackScript returns the one script element of a rendered document.
+func fallbackScript(t *testing.T, page string) string {
+	t.Helper()
 	script := regexp.MustCompile(`(?s)<script>.*?</script>`).FindString(page)
 	if script == "" {
 		t.Fatal("the document carries no script: the actions have no forwarder")
 	}
-	for _, name := range regexp.MustCompile(`hfdesk[A-Za-z0-9_$]*`).FindAllString(script, -1) {
-		if !bound[name] {
-			t.Errorf("the script carries the literal %q, want only the bound action names: "+
-				"a hardcoded name is a dead button", name)
+	return script
+}
+
+// TestLogsFallbackPageScriptCallsOnlyBoundActionNames pins the source of
+// truth of the bridge names: the script may reference ONLY the names
+// substituted from the bound-action constants — the open actions, the retry
+// and all five service actions — so a rename on either side cannot pass.
+// The configuration carries the names; the wiring calls them by the map
+// entry, never by a literal of its own.
+func TestLogsFallbackPageScriptCallsOnlyBoundActionNames(t *testing.T) {
+	identifier := regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
+	bound := []string{
+		openLogFileAction, openLogFolderAction, logsTryAgainAction,
+		logsStartServiceAction, logsStopServiceAction,
+		logsUpdateServiceAction, logsDeleteServiceAction,
+		logsInstallServiceAction,
+	}
+	allowed := map[string]bool{}
+	for _, name := range bound {
+		if !identifier.MatchString(name) {
+			t.Fatalf("%q is not a JavaScript identifier: "+
+				"substituting it would produce a script that cannot parse", name)
 		}
+		allowed[name] = true
 	}
 
-	// The buttons are looked up by the very ids the markup carries: the
-	// document of the stopped state carries the start button and no
-	// install button, the document of the machine without a registration
-	// the other way round, and the broken document the update button.
-	assertNames(t, page, "the bridge elements", []string{
-		`id="open-log-file"`, `getElementById("open-log-file")`,
-		`id="try-again"`, `getElementById("try-again")`,
-		`id="start-service"`, `getElementById("start-service")`,
-		`getElementById("update-service")`,
-		`getElementById("install-service")`,
+	page := logsFallbackPage(logsFallbackState{
+		Address: "http://127.0.0.1:18080",
+		LogPath: `C:\ProgramData\HFDesk\logs\hfdesk.log`,
+		Service: serviceview.From("stopped", false, false),
 	})
-	assertNamesWithout(t, page, "the stopped document", nil, []string{`id="install-service"`, `id="update-service"`})
-	assertNames(t, installPage, "the bridge elements of the install document", []string{
-		`id="install-service"`, `getElementById("install-service")`,
-		`getElementById("start-service")`, `getElementById("update-service")`,
+	script := fallbackScript(t, page)
+
+	for _, ref := range regexp.MustCompile(`hfdesk[A-Za-z0-9_$]*`).FindAllString(script, -1) {
+		if !allowed[ref] {
+			t.Errorf("the script carries the name %q, want only the bound actions: a foreign name is a dead button", ref)
+		}
+	}
+	for _, name := range bound {
+		if !strings.Contains(script, `"`+name+`"`) {
+			t.Errorf("the script config never carries %q: the window host binds it", name)
+		}
+	}
+	if strings.Contains(script, openUiAction) {
+		t.Errorf("the fallback script names %s: the dead address is never opened from the document", openUiAction)
+	}
+	if strings.Contains(script, "{{") || strings.Contains(script, "}}") {
+		t.Error("the document carries an unsubstituted placeholder")
+	}
+	if strings.Contains(script, "innerHTML") {
+		t.Error("the script writes markup: every value must reach the DOM through textContent")
+	}
+	if strings.Contains(script, "fetch(") {
+		t.Error("the script reaches out of the document")
+	}
+
+	// The wiring drives the shipped menu unit and looks its elements up by
+	// the very ids the markup carries.
+	assertNames(t, script, "the fallback wiring", []string{
+		"window.HFDeskServiceControl.wire",
+		`getElementById('serviceTrigger')`,
+		`getElementById('serviceMenu')`,
+		`getElementById('logBody')`,
+		`bindOpen('openLogsButton'`,
+		`bindOpen('openLogFileButton'`,
+		`bindOpen('try-again'`,
+		"window.HFDeskLogView",
 	})
-	assertNamesWithout(t, installPage, "the install document", nil,
-		[]string{`id="start-service"`, `id="update-service"`})
 }
 
 // TestLogsFallbackPageHonestShapesAndEscapesEverything proves the honest
 // shapes of the fallback document — an address that did not answer is
 // stated as a fact and never linked, a machine without an address states
-// the honest reason instead, and a model without a log path states that
-// fact and offers no open button beside the retry (a button with nothing
-// to open would be a dead action) — and that every value from the machine
-// is escaped, so none of it can become markup.
+// the honest reason instead — and that every value from the machine is
+// escaped, both in the HTML and in the one script that carries the tail.
 func TestLogsFallbackPageHonestShapesAndEscapesEverything(t *testing.T) {
 	t.Run("an address that did not answer is stated, never linked", func(t *testing.T) {
 		page := logsFallbackPage(logsFallbackState{
-			State:   "The HFDesk service is stopped.",
 			Address: "http://127.0.0.1:18080",
+			Service: serviceview.From("stopped", false, false),
 		})
 		assertNamesWithout(t, page, "the address line", []string{
 			"The web UI at <code>http://127.0.0.1:18080</code> does not answer.",
@@ -535,124 +560,158 @@ func TestLogsFallbackPageHonestShapesAndEscapesEverything(t *testing.T) {
 
 	t.Run("a machine without an address states the honest reason", func(t *testing.T) {
 		page := logsFallbackPage(logsFallbackState{
-			State: "HFDesk is not registered as a Windows service.",
-			Note:  "The registration names no address, so there is nothing to open.",
+			Note:    "The registration names no address, so there is nothing to open.",
+			Service: serviceview.From("not-installed", false, false),
 		})
 		assertNames(t, page, "the note line", []string{
 			"The registration names no address, so there is nothing to open.",
 		})
 		if strings.Contains(page, "does not answer") {
-			t.Errorf("the document claims an address did not answer although it names none: %q", page)
+			t.Errorf("the document claims an address did not answer although it names none")
 		}
 	})
 
-	t.Run("no log path states the fact and offers no open button", func(t *testing.T) {
+	t.Run("no log path states the fact and offers no open action", func(t *testing.T) {
 		page := logsFallbackPage(logsFallbackState{
-			State: "The HFDesk service is stopped.",
-			Note:  "The address of the web UI is not known.",
+			Note:    "The address of the web UI is not known.",
+			Service: serviceview.From("stopped", false, false),
 		})
-		assertNamesWithout(t, page, "the pathless document", []string{
-			"The log file is not known.",
-			`id="try-again"`,
-		}, []string{`id="open-log-file"`, "Open the log file"})
-		// The pathless shape reaches out of the document just as
-		// little as the full one.
+		assertNames(t, page, "the pathless document", []string{
+			`<h3 id="emptyTitle">The log file is not known.</h3>`,
+			`<code id="logFile">&mdash;</code>`,
+			`id="openLogsButton" type="button"`,
+		})
+		if !strings.Contains(page, `id="openLogsButton" type="button"
+              title="Open the folder of the service log file" disabled`) {
+			t.Error("the pathless document offers the log folder: there is nothing to open")
+		}
+		if !strings.Contains(page, `id="openLogFileButton" type="button"
+              title="Open the service log file in the default program" disabled`) {
+			t.Error("the pathless document offers the log file: there is nothing to open")
+		}
 		assertPageReachesOutNowhere(t, page, "the pathless document")
 	})
 
 	t.Run("every value is escaped", func(t *testing.T) {
 		page := logsFallbackPage(logsFallbackState{
-			State:   `<script>alert("state")</script>`,
+			Version: `1.0<&>`,
 			Address: `127.0.0.1:8080&<i>`,
 			LogPath: `<b>log</b>`,
+			Service: serviceview.From("stopped", false, false),
+			Log: serviceLogSection{
+				Path: `<b>log</b>`,
+				Tail: "plain </script><img src=x>&\u2028tail",
+			},
 		})
 		for _, raw := range []string{
-			`<script>alert("state")</script>`, `&<i>`, `<b>log</b>`,
+			`</script><img`, `<b>log</b>`, `1.0<&>`,
 		} {
 			if strings.Contains(page, raw) {
 				t.Errorf("the document carries the raw value %q: nothing from the machine may become markup", raw)
 			}
 		}
 		assertNames(t, page, "the escaped document", []string{
-			"&lt;script&gt;",
-			"&amp;&lt;i&gt;",
-			"&lt;b&gt;log&lt;/b&gt;",
+			"1.0&lt;&amp;&gt;",
+			"127.0.0.1:8080&amp;&lt;i&gt;",
+			`\u003c/script\u003e\u003cimg`,
 		})
+		if strings.Contains(page, "\u2028") {
+			t.Error("the document carries a raw U+2028: the script could break on it")
+		}
+		if !strings.Contains(page, `\u2028`) {
+			t.Error("the document does not escape U+2028 in the script data")
+		}
 	})
 }
 
-// TestLogsFallbackPageCarriesTheServiceLogTail proves variant A of the
-// fallback (decision of 2026-11-24): the document carries the bounded tail
-// of the service log under its own **Service log** section beside the
-// action that opens the whole file, in every honest shape of that file —
-// the tail, the file that does not exist yet, the file that could not be
-// read — and it still reaches out of nowhere: one local script, no fetch,
-// no link, nothing listening.
+// TestLogsFallbackPageCarriesTheServiceLogTail proves the tail of the
+// fallback: the records of the service log in the table of the live page —
+// the wire records parsed, the lines the service did not write kept as
+// their own text — under the honest meta (the last N lines, at most the
+// documented bounds), with the missing, unreadable and empty file stated in
+// the empty state of the panel, never in the status strip.
 func TestLogsFallbackPageCarriesTheServiceLogTail(t *testing.T) {
 	const logPath = `C:\ProgramData\HFDesk\logs\hfdesk.log`
+	tail := `{"seq":4,"time":"2026-11-25T10:00:00Z","level":"WARN","component":"server","message":"first line","attrs":{"queued":2}}` + "\n" +
+		`plain <b>line</b>`
 
-	t.Run("a readable file shows its tail beside the open action", func(t *testing.T) {
+	t.Run("a readable file shows its records in the table of the page", func(t *testing.T) {
 		page := logsFallbackPage(logsFallbackState{
-			State:   "The HFDesk service is stopped.",
 			Address: "http://127.0.0.1:18080",
+			Service: serviceview.From("stopped", false, false),
 			LogPath: logPath,
-			Log:     serviceLogSection{Path: logPath, Tail: "first line\nnewest line"},
+			Log:     serviceLogSection{Path: logPath, Tail: tail},
 		})
+
 		assertNames(t, page, "the fallback with a tail", []string{
-			`<div class="stat-label">Service log</div>`,
-			`id="service-log-tail"`,
-			"first line\nnewest line",
-			// The action that opens the whole file stays the one
-			// action of the header.
-			`id="open-log-file"`,
-			"Open the log file",
-			// The script looks the tail box up by the very id the
-			// markup carries: an id renamed in one of its two
-			// places would leave the scroll dead.
-			`getElementById("service-log-tail")`,
+			`<div class="runtime-log-head" aria-hidden="true">`,
+			`id="logBody"`,
+			`"message":"first line"`,
+			`"level":"WARN"`,
+			`"component":"server"`,
+			`"queued":2`,
+			`"raw":"plain \u003cb\u003eline\u003c/b\u003e"`,
+			`Offline &mdash; last 2 lines`,
+			`at most 200 lines, 64 KiB`,
+			`id="emptyState" hidden`,
+			`id="openLogsButton" type="button"
+              title="Open the folder of the service log file">Open log folder</button>`,
+			`id="openLogFileButton" type="button"
+              title="Open the service log file in the default program">Open log file</button>`,
 		})
+		// The tail is the table of the live page, not a preformatted
+		// block of a second shape.
+		assertNamesWithout(t, page, "the fallback with a tail", nil,
+			[]string{"<pre", `id="service-log-tail"`})
 		if count := strings.Count(page, "<script"); count != 1 {
 			t.Errorf("the document carries %d script elements, want exactly the one local script", count)
 		}
 		assertPageReachesOutNowhere(t, page, "the fallback with a tail")
-		assertNamesWithout(t, page, "the fallback with a tail", nil, []string{"<a ", "href="})
 	})
 
-	t.Run("a file that does not exist yet says so", func(t *testing.T) {
-		page := logsFallbackPage(logsFallbackState{
-			State:   "The HFDesk service is stopped.",
-			LogPath: logPath,
-			Log:     serviceLogSection{Path: logPath, Missing: true},
+	for _, tc := range []struct {
+		name    string
+		section serviceLogSection
+		title   string
+	}{
+		{
+			name:    "a file that does not exist yet says so",
+			section: serviceLogSection{Path: logPath, Missing: true},
+			title:   "The service log file has not been created yet.",
+		},
+		{
+			name:    "a file that could not be read names the reason",
+			section: serviceLogSection{Path: logPath, ReadError: "access is denied."},
+			title:   "The service log file could not be read: access is denied.",
+		},
+		{
+			name:    "an empty file says so",
+			section: serviceLogSection{Path: logPath},
+			title:   "The service log is empty.",
+		},
+		{
+			name:    "a model without a log source claims nothing",
+			section: serviceLogSection{},
+			title:   "The log file is not known.",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			page := logsFallbackPage(logsFallbackState{
+				Service: serviceview.From("stopped", false, false),
+				LogPath: tc.section.Path,
+				Log:     tc.section,
+			})
+			assertNames(t, page, "the empty state", []string{
+				`<div class="empty-state" id="emptyState">`,
+				`<h3 id="emptyTitle">` + tc.title + `</h3>`,
+			})
+			// The honest state sits inside the panel, never in the strip.
+			if empty := strings.Index(page, `id="emptyState"`); empty < 0 || strings.Index(page, tc.title) < empty {
+				t.Errorf("the honest state %q is not inside the empty state of the panel", tc.title)
+			}
+			assertPageReachesOutNowhere(t, page, "the fallback without records")
 		})
-		assertNames(t, page, "the missing shape", []string{
-			`<div class="stat-label">Service log</div>`,
-			"The service log file has not been created yet.",
-		})
-		assertNamesWithout(t, page, "the missing shape", nil, []string{`id="service-log-tail"`})
-		assertPageReachesOutNowhere(t, page, "the fallback with a missing file")
-	})
-
-	t.Run("a file that could not be read names the reason alone", func(t *testing.T) {
-		page := logsFallbackPage(logsFallbackState{
-			State:   "The HFDesk service is stopped.",
-			LogPath: logPath,
-			Log:     serviceLogSection{Path: logPath, ReadError: "access is denied."},
-		})
-		assertNames(t, page, "the unreadable shape", []string{
-			"The service log file could not be read: access is denied.",
-		})
-		assertNamesWithout(t, page, "the unreadable shape", nil, []string{`id="service-log-tail"`})
-	})
-
-	t.Run("a model without a log source claims nothing", func(t *testing.T) {
-		page := logsFallbackPage(logsFallbackState{
-			State: "The HFDesk service is stopped.",
-			Note:  "The address of the web UI is not known.",
-		})
-		assertNamesWithout(t, page, "the sectionless document", nil,
-			[]string{`<div class="stat-label">Service log</div>`, `id="service-log-tail"`})
-		assertPageReachesOutNowhere(t, page, "the sectionless document")
-	})
+	}
 }
 
 // TestReadServiceLogTailBoundsTheRead pins the mechanics the section reads
@@ -702,6 +761,168 @@ func TestReadServiceLogTailBoundsTheRead(t *testing.T) {
 
 	if _, err := readServiceLogTail(filepath.Join(t.TempDir(), "gone.log")); !os.IsNotExist(err) {
 		t.Errorf("a missing file reported %v, want the not-exist error", err)
+	}
+}
+
+// TestParseServiceLogTailKeepsEveryLine proves the parse of the tail: a wire
+// record keeps its fields, and any other line keeps its text verbatim under
+// Raw instead of being dropped or parsed into fields it does not have. An
+// empty line is a line too: it keeps its empty text and the view renders it
+// as an empty row rather than dropping it.
+func TestParseServiceLogTailKeepsEveryLine(t *testing.T) {
+	records := parseServiceLogTail(
+		`{"seq":7,"time":"2026-11-25T10:00:00Z","level":"ERROR","component":"cache","message":"unreadable","attrs":{"path":"a"}}` + "\n" +
+			"not json <tag>\n" +
+			`{"message":"no sequence"}` + "\n" +
+			"")
+
+	if len(records) != 4 {
+		t.Fatalf("the tail parsed into %d records, want 4", len(records))
+	}
+	if records[0].Raw != nil {
+		t.Errorf("the wire record = %+v, want no raw text", records[0])
+	}
+	if records[0].Seq != 7 || records[0].Message != "unreadable" || records[0].Level != "ERROR" {
+		t.Errorf("the wire record = %+v, want its fields", records[0])
+	}
+	if records[1].Raw == nil || *records[1].Raw != "not json <tag>" {
+		t.Errorf("the plain line = %+v, want its text under Raw", records[1])
+	}
+	if records[2].Raw == nil || *records[2].Raw != `{"message":"no sequence"}` {
+		t.Errorf("the JSON without a sequence = %+v, want its text under Raw", records[2])
+	}
+	if records[3].Raw == nil || *records[3].Raw != "" {
+		t.Errorf("the empty line = %+v, want its empty text under Raw", records[3])
+	}
+	if got := parseServiceLogTail(""); len(got) != 0 {
+		t.Errorf("an empty tail parsed into %v, want no records", got)
+	}
+}
+
+// TestLogsFallbackPageInlinesTheShippedAssets proves that the fallback
+// document really carries the shipped frame and units, not references to
+// them: the stylesheets and the scripts of the live page are embedded, so a
+// build that loses one of them fails here instead of rendering an unstyled
+// or inert document.
+func TestLogsFallbackPageInlinesTheShippedAssets(t *testing.T) {
+	for _, asset := range []struct {
+		name  string
+		proof string
+	}{
+		{name: "css/style.css", proof: "--color-bg:"},
+		{name: "css/runtime.css", proof: ".runtime-log-panel"},
+		{name: "js/logview.js", proof: "window.HFDeskLogView"},
+		{name: "js/servicecontrol.js", proof: "window.HFDeskServiceControl"},
+	} {
+		if text := fallbackAsset(asset.name); !strings.Contains(text, asset.proof) {
+			t.Errorf("the embedded asset %s does not carry %q", asset.name, asset.proof)
+		}
+	}
+
+	page := logsFallbackPage(logsFallbackState{
+		Service: serviceview.From("stopped", false, false),
+	})
+	for _, proof := range []string{
+		".runtime-log-panel",          // css/runtime.css
+		".runtime-shell",              // css/style.css
+		"window.HFDeskLogView",        // js/logview.js
+		"window.HFDeskServiceControl", // js/servicecontrol.js
+	} {
+		if !strings.Contains(page, proof) {
+			t.Errorf("the fallback document does not inline %q", proof)
+		}
+	}
+}
+
+// TestLogsFallbackPageWearsTheRuntimeFrame pins the structural parity of the
+// fallback and the live page: the same regions, the same classes, the same
+// menu items in the same order. The fallback must not grow a second visual
+// language or a second state line inside the menu.
+func TestLogsFallbackPageWearsTheRuntimeFrame(t *testing.T) {
+	live, err := os.ReadFile(filepath.Join("..", "assets", "static", "runtime.html"))
+	if err != nil {
+		t.Fatalf("read the shipped runtime.html: %v", err)
+	}
+	page := logsFallbackPage(logsFallbackState{
+		Address: "http://127.0.0.1:18080",
+		Service: serviceview.From("running", true, false),
+	})
+
+	classesIn := func(markup string) map[string]bool {
+		found := map[string]bool{}
+		for _, match := range regexp.MustCompile(`class="([^"]*)"`).FindAllStringSubmatch(markup, -1) {
+			for _, class := range strings.Fields(match[1]) {
+				found[class] = true
+			}
+		}
+		return found
+	}
+	liveClasses := classesIn(string(live))
+	fallbackClasses := classesIn(page)
+
+	for _, class := range []string{
+		"runtime-shell", "runtime-header", "logo", "logo-icon", "logo-text",
+		"runtime-header-status", "connection-status", "status-indicator",
+		"runtime-version", "runtime-service", "runtime-service-trigger",
+		"runtime-service-dot", "runtime-service-label", "runtime-service-chevron",
+		"runtime-service-menu", "runtime-service-item", "runtime-service-item-danger",
+		"runtime-service-separator", "runtime-service-chip", "badge", "badge-secondary",
+		"runtime-error", "runtime-strip", "runtime-stat", "runtime-stat-label",
+		"runtime-stat-value", "runtime-url", "config-chip", "runtime-log-panel",
+		"runtime-log-toolbar", "runtime-toolbar-group", "runtime-toolbar-label",
+		"runtime-search", "runtime-log-meta", "runtime-log-view", "runtime-log-head",
+		"runtime-log-body", "empty-state",
+	} {
+		if !liveClasses[class] {
+			t.Errorf("runtime.html does not carry the frame class %q", class)
+		}
+		if !fallbackClasses[class] {
+			t.Errorf("the fallback does not carry the frame class %q", class)
+		}
+	}
+
+	// The menu is the same list in the same order, with the same classes.
+	order := regexp.MustCompile(`id="service(Install|Start|Stop|Update|Delete)Item"`)
+	keys := func(markup string) string {
+		var items []string
+		for _, match := range order.FindAllStringSubmatch(markup, -1) {
+			items = append(items, match[1])
+		}
+		return strings.Join(items, ",")
+	}
+	if got, want := keys(page), keys(string(live)); got != want {
+		t.Errorf("the fallback menu is %q, want the order of runtime.html %q", got, want)
+	}
+
+	itemClass := regexp.MustCompile(`<button class="([^"]*)" id="service(Install|Start|Stop|Update|Delete)Item"`)
+	classes := func(markup string) map[string]string {
+		found := map[string]string{}
+		for _, match := range itemClass.FindAllStringSubmatch(markup, -1) {
+			found[match[2]] = match[1]
+		}
+		return found
+	}
+	if got, want := classes(page), classes(string(live)); !reflect.DeepEqual(got, want) {
+		t.Errorf("the fallback item classes = %v, want %v", got, want)
+	}
+
+	// The control keeps its menu semantics, and the state line stays in the
+	// trigger: the menu carries the actions and nothing else.
+	assertNames(t, page, "the fallback control", []string{
+		`aria-haspopup="menu"`,
+		`aria-expanded="false"`,
+		`aria-controls="serviceMenu"`,
+		`role="menu"`,
+		`aria-labelledby="serviceTrigger"`,
+		`role="menuitem"`,
+		`role="separator"`,
+	})
+	menu := page[strings.Index(page, `id="serviceMenu"`):]
+	if end := strings.Index(menu, `id="serviceChip"`); end >= 0 {
+		menu = menu[:end]
+	}
+	if strings.Contains(menu, "serviceLabel") {
+		t.Error("the fallback menu carries a second state line, want the actions only")
 	}
 }
 

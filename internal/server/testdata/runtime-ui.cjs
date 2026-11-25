@@ -94,6 +94,12 @@ function makeNode(extra = {}) {
       this.firstChild = this.children[0] || null;
       return child;
     },
+    querySelectorAll(selector) {
+      if (selector === '[role="menuitem"]') {
+        return this.children.filter(child => child.getAttribute('role') === 'menuitem');
+      }
+      return [];
+    },
     replaceChildren(...nodes) {
       this.children.forEach(child => { child.parentNode = null; });
       this.children = [];
@@ -141,6 +147,22 @@ for (const id of [
   'serviceSeparator', 'serviceDeleteItem'
 ]) {
   serviceMenu.appendChild(nodes.get('#' + id));
+}
+
+// The menu items carry the role and the action name the shipped markup
+// carries, so the service control unit finds them the way it finds the real
+// ones.
+const SERVICE_ITEM_ACTIONS = {
+  serviceInstallItem: 'install',
+  serviceStartItem: 'start',
+  serviceStopItem: 'stop',
+  serviceUpdateItem: 'update',
+  serviceDeleteItem: 'delete'
+};
+for (const [id, action] of Object.entries(SERVICE_ITEM_ACTIONS)) {
+  const item = nodes.get('#' + id);
+  item.setAttribute('role', 'menuitem');
+  item.setAttribute('data-service-action', action);
 }
 for (const id of [
   'serviceTrigger', 'serviceDot', 'serviceLabel', 'serviceMenu',
@@ -399,6 +421,13 @@ const logviewSource = fs.readFileSync(
   path.join(__dirname, '..', '..', 'assets', 'static', 'js', 'logview.js'), 'utf8');
 vm.runInNewContext(logviewSource, context);
 
+// The interaction of the service menu is a unit of its own as well: the
+// page loads it before the view, and the fallback document of the window
+// host inlines it.
+const serviceControlSource = fs.readFileSync(
+  path.join(__dirname, '..', '..', 'assets', 'static', 'js', 'servicecontrol.js'), 'utf8');
+vm.runInNewContext(serviceControlSource, context);
+
 let source = fs.readFileSync(path.join(__dirname, '..', '..', 'assets', 'static', 'js', 'runtime.js'), 'utf8');
 const marker = '  // Start\n';
 if (!source.includes(marker)) {
@@ -419,7 +448,8 @@ const hook = `
     ingest,
     connectStream,
     startPolling,
-    wireEvents
+    wireEvents,
+    serviceControl
   };
 `;
 source = source.replace(marker, hook + '\n' + marker);
@@ -568,10 +598,13 @@ function resetView() {
   ui.state.logError = '';
   ui.state.statusError = '';
   ui.state.loggedErrors = new Set();
-  ui.state.serviceBusy = false;
-  ui.state.serviceMenuOpen = false;
   ui.state.serviceActions = {};
   ui.state.serviceInstallMissing = false;
+
+  // The menu of the previous scenario is closed and its call is released,
+  // so a busy trigger or an open menu never reaches the next scenario.
+  ui.serviceControl.close(false);
+  ui.serviceControl.setBusy(false);
 
   // The live source of the previous scenario is closed, so the scenarios do
   // not share a stream.
@@ -1704,7 +1737,7 @@ async function scenarioLogViewRenderer() {
   const logView = window.HFDeskLogView;
   ok(logView, 'logview.js exposes one renderer object');
   for (const name of [
-    'normalizeRecord', 'buildRow', 'matches', 'levelPasses', 'isFilter',
+    'normalizeRecord', 'buildRow', 'buildRawRow', 'matches', 'levelPasses', 'isFilter',
     'formatTime', 'formatAttrValue', 'attrEntries', 'formatLine'
   ]) {
     eq(typeof logView[name], 'function', `the renderer carries ${name}`);
@@ -1750,6 +1783,15 @@ async function scenarioLogViewRenderer() {
   eq(logView.formatLine(record),
     `${logView.formatTime(record.time)}  WARN   jobs        Slow queue  queued=2 note=x`,
     'the copy line is the line of the view');
+
+  // A line the service wrote that is not a record is one text cell: the
+  // markup of the line stays text.
+  const rawRow = logView.buildRawRow('plain <b>line</b>');
+  eq(rawRow.className, 'runtime-log-row runtime-log-row-text',
+    'the raw line keeps the row of the log');
+  eq(rawRow.children.length, 1, 'the raw line is one cell');
+  eq(rawRow.children[0].textContent, 'plain <b>line</b>',
+    'the raw line reaches the cell as text');
 
   // The renderer loads on its own: one global, and no page code runs.
   const fresh = { window: {} };

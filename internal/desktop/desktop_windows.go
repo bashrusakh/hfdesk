@@ -67,6 +67,11 @@ const gracefulShutdownTimeout = 30 * time.Second
 // running instance. It returns an error after a startup failure, and every
 // startup failure is shown to the user in a native message box.
 func Run(o Options) error {
+	// The fallback document of the Logs window states the build version of
+	// this host. It is a constant of the process, assigned once before any
+	// companion or window exists.
+	companionVersion = strings.TrimSpace(o.Version)
+
 	logPath := o.App.LogFile
 	if logPath == "" {
 		logPath = app.DefaultLogPath()
