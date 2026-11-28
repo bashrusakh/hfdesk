@@ -37,6 +37,10 @@ and mirror models to another drive. One static binary, UI included.
 |---|---|
 | ![Mirror](docs/screenshots/hfdesk-mirror.png) | ![Settings](docs/screenshots/hfdesk-settings.png) |
 
+| Model analysis | Download history |
+|---|---|
+| ![Model analysis](docs/screenshots/hfdesk-analysis.png) | ![Download history](docs/screenshots/hfdesk-history.png) |
+
 ## Install
 
 Prebuilt binaries for Linux, macOS, and Windows are on the
